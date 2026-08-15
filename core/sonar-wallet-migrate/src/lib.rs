@@ -187,7 +187,10 @@ impl<'a> MigrationEngine<'a> {
     /// few iterations converge). Each infeasible iteration abandons an unpaid
     /// destination invoice, which is harmless — unpaid quotes expire.
     pub fn plan_drain(&self) -> Result<MigrationPlan> {
-        const MAX_ATTEMPTS: u32 = 3;
+        // 5 attempts takes the reserve schedule to ~16% of balance, which
+        // clears a real Boltz swap fee on a small balance. Each attempt costs
+        // one abandoned destination mint quote, so this stays bounded.
+        const MAX_ATTEMPTS: u32 = 5;
         let balance = Self::src(self.source.balance())?.confirmed_sats;
         if balance == 0 {
             return Err(MigrateError::SourceTooSmall {
@@ -201,7 +204,7 @@ impl<'a> MigrationEngine<'a> {
             balance
         };
         let mut last = String::new();
-        for _ in 0..MAX_ATTEMPTS {
+        for attempt in 0..MAX_ATTEMPTS {
             match self.plan_amount(candidate) {
                 Ok(plan) => return Ok(plan),
                 Err(MigrateError::ExceedsSourceBalance {
@@ -227,16 +230,32 @@ impl<'a> MigrationEngine<'a> {
                 // Source backends may report capacity as InsufficientFunds at
                 // prepare time instead of letting us compare; treat it as the
                 // same signal with a conservative step down.
-                Err(MigrateError::Source(WalletError::InsufficientFunds)) => {
-                    let next = candidate.saturating_sub(candidate / 100 + 1);
+                //
+                // A source reached over a host boundary reports the SAME
+                // condition as an opaque backend error: the variant does not
+                // survive the FFI, so a real Breez wallet refusing a
+                // whole-balance drain with "Cannot pay: not enough funds"
+                // arrives here as Backend(..). Treating only the typed variant
+                // as retryable made drain fail on the first attempt on
+                // Android while the identical case retried fine in-process.
+                // Both step down; the schedule below is what actually clears a
+                // fee, since a 1%-of-balance step never reaches a swap fee on
+                // a small balance.
+                Err(MigrateError::Source(
+                    err @ (WalletError::InsufficientFunds | WalletError::Backend(_)),
+                )) => {
+                    // Reserve grows per attempt (1% → 2% → 4% …, floor 4 sats)
+                    // so a few bounded attempts cross a realistic swap fee
+                    // instead of creeping.
+                    let reserve = ((balance * (1u64 << attempt)) / 100).max(4);
+                    let next = balance.saturating_sub(reserve).min(candidate.saturating_sub(1));
                     if next == 0 {
                         return Err(MigrateError::SourceTooSmall {
                             balance_sats: balance,
-                            reason: "source reports insufficient funds even at minimal amounts"
-                                .into(),
+                            reason: format!("fees consume the whole balance ({err})"),
                         });
                     }
-                    last = format!("source reported insufficient funds at {candidate} sats");
+                    last = format!("source refused {candidate} sats: {err}");
                     candidate = next;
                 }
                 Err(other) => return Err(other),
@@ -298,6 +317,87 @@ impl<'a> MigrationEngine<'a> {
 mod tests {
     use super::*;
     use sonar_wallet::MockWallet;
+    use std::sync::Arc;
+
+    /// A source that refuses to quote more than it can afford, and reports
+    /// that refusal as an OPAQUE backend error rather than the typed
+    /// `InsufficientFunds`.
+    ///
+    /// This is not hypothetical: a host-implemented source reaches the engine
+    /// through a UniFFI foreign trait whose error is flat, so the variant does
+    /// not survive the boundary. A real Breez wallet on Android refusing a
+    /// whole-balance drain arrives here as
+    /// `Backend("... Cannot pay: not enough funds")`. Before the fix, that
+    /// landed in the catch-all arm and `plan_drain` gave up on the first
+    /// attempt instead of stepping the amount down.
+    struct OpaqueRefusingSource {
+        inner: MockWallet,
+        /// Refuse any amount whose amount+fee exceeds the balance.
+        fee_sats: u64,
+    }
+
+    impl WalletBackend for OpaqueRefusingSource {
+        fn capabilities(&self) -> sonar_wallet::WalletCapabilities {
+            self.inner.capabilities()
+        }
+        fn connect(&self) -> sonar_wallet::Result<()> {
+            self.inner.connect()
+        }
+        fn disconnect(&self) -> sonar_wallet::Result<()> {
+            self.inner.disconnect()
+        }
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+        fn balance(&self) -> sonar_wallet::Result<sonar_wallet::Balance> {
+            self.inner.balance()
+        }
+        fn receive(&self, request: &sonar_wallet::ReceiveRequest) -> sonar_wallet::Result<String> {
+            self.inner.receive(request)
+        }
+        fn parse_destination(&self, input: &str) -> sonar_wallet::Result<sonar_wallet::Destination> {
+            self.inner.parse_destination(input)
+        }
+        fn prepare_send(
+            &self,
+            destination: &sonar_wallet::Destination,
+            amount_sats: Option<u64>,
+        ) -> sonar_wallet::Result<sonar_wallet::PreparedSend> {
+            let balance = self.inner.balance()?.confirmed_sats;
+            if let Some(amount) = amount_sats {
+                if amount.saturating_add(self.fee_sats) > balance {
+                    // Exactly what Breez says, flattened to a string on the
+                    // way through the FFI.
+                    return Err(WalletError::Backend(
+                        "host source prepare: Cannot pay: not enough funds".into(),
+                    ));
+                }
+            }
+            self.inner.prepare_send(destination, amount_sats)
+        }
+        fn send(
+            &self,
+            prepared: &sonar_wallet::PreparedSend,
+            note: &str,
+        ) -> sonar_wallet::Result<sonar_wallet::Payment> {
+            self.inner.send(prepared, note)
+        }
+        fn list_recent_payments(
+            &self,
+            limit: u32,
+        ) -> sonar_wallet::Result<Vec<sonar_wallet::Payment>> {
+            self.inner.list_recent_payments(limit)
+        }
+        fn add_event_listener(&self, listener: Arc<dyn sonar_wallet::WalletEventListener>) -> u64 {
+            self.inner.add_event_listener(listener)
+        }
+        fn remove_event_listener(&self, id: u64) {
+            self.inner.remove_event_listener(id)
+        }
+        fn wipe_local_storage(&self) -> sonar_wallet::Result<()> {
+            self.inner.wipe_local_storage()
+        }
+    }
 
     fn engine<'a>(
         source: &'a MockWallet,
@@ -388,6 +488,29 @@ mod tests {
         assert!(!payment.incoming);
         assert_eq!(payment.amount_sats, 9_998);
         assert_eq!(source.balance().unwrap().confirmed_sats, 1);
+    }
+
+    #[test]
+    fn drain_converges_when_the_source_refuses_opaquely() {
+        // 813 sats with a 40-sat fee: the real Pixel case. A whole-balance
+        // drain is refused, and the refusal carries no recognisable variant.
+        let source = OpaqueRefusingSource {
+            inner: MockWallet::new(813),
+            fee_sats: 40,
+        };
+        source.connect().unwrap();
+        let dest = MockWallet::new(0);
+        dest.connect().unwrap();
+
+        let e = MigrationEngine::new(&source, &dest, limits(Some(500_000), None));
+        let plan = e
+            .plan_drain()
+            .expect("drain must step down past an opaque refusal, not give up on attempt one");
+        assert!(
+            plan.amount_sats > 0 && plan.amount_sats + 40 <= 813,
+            "planned {} sats, which the source cannot afford with a 40 sat fee",
+            plan.amount_sats
+        );
     }
 
     #[test]

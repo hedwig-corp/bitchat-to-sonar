@@ -82,24 +82,66 @@ pub struct HostPayment {
     pub complete: bool,
 }
 
+/// Why a host-side wallet call failed, in a form UniFFI can carry BACK across
+/// the boundary.
+///
+/// This must NOT be `#[uniffi(flat_error)]`. A flat error cannot be lifted out
+/// of a foreign trait: when the host throws one, UniFFI aborts the entire
+/// outer call with the opaque message "Can't lift flat errors", and the Rust
+/// side never sees an `Err` at all. That is not merely a bad message — it
+/// makes every host failure unrecoverable, because the engine's own retry
+/// logic never runs. A real Pixel drain failed exactly this way: Breez
+/// refused the whole balance with "Cannot pay: not enough funds",
+/// `plan_drain`'s step-down never fired, and the user saw
+/// "Can't lift flat errors".
+///
+/// [`InsufficientFunds`](Self::InsufficientFunds) is a distinct variant rather
+/// than a message because the engine branches on it: it is the signal to plan
+/// a smaller amount, and a string could not be matched on safely.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum HostWalletError {
+    /// The wallet cannot afford this amount plus its fee. The engine responds
+    /// by stepping the amount down, so hosts should prefer this over
+    /// `Failed` whenever the backend says so.
+    #[error("insufficient funds")]
+    InsufficientFunds,
+    /// Anything else, carrying the host's own message.
+    ///
+    /// The field is `reason`, not `message`: UniFFI maps this variant to a
+    /// Kotlin subclass of `Exception`, and a field called `message` collides
+    /// with `Throwable.message` — the generated bindings then fail to compile.
+    #[error("{reason}")]
+    Failed { reason: String },
+}
+
 /// The migration SOURCE, implemented by the host over its existing native
 /// Breez integration. Deliberately minimal — the engine needs exactly these
 /// three operations, so hosts do not have to mirror the whole `WalletBackend`
 /// trait over the FFI boundary.
 ///
 /// Implementations are called from a Rust thread and MUST block until done.
-/// Failures are reported by throwing [`SonarFfiError`] — the same error type
-/// the rest of this FFI surface uses, so hosts have one error to handle.
-/// (A bare `String` error is NOT exportable by UniFFI for callback
-/// interfaces; the binding generator rejects it outright.)
+/// Failures are reported by throwing [`HostWalletError`]; see the note there
+/// on why this deliberately is not the flat `SonarFfiError` used elsewhere in
+/// this FFI surface.
 #[uniffi::export(with_foreign)]
 pub trait HostMigrationSource: Send + Sync {
     /// Confirmed spendable balance, sats.
-    fn balance_sats(&self) -> Result<u64, SonarFfiError>;
+    fn balance_sats(&self) -> Result<u64, HostWalletError>;
     /// Price paying `invoice` for `amount_sats` WITHOUT paying it.
-    fn prepare(&self, invoice: String, amount_sats: u64) -> Result<HostSendQuote, SonarFfiError>;
+    fn prepare(&self, invoice: String, amount_sats: u64) -> Result<HostSendQuote, HostWalletError>;
     /// Pay a previously prepared quote. Called at most once per token.
-    fn send(&self, token: String, note: String) -> Result<HostPayment, SonarFfiError>;
+    fn send(&self, token: String, note: String) -> Result<HostPayment, HostWalletError>;
+}
+
+impl From<HostWalletError> for WalletError {
+    fn from(err: HostWalletError) -> Self {
+        match err {
+            // Preserved as the typed variant: the migration engine matches on
+            // it to plan a smaller amount.
+            HostWalletError::InsufficientFunds => WalletError::InsufficientFunds,
+            HostWalletError::Failed { reason } => WalletError::Backend(reason),
+        }
+    }
 }
 
 /// Adapts the host's minimal source to the full `WalletBackend` the engine
@@ -135,7 +177,10 @@ impl WalletBackend for HostSourceBackend {
         let confirmed = self
             .host
             .balance_sats()
-            .map_err(|e| WalletError::Backend(format!("host source balance: {e}")))?;
+            // Map through From<HostWalletError>, NOT to_string(): the engine
+            // branches on InsufficientFunds to plan a smaller amount,
+            // and stringifying it here silently disables that.
+            .map_err(WalletError::from)?;
         Ok(Balance {
             confirmed_sats: confirmed,
             ..Balance::default()
@@ -166,7 +211,10 @@ impl WalletBackend for HostSourceBackend {
         let quote = self
             .host
             .prepare(destination.raw.clone(), amount)
-            .map_err(|e| WalletError::Backend(format!("host source prepare: {e}")))?;
+            // Map through From<HostWalletError>, NOT to_string(): the engine
+            // branches on InsufficientFunds to plan a smaller amount,
+            // and stringifying it here silently disables that.
+            .map_err(WalletError::from)?;
         Ok(PreparedSend {
             destination: destination.clone(),
             amount_sats: quote.amount_sats,
@@ -184,7 +232,10 @@ impl WalletBackend for HostSourceBackend {
         let paid = self
             .host
             .send(token.clone(), note.to_string())
-            .map_err(|e| WalletError::Backend(format!("host source send: {e}")))?;
+            // Map through From<HostWalletError>, NOT to_string(): the engine
+            // branches on InsufficientFunds to plan a smaller amount,
+            // and stringifying it here silently disables that.
+            .map_err(WalletError::from)?;
         Ok(Payment {
             id: paid.id,
             amount_sats: paid.amount_sats,

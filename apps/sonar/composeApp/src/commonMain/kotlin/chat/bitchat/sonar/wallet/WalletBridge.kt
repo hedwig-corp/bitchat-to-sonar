@@ -121,6 +121,18 @@ expect object WalletBridge {
      */
     suspend fun prepareSend(destination: String, amountSats: Long): PreparedSendQuote?
 
+    /**
+     * Why the most recent [prepareSend] returned null, or null when the last
+     * one succeeded.
+     *
+     * [prepareSend] answers with a bare null, which is enough for a UI that
+     * only needs "no quote" but loses the distinction the migration engine
+     * depends on: a wallet that cannot afford the amount must be reported as
+     * insufficient funds so the engine plans a smaller one, while any other
+     * failure must not trigger that retry.
+     */
+    fun lastPrepareFailure(): String?
+
     /** Pay a quote from [prepareSend]. Single-use — the quote is consumed. */
     suspend fun sendPrepared(id: String, note: String): SendResult
 

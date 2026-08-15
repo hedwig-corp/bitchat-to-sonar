@@ -5,7 +5,7 @@ import kotlinx.coroutines.runBlocking
 import uniffi.sonar_ffi.HostMigrationSource
 import uniffi.sonar_ffi.HostPayment
 import uniffi.sonar_ffi.HostSendQuote
-import uniffi.sonar_ffi.SonarFfiException
+import uniffi.sonar_ffi.HostWalletException
 
 /**
  * Breez→Cashu migration source on Compose Desktop (JVM).
@@ -20,6 +20,12 @@ import uniffi.sonar_ffi.SonarFfiException
  * must therefore invoke the engine from `Dispatchers.IO`, never the main
  * dispatcher.
  */
+/** Mirror of the Android classifier; see that file for why it is textual. */
+private fun looksInsufficient(message: String): Boolean =
+    message.contains("not enough funds", ignoreCase = true) ||
+        message.contains("insufficient", ignoreCase = true) ||
+        message.contains("balance too low", ignoreCase = true)
+
 class BreezMigrationSource : HostMigrationSource {
 
     /**
@@ -36,7 +42,18 @@ class BreezMigrationSource : HostMigrationSource {
 
     override fun `prepare`(invoice: String, amountSats: ULong): HostSendQuote = runBlocking {
         val quote = WalletBridge.prepareSend(invoice, amountSats.toLong())
-            ?: throw SonarFfiException.Core("the Lightning wallet could not price this payment")
+            ?: run {
+                val reason = WalletBridge.lastPrepareFailure()
+                // InsufficientFunds is the engine's signal to plan a smaller
+                // amount; anything else aborts the migration.
+                throw if (reason != null && looksInsufficient(reason)) {
+                    HostWalletException.InsufficientFunds()
+                } else {
+                    HostWalletException.Failed(
+                        reason ?: "the Lightning wallet could not price this payment"
+                    )
+                }
+            }
         val quoted = quote.amountSats.coerceAtLeast(0).toULong()
         quotedAmounts[quote.id] = quoted
         HostSendQuote(
@@ -50,7 +67,12 @@ class BreezMigrationSource : HostMigrationSource {
         val amount = quotedAmounts.remove(token) ?: 0uL
         val result = WalletBridge.sendPrepared(token, note)
         if (!result.ok) {
-            throw SonarFfiException.Core(result.error ?: "the Lightning payment failed")
+            val reason = result.error ?: "the Lightning payment failed"
+            throw if (looksInsufficient(reason)) {
+                HostWalletException.InsufficientFunds()
+            } else {
+                HostWalletException.Failed(reason)
+            }
         }
         HostPayment(
             `id` = result.paymentId ?: token,

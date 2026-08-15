@@ -449,6 +449,12 @@ actual object WalletBridge {
     private val pendingQuotes = LinkedHashMap<String, PrepareSendResponse>()
     private const val MAX_PENDING_QUOTES = 16
 
+    /** Reason the last [prepareSend] failed; see the expect declaration. */
+    @Volatile
+    private var lastPrepareError: String? = null
+
+    actual fun lastPrepareFailure(): String? = lastPrepareError
+
     actual suspend fun prepareSend(destination: String, amountSats: Long): PreparedSendQuote? =
         withContext(Dispatchers.IO) {
             val node = lock.withLock { sdk } ?: return@withContext null
@@ -466,8 +472,19 @@ actual object WalletBridge {
                     }
                     pendingQuotes[id] = prepared
                 }
+                lastPrepareError = null
                 PreparedSendQuote(id = id, amountSats = quoted, feesSats = prepared.feesSat?.toLong())
             } catch (t: Throwable) {
+                lastPrepareError = t.message ?: t.toString()
+                // Returning a bare null discards WHY Breez refused (amount
+                // below the swap minimum, no route, service down). Callers
+                // turn that into "could not price this payment", which is
+                // undiagnosable in the field — log the cause before dropping
+                // it. The destination is omitted: it is a payment instrument.
+                android.util.Log.w(
+                    "SonarWallet",
+                    "prepareSend($amountSats sats) failed: ${t.message ?: t.toString()}",
+                )
                 null
             }
         }

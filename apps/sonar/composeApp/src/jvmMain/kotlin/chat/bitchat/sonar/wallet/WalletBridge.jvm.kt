@@ -236,6 +236,12 @@ actual object WalletBridge {
     private val pendingQuotes = LinkedHashMap<String, PrepareSendResponse>()
     private const val MAX_PENDING_QUOTES = 16
 
+    /** Reason the last [prepareSend] failed; see the expect declaration. */
+    @Volatile
+    private var lastPrepareError: String? = null
+
+    actual fun lastPrepareFailure(): String? = lastPrepareError
+
     actual suspend fun prepareSend(destination: String, amountSats: Long): PreparedSendQuote? =
         withContext(Dispatchers.IO) {
             val node = sdk ?: return@withContext null
@@ -253,8 +259,12 @@ actual object WalletBridge {
                     }
                     pendingQuotes[id] = prepared
                 }
+                lastPrepareError = null
                 PreparedSendQuote(id = id, amountSats = quoted, feesSats = prepared.feesSat?.toLong())
             } catch (t: Throwable) {
+                // Keep the reason: the migration engine must be able to tell
+                // "cannot afford it" from any other failure.
+                lastPrepareError = t.message ?: t.toString()
                 null
             }
         }
