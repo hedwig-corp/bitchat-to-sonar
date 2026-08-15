@@ -1468,13 +1468,13 @@ struct SNMsgList: View {
     var onTapPack: ((String) -> Void)? = nil
     /// Retry one failed outgoing message without rebuilding the transcript.
     var onRetry: ((SNMessage) -> Void)? = nil
-    /// Long-press Reply; quote-chip tap Jump.
-    var onReply: ((SNMessage) -> Void)? = nil
-    var onJumpQuote: ((String) -> Void)? = nil
     /// Cancel an in-flight Blossom upload for an optimistic media bubble.
     var onCancelUpload: ((SNMessage) -> Void)? = nil
     /// Live Blossom upload fractions (collection-host / Compose parity).
     var uploadProgressSource: SNMediaUploadProgressSource? = nil
+    /// Long-press Reply; quote-chip tap Jump.
+    var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
     var loadOlder: (() async -> Bool)? = nil
     /// Restore a movable historical window to its newest local page.
