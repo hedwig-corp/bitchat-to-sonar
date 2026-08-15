@@ -2076,9 +2076,10 @@ landing mid-attempt but before the DB read is *in* the sealed bytes yet keeps
 `dirty=true` at success, and left set with nothing new to upload it re-seals
 and re-hashes the whole account every opportunistic pass, forever — and stale
 `last_error`, which would otherwise keep a red Settings row under a provably
-backed-up account. Both clears use the same `attempt_dirty_seq` guard as
-`record_backup_success`: a bump *after* the attempt snapshot keeps `dirty`,
-because that send is not proven covered.
+backed-up account. The `dirty` clear uses the same `attempt_dirty_seq` guard as
+`record_backup_success` — a bump *after* the attempt snapshot keeps `dirty`,
+because that send is not proven covered; the `last_error` clear is
+unconditional, matching how success clears it.
 
 **Guarded by:** `client.rs::only_our_own_messages_make_the_account_backup_urgent`
 (pins the real index call site — inbound must not dirty, outbound must)

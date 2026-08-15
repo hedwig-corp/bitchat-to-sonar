@@ -2437,10 +2437,13 @@ final class SonarAppStore: ObservableObject {
             case .skippedOptOut, .abortedMeteredLink:
                 // Unreachable from the manual path: it never passes
                 // `respectOptOut`, and manual backups are deliberately never
-                // metered-gated. If a refactor makes this reachable, surface it
-                // rather than toast a state the user did not ask for.
+                // metered-gated. If a refactor ever makes this reachable, the
+                // truthful summary is that the upload the user asked for did
+                // not happen — the failure toast, never "up to date"
+                // (assertionFailure is a no-op in Release, so the toast is
+                // what a user would actually see).
                 assertionFailure("manual backup returned an auto-only outcome")
-                showToast(String(localized: "Chat backup is already up to date"))
+                showToast(String(localized: "Backup failed — try again when online"))
             }
             refreshBackupPolicy()
         } catch MarmotService.ServiceError.backupAlreadyInProgress {
