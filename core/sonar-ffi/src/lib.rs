@@ -34,6 +34,8 @@ uniffi::setup_scaffolding!();
 mod android_jni;
 
 mod logging;
+mod wallet;
+pub use wallet::*;
 
 /// Flat error: only the rendered message crosses the FFI boundary
 /// (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
@@ -442,10 +444,12 @@ pub fn abort_account_restore(db_path: String) -> FfiResult<()> {
 /// leftover staging was committed under `db_key_hex`.
 #[uniffi::export]
 pub fn reconcile_account_restore(db_path: String, db_key_hex: String) -> FfiResult<bool> {
-    Ok(sonar_core::account_backup::reconcile_staged_account_restore(
-        Path::new(&db_path),
-        &db_key_hex,
-    )?)
+    Ok(
+        sonar_core::account_backup::reconcile_staged_account_restore(
+            Path::new(&db_path),
+            &db_key_hex,
+        )?,
+    )
 }
 
 /// True when `*.sonar-restore-staging` still exists (DB not yet promoted).
@@ -3375,9 +3379,7 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
             .into_iter()
             .map(|c| match c {
                 mesh_engine::Command::Dial { conn } => MeshEngineCommand::Dial { conn },
-                mesh_engine::Command::Disconnect { conn } => {
-                    MeshEngineCommand::Disconnect { conn }
-                }
+                mesh_engine::Command::Disconnect { conn } => MeshEngineCommand::Disconnect { conn },
                 mesh_engine::Command::CancelServer { conn } => {
                     MeshEngineCommand::CancelServer { conn }
                 }
@@ -3513,9 +3515,9 @@ impl MeshLinkEngine {
     ) -> FfiResult<Arc<Self>> {
         let sk = hex::decode(&noise_private_hex).map_err(invalid("noise private key"))?;
         let seed = hex::decode(&ed25519_seed_hex).map_err(invalid("mesh seed"))?;
-        let sk: [u8; 32] = sk
-            .try_into()
-            .map_err(|_| SonarFfiError::InvalidInput("noise private key must be 32 bytes".into()))?;
+        let sk: [u8; 32] = sk.try_into().map_err(|_| {
+            SonarFfiError::InvalidInput("noise private key must be 32 bytes".into())
+        })?;
         let seed: [u8; 32] = seed
             .try_into()
             .map_err(|_| SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()))?;
@@ -3572,7 +3574,10 @@ impl MeshLinkEngine {
         instances: Vec<i32>,
         now_ms: i64,
     ) -> MeshEngineOutput {
-        engine_output(self.lock().on_instances_discovered(&conn, &instances, ms(now_ms)))
+        engine_output(
+            self.lock()
+                .on_instances_discovered(&conn, &instances, ms(now_ms)),
+        )
     }
 
     pub fn on_subscribe_result(
@@ -3595,7 +3600,10 @@ impl MeshLinkEngine {
         bytes: Vec<u8>,
         now_ms: i64,
     ) -> MeshEngineOutput {
-        engine_output(self.lock().on_client_rx(&conn, instance, &bytes, ms(now_ms)))
+        engine_output(
+            self.lock()
+                .on_client_rx(&conn, instance, &bytes, ms(now_ms)),
+        )
     }
 
     pub fn on_server_connected(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
@@ -3711,11 +3719,7 @@ impl MeshLinkEngine {
         engine_output(self.lock().set_nickname(&nickname, ms(now_ms)))
     }
 
-    pub fn set_sonar_payload(
-        &self,
-        payload: Option<Vec<u8>>,
-        now_ms: i64,
-    ) -> MeshEngineOutput {
+    pub fn set_sonar_payload(&self, payload: Option<Vec<u8>>, now_ms: i64) -> MeshEngineOutput {
         engine_output(self.lock().set_sonar_payload(payload, ms(now_ms)))
     }
 
@@ -4057,7 +4061,13 @@ mod tests {
         ));
         // empty db path
         assert!(matches!(
-            SonarNode::connect(id, vec!["wss://relay.example".into()], String::new(), key, None),
+            SonarNode::connect(
+                id,
+                vec!["wss://relay.example".into()],
+                String::new(),
+                key,
+                None
+            ),
             Err(SonarFfiError::InvalidInput(_))
         ));
     }

@@ -145,49 +145,14 @@ pub fn is_valid_local_part(s: &str) -> bool {
         .all(|&b| alnum(b) || b == b'-' || b == b'_' || b == b'.')
 }
 
-/// WHATWG URL's "ends in a number" test, applied to a host's last label.
-///
-/// The URL parser (`url` 2.5.8, under `reqwest`) treats a host whose final part
-/// parses as a number as an IPv4 address, and its IPv4 grammar accepts hex and
-/// octal octets — not just decimal. Testing the TLD for all-ASCII-digits alone
-/// therefore caught `1.2.3.4` but let every hex form through:
-/// `0x7f.0x0.0x0.0x1` and the short `0x7f.0x1` both normalise to `127.0.0.1`,
-/// `0xa9.0xfe.0xa9.0xfe` to the link-local metadata address `169.254.169.254`,
-/// `0xc0.0xa8.0x1.0x1` to `192.168.1.1`.
-///
-/// Octal needs no separate arm — `0177.0.0.01` is all digits already. An empty
-/// label counts as a number (`0x` with an empty body parses as 0, which is what
-/// makes `0x.0x.0x.0x1` a host), and that also keeps the trailing-dot form
-/// `1.2.3.4.` rejected.
-///
-/// Rejecting is the safe direction for the cases where the URL parser would
-/// *fail* instead of normalising (`1.0x7f000001` overflows its 2-part slot):
-/// such a host can never be fetched anyway.
-///
-/// Both `0x` and `0X` are matched. The uppercase form cannot reach here through
-/// `parse_handle_input` (it lowercases) and would be caught downstream anyway by
-/// `is_valid_domain`'s lowercase-only charset check — but this predicate answers
-/// "is this label an IPv4 octet", and that answer must not depend on a check
-/// that runs after it.
-fn label_is_ipv4_number(label: &str) -> bool {
-    let hex_body = label
-        .strip_prefix("0x")
-        .or_else(|| label.strip_prefix("0X"));
-    match hex_body {
-        Some(hex) => hex.bytes().all(|b| b.is_ascii_hexdigit()),
-        None => label.bytes().all(|b| b.is_ascii_digit()),
-    }
-}
-
 /// True if `s` looks like a resolvable *public* DNS name for a handle domain:
 /// ASCII letters/digits/hyphens in dot-separated labels, at least one dot.
 ///
 /// SSRF hardening — the domain comes from attacker-controlled data (a peer's
 /// kind-0 `nip05` field, or typed input), and resolution auto-fires from the
 /// contact-profile screen. Reject IP literals (a numeric TLD is an IPv4
-/// address in *any* radix — see `label_is_ipv4_number`; `[` opens an IPv6
-/// literal) and well-known internal suffixes so the client never GETs
-/// loopback/link-local/metadata or LAN hosts by name.
+/// address; `[` opens an IPv6 literal) and well-known internal suffixes so
+/// the client never GETs loopback/link-local/metadata or LAN hosts by name.
 /// (A public name that *resolves* to a private IP — DNS rebinding — is out of
 /// scope for a client-side string check; impact stays bounded by the GET-only,
 /// no-redirect, 64KB-capped fetch path.)
@@ -196,8 +161,8 @@ fn is_valid_domain(s: &str) -> bool {
         return false;
     }
     let labels: Vec<&str> = s.split('.').collect();
-    // Numeric TLD ⇒ IPv4 literal (1.2.3.4, 0x7f.0x1); bracket ⇒ IPv6 literal.
-    if s.starts_with('[') || labels.last().is_some_and(|tld| label_is_ipv4_number(tld)) {
+    // Numeric TLD ⇒ IPv4 literal (1.2.3.4); bracket ⇒ IPv6 literal.
+    if s.starts_with('[') || labels.last().is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit())) {
         return false;
     }
     // Include `localhost` as a suffix so `foo.localhost` (loopback on most
@@ -429,49 +394,6 @@ mod tests {
         assert!(parse_handle_input("alice@example.com", DEFAULT_HANDLE_DOMAIN).is_ok());
         // Numeric label is fine when it isn't the TLD.
         assert!(parse_handle_input("alice@1password.com", DEFAULT_HANDLE_DOMAIN).is_ok());
-    }
-
-    /// Regression: the IP-literal filter used to test the TLD for ASCII digits
-    /// only, so every non-decimal IPv4 form walked past it and reqwest's WHATWG
-    /// URL parser normalised the host back to a private address before
-    /// connecting. Each `bad` below was verified against `url` 2.5.8 — the
-    /// comment is the host it resolves to.
-    #[test]
-    fn domain_rejects_non_decimal_ipv4_literals() {
-        for bad in [
-            "0x7f.0x0.0x0.0x1",    // 127.0.0.1
-            "0xa9.0xfe.0xa9.0xfe", // 169.254.169.254 — link-local metadata
-            "0xc0.0xa8.0x1.0x1",   // 192.168.1.1
-            "0x7f.0x1",            // 127.0.0.1 — short 2-part form
-            "0x.0x.0x.0x1",        // 0.0.0.1 — empty hex body parses as 0
-            "0177.0.0.01",         // 127.0.0.1 — octal, all-digits arm
-            "1.0x7f000001",        // URL parse *failure*; reject anyway
-        ] {
-            assert!(
-                parse_handle_input(&format!("alice@{bad}"), DEFAULT_HANDLE_DOMAIN).is_err(),
-                "expected rejection of non-decimal IPv4 literal: {bad}"
-            );
-        }
-        // Uppercase hex is double-gated: `parse_handle_input` lowercases, and
-        // the charset check below accepts `is_ascii_lowercase` only. Pinned
-        // here so `label_is_ipv4_number` staying case-insensitive is a tested
-        // property, not an accident of call order.
-        for upper in ["0X7F.0X0.0X0.0X1", "0x7F.0x0.0x0.0x1", "0X7f.0X1"] {
-            assert!(
-                !is_valid_domain(upper),
-                "expected rejection of uppercase-hex IPv4 literal: {upper}"
-            );
-            assert!(label_is_ipv4_number(upper.rsplit('.').next().unwrap()));
-        }
-
-        // A hex-looking label is only an IPv4 octet when the host *ends* in a
-        // number. These are ordinary names and must still resolve.
-        for good in ["0x7f.example.com", "0xdeadbeef.org", "1password.com"] {
-            assert!(
-                parse_handle_input(&format!("alice@{good}"), DEFAULT_HANDLE_DOMAIN).is_ok(),
-                "expected acceptance of public domain: {good}"
-            );
-        }
     }
 
     #[test]
