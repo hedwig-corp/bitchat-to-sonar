@@ -3,7 +3,7 @@
 import Foundation
 import SonarCore
 import SwiftUI
-import WalletKit
+@preconcurrency import WalletKit
 
 /// Breez→Cashu migration on Apple.
 ///
@@ -18,7 +18,11 @@ import WalletKit
 /// type blocks. `SonarMigrationModel` therefore only ever calls the engine
 /// from a detached task — never the main actor, or the semaphore below would
 /// deadlock against `SonarWallet`'s own continuations.
-final class BreezMigrationSource: HostMigrationSource {
+final class BreezMigrationSource: HostMigrationSource, @unchecked Sendable {
+    /// Non-Sendable by WalletKit's own annotations, but every use here goes
+    /// through `blocking`, which hands the call to a detached task, and
+    /// `SonarWallet` serialises its Breez work on a private queue. Hence
+    /// `@unchecked` rather than weakening the wallet's annotations.
     private let wallet: SonarWallet
 
     init(wallet: SonarWallet) {
