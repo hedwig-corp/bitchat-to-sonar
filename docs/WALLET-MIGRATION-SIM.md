@@ -47,10 +47,26 @@ Tear down with `docker rm -f sim-mint-src sim-mint-dst`.
 
 ## What it does and does not prove
 
-**Proven end to end:** plan/quote pricing, the destination-max and fee-cap
-gates, the custody-consent gate, melt→mint hand-off, the settlement watch, the
-`settle` crash-resume path, NUT-13 restore, and value conservation — a clean
-run funds 5000, migrates 2000, and lands exactly 2000 at the destination.
+**Verified by an actual run**, not by inspection:
+
+| Property | Evidence |
+| --- | --- |
+| Value conservation | fund 5000 → migrate 2000 → destination holds exactly 2000 |
+| Custody-consent gate | `migrate` without `--accept-custody-change` refuses |
+| Fee cap (fail-closed) | `--max-fee-sats 0` refuses: quoted fee 20 exceeds cap |
+| Destination max | `--amount-sats 2000 --dest-max-sats 100` refuses |
+| melt→mint hand-off | payment reports `Complete`, settlement watch reports `settled` |
+| `settle` resume | re-running `settle` after a migration re-reports the right balance |
+| NUT-13 restore | deleting the whole destination wallet directory and reopening with only the account key recovers the full balance |
+
+The restore check is the one that matters most for a migration: it is what makes
+moving funds into ecash survivable across a reinstall.
+
+Two things that claim is careful *not* to cover. `settle` was exercised on an
+already-settled migration, so it proves the command reads state correctly — a
+genuine mid-flight `Pending` was never induced, and the crash-resume path
+proper is still untested. And every figure above comes from a fake backend; see
+the next section for what that means.
 
 **Not proven.** The two mints have *independent* fake backends, so the source
 only pretends to pay and the destination independently believes its own invoice
