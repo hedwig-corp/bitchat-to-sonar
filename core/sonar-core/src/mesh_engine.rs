@@ -1211,6 +1211,7 @@ impl Engine {
         let pm = mesh::PrivateMessage {
             message_id: message_id.to_string(),
             content: text.to_string(),
+            reply_to: None,
         };
         let Some(plain) = mesh::encode_private_message_plaintext(&pm) else {
             return false;

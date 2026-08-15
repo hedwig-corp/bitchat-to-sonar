@@ -30,6 +30,7 @@ use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
+use crate::reply::{ReplyRef, ReplyTo};
 use crate::{Error, Result};
 
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
@@ -225,6 +226,8 @@ pub struct ChatMessage {
     /// Content classification (pay/call control vs plain text), precomputed so
     /// hosts never parse `content` on the render path.
     pub classification: MessageClassification,
+    /// NIP-C7 reply pointer. `content` is already the display body (nevent stripped).
+    pub reply: Option<ReplyRef>,
 }
 
 /// Compare render messages in the stable newest-first order used by transcript
@@ -1182,14 +1185,27 @@ impl MarmotEngine {
     /// The returned event is signed by an MDK-generated ephemeral key and is
     /// already recorded as "ours" in storage once processed back.
     pub fn create_text_message(&self, group_id: &GroupId, text: &str) -> Result<Event> {
+        self.create_text_message_with_reply(group_id, text, None)
+    }
+
+    pub fn create_text_message_with_reply(
+        &self,
+        group_id: &GroupId,
+        text: &str,
+        reply: Option<&ReplyTo>,
+    ) -> Result<Event> {
         let _mls = self.mls_write();
-        self.create_text_event_inner(group_id, text)
+        self.create_text_event_inner(group_id, text, reply)
     }
 
     /// Requires the caller to hold the MLS write guard.
-    fn create_text_event_inner(&self, group_id: &GroupId, text: &str) -> Result<Event> {
-        let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), text)
-            .build(self.identity.public_key());
+    fn create_text_event_inner(
+        &self,
+        group_id: &GroupId,
+        text: &str,
+        reply: Option<&ReplyTo>,
+    ) -> Result<Event> {
+        let rumor = self.kind9_rumor(text, Vec::new(), reply)?;
         let event = dispatch!(&self.storage, |mdk| mdk
             .create_message(group_id, rumor, None))?;
         Ok(event)
@@ -1205,8 +1221,20 @@ impl MarmotEngine {
         text: &str,
     ) -> Result<(Event, Incoming)> {
         let _mls = self.mls_write();
-        let event = self.create_text_event_inner(group_id, text)?;
+        let event = self.create_text_event_inner(group_id, text, None)?;
         let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    pub fn create_and_process_text_message_with_reply(
+        &self,
+        group_id: &GroupId,
+        text: &str,
+        reply: Option<&ReplyTo>,
+    ) -> Result<(Event, Incoming)> {
+        let _mls = self.mls_write();
+        let event = self.create_text_event_inner(group_id, text, reply)?;
+        let incoming = overlay_reply_preview(self.process_group_message(&event)?, reply);
         Ok((event, incoming))
     }
 
@@ -1219,7 +1247,17 @@ impl MarmotEngine {
         sticker_ref: &StickerRef,
     ) -> Result<Event> {
         let _mls = self.mls_write();
-        self.create_sticker_event_inner(group_id, sticker_ref)
+        self.create_sticker_event_inner(group_id, sticker_ref, None)
+    }
+
+    pub fn create_sticker_message_with_reply(
+        &self,
+        group_id: &GroupId,
+        sticker_ref: &StickerRef,
+        reply: Option<&ReplyTo>,
+    ) -> Result<Event> {
+        let _mls = self.mls_write();
+        self.create_sticker_event_inner(group_id, sticker_ref, reply)
     }
 
     /// Requires the caller to hold the MLS write guard.
@@ -1227,11 +1265,10 @@ impl MarmotEngine {
         &self,
         group_id: &GroupId,
         sticker_ref: &StickerRef,
+        reply: Option<&ReplyTo>,
     ) -> Result<Event> {
         let tag = build_sticker_ref_tag(sticker_ref);
-        let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), "")
-            .tags([tag])
-            .build(self.identity.public_key());
+        let rumor = self.kind9_rumor("", vec![tag], reply)?;
         let event = dispatch!(&self.storage, |mdk| mdk
             .create_message(group_id, rumor, None))?;
         Ok(event)
@@ -1245,8 +1282,20 @@ impl MarmotEngine {
         sticker_ref: &StickerRef,
     ) -> Result<(Event, Incoming)> {
         let _mls = self.mls_write();
-        let event = self.create_sticker_event_inner(group_id, sticker_ref)?;
+        let event = self.create_sticker_event_inner(group_id, sticker_ref, None)?;
         let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    pub fn create_and_process_sticker_message_with_reply(
+        &self,
+        group_id: &GroupId,
+        sticker_ref: &StickerRef,
+        reply: Option<&ReplyTo>,
+    ) -> Result<(Event, Incoming)> {
+        let _mls = self.mls_write();
+        let event = self.create_sticker_event_inner(group_id, sticker_ref, reply)?;
+        let incoming = overlay_reply_preview(self.process_group_message(&event)?, reply);
         Ok((event, incoming))
     }
 
@@ -1299,7 +1348,21 @@ impl MarmotEngine {
             return Err(Error::Media("no media uploads for message".into()));
         }
         let _mls = self.mls_write();
-        self.create_media_event_multi_inner(group_id, uploads, caption)
+        self.create_media_event_multi_inner(group_id, uploads, caption, None)
+    }
+
+    pub fn create_media_event_multi_with_reply(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+        reply: Option<&ReplyTo>,
+    ) -> Result<Event> {
+        if uploads.is_empty() {
+            return Err(Error::Media("no media uploads for message".into()));
+        }
+        let _mls = self.mls_write();
+        self.create_media_event_multi_inner(group_id, uploads, caption, reply)
     }
 
     /// Media variant of [`Self::create_and_process_text_message`]: create and
@@ -1314,8 +1377,24 @@ impl MarmotEngine {
             return Err(Error::Media("no media uploads for message".into()));
         }
         let _mls = self.mls_write();
-        let event = self.create_media_event_multi_inner(group_id, uploads, caption)?;
+        let event = self.create_media_event_multi_inner(group_id, uploads, caption, None)?;
         let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    pub fn create_and_process_media_event_multi_with_reply(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+        reply: Option<&ReplyTo>,
+    ) -> Result<(Event, Incoming)> {
+        if uploads.is_empty() {
+            return Err(Error::Media("no media uploads for message".into()));
+        }
+        let _mls = self.mls_write();
+        let event = self.create_media_event_multi_inner(group_id, uploads, caption, reply)?;
+        let incoming = overlay_reply_preview(self.process_group_message(&event)?, reply);
         Ok((event, incoming))
     }
 
@@ -1325,6 +1404,7 @@ impl MarmotEngine {
         group_id: &GroupId,
         uploads: &[(&EncryptedMediaUpload, &str)],
         caption: &str,
+        reply: Option<&ReplyTo>,
     ) -> Result<Event> {
         let event = dispatch!(&self.storage, |mdk| {
             // One imeta tag per attachment, in send order. A fresh media_manager
@@ -1336,12 +1416,27 @@ impl MarmotEngine {
                     .create_imeta_tag(upload, url);
                 imetas.push(tag);
             }
-            let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), caption)
-                .tags(imetas)
-                .build(self.identity.public_key());
+            let rumor = self.kind9_rumor(caption, imetas, reply)?;
             mdk.create_message(group_id, rumor, None)
         })?;
         Ok(event)
+    }
+
+    fn kind9_rumor(
+        &self,
+        content: &str,
+        mut tags: Vec<Tag>,
+        reply: Option<&ReplyTo>,
+    ) -> Result<UnsignedEvent> {
+        let body = if let Some(r) = reply {
+            tags.push(crate::reply::quote_tag(&r.parent_id, &r.parent_pubkey));
+            crate::reply::prefix_content(content, &r.parent_id, &r.parent_pubkey)?
+        } else {
+            content.to_string()
+        };
+        Ok(EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), body)
+            .tags(tags)
+            .build(self.identity.public_key()))
     }
 
     /// Find the `MediaReference` for `url` among `group_id`'s stored messages and
@@ -2136,12 +2231,13 @@ impl MarmotEngine {
                     None
                 }
             });
+        let (content, reply) = crate::reply::project_application_content(&m.content, m.tags.iter());
         ChatMessage {
             id: m.id,
             group_id: m.mls_group_id.clone(),
             sender: m.pubkey,
-            classification: MessageClassification::of(&m.content),
-            content: m.content.clone(),
+            classification: MessageClassification::of(&content),
+            content,
             created_at: m.created_at,
             mine: m.pubkey == self.identity.public_key(),
             delivery_state: if m.pubkey == self.identity.public_key() {
@@ -2151,8 +2247,21 @@ impl MarmotEngine {
             },
             media,
             sticker_ref,
+            reply,
         }
     }
+}
+
+fn overlay_reply_preview(incoming: Incoming, reply: Option<&ReplyTo>) -> Incoming {
+    let Incoming::Message(mut message) = incoming else {
+        return incoming;
+    };
+    if let (Some(sent), Some(parsed)) = (reply, message.reply.as_mut()) {
+        if parsed.preview.is_none() {
+            parsed.preview = sent.preview.clone();
+        }
+    }
+    Incoming::Message(message)
 }
 
 /// The database file plus the SQLite sidecar files that may exist alongside it.

@@ -67,4 +67,5 @@ pub struct GeoMessage {
     pub content: String,
     pub created_at: u64,
     pub mine: bool,
+    pub reply_to: Option<String>,
 }

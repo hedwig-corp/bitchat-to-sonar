@@ -559,6 +559,101 @@ private struct SNMessageStatusFooter: View {
     }
 }
 
+/// Signal-style quoted-parent chip. Paints from the denormalized snapshot;
+/// tap jumps in-chat when the parent id is in the local window.
+struct SNQuoteChip: View {
+    let reply: SNReplyRef
+    let mine: Bool
+    var onTap: (() -> Void)? = nil
+
+    var body: some View {
+        Button(action: { onTap?() }) {
+            HStack(alignment: .top, spacing: 8) {
+                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                    .fill(mine ? Color.white.opacity(0.85) : SonarTheme.accent)
+                    .frame(width: 3)
+                Text(verbatim: reply.preview)
+                    .font(SonarTheme.uiFont(size: 13))
+                    .foregroundColor(mine ? Color.white.opacity(0.9) : SonarTheme.text2)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(mine ? Color.white.opacity(0.16) : SonarTheme.surface2)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(onTap == nil)
+        .accessibilityLabel(String(localized: "chat.reply", defaultValue: "Reply"))
+    }
+}
+
+struct SNComposerReplyBanner: View {
+    let reply: SNReplyRef
+    var onCancel: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                .fill(SonarTheme.accent)
+                .frame(width: 3, height: 28)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(String(localized: "chat.reply", defaultValue: "Reply"))
+                    .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                    .foregroundColor(SonarTheme.accentDeep)
+                Text(verbatim: reply.preview)
+                    .font(SonarTheme.uiFont(size: 13))
+                    .foregroundColor(SonarTheme.text2)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(SonarTheme.text3)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(String(localized: "chat.reply.cancel", defaultValue: "Cancel reply"))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(SonarTheme.surface2)
+    }
+}
+
+struct SNReplyChrome<Content: View>: View {
+    let m: SNMessage
+    var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
+            if SonarAppStore.replyUIEnabled, let reply = m.reply {
+                SNQuoteChip(reply: reply, mine: m.mine) {
+                    onJumpQuote?(reply.parentId)
+                }
+            }
+            content()
+        }
+        .contextMenu {
+            if snCanReply(to: m), let onReply {
+                Button { onReply(m) } label: {
+                    Label(
+                        String(localized: "chat.reply", defaultValue: "Reply"),
+                        systemImage: "arrowshape.turn.up.left"
+                    )
+                }
+            }
+        }
+    }
+}
+
 struct SNMsgBubble: View {
     let m: SNMessage
     let preview: SonarTranscriptTextPreview
@@ -573,6 +668,7 @@ struct SNMsgBubble: View {
     /// Mentions decoded by the core for this row. Computed once when the row is
     /// built and cached there — never per frame.
     var mentions: SNMentionInfo = .empty
+    var onReply: ((SNMessage) -> Void)? = nil
 
     @Environment(\.openURL) private var openURL
     /// Tap a resolved `@mention` to open that member's profile. Injected by the
@@ -707,6 +803,14 @@ struct SNMsgBubble: View {
                 // inline-link taps. The metadata owns the whole-message actions
                 // so Copy still uses the untruncated source text.
                 .contextMenu {
+                    if snCanReply(to: m), let onReply {
+                        Button { onReply(m) } label: {
+                            Label(
+                                String(localized: "chat.reply", defaultValue: "Reply"),
+                                systemImage: "arrowshape.turn.up.left"
+                            )
+                        }
+                    }
                     Button {
                         SNMsgBubble.copyToClipboard(m.text)
                     } label: {
@@ -1364,6 +1468,9 @@ struct SNMsgList: View {
     var onTapPack: ((String) -> Void)? = nil
     /// Retry one failed outgoing message without rebuilding the transcript.
     var onRetry: ((SNMessage) -> Void)? = nil
+    /// Long-press Reply; quote-chip tap Jump.
+    var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
     /// Cancel an in-flight Blossom upload for an optimistic media bubble.
     var onCancelUpload: ((SNMessage) -> Void)? = nil
     /// Live Blossom upload fractions (collection-host / Compose parity).
@@ -1587,7 +1694,7 @@ struct SNMsgList: View {
                             if m.id == unreadAnchorId {
                                 SNUnreadDivider().id("sn-unread")
                             }
-                            Group {
+                            SNReplyChrome(m: m, onReply: onReply, onJumpQuote: onJumpQuote) {
                             if let call = m.call {
                                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
                             } else if m.trill {
@@ -1644,7 +1751,8 @@ struct SNMsgList: View {
                                     onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
                                     maxBubbleWidth: geo.size.width * 0.78,
                                     onTapAuthor: onTapAuthor,
-                                    mentions: m.mentions
+                                    mentions: m.mentions,
+                                    onReply: onReply
                                 )
                             }
                             }

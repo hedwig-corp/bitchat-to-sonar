@@ -24,6 +24,7 @@ pub mod outbox;
 pub mod own_profile;
 pub mod push;
 pub mod relay_directory;
+pub mod reply;
 pub mod sonar_descriptor;
 pub mod sticker_cache;
 

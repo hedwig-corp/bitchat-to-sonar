@@ -166,6 +166,7 @@ fn nip17_bitchat_private_message_content_round_trips() {
     let msg = PrivateMessage {
         message_id: "mid-123".to_string(),
         content: "hello over nostr".to_string(),
+        reply_to: None,
     };
 
     let content =

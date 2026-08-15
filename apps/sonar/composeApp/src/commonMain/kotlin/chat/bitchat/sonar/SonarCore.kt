@@ -50,7 +50,36 @@ data class SonarMsg(
     /// rows (mesh, optimistic echoes) that never went through the core mapper —
     /// those still fall back to string decoding.
     val classification: SonarMsgClass? = null,
+    /// Signal-style quote snapshot. Null for ordinary messages.
+    val reply: SonarReplyRef? = null,
 )
+
+/** Quoted parent pointer projected from NIP-C7 / mesh TLV. */
+data class SonarReplyRef(
+    val parentId: String,
+    val parentNpub: String? = null,
+    val preview: String,
+)
+
+expect fun sonarReplyUiEnabled(): Boolean
+
+fun sonarCanReply(message: SonarMsg): Boolean {
+    if (!sonarReplyUiEnabled()) return false
+    if (message.id.startsWith("optimistic-") || message.id.startsWith("echo-") ||
+        message.id.startsWith("failed-")
+    ) {
+        return false
+    }
+    if (message.state == "Sending" || message.state == "Uploading") return false
+    return true
+}
+
+fun sonarCanEmitNipC7(parentId: String, parentNpub: String?): Boolean {
+    if (parentId.length != 64 || parentId.any { !it.isDigit() && it !in 'a'..'f' && it !in 'A'..'F' }) {
+        return false
+    }
+    return parentNpub?.startsWith("npub1") == true
+}
 
 /**
  * Transcript-level classification of a message, mirrored from core
@@ -721,6 +750,15 @@ expect object SonarCore {
 
     /** Send an encrypted text message to a chat. */
     suspend fun send(chatId: String, text: String)
+
+    /** Like [send], attaching a NIP-C7 reply pointer. */
+    suspend fun sendReply(
+        chatId: String,
+        text: String,
+        replyToHex: String,
+        replyToNpub: String,
+        preview: String?,
+    )
 
     /** Republish one failed message from the durable local outbox. */
     suspend fun retryMessage(messageId: String): String

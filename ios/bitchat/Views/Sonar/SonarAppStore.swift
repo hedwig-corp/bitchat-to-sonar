@@ -305,11 +305,13 @@ private struct SNPendingMarmotSend {
     let chatId: String
     let text: String
     let messageId: String
+    var reply: SNReplyRef? = nil
 }
 
 private struct SNPendingMarmotGroupSend {
     let text: String
     let messageId: String
+    var reply: SNReplyRef? = nil
 }
 
 struct SNMarmotRouteReplacement: Equatable {
@@ -383,6 +385,45 @@ struct SNMessage: Identifiable, Equatable {
     /// land on a frame, and the transcript's height cache keys on `text`, which
     /// stays sound only because spans derive purely from that same text.
     var mentions: SNMentionInfo = .empty
+    /// Signal-style quote snapshot. Nil for ordinary messages.
+    var reply: SNReplyRef? = nil
+    /// Sender npub when known (Marmot rows). Used to emit NIP-C7 `q` author.
+    var senderNpub: String? = nil
+}
+
+struct SNReplyRef: Equatable {
+    let parentId: String
+    let parentNpub: String?
+    let preview: String
+}
+
+func snCanReply(to message: SNMessage) -> Bool {
+    guard SonarAppStore.replyUIEnabled else { return false }
+    if message.id.hasPrefix(MarmotChatModel.optimisticIDPrefix) { return false }
+    if message.id.hasPrefix(MarmotChatModel.failedOptimisticIDPrefix) { return false }
+    if message.action || message.call != nil || message.trill { return false }
+    if message.state == "Sending" || message.state == "Uploading" { return false }
+    return true
+}
+
+func snReplyRef(from message: MarmotService.MarmotMessage) -> SNReplyRef? {
+    guard let r = message.reply else { return nil }
+    let preview = (r.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let fallback = String(localized: "chat.reply.fallback", defaultValue: "Message")
+    return SNReplyRef(
+        parentId: r.parentId,
+        parentNpub: r.parentNpub,
+        preview: preview.isEmpty ? fallback : String(preview.prefix(140))
+    )
+}
+
+func snCanEmitNipC7(parentId: String, parentNpub: String?) -> Bool {
+    guard parentId.count == 64,
+          parentId.allSatisfy(\.isHexDigit),
+          let npub = parentNpub,
+          npub.hasPrefix("npub1")
+    else { return false }
+    return true
 }
 
 /// Internet and mesh failures use different resend pipelines. The retry
@@ -1170,6 +1211,10 @@ final class SonarAppStore: ObservableObject {
     /// (`updateUIViewController` → `applySnapshot`) while typing.
     private var composerDrafts: [String: String] = [:]
 
+    /// Pending Signal-style reply target per chat. Published so the composer
+    /// banner appears without keystroke invalidation of the draft map.
+    @Published private(set) var composerReplyByChat: [String: SNReplyRef] = [:]
+
     /// Boundary-only published mirror of draft non-emptiness per chat. The draft
     /// map above stays unpublished, but the composer's send/mic toggle must
     /// re-render the moment a draft crosses empty <-> non-empty -- otherwise the
@@ -1187,6 +1232,58 @@ final class SonarAppStore: ObservableObject {
 
     func composerDraft(for chatId: String) -> String {
         composerDrafts[chatId] ?? ""
+    }
+
+    static var replyUIEnabled: Bool {
+        ProcessInfo.processInfo.environment["SONAR_REPLY_UI"] != "0"
+    }
+
+    func composerReply(for chatId: String) -> SNReplyRef? {
+        guard Self.replyUIEnabled else { return nil }
+        return composerReplyByChat[chatId]
+    }
+
+    func beginReply(chatId: String, to message: SNMessage) {
+        guard snCanReply(to: message) else { return }
+        let previewSource: String
+        if message.pay != nil {
+            previewSource = String(localized: "chat.reply.payment", defaultValue: "Payment")
+        } else if message.stickerRef != nil {
+            previewSource = String(localized: "chat.reply.sticker", defaultValue: "Sticker")
+        } else if !message.media.isEmpty {
+            previewSource = String(localized: "chat.reply.photo", defaultValue: "Photo")
+        } else {
+            previewSource = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let fallback = String(localized: "chat.reply.fallback", defaultValue: "Message")
+        composerReplyByChat[chatId] = SNReplyRef(
+            parentId: message.id,
+            parentNpub: message.senderNpub,
+            preview: previewSource.isEmpty ? fallback : String(previewSource.prefix(140))
+        )
+    }
+
+    func cancelReply(chatId: String) {
+        composerReplyByChat[chatId] = nil
+    }
+
+    func jumpToQuotedMessage(chatId: String, parentId: String) {
+        jumpMessageIdAtOpenByDM[chatId] = parentId
+        objectWillChange.send()
+    }
+
+    private func consumeComposerReply(for chatId: String) -> SNReplyRef? {
+        let reply = composerReplyByChat[chatId]
+        composerReplyByChat[chatId] = nil
+        return reply
+    }
+
+    private func marmotReplyRef(from sn: SNReplyRef) -> MarmotService.MarmotReplyRef {
+        MarmotService.MarmotReplyRef(
+            parentId: sn.parentId,
+            parentNpub: sn.parentNpub,
+            preview: sn.preview
+        )
     }
 
     func setComposerDraft(_ text: String, for chatId: String) {
@@ -2684,6 +2781,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotRouteFailure = nil
         pendingDirectMarmotSends = [:]
         pendingMarmotGroupSends = [:]
+        composerReplyByChat = [:]
         cancelPendingSecureChatSetups()
         cancelPendingMarmotGroupSetups()
         localHydratingDMs = []
@@ -4336,6 +4434,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func sendCh(_ chId: String, _ text: String) {
+        _ = consumeComposerReply(for: chId)
         // sendMessage() routes to the private chat while one is selected.
         if chatViewModel.selectedPrivateChatPeer != nil {
             chatViewModel.endPrivateChat()
@@ -5583,7 +5682,9 @@ final class SonarAppStore: ObservableObject {
                             time: Self.clock(m.createdAt),
                             transcriptSourceID: group.id,
                             via: .internet,
-                            trill: true
+                            trill: true,
+                            reply: snReplyRef(from: m),
+                            senderNpub: m.senderNpub
                         ))
                     case .bubble(let pay, let payVia):
                         return (m.createdAt, SNMessage(
@@ -5591,7 +5692,9 @@ final class SonarAppStore: ObservableObject {
                             time: Self.clock(m.createdAt),
                             transcriptSourceID: group.id,
                             via: payVia,
-                            pay: pay
+                            pay: pay,
+                            reply: snReplyRef(from: m),
+                            senderNpub: m.senderNpub
                         ))
                     case .notPay:
                         return (m.createdAt, SNMessage(
@@ -5608,7 +5711,9 @@ final class SonarAppStore: ObservableObject {
                             stickerRef: m.stickerRef,
                             // Decoded here, at row build, so the bubble never
                             // crosses the FFI while rendering a frame.
-                            mentions: mentionInfo(content: m.content, context: mentionCtx)
+                            mentions: mentionInfo(content: m.content, context: mentionCtx),
+                            reply: snReplyRef(from: m),
+                            senderNpub: m.senderNpub
                         ))
                     }
                 }
@@ -5870,6 +5975,8 @@ final class SonarAppStore: ObservableObject {
         // defer covers all early-return branches (mesh route, Marmot,
         // pending) uniformly.
         defer { objectWillChange.send() }
+        let reply = consumeComposerReply(for: id)
+        let marmotReply = reply.map { marmotReplyRef(from: $0) }
         // Route on the live BLE alias — canonical fold id may be a stale
         // fingerprint while the peer is connected under another Noise key.
         if let route = liveMeshRoutePeerId(for: id) {
@@ -5877,19 +5984,19 @@ final class SonarAppStore: ObservableObject {
             return
         }
         if let groupId = marmotGroupId(id) {
-            marmot.send(text, to: groupId)
+            marmot.send(text, to: groupId, reply: marmotReply)
             return
         }
         if let pendingNpub = pendingMarmotNpub(for: id) {
-            sendPendingMarmot(text, chatId: id, npub: pendingNpub)
+            sendPendingMarmot(text, chatId: id, npub: pendingNpub, reply: reply)
             return
         }
         if isPendingMarmotGroup(id) {
-            sendPendingMarmotGroup(text, chatId: id)
+            sendPendingMarmotGroup(text, chatId: id, reply: reply)
             return
         }
         if let profile = resolvedSonarProfile(id) {
-            sendOverMarmot(text, npub: profile.npub)
+            sendOverMarmot(text, npub: profile.npub, reply: marmotReply)
             return
         }
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
@@ -5965,6 +6072,7 @@ final class SonarAppStore: ObservableObject {
                 marmot.send(
                     content,
                     to: groupId,
+                    reply: message.reply.map { marmotReplyRef(from: $0) },
                     onEchoVisible: onEchoVisible,
                     onFailure: onFailure
                 )
@@ -5978,7 +6086,7 @@ final class SonarAppStore: ObservableObject {
                 ?? SNPendingMarmotChat(npub: clean, createdAt: source.message.sortDate ?? Date())
             var queue = pendingDirectMarmotSends[clean, default: []]
             queue.removeAll { $0.messageId == message.id }
-            queue.append(SNPendingMarmotSend(chatId: id, text: content, messageId: message.id))
+            queue.append(SNPendingMarmotSend(chatId: id, text: content, messageId: message.id, reply: message.reply))
             if queue.count > Self.pendingMarmotDirectSendQueueLimit {
                 let dropped = queue.removeFirst()
                 pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
@@ -5995,7 +6103,7 @@ final class SonarAppStore: ObservableObject {
         if isPendingMarmotGroup(id) {
             var queue = pendingMarmotGroupSends[id, default: []]
             queue.removeAll { $0.messageId == message.id }
-            queue.append(SNPendingMarmotGroupSend(text: content, messageId: message.id))
+            queue.append(SNPendingMarmotGroupSend(text: content, messageId: message.id, reply: message.reply))
             if queue.count > Self.pendingMarmotGroupSendQueueLimit {
                 let dropped = queue.removeFirst()
                 pendingMarmotMessagesByChat[id] = pendingMarmotMessagesByChat[id]?.map {
@@ -6123,31 +6231,33 @@ final class SonarAppStore: ObservableObject {
         startSecureMeshMarmotChat(npub: npub)
     }
 
-    private func sendOverMarmot(_ text: String, npub: String) {
+    private func sendOverMarmot(_ text: String, npub: String, reply: MarmotService.MarmotReplyRef? = nil) {
         if let group = marmotGroup(forNpub: npub) {
-            marmot.send(text, to: group.id)
+            marmot.send(text, to: group.id, reply: reply)
             return
         }
-        queuePendingMeshMarmotSend(text: text, npub: npub)
+        queuePendingMeshMarmotSend(text: text, npub: npub, reply: reply.map {
+            SNReplyRef(parentId: $0.parentId, parentNpub: $0.parentNpub, preview: $0.preview ?? "")
+        })
         showToast("Out of range — continuing over White Noise…")
         startSecureMeshMarmotChat(npub: npub)
     }
 
     /// Paint a Sending echo on the open mesh conversation immediately, then
     /// queue the plaintext for [flushPendingMarmotSends] once the WN group lands.
-    private func queuePendingMeshMarmotSend(text: String, npub: String) {
+    private func queuePendingMeshMarmotSend(text: String, npub: String, reply: SNReplyRef? = nil) {
         let clean = SNMarmotProfileCache.canonicalKey(npub)
         let chatId = currentDMId ?? sonarPeerKey(forNpub: clean)
         if let chatId {
-            let message = pendingMarmotEcho(text: text, createdAt: Date())
+            let message = pendingMarmotEcho(text: text, createdAt: Date(), reply: reply)
             pendingMarmotMessagesByChat[chatId, default: []].append(message)
             objectWillChange.send()
             pendingMarmotSends[clean, default: []].append(
-                SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id)
+                SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id, reply: reply)
             )
         } else {
             pendingMarmotSends[clean, default: []].append(
-                SNPendingMarmotSend(chatId: "", text: text, messageId: "")
+                SNPendingMarmotSend(chatId: "", text: text, messageId: "", reply: reply)
             )
         }
     }
@@ -6192,16 +6302,16 @@ final class SonarAppStore: ObservableObject {
         objectWillChange.send()
     }
 
-    private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
+    private func sendPendingMarmot(_ text: String, chatId: String, npub: String, reply: SNReplyRef? = nil) {
         let clean = SNMarmotProfileCache.canonicalKey(npub)
         let createdAt = Date()
         if pendingMarmotChats[chatId] == nil, pendingMarmotNpub(for: chatId) == clean {
             pendingMarmotChats[chatId] = SNPendingMarmotChat(npub: clean, createdAt: createdAt)
         }
-        let message = pendingMarmotEcho(text: text, createdAt: createdAt)
+        let message = pendingMarmotEcho(text: text, createdAt: createdAt, reply: reply)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
         var queue = pendingDirectMarmotSends[clean, default: []]
-        queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id))
+        queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id, reply: reply))
         if queue.count > Self.pendingMarmotDirectSendQueueLimit {
             let dropped = queue.removeFirst()
             pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
@@ -6213,13 +6323,13 @@ final class SonarAppStore: ObservableObject {
         startSecureChatInBackground(npub: clean, pendingId: chatId)
     }
 
-    private func sendPendingMarmotGroup(_ text: String, chatId: String) {
+    private func sendPendingMarmotGroup(_ text: String, chatId: String, reply: SNReplyRef? = nil) {
         guard isPendingMarmotGroup(chatId) else { return }
         let createdAt = Date()
-        let message = pendingMarmotEcho(text: text, createdAt: createdAt)
+        let message = pendingMarmotEcho(text: text, createdAt: createdAt, reply: reply)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
         var queue = pendingMarmotGroupSends[chatId, default: []]
-        queue.append(SNPendingMarmotGroupSend(text: text, messageId: message.id))
+        queue.append(SNPendingMarmotGroupSend(text: text, messageId: message.id, reply: reply))
         if queue.count > Self.pendingMarmotGroupSendQueueLimit {
             let dropped = queue.removeFirst()
             pendingMarmotMessagesByChat[chatId] = pendingMarmotMessagesByChat[chatId]?.map {
@@ -6234,7 +6344,8 @@ final class SonarAppStore: ObservableObject {
         text: String,
         id: String = "echo-\(UUID().uuidString)",
         createdAt: Date,
-        state: String = "Sending"
+        state: String = "Sending",
+        reply: SNReplyRef? = nil
     ) -> SNMessage {
         let stickerRef = meshParseStickerContent(content: text).map {
             MarmotService.MarmotStickerRef(
@@ -6255,7 +6366,8 @@ final class SonarAppStore: ObservableObject {
             via: .internet,
             state: state,
             trill: isTrill,
-            stickerRef: stickerRef
+            stickerRef: stickerRef,
+            reply: reply
         )
     }
 
@@ -6479,7 +6591,9 @@ final class SonarAppStore: ObservableObject {
             pay: message.pay,
             call: message.call,
             media: message.media,
-            stickerRef: message.stickerRef
+            stickerRef: message.stickerRef,
+            reply: message.reply,
+            senderNpub: message.senderNpub
         )
     }
 
@@ -6498,7 +6612,7 @@ final class SonarAppStore: ObservableObject {
                 if !isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
-                let ok = await sendPendingTransferredMarmotContent(item.text, to: groupId)
+                let ok = await sendPendingTransferredMarmotContent(item.text, to: groupId, reply: item.reply)
                 if isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
@@ -6526,7 +6640,7 @@ final class SonarAppStore: ObservableObject {
                 if !isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
-                let ok = await sendPendingTransferredMarmotContent(item.text, to: groupId)
+                let ok = await sendPendingTransferredMarmotContent(item.text, to: groupId, reply: item.reply)
                 if isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
@@ -6540,7 +6654,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Mesh→WN flush: no second optimistic (mesh echo already visible).
-    private func sendQueuedMarmotContent(_ text: String, to groupId: String) async -> Bool {
+    private func sendQueuedMarmotContent(
+        _ text: String,
+        to groupId: String,
+        reply: SNReplyRef? = nil
+    ) async -> Bool {
         if let ref = meshParseStickerContent(content: text) {
             return await marmot.sendQueuedSticker(
                 groupId: groupId,
@@ -6549,12 +6667,20 @@ final class SonarAppStore: ObservableObject {
                 plaintextSha256: ref.plaintextSha256
             )
         }
-        return await marmot.sendQueuedText(groupId: groupId, text: text)
+        return await marmot.sendQueuedText(
+            groupId: groupId,
+            text: text,
+            reply: reply.map { marmotReplyRef(from: $0) }
+        )
     }
 
     /// Pending-chat / pending-group flush: paint a group optimistic because the
     /// platform echo was already moved off the pending id.
-    private func sendPendingTransferredMarmotContent(_ text: String, to groupId: String) async -> Bool {
+    private func sendPendingTransferredMarmotContent(
+        _ text: String,
+        to groupId: String,
+        reply: SNReplyRef? = nil
+    ) async -> Bool {
         if let ref = meshParseStickerContent(content: text) {
             return await marmot.sendQueuedSticker(
                 groupId: groupId,
@@ -6563,7 +6689,11 @@ final class SonarAppStore: ObservableObject {
                 plaintextSha256: ref.plaintextSha256
             )
         }
-        return await marmot.send([text], to: groupId)
+        return await marmot.send(
+            [text],
+            to: groupId,
+            reply: reply.map { marmotReplyRef(from: $0) }
+        )
     }
 
     /// R-011: clear the mesh echo only after a folded durable WN row exists.
@@ -6625,7 +6755,7 @@ final class SonarAppStore: ObservableObject {
                 for send in sends {
                     // Await real send outcome without creating a second optimistic.
                     // Clear the mesh echo only once a folded canonical row exists.
-                    let ok = await sendQueuedMarmotContent(send.text, to: group.id)
+                    let ok = await sendQueuedMarmotContent(send.text, to: group.id, reply: send.reply)
                     guard !send.chatId.isEmpty, !send.messageId.isEmpty else { continue }
                     if ok {
                         await clearMeshEchoWhenCanonical(send: send, groupId: group.id)
@@ -9695,6 +9825,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotRouteFailure = nil
         pendingDirectMarmotSends = [:]
         pendingMarmotGroupSends = [:]
+        composerReplyByChat = [:]
         cancelPendingSecureChatSetups()
         cancelPendingMarmotGroupSetups()
         scannedPayMessageIDs = []
@@ -9823,6 +9954,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotRouteFailure = nil
         pendingDirectMarmotSends = [:]
         pendingMarmotGroupSends = [:]
+        composerReplyByChat = [:]
         cancelPendingSecureChatSetups()
         cancelPendingMarmotGroupSetups()
         // Wallet seed and Breez state were shut down and removed at the start

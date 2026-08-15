@@ -602,6 +602,16 @@ pub struct MessageInfo {
     pub sticker_ref: Option<StickerRefInfo>,
     /// Precomputed content classification (pay/call control vs plain text).
     pub classification: MessageClassInfo,
+    /// NIP-C7 reply pointer. `content` is the display body (nevent already stripped).
+    pub reply: Option<ReplyRefInfo>,
+}
+
+/// FFI-friendly NIP-C7 quote pointer.
+#[derive(uniffi::Record)]
+pub struct ReplyRefInfo {
+    pub parent_id_hex: String,
+    pub parent_npub: Option<String>,
+    pub preview: Option<String>,
 }
 
 /// FFI-friendly sticker reference carried on a chat message.
@@ -757,6 +767,7 @@ pub struct GeoMessageInfo {
     pub content: String,
     pub created_at_secs: u64,
     pub mine: bool,
+    pub reply_to_hex: Option<String>,
 }
 
 /// FFI-friendly account-level direct NIP-17 DM, decoded from a `bitchat1:`
@@ -1414,6 +1425,29 @@ impl SonarNode {
         let group_id = parse_group_id(&group_id_hex)?;
         self.runtime
             .block_on(self.client.send_text(&group_id, &text))?;
+        Ok(())
+    }
+
+    /// Like `send_text`, attaching a NIP-C7 reply pointer.
+    pub fn send_text_reply(
+        &self,
+        group_id_hex: String,
+        text: String,
+        reply_to_hex: String,
+        reply_to_npub: String,
+        preview: Option<String>,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let parent_id = nostr::EventId::from_hex(&reply_to_hex)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("reply_to: {e}")))?;
+        let parent_pk = PublicKey::parse(&reply_to_npub)
+            .map_err(invalid("reply_to npub"))?;
+        let reply = sonar_core::reply::ReplyTo::new(parent_id, parent_pk, preview);
+        self.runtime.block_on(self.client.send_text_with_reply(
+            &group_id,
+            &text,
+            Some(&reply),
+        ))?;
         Ok(())
     }
 
@@ -2602,6 +2636,7 @@ pub struct MeshPacketInfo {
 pub struct MeshPrivateMessage {
     pub message_id: String,
     pub content: String,
+    pub reply_to: Option<String>,
 }
 
 /// A decoded mesh file transfer (`BitchatFilePacket`, type 0x22). `content` is
@@ -2862,6 +2897,7 @@ pub fn mesh_encode_private_message(message_id: String, content: String) -> FfiRe
     let pm = mesh::PrivateMessage {
         message_id,
         content,
+        reply_to: None,
     };
     mesh::encode_private_message_plaintext(&pm)
         .ok_or_else(|| SonarFfiError::Core("private message encode failed".into()))
@@ -2879,6 +2915,7 @@ pub fn mesh_decode_private_message(plaintext: Vec<u8>) -> Option<MeshPrivateMess
     Some(MeshPrivateMessage {
         message_id: pm.message_id,
         content: pm.content,
+        reply_to: pm.reply_to,
     })
 }
 
@@ -3078,6 +3115,7 @@ fn geo_message_info(m: sonar_core::geohash::GeoMessage) -> GeoMessageInfo {
         content: m.content,
         created_at_secs: m.created_at,
         mine: m.mine,
+        reply_to_hex: m.reply_to,
     }
 }
 
@@ -3138,6 +3176,11 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             pack_coordinate: s.pack.coordinate(),
             shortcode: s.shortcode,
             plaintext_sha256: s.plaintext_sha256,
+        }),
+        reply: m.reply.map(|r| ReplyRefInfo {
+            parent_id_hex: r.parent_id.to_hex(),
+            parent_npub: r.parent_pubkey.and_then(|pk| pk.to_bech32().ok()),
+            preview: r.preview,
         }),
     }
 }

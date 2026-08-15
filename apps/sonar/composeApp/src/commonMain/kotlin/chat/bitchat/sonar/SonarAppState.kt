@@ -2781,8 +2781,36 @@ class SonarAppState(private val scope: CoroutineScope) {
      * Survives leaving a chat and returning within the same process; cleared on send.
      */
     private val composerDrafts = mutableStateMapOf<String, String>()
+    private val composerReplyByChat = mutableStateMapOf<String, SonarReplyRef>()
 
     fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
+
+    fun composerReply(chatId: String): SonarReplyRef? {
+        if (!sonarReplyUiEnabled()) return null
+        return composerReplyByChat[chatId]
+    }
+
+    fun beginReply(chatId: String, message: SonarMsg, preview: String) {
+        if (!sonarCanReply(message)) return
+        val trimmed = preview.trim()
+        if (trimmed.isEmpty()) return
+        composerReplyByChat[chatId] = SonarReplyRef(
+            parentId = message.id,
+            parentNpub = message.senderNpub.takeIf { it.startsWith("npub1") },
+            preview = trimmed.take(140),
+        )
+    }
+
+    fun cancelReply(chatId: String) {
+        composerReplyByChat.remove(chatId)
+    }
+
+    fun jumpToQuotedMessage(chatId: String, parentId: String) {
+        openChatJumpMessageId = openChatJumpMessageId + (chatId to parentId)
+    }
+
+    private fun consumeComposerReply(chatId: String): SonarReplyRef? =
+        composerReplyByChat.remove(chatId)
 
     fun setComposerDraft(chatId: String, text: String) {
         val current = composerDrafts.toMap()
@@ -6528,12 +6556,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
-    private fun sendPendingMarmotChat(chatId: String, peerNpub: String, text: String) {
+    private fun sendPendingMarmotChat(
+        chatId: String,
+        peerNpub: String,
+        text: String,
+        reply: SonarReplyRef? = null,
+    ) {
         val npubHex = canonicalNpubHex(peerNpub) ?: return
-        val echo = createSendEcho(chatId, text)
+        val echo = createSendEcho(chatId, text, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
         val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
-        queue.add(PendingDirectMarmotSend(chatId, text, echo.id))
+        queue.add(PendingDirectMarmotSend(chatId, text, echo.id, reply))
         if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
             val dropped = queue.removeAt(0)
             failSendEcho(dropped.pendingChatId, dropped.echoId)
@@ -6545,7 +6578,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun flushPendingDirectMarmot(npubHex: String, chatId: String) {
         val queued = pendingDirectMarmotSends.remove(npubHex).orEmpty()
         for (send in queued) {
-            runCatching { sendQueuedMarmotContent(chatId, send.text) }
+            runCatching { sendQueuedMarmotContent(chatId, send.text, send.reply) }
                 .onSuccess { clearSendEcho(chatId, send.echoId) }
                 .onFailure {
                     failSendEcho(chatId, send.echoId)
@@ -6654,12 +6687,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
-    private fun sendPendingMarmotGroup(chatId: String, text: String) {
+    private fun sendPendingMarmotGroup(chatId: String, text: String, reply: SonarReplyRef? = null) {
         if (!isPendingMarmotGroup(chatId)) return
-        val echo = createSendEcho(chatId, text)
+        val echo = createSendEcho(chatId, text, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
         val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
-        queue.add(PendingMarmotGroupSend(text, echo.id))
+        queue.add(PendingMarmotGroupSend(text, echo.id, reply))
         if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
             val dropped = queue.removeAt(0)
             failSendEcho(chatId, dropped.echoId)
@@ -6670,7 +6703,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun flushPendingMarmotGroupSends(pendingChatId: String, chatId: String) {
         val queued = pendingMarmotGroupSends.remove(pendingChatId).orEmpty()
         for (send in queued) {
-            runCatching { sendQueuedMarmotContent(chatId, send.text) }
+            runCatching { sendQueuedMarmotContent(chatId, send.text, send.reply) }
                 .onSuccess { clearSendEcho(chatId, send.echoId) }
                 .onFailure {
                     failSendEcho(chatId, send.echoId)
@@ -6679,7 +6712,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private suspend fun sendQueuedMarmotContent(chatId: String, text: String) {
+    private suspend fun sendQueuedMarmotContent(
+        chatId: String,
+        text: String,
+        reply: SonarReplyRef? = null,
+    ) {
         val sticker = meshParseStickerContent(text)
         if (sticker != null) {
             sendMarmotStickerOrdered(
@@ -6689,12 +6726,24 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sticker.plaintextSha256,
             )
         } else {
-            sendMarmotTextOrdered(chatId, text)
+            sendMarmotTextOrdered(chatId, text, reply)
         }
     }
 
-    private suspend fun sendMarmotTextOrdered(chatId: String, text: String) {
-        runMarmotAccountOperation { SonarCore.send(chatId, text) }
+    private suspend fun sendMarmotTextOrdered(chatId: String, text: String, reply: SonarReplyRef? = null) {
+        runMarmotAccountOperation {
+            if (reply != null && sonarCanEmitNipC7(reply.parentId, reply.parentNpub)) {
+                SonarCore.sendReply(
+                    chatId,
+                    text,
+                    reply.parentId,
+                    reply.parentNpub!!,
+                    reply.preview,
+                )
+            } else {
+                SonarCore.send(chatId, text)
+            }
+        }
     }
 
     private suspend fun sendMarmotStickerOrdered(
@@ -7031,26 +7080,27 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return
         }
+        val reply = consumeComposerReply(chatId)
         if (isMeshChat(chatId)) {
-            sendDmAuto(meshPeerId(chatId), t)
+            sendDmAuto(meshPeerId(chatId), t, reply)
             reloadNewestAfterSendIfNeeded(chatId)
             return
         }
         pendingMarmotNpub(chatId)?.let { pendingNpub ->
-            sendPendingMarmotChat(chatId, pendingNpub, t)
+            sendPendingMarmotChat(chatId, pendingNpub, t, reply)
             reloadNewestAfterSendIfNeeded(chatId)
             return
         }
         if (isPendingMarmotGroup(chatId)) {
-            sendPendingMarmotGroup(chatId, t)
+            sendPendingMarmotGroup(chatId, t, reply)
             reloadNewestAfterSendIfNeeded(chatId)
             return
         }
-        val echo = createSendEcho(chatId, t)
+        val echo = createSendEcho(chatId, t, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
         scope.launch {
             runMarmotSendWithBestEffortReconciliation(
-                send = { sendMarmotTextOrdered(chatId, t) },
+                send = { sendMarmotTextOrdered(chatId, t, reply) },
                 onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                 reconcile = {
                     val refreshGeneration = transcriptGeneration
@@ -7249,7 +7299,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
             queue.removeAll { it.echoId == echoId }
-            queue.add(PendingDirectMarmotSend(chatId, content, echoId))
+            queue.add(PendingDirectMarmotSend(chatId, content, echoId, source.reply))
             if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
                 val dropped = queue.removeAt(0)
                 failSendEcho(dropped.pendingChatId, dropped.echoId)
@@ -7262,7 +7312,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isPendingMarmotGroup(chatId)) {
             val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
             queue.removeAll { it.echoId == echoId }
-            queue.add(PendingMarmotGroupSend(content, echoId))
+            queue.add(PendingMarmotGroupSend(content, echoId, source.reply))
             if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
                 val dropped = queue.removeAt(0)
                 failSendEcho(chatId, dropped.echoId)
@@ -7276,7 +7326,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (groupId != null) {
             scope.launch {
                 try {
-                    sendQueuedMarmotContent(groupId, content)
+                    sendQueuedMarmotContent(groupId, content, source.reply)
                     val generation = transcriptGeneration
                     val published = if (isMeshChat(chatId)) {
                         marmotMessagesForPeer(meshPeerId(chatId), chatId, generation)
@@ -7363,7 +7413,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     // window bounds them so echo reconciliation can still see an outgoing row.
     private val freshCanonicalByGroup = mutableMapOf<String, List<SonarMsg>>()
 
-    private fun createSendEcho(chatId: String, text: String, viaInternet: Boolean = true): SonarMsg {
+    private fun createSendEcho(
+        chatId: String,
+        text: String,
+        viaInternet: Boolean = true,
+        reply: SonarReplyRef? = null,
+    ): SonarMsg {
         val echo = privateDmMessage(
             id = "$echoIdPrefix${randomMeshId()}",
             senderNpub = npub,
@@ -7372,7 +7427,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             tsSecs = SonarClock.nowSecs(),
             viaInternet = viaInternet,
             state = "Sending",
-        )
+        ).copy(reply = reply)
         previouslyPublishedMessageIdsByEcho[echo.id] = messages
             .asSequence()
             .filter { message ->
@@ -8994,7 +9049,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  account-level NIP-17 for a mutual-favorite plain bitchat peer. When neither
      *  route is available the message is queued in the outbox (mirrors iOS
      *  MessageRouter) and auto-sent when a route becomes available. */
-    private fun sendDmAuto(peerId: String, text: String) {
+    private fun sendDmAuto(peerId: String, text: String, reply: SonarReplyRef? = null) {
         if (isMeshContactBlocked(peerId)) {
             toast = "Unblock this contact before sending."
             return
@@ -9013,7 +9068,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val raw = npubRawFor(peerId)
         if (raw != null) {
             when {
-                shouldUseMarmotRoute(peerId, raw) -> sendOverMarmot(peerId, raw, text)
+                shouldUseMarmotRoute(peerId, raw) -> sendOverMarmot(peerId, raw, text, reply)
                 canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, text)
                 else -> {
                     val mid = randomMeshId()
@@ -9438,15 +9493,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         val meshChatId: String,
         val text: String,
         val echoId: String,
+        val reply: SonarReplyRef? = null,
     )
     private data class PendingDirectMarmotSend(
         val pendingChatId: String,
         val text: String,
         val echoId: String,
+        val reply: SonarReplyRef? = null,
     )
     private data class PendingMarmotGroupSend(
         val text: String,
         val echoId: String,
+        val reply: SonarReplyRef? = null,
     )
     private val pendingDirectMarmotSends = mutableMapOf<String, MutableList<PendingDirectMarmotSend>>()
     private val pendingMarmotGroupSends = mutableMapOf<String, MutableList<PendingMarmotGroupSend>>()
@@ -9574,15 +9632,20 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Always paint an optimistic echo on the mesh chat id first. Clearing the
      *  echo before [refreshOpenDm] can merge the White Noise canonical row made
      *  the bubble vanish for a couple of seconds ("Sending · internet" gap). */
-    private fun sendOverMarmot(peerId: String, npubRaw: ByteArray, text: String) {
+    private fun sendOverMarmot(
+        peerId: String,
+        npubRaw: ByteArray,
+        text: String,
+        reply: SonarReplyRef? = null,
+    ) {
         val chatId = meshChatId(peerId)
         val group = marmotGroupForNpub(npubRaw)
         if (group != null) {
-            val echo = createSendEcho(chatId, text)
+            val echo = createSendEcho(chatId, text, reply = reply)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 runMarmotSendWithBestEffortReconciliation(
-                    send = { sendMarmotTextOrdered(group.id, text) },
+                    send = { sendMarmotTextOrdered(group.id, text, reply) },
                     onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                     reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
                     onSendFailure = { error ->
@@ -9594,11 +9657,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             return
         }
-        val echo = createSendEcho(chatId, text)
+        val echo = createSendEcho(chatId, text, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
         val npubHex = npubRaw.toHexLower()
         pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }
-            .add(PendingMeshMarmotSend(meshChatId = chatId, text = text, echoId = echo.id))
+            .add(PendingMeshMarmotSend(meshChatId = chatId, text = text, echoId = echo.id, reply = reply))
         toast = "Out of range — continuing over White Noise…"
         startMarmotChatForPendingPeer(npubHex, peerId)
     }
@@ -9728,7 +9791,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         val echo = pendingSendEchoes[send.meshChatId]
                             ?.firstOrNull { it.id == send.echoId }
                         runMarmotSendWithBestEffortReconciliation(
-                            send = { sendQueuedMarmotContent(group.id, send.text) },
+                            send = { sendQueuedMarmotContent(group.id, send.text, send.reply) },
                             onSendAccepted = {
                                 if (echo != null) markSendEchoAccepted(send.meshChatId, echo.id)
                             },

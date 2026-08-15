@@ -109,6 +109,12 @@ import chat.bitchat.sonar.resources.content_message_collapsed
 import chat.bitchat.sonar.resources.content_message_expanded
 import chat.bitchat.sonar.resources.content_message_show_less
 import chat.bitchat.sonar.resources.content_message_show_more
+import chat.bitchat.sonar.resources.chat_reply
+import chat.bitchat.sonar.resources.chat_reply_cancel
+import chat.bitchat.sonar.resources.chat_reply_fallback
+import chat.bitchat.sonar.resources.chat_reply_payment
+import chat.bitchat.sonar.resources.chat_reply_photo
+import chat.bitchat.sonar.resources.chat_reply_sticker
 import chat.bitchat.sonar.resources.sonar_icon
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.screens.shouldCloseEmojiTrayOnComposerFocus
@@ -1723,6 +1729,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                     CallLogRow(item)
                                 } else {
                                     val m = item as SonarMsg
+                                    ReplyDecorated(m, chatId = screen.id, state = state) {
                                     val msgMesh = isMeshRoute && !m.viaInternet
                                     // Contiguity from adjacent feed message rows only.
                                     val prevMsg = prevAny as? SonarMsg
@@ -1786,6 +1793,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                             )
                                         },
                                     )
+                                    }
                                 }
                             }
                         }
@@ -1804,6 +1812,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // still visible. One Column root keeps tray + composer vertically stacked
         // in both the legacy Column shell and the Phase-2 Box host.
         Column(Modifier.fillMaxWidth()) {
+            val pendingReply = state.composerReply(screen.id)
+            if (pendingReply != null) {
+                ComposerReplyBanner(
+                    reply = pendingReply,
+                    onCancel = { state.cancelReply(screen.id) },
+                )
+            }
             if (draft.startsWith("/")) SlashHints(draft) { state.setComposerDraft(screen.id, it) }
             MentionHints(mentionRoster, draft) { state.setComposerDraft(screen.id, it) }
             if (emojiTray && !recording) {
@@ -2644,6 +2659,111 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
 
 /** Meta (time + via-transport icon) inline id — design .bc-meta. */
 private const val BUBBLE_META_ICON = "sn.meta.via"
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ReplyDecorated(
+    m: SonarMsg,
+    chatId: String,
+    state: SonarAppState,
+    content: @Composable () -> Unit,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val replyPreview = when {
+        m.classification is SonarMsgClass.PayReceipt -> stringResource(Res.string.chat_reply_payment)
+        m.stickerRef != null -> stringResource(Res.string.chat_reply_sticker)
+        m.media.isNotEmpty() -> stringResource(Res.string.chat_reply_photo)
+        else -> m.content.trim()
+    }.ifBlank { stringResource(Res.string.chat_reply_fallback) }.take(140)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .combinedClickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = {},
+                onLongClick = {
+                    if (sonarCanReply(m)) state.beginReply(chatId, m, replyPreview)
+                },
+            ),
+        horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start,
+    ) {
+        val reply = m.reply
+        if (sonarReplyUiEnabled() && reply != null) {
+            QuoteChip(reply = reply, mine = m.mine) {
+                state.jumpToQuotedMessage(chatId, reply.parentId)
+            }
+        }
+        content()
+    }
+}
+
+@Composable
+private fun QuoteChip(reply: SonarReplyRef, mine: Boolean, onTap: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier
+            .padding(bottom = 4.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (mine) s.onAccent.copy(alpha = 0.16f) else s.surface2)
+            .clickable(onClick = onTap)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Box(
+            Modifier
+                .width(3.dp)
+                .height(28.dp)
+                .background(if (mine) s.onAccent else s.accent, RoundedCornerShape(1.5.dp)),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            reply.preview,
+            color = if (mine) s.onAccent.copy(alpha = 0.9f) else s.text2,
+            fontSize = 13.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun ComposerReplyBanner(reply: SonarReplyRef, onCancel: () -> Unit) {
+    val s = sonar
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(s.surface2)
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .width(3.dp)
+                .height(28.dp)
+                .background(s.accent, RoundedCornerShape(1.5.dp)),
+        )
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(stringResource(Res.string.chat_reply), color = s.accentDeep, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                reply.preview,
+                color = s.text2,
+                fontSize = 13.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Box(
+            Modifier
+                .size(28.dp)
+                .clickable { onCancel() },
+            contentAlignment = Alignment.Center,
+        ) {
+            SNIcon(SNIconName.X, 12.dp, s.text3, weight = 2.2f)
+        }
+    }
+}
 
 /** bc-msg / bc-bubble (components.jsx MsgBubble): max-width 78%, transport-
  *  colored own bubbles (cyan mesh / indigo internet), tail corner at 28% of the

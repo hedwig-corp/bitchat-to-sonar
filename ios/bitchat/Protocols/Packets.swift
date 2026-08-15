@@ -107,12 +107,15 @@ struct AnnouncementPacket {
 struct PrivateMessagePacket {
     let messageID: String
     let content: String
+    var replyTo: String? = nil
 
     private enum TLVType: UInt8 {
         case messageID = 0x00
         case content = 0x01
         case messageIDLong = 0x02
         case contentLong = 0x03
+        case replyTo = 0x04
+        case replyToLong = 0x05
     }
 
     func encode() -> Data? {
@@ -123,6 +126,11 @@ struct PrivateMessagePacket {
 
         appendTLV(.messageID, longType: .messageIDLong, value: messageIDData, to: &data)
         appendTLV(.content, longType: .contentLong, value: contentData, to: &data)
+        if let replyData = replyTo?.data(using: .utf8),
+           !replyData.isEmpty,
+           replyData.count <= UInt16.max {
+            appendTLV(.replyTo, longType: .replyToLong, value: replyData, to: &data)
+        }
 
         return data
     }
@@ -143,25 +151,30 @@ struct PrivateMessagePacket {
         var offset = 0
         var messageID: String?
         var content: String?
+        var replyTo: String?
 
         while offset < data.count {
-            guard let type = TLVType(rawValue: data[offset]) else { return nil }
+            let typeRaw = data[offset]
             offset += 1
+            let type = TLVType(rawValue: typeRaw)
 
+            let isLong = type == .messageIDLong || type == .contentLong || type == .replyToLong
             let length: Int
-            switch type {
-            case .messageID, .content:
-                guard offset + 1 <= data.count else { return nil }
-                length = Int(data[offset])
-                offset += 1
-            case .messageIDLong, .contentLong:
+            if isLong {
                 guard offset + 2 <= data.count else { return nil }
                 length = (Int(data[offset]) << 8) | Int(data[offset + 1])
                 offset += 2
+            } else {
+                // Known short types AND unknown types use a 1-byte length
+                // (matches Rust PrivateMessage::decode). Skipping unknowns is
+                // required so a newer peer's reply TLV cannot drop the PM.
+                guard offset + 1 <= data.count else { return nil }
+                length = Int(data[offset])
+                offset += 1
             }
 
             guard offset + length <= data.count else { return nil }
-            let value = data[offset..<offset + length]
+            let value = data[offset..<(offset + length)]
             offset += length
 
             switch type {
@@ -169,10 +182,15 @@ struct PrivateMessagePacket {
                 messageID = String(data: value, encoding: .utf8)
             case .content, .contentLong:
                 content = String(data: value, encoding: .utf8)
+            case .replyTo, .replyToLong:
+                let parsed = String(data: value, encoding: .utf8)
+                replyTo = parsed.flatMap { $0.isEmpty ? nil : $0 }
+            case nil:
+                break
             }
         }
 
         guard let messageID = messageID, let content = content else { return nil }
-        return PrivateMessagePacket(messageID: messageID, content: content)
+        return PrivateMessagePacket(messageID: messageID, content: content, replyTo: replyTo)
     }
 }

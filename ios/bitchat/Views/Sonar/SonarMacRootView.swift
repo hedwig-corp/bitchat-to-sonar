@@ -874,7 +874,13 @@ private struct MacConversationPane: View {
     }
 
     private var composer: some View {
-        SNComposer(
+        VStack(spacing: 0) {
+            if !isChannel, let reply = store.composerReply(for: id) {
+                SNComposerReplyBanner(reply: reply) {
+                    store.cancelReply(chatId: id)
+                }
+            }
+            SNComposer(
             text: store.composerDraftBinding(for: id),
             placeholder: "Message \(isChannel ? channel.name : peer.name)" + (!isChannel && transport == .internet ? " - via internet" : ""),
             transport: transport,
@@ -925,6 +931,7 @@ private struct MacConversationPane: View {
             voiceEnabled: !isChannel && store.canSendMedia(id),
             onVoice: { store.sendVoiceNote(id, url: $0) }
         )
+        }
     }
 
     @ViewBuilder private var actionContent: some View {
@@ -3877,6 +3884,8 @@ private struct MacDMTranscript: View {
                 onRetry: { store.retryDm(peerId, message: $0) },
                 onCancelUpload: { store.cancelMediaUpload($0) },
                 uploadProgressSource: store.marmot.mediaUploadProgressSource,
+                onReply: { store.beginReply(chatId: peerId, to: $0) },
+                onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
                 unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
@@ -3945,6 +3954,8 @@ private struct MacCollectionHostDM<Composer: View>: View {
                 onRetry: { store.retryDm(peerId, message: $0) },
                 onCancelUpload: { store.cancelMediaUpload($0) },
                 uploadProgressSource: store.marmot.mediaUploadProgressSource,
+                onReply: { store.beginReply(chatId: peerId, to: $0) },
+                onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
                 unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],

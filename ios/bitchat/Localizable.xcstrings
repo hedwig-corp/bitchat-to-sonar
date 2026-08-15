@@ -37066,7 +37066,80 @@
     },
     "Your nickname is what people see. Your key stays on this device unless you explicitly export it." : {
 
+    }    ,
+    "chat.reply" : {
+      "comment" : "Context-menu and composer-banner label for quote-reply",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reply"
+          }
+        }
+      }
+    },
+    "chat.reply.cancel" : {
+      "comment" : "Dismiss the composer reply banner",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel reply"
+          }
+        }
+      }
+    },
+    "chat.reply.fallback" : {
+      "comment" : "Generic quoted-message chip when preview is empty",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Message"
+          }
+        }
+      }
+    },
+    "chat.reply.payment" : {
+      "comment" : "Quoted preview for a payment receipt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Payment"
+          }
+        }
+      }
+    },
+    "chat.reply.photo" : {
+      "comment" : "Quoted preview for a media attachment",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Photo"
+          }
+        }
+      }
+    },
+    "chat.reply.sticker" : {
+      "comment" : "Quoted preview for a sticker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sticker"
+          }
+        }
+      }
     }
+
   },
   "version" : "1.1"
 }

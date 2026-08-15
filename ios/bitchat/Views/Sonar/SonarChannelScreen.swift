@@ -100,10 +100,17 @@ struct SonarChannelScreen: View {
                         showToast("\(m.author ?? "Questa persona") non \u{00E8} pi\u{00F9} nel canale")
                     }
                 }, loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
-                    onTapPack: { previewPackCoordinate = $0 })
+                    onTapPack: { previewPackCoordinate = $0 },
+                    onReply: { store.beginReply(chatId: chId, to: $0) })
             }
 
-            SNComposer(
+            VStack(spacing: 0) {
+                if let reply = store.composerReply(for: chId) {
+                    SNComposerReplyBanner(reply: reply) {
+                        store.cancelReply(chatId: chId)
+                    }
+                }
+                SNComposer(
                 text: store.composerDraftBinding(for: chId),
                 placeholder: "Message \(ch.name)",
                 transport: transport,
@@ -125,6 +132,7 @@ struct SonarChannelScreen: View {
                 cachedStickerPacks: { store.cachedStickerPacks() },
                 voiceEnabled: false
             )
+            }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
         .overlay {

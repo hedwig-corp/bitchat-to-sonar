@@ -85,6 +85,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var onRetry: ((SNMessage) -> Void)? = nil
     var onCancelUpload: ((SNMessage) -> Void)? = nil
     var uploadProgressSource: SNMediaUploadProgressSource? = nil
+    var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
     var loadOlder: (() async -> Bool)? = nil
     var loadNewest: (() async -> Void)? = nil
     var unreadCountAtOpen: UInt64? = nil
@@ -114,6 +116,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             onRetry: onRetry,
             onCancelUpload: onCancelUpload,
             uploadProgressSource: uploadProgressSource,
+            onReply: onReply,
+            onJumpQuote: onJumpQuote,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
@@ -137,6 +141,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             onRetry: onRetry,
             onCancelUpload: onCancelUpload,
             uploadProgressSource: uploadProgressSource,
+            onReply: onReply,
+            onJumpQuote: onJumpQuote,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
@@ -168,6 +174,8 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
     var onRetry: ((SNMessage) -> Void)?
     var onCancelUpload: ((SNMessage) -> Void)?
     var uploadProgressSource: SNMediaUploadProgressSource?
+    var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
     var loadOlder: (() async -> Bool)?
     var loadNewest: (() async -> Void)?
     var unreadCountAtOpen: UInt64?
@@ -191,6 +199,8 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
                 onRetry: onRetry,
                 onCancelUpload: onCancelUpload,
                 uploadProgressSource: uploadProgressSource,
+                onReply: onReply,
+                onJumpQuote: onJumpQuote,
                 loadOlder: loadOlder,
                 loadNewest: loadNewest,
                 unreadCountAtOpen: unreadCountAtOpen,
@@ -257,6 +267,8 @@ struct SNCollectionHostMessageRow: View {
     let onRetry: ((SNMessage) -> Void)?
     let onCancelUpload: ((SNMessage) -> Void)?
     let uploadProgressSource: SNMediaUploadProgressSource?
+    var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
     /// Collection column width (margins already subtracted). Never UIScreen —
     /// measure and cell must agree under Split View.
     let columnWidth: CGFloat
@@ -267,7 +279,7 @@ struct SNCollectionHostMessageRow: View {
         let m = message
         let textMax = columnWidth * 0.78
         let mediaMax = columnWidth * 0.72
-        Group {
+        SNReplyChrome(m: m, onReply: onReply, onJumpQuote: onJumpQuote) {
             if let call = m.call {
                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
             } else if m.trill {
@@ -321,7 +333,8 @@ struct SNCollectionHostMessageRow: View {
                     onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
                     maxBubbleWidth: textMax,
                     onTapAuthor: onTapAuthor,
-                    mentions: m.mentions
+                    mentions: m.mentions,
+                    onReply: onReply
                 )
             }
         }

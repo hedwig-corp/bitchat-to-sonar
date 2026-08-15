@@ -20,6 +20,8 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     var onRetry: ((SNMessage) -> Void)?
     var onCancelUpload: ((SNMessage) -> Void)?
     var uploadProgressSource: SNMediaUploadProgressSource?
+    var onReply: ((SNMessage) -> Void)?
+    var onJumpQuote: ((String) -> Void)?
 
     @Published var expandedMessageIDs: Set<String> = [] {
         didSet { contentRevision &+= 1 }
@@ -63,7 +65,9 @@ final class SNTranscriptHostRenderContext: ObservableObject {
         onTapPack: ((String) -> Void)?,
         onRetry: ((SNMessage) -> Void)?,
         onCancelUpload: ((SNMessage) -> Void)?,
-        uploadProgressSource: SNMediaUploadProgressSource?
+        uploadProgressSource: SNMediaUploadProgressSource?,
+        onReply: ((SNMessage) -> Void)?,
+        onJumpQuote: ((String) -> Void)?
     ) {
         // Bump only on real row-content change: composer keystrokes republish
         // the store with an identical transcript and must stay O(1) here.
@@ -91,6 +95,8 @@ final class SNTranscriptHostRenderContext: ObservableObject {
         self.onRetry = onRetry
         self.onCancelUpload = onCancelUpload
         self.uploadProgressSource = uploadProgressSource
+        self.onReply = onReply
+        self.onJumpQuote = onJumpQuote
     }
 
     func heightKey(for item: TranscriptDayRow) -> String {
@@ -107,7 +113,8 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             // Nudge and pay rows render (and wrap on) the peer's display name;
             // a resolved name must re-measure and reconfigure exactly those.
             let nameKey = (m.trill || m.pay != nil) ? "|\(peerName)" : ""
-            return "m|\(id)|\(m.text)|\(m.state ?? "")|\(mediaKey)|\(bits)\(nameKey)"
+            let replyKey = m.reply.map { "|r:\($0.parentId):\($0.preview)" } ?? ""
+            return "m|\(id)|\(m.text)|\(m.state ?? "")|\(mediaKey)|\(bits)\(nameKey)\(replyKey)"
         }
     }
 
@@ -199,6 +206,8 @@ final class SNTranscriptHostRenderContext: ObservableObject {
                     onRetry: onRetry,
                     onCancelUpload: onCancelUpload,
                     uploadProgressSource: uploadProgressSource,
+                    onReply: onReply,
+                    onJumpQuote: onJumpQuote,
                     columnWidth: columnWidth,
                     expandedMessageIDs: expandedMessageIDs,
                     onExpandedChange: { [weak self] newValue in
@@ -242,6 +251,8 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let onRetry: ((SNMessage) -> Void)?
     let onCancelUpload: ((SNMessage) -> Void)?
     let uploadProgressSource: SNMediaUploadProgressSource?
+    var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
     let loadOlder: (() async -> Bool)?
     let loadNewest: (() async -> Void)?
     let unreadCountAtOpen: UInt64?
@@ -279,7 +290,9 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
                     onTapPack: onTapPack,
                     onRetry: onRetry,
                     onCancelUpload: onCancelUpload,
-                    uploadProgressSource: uploadProgressSource
+                    uploadProgressSource: uploadProgressSource,
+                    onReply: onReply,
+                    onJumpQuote: onJumpQuote
                 )
             },
             onJumpSettled: onJumpSettled,
