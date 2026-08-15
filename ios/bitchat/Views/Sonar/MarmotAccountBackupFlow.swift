@@ -47,6 +47,27 @@ enum MarmotAccountBackupFlow {
         )
     }
 
+    /// What a `backupAccount()` run that did not throw actually did. Mirrors
+    /// Compose's `AccountBackupOutcome` minus the failure legs, which throw on
+    /// iOS.
+    ///
+    /// A `Bool` here conflated three different "no upload" exits, and the
+    /// auto-executor's summary line then logged an opt-out or metered abort as
+    /// "account already backed up" — a lie in exactly the log stream R-033
+    /// names as the real verification channel for this feature.
+    enum RunOutcome {
+        /// Bytes went to Blossom and the success was recorded.
+        case uploaded
+        /// Core skip: byte-identical to the last successful upload. A no-op,
+        /// never a failure.
+        case alreadyUpToDate
+        /// `respectOptOut` was set and the policy is disabled. Nothing sealed.
+        case skippedOptOut
+        /// The route became metered between the executor's entry gate and the
+        /// upload boundary; the seal was discarded, the bytes were not sent.
+        case abortedMeteredLink
+    }
+
     /// `UserDefaults` key for "back up over cellular". Off by default: an
     /// account backup is a multi-megabyte full-snapshot upload, and shipping it
     /// over a metered link by default cost one roaming user 66.3 GB in a single

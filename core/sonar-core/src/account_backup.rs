@@ -1807,9 +1807,33 @@ fn backup_upload_is_redundant(db_path: &Path, fingerprint: &str, now_secs: u64) 
 /// Close the in-flight window opened by [`record_backup_attempt`] without
 /// recording either a success or a failure. `last_attempt_at` deliberately
 /// stays put, so the skip still debounces the next opportunistic pass.
+///
+/// Called only from the redundant-skip path, and the skip is itself evidence:
+/// the bytes read under THIS attempt match the last successful upload. Two
+/// consequences follow, and missing either one turns the skip into a new bug:
+///
+/// * **`dirty` is stale and must clear** (same `attempt_dirty_seq` guard as
+///   [`record_backup_success`]). `dirty` can outlive its own content — a send
+///   that lands mid-attempt but before the DB read is *in* the sealed bytes,
+///   yet keeps `dirty=true` at success. Left set with nothing new to upload,
+///   every opportunistic pass re-reads and re-hashes the whole account (tens of
+///   MB) just to skip again, forever. A bump *after* the attempt snapshot keeps
+///   `dirty`, exactly as at success.
+/// * **`last_error` is moot and must clear.** The account provably matches the
+///   last successful upload, so whatever a previous attempt failed on is no
+///   longer the state of the world — leaving it paints a red Settings row under
+///   a perfectly backed-up account, the exact conflation this module exists to
+///   avoid.
 fn end_backup_attempt_window(db_path: &Path) {
     with_policy_state(|map| {
         let mut policy = cached_policy(map, db_path);
+        // A cross-process bump (NSE during an unlocked window) must be visible
+        // BEFORE the attempt compare — same ordering as record_backup_success.
+        merge_cross_process_dirty(&mut policy, db_path);
+        if policy.attempt_dirty_seq == Some(policy.dirty_seq) {
+            policy.dirty = false;
+        }
+        policy.last_error = None;
         policy.attempt_dirty_seq = None;
         policy.attempt_plain_hash = None;
         if let Err(e) = store_policy(map, db_path, &policy) {
@@ -3498,6 +3522,85 @@ mod tests {
             load_backup_policy(&db_path).last_plain_hash,
             None,
             "a success with no seal behind it must clear the marker, not inherit one"
+        );
+    }
+
+    /// A skip must clear stale `dirty`, or a covered account re-seals forever.
+    ///
+    /// `dirty` can outlive its content: a send landing mid-attempt but before
+    /// the DB read is IN the sealed bytes yet keeps `dirty=true` at success.
+    /// With nothing new to upload, every opportunistic pass then re-reads and
+    /// re-hashes the whole account (tens of MB) just to skip again — a battery
+    /// and IO loop with the same shape as the data loop this module fixed.
+    #[test]
+    fn a_redundant_skip_clears_stale_dirty() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        seed_account(&db_path, &key_hex);
+        let keys = Keys::generate();
+
+        let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
+        record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
+
+        // Dirty set with the CONTENT unchanged — the covered-send case.
+        mark_backup_dirty(&db_path);
+        assert!(load_backup_policy(&db_path).dirty, "precondition");
+
+        assert!(matches!(
+            seal_account_backup_files(&keys, &db_path, &key_hex),
+            Err(Error::AccountBackupUnchanged)
+        ));
+        assert!(
+            !load_backup_policy(&db_path).dirty,
+            "content matches the last upload, so dirty is stale — leaving it \
+             set re-seals the whole account every opportunistic pass"
+        );
+    }
+
+    /// ...but a bump AFTER the skip's own attempt snapshot keeps `dirty`, the
+    /// same guard `record_backup_success` applies. That send is not proven
+    /// covered, and a wrongly-cleared dirty is a missed backup.
+    #[test]
+    fn a_send_during_the_skips_own_window_keeps_dirty() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        record_backup_attempt(&db_path).unwrap();
+        // In-flight bump: dirty_seq moves past the attempt snapshot.
+        mark_backup_dirty(&db_path);
+
+        end_backup_attempt_window(&db_path);
+        let policy = load_backup_policy(&db_path);
+        assert!(
+            policy.dirty,
+            "a send after the attempt snapshot is not covered by the skip's evidence"
+        );
+        assert_eq!(policy.attempt_dirty_seq, None);
+    }
+
+    /// A skip proves the account matches the last successful upload, so any
+    /// stale failure under it is moot. Leaving it would keep a red Settings row
+    /// under a perfectly backed-up account — the conflation R-033 forbids.
+    #[test]
+    fn a_redundant_skip_clears_a_stale_error() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        seed_account(&db_path, &key_hex);
+        let keys = Keys::generate();
+
+        let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
+        record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
+        record_backup_failure(&db_path, "blossom upload timed out").unwrap();
+        assert!(load_backup_policy(&db_path).last_error.is_some(), "precondition");
+
+        assert!(matches!(
+            seal_account_backup_files(&keys, &db_path, &key_hex),
+            Err(Error::AccountBackupUnchanged)
+        ));
+        assert!(
+            load_backup_policy(&db_path).last_error.is_none(),
+            "the account provably matches the last upload — the old failure is moot"
         );
     }
 }

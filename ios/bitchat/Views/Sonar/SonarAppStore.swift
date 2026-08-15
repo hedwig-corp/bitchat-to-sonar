@@ -2425,13 +2425,23 @@ final class SonarAppStore: ObservableObject {
         showStickyToast(String(localized: "Backing up chats…"))
         do {
             // Settings tap = foreground session: reopen so chats stay live.
-            let uploaded = try await marmot.backupAccount(reopenAfterSeal: true)
+            let outcome = try await marmot.backupAccount(reopenAfterSeal: true)
             // "Uploaded" would be a small lie for an account that was already
             // current; "failed" (the Compose bug this mirrors) would be a big
             // one. Say what happened.
-            showToast(uploaded
-                ? String(localized: "Chat backup uploaded")
-                : String(localized: "Chat backup is already up to date"))
+            switch outcome {
+            case .uploaded:
+                showToast(String(localized: "Chat backup uploaded"))
+            case .alreadyUpToDate:
+                showToast(String(localized: "Chat backup is already up to date"))
+            case .skippedOptOut, .abortedMeteredLink:
+                // Unreachable from the manual path: it never passes
+                // `respectOptOut`, and manual backups are deliberately never
+                // metered-gated. If a refactor makes this reachable, surface it
+                // rather than toast a state the user did not ask for.
+                assertionFailure("manual backup returned an auto-only outcome")
+                showToast(String(localized: "Chat backup is already up to date"))
+            }
             refreshBackupPolicy()
         } catch MarmotService.ServiceError.backupAlreadyInProgress {
             // In-flight backup owns sticky/result toasts; do not clobber with failure.

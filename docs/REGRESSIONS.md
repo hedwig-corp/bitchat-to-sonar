@@ -2069,6 +2069,17 @@ a seal that stamped and then died (this app is killed in the background
 routinely) must not leave a fingerprint for a later success to promote, or every
 seal after that would skip against a blob Blossom never received.
 
+**A skip is also evidence, and must act on it.** The redundancy check proves
+the bytes read under this attempt match the last successful upload, so the skip
+clears two things (multi-model review found both): stale `dirty` — a send
+landing mid-attempt but before the DB read is *in* the sealed bytes yet keeps
+`dirty=true` at success, and left set with nothing new to upload it re-seals
+and re-hashes the whole account every opportunistic pass, forever — and stale
+`last_error`, which would otherwise keep a red Settings row under a provably
+backed-up account. Both clears use the same `attempt_dirty_seq` guard as
+`record_backup_success`: a bump *after* the attempt snapshot keeps `dirty`,
+because that send is not proven covered.
+
 **Guarded by:** `client.rs::only_our_own_messages_make_the_account_backup_urgent`
 (pins the real index call site — inbound must not dirty, outbound must)
 
@@ -2078,7 +2089,7 @@ citation wrapped onto a continuation line is silently never verified — the
 first draft of this entry had eight of those. If you reflow this block, keep
 each prefix's citations on its own single line or they stop being checked.
 
-**Also guarded by:** `account_backup.rs::second_seal_of_an_untouched_account_is_refused`, `account_backup.rs::seal_runs_again_once_the_account_changes`, `account_backup.rs::plaintext_fingerprint_tracks_content_not_nonce`, `account_backup.rs::unchanged_account_inside_the_refresh_window_is_redundant`, `account_backup.rs::the_refresh_window_never_outlives_the_chosen_cadence`, `account_backup.rs::a_failed_attempt_drops_its_fingerprint`, `account_backup.rs::a_redundant_seal_closes_the_attempt_window_it_opened`, `account_backup.rs::a_crashed_seals_fingerprint_does_not_survive_reload`, `account_backup.rs::no_recorded_success_is_never_redundant`, `account_backup.rs::changed_account_is_never_redundant`, `account_backup.rs::unchanged_account_past_the_refresh_window_uploads_again`
+**Also guarded by:** `account_backup.rs::second_seal_of_an_untouched_account_is_refused`, `account_backup.rs::seal_runs_again_once_the_account_changes`, `account_backup.rs::plaintext_fingerprint_tracks_content_not_nonce`, `account_backup.rs::unchanged_account_inside_the_refresh_window_is_redundant`, `account_backup.rs::the_refresh_window_never_outlives_the_chosen_cadence`, `account_backup.rs::a_failed_attempt_drops_its_fingerprint`, `account_backup.rs::a_redundant_seal_closes_the_attempt_window_it_opened`, `account_backup.rs::a_crashed_seals_fingerprint_does_not_survive_reload`, `account_backup.rs::no_recorded_success_is_never_redundant`, `account_backup.rs::changed_account_is_never_redundant`, `account_backup.rs::unchanged_account_past_the_refresh_window_uploads_again`, `account_backup.rs::a_redundant_skip_clears_stale_dirty`, `account_backup.rs::a_send_during_the_skips_own_window_keeps_dirty`, `account_backup.rs::a_redundant_skip_clears_a_stale_error`
 
 **Also guarded by:** `AutoBackupNetworkPolicyTest.meteredLinkBlocksAutomaticBackupByDefault`, `AutoBackupNetworkPolicyTest.coreRefusalToReuploadAnUnchangedAccountIsNotAFailure`, `AutoBackupNetworkPolicyTest.alreadyUpToDateIsNotAFailure`, `AutoBackupNetworkPolicyTest.optingInAllowsAutomaticBackupOnCellular`, `AutoBackupNetworkPolicyTest.realBackupFailuresAreStillFailures`
 

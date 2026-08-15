@@ -4768,10 +4768,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("Backup", "opportunistic: skipped (disclosed=${isAutoBackupDisclosed()} enabled=$autoBackupEnabled)")
             return
         }
-        // Enqueue the one-shot FIRST, and unconditionally. It carries an
-        // UNMETERED constraint, so on cellular WorkManager parks it and runs it
-        // the moment the device reaches Wi-Fi — which is exactly the behaviour
-        // that keeps "wait for Wi-Fi" from degrading into "never back up".
+        // Enqueue the one-shot FIRST, and unconditionally. Its constraint comes
+        // from `networkType()` (UNMETERED unless the user opted into cellular),
+        // so on cellular WorkManager parks it and runs it the moment the device
+        // reaches Wi-Fi — which is exactly the behaviour that keeps
+        // "wait for Wi-Fi" from degrading into "never back up".
         // Skipping the enqueue on a metered link (as this did) threw that away
         // and left the user on the 12-hour periodic job instead.
         chat.bitchat.sonar.backup.enqueueOneShotPlatformAutoBackup()

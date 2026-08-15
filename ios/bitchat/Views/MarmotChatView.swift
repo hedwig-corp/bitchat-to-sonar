@@ -1324,16 +1324,17 @@ final class MarmotChatModel: ObservableObject {
     /// `reopenAfterSeal` is deliberately REQUIRED: a defaulted `true` here let
     /// any future background caller silently inherit the reopen that round 8
     /// exists to remove. Every call site must choose.
-    /// - Returns: whether bytes actually went to Blossom. `false` means the
-    ///   account was byte-identical to the blob already there, so the upload was
-    ///   skipped — callers must not report that as "uploaded". Orthogonal to
+    /// - Returns: what actually happened — see
+    ///   `MarmotAccountBackupFlow.RunOutcome`. Only `.uploaded` sent bytes;
+    ///   callers must not report any other case as an upload, and must not
+    ///   report `.alreadyUpToDate` as a failure. Orthogonal to
     ///   `reopenAfterSeal`: whether the store is left open is that parameter's
     ///   business, and a skipped upload does not change it either way.
     @discardableResult
     func backupAccount(
         respectOptOut: Bool = false,
         reopenAfterSeal: Bool
-    ) async throws -> Bool {
+    ) async throws -> MarmotAccountBackupFlow.RunOutcome {
         // `@MainActor` serializes check-then-set; Settings taps share this actor.
         guard !accountBackupInFlight else {
             throw MarmotService.ServiceError.backupAlreadyInProgress
@@ -1343,7 +1344,7 @@ final class MarmotChatModel: ObservableObject {
 
         if respectOptOut {
             let enabled = (try? service.loadBackupPolicy().enabled) ?? false
-            guard enabled else { return false }
+            guard enabled else { return .skippedOptOut }
         }
 
         let wasPolling = syncTask != nil
@@ -1408,7 +1409,7 @@ final class MarmotChatModel: ObservableObject {
             if reopenAfterSeal, !reconnected {
                 throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
             }
-            return false
+            return .alreadyUpToDate
         }
 
         if let sealError {
@@ -1430,7 +1431,7 @@ final class MarmotChatModel: ObservableObject {
                 // Clear in-flight attempt so dirty remake / debounce state stays sane.
                 try? service.noteBackupFailure("auto-backup aborted — user opted out")
                 SecureLogger.info("Auto-backup aborted after seal — user opted out", category: .session)
-                return false
+                return .skippedOptOut
             }
             // Re-check the route at the UPLOAD boundary, not just at the
             // executor's entry. Everything between the two — relay drain,
@@ -1454,7 +1455,7 @@ final class MarmotChatModel: ObservableObject {
                     "Auto-backup aborted after seal — route became metered before upload",
                     category: .session
                 )
-                return false
+                return .abortedMeteredLink
             }
         }
 
@@ -1480,7 +1481,7 @@ final class MarmotChatModel: ObservableObject {
         if outcome.shouldSurfaceReconnectFailure {
             throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
         }
-        return true
+        return .uploaded
     }
 
     /// Best-effort drain of an in-flight relay attach before `closeNode` +
@@ -1600,16 +1601,25 @@ final class MarmotChatModel: ObservableObject {
             return false
         }
         do {
-            let uploaded = try await backupAccount(
+            let outcome = try await backupAccount(
                 respectOptOut: true,
                 reopenAfterSeal: reopenStore
             )
-            SecureLogger.info(
-                uploaded
-                    ? "Auto account backup uploaded"
-                    : "Auto account backup: nothing to upload (account already backed up)",
-                category: .session
-            )
+            // Say what actually happened. R-033 names these lines as the real
+            // verification channel for the cellular fix — a summary that calls
+            // an abort "already backed up" would poison exactly that record.
+            let summary: String
+            switch outcome {
+            case .uploaded:
+                summary = "Auto account backup uploaded"
+            case .alreadyUpToDate:
+                summary = "Auto account backup: nothing to upload (account already backed up)"
+            case .skippedOptOut:
+                summary = "Auto account backup: skipped (backup disabled)"
+            case .abortedMeteredLink:
+                summary = "Auto account backup: aborted (route became metered before upload)"
+            }
+            SecureLogger.info(summary, category: .session)
         } catch {
             // Dump the typed error, not just localizedDescription: the 1.12.9
             // (38) crash forensics stalled on an opaque "ServiceError error 1".
