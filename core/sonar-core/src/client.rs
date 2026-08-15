@@ -8486,6 +8486,7 @@ mod tests {
             media: vec![],
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("hey"),
+            reply: None,
         };
 
         client.upsert_index_for_message(&msg(1, 100, false), Some("Chat"));
