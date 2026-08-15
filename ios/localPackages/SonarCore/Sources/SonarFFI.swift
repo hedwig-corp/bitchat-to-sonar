@@ -588,6 +588,318 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 
+/**
+ * The migration SOURCE, implemented by the host over its existing native
+ * Breez integration. Deliberately minimal — the engine needs exactly these
+ * three operations, so hosts do not have to mirror the whole `WalletBackend`
+ * trait over the FFI boundary.
+ *
+ * Implementations are called from a Rust thread and MUST block until done.
+ * Failures are reported by throwing [`SonarFfiError`] — the same error type
+ * the rest of this FFI surface uses, so hosts have one error to handle.
+ * (A bare `String` error is NOT exportable by UniFFI for callback
+ * interfaces; the binding generator rejects it outright.)
+ */
+public protocol HostMigrationSource: AnyObject, Sendable {
+
+    /**
+     * Confirmed spendable balance, sats.
+     */
+    func balanceSats() throws  -> UInt64
+
+    /**
+     * Price paying `invoice` for `amount_sats` WITHOUT paying it.
+     */
+    func prepare(invoice: String, amountSats: UInt64) throws  -> HostSendQuote
+
+    /**
+     * Pay a previously prepared quote. Called at most once per token.
+     */
+    func send(token: String, note: String) throws  -> HostPayment
+
+}
+/**
+ * The migration SOURCE, implemented by the host over its existing native
+ * Breez integration. Deliberately minimal — the engine needs exactly these
+ * three operations, so hosts do not have to mirror the whole `WalletBackend`
+ * trait over the FFI boundary.
+ *
+ * Implementations are called from a Rust thread and MUST block until done.
+ * Failures are reported by throwing [`SonarFfiError`] — the same error type
+ * the rest of this FFI surface uses, so hosts have one error to handle.
+ * (A bare `String` error is NOT exportable by UniFFI for callback
+ * interfaces; the binding generator rejects it outright.)
+ */
+open class HostMigrationSourceImpl: HostMigrationSource, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_hostmigrationsource(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_hostmigrationsource(handle, $0) }
+    }
+
+
+
+
+    /**
+     * Confirmed spendable balance, sats.
+     */
+open func balanceSats()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_hostmigrationsource_balance_sats(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * Price paying `invoice` for `amount_sats` WITHOUT paying it.
+     */
+open func prepare(invoice: String, amountSats: UInt64)throws  -> HostSendQuote  {
+    return try  FfiConverterTypeHostSendQuote_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_hostmigrationsource_prepare(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(invoice),
+        FfiConverterUInt64.lower(amountSats),$0
+    )
+})
+}
+
+    /**
+     * Pay a previously prepared quote. Called at most once per token.
+     */
+open func send(token: String, note: String)throws  -> HostPayment  {
+    return try  FfiConverterTypeHostPayment_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_hostmigrationsource_send(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(token),
+        FfiConverterString.lower(note),$0
+    )
+})
+}
+
+
+
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceHostMigrationSource {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceHostMigrationSource = UniffiVTableCallbackInterfaceHostMigrationSource(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeHostMigrationSource.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface HostMigrationSource: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeHostMigrationSource.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface HostMigrationSource: handle missing in uniffiClone")
+            }
+        },
+        balanceSats: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UInt64>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> UInt64 in
+                guard let uniffiObj = try? FfiConverterTypeHostMigrationSource.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.balanceSats(
+                )
+            }
+
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterUInt64.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeSonarFfiError_lower
+            )
+        },
+        prepare: { (
+            uniffiHandle: UInt64,
+            invoice: RustBuffer,
+            amountSats: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> HostSendQuote in
+                guard let uniffiObj = try? FfiConverterTypeHostMigrationSource.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.prepare(
+                     invoice: try FfiConverterString.lift(invoice),
+                     amountSats: try FfiConverterUInt64.lift(amountSats)
+                )
+            }
+
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterTypeHostSendQuote_lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeSonarFfiError_lower
+            )
+        },
+        send: { (
+            uniffiHandle: UInt64,
+            token: RustBuffer,
+            note: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> HostPayment in
+                guard let uniffiObj = try? FfiConverterTypeHostMigrationSource.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.send(
+                     token: try FfiConverterString.lift(token),
+                     note: try FfiConverterString.lift(note)
+                )
+            }
+
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterTypeHostPayment_lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeSonarFfiError_lower
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceHostMigrationSource> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceHostMigrationSource>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitHostMigrationSource() {
+    uniffi_sonar_ffi_fn_init_callback_vtable_hostmigrationsource(UniffiCallbackInterfaceHostMigrationSource.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHostMigrationSource: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<HostMigrationSource>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = HostMigrationSource
+
+    public static func lift(_ handle: UInt64) throws -> HostMigrationSource {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return HostMigrationSourceImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: HostMigrationSource) -> UInt64 {
+         if let rustImpl = value as? HostMigrationSourceImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HostMigrationSource {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: HostMigrationSource, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostMigrationSource_lift(_ handle: UInt64) throws -> HostMigrationSource {
+    return try FfiConverterTypeHostMigrationSource.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostMigrationSource_lower(_ value: HostMigrationSource) -> UInt64 {
+    return FfiConverterTypeHostMigrationSource.lower(value)
+}
+
+
+
+
+
+
 public protocol MeshLinkEngineProtocol: AnyObject, Sendable {
 
     /**
@@ -1241,6 +1553,207 @@ public func FfiConverterTypeMeshReassembler_lower(_ value: MeshReassembler) -> U
 
 
 /**
+ * The Cashu wallet, backed by `sonar-wallet-cdk`. Seeded from the account
+ * nsec via the `sonar-cashu-v1` HKDF domain — a different domain from the
+ * Breez seed, so the two funds domains share no key material while both stay
+ * restorable from the account key alone.
+ */
+public protocol SonarCashuWalletProtocol: AnyObject, Sendable {
+
+    func balance() throws  -> WalletBalance
+
+    func disconnect() throws
+
+    /**
+     * A BOLT11 invoice for an exact amount.
+     */
+    func receiveInvoice(amountSats: UInt64) throws  -> String
+
+    /**
+     * A reusable BOLT12 offer for this wallet.
+     */
+    func receiveOffer() throws  -> String
+
+    /**
+     * Reconcile with the mint now (mints paid quotes, finalizes melts).
+     */
+    func sync() throws
+
+}
+/**
+ * The Cashu wallet, backed by `sonar-wallet-cdk`. Seeded from the account
+ * nsec via the `sonar-cashu-v1` HKDF domain — a different domain from the
+ * Breez seed, so the two funds domains share no key material while both stay
+ * restorable from the account key alone.
+ */
+open class SonarCashuWallet: SonarCashuWalletProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_sonarcashuwallet(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_sonarcashuwallet(handle, $0) }
+    }
+
+
+    /**
+     * Open (or create) the Cashu wallet and connect to the mint. On a store
+     * that has never completed a NUT-13 restore against this mint, the
+     * restore scan runs here — that is what makes a reinstall or a wiped
+     * store recover funds instead of showing an empty balance.
+     */
+public static func `open`(nsec: String, mintUrl: String, workingDir: String)throws  -> SonarCashuWallet  {
+    return try  FfiConverterTypeSonarCashuWallet_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_constructor_sonarcashuwallet_open(
+        FfiConverterString.lower(nsec),
+        FfiConverterString.lower(mintUrl),
+        FfiConverterString.lower(workingDir),$0
+    )
+})
+}
+
+
+
+open func balance()throws  -> WalletBalance  {
+    return try  FfiConverterTypeWalletBalance_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_balance(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+open func disconnect()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
+     * A BOLT11 invoice for an exact amount.
+     */
+open func receiveInvoice(amountSats: UInt64)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_receive_invoice(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(amountSats),$0
+    )
+})
+}
+
+    /**
+     * A reusable BOLT12 offer for this wallet.
+     */
+open func receiveOffer()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_receive_offer(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * Reconcile with the mint now (mints paid quotes, finalizes melts).
+     */
+open func sync()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_sync(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarCashuWallet: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = SonarCashuWallet
+
+    public static func lift(_ handle: UInt64) throws -> SonarCashuWallet {
+        return SonarCashuWallet(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: SonarCashuWallet) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarCashuWallet {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SonarCashuWallet, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarCashuWallet_lift(_ handle: UInt64) throws -> SonarCashuWallet {
+    return try FfiConverterTypeSonarCashuWallet.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarCashuWallet_lower(_ value: SonarCashuWallet) -> UInt64 {
+    return FfiConverterTypeSonarCashuWallet.lower(value)
+}
+
+
+
+
+
+
+/**
  * A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
  */
 public protocol SonarIdentityProtocol: AnyObject, Sendable {
@@ -1414,6 +1927,201 @@ public func FfiConverterTypeSonarIdentity_lift(_ handle: UInt64) throws -> Sonar
 #endif
 public func FfiConverterTypeSonarIdentity_lower(_ value: SonarIdentity) -> UInt64 {
     return FfiConverterTypeSonarIdentity.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Drives one migration. Held by the host across the consent step: `plan` →
+ * (consent UI) → `execute` → `settle`.
+ */
+public protocol SonarMigrationProtocol: AnyObject, Sendable {
+
+    /**
+     * Pay the planned migration. THE spending call — hosts must not reach it
+     * without explicit user consent to the custody change. Single-use: the
+     * plan is consumed, so a double-tap cannot pay twice.
+     */
+    func execute(planId: String) throws  -> HostPayment
+
+    /**
+     * Price the migration. Nothing is paid. `amount_sats = None` plans a
+     * whole-balance drain.
+     */
+    func plan(amountSats: UInt64?) throws  -> MigrationQuote
+
+    /**
+     * Watch the Cashu wallet until the funds land. Blocking; each poll is a
+     * mint sync. Safe to call any number of times, including after a crash
+     * between `execute` and settlement — the wallet's own reconciliation is
+     * what finishes the job, this only observes it.
+     */
+    func settle(baselineSats: UInt64, expectedSats: UInt64, polls: UInt32) throws  -> MigrationOutcome
+
+}
+/**
+ * Drives one migration. Held by the host across the consent step: `plan` →
+ * (consent UI) → `execute` → `settle`.
+ */
+open class SonarMigration: SonarMigrationProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_sonarmigration(self.handle, $0) }
+    }
+    /**
+     * `dest_max_sats` is the mint's per-quote ceiling (mint.hedwig.sh: 500000)
+     * and `fee_cap_sats` is a fail-closed cap on the source fee — a quote
+     * above it, or a source that cannot quote a fee at all, refuses to plan.
+     */
+public convenience init(source: HostMigrationSource, destination: SonarCashuWallet, destMaxSats: UInt64?, feeCapSats: UInt64?) {
+    let handle =
+        try! rustCall() {
+    uniffi_sonar_ffi_fn_constructor_sonarmigration_new(
+        FfiConverterTypeHostMigrationSource_lower(source),
+        FfiConverterTypeSonarCashuWallet_lower(destination),
+        FfiConverterOptionUInt64.lower(destMaxSats),
+        FfiConverterOptionUInt64.lower(feeCapSats),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_sonarmigration(handle, $0) }
+    }
+
+
+
+
+    /**
+     * Pay the planned migration. THE spending call — hosts must not reach it
+     * without explicit user consent to the custody change. Single-use: the
+     * plan is consumed, so a double-tap cannot pay twice.
+     */
+open func execute(planId: String)throws  -> HostPayment  {
+    return try  FfiConverterTypeHostPayment_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarmigration_execute(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(planId),$0
+    )
+})
+}
+
+    /**
+     * Price the migration. Nothing is paid. `amount_sats = None` plans a
+     * whole-balance drain.
+     */
+open func plan(amountSats: UInt64?)throws  -> MigrationQuote  {
+    return try  FfiConverterTypeMigrationQuote_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarmigration_plan(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt64.lower(amountSats),$0
+    )
+})
+}
+
+    /**
+     * Watch the Cashu wallet until the funds land. Blocking; each poll is a
+     * mint sync. Safe to call any number of times, including after a crash
+     * between `execute` and settlement — the wallet's own reconciliation is
+     * what finishes the job, this only observes it.
+     */
+open func settle(baselineSats: UInt64, expectedSats: UInt64, polls: UInt32)throws  -> MigrationOutcome  {
+    return try  FfiConverterTypeMigrationOutcome_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarmigration_settle(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(baselineSats),
+        FfiConverterUInt64.lower(expectedSats),
+        FfiConverterUInt32.lower(polls),$0
+    )
+})
+}
+
+
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarMigration: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = SonarMigration
+
+    public static func lift(_ handle: UInt64) throws -> SonarMigration {
+        return SonarMigration(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: SonarMigration) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarMigration {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SonarMigration, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarMigration_lift(_ handle: UInt64) throws -> SonarMigration {
+    return try FfiConverterTypeSonarMigration.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarMigration_lower(_ value: SonarMigration) -> UInt64 {
+    return FfiConverterTypeSonarMigration.lower(value)
 }
 
 
@@ -4433,6 +5141,141 @@ public func FfiConverterTypeGroupInviteInfo_lower(_ value: GroupInviteInfo) -> R
 }
 
 
+/**
+ * A payment the host's wallet made.
+ */
+public struct HostPayment: Equatable, Hashable {
+    public var id: String
+    public var amountSats: UInt64
+    public var feesSats: UInt64?
+    /**
+     * True only when the host's backend reports the payment as settled.
+     */
+    public var complete: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, amountSats: UInt64, feesSats: UInt64?,
+        /**
+         * True only when the host's backend reports the payment as settled.
+         */complete: Bool) {
+        self.id = id
+        self.amountSats = amountSats
+        self.feesSats = feesSats
+        self.complete = complete
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension HostPayment: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHostPayment: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HostPayment {
+        return
+            try HostPayment(
+                id: FfiConverterString.read(from: &buf),
+                amountSats: FfiConverterUInt64.read(from: &buf),
+                feesSats: FfiConverterOptionUInt64.read(from: &buf),
+                complete: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HostPayment, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterUInt64.write(value.amountSats, into: &buf)
+        FfiConverterOptionUInt64.write(value.feesSats, into: &buf)
+        FfiConverterBool.write(value.complete, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostPayment_lift(_ buf: RustBuffer) throws -> HostPayment {
+    return try FfiConverterTypeHostPayment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostPayment_lower(_ value: HostPayment) -> RustBuffer {
+    return FfiConverterTypeHostPayment.lower(value)
+}
+
+
+/**
+ * A priced send from the host's wallet: what the engine asked for, and what
+ * the host's backend quoted. `token` is opaque — the host hands it back to
+ * its own `send`, so it can be a quote id, a serialized prepare-response, or
+ * anything else the host needs to execute exactly this quote.
+ */
+public struct HostSendQuote: Equatable, Hashable {
+    public var amountSats: UInt64
+    public var feesSats: UInt64?
+    public var token: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(amountSats: UInt64, feesSats: UInt64?, token: String) {
+        self.amountSats = amountSats
+        self.feesSats = feesSats
+        self.token = token
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension HostSendQuote: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHostSendQuote: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HostSendQuote {
+        return
+            try HostSendQuote(
+                amountSats: FfiConverterUInt64.read(from: &buf),
+                feesSats: FfiConverterOptionUInt64.read(from: &buf),
+                token: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HostSendQuote, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.amountSats, into: &buf)
+        FfiConverterOptionUInt64.write(value.feesSats, into: &buf)
+        FfiConverterString.write(value.token, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostSendQuote_lift(_ buf: RustBuffer) throws -> HostSendQuote {
+    return try FfiConverterTypeHostSendQuote.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostSendQuote_lower(_ value: HostSendQuote) -> RustBuffer {
+    return FfiConverterTypeHostSendQuote.lower(value)
+}
+
+
 public struct JoinRequestInfo: Equatable, Hashable {
     public var requesterNpub: String
     public var groupIdHex: String
@@ -5142,6 +5985,97 @@ public func FfiConverterTypeMessageInfo_lift(_ buf: RustBuffer) throws -> Messag
 #endif
 public func FfiConverterTypeMessageInfo_lower(_ value: MessageInfo) -> RustBuffer {
     return FfiConverterTypeMessageInfo.lower(value)
+}
+
+
+/**
+ * What the user must see before consenting. Amounts in sats.
+ */
+public struct MigrationQuote: Equatable, Hashable {
+    /**
+     * Net amount that will arrive in the Cashu wallet.
+     */
+    public var amountSats: UInt64
+    /**
+     * Fee the source wallet will pay on top, when it can quote one.
+     */
+    public var sourceFeeSats: UInt64?
+    /**
+     * Destination balance before the migration — hand this back to `settle`
+     * so a resumed watch knows what "arrived" means.
+     */
+    public var destinationBaselineSats: UInt64
+    /**
+     * Opaque handle for `execute`; single-use.
+     */
+    public var planId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Net amount that will arrive in the Cashu wallet.
+         */amountSats: UInt64,
+        /**
+         * Fee the source wallet will pay on top, when it can quote one.
+         */sourceFeeSats: UInt64?,
+        /**
+         * Destination balance before the migration — hand this back to `settle`
+         * so a resumed watch knows what "arrived" means.
+         */destinationBaselineSats: UInt64,
+        /**
+         * Opaque handle for `execute`; single-use.
+         */planId: String) {
+        self.amountSats = amountSats
+        self.sourceFeeSats = sourceFeeSats
+        self.destinationBaselineSats = destinationBaselineSats
+        self.planId = planId
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MigrationQuote: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMigrationQuote: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MigrationQuote {
+        return
+            try MigrationQuote(
+                amountSats: FfiConverterUInt64.read(from: &buf),
+                sourceFeeSats: FfiConverterOptionUInt64.read(from: &buf),
+                destinationBaselineSats: FfiConverterUInt64.read(from: &buf),
+                planId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MigrationQuote, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.amountSats, into: &buf)
+        FfiConverterOptionUInt64.write(value.sourceFeeSats, into: &buf)
+        FfiConverterUInt64.write(value.destinationBaselineSats, into: &buf)
+        FfiConverterString.write(value.planId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationQuote_lift(_ buf: RustBuffer) throws -> MigrationQuote {
+    return try FfiConverterTypeMigrationQuote.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationQuote_lower(_ value: MigrationQuote) -> RustBuffer {
+    return FfiConverterTypeMigrationQuote.lower(value)
 }
 
 
@@ -5995,6 +6929,67 @@ public func FfiConverterTypeStickerRefInfo_lower(_ value: StickerRefInfo) -> Rus
     return FfiConverterTypeStickerRefInfo.lower(value)
 }
 
+
+/**
+ * Balance snapshot, sats.
+ */
+public struct WalletBalance: Equatable, Hashable {
+    public var confirmedSats: UInt64
+    public var pendingReceiveSats: UInt64
+    public var pendingSendSats: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(confirmedSats: UInt64, pendingReceiveSats: UInt64, pendingSendSats: UInt64) {
+        self.confirmedSats = confirmedSats
+        self.pendingReceiveSats = pendingReceiveSats
+        self.pendingSendSats = pendingSendSats
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletBalance: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletBalance: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletBalance {
+        return
+            try WalletBalance(
+                confirmedSats: FfiConverterUInt64.read(from: &buf),
+                pendingReceiveSats: FfiConverterUInt64.read(from: &buf),
+                pendingSendSats: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletBalance, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.confirmedSats, into: &buf)
+        FfiConverterUInt64.write(value.pendingReceiveSats, into: &buf)
+        FfiConverterUInt64.write(value.pendingSendSats, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletBalance_lift(_ buf: RustBuffer) throws -> WalletBalance {
+    return try FfiConverterTypeWalletBalance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletBalance_lower(_ value: WalletBalance) -> RustBuffer {
+    return FfiConverterTypeWalletBalance.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -6685,6 +7680,86 @@ public func FfiConverterTypeMessageClassInfo_lift(_ buf: RustBuffer) throws -> M
 #endif
 public func FfiConverterTypeMessageClassInfo_lower(_ value: MessageClassInfo) -> RustBuffer {
     return FfiConverterTypeMessageClassInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum MigrationOutcome: Equatable, Hashable {
+
+    /**
+     * Funds are in the Cashu wallet.
+     */
+    case settled(cashuConfirmedSats: UInt64
+    )
+    /**
+     * Paid, not yet visible. NOT a failure — the wallet keeps reconciling;
+     * call `settle` again (the same call is the crash-resume path).
+     */
+    case pending(cashuConfirmedSats: UInt64
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MigrationOutcome: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMigrationOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = MigrationOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MigrationOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .settled(cashuConfirmedSats: try FfiConverterUInt64.read(from: &buf)
+        )
+
+        case 2: return .pending(cashuConfirmedSats: try FfiConverterUInt64.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MigrationOutcome, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case let .settled(cashuConfirmedSats):
+            writeInt(&buf, Int32(1))
+            FfiConverterUInt64.write(cashuConfirmedSats, into: &buf)
+
+
+        case let .pending(cashuConfirmedSats):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(cashuConfirmedSats, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationOutcome_lift(_ buf: RustBuffer) throws -> MigrationOutcome {
+    return try FfiConverterTypeMigrationOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationOutcome_lower(_ value: MigrationOutcome) -> RustBuffer {
+    return FfiConverterTypeMigrationOutcome.lower(value)
 }
 
 
@@ -9528,6 +10603,39 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarsuspendlatch_is_interrupted() != 22902) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_balance_sats() != 64047) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_prepare() != 28809) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_send() != 7016) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_balance() != 34400) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_disconnect() != 19330) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_invoice() != 33747) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_offer() != 9682) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_sync() != 8473) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarmigration_execute() != 1036) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarmigration_plan() != 29160) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarmigration_settle() != 1241) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_constructor_meshlinkengine_new() != 12347) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9552,6 +10660,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_constructor_sonarsuspendlatch_new() != 52224) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_constructor_sonarcashuwallet_open() != 1090) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_constructor_sonarmigration_new() != 64361) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_conversationchangelistener_on_conversation_changed() != 35719) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9568,6 +10682,7 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
 
+    uniffiCallbackInitHostMigrationSource()
     uniffiCallbackInitConversationChangeListener()
     uniffiCallbackInitMediaDownloadListener()
     uniffiCallbackInitMediaUploadListener()
