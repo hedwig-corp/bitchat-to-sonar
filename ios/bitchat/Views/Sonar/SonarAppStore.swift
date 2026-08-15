@@ -397,8 +397,12 @@ struct SNReplyRef: Equatable {
     let preview: String
 }
 
+func snReplyUIEnabled() -> Bool {
+    ProcessInfo.processInfo.environment["SONAR_REPLY_UI"] != "0"
+}
+
 func snCanReply(to message: SNMessage) -> Bool {
-    guard SonarAppStore.replyUIEnabled else { return false }
+    guard snReplyUIEnabled() else { return false }
     if message.id.hasPrefix(MarmotChatModel.optimisticIDPrefix) { return false }
     if message.id.hasPrefix(MarmotChatModel.failedOptimisticIDPrefix) { return false }
     if message.action || message.call != nil || message.trill { return false }
@@ -1234,9 +1238,7 @@ final class SonarAppStore: ObservableObject {
         composerDrafts[chatId] ?? ""
     }
 
-    static var replyUIEnabled: Bool {
-        ProcessInfo.processInfo.environment["SONAR_REPLY_UI"] != "0"
-    }
+    static var replyUIEnabled: Bool { snReplyUIEnabled() }
 
     func composerReply(for chatId: String) -> SNReplyRef? {
         guard Self.replyUIEnabled else { return nil }

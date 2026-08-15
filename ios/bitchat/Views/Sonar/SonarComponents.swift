@@ -634,7 +634,7 @@ struct SNReplyChrome<Content: View>: View {
 
     var body: some View {
         VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
-            if SonarAppStore.replyUIEnabled, let reply = m.reply {
+            if snReplyUIEnabled(), let reply = m.reply {
                 SNQuoteChip(reply: reply, mine: m.mine) {
                     onJumpQuote?(reply.parentId)
                 }
