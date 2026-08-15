@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use sonar_wallet::{
-    cashu_wallet_seed, nsec_to_secret, wallet_entropy, Network, WalletBackend, WalletConfig,
-    WalletError, Zeroizing,
+    cashu_wallet_seed, nsec_to_secret, wallet_entropy, Network, ReceiveMethod, ReceiveRequest,
+    WalletBackend, WalletConfig, WalletError, Zeroizing,
 };
 use sonar_wallet_breez::BreezWallet;
 use sonar_wallet_cdk::CdkWallet;
@@ -35,6 +35,17 @@ struct Cli {
     /// Cashu wallet working directory.
     #[arg(long, global = true, default_value = "~/.sonar-cashu")]
     cashu_dir: String,
+    /// SIMULATION ONLY: drive the migration FROM a Cashu mint instead of the
+    /// Breez Lightning wallet, so the engine can be exercised end to end
+    /// against throwaway mints without touching real funds. Everything
+    /// downstream of the source is identical to a production run — the engine
+    /// only ever sees two `dyn WalletBackend`s.
+    #[arg(long, global = true)]
+    source_mint: Option<String>,
+    /// Working directory for the `--source-mint` wallet. Must differ from
+    /// --cashu-dir: same-account stores are bound to one mint each.
+    #[arg(long, global = true, default_value = "~/.sonar-cashu-source")]
+    source_cashu_dir: String,
     /// Use testnet (refused by the Breez backend; present for parity).
     #[arg(long, global = true)]
     testnet: bool,
@@ -52,6 +63,11 @@ enum Command {
     Migrate(MigrateArgs),
     /// Resume settlement watching after a crash or a Pending outcome.
     Settle(SettleArgs),
+    /// SIMULATION ONLY (requires --source-mint): mint sats into the simulated
+    /// source wallet so a migration has something to move. Receives only — it
+    /// never spends. Against a fake-backend mint the quote settles itself; any
+    /// other mint will simply wait for the printed invoice to be paid.
+    SimFund(SimFundArgs),
 }
 
 #[derive(Args)]
@@ -83,6 +99,16 @@ struct MigrateArgs {
     /// Pending instead of Settled.
     #[arg(long, default_value_t = 24)]
     settle_polls: u32,
+}
+
+#[derive(Args)]
+struct SimFundArgs {
+    /// Amount to mint into the simulated source wallet.
+    #[arg(long)]
+    amount_sats: u64,
+    /// Polls (~5s of source sync each) to wait for the quote to be issued.
+    #[arg(long, default_value_t = 24)]
+    polls: u32,
 }
 
 #[derive(Args)]
@@ -130,12 +156,45 @@ fn main() -> Result<(), WalletError> {
         Network::Mainnet
     };
 
-    let source = BreezWallet::new(WalletConfig {
-        seed: Zeroizing::new(wallet_entropy(&secret).to_vec()),
-        network,
-        api_key,
-        working_dir: expand_home(&cli.breez_dir),
-    })?;
+    // The source is chosen here and nowhere else: everything downstream takes
+    // `&dyn WalletBackend`, so the simulated run exercises the same engine,
+    // the same consent gates, and the same settlement loop as a real one.
+    let source: Box<dyn WalletBackend> = match &cli.source_mint {
+        Some(source_mint) => {
+            let source_dir = expand_home(&cli.source_cashu_dir);
+            if source_dir == expand_home(&cli.cashu_dir) {
+                return Err(WalletError::InvalidInput(
+                    "--source-cashu-dir must differ from --cashu-dir".into(),
+                ));
+            }
+            if source_mint == &mint {
+                return Err(WalletError::InvalidInput(
+                    "--source-mint must differ from --mint: migrating a mint to itself proves \
+                     nothing about the engine"
+                        .into(),
+                ));
+            }
+            eprintln!(
+                "SIMULATION: source is the Cashu mint {source_mint}, not the Breez wallet. \
+                 No Lightning funds move."
+            );
+            Box::new(CdkWallet::new(
+                WalletConfig {
+                    seed: Zeroizing::new(cashu_wallet_seed(&secret).to_vec()),
+                    network,
+                    api_key: None,
+                    working_dir: source_dir,
+                },
+                source_mint,
+            )?)
+        }
+        None => Box::new(BreezWallet::new(WalletConfig {
+            seed: Zeroizing::new(wallet_entropy(&secret).to_vec()),
+            network,
+            api_key,
+            working_dir: expand_home(&cli.breez_dir),
+        })?),
+    };
     let dest = CdkWallet::new(
         WalletConfig {
             seed: Zeroizing::new(cashu_wallet_seed(&secret).to_vec()),
@@ -149,16 +208,16 @@ fn main() -> Result<(), WalletError> {
     source.connect()?;
     let result = (|| {
         dest.connect()?;
-        let r = run(&cli, &source, &dest);
+        let r = run(&cli, source.as_ref(), &dest);
         let _ = dest.disconnect();
         r
     })();
-    // Always release the Breez node so its store is not left locked.
+    // Always release the source node so its store is not left locked.
     let _ = source.disconnect();
     result
 }
 
-fn run(cli: &Cli, source: &BreezWallet, dest: &CdkWallet) -> Result<(), WalletError> {
+fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), WalletError> {
     let to_wallet_err = |e: sonar_wallet_migrate::MigrateError| WalletError::Backend(e.to_string());
     match &cli.command {
         Command::Status => {
@@ -244,6 +303,46 @@ fn run(cli: &Cli, source: &BreezWallet, dest: &CdkWallet) -> Result<(), WalletEr
                 .settle(baseline, plan.amount_sats, args.settle_polls)
                 .map_err(to_wallet_err)?;
             print_settlement(&outcome, baseline, plan.amount_sats);
+        }
+        Command::SimFund(args) => {
+            if cli.source_mint.is_none() {
+                return Err(WalletError::InvalidInput(
+                    "sim-fund requires --source-mint: it exists to fund a simulated source \
+                     wallet, and must never be pointed at the real Breez wallet"
+                        .into(),
+                ));
+            }
+            let before = source.balance()?.confirmed_sats;
+            let invoice = source.receive(&ReceiveRequest {
+                method: ReceiveMethod::Bolt11Invoice,
+                amount_sats: Some(args.amount_sats),
+                description: Some("Sonar migration simulation funding".into()),
+            })?;
+            println!(
+                "{}",
+                json!({
+                    "invoice": invoice,
+                    "note": "pay this to fund the simulated source; a fake-backend mint settles it itself",
+                })
+            );
+            // Same shape as the engine's settlement watch: sync, then look at
+            // the confirmed balance. Nothing here spends.
+            let mut confirmed = before;
+            for _ in 0..args.polls {
+                let _ = source.sync_wallet();
+                confirmed = source.balance()?.confirmed_sats;
+                if confirmed > before {
+                    break;
+                }
+            }
+            println!(
+                "{}",
+                json!({
+                    "funded": confirmed > before,
+                    "source_confirmed_sats": confirmed,
+                    "gained_sats": confirmed.saturating_sub(before),
+                })
+            );
         }
         Command::Settle(args) => {
             let engine = MigrationEngine::new(
