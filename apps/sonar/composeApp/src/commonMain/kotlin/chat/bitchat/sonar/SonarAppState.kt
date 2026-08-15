@@ -364,6 +364,8 @@ sealed interface Screen {
     data class ContactProfile(val chatId: String, val name: String) : Screen
     data class GroupInfo(val chatId: String) : Screen
     data object WalletActivity : Screen
+    /** Move the Lightning balance into ecash held on this device. */
+    data object WalletMigration : Screen
     /** Standalone send-payment picker (new-chat sheet → "Send a payment"). */
     data object SendPayment : Screen
     /**

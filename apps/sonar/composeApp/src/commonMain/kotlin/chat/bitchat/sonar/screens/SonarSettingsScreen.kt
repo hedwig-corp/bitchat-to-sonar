@@ -191,6 +191,9 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 ) { if (state.walletAvailable) state.push(Screen.WalletActivity) }
                 if (state.walletAvailable) {
                     SNSettingsRow(
+                        icon = SNIconName.Coin, tone = SNTone.Gold, label = "Move to ecash",
+                    ) { state.push(Screen.WalletMigration) }
+                    SNSettingsRow(
                         icon = SNIconName.Globe, label = "Currency", value = state.currency.code,
                     ) { currencyPick = true }
                     SNSettingsRow(
