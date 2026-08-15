@@ -1230,9 +1230,13 @@ actual object SonarCore {
     // ── P2P voice calls — UNAVAILABLE on desktop ──────────────────────────────
     // The iroh call engine (calls-audio: iroh + opus + cpal) is not built into the
     // desktop sonar_ffi dylib, so calls no-op here: callStart throws → the app's
-    // ensureCallStarted catches it → callStarted stays false → the call UI is never
-    // offered (graceful, like a keyless wallet). Wiring desktop calls (build the
-    // host dylib with calls-audio) is the documented follow-up.
+    // ensureCallStarted catches it → callStarted stays false. The UI is kept honest
+    // by [callsSupported], not by this comment: it used to say the call UI was
+    // "never offered" while the desktop detail rail rendered call buttons anyway.
+    // Wiring desktop calls (build the host dylib with calls-audio) is the
+    // documented follow-up.
+    actual val callsSupported: Boolean = false
+
     actual suspend fun callStart() { error("calls unavailable on desktop") }
     actual suspend fun callLocalAddress(): String = ""
     actual suspend fun callPlace(callId: String, video: Boolean) {}

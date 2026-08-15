@@ -1055,6 +1055,18 @@ expect object SonarCore {
 
     // ── P2P voice calls (iroh transport; ☎CALL rides chat signaling) ──
 
+    /**
+     * Whether this build can actually place or take a call.
+     *
+     * False on desktop: the iroh call engine (`calls-audio`: iroh + opus + cpal) is
+     * not compiled into the desktop `sonar_ffi` dylib. The desktop core said so in a
+     * comment claiming "the call UI is never offered", but nothing enforced it, so
+     * the detail rail rendered Phone and Videocam buttons on every install and an
+     * incoming offer raised a ringing screen that could never be answered. A comment
+     * is not a guarantee; this is the value the UI can ask.
+     */
+    val callsSupported: Boolean
+
     /** Bind the iroh call endpoint once for this session. The Ed25519 call key is
      *  derived in-core from our Nostr identity, so nothing is passed. Idempotent-ish. */
     suspend fun callStart()
