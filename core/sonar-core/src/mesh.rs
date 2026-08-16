@@ -875,7 +875,7 @@ pub mod fragment {
         }
     }
 
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     /// Upper bound on a message's fragment count. The fragments arrive from
     /// UNTRUSTED BLE peers, so a malicious `total` (up to 65535) would otherwise
@@ -885,12 +885,68 @@ pub mod fragment {
     /// Max concurrent in-flight reassembly streams. Bounds memory against an
     /// attacker opening many never-completed streams with distinct fragment ids.
     pub const MAX_BUCKETS: usize = 256;
+    /// A stream that has not seen a new fragment for this long is abandoned.
+    /// Legitimate BLE fragment trains arrive back-to-back and finish within a
+    /// few seconds even at worst-case throughput; a bucket idle for 30s is a
+    /// sender that gave up, went out of range, or an attacker parking streams
+    /// to exhaust `MAX_BUCKETS`. (Mirrors iOS `bleFragmentLifetimeSeconds`.)
+    pub const STREAM_IDLE_TIMEOUT_MS: u64 = 30_000;
+    /// Absolute stream lifetime. Refreshing `last_touch` with trickled (even
+    /// duplicate) fragments would otherwise keep a bucket alive forever at a
+    /// few packets per second; no legitimate 1 MiB transfer takes 5 minutes
+    /// even at worst-case BLE throughput.
+    pub const STREAM_MAX_LIFETIME_MS: u64 = 5 * 60 * 1_000;
+    /// Cumulative byte cap per stream, mirroring iOS `assemblyLimit`
+    /// (`maxFramedFileBytes`): sparse storage bounds slots, this bounds
+    /// bytes — without it 256 buckets of attacker chunks could hold ~100+ MB
+    /// of heap alive via periodic refresh.
+    pub const MAX_STREAM_BYTES: usize = super::file_packet::MAX_FRAMED_FILE_BYTES;
+    /// Cumulative byte cap across ALL in-flight streams. The per-stream cap
+    /// alone does not bound heap: `MAX_BUCKETS * MAX_STREAM_BYTES` is ~287 MiB,
+    /// which is a jetsam kill on a phone, and an attacker can approach it while
+    /// refreshing every bucket inside its lifetime. Eight concurrent maximal
+    /// transfers is far past any real mesh encounter (fragments arrive from
+    /// peers in radio range, one file at a time) and two orders of magnitude
+    /// below the per-stream-only ceiling.
+    pub const MAX_TOTAL_STREAM_BYTES: usize = 8 * MAX_STREAM_BYTES;
+    /// A newcomer at capacity may only evict a bucket idle at least this
+    /// long. What this buys, precisely: an ACTIVELY transmitting stream
+    /// refreshes its bucket every few ms and is therefore never evictable —
+    /// which unconditional stalest-wins did not guarantee (a flood could
+    /// evict a victim between its own fragments).
+    ///
+    /// What it does NOT buy, stated because the first version of this comment
+    /// claimed it: refusal is not a "≤2s stall". There is no fragment-level
+    /// ACK or retransmit in this engine — `send_file` emits its writes once,
+    /// fire-and-forget — so a refused fragment is lost, and under a sustained
+    /// flood (≈4 kB/s of minimal fragments refreshing 256 buckets) reassembly
+    /// stays denied until the attacker's buckets hit STREAM_MAX_LIFETIME_MS.
+    /// The absolute lifetime, not this window, is what bounds the denial.
+    pub const STREAM_EVICT_PROTECT_MS: u64 = 2_000;
+
+    /// One in-flight reassembly stream. Chunks are stored sparsely, keyed by
+    /// fragment index: memory grows with what actually arrived, so a forged
+    /// `total` of `MAX_FRAGMENTS` cannot reserve ~8192 slots from one tiny
+    /// packet.
+    struct Bucket {
+        total: u16,
+        chunks: BTreeMap<u16, Vec<u8>>,
+        bytes: usize,
+        created_ms: u64,
+        last_touch_ms: u64,
+    }
 
     /// Reassembles fragments keyed by (sender, fragmentID). `add` returns the
     /// concatenated original bytes once every index 0..total has arrived.
+    ///
+    /// Buckets are bounded two ways: idle streams expire after
+    /// [`STREAM_IDLE_TIMEOUT_MS`], and when the table is full the stalest
+    /// stream is evicted for a new one. Without the second rule, 256 stuck
+    /// streams (untrusted, ~14 bytes each) would permanently disable
+    /// reassembly for every legitimate peer.
     #[derive(Default)]
     pub struct Reassembler {
-        buckets: HashMap<([u8; 8], [u8; 8]), Vec<Option<Vec<u8>>>>,
+        buckets: HashMap<([u8; 8], [u8; 8]), Bucket>,
     }
 
     impl Reassembler {
@@ -900,31 +956,197 @@ pub mod fragment {
             }
         }
 
-        /// Feed one fragment (with the carrying packet's `sender`). Returns the
-        /// reassembled original packet bytes when complete. Hardened against
-        /// untrusted input: rejects an oversized `total` and caps the number of
-        /// concurrent streams (a new stream is dropped once at capacity rather
-        /// than growing memory unbounded).
-        pub fn add(&mut self, sender: [u8; 8], frag: &Fragment) -> Option<Vec<u8>> {
+        /// Total chunks currently buffered across all in-flight streams.
+        /// Memory diagnostics / tests; storage is sparse so this tracks what
+        /// actually arrived, never a claimed `total`.
+        pub fn stored_chunks(&self) -> usize {
+            self.buckets.values().map(|b| b.chunks.len()).sum()
+        }
+
+        /// Bytes currently buffered across all in-flight streams.
+        ///
+        /// Derived rather than maintained as a counter on purpose: an
+        /// incremental total has to be adjusted at every mutation point
+        /// (chunk replace, per-stream cap drop, completion, eviction, lifetime
+        /// drop, sweep retain), and a single missed path silently corrupts the
+        /// budget in the direction of accepting more. Summing ≤ MAX_BUCKETS
+        /// integers on the fragment path is not measurable next to the
+        /// decrypt/BLE work around it, and this is not on a render path.
+        pub fn buffered_bytes(&self) -> usize {
+            self.buckets.values().map(|b| b.bytes).sum()
+        }
+
+        /// Free buckets until `needed` bytes are reclaimable, largest first,
+        /// never touching `keep` or a bucket inside the protect window (an
+        /// actively transmitting stream). Returns whether enough was freed.
+        fn reclaim_bytes(
+            &mut self,
+            keep: ([u8; 8], [u8; 8]),
+            needed: usize,
+            now_ms: u64,
+        ) -> bool {
+            let mut freed = 0usize;
+            loop {
+                if freed >= needed {
+                    return true;
+                }
+                let victim = self
+                    .buckets
+                    .iter()
+                    .filter(|(k, b)| {
+                        **k != keep
+                            && now_ms.saturating_sub(b.last_touch_ms) >= STREAM_EVICT_PROTECT_MS
+                    })
+                    .max_by_key(|(_, b)| b.bytes)
+                    .map(|(k, b)| (*k, b.bytes));
+                match victim {
+                    Some((k, bytes)) => {
+                        self.buckets.remove(&k);
+                        freed = freed.saturating_add(bytes);
+                    }
+                    None => return freed >= needed,
+                }
+            }
+        }
+
+        /// Drops streams idle past [`STREAM_IDLE_TIMEOUT_MS`] or older than
+        /// [`STREAM_MAX_LIFETIME_MS`]. Called from the engine tick so parked
+        /// streams free their memory without waiting for the table to fill.
+        pub fn sweep(&mut self, now_ms: u64) {
+            self.buckets.retain(|_, b| {
+                now_ms.saturating_sub(b.last_touch_ms) < STREAM_IDLE_TIMEOUT_MS
+                    && now_ms.saturating_sub(b.created_ms) < STREAM_MAX_LIFETIME_MS
+            });
+        }
+
+        /// Doze/freeze recovery: silence measured across a process-suspend gap
+        /// is OUR downtime, not the senders'. Shift each bucket's IDLE clock
+        /// forward by the gap so a transfer that was live when we froze
+        /// survives the next sweep — the same intent as the engine re-seeding
+        /// link `last_rx_ms`.
+        ///
+        /// Shifted, not stamped to `now`: stamping would resurrect buckets
+        /// already dead before the freeze.
+        ///
+        /// `created_ms` is deliberately NOT shifted. Android drives `on_tick`
+        /// from a `postDelayed` handler that Doze suppresses, while the engine
+        /// clock is `elapsedRealtime()` which keeps advancing — so every
+        /// screen-off period is a resume gap. Shifting `created_ms` too would
+        /// rewind the absolute lifetime on every one of them, turning the
+        /// ceiling into an "awake-time" ceiling: a probe kept an attacker
+        /// bucket alive for 12 hours of wall clock by refreshing it once per
+        /// 20s of awake time. The absolute lifetime must be monotonic or it is
+        /// not a backstop.
+        pub fn reseed(&mut self, gap_ms: u64, now_ms: u64) {
+            for b in self.buckets.values_mut() {
+                b.last_touch_ms = b.last_touch_ms.saturating_add(gap_ms).min(now_ms);
+            }
+        }
+
+        /// Feed one fragment (with the carrying packet's `sender` and the
+        /// engine's monotonic clock). Returns the reassembled original packet
+        /// bytes when complete. Hardened against untrusted input: rejects an
+        /// oversized `total`, stores chunks sparsely, and admits a new stream
+        /// at capacity by evicting expired buckets first and the stalest
+        /// bucket as a last resort — a full table never becomes a permanent
+        /// denial of reassembly.
+        pub fn add(&mut self, sender: [u8; 8], frag: &Fragment, now_ms: u64) -> Option<Vec<u8>> {
             if frag.total == 0 || frag.index >= frag.total || frag.total > MAX_FRAGMENTS {
                 return None;
             }
             let key = (sender, frag.fragment_id);
             if !self.buckets.contains_key(&key) && self.buckets.len() >= MAX_BUCKETS {
-                return None; // at capacity: drop fragments for new streams
+                self.sweep(now_ms);
+                if self.buckets.len() >= MAX_BUCKETS {
+                    // Still full: evict the stalest bucket, but ONLY if it has
+                    // been idle past the protect window. An unconditional
+                    // stalest-wins would let ~256 fresh attacker streams evict
+                    // a victim's bucket between its own fragments; with the
+                    // protect window an actively transmitting stream (which
+                    // refreshes every few ms) is never evictable.
+                    //
+                    // The refused fragment is LOST, not stalled: there is no
+                    // fragment ACK or retransmit here (`send_file` writes once,
+                    // fire-and-forget). See STREAM_EVICT_PROTECT_MS for what
+                    // this window does and does not bound — the absolute
+                    // lifetime is what ends a sustained flood, not this.
+                    let stalest = self
+                        .buckets
+                        .iter()
+                        .min_by_key(|(_, b)| b.last_touch_ms)
+                        .map(|(k, b)| (*k, b.last_touch_ms));
+                    match stalest {
+                        Some((k, touched))
+                            if now_ms.saturating_sub(touched) >= STREAM_EVICT_PROTECT_MS =>
+                        {
+                            self.buckets.remove(&k);
+                        }
+                        _ => return None, // everything is live: refuse, don't evict
+                    }
+                }
             }
-            let slots = self
+            // Deliberately NOT enforcing the absolute lifetime here, only in
+            // `sweep`. Reviewed and rejected: rejecting the fragment and
+            // dropping the bucket in `add` looks tighter, but the engine now
+            // sweeps on every tick including the resume path, so the aged
+            // bucket survives at most one tick while holding bytes already
+            // capped by MAX_STREAM_BYTES and the global budget. Folding the
+            // fragment into a fresh bucket instead is actively wrong — it
+            // stamps `created_ms = now` and hands the sender an indefinitely
+            // renewable stream, defeating the ceiling that
+            // `refresh_cannot_extend_a_stream_forever` pins.
+
+            // Global byte budget. The per-stream cap below bounds ONE stream;
+            // without this, 256 buckets each approaching MAX_STREAM_BYTES hold
+            // ~287 MiB alive, which is a jetsam kill rather than a bounded
+            // reassembler. Reclaim idle buckets (largest first) to make room
+            // and refuse the fragment only if everything else is actively
+            // transmitting — the same "never evict a live stream" rule the
+            // capacity path uses.
+            let replaced_now = self
                 .buckets
-                .entry(key)
-                .or_insert_with(|| vec![None; frag.total as usize]);
-            if slots.len() != frag.total as usize {
+                .get(&key)
+                .and_then(|b| b.chunks.get(&frag.index))
+                .map_or(0, Vec::len);
+            let projected = self
+                .buffered_bytes()
+                .saturating_sub(replaced_now)
+                .saturating_add(frag.chunk.len());
+            if projected > MAX_TOTAL_STREAM_BYTES {
+                let needed = projected - MAX_TOTAL_STREAM_BYTES;
+                if !self.reclaim_bytes(key, needed, now_ms) {
+                    return None;
+                }
+            }
+            let bucket = self.buckets.entry(key).or_insert_with(|| Bucket {
+                total: frag.total,
+                chunks: BTreeMap::new(),
+                bytes: 0,
+                created_ms: now_ms,
+                last_touch_ms: now_ms,
+            });
+            if bucket.total != frag.total {
                 return None; // inconsistent total for this id
             }
-            slots[frag.index as usize] = Some(frag.chunk.clone());
-            if slots.iter().all(|s| s.is_some()) {
-                let mut out = Vec::new();
-                for s in slots.iter() {
-                    out.extend_from_slice(s.as_ref().unwrap());
+            // Cumulative byte cap (iOS `assemblyLimit` mirror): a stream that
+            // claims more than a maximal framed file is hostile — drop the
+            // whole bucket rather than keep buffering for it.
+            let replaced = bucket.chunks.get(&frag.index).map_or(0, Vec::len);
+            // `saturating_sub` states the invariant instead of relying on it:
+            // `bytes` is maintained as the exact sum of stored chunk lengths,
+            // but a debug-build panic on an untrusted BLE path is a bad
+            // failure mode for an invariant no type enforces.
+            if bucket.bytes.saturating_sub(replaced) + frag.chunk.len() > MAX_STREAM_BYTES {
+                self.buckets.remove(&key);
+                return None;
+            }
+            bucket.last_touch_ms = now_ms;
+            bucket.bytes = bucket.bytes.saturating_sub(replaced) + frag.chunk.len();
+            bucket.chunks.insert(frag.index, frag.chunk.clone());
+            if bucket.chunks.len() == bucket.total as usize {
+                let mut out = Vec::with_capacity(bucket.bytes);
+                for chunk in bucket.chunks.values() {
+                    out.extend_from_slice(chunk);
                 }
                 self.buckets.remove(&key);
                 Some(out)
@@ -1486,9 +1708,344 @@ mod tests {
 
         let mut r = fragment::Reassembler::new();
         // Feed out of order: 2, 0, 1.
-        assert!(r.add(sender, &frags[2]).is_none());
-        assert!(r.add(sender, &frags[0]).is_none());
-        let done = r.add(sender, &frags[1]).unwrap();
+        assert!(r.add(sender, &frags[2], 0).is_none());
+        assert!(r.add(sender, &frags[0], 0).is_none());
+        let done = r.add(sender, &frags[1], 0).unwrap();
         assert_eq!(done, original);
+    }
+
+    /// One stuck opening fragment per bucket slot. Total on-wire cost is ~14
+    /// bytes × MAX_BUCKETS, unauthenticated.
+    fn park_streams(r: &mut fragment::Reassembler, count: usize, now_ms: u64) {
+        for i in 0..count {
+            let stuck = fragment::Fragment {
+                fragment_id: (i as u64).to_be_bytes(),
+                index: 0,
+                total: 2, // never completed: index 1 never arrives
+                original_type: msg_type::MESSAGE,
+                chunk: vec![0u8; 4],
+            };
+            assert!(r.add([0xEE; 8], &stuck, now_ms).is_none());
+        }
+    }
+
+    fn two_part_stream(id_byte: u8) -> [fragment::Fragment; 2] {
+        let make = |index| fragment::Fragment {
+            fragment_id: [id_byte; 8],
+            index,
+            total: 2,
+            original_type: msg_type::MESSAGE,
+            chunk: vec![id_byte; 3],
+        };
+        [make(0), make(1)]
+    }
+
+    /// The per-stream cap bounds ONE stream; the reassembler must also bound
+    /// the sum. Without a global budget, MAX_BUCKETS streams each approaching
+    /// MAX_STREAM_BYTES hold ~287 MiB alive — a jetsam kill, and reachable by
+    /// an attacker who refreshes each bucket inside its lifetime.
+    #[test]
+    fn total_buffered_bytes_stay_within_the_global_budget() {
+        let mut r = fragment::Reassembler::new();
+        // 64 KiB per fragment, 16 indices per stream => each stream walks
+        // toward the 1 MiB per-stream cap. Feed far more streams than the
+        // global budget can hold, all inside the protect window.
+        let chunk = vec![0xAB; 64 * 1024];
+        let mut now = 0u64;
+        for stream in 0..64u64 {
+            for index in 0..16u16 {
+                let frag = fragment::Fragment {
+                    fragment_id: stream.to_be_bytes(),
+                    index,
+                    total: 64, // never completes
+                    original_type: msg_type::MESSAGE,
+                    chunk: chunk.clone(),
+                };
+                // Advance past the protect window so reclaim has candidates;
+                // stay well inside the absolute lifetime.
+                now += fragment::STREAM_EVICT_PROTECT_MS + 1;
+                let _ = r.add([0xEE; 8], &frag, now);
+                assert!(
+                    r.buffered_bytes() <= fragment::MAX_TOTAL_STREAM_BYTES,
+                    "buffered {} exceeded the global budget {}",
+                    r.buffered_bytes(),
+                    fragment::MAX_TOTAL_STREAM_BYTES
+                );
+            }
+        }
+    }
+
+    /// A legitimate transfer must not be starved by the global budget: while
+    /// one stream is actively transmitting, the reclaim path takes bytes from
+    /// idle buckets rather than from the live stream.
+    #[test]
+    fn global_budget_reclaims_idle_streams_not_the_live_one() {
+        let mut r = fragment::Reassembler::new();
+        let chunk = vec![0xCD; 64 * 1024];
+        // Park several fat idle streams.
+        let mut now = 0u64;
+        for stream in 0..16u64 {
+            for index in 0..8u16 {
+                let frag = fragment::Fragment {
+                    fragment_id: stream.to_be_bytes(),
+                    index,
+                    total: 64,
+                    original_type: msg_type::MESSAGE,
+                    chunk: chunk.clone(),
+                };
+                let _ = r.add([0xEE; 8], &frag, now);
+            }
+        }
+        now += fragment::STREAM_EVICT_PROTECT_MS + 1;
+
+        // A legitimate 4-part stream now transmits back to back. Every part
+        // must be admitted: reclaim frees the idle buckets instead.
+        let live_id = 0xFFFF_FFFFu64.to_be_bytes();
+        let mut completed = None;
+        for index in 0..4u16 {
+            let frag = fragment::Fragment {
+                fragment_id: live_id,
+                index,
+                total: 4,
+                original_type: msg_type::MESSAGE,
+                chunk: chunk.clone(),
+            };
+            now += 5; // actively transmitting, inside the protect window
+            completed = r.add([0x77; 8], &frag, now);
+        }
+        let bytes = completed.expect("an actively transmitting stream must complete");
+        assert_eq!(bytes.len(), 4 * chunk.len());
+    }
+
+    /// #416: 256 parked streams used to occupy every bucket forever — the
+    /// capacity guard then dropped every future stream from every legitimate
+    /// peer for the process lifetime. Expiry + protected-age eviction must
+    /// reclaim them, and refusal is only ever a bounded (≤ protect window)
+    /// admission stall — never a permanent veto.
+    #[test]
+    fn parked_streams_expire_and_reassembly_recovers() {
+        let mut r = fragment::Reassembler::new();
+        park_streams(&mut r, fragment::MAX_BUCKETS, 1_000);
+
+        // While EVERY parked stream is inside the protect window, a newcomer
+        // is refused — evicting a possibly-live bucket is the attack surface
+        // (#422 precedent). The refused fragment is lost, not retried; the
+        // absolute lifetime is what ends a sustained flood.
+        let [first, second] = two_part_stream(0xA1);
+        assert!(r.add([0x11; 8], &first, 1_500).is_none());
+        assert_eq!(
+            r.stored_chunks(),
+            fragment::MAX_BUCKETS as usize,
+            "a fresh full table refuses the newcomer instead of evicting"
+        );
+
+        // Once the stalest bucket ages past the protect window, the newcomer
+        // is admitted by evicting it — capacity is never a permanent veto.
+        let now = 1_000 + fragment::STREAM_EVICT_PROTECT_MS;
+        assert!(r.add([0x11; 8], &first, now).is_none());
+        let done = r
+            .add([0x11; 8], &second, now)
+            .expect("a full-but-stale table must admit a new legitimate stream");
+        assert_eq!(done, [vec![0xA1; 3], vec![0xA1; 3]].concat());
+
+        // Past the idle timeout the parked streams are swept wholesale and a
+        // fresh stream completes without evicting anything live.
+        let later = 1_000 + fragment::STREAM_IDLE_TIMEOUT_MS;
+        let [first, second] = two_part_stream(0xB2);
+        assert!(r.add([0x22; 8], &first, later).is_none());
+        assert!(r.add([0x22; 8], &second, later).is_some());
+    }
+
+    /// The engine tick sweeps parked streams so their memory is released even
+    /// when no new fragment ever arrives. Asserted on `stored_chunks`, not on
+    /// `add` returning `None` — refusal at capacity returns `None` too, which
+    /// is how a no-op `sweep` once survived this suite (mutation finding).
+    #[test]
+    fn sweep_reclaims_idle_streams() {
+        let mut r = fragment::Reassembler::new();
+        park_streams(&mut r, fragment::MAX_BUCKETS, 0);
+        assert_eq!(r.stored_chunks(), fragment::MAX_BUCKETS as usize);
+        r.sweep(fragment::STREAM_IDLE_TIMEOUT_MS);
+        assert_eq!(r.stored_chunks(), 0, "idle streams must actually be swept");
+
+        // All slots are free again: MAX_BUCKETS new streams are admitted
+        // without touching the eviction path.
+        let now = fragment::STREAM_IDLE_TIMEOUT_MS;
+        park_streams(&mut r, fragment::MAX_BUCKETS, now);
+        assert_eq!(r.stored_chunks(), fragment::MAX_BUCKETS as usize);
+    }
+
+    /// Doze resumes must not rewind the absolute lifetime. Android's tick
+    /// handler is suppressed by Doze while the engine clock keeps advancing,
+    /// so a bucket refreshed once per short awake period would otherwise
+    /// survive indefinitely across screen-off cycles.
+    #[test]
+    fn repeated_doze_resumes_cannot_extend_a_stream_forever() {
+        let mut r = fragment::Reassembler::new();
+        let [first, _second] = two_part_stream(0xF6);
+        assert!(r.add([0x66; 8], &first, 0).is_none());
+
+        // Simulate 20 screen-off cycles: each one is a long resume gap, and
+        // the attacker touches the bucket once while we are awake.
+        let mut now = 0u64;
+        for _ in 0..20 {
+            let gap = 10 * fragment::STREAM_IDLE_TIMEOUT_MS;
+            now += gap;
+            r.reseed(gap, now);
+            let _ = r.add([0x66; 8], &first, now);
+        }
+        r.sweep(now);
+        assert_eq!(
+            r.stored_chunks(),
+            0,
+            "the absolute lifetime must be monotonic across doze resumes"
+        );
+    }
+
+    /// The absolute lifetime ceiling: a bucket kept "fresh" by trickled
+    /// duplicates still dies at STREAM_MAX_LIFETIME_MS.
+    #[test]
+    fn refresh_cannot_extend_a_stream_forever() {
+        let mut r = fragment::Reassembler::new();
+        let [first, _second] = two_part_stream(0xD4);
+        assert!(r.add([0x44; 8], &first, 0).is_none());
+        // Keep touching the same fragment to refresh last_touch…
+        let mut now = 0;
+        while now < fragment::STREAM_MAX_LIFETIME_MS {
+            now += fragment::STREAM_IDLE_TIMEOUT_MS / 2;
+            let _ = r.add([0x44; 8], &first, now);
+        }
+        r.sweep(now);
+        assert_eq!(
+            r.stored_chunks(),
+            0,
+            "refreshing must not extend a stream past the absolute lifetime"
+        );
+    }
+
+    /// A protected (recently active) stream survives eviction pressure; the
+    /// attacker's own parked buckets are what get evicted once they age.
+    #[test]
+    fn active_stream_survives_eviction_pressure() {
+        let mut r = fragment::Reassembler::new();
+        // The victim's stream starts first (oldest start time)…
+        let victim = [0x77; 8];
+        let chunks: Vec<&[u8]> = b"legitimate payload".chunks(6).collect();
+        let total = chunks.len() as u16;
+        let frags: Vec<fragment::Fragment> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| fragment::Fragment {
+                fragment_id: [0x55; 8],
+                index: i as u16,
+                total,
+                original_type: msg_type::MESSAGE,
+                chunk: c.to_vec(),
+            })
+            .collect();
+        assert!(r.add(victim, &frags[0], 100).is_none());
+        // …then the attacker parks MAX_BUCKETS - 1 streams (table now full).
+        park_streams(&mut r, fragment::MAX_BUCKETS - 1, 200);
+        // While everything is fresh a newcomer is refused (bounded stall)…
+        let [first, second] = two_part_stream(0xC3);
+        assert!(r.add([0x33; 8], &first, 400).is_none());
+        // …and the victim keeps transmitting, refreshing its bucket.
+        let refresh = 200 + fragment::STREAM_EVICT_PROTECT_MS;
+        assert!(r.add(victim, &frags[1], refresh).is_none());
+        // Now the attacker's parked buckets are past the protect window while
+        // the victim's is fresh: the newcomer evicts a PARKED bucket.
+        let now = refresh + 50;
+        assert!(r.add([0x33; 8], &first, now).is_none());
+        assert!(r.add([0x33; 8], &second, now).is_some());
+        // The victim's stream still completes.
+        let done = r
+            .add(victim, &frags[2], now + 50)
+            .expect("an actively transmitting stream must survive table pressure");
+        assert_eq!(done, b"legitimate payload".to_vec());
+    }
+
+    /// Doze recovery must not resurrect the dead: a freeze re-seeds streams
+    /// that were LIVE when we froze, but a bucket already parked past its
+    /// bounds before the freeze must still expire. Stamping every bucket to
+    /// `now` (the first cut) let an attacker's parked streams outlive both
+    /// the idle timeout and the absolute lifetime on any host whose ticks
+    /// Doze suppresses — i.e. every Android phone in a pocket.
+    #[test]
+    fn reseed_shifts_ages_instead_of_resurrecting_parked_streams() {
+        let mut r = fragment::Reassembler::new();
+        // Parked long ago, already past the idle timeout when we froze.
+        park_streams(&mut r, 4, 0);
+        // A stream that was live moments before the freeze.
+        let [first, second] = two_part_stream(0xE5);
+        let live_at = fragment::STREAM_IDLE_TIMEOUT_MS;
+        assert!(r.add([0x55; 8], &first, live_at).is_none());
+
+        // Freeze, then resume: the gap is OUR downtime.
+        let gap = 5 * fragment::STREAM_IDLE_TIMEOUT_MS;
+        let now = live_at + gap;
+        r.reseed(gap, now);
+
+        r.sweep(now);
+        assert_eq!(
+            r.stored_chunks(),
+            1,
+            "only the pre-freeze-live stream survives; parked ones still expire"
+        );
+        // And the survivor can still complete.
+        assert!(r.add([0x55; 8], &second, now + 10).is_some());
+    }
+
+    /// iOS `assemblyLimit` mirror: a stream whose cumulative bytes exceed a
+    /// maximal framed file is hostile — the whole bucket is dropped, not
+    /// buffered further.
+    #[test]
+    fn stream_exceeding_the_byte_cap_is_dropped() {
+        let mut r = fragment::Reassembler::new();
+        let chunk = vec![0u8; 200_000];
+        let total = 8u16;
+        let mut admitted = 0;
+        for i in 0..total {
+            let f = fragment::Fragment {
+                fragment_id: [0xAB; 8],
+                index: i,
+                total,
+                original_type: msg_type::MESSAGE,
+                chunk: chunk.clone(),
+            };
+            if r.add([0x66; 8], &f, 0).is_none() && r.stored_chunks() == 0 && i > 0 {
+                break;
+            }
+            admitted += 1;
+        }
+        assert!(
+            (admitted as usize) * 200_000 <= fragment::MAX_STREAM_BYTES,
+            "admitted {admitted} chunks — cap must fire before exceeding MAX_STREAM_BYTES"
+        );
+        assert_eq!(
+            r.stored_chunks(),
+            0,
+            "an over-cap stream is dropped wholesale, not kept partially"
+        );
+    }
+
+    /// #416 secondary amplification: a single ~14-byte fragment claiming
+    /// `total = MAX_FRAGMENTS` must not reserve thousands of slots. Storage is
+    /// sparse — one stored chunk per fragment actually received.
+    #[test]
+    fn forged_total_does_not_preallocate() {
+        let mut r = fragment::Reassembler::new();
+        let evil = fragment::Fragment {
+            fragment_id: [0xDD; 8],
+            index: 0,
+            total: fragment::MAX_FRAGMENTS,
+            original_type: msg_type::MESSAGE,
+            chunk: vec![0u8; 4],
+        };
+        assert!(r.add([0x44; 8], &evil, 0).is_none());
+        assert_eq!(
+            r.stored_chunks(),
+            1,
+            "sparse storage: memory tracks received fragments, not claimed total"
+        );
     }
 }

@@ -639,6 +639,14 @@ impl Engine {
         self.handle_packet(Origin::Server(conn.to_string()), bytes, now_ms)
     }
 
+    /// Bytes held by in-flight fragment reassembly. Diagnostics and call-site
+    /// tests for the #416 bounds — the engine owns the reassembler, so a test
+    /// that pins expiry has to observe it through here rather than reaching
+    /// into the helper.
+    pub fn buffered_fragment_bytes(&self) -> usize {
+        self.reassembler.buffered_bytes()
+    }
+
     // ── Tick: heartbeat + liveness ──
 
     pub fn on_tick(&mut self, now_ms: u64) -> Output {
@@ -649,6 +657,7 @@ impl Engine {
             now_ms.saturating_sub(self.last_tick_ms)
         };
         let resumed_from_gap = self.last_tick_ms != 0 && gap >= SWEEP_RESUME_GAP_MS;
+        let first_tick = self.last_tick_ms == 0;
         self.last_tick_ms = now_ms;
 
         if (!self.links.is_empty() || !self.server_conns.is_empty())
@@ -668,7 +677,34 @@ impl Engine {
             for s in self.server_conns.values_mut() {
                 s.last_rx_ms = now_ms;
             }
+            // A file transfer that was mid-flight when we froze must not be
+            // swept for OUR downtime — re-stamp its buckets like the links.
+            self.reassembler.reseed(gap, now_ms);
+            // Sweep on this path too. `reseed` already shifted the IDLE clocks
+            // past our downtime, so this cannot kill a transfer that was live
+            // when we froze; what it does still enforce is the absolute
+            // lifetime, whose `created_ms` reseed deliberately leaves alone.
+            // Without it, a device where EVERY tick is a resume tick — Android
+            // Doze defers the `postDelayed` tick to maintenance windows spaced
+            // well past SWEEP_RESUME_GAP_MS — would never expire a parked
+            // stream at all, which is the leak #416 is about.
+            self.reassembler.sweep(now_ms);
             return out;
+        }
+
+        // Parked reassembly streams release their memory on the tick rather
+        // than waiting for the bucket table to fill (#416). Below the resume
+        // guard on purpose: sweeping with pre-doze timestamps would kill live
+        // transfers the moment the app thaws.
+        //
+        // The FIRST tick is exempt. `last_tick_ms == 0` means we have no gap to
+        // measure, so `resumed_from_gap` is false and we cannot tell a quiet
+        // 30s from a suspend we slept through — and Android delays the initial
+        // `onTick` by TICK_MS while receive callbacks already populate the
+        // reassembler, so a transfer interrupted across a cold start would be
+        // swept on sight. Reclamation just waits one tick.
+        if !first_tick {
+            self.reassembler.sweep(now_ms);
         }
 
         // Cull zombie links the stack never reported as disconnected: a stale
@@ -1320,7 +1356,7 @@ impl Engine {
             msg_type::NOISE_ENCRYPTED => self.handle_encrypted(origin, &packet, &mut out),
             msg_type::FRAGMENT => {
                 if let Some(frag) = mesh::fragment::Fragment::decode_payload(&packet.payload) {
-                    if let Some(full) = self.reassembler.add(packet.sender_id, &frag) {
+                    if let Some(full) = self.reassembler.add(packet.sender_id, &frag, now_ms) {
                         out.merge(self.handle_packet(origin, &full, now_ms));
                     }
                 }
@@ -2143,6 +2179,131 @@ mod tests {
 
     fn fp_of(e: &Engine) -> String {
         Engine::fingerprint_of(&e.noise_public_hex)
+    }
+
+    /// #416 at the REAL call site (Regression Invariant Rule: pin the call
+    /// site, not the helper): fragments flow through `handle_packet` with the
+    /// engine clock, a doze gap mid-transfer RE-SEEDS the partial bucket
+    /// instead of sweeping it, and the transfer still completes after thaw.
+    /// Fails when the tick sweep runs above the resume guard, or when the
+    /// resume branch forgets the reassembler.
+    #[test]
+    fn fragmented_file_survives_a_doze_gap_at_the_call_site() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+        let media = vec![0x42; FRAGMENT_CHUNK_SIZE * 4];
+        let send = a
+            .send_file(&fp_of(&b), "mid", &media, "photo.jpg", "image/jpeg", 3_000)
+            .expect("media route");
+        let writes: Vec<Vec<u8>> = send
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::WriteLink { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(writes.len() > 2, "file must fragment for this test");
+
+        // All but the last fragment land, then the app freezes.
+        for w in &writes[..writes.len() - 1] {
+            let out = b.on_server_rx("droid", w, 3_000);
+            assert!(
+                !out.events
+                    .iter()
+                    .any(|e| matches!(e, AppEvent::FileReceived { .. })),
+                "file must not complete before its last fragment"
+            );
+        }
+        b.on_tick(3_100);
+        // Freeze long past both the resume-gap and the idle timeout. The
+        // resume tick re-seeds; the next regular tick sweeps against the
+        // re-seeded stamps and must keep the bucket.
+        let resume = 3_100 + SWEEP_RESUME_GAP_MS + mesh::fragment::STREAM_IDLE_TIMEOUT_MS;
+        b.on_tick(resume);
+        b.on_tick(resume + TICK_MS);
+
+        let out = b.on_server_rx("droid", writes.last().unwrap(), resume + TICK_MS + 10);
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, AppEvent::FileReceived { .. })),
+            "a transfer live before the freeze must complete after thaw, got {:?}",
+            out.events
+        );
+    }
+
+    /// #416 at the call site, the case the companion test above does NOT cover:
+    /// a device where EVERY tick is a resume tick. Android drives `on_tick`
+    /// from a `postDelayed` handler that Doze defers to maintenance windows
+    /// spaced well past `SWEEP_RESUME_GAP_MS`, so a pocketed phone never gets
+    /// the "next regular tick" the other test relies on. Parked streams must
+    /// still be reclaimed.
+    ///
+    /// Fails when the resume branch returns before `sweep` — the leak is
+    /// invisible to every test that mixes in one regular tick.
+    #[test]
+    fn parked_streams_are_reclaimed_when_every_tick_is_a_resume_tick() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+        let media = vec![0x42; FRAGMENT_CHUNK_SIZE * 4];
+        let send = a
+            .send_file(&fp_of(&b), "mid", &media, "photo.jpg", "image/jpeg", 3_000)
+            .expect("media route");
+        let writes: Vec<Vec<u8>> = send
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::WriteLink { bytes, .. } => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(writes.len() > 2, "file must fragment for this test");
+
+        // A partial transfer is parked: the sender stopped (out of range, or
+        // an attacker who never intends to finish).
+        for w in &writes[..writes.len() - 1] {
+            b.on_server_rx("droid", w, 3_000);
+        }
+        assert!(
+            b.buffered_fragment_bytes() > 0,
+            "the partial transfer must be buffered before the doze cycles"
+        );
+
+        // One ordinary tick while the bucket is still young: it seeds
+        // `last_tick_ms` (the very first tick has no gap to measure, so it is
+        // always a regular tick) and must NOT reclaim a fresh transfer.
+        b.on_tick(3_100);
+        assert!(
+            b.buffered_fragment_bytes() > 0,
+            "a transfer seconds old must survive an ordinary tick"
+        );
+
+        // From here every gap exceeds SWEEP_RESUME_GAP_MS, so every tick takes
+        // the resume branch — the pocketed-phone case. `reseed` keeps shifting
+        // the idle clock, so only the absolute lifetime (`created_ms`, which
+        // reseed deliberately leaves alone) can end this stream.
+        let mut now = 3_100u64;
+        for _ in 0..10 {
+            now += SWEEP_RESUME_GAP_MS + mesh::fragment::STREAM_IDLE_TIMEOUT_MS;
+            b.on_tick(now);
+        }
+        assert!(
+            now - 3_000 > mesh::fragment::STREAM_MAX_LIFETIME_MS,
+            "the doze cycles must run past the absolute lifetime for this test \
+             to mean anything"
+        );
+
+        assert_eq!(
+            b.buffered_fragment_bytes(),
+            0,
+            "a parked stream must be reclaimed even when every tick is a \
+             resume tick — Doze never delivers a regular one"
+        );
     }
 
     /// An announce is a self-contained signed packet, so anyone who overhears
