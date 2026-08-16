@@ -87,6 +87,55 @@ Two consequences worth knowing before reading simulation output:
   input fee) while `fees_sats` reports only the routing fee. Do not read that
   1-sat gap as a Breez-side discrepancy.
 
+## What the simulation could not have caught
+
+The harness above validated the engine thoroughly and still missed everything
+that only appears on a real device against a real Lightning wallet. Running the
+migration on a Pixel 10 (against the real account, 813 sats) found five
+defects, none of which the fake-mint simulation could reach:
+
+1. **The host boundary erased every error.** `HostMigrationSource` is a UniFFI
+   foreign trait, and it returned the flat `SonarFfiError`. A flat error cannot
+   be lifted *out* of a foreign trait: UniFFI aborts the whole outer call with
+   `Can't lift flat errors` and the Rust side never sees an `Err`. So
+   `plan_drain`'s existing `InsufficientFunds` step-down could not run, and a
+   whole-balance drain died on its first refusal. Fixed with a non-flat
+   `HostWalletError`. The simulation missed it because both wallets were
+   in-process Rust — no host boundary existed.
+2. **The controller was built during composition**, so opening the mint (and a
+   NUT-13 restore scan on a fresh store) blocked the UI thread.
+3. **`DisposableEffect` keyed on the controller closed the instance it had just
+   created**, producing `SonarMigration object has already been destroyed`.
+4. **Every host failure was flattened to "wallet not available"** and logged
+   nothing, which is what made 1–3 take several device cycles to tell apart.
+5. **`:composeApp:buildAndroidRustCore` reported `UP-TO-DATE`** after an engine
+   edit, so the APK shipped a stale `.so` and a real fix looked ineffective.
+   Force `core/build-android.sh`, and confirm the change reached the binary:
+   `strings …/jniLibs/arm64-v8a/libsonar_ffi.so | grep '<new string>'`.
+
+The lesson is not that the simulation was wasted — it caught value-conservation
+and settlement bugs cheaply and repeatably. It is that a fake-mint harness
+proves the *engine*, and nothing about the *seams*: the FFI boundary, the UI
+lifecycle, and the build pipeline each had a defect the engine tests could
+never see.
+
+## Minimum viable balance: 1,000 sats
+
+A migration below the swap floor cannot succeed at any amount. Breez Liquid
+pays Lightning through a Boltz submarine swap, and the live limits are:
+
+```sh
+curl -s https://api.boltz.exchange/v2/swap/submarine
+# L-BTC->BTC: min=1000  max=25000000  fees 0.1% + 19 sat miner
+# BTC->BTC:   min=25000
+```
+
+With 813 sats, every amount the engine tried (813 → 805 → 797 → 781 → 748) was
+under the floor. Breez reports this as `Cannot pay: not enough funds`, which
+reads like a fee-reserve problem and sends you chasing the wrong bug. **Budget
+≥ ~1,050 sats for any live test**, and check the limits endpoint before
+assuming a payment failure is ours.
+
 ## Known gap: the settlement watch has no timeout
 
 Freeze the destination mint after the melt (`docker pause sim-mint-dst` two
