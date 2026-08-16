@@ -13,6 +13,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * What a denied foreground-service start falls back to, per wake type (#203).
@@ -49,8 +51,9 @@ internal interface InlineFallbackEffects {
     /** Bounded reconnect + gap-recovery fetch. Returns whether it completed. */
     suspend fun syncMarmot(): Boolean
 
-    /** Titled notifications from local state. Returns how many were posted. */
-    suspend fun notifyUnread(): Int
+    /** Titled notifications from local state. Returns how many were posted.
+     *  [tryClaimPost] must succeed immediately before every posting side effect. */
+    suspend fun notifyUnread(tryClaimPost: () -> Boolean): Int
 
     /** Generic "you have a message" banner. */
     fun notifyGeneric()
@@ -142,7 +145,10 @@ internal object SonarPushInlineFallback {
         }
     }
 
-    internal suspend fun marmotBoundedSync(effects: InlineFallbackEffects) {
+    internal suspend fun marmotBoundedSync(
+        effects: InlineFallbackEffects,
+        notifyBudgetMs: Long = NOTIFY_BUDGET_MS,
+    ) {
         val synced = effects.syncMarmot()
         if (!effects.notificationsEnabled()) {
             Log.d(TAG, "Inline Marmot fallback done (synced=$synced), notifications disabled")
@@ -151,7 +157,36 @@ internal object SonarPushInlineFallback {
         // Even a cut-short sync has usually landed the pushed message locally;
         // prefer real titled notifications and degrade only when nothing is
         // unread AND the sync was cut short (same policy as the service).
-        val notified = effects.notifyUnread()
+        // conversationSummaries() is a blocking UniFFI call, so the timeout
+        // must await an orphan rather than own the work as a child. Cancelling
+        // the orphan stops later suspensions; the gate is what prevents the
+        // blocking call from posting after this path has degraded to generic.
+        val gaveUp = AtomicBoolean(false)
+        val claimedPosts = AtomicInteger(0)
+        val postGateLock = Any()
+        val job = scope.async {
+            effects.notifyUnread {
+                synchronized(postGateLock) {
+                    if (gaveUp.get()) {
+                        false
+                    } else {
+                        // Claim before the actual post. If the budget expires
+                        // between this gate and Notifier.notify, the fallback
+                        // sees the claim and does not add a generic duplicate.
+                        claimedPosts.incrementAndGet()
+                        true
+                    }
+                }
+            }
+        }
+        val notified = withTimeoutOrNull(notifyBudgetMs) { job.await() } ?: run {
+            val postsBeforeTimeout = synchronized(postGateLock) {
+                gaveUp.set(true)
+                claimedPosts.get()
+            }
+            job.cancel()
+            postsBeforeTimeout
+        }
         when {
             notified > 0 ->
                 Log.d(TAG, "Inline Marmot fallback: notified $notified conversation(s) (synced=$synced)")
@@ -175,20 +210,15 @@ internal object SonarPushInlineFallback {
             return withTimeoutOrNull(SYNC_BUDGET_MS) { job.await() } == true
         }
 
-        override suspend fun notifyUnread(): Int {
-            // Bounded by an orphan await: conversationSummaries() is a blocking
-            // UniFFI call, so a child timeout could not cut it short.
-            val job = scope.async {
-                runCatching {
-                    SonarWakeNotifications.notifyUnreadConversations(
-                        prefs = SonarPushPrefs.notificationPrefs(context),
-                        scope = scope,
-                        profileFetchBudgetMs = NOTIFY_BUDGET_MS / 2,
-                    )
-                }.getOrDefault(0)
-            }
-            return withTimeoutOrNull(NOTIFY_BUDGET_MS) { job.await() } ?: 0
-        }
+        override suspend fun notifyUnread(tryClaimPost: () -> Boolean): Int =
+            runCatching {
+                SonarWakeNotifications.notifyUnreadConversations(
+                    prefs = SonarPushPrefs.notificationPrefs(context),
+                    scope = scope,
+                    profileFetchBudgetMs = NOTIFY_BUDGET_MS / 2,
+                    tryClaimPost = tryClaimPost,
+                )
+            }.getOrDefault(0)
 
         override fun notifyGeneric() =
             SonarWakeNotifications.notifyFallback(SonarPushPrefs.notificationPrefs(context))
