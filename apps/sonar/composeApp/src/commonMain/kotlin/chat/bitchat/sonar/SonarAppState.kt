@@ -11190,10 +11190,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             val stickerRef = meshParseStickerContent(m.text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
+            val reply = m.replyTo?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                SonarReplyRef(parentId = it, preview = "")
+            }
             val msg = SonarMsg(
                 incomingId, m.peerId,
                 if (stickerRef != null) "" else m.text,
-                mine = false, m.tsSecs, stickerRef = stickerRef,
+                mine = false, m.tsSecs, stickerRef = stickerRef, reply = reply,
             )
             val chatId = meshChatId(m.peerId)
             if (stickerRef == null && SonarCore.callParseControl(m.text) != null) {

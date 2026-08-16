@@ -182,7 +182,7 @@ object MeshLink {
                 when (plain.firstOrNull()?.toInt()?.and(0xff)) {
                     MeshNoisePayload.PRIVATE_MESSAGE -> meshDecodePrivateMessage(plain)?.let { pm ->
                         sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
-                        rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
+                        rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000, pm.replyTo))
                     }
                     MeshNoisePayload.DELIVERED -> plain.copyOfRange(1, plain.size).decodeToString().takeIf(String::isNotEmpty)?.let { messageId ->
                         sonarLog("MeshLink", "RX delivery receipt from ${nameByFp[fp] ?: fp.take(8)} id=${messageId.take(12)}")

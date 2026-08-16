@@ -649,15 +649,17 @@ struct SNReplyChrome<Content: View>: View {
     var onJumpQuote: ((String) -> Void)? = nil
     @ViewBuilder var content: () -> Content
 
+    @Environment(\.layoutDirection) private var layoutDirection
     @State private var dragX: CGFloat = 0
     @State private var armed = false
     @State private var rowWidth: CGFloat = 0
 
     private var canSwipe: Bool { snCanReply(to: m) && onReply != nil }
     private var progress: CGFloat { SNSwipeReplyMetrics.iconAlpha(dragX) }
+    private var isLTR: Bool { layoutDirection == .leftToRight }
 
     var body: some View {
-        ZStack(alignment: .leading) {
+        ZStack(alignment: isLTR ? .leading : .trailing) {
             if canSwipe, progress > 0.05 {
                 SNIcon(name: .reply, size: 18, weight: 2.1)
                     .foregroundColor(SonarTheme.accent)
@@ -667,7 +669,7 @@ struct SNReplyChrome<Content: View>: View {
                         .interpolatingSpring(stiffness: 400, damping: 12),
                         value: armed
                     )
-                    .offset(x: 8 + SNSwipeReplyMetrics.iconOffset(dragX))
+                    .offset(x: (isLTR ? 1 : -1) * (8 + abs(SNSwipeReplyMetrics.iconOffset(dragX))))
                     .allowsHitTesting(false)
             }
             content()
@@ -702,11 +704,13 @@ struct SNReplyChrome<Content: View>: View {
                 guard canSwipe else { return }
                 let dx = value.translation.width
                 let dy = value.translation.height
-                guard abs(dx) >= abs(dy), dx > 0 else { return }
+                let towardReply = isLTR ? dx > 0 : dx < 0
+                guard abs(dx) >= abs(dy), towardReply else { return }
                 guard SNSwipeReplyMetrics.allowsStart(
                     localX: value.startLocation.x,
                     rowWidth: rowWidth,
-                    mine: m.mine
+                    mine: m.mine,
+                    ltr: isLTR
                 ) else { return }
                 dragX = dx
                 let nowArmed = SNSwipeReplyMetrics.isTriggered(dx)
@@ -723,9 +727,11 @@ struct SNReplyChrome<Content: View>: View {
                 let started = SNSwipeReplyMetrics.allowsStart(
                     localX: value.startLocation.x,
                     rowWidth: rowWidth,
-                    mine: m.mine
+                    mine: m.mine,
+                    ltr: isLTR
                 )
-                let triggered = canSwipe && started && SNSwipeReplyMetrics.isTriggered(value.translation.width)
+                let towardReply = isLTR ? value.translation.width > 0 : value.translation.width < 0
+                let triggered = canSwipe && started && towardReply && SNSwipeReplyMetrics.isTriggered(value.translation.width)
                 withAnimation(.easeOut(duration: 0.2)) {
                     dragX = 0
                     armed = false

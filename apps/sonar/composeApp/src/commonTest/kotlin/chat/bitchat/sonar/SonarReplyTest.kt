@@ -64,6 +64,12 @@ class SonarReplyTest {
         assertFalse(sonarSwipeReplyAllowsStart(localX = 360f, rowWidth = 400f, mine = false, edgeGuardPx = 24f))
         assertTrue(sonarSwipeReplyAllowsStart(localX = 320f, rowWidth = 400f, mine = true, edgeGuardPx = 24f))
         assertFalse(sonarSwipeReplyAllowsStart(localX = 40f, rowWidth = 400f, mine = true, edgeGuardPx = 24f))
+        assertFalse(sonarSwipeReplyAllowsStart(localX = 390f, rowWidth = 400f, mine = false, edgeGuardPx = 24f, ltr = false))
+        assertTrue(sonarSwipeReplyAllowsStart(localX = 360f, rowWidth = 400f, mine = false, edgeGuardPx = 24f, ltr = false))
+        assertFalse(sonarSwipeReplyAllowsStart(localX = 40f, rowWidth = 400f, mine = false, edgeGuardPx = 24f, ltr = false))
+        assertTrue(sonarSwipeReplyAllowsStart(localX = 80f, rowWidth = 400f, mine = true, edgeGuardPx = 24f, ltr = false))
+        assertEquals(32f, sonarSwipeReplySignedOffset(32f, ltr = true))
+        assertEquals(-32f, sonarSwipeReplySignedOffset(32f, ltr = false))
     }
 
     @Test
@@ -80,6 +86,34 @@ class SonarReplyTest {
         assertEquals(
             "Message",
             sonarResolvedReplyPreview(reply, parentContent = "  ", fallback = "Message"),
+        )
+        assertEquals(
+            "Payment",
+            sonarResolvedReplyPreview(
+                reply.copy(preview = "⚡PAY|1|abc|21"),
+                parentContent = "⚡PAY|1|abc|21",
+                fallback = "Message",
+                typedPreview = "Payment",
+            ),
+        )
+        assertEquals(
+            "Message",
+            sonarResolvedReplyPreview(
+                reply.copy(preview = "⚡PAY|1|abc|21"),
+                parentContent = "⚡PAY|1|abc|21",
+                fallback = "Message",
+            ),
+        )
+        assertEquals(
+            "Payment",
+            sonarTypedReplyPreview(
+                SonarMsgClass.PayReceipt("abc", 21),
+                hasSticker = false,
+                hasMedia = false,
+                paymentLabel = "Payment",
+                photoLabel = "Photo",
+                stickerLabel = "Sticker",
+            ),
         )
     }
 }

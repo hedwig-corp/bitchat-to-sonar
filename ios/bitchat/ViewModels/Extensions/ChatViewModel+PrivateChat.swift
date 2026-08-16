@@ -28,6 +28,11 @@ extension ChatViewModel {
     /// - Note: Automatically establishes Noise encryption if not already active
     @MainActor
     func sendPrivateMessage(_ content: String, to peerID: PeerID) {
+        sendPrivateMessage(content, to: peerID, replyTo: nil)
+    }
+
+    @MainActor
+    func sendPrivateMessage(_ content: String, to peerID: PeerID, replyTo: String?) {
         guard !content.isEmpty else { return }
         
         // Check if blocked
@@ -83,7 +88,8 @@ extension ChatViewModel {
             recipientNickname: recipientNickname,
             senderPeerID: meshService.myPeerID,
             mentions: nil,
-            deliveryStatus: .sending
+            deliveryStatus: .sending,
+            replyTo: replyTo
         )
         
         // Add to local chat
@@ -100,7 +106,7 @@ extension ChatViewModel {
             #if DEBUG
             appendBleDebugReport("send text message=\(messageID) peer=\(peerID.id)")
             #endif
-            messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
+            messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID, replyTo: replyTo)
             // Optimistically mark as sent for both transports; delivery/read will update subsequently
             if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
                 privateChats[peerID]?[idx].deliveryStatus = .sent
@@ -242,7 +248,8 @@ extension ChatViewModel {
             recipientNickname: nickname,
             senderPeerID: convKey,
             receivedViaInternet: true,
-            deliveryStatus: .delivered(to: nickname, at: Date())
+            deliveryStatus: .delivered(to: nickname, at: Date()),
+            replyTo: pm.replyTo
         )
         
         if privateChats[convKey] == nil {
@@ -858,7 +865,8 @@ extension ChatViewModel {
             recipientNickname: nickname,
             senderPeerID: targetPeerID,
             receivedViaInternet: true,
-            deliveryStatus: .delivered(to: nickname, at: Date())
+            deliveryStatus: .delivered(to: nickname, at: Date()),
+            replyTo: pm.replyTo
         )
         
         addMessageToPrivateChatsIfNeeded(message, targetPeerID: targetPeerID)

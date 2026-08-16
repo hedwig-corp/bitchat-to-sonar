@@ -116,13 +116,13 @@ final class NostrTransport: Transport, @unchecked Sendable {
     // Public broadcast not supported over Nostr here
     func sendMessage(_ content: String, mentions: [String]) { /* no-op */ }
 
-    func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
+    func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String, replyTo: String?) {
         Task { @MainActor in
             guard let recipientNpub = resolveRecipientNpub(for: peerID),
                   let recipientHex = npubToHex(recipientNpub),
                   let senderIdentity = try? idBridge.getCurrentNostrIdentity() else { return }
             SecureLogger.debug("NostrTransport: preparing PM to \(recipientNpub.prefix(16))… id=\(messageID.prefix(8))…", category: .session)
-            guard let embedded = NostrEmbeddedBitChat.encodePMForNostr(content: content, messageID: messageID, recipientPeerID: peerID, senderPeerID: senderPeerID) else {
+            guard let embedded = NostrEmbeddedBitChat.encodePMForNostr(content: content, messageID: messageID, recipientPeerID: peerID, senderPeerID: senderPeerID, replyTo: replyTo) else {
                 SecureLogger.error("NostrTransport: failed to embed PM packet", category: .session)
                 return
             }

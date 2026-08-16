@@ -28,6 +28,8 @@ final class BitchatMessage: Codable {
     let receivedViaInternet: Bool?
     let mentions: [String]?  // Array of mentioned nicknames
     var deliveryStatus: DeliveryStatus? // Delivery tracking
+    /// Mesh TLV 0x04/0x05 parent id. Optional so older MessageStore JSON still decodes.
+    let replyTo: String?
     
     // Cached formatted text (not included in Codable)
     private var _cachedFormattedText: [String: AttributedString] = [:]
@@ -44,7 +46,7 @@ final class BitchatMessage: Codable {
     enum CodingKeys: String, CodingKey {
         case id, sender, content, timestamp, isRelay, originalSender
         case isPrivate, recipientNickname, senderPeerID, receivedViaInternet
-        case mentions, deliveryStatus
+        case mentions, deliveryStatus, replyTo
     }
     
     init(
@@ -59,7 +61,8 @@ final class BitchatMessage: Codable {
         senderPeerID: PeerID? = nil,
         receivedViaInternet: Bool? = nil,
         mentions: [String]? = nil,
-        deliveryStatus: DeliveryStatus? = nil
+        deliveryStatus: DeliveryStatus? = nil,
+        replyTo: String? = nil
     ) {
         self.id = id ?? UUID().uuidString
         self.sender = sender
@@ -73,6 +76,7 @@ final class BitchatMessage: Codable {
         self.receivedViaInternet = receivedViaInternet
         self.mentions = mentions
         self.deliveryStatus = deliveryStatus ?? (isPrivate ? .sending : nil)
+        self.replyTo = replyTo
     }
 }
 
@@ -91,7 +95,8 @@ extension BitchatMessage: Equatable {
                lhs.senderPeerID == rhs.senderPeerID &&
                lhs.receivedViaInternet == rhs.receivedViaInternet &&
                lhs.mentions == rhs.mentions &&
-               lhs.deliveryStatus == rhs.deliveryStatus
+               lhs.deliveryStatus == rhs.deliveryStatus &&
+               lhs.replyTo == rhs.replyTo
     }
 }
 

@@ -3180,7 +3180,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                     isPrivate: true,
                     recipientNickname: nickname,
                     senderPeerID: peerID,
-                    mentions: pmMentions.isEmpty ? nil : pmMentions
+                    mentions: pmMentions.isEmpty ? nil : pmMentions,
+                    replyTo: pm.replyTo
                 )
                 handlePrivateMessage(msg)
                 // Send delivery ACK back over BLE

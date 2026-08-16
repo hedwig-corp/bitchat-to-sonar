@@ -419,9 +419,10 @@ enum SNSwipeReplyMetrics {
     static let edgeGuard: CGFloat = 20
 
     static func bubbleOffset(_ raw: CGFloat) -> CGFloat {
-        let x = max(0, raw)
-        if x <= trigger { return x }
-        return trigger + (x - trigger) / 4
+        let sign: CGFloat = raw < 0 ? -1 : 1
+        let x = abs(raw)
+        if x <= trigger { return sign * x }
+        return sign * (trigger + (x - trigger) / 4)
     }
 
     static func iconOffset(_ raw: CGFloat) -> CGFloat {
@@ -429,44 +430,106 @@ enum SNSwipeReplyMetrics {
     }
 
     static func iconAlpha(_ raw: CGFloat) -> CGFloat {
-        min(1, max(0, raw / trigger))
+        min(1, max(0, abs(raw) / trigger))
     }
 
     static func isTriggered(_ raw: CGFloat) -> Bool {
-        raw >= trigger
+        abs(raw) >= trigger
     }
 
-    static func allowsStart(localX: CGFloat, rowWidth: CGFloat, mine: Bool) -> Bool {
-        if localX < edgeGuard { return false }
+    static func allowsStart(localX: CGFloat, rowWidth: CGFloat, mine: Bool, ltr: Bool = true) -> Bool {
         guard rowWidth > 0 else { return true }
-        if mine { return localX > rowWidth * 0.22 }
-        return localX < rowWidth * 0.82
+        if ltr {
+            if localX < edgeGuard { return false }
+            if mine { return localX > rowWidth * 0.22 }
+            return localX < rowWidth * 0.82
+        }
+        if localX > rowWidth - edgeGuard { return false }
+        if mine { return localX < rowWidth * 0.78 }
+        return localX > rowWidth * 0.18
     }
 }
 
 func snReplyRef(
     from message: MarmotService.MarmotMessage,
-    parentPreviewById: [String: String] = [:],
+    parents: [MarmotService.MarmotMessage] = [],
     parentAuthorById: [String: String] = [:]
 ) -> SNReplyRef? {
     guard let r = message.reply else { return nil }
     let snapshot = (r.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    let parentText = parentPreviewById[r.parentId]
+    let parent = parents.first { $0.id.caseInsensitiveCompare(r.parentId) == .orderedSame }
     return SNReplyRef(
         parentId: r.parentId,
         parentNpub: r.parentNpub,
         author: parentAuthorById[r.parentId],
-        preview: snResolvedReplyPreview(snapshot: snapshot, parentText: parentText)
+        preview: snResolvedReplyPreview(
+            snapshot: snapshot,
+            parentText: parent?.content,
+            typed: parent.flatMap(snTypedReplyPreview(from:))
+        )
     )
 }
 
-/// Signal-style quote text: prefer the denormalized snapshot, else the local
-/// parent body, else the generic fallback.
-func snResolvedReplyPreview(snapshot: String, parentText: String?) -> String {
+func snMeshReplyRef(from message: BitchatMessage, parents: [BitchatMessage]) -> SNReplyRef? {
+    guard let parentId = message.replyTo?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !parentId.isEmpty
+    else { return nil }
+    let parent = parents.first { $0.id == parentId }
+    let body = parent?.content ?? ""
+    let typed = snTypedReplyPreview(
+        pay: body.hasPrefix("⚡PAY"),
+        sticker: meshParseStickerContent(content: body) != nil,
+        media: body.hasPrefix("[image] ") || body.hasPrefix("[voice] ") || body.hasPrefix("[file] ")
+    )
+    return SNReplyRef(
+        parentId: parentId,
+        parentNpub: nil,
+        author: parent?.sender,
+        preview: snResolvedReplyPreview(snapshot: "", parentText: parent?.content, typed: typed)
+    )
+}
+
+func snLooksLikeProtocolPreview(_ text: String) -> Bool {
+    let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.hasPrefix("⚡PAY") || t.hasPrefix("☎")
+}
+
+func snTypedReplyPreview(from message: MarmotService.MarmotMessage) -> String? {
+    switch message.classification {
+    case .payReceipt, .payDone:
+        return String(localized: "chat.reply.payment", defaultValue: "Payment")
+    case .callControl:
+        return nil
+    case .text:
+        break
+    }
+    if message.stickerRef != nil {
+        return String(localized: "chat.reply.sticker", defaultValue: "Sticker")
+    }
+    if !message.media.isEmpty {
+        return String(localized: "chat.reply.photo", defaultValue: "Photo")
+    }
+    return nil
+}
+
+func snTypedReplyPreview(pay: Bool, sticker: Bool, media: Bool) -> String? {
+    if pay { return String(localized: "chat.reply.payment", defaultValue: "Payment") }
+    if sticker { return String(localized: "chat.reply.sticker", defaultValue: "Sticker") }
+    if media { return String(localized: "chat.reply.photo", defaultValue: "Photo") }
+    return nil
+}
+
+/// Signal-style quote text: typed host labels win over protocol snapshots.
+func snResolvedReplyPreview(snapshot: String, parentText: String?, typed: String? = nil) -> String {
+    if let typed, !typed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return String(typed.prefix(140))
+    }
     let snap = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !snap.isEmpty { return String(snap.prefix(140)) }
+    if !snap.isEmpty, !snLooksLikeProtocolPreview(snap) { return String(snap.prefix(140)) }
     let fromParent = (parentText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    if !fromParent.isEmpty { return String(fromParent.prefix(140)) }
+    if !fromParent.isEmpty, !snLooksLikeProtocolPreview(fromParent) {
+        return String(fromParent.prefix(140))
+    }
     return String(localized: "chat.reply.fallback", defaultValue: "Message")
 }
 
@@ -5794,9 +5857,6 @@ final class SonarAppStore: ObservableObject {
             let mentionCtx = mentionContext(forConversationId: id)
             for group in sourceGroups {
                 let groupMessages = marmot.messagesByGroup[group.id] ?? []
-                let parentPreviewById = Dictionary(
-                    uniqueKeysWithValues: groupMessages.map { ($0.id, $0.content) }
-                )
                 let parentAuthorById = Dictionary(
                     uniqueKeysWithValues: groupMessages.map {
                         (
@@ -5817,7 +5877,7 @@ final class SonarAppStore: ObservableObject {
                     if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
                     let reply = snReplyRef(
                         from: m,
-                        parentPreviewById: parentPreviewById,
+                        parents: groupMessages,
                         parentAuthorById: parentAuthorById
                     )
                     switch payMapping(m, fallbackVia: .internet) {
@@ -5869,13 +5929,15 @@ final class SonarAppStore: ObservableObject {
             }
             if !id.hasPrefix(Self.marmotIDPrefix), pendingMarmotNpub(for: id) == nil {
                 let my = chatViewModel.meshService.myPeerID
+                let meshMsgs = meshPrivateMessages(forConversationId: id)
                 dated += Self.transcriptSource(
-                    meshPrivateMessages(forConversationId: id),
+                    meshMsgs,
                     limit: limit,
                     newestOffset: meshNewestOffset
                 ).compactMap { m in
                     let mine = m.senderPeerID == my
                     let via = snMeshRowVia(receivedViaInternet: m.receivedViaInternet, default: .mesh)
+                    let reply = snMeshReplyRef(from: m, parents: meshMsgs)
                     switch payMapping(m.content, fallbackVia: via) {
                     case .hidden:
                         return nil
@@ -5887,7 +5949,8 @@ final class SonarAppStore: ObservableObject {
                             time: Self.clock(m.timestamp),
                             transcriptSourceID: SNConversationTranscriptSource.meshID,
                             via: via,
-                            trill: true
+                            trill: true,
+                            reply: reply
                         ))
                     case .bubble(let pay, let payVia):
                         return (m.timestamp, SNMessage(
@@ -5895,7 +5958,8 @@ final class SonarAppStore: ObservableObject {
                             time: Self.clock(m.timestamp),
                             transcriptSourceID: SNConversationTranscriptSource.meshID,
                             via: payVia,
-                            pay: pay
+                            pay: pay,
+                            reply: reply
                         ))
                     case .notPay:
                         let mediaItem = meshMediaItem(m.content)
@@ -5912,7 +5976,8 @@ final class SonarAppStore: ObservableObject {
                             via: via,
                             state: mine ? Self.stateText(m.deliveryStatus) : nil,
                             media: mediaItem.map { [$0] } ?? [],
-                            stickerRef: meshSticker
+                            stickerRef: meshSticker,
+                            reply: reply
                         ))
                     }
                 }
@@ -6129,7 +6194,7 @@ final class SonarAppStore: ObservableObject {
         // Route on the live BLE alias — canonical fold id may be a stale
         // fingerprint while the peer is connected under another Noise key.
         if let route = liveMeshRoutePeerId(for: id) {
-            chatViewModel.sendPrivateMessage(text, to: PeerID(str: route))
+            chatViewModel.sendPrivateMessage(text, to: PeerID(str: route), replyTo: reply?.parentId)
             return
         }
         if let groupId = marmotGroupId(id) {
@@ -6148,7 +6213,7 @@ final class SonarAppStore: ObservableObject {
             sendOverMarmot(text, npub: profile.npub, reply: marmotReply)
             return
         }
-        chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
+        chatViewModel.sendPrivateMessage(text, to: PeerID(str: id), replyTo: reply?.parentId)
     }
 
     /// Cancel an in-flight Blossom upload for an optimistic media bubble.

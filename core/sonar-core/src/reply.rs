@@ -141,6 +141,31 @@ pub fn truncate_preview(text: &str) -> String {
     out
 }
 
+/// Parent body that is safe to copy into a quote snapshot.
+///
+/// Pay/call/sticker/media rows are typed by the host (`Payment` / `Photo` /
+/// `Sticker`). Copying raw `content` here would flash `⚡PAY|…` after a page
+/// hydrate. Leave `preview` empty and let the host fill the type label.
+pub fn parent_content_for_preview<'a>(
+    classification: &crate::marmot::MessageClassification,
+    has_sticker: bool,
+    has_media: bool,
+    content: &'a str,
+) -> Option<&'a str> {
+    use crate::marmot::MessageClassification;
+    if !matches!(classification, MessageClassification::Text) {
+        return None;
+    }
+    if has_sticker || has_media {
+        return None;
+    }
+    let t = content.trim();
+    if t.is_empty() || t.starts_with("⚡PAY") || t.starts_with('☎') {
+        return None;
+    }
+    Some(t)
+}
+
 /// Fill a missing quote snapshot from a locally stored parent body.
 /// NIP-C7 does not carry preview text; Signal-style chips denormalize it here.
 pub fn hydrate_reply_preview(reply: &mut ReplyRef, parent_content: Option<&str>) {
@@ -259,5 +284,47 @@ mod tests {
         assert_eq!(reply.preview.as_deref(), Some("parent body"));
         hydrate_reply_preview(&mut reply, Some("ignored once filled"));
         assert_eq!(reply.preview.as_deref(), Some("parent body"));
+    }
+
+    #[test]
+    fn parent_content_for_preview_skips_typed_and_protocol_bodies() {
+        use crate::marmot::MessageClassification;
+        assert_eq!(
+            parent_content_for_preview(&MessageClassification::Text, false, false, " hello "),
+            Some("hello")
+        );
+        assert_eq!(
+            parent_content_for_preview(
+                &MessageClassification::PayReceipt {
+                    payment_id: "p".into(),
+                    amount_sats: 1,
+                },
+                false,
+                false,
+                "⚡PAY|1|p|1"
+            ),
+            None
+        );
+        assert_eq!(
+            parent_content_for_preview(
+                &MessageClassification::Text,
+                false,
+                false,
+                "⚡PAY|1|p|1"
+            ),
+            None
+        );
+        assert_eq!(
+            parent_content_for_preview(&MessageClassification::CallControl, false, false, "☎CALL|1"),
+            None
+        );
+        assert_eq!(
+            parent_content_for_preview(&MessageClassification::Text, true, false, "sticker"),
+            None
+        );
+        assert_eq!(
+            parent_content_for_preview(&MessageClassification::Text, false, true, "photo"),
+            None
+        );
     }
 }

@@ -4,9 +4,9 @@ import Foundation
 
 struct NostrEmbeddedBitChat {
     /// Build a `bitchat1:` base64url-encoded BitChat packet carrying a private message for Nostr DMs.
-    static func encodePMForNostr(content: String, messageID: String, recipientPeerID: PeerID, senderPeerID: PeerID) -> String? {
+    static func encodePMForNostr(content: String, messageID: String, recipientPeerID: PeerID, senderPeerID: PeerID, replyTo: String? = nil) -> String? {
         // TLV-encode the private message
-        let pm = PrivateMessagePacket(messageID: messageID, content: content)
+        let pm = PrivateMessagePacket(messageID: messageID, content: content, replyTo: replyTo)
         guard let tlv = pm.encode() else { return nil }
 
         // Prefix with NoisePayloadType

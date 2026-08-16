@@ -2724,7 +2724,7 @@ private fun ReplyDecorated(
         val author = if (m.mine) youLabel else state.groupAuthorName(m, isGroup) ?: peerName
         state.beginReply(chatId, m, replyPreview, author)
     }
-    val progress = sonarSwipeReplyProgress(offsetPx.value, triggerPx)
+    val progress = sonarSwipeReplyProgress(abs(offsetPx.value), triggerPx)
     Column(
         Modifier
             .fillMaxWidth()
@@ -2739,7 +2739,7 @@ private fun ReplyDecorated(
                 val ltr = layoutDirection == LayoutDirection.Ltr
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
-                    if (!sonarSwipeReplyAllowsStart(down.position.x, size.width.toFloat(), m.mine, edgeGuardPx)) {
+                    if (!sonarSwipeReplyAllowsStart(down.position.x, size.width.toFloat(), m.mine, edgeGuardPx, ltr)) {
                         return@awaitEachGesture
                     }
                     var rawDx = 0f
@@ -2771,7 +2771,10 @@ private fun ReplyDecorated(
                             rawDx = (rawDx + delta).coerceAtLeast(0f)
                             change.consume()
                         }
-                        offsetPx.value = sonarSwipeReplyBubbleOffset(rawDx, triggerPx, maxPx)
+                        offsetPx.value = sonarSwipeReplySignedOffset(
+                            sonarSwipeReplyBubbleOffset(rawDx, triggerPx, maxPx),
+                            ltr,
+                        )
                         if (!armed && sonarSwipeReplyTriggered(rawDx, triggerPx)) {
                             armed = true
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -2794,25 +2797,42 @@ private fun ReplyDecorated(
         val resolvedReply = if (sonarReplyUiEnabled() && reply != null) {
             val fallback = stringResource(Res.string.chat_reply_fallback)
             val parent = state.messages.firstOrNull { it.id.equals(reply.parentId, ignoreCase = true) }
+            val paymentLabel = stringResource(Res.string.chat_reply_payment)
+            val photoLabel = stringResource(Res.string.chat_reply_photo)
+            val stickerLabel = stringResource(Res.string.chat_reply_sticker)
+            val typed = parent?.let {
+                sonarTypedReplyPreview(
+                    it.classification,
+                    it.stickerRef != null,
+                    it.media.isNotEmpty(),
+                    paymentLabel,
+                    photoLabel,
+                    stickerLabel,
+                )
+            }
             reply.copy(
                 author = reply.author ?: parent?.let {
                     if (it.mine) youLabel else state.groupAuthorName(it, isGroup) ?: peerName
                 },
-                preview = sonarResolvedReplyPreview(reply, parent?.content, fallback),
+                preview = sonarResolvedReplyPreview(reply, parent?.content, fallback, typed),
             )
         } else null
         Box {
             if (canReply && progress > 0.05f) {
                 Box(
                     Modifier
-                        .align(Alignment.CenterStart)
-                        .padding(start = 8.dp)
+                        .align(if (layoutDirection == LayoutDirection.Ltr) Alignment.CenterStart else Alignment.CenterEnd)
+                        .padding(
+                            start = if (layoutDirection == LayoutDirection.Ltr) 8.dp else 0.dp,
+                            end = if (layoutDirection == LayoutDirection.Ltr) 0.dp else 8.dp,
+                        )
                         .graphicsLayer {
                             alpha = progress
                             val scale = 1f + 0.2f * progress
                             scaleX = scale
                             scaleY = scale
-                            translationX = iconTravelPx * progress
+                            val dir = if (layoutDirection == LayoutDirection.Ltr) 1f else -1f
+                            translationX = dir * iconTravelPx * progress
                         },
                 ) {
                     SNIcon(SNIconName.Reply, 18.dp, sonar.accent, weight = 2.1f)

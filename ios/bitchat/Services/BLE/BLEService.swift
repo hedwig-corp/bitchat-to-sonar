@@ -208,7 +208,7 @@ final class BLEService: NSObject {
     private let bleQueueKey = DispatchSpecificKey<Void>()
     
     // Queue for messages pending handshake completion
-    private var pendingMessagesAfterHandshake: [PeerID: [(content: String, messageID: String)]] = [:]
+    private var pendingMessagesAfterHandshake: [PeerID: [(content: String, messageID: String, replyTo: String?)]] = [:]
     // Noise typed payloads (ACKs, read receipts, etc.) pending handshake
     private var pendingNoisePayloadsAfterHandshake: [PeerID: [Data]] = [:]
     // Queue for notifications that failed due to full queue
@@ -948,12 +948,12 @@ final class BLEService: NSObject {
         sendMessage(content, mentions: mentions, to: nil, messageID: messageID, timestamp: timestamp)
     }
     
-    func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
+    func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String, replyTo: String? = nil) {
         guard let target = routingPeerID(for: peerID) else {
             SecureLogger.debug("Private BLE send has no routing peer for \(peerID.id.prefix(16))", category: .session)
             return
         }
-        sendPrivateMessage(content, to: target, messageID: messageID)
+        sendPrivateMessage(content, to: target, messageID: messageID, replyTo: replyTo)
     }
 
     /// Immediate BLE-only private send for real-time controls such as ☎CALL.
@@ -3741,7 +3741,7 @@ extension BLEService {
     
     // MARK: Private Message Handling
     
-    private func sendPrivateMessage(_ content: String, to recipientID: PeerID, messageID: String) {
+    private func sendPrivateMessage(_ content: String, to recipientID: PeerID, messageID: String, replyTo: String? = nil) {
         SecureLogger.debug("📨 Sending PM to \(recipientID): \(content.prefix(30))...", category: .session)
         
         // Check if we have an established Noise session
@@ -3749,7 +3749,7 @@ extension BLEService {
             // Encrypt and send
             do {
                 // Create TLV-encoded private message
-                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
+                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content, replyTo: replyTo)
                 guard let tlvData = privateMessage.encode() else {
                     SecureLogger.error("Failed to encode private message with TLV")
                     return
@@ -3805,7 +3805,7 @@ extension BLEService {
                 if pendingMessagesAfterHandshake[recipientID] == nil {
                     pendingMessagesAfterHandshake[recipientID] = []
                 }
-                pendingMessagesAfterHandshake[recipientID]?.append((content, messageID))
+                pendingMessagesAfterHandshake[recipientID]?.append((content, messageID, replyTo))
             }
             
             initiateNoiseHandshake(with: recipientID)
@@ -3893,7 +3893,7 @@ extension BLEService {
     
     private func sendPendingMessagesAfterHandshake(for peerID: PeerID) {
         // Atomically take all pending messages to process (prevents concurrent modification)
-        let pendingMessages = collectionsQueue.sync(flags: .barrier) { () -> [(content: String, messageID: String)]? in
+        let pendingMessages = collectionsQueue.sync(flags: .barrier) { () -> [(content: String, messageID: String, replyTo: String?)]? in
             let messages = pendingMessagesAfterHandshake[peerID]
             pendingMessagesAfterHandshake.removeValue(forKey: peerID)
             return messages
@@ -3904,16 +3904,16 @@ extension BLEService {
         SecureLogger.debug("📤 Sending \(messages.count) pending messages after handshake to \(peerID)", category: .session)
 
         // Track failed messages for re-queuing
-        var failedMessages: [(content: String, messageID: String)] = []
+        var failedMessages: [(content: String, messageID: String, replyTo: String?)] = []
 
         // Send each pending message directly (we know session is established)
-        for (content, messageID) in messages {
+        for (content, messageID, replyTo) in messages {
             do {
                 // Use the same TLV format as normal sends to keep receiver decoding consistent
-                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
+                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content, replyTo: replyTo)
                 guard let tlvData = privateMessage.encode() else {
                     SecureLogger.error("Failed to encode pending private message TLV")
-                    failedMessages.append((content, messageID))
+                    failedMessages.append((content, messageID, replyTo))
                     continue
                 }
 
@@ -3943,7 +3943,7 @@ extension BLEService {
                 SecureLogger.debug("✅ Sent pending message \(messageID) to \(peerID) after handshake", category: .session)
             } catch {
                 SecureLogger.error("Failed to send pending message after handshake: \(error)")
-                failedMessages.append((content, messageID))
+                failedMessages.append((content, messageID, replyTo))
 
                 // Notify delegate of failure
                 notifyUI { [weak self] in

@@ -129,10 +129,38 @@ fun sonarSwipeReplyAllowsStart(
     rowWidth: Float,
     mine: Boolean,
     edgeGuardPx: Float,
+    ltr: Boolean = true,
 ): Boolean {
-    if (localX < edgeGuardPx) return false
     if (rowWidth <= 0f) return true
-    return if (mine) localX > rowWidth * 0.22f else localX < rowWidth * 0.82f
+    if (ltr) {
+        if (localX < edgeGuardPx) return false
+        return if (mine) localX > rowWidth * 0.22f else localX < rowWidth * 0.82f
+    }
+    if (localX > rowWidth - edgeGuardPx) return false
+    return if (mine) localX < rowWidth * 0.78f else localX > rowWidth * 0.18f
+}
+
+fun sonarSwipeReplySignedOffset(magnitude: Float, ltr: Boolean): Float =
+    if (ltr) magnitude else -magnitude
+
+fun sonarLooksLikeProtocolPreview(text: String): Boolean {
+    val t = text.trim()
+    return t.startsWith("⚡PAY") || t.startsWith("☎")
+}
+
+fun sonarTypedReplyPreview(
+    classification: SonarMsgClass?,
+    hasSticker: Boolean,
+    hasMedia: Boolean,
+    paymentLabel: String,
+    photoLabel: String,
+    stickerLabel: String,
+): String? = when {
+    classification is SonarMsgClass.PayReceipt || classification is SonarMsgClass.PayDone -> paymentLabel
+    classification is SonarMsgClass.CallControl -> null
+    hasSticker -> stickerLabel
+    hasMedia -> photoLabel
+    else -> null
 }
 
 fun sonarCanEmitNipC7(parentId: String, parentNpub: String?): Boolean {
@@ -146,11 +174,15 @@ fun sonarResolvedReplyPreview(
     reply: SonarReplyRef,
     parentContent: String?,
     fallback: String,
+    typedPreview: String? = null,
 ): String {
+    typedPreview?.trim()?.takeIf { it.isNotEmpty() }?.let { return it.take(140) }
     val snapshot = reply.preview.trim()
-    if (snapshot.isNotEmpty()) return snapshot.take(140)
+    if (snapshot.isNotEmpty() && !sonarLooksLikeProtocolPreview(snapshot)) return snapshot.take(140)
     val fromParent = parentContent?.trim().orEmpty()
-    if (fromParent.isNotEmpty()) return fromParent.take(140)
+    if (fromParent.isNotEmpty() && !sonarLooksLikeProtocolPreview(fromParent)) {
+        return fromParent.take(140)
+    }
     return fallback
 }
 

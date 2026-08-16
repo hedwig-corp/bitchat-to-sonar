@@ -766,11 +766,23 @@ impl Engine {
         text: &str,
         now_ms: u64,
     ) -> Option<Output> {
+        self.send_text_with_reply(fingerprint, message_id, text, None, now_ms)
+    }
+
+    /// Same as [`send_text`], with an optional parent message id (TLV 0x04).
+    pub fn send_text_with_reply(
+        &mut self,
+        fingerprint: &str,
+        message_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        now_ms: u64,
+    ) -> Option<Output> {
         if !self.fp_allowed(fingerprint) {
             return None;
         }
         let mut out = Output::default();
-        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
+        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out, reply_to) {
             return None;
         }
         Some(out)
@@ -790,7 +802,7 @@ impl Engine {
         }
         let route = self.sendable_route(fingerprint)?;
         let mut out = self.discovery_to_route(&route, now_ms);
-        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
+        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out, None) {
             return None;
         }
         Some(out)
@@ -1198,6 +1210,7 @@ impl Engine {
         text: &str,
         now_ms: u64,
         out: &mut Output,
+        reply_to: Option<&str>,
     ) -> bool {
         let Some(route) = self.sendable_route(fingerprint) else {
             return false;
@@ -1211,7 +1224,10 @@ impl Engine {
         let pm = mesh::PrivateMessage {
             message_id: message_id.to_string(),
             content: text.to_string(),
-            reply_to: None,
+            reply_to: reply_to
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
         let Some(plain) = mesh::encode_private_message_plaintext(&pm) else {
             return false;

@@ -2272,8 +2272,18 @@ fn overlay_reply_preview(incoming: Incoming, reply: Option<&ReplyTo>) -> Incomin
 /// Denormalize quote chip text from other rows in the same bounded local page.
 /// NIP-C7 does not carry a preview; never full-scan the group to fill one.
 fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
-    let by_id: HashMap<EventId, String> =
-        msgs.iter().map(|m| (m.id, m.content.clone())).collect();
+    let by_id: HashMap<EventId, String> = msgs
+        .iter()
+        .filter_map(|m| {
+            crate::reply::parent_content_for_preview(
+                &m.classification,
+                m.sticker_ref.is_some(),
+                !m.media.is_empty(),
+                &m.content,
+            )
+            .map(|t| (m.id, t.to_string()))
+        })
+        .collect();
     for m in msgs.iter_mut() {
         let Some(reply) = m.reply.as_mut() else { continue };
         crate::reply::hydrate_reply_preview(reply, by_id.get(&reply.parent_id).map(String::as_str));
