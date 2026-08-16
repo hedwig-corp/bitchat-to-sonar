@@ -190,10 +190,46 @@ Non-blocking: missing dSYM for `breez_sdk_liquidFFI` (tracked separately).
   first — **wipes app data**. Serial used historically: `61020DLCH008PZ` (Pixel 10 Pro).
 - **iPhone**: Release install via `devicectl` / Xcode; keep team `ZQB239SHCM`.
 
-## Tester note
+## Required output: tester note
 
-After Apple upload, offer a short paste-ready note from `ios/TestFlight/WhatToTest.md`
-(headline + 5–8 try bullets + crash/diagnostics priority).
+After a successful Apple upload (or at the end of any full/Apple-only cut),
+**always** paste a tester note in the chat as a first-class deliverable — same
+priority as the release URL table. Do not wait for the user to ask.
+
+### Sources
+
+1. `ios/TestFlight/WhatToTest.md` (build line + headline you wrote in the bump)
+2. `git log <prev-tag>..HEAD --oneline` for the cut (or commits since last Apple bump)
+3. GitHub release notes if already drafted
+
+### Format (paste-ready)
+
+```markdown
+**Sonar <MARKETING> (<BUILD>) — Apple TestFlight · <tag> (<pre-next if any>)**
+
+<One sentence: cautious cut / hotfix and what it sits on.>
+
+**Please try**
+- **<Headline feature>** — <how to exercise it in 1 line>
+- <5–8 more concrete try bullets; prefer user actions over PR numbers>
+- Background / lock / push-wake — watch for crashes while locked or right after wake
+- Open an existing chat — paints from local history first (not blank / spinner)
+
+**Highest priority:** crash on launch, while locked, or right after send / photo /
+payment / reply. If sync feels wrong or a message is missing: **Settings →
+Diagnostics → Share** and send the log.
+
+**<Optional Note:>** known gaps / platform follow-ups (one line).
+```
+
+Rules:
+- Lead with marketing + build + tag (e.g. `1.13.1 (42)` · `v0.1-alpha.13.1`)
+- Prefer product language (“long-press → Reply”) over issue numbers
+- Keep to ~12–20 short lines so it pastes into TestFlight / chat
+- Android-only cuts: same shape, say **Android / Zapstore** instead of TestFlight
+- Also drop the note into GitHub release `--notes` under a `### What to test` section when creating the release (if you have not already)
+
+Example template with filled slots: [reference.md](reference.md#tester-note-example).
 
 ## Done checklist
 
@@ -202,6 +238,7 @@ After Apple upload, offer a short paste-ready note from `ios/TestFlight/WhatToTe
 - [ ] GitHub pre-release with phone + universal APKs
 - [ ] Zapstore `chat.bitchat.sonar@<versionName>` (if full Android cut)
 - [ ] TestFlight iOS + macOS uploaded (or Accounts blocker reported)
+- [ ] **Tester note pasted in chat** (and in GitHub notes when applicable)
 - [ ] No secrets in git, logs, or chat (SIGN_WITH / Breez / keystore passwords)
 
 ## Additional resources

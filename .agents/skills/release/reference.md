@@ -201,4 +201,39 @@ Cautious pre-alpha.(X+1) cut after …
 
 ### Headline
 - …
+
+### What to test
+Paste the same tester note produced for chat (see below).
+```
+
+## Tester note example
+
+Filled example from `v0.1-alpha.13.1` / Apple **1.13.1 (42)** — agents should
+regenerate from `WhatToTest.md` + changelog, not copy this blindly next cut:
+
+```markdown
+**Sonar 1.13.1 (42) — Apple TestFlight · v0.1-alpha.13.1 (pre-alpha.14)**
+
+Cautious cut after alpha.13. Please dogfood before we cut alpha.14.
+
+**Please try**
+- **Reply to a message** — long-press / hold a message → **Reply** → send. Your
+  message should show a quote snapshot of the parent (Signal-style).
+- **@mention** in a group — type `@` and pick someone by their Sonar name.
+- Open an existing chat — history should paint immediately from local storage
+  (not blank / spinner).
+- Background / lock the phone, get a push or wait, then reopen — watch for
+  crashes while locked or right after wake.
+- Push banners — shouldn’t double up when a message arrives.
+- Onboarding — long steps should scroll if content overflows.
+- Auto-backup — shouldn’t chew the data plan (no runaway upload).
+- Profile / kind-0 — republishing yourself shouldn’t wipe fields set by other
+  clients.
+
+**Highest priority:** crash on launch, while locked, or right after send /
+photo / payment / reply. If sync feels wrong or a message is missing:
+**Settings → Diagnostics → Share** and send the log.
+
+**Note:** Reply is for White Noise / relay messages in this build; mesh BLE
+reply is a follow-up.
 ```

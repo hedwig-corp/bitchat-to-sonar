@@ -1,4 +1,4 @@
 interface:
   display_name: "Sonar release"
   short_description: "Cut alpha / TestFlight / Zapstore releases"
-  default_prompt: "Use the release skill: fetch main, bump versions, ship Android+GitHub+Zapstore and iOS/macOS TestFlight in parallel."
+  default_prompt: "Use the release skill: fetch main, bump versions, ship Android+GitHub+Zapstore and iOS/macOS TestFlight in parallel, then paste the required tester note in chat."
