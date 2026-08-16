@@ -37138,6 +37138,30 @@
           }
         }
       }
+    },
+    "chat.reply.them" : {
+      "comment" : "Quoted-author fallback when the peer has no display name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Them"
+          }
+        }
+      }
+    },
+    "chat.reply.you" : {
+      "comment" : "Quoted-author label when the parent message is ours",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "You"
+          }
+        }
+      }
     }
 
   },

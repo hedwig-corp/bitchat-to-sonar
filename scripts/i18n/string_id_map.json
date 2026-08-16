@@ -178,6 +178,8 @@
   "chat.reply.payment": "chat_reply_payment",
   "chat.reply.photo": "chat_reply_photo",
   "chat.reply.sticker": "chat_reply_sticker",
+  "chat.reply.them": "chat_reply_them",
+  "chat.reply.you": "chat_reply_you",
   "close": "close_2",
   "cmd K": "cmd_k",
   "common.cancel": "common_cancel",
