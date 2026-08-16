@@ -1,16 +1,15 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.7 (35)** · release tag **v0.1-alpha.12.2**
+Build: **Sonar 1.13.1 (42)** · release tag **v0.1-alpha.13.1** (pre-alpha.14)
 
-Cut after alpha.12.1 + Apple hotfixes through 1.12.6, then 0xdead10cc round 6
-(abort a Marmot connect that holds the store when iOS suspends; close a store a
-background auto-backup reopened), restored group-invite link handoff/approval,
-backup stats carried into the live policy after a restore, short transcripts
-bottom-aligned and re-pinned on viewport shrink, and internet replies that only
-the chat list could see now surfaced in the transcript. Opening a chat should
-paint from local storage first; missed messages catch up in the background;
-payments and notifications should stay stable when the phone is locked or the
-app is killed.
+Cautious cut after alpha.13. Headline: **Signal-style reply-to-message**
+(White Noise NIP-C7). Also: @mention by Sonar name, bounded BLE reassembly,
+WAL-checkpoint skip on Marmot store drop, auto-backup data-plan cap, kind-0
+republish no longer wiping foreign profile fields, duplicate push banners
+fixed, scrollable onboarding, desktop no longer offers calls it can't make,
+mesh packet verify against pinned signing key, Android FCM foreground-service
+fallback. Opening a chat should paint from local storage first; missed
+messages catch up in the background.
 
 ## 1. Sync speed & catching up (headline)
 
