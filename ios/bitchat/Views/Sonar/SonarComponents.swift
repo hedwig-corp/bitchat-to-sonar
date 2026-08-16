@@ -570,8 +570,14 @@ struct SNMsgBubble: View {
     let maxBubbleWidth: CGFloat
     /// Tap another participant's name/bubble to open a private DM (channels).
     var onTapAuthor: ((SNMessage) -> Void)? = nil
+    /// Mentions decoded by the core for this row. Computed once when the row is
+    /// built and cached there — never per frame.
+    var mentions: SNMentionInfo = .empty
 
     @Environment(\.openURL) private var openURL
+    /// Tap a resolved `@mention` to open that member's profile. Injected by the
+    /// screen so no transcript host has to thread it down.
+    @Environment(\.snMentionTap) private var onTapMention
 
     private var mine: Bool { m.mine }
     /// Only other participants' names in a channel context are tappable.
@@ -579,12 +585,34 @@ struct SNMsgBubble: View {
     private var isExpanded: Bool { expandedMessageIDs.contains(m.id) }
     private var visibleText: String { isExpanded ? m.text : preview.text }
 
-    /// Message text with detected URLs turned into tappable, underlined links.
+    /// A mention of you is called out in the accent so it is findable by eye in
+    /// a busy group; mentions of other people read as plain references.
+    private var mentionColor: Color {
+        mentions.mentionsMe && !mine ? SonarTheme.accentDeep : bubbleText
+    }
+
+    /// Mention spans are offsets into the FULL message text, decoded at row
+    /// build. A collapsed long message renders `preview.text`, which is not just
+    /// a prefix — it is also whitespace-trimmed at both ends, so a message
+    /// starting with whitespace shifts every offset and would style the wrong
+    /// characters. Re-deriving spans here would mean an FFI call per frame, so
+    /// the truncated preview simply goes unstyled until it is expanded.
+    private var renderableMentions: [SNResolvedMention] {
+        guard !mentions.isEmpty else { return [] }
+        guard visibleText == m.text else { return [] }
+        return mentions.mentions
+    }
+
+    /// Message text with detected URLs turned into tappable, underlined links,
+    /// and `@mentions` styled + linked to the member they name.
     private var linkified: AttributedString {
         SonarMessageTextFormatter.attributedBubbleText(
             visibleText,
             baseColor: bubbleText,
             linkColor: mine ? bubbleText : SonarTheme.accentDeep,
+            mentionFont: renderableMentions.isEmpty ? nil : SonarTheme.uiFont(size: 16, weight: .semibold),
+            mentionColor: renderableMentions.isEmpty ? nil : mentionColor,
+            mentions: renderableMentions.isEmpty ? nil : renderableMentions,
             detectBareDomains: true,
             excludeLinkBeforeTrailingEllipsis: preview.isTruncated && !isExpanded
         )
@@ -658,6 +686,14 @@ struct SNMsgBubble: View {
                     .foregroundColor(bubbleText)
                     .tint(mine ? bubbleText : SonarTheme.accentDeep)
                     .textSelection(.enabled)
+                    // A mention link is an in-app navigation, not a URL: catch
+                    // our own scheme here so it never reaches the system opener,
+                    // and let every other link fall through unchanged.
+                    .environment(\.openURL, OpenURLAction { url in
+                        guard let npub = SNMentions.npub(fromURL: url) else { return .systemAction }
+                        onTapMention?(npub)
+                        return .handled
+                    })
                 HStack(spacing: 3) {
                     Text(verbatim: m.time)
                         .font(SonarTheme.uiFont(size: 10.5))
@@ -1607,7 +1643,8 @@ struct SNMsgList: View {
                                     showState: m.mine && (i == msgs.count - 1 || m.state == "Couldn't send"),
                                     onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
                                     maxBubbleWidth: geo.size.width * 0.78,
-                                    onTapAuthor: onTapAuthor
+                                    onTapAuthor: onTapAuthor,
+                                    mentions: m.mentions
                                 )
                             }
                             }
@@ -3952,6 +3989,9 @@ struct SNComposer: View {
     var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
+    /// Group members the `@` picker can offer. Empty outside multi-member
+    /// Marmot groups, which is what keeps the picker off 1:1 chats.
+    var mentionRoster: [SNMentionCandidate] = []
 
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
@@ -3966,6 +4006,9 @@ struct SNComposer: View {
     #endif
 
     private var slash: Bool { text.hasPrefix("/") }
+    private var mentionSuggestions: [SNMentionCandidate] {
+        mentionRoster.isEmpty ? [] : SNMentions.matches(draft: text, roster: mentionRoster)
+    }
     private var hasText: Bool { snComposerHasText(text) }
     /// Soft-IME platforms only. macOS shares `SNComposer` but has no system
     /// keyboard occupying the transcript — do not steal hardware-keyboard focus.
@@ -4039,6 +4082,38 @@ struct SNComposer: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if !mentionSuggestions.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(mentionSuggestions) { candidate in
+                        Button {
+                            text = SNMentions.applyPick(
+                                draft: text,
+                                pick: candidate,
+                                roster: mentionRoster
+                            )
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text(verbatim: "@" + candidate.name)
+                                    .font(SonarTheme.monoFont(size: 13, weight: .medium))
+                                    .foregroundColor(SonarTheme.accentDeep)
+                                // Two members can share a display name; show the
+                                // npub so the sender can tell which one this is.
+                                if SNMentions.needsSuffix(candidate, roster: mentionRoster) {
+                                    Text(verbatim: snShortNpubLabel(candidate.npub))
+                                        .font(SonarTheme.uiFont(size: 11))
+                                        .foregroundColor(SonarTheme.text2)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SNScaleStyle(scale: 0.99))
+                    }
+                }
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(SonarTheme.surface2))
+                .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
+            }
             if slash {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {

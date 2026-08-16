@@ -377,6 +377,12 @@ struct SNMessage: Identifiable, Equatable {
     var media: [SNMediaItem] = []
     /// Non-nil = render as a sticker bubble instead of text.
     var stickerRef: MarmotService.MarmotStickerRef?
+    /// `@mentions` decoded by the core, resolved against the group roster.
+    ///
+    /// Filled when the row is BUILT, never at render: the core call must not
+    /// land on a frame, and the transcript's height cache keys on `text`, which
+    /// stays sound only because spans derive purely from that same text.
+    var mentions: SNMentionInfo = .empty
 }
 
 /// Internet and mesh failures use different resend pipelines. The retry
@@ -1172,6 +1178,13 @@ final class SonarAppStore: ObservableObject {
     /// never per keystroke.
     @Published private(set) var composerDraftHasText: [String: Bool] = [:]
 
+    /// The `@token` currently being typed per chat, or absent. Same
+    /// boundary-mirror trick as `composerDraftHasText`: the draft map stays
+    /// unpublished, but the mention picker has to re-filter on every keystroke
+    /// *while composing a mention*. Outside a mention this never changes, so
+    /// ordinary typing still publishes nothing.
+    @Published private(set) var composerMentionQuery: [String: String] = [:]
+
     func composerDraft(for chatId: String) -> String {
         composerDrafts[chatId] ?? ""
     }
@@ -1179,9 +1192,24 @@ final class SonarAppStore: ObservableObject {
     func setComposerDraft(_ text: String, for chatId: String) {
         let nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
         if nextFlags != composerDraftHasText { composerDraftHasText = nextFlags }
+        updateComposerMentionQuery(text, for: chatId)
         let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
         guard next != composerDrafts else { return }
         composerDrafts = next
+    }
+
+    /// Publishes only while an `@token` is actively being typed, so the picker
+    /// can filter per keystroke without the draft map itself becoming
+    /// `@Published`. Typing ordinary text publishes nothing: the value is nil
+    /// before and after a mention, and only changes inside one.
+    private func updateComposerMentionQuery(_ text: String, for chatId: String) {
+        let query = SNMentions.activeQuery(text)
+        if composerMentionQuery[chatId] == query { return }
+        if let query {
+            composerMentionQuery[chatId] = query
+        } else {
+            composerMentionQuery.removeValue(forKey: chatId)
+        }
     }
 
     func composerDraftBinding(for chatId: String) -> Binding<String> {
@@ -3221,10 +3249,22 @@ final class SonarAppStore: ObservableObject {
                     continue
                 }
                 guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
-                let kind = localNotificationKind(for: message.content)
+                let classified = localNotificationKind(for: message.content)
                 // ⚡TRILL alerts (throttle + buzz + trill sound) are owned by
                 // processIncomingTrillLines, same split as ⚡PAY on mesh.
-                guard kind != .call, kind != .trill else { continue }
+                guard classified != .call, classified != .trill else { continue }
+                // A plain message that names us is promoted so the banner reads
+                // "X mentioned you". Only plain messages in a MULTI-MEMBER group
+                // are eligible: a payment keeps its own kind, and in a 1:1 chat
+                // "X mentioned you" is both odd and inconsistent with the
+                // transcript, which renders no mention styling there. Mute is
+                // enforced downstream in NotificationService, so a mention does
+                // NOT pierce it (R-022).
+                let isGroupMessage = group.memberNpubs.count > 2
+                let kind: SonarLocalNotificationKind =
+                    (classified == .message && isGroupMessage && mentionsMe(message.content))
+                        ? .mention
+                        : classified
                 let senderName = marmot.displayName(forNpub: message.senderNpub) ?? snShortNpubLabel(message.senderNpub)
                 sendSonarNotification(
                     kind: kind,
@@ -4752,6 +4792,111 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Group members the `@` picker can offer, named from already-cached kind-0
+    /// profiles.
+    ///
+    /// Deliberately does NOT call `ensureProfile`: this runs while the user is
+    /// typing, and kicking a relay fetch from that path is exactly the side
+    /// effect the performance rule forbids. Profiles are already warmed by
+    /// opening the chat, and a member with no cached name simply cannot be
+    /// matched by a typed name.
+    func mentionRoster(forConversationId id: String) -> [SNMentionCandidate] {
+        guard isMultiMemberMarmotGroupId(id) else { return [] }
+        let members: [String]
+        if let pending = pendingMarmotGroups[id] {
+            members = pending.members
+        } else if let group = marmotGroup(forConversationId: id) {
+            members = marmot.otherMembers(in: group)
+        } else {
+            return []
+        }
+        return members.compactMap { npub in
+            guard let name = marmot.displayName(forNpub: npub) else { return nil }
+            return SNMentionCandidate(
+                npub: npub,
+                name: name,
+                // The suffix comes from the key, so it stays correct across renames.
+                suffixHex4: SNMentions.pubkeyHex(fromNpubOrHex: npub)
+                    .flatMap { sonarMentionShortSuffix(pubkeyHex: $0) }
+            )
+        }
+    }
+
+    /// Everything mention decoding needs that is per-CONVERSATION rather than
+    /// per-message. Built once per transcript page: resolving the roster costs a
+    /// bech32 decode per member, so doing it per row would repeat that work for
+    /// every message on the page.
+    func mentionContext(forConversationId id: String) -> SNMentionContext {
+        let nick = chatViewModel.nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        return SNMentionContext(
+            roster: mentionRoster(forConversationId: id),
+            myPubkeyHex: marmot.npub.flatMap { SNMentions.pubkeyHex(fromNpubOrHex: $0) },
+            myNickname: nick.isEmpty ? nil : nick
+        )
+    }
+
+    /// Mention spans and self-mention verdict for one message.
+    ///
+    /// Both derive purely from the message text, so callers cache on the message
+    /// id and this never runs per rendered frame. Staying text-only is also what
+    /// lets the transcript keep caching row heights by text: same text ⇒ same
+    /// spans ⇒ same wrap.
+    func mentionInfo(content: String, context: SNMentionContext) -> SNMentionInfo {
+        guard content.contains("@") else { return .empty }
+        // No roster ⇒ not a group we can resolve mentions against (a 1:1 chat,
+        // or a group whose profiles have not arrived yet). Bail rather than
+        // styling an unresolvable mention — Compose gates the same way, and a
+        // silent divergence here is how the two stores drift apart.
+        guard !context.roster.isEmpty else { return .empty }
+        let spans = sonarParseMentions(content: content).map {
+            SNMentionSpan(
+                start: Int($0.startUtf16),
+                end: Int($0.endUtf16),
+                name: $0.name,
+                suffixHex4: $0.suffixHex4
+            )
+        }
+        guard !spans.isEmpty else { return .empty }
+        return SNMentionInfo(
+            mentions: spans.map {
+                SNResolvedMention(
+                    span: $0,
+                    npub: SNMentions.target(for: $0, roster: context.roster)?.npub
+                )
+            },
+            mentionsMe: context.myPubkeyHex.map {
+                sonarMentionsPubkey(
+                    content: content,
+                    pubkeyHex: $0,
+                    displayName: context.myNickname
+                )
+            } ?? false
+        )
+    }
+
+    /// True when `content` names us — either `@name#abcd` carrying our key's
+    /// suffix (rename-proof), or a bare `@name` matching our current nickname.
+    ///
+    /// The core owns the decode; we supply only the two things it cannot know:
+    /// our public key and the nickname we currently publish.
+    func mentionsMe(_ content: String) -> Bool {
+        guard content.contains("@") else { return false }
+        guard let myNpub = marmot.npub,
+              let myHex = SNMentions.pubkeyHex(fromNpubOrHex: myNpub) else { return false }
+        let nick = chatViewModel.nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        return sonarMentionsPubkey(
+            content: content,
+            pubkeyHex: myHex,
+            displayName: nick.isEmpty ? nil : nick
+        )
+    }
+
+    /// Best human label for a contact npub — cached profile name, else a short
+    /// npub. Titles a screen opened from a tapped mention.
+    func contactTitle(forNpub npub: String) -> String {
+        marmot.displayName(forNpub: npub) ?? Self.shortNpub(npub)
+    }
+
     static func shortNpub(_ value: String) -> String {
         snShortNpubLabel(value)
     }
@@ -5416,6 +5561,9 @@ final class SonarAppStore: ObservableObject {
                 ? [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
                 : groups
             var dated: [(Date, SNMessage)] = []
+            // Built once per page: per-row it would repeat a bech32 decode for
+            // every group member on every message.
+            let mentionCtx = mentionContext(forConversationId: id)
             for group in sourceGroups {
                 dated += Self.transcriptSource(
                     marmot.messagesByGroup[group.id] ?? [],
@@ -5457,7 +5605,10 @@ final class SonarAppStore: ObservableObject {
                             state: MarmotChatModel.stateText(for: m),
                             uploadProgress: marmot.mediaUploadProgress[m.id],
                             media: Self.mediaItems(m, groupId: group.id),
-                            stickerRef: m.stickerRef
+                            stickerRef: m.stickerRef,
+                            // Decoded here, at row build, so the bubble never
+                            // crosses the FFI while rendering a frame.
+                            mentions: mentionInfo(content: m.content, context: mentionCtx)
                         ))
                     }
                 }

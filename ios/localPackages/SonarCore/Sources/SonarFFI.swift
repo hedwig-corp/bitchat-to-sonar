@@ -5430,6 +5430,88 @@ public func FfiConverterTypeSonarDescriptorInfo_lower(_ value: SonarDescriptorIn
 }
 
 
+/**
+ * One `@mention` found in message content.
+ *
+ * `start_utf16` / `end_utf16` are **UTF-16 code unit** offsets: they index a
+ * Kotlin `String` directly and convert to a Swift `String.Index` with
+ * `String.Index(utf16Offset:in:)`. Byte offsets would land in the wrong place
+ * on both hosts as soon as the message contains an emoji.
+ */
+public struct SonarMentionSpanInfo: Equatable, Hashable {
+    public var startUtf16: UInt32
+    public var endUtf16: UInt32
+    /**
+     * Name as typed, without the leading `@` and without any `#abcd` suffix.
+     */
+    public var name: String
+    /**
+     * Lowercased 4-hex disambiguator, when the mention carried one.
+     */
+    public var suffixHex4: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(startUtf16: UInt32, endUtf16: UInt32,
+        /**
+         * Name as typed, without the leading `@` and without any `#abcd` suffix.
+         */name: String,
+        /**
+         * Lowercased 4-hex disambiguator, when the mention carried one.
+         */suffixHex4: String?) {
+        self.startUtf16 = startUtf16
+        self.endUtf16 = endUtf16
+        self.name = name
+        self.suffixHex4 = suffixHex4
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SonarMentionSpanInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarMentionSpanInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarMentionSpanInfo {
+        return
+            try SonarMentionSpanInfo(
+                startUtf16: FfiConverterUInt32.read(from: &buf),
+                endUtf16: FfiConverterUInt32.read(from: &buf),
+                name: FfiConverterString.read(from: &buf),
+                suffixHex4: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SonarMentionSpanInfo, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.startUtf16, into: &buf)
+        FfiConverterUInt32.write(value.endUtf16, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.suffixHex4, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarMentionSpanInfo_lift(_ buf: RustBuffer) throws -> SonarMentionSpanInfo {
+    return try FfiConverterTypeSonarMentionSpanInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarMentionSpanInfo_lower(_ value: SonarMentionSpanInfo) -> RustBuffer {
+    return FfiConverterTypeSonarMentionSpanInfo.lower(value)
+}
+
+
 public struct SonarNotificationEnvelopeInfo: Equatable, Hashable {
     public var kind: SonarNotificationKindInfo
     public var title: String
@@ -7975,6 +8057,31 @@ fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSonarMentionSpanInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [SonarMentionSpanInfo]
+
+    public static func write(_ value: [SonarMentionSpanInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSonarMentionSpanInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SonarMentionSpanInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SonarMentionSpanInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSonarMentionSpanInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeStickerInfo: FfiConverterRustBuffer {
     typealias SwiftType = [StickerInfo]
 
@@ -8604,6 +8711,36 @@ public func setupLogging(dir: String, verbose: Bool)throws   {try rustCallWithEr
     )
 }
 }
+/**
+ * The `#abcd` disambiguator for a public key — its last 4 hex digits,
+ * lowercased. Hosts use it to build `@name#abcd` when two group members share
+ * a display name. `None` when `pubkey_hex` is not plausible hex.
+ */
+public func sonarMentionShortSuffix(pubkeyHex: String) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_sonar_mention_short_suffix(
+        FfiConverterString.lower(pubkeyHex),$0
+    )
+})
+}
+/**
+ * True when `content` mentions the identity holding `pubkey_hex`.
+ *
+ * `display_name` is supplied by the host rather than read from core state:
+ * the core deliberately caches no local kind-0 profile, and both hosts already
+ * hold the user's current nickname. A `@name#abcd` mention matches on the
+ * suffix alone and so survives a rename; a bare `@name` needs `display_name`
+ * and stops resolving if the user renames after the message was sent.
+ */
+public func sonarMentionsPubkey(content: String, pubkeyHex: String, displayName: String?) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_sonar_mentions_pubkey(
+        FfiConverterString.lower(content),
+        FfiConverterString.lower(pubkeyHex),
+        FfiConverterOptionString.lower(displayName),$0
+    )
+})
+}
 public func sonarNotificationClassifyContent(content: String) -> SonarNotificationKindInfo  {
     return try!  FfiConverterTypeSonarNotificationKindInfo_lift(try! rustCall() {
     uniffi_sonar_ffi_fn_func_sonar_notification_classify_content(
@@ -8614,6 +8751,22 @@ public func sonarNotificationClassifyContent(content: String) -> SonarNotificati
 public func sonarNotificationPaymentSats(content: String) -> UInt64?  {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_func_sonar_notification_payment_sats(
+        FfiConverterString.lower(content),$0
+    )
+})
+}
+/**
+ * Extract every `@mention` in `content`.
+ *
+ * Mentions are plain text on the wire, so this is pure parsing — it is the
+ * single decoder both hosts read rather than each re-implementing the scan
+ * (same rule as `MessageClassification`; see R-017 in `docs/REGRESSIONS.md`).
+ * Cheap and allocation-free when the content holds no `@`, but hosts should
+ * still call it at row-build time and memoize, never per rendered frame.
+ */
+public func sonarParseMentions(content: String) -> [SonarMentionSpanInfo]  {
+    return try!  FfiConverterSequenceTypeSonarMentionSpanInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_sonar_parse_mentions(
         FfiConverterString.lower(content),$0
     )
 })
@@ -8805,10 +8958,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_setup_logging() != 6013) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_sonar_mention_short_suffix() != 10032) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_sonar_mentions_pubkey() != 45795) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_sonar_notification_classify_content() != 59219) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_sonar_notification_payment_sats() != 9687) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_sonar_parse_mentions() != 60255) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_sonar_render_notification() != 13744) {

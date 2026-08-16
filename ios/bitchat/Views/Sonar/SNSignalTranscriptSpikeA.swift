@@ -745,7 +745,8 @@ private struct SNSpikeAMessageRow: View {
                     showState: m.mine && (index == msgs.count - 1 || m.state == "Couldn't send"),
                     onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
                     maxBubbleWidth: UIScreen.main.bounds.width * 0.78,
-                    onTapAuthor: onTapAuthor
+                    onTapAuthor: onTapAuthor,
+                    mentions: m.mentions
                 )
             }
         }

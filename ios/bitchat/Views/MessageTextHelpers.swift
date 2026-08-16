@@ -9,7 +9,9 @@ import SwiftUI
 enum SonarMessageTextFormatter {
     private enum MatchKind {
         case link(URL?)
-        case mention
+        /// `npub` is non-nil only when the mention resolves to a real group
+        /// member, which is what makes it tappable.
+        case mention(npub: String?)
     }
 
     private struct TextMatch {
@@ -23,6 +25,8 @@ enum SonarMessageTextFormatter {
         baseColor: Color,
         linkColor: Color? = nil,
         mentionFont: Font? = nil,
+        mentionColor: Color? = nil,
+        mentions: [SNResolvedMention]? = nil,
         detectBareDomains: Bool = false,
         includeLinkAttributes: Bool = true,
         excludeLinkBeforeTrailingEllipsis: Bool = false
@@ -30,6 +34,7 @@ enum SonarMessageTextFormatter {
         let matches = textMatches(
             in: text,
             mentionFont: mentionFont,
+            mentions: mentions,
             detectBareDomains: detectBareDomains,
             excludeLinkBeforeTrailingEllipsis: excludeLinkBeforeTrailingEllipsis
         )
@@ -47,9 +52,17 @@ enum SonarMessageTextFormatter {
                     if includeLinkAttributes {
                         segment.link = url
                     }
-                case .mention:
+                case .mention(let npub):
                     if let mentionFont {
                         segment.font = mentionFont
+                    }
+                    if let mentionColor {
+                        segment.foregroundColor = mentionColor
+                    }
+                    // Only a mention that resolved to a member is tappable; an
+                    // unresolved one still stands out, it just goes nowhere.
+                    if let npub, let url = SNMentions.url(forNpub: npub) {
+                        segment.link = url
                     }
                 }
             }
@@ -63,6 +76,7 @@ enum SonarMessageTextFormatter {
     private static func textMatches(
         in text: String,
         mentionFont: Font?,
+        mentions: [SNResolvedMention]?,
         detectBareDomains: Bool,
         excludeLinkBeforeTrailingEllipsis: Bool
     ) -> [TextMatch] {
@@ -83,9 +97,22 @@ enum SonarMessageTextFormatter {
             }
         }
 
-        if mentionFont != nil, text.contains("@") {
+        // Core-decoded spans win when supplied (Sonar/Marmot transcripts). The
+        // regex branch stays for the mesh bubble, which has no group roster to
+        // resolve against and only wants the bolder font.
+        if let mentions {
+            for mention in mentions {
+                appendMatch(
+                    mention.span.nsRange,
+                    kind: .mention(npub: mention.npub),
+                    priority: 1,
+                    in: text,
+                    to: &matches
+                )
+            }
+        } else if mentionFont != nil, text.contains("@") {
             for match in MessageFormattingEngine.Patterns.mention.matches(in: text, options: [], range: fullRange) {
-                appendMatch(match.range(at: 0), kind: .mention, priority: 1, in: text, to: &matches)
+                appendMatch(match.range(at: 0), kind: .mention(npub: nil), priority: 1, in: text, to: &matches)
             }
         }
 

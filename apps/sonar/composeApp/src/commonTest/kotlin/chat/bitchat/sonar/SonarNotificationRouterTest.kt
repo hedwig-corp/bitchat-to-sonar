@@ -118,6 +118,53 @@ class SonarNotificationRouterTest {
     }
 
     @Test
+    fun mentionsAnnounceThemselvesInTheTitle() {
+        val n = SonarNotificationRouter.build(
+            idKey = "chat-1",
+            kind = SonarNotificationKind.Mention,
+            conversationTitle = "Alice",
+            senderName = "Alice",
+            groupName = "Signal Room",
+            preview = "hey @vincenzo",
+            prefs = SonarNotificationPrefs(showNames = true, showPreview = true),
+        )
+
+        assertEquals("Alice mentioned you", n?.title)
+        assertEquals("hey @vincenzo", n?.body)
+    }
+
+    @Test
+    fun mentionsStillHonourThePrivacyToggles() {
+        // R-012: the Show names / Message preview toggles govern every kind.
+        // A mention must not become a back door that leaks the sender or body.
+        val n = SonarNotificationRouter.build(
+            idKey = "chat-1",
+            kind = SonarNotificationKind.Mention,
+            conversationTitle = "Alice",
+            senderName = "Alice",
+            groupName = "Signal Room",
+            preview = "hey @vincenzo",
+            prefs = SonarNotificationPrefs(showNames = false, showPreview = false),
+        )
+
+        assertEquals("You were mentioned", n?.title)
+        assertEquals("Open Sonar to read it.", n?.body)
+    }
+
+    @Test
+    fun mentionsAreSuppressedWhenNotificationsAreOff() {
+        val n = SonarNotificationRouter.build(
+            idKey = "chat-1",
+            kind = SonarNotificationKind.Mention,
+            senderName = "Alice",
+            preview = "hey @vincenzo",
+            prefs = SonarNotificationPrefs(enabled = false),
+        )
+
+        assertNull(n)
+    }
+
+    @Test
     fun contentClassificationFindsPaymentsAndCalls() {
         assertEquals(
             SonarNotificationKind.Payment,

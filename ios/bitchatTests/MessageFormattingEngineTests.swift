@@ -57,12 +57,29 @@ struct MessageFormattingEngineTests {
     }
 
     @Test func extractMentions_emailNotCaptured() {
-        // Email addresses should not be captured as mentions
+        // Email addresses are not mentions. This previously asserted the
+        // opposite — the shipped regex had no left-boundary rule, so it
+        // captured "example" out of an email and the test documented that as
+        // "expected behavior". Extraction now runs through the Rust core
+        // scanner, which requires start-of-text or whitespace before the `@`,
+        // so the long-standing wart is gone.
         let content = "Contact me at test@example.com"
         let mentions = MessageFormattingEngine.extractMentions(from: content)
-        // The regex will capture "example" after @ in email - this is expected behavior
-        // as the regex doesn't distinguish email addresses
-        #expect(mentions.count == 1)
+        #expect(mentions.isEmpty)
+    }
+
+    @Test func extractMentions_urlHandleNotCaptured() {
+        // Same boundary rule: a profile URL is a link, not a mention.
+        let content = "see https://njump.me/@bob"
+        #expect(MessageFormattingEngine.extractMentions(from: content).isEmpty)
+    }
+
+    @Test func extractMentions_malformedSuffixFallsBackToBareName() {
+        // `#abcd` counts only as exactly 4 hex; anything else stays part of a
+        // bare mention rather than being half-swallowed.
+        #expect(MessageFormattingEngine.extractMentions(from: "@alice#zzzz") == ["alice"])
+        #expect(MessageFormattingEngine.extractMentions(from: "@alice#abc") == ["alice"])
+        #expect(MessageFormattingEngine.extractMentions(from: "@alice#abcdef") == ["alice"])
     }
 
     // MARK: - Cashu Token Detection Tests
