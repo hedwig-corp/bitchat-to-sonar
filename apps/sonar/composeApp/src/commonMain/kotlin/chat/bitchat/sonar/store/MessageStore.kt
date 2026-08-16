@@ -3,6 +3,7 @@ package chat.bitchat.sonar.store
 import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.SonarMedia
 import chat.bitchat.sonar.SonarMsg
+import chat.bitchat.sonar.SonarReplyRef
 import chat.bitchat.sonar.SonarStickerRef
 
 /**
@@ -73,7 +74,8 @@ object MessageCodec {
             val base = row(m.id, m.senderNpub, if (m.mine) "1" else "0", m.tsSecs.toString(), m.content)
             val ref = m.stickerRef
             val media = m.media.firstOrNull()
-            if (ref != null || media != null || m.viaInternet) {
+            val reply = m.reply
+            if (ref != null || media != null || m.viaInternet || reply != null) {
                 base + "\t" +
                     hexEnc(ref?.packCoordinate.orEmpty()) + "\t" +
                     hexEnc(ref?.shortcode.orEmpty()) + "\t" +
@@ -88,7 +90,15 @@ object MessageCodec {
                     // Field 15 (append-only versioning, like field 14 for
                     // viaInternet): optional media caption. Old decoders
                     // ignore trailing fields; old envelopes lack it.
-                    hexEnc(media?.caption.orEmpty())
+                    hexEnc(media?.caption.orEmpty()) +
+                    if (reply != null) {
+                        // Fields 16-19: mesh/NIP-17 quote snapshot. Absent on
+                        // older envelopes; empty parent id means no reply.
+                        "\t" + hexEnc(reply.parentId) +
+                            "\t" + hexEnc(reply.parentNpub.orEmpty()) +
+                            "\t" + hexEnc(reply.author.orEmpty()) +
+                            "\t" + hexEnc(reply.preview)
+                    } else ""
             } else base
         }
 
@@ -113,12 +123,21 @@ object MessageCodec {
                     )
                 )
             } else emptyList()
+            val reply = if (f.size >= 17 && f[16].isNotBlank()) {
+                SonarReplyRef(
+                    parentId = f[16],
+                    parentNpub = f.getOrNull(17)?.takeIf { it.isNotEmpty() },
+                    author = f.getOrNull(18)?.takeIf { it.isNotEmpty() },
+                    preview = f.getOrNull(19).orEmpty(),
+                )
+            } else null
             SonarMsg(
                 id = f[0], senderNpub = f[1], content = f[4],
                 mine = f[2] == "1", tsSecs = f[3].toLongOrNull() ?: 0L,
                 viaInternet = f.size >= 15 && f[14] == "1",
                 media = media,
                 stickerRef = stickerRef,
+                reply = reply,
             )
         }.toList()
 

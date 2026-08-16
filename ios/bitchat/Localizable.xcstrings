@@ -37067,6 +37067,18 @@
     "Your nickname is what people see. Your key stays on this device unless you explicitly export it." : {
 
     }    ,
+    "chat.copy" : {
+      "comment" : "Context-menu action to copy the full message text, Signal-style",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy"
+          }
+        }
+      }
+    },
     "chat.reply" : {
       "comment" : "Context-menu and composer-banner label for quote-reply",
       "extractionState" : "manual",

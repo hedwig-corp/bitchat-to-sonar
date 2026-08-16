@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sonar Stickers — sticker packs on Nostr</title>
+<link rel="icon" href="sonar/brand/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="sonar/brand/sonar-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #060809;
+    --panel: #0C1013;
+    --card: #12171B;
+    --card2: #171D22;
+    --text: #EFF3F4;
+    --text2: #9AA6AB;
+    --text3: #65717A;
+    --hairline: rgba(255, 255, 255, 0.08);
+    --cyan: #22D3EE;
+    --cyan-deep: #67E2F4;
+    --cyan-fill: #1FC0DE;
+    --on-cyan: #04222B;
+    --cyan-soft: rgba(34, 211, 238, 0.12);
+    --indigo: #7B79F7;
+    --indigo-fill: #5E5CE6;
+    --indigo-soft: rgba(123, 121, 247, 0.14);
+    --green: #41BC76;
+    --gold-fill: #F0B03A;
+    --gold-soft: rgba(240, 176, 58, 0.16);
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Figtree', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 0 28px; }
+  a { color: inherit; }
+
+  /* nav */
+  nav { position: sticky; top: 0; z-index: 40; background: rgba(6, 8, 9, 0.82); backdrop-filter: blur(12px); border-bottom: 1px solid var(--hairline); }
+  .navin { display: flex; align-items: center; justify-content: space-between; padding: 16px 28px; max-width: 1100px; margin: 0 auto; }
+  .wordmark { display: flex; align-items: center; gap: 9px; font-size: 20px; font-weight: 800; letter-spacing: -0.02em; color: var(--text); text-decoration: none; }
+  .wordmark img { width: 28px; height: 28px; border-radius: 8px; display: block; box-shadow: inset 0 0 0 1px var(--hairline); }
+  .navlinks { display: flex; align-items: center; gap: 10px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; white-space: nowrap;
+    padding: 11px 20px; border-radius: 999px; border: none;
+    font-family: inherit; font-size: 15px; font-weight: 700;
+    text-decoration: none; cursor: pointer; transition: transform 0.12s, background 0.15s;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn.primary { background: var(--cyan-fill); color: var(--on-cyan); }
+  .btn.primary:hover { background: var(--cyan); }
+  .btn.ghost { background: transparent; color: var(--text2); box-shadow: inset 0 0 0 1px var(--hairline); }
+  .btn.ghost:hover { color: var(--text); }
+  .btn.small { padding: 9px 16px; font-size: 13.5px; }
+
+  /* header */
+  header.head { padding: 64px 0 30px; text-align: center; }
+  .kicker {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 700; color: var(--cyan-deep);
+    background: var(--cyan-soft); border-radius: 999px; padding: 6px 13px; margin-bottom: 20px;
+  }
+  .kicker .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--cyan); }
+  h1 { font-size: clamp(34px, 5vw, 54px); font-weight: 800; letter-spacing: -0.03em; line-height: 1.05; margin: 0 0 16px; }
+  h1 em { font-style: normal; color: var(--cyan); }
+  .sub { font-size: 18px; color: var(--text2); max-width: 56ch; margin: 0 auto; text-wrap: pretty; }
+
+  /* controls */
+  .controls { position: sticky; top: 65px; z-index: 30; background: rgba(6,8,9,0.82); backdrop-filter: blur(12px); padding: 14px 0; border-bottom: 1px solid var(--hairline); margin-bottom: 36px; }
+  .controlsin { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .search {
+    flex: 1; min-width: 220px; display: flex; align-items: center; gap: 10px;
+    background: var(--card); border: 1px solid var(--hairline); border-radius: 999px;
+    padding: 11px 16px;
+  }
+  .search input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-family: inherit; font-size: 15px; }
+  .search input::placeholder { color: var(--text3); }
+  .search svg { color: var(--text3); flex: none; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    border: none; cursor: pointer; font-family: inherit; font-size: 13.5px; font-weight: 650;
+    padding: 9px 15px; border-radius: 999px;
+    background: var(--card); color: var(--text2); box-shadow: inset 0 0 0 1px var(--hairline);
+    transition: background 0.15s, color 0.15s;
+  }
+  .chip:hover { color: var(--text); }
+  .chip.on { background: var(--cyan-soft); color: var(--cyan-deep); box-shadow: inset 0 0 0 1px transparent; }
+  .count { font-size: 13px; color: var(--text3); margin-left: auto; white-space: nowrap; }
+
+  /* submit banner */
+  .submit {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    background: linear-gradient(120deg, var(--indigo-soft), transparent 70%), var(--card);
+    border: 1px solid var(--hairline); border-radius: 22px;
+    padding: 22px 24px; margin-bottom: 36px;
+  }
+  .submit .si { width: 50px; height: 50px; flex: none; border-radius: 14px; background: var(--indigo-soft); color: var(--indigo); display: flex; align-items: center; justify-content: center; }
+  .submit .st { flex: 1; min-width: 220px; }
+  .submit h3 { margin: 0 0 4px; font-size: 18px; font-weight: 750; }
+  .submit p { margin: 0; font-size: 14px; color: var(--text2); }
+
+  /* grid */
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .pack {
+    background: var(--card); border: 1px solid var(--hairline); border-radius: 22px;
+    padding: 16px; cursor: pointer; text-align: left;
+    transition: transform 0.16s, border-color 0.16s, background 0.16s;
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  .pack:hover { transform: translateY(-3px); border-color: rgba(34,211,238,0.4); background: var(--card2); }
+  .preview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .preview img { width: 100%; aspect-ratio: 1; border-radius: 12px; background: var(--panel); display: block; }
+  .packfoot { display: flex; align-items: center; gap: 11px; }
+  .packfoot img { width: 44px; height: 44px; border-radius: 12px; flex: none; background: var(--panel); }
+  .packinfo { flex: 1; min-width: 0; }
+  .packname { font-size: 16px; font-weight: 750; letter-spacing: -0.01em; display: flex; align-items: center; gap: 6px; }
+  .packby { font-size: 12.5px; color: var(--text3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pcount { font-size: 12px; font-weight: 650; color: var(--text2); background: var(--panel); border-radius: 999px; padding: 4px 10px; flex: none; }
+  .vbadge { color: var(--cyan); display: inline-flex; }
+  .tagrow { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tag { font-size: 11px; color: var(--text3); background: var(--panel); border-radius: 6px; padding: 2px 7px; font-family: var(--mono); }
+  .noresults { grid-column: 1 / -1; text-align: center; color: var(--text3); padding: 60px 0; font-size: 16px; }
+
+  footer { border-top: 1px solid var(--hairline); margin-top: 64px; padding: 30px 0 48px; }
+  .footin { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .footin .fine { font-size: 13px; color: var(--text3); }
+  .footin .fine code { font-family: var(--mono); font-size: 11.5px; }
+
+  /* modal */
+  .scrim { position: fixed; inset: 0; z-index: 60; background: rgba(3,5,7,0.72); backdrop-filter: blur(4px); display: none; align-items: center; justify-content: center; padding: 24px; }
+  .scrim.open { display: flex; }
+  .modal {
+    width: 560px; max-width: 100%; max-height: 88vh; overflow-y: auto;
+    background: var(--card); border: 1px solid var(--hairline); border-radius: 26px;
+    padding: 26px; animation: pop 0.22s cubic-bezier(0.25,0.9,0.3,1);
+  }
+  @keyframes pop { from { transform: scale(0.96) translateY(10px); opacity: 0; } }
+  .modalhead { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+  .modalhead img { width: 60px; height: 60px; border-radius: 16px; flex: none; background: var(--panel); }
+  .modalhead .mh { flex: 1; min-width: 0; }
+  .modalhead h2 { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em; display: flex; align-items: center; gap: 7px; }
+  .modalhead .mby { font-size: 13px; color: var(--text3); margin-top: 2px; }
+  .modalclose { width: 38px; height: 38px; border-radius: 50%; border: none; background: var(--panel); color: var(--text2); cursor: pointer; flex: none; display: flex; align-items: center; justify-content: center; }
+  .modalclose:hover { color: var(--text); }
+  .modaldesc { font-size: 14.5px; color: var(--text2); margin: 0 0 18px; }
+  .mgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 20px; }
+  .mgrid img { width: 100%; aspect-ratio: 1; border-radius: 14px; background: var(--panel); }
+  .mmeta { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
+  .mmeta .mm { background: var(--panel); border-radius: 12px; padding: 9px 13px; font-size: 13px; }
+  .mmeta .mm b { display: block; color: var(--text); font-weight: 700; }
+  .mmeta .mm span { color: var(--text3); font-size: 11.5px; }
+  .naddr { font-family: var(--mono); font-size: 11.5px; color: var(--text3); word-break: break-all; background: var(--panel); border-radius: 10px; padding: 10px 12px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+  .naddr span { flex: 1; min-width: 0; }
+  .naddr button { border: none; background: var(--card); color: var(--cyan-deep); border-radius: 7px; padding: 5px 10px; font-family: inherit; font-size: 12px; font-weight: 700; cursor: pointer; flex: none; }
+  .modalbtns { display: flex; gap: 10px; }
+  .modalbtns .btn { flex: 1; justify-content: center; }
+
+  @media (max-width: 860px) {
+    .grid { grid-template-columns: repeat(2, 1fr); }
+    .navlinks .hidem { display: none; }
+    .mgrid { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 560px) {
+    .grid { grid-template-columns: 1fr; }
+    .count { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="navin">
+    <a class="wordmark" href="Sonar Landing.html">
+      <img src="sonar/brand/sonar-icon.png" alt="" />
+      sonar
+    </a>
+    <div class="navlinks">
+      <a class="btn ghost small hidem" href="Sonar Landing.html">Home</a>
+      <a class="btn ghost small" href="Sonar Prototype.html">Open the prototype</a>
+      <a class="btn primary small" href="Sonar Landing.html#download">Get the app</a>
+    </div>
+  </div>
+</nav>
+
+<header class="head wrap">
+  <span class="kicker"><span class="dot"></span>Open directory · published on Nostr</span>
+  <h1>Sonar <em>Stickers</em></h1>
+  <p class="sub">A community directory of sticker packs anyone can use in Sonar. Packs are published to the open Nostr network — no store, no gatekeeper. Find one you like and add it in two taps.</p>
+</header>
+
+<div class="controls">
+  <div class="wrap controlsin">
+    <label class="search">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="6"></circle><path d="M15.5 15.5 20 20"></path></svg>
+      <input id="q" type="text" placeholder="Search packs, makers, tags…" autocomplete="off" />
+    </label>
+    <div class="filters" id="filters"></div>
+    <span class="count" id="count"></span>
+  </div>
+</div>
+
+<main class="wrap">
+  <div class="submit">
+    <span class="si"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg></span>
+    <div class="st">
+      <h3>Made a pack? Publish it.</h3>
+      <p>Sign your pack with your Nostr key and it shows up here automatically — you stay the owner, forever. No review queue, no fees.</p>
+    </div>
+    <a class="btn ghost" href="#">Read the spec</a>
+  </div>
+
+  <div class="grid" id="grid"></div>
+</main>
+
+<footer>
+  <div class="wrap footin">
+    <a class="wordmark" href="Sonar Landing.html" style="font-size:17px;">
+      <img src="sonar/brand/sonar-icon.png" alt="" style="width:22px;height:22px;border-radius:6px;" />
+      sonar
+    </a>
+    <span class="fine">Stickers are public Nostr events · anyone can mirror this directory · <code>kind:30030</code></span>
+  </div>
+</footer>
+
+<div class="scrim" id="scrim">
+  <div class="modal" id="modal"></div>
+</div>
+
+<script>
+  const PACKS = [
+    { id:'mesh-mates', name:'Mesh Mates', by:'quietfox', verified:true, tags:['cute','faces','blue'], cat:'Characters', count:6, desc:'Round little signal-buddies for everyday chats. The original Sonar pack.', npub:'npub1w4j8mc7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vrtsq4k9dj' },
+    { id:'night-signal', name:'Night Signal', by:'morningstatic', verified:true, tags:['ghosts','purple','moody'], cat:'Characters', count:6, desc:'For late-night threads when everyone’s half offline.', npub:'npub1k5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vrtsw4j8mc7q0e2v9zq8m2hd' },
+    { id:'lake-days', name:'Lake Days', by:'lakeswim', verified:false, tags:['summer','green','calm'], cat:'Moods', count:6, desc:'Warm-weather plans, made for the group chat.', npub:'npub1d4ynq9c3uxe650pgh8vrtsw4j8mc7q0e2v9zk5xr3thl6f8s2a7q7x3jd' },
+    { id:'sat-stack', name:'Sat Stack', by:'northpine', verified:true, tags:['bitcoin','gold','tips'], cat:'Bitcoin', count:6, desc:'Drop one when the sats land. Pairs nicely with a payment.', npub:'npub1uxe650pgh8vrtsw4j8mc7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3q2k9wd' },
+    { id:'quiet-ghosts', name:'Quiet Ghosts', by:'papercrane', verified:false, tags:['ghosts','minimal','violet'], cat:'Characters', count:6, desc:'Soft, wordless reactions for when less is more.', npub:'npub1pgh8vrtsw4j8mc7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650q4m8jd' },
+    { id:'tram-life', name:'Tram Life', by:'tram12', verified:false, tags:['city','orange','transit'], cat:'Moods', count:6, desc:'Commuter moods for the daily back-and-forth.', npub:'npub1rtsw4j8mc7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vq9x2jd' },
+  ];
+  const CATS = ['All', 'Characters', 'Moods', 'Bitcoin'];
+  let activeCat = 'All', query = '';
+
+  const grid = document.getElementById('grid');
+  const filtersEl = document.getElementById('filters');
+  const countEl = document.getElementById('count');
+  const qEl = document.getElementById('q');
+
+  CATS.forEach(c => {
+    const b = document.createElement('button');
+    b.className = 'chip' + (c === 'All' ? ' on' : '');
+    b.textContent = c;
+    b.onclick = () => { activeCat = c; [...filtersEl.children].forEach(x => x.classList.toggle('on', x.textContent === c)); render(); };
+    filtersEl.appendChild(b);
+  });
+
+  function vbadge() {
+    return '<span class="vbadge" title="Maker verified by Nostr key"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1"><path d="M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z"></path><path d="M8.8 12.1l2.3 2.3 4.3-4.6"></path></svg></span>';
+  }
+  function thumbs(p, n) {
+    let h = '';
+    for (let i = 0; i < n; i++) h += '<img loading="lazy" src="sonar/stickers/' + p.id + '-' + i + '.png" alt="" />';
+    return h;
+  }
+
+  function render() {
+    const list = PACKS.filter(p => {
+      if (activeCat !== 'All' && p.cat !== activeCat) return false;
+      if (query) {
+        const hay = (p.name + ' ' + p.by + ' ' + p.tags.join(' ') + ' ' + p.cat).toLowerCase();
+        if (!hay.includes(query)) return false;
+      }
+      return true;
+    });
+    countEl.textContent = list.length + ' pack' + (list.length === 1 ? '' : 's');
+    grid.innerHTML = '';
+    if (!list.length) { grid.innerHTML = '<div class="noresults">No packs match “' + query + '”. Try another search.</div>'; return; }
+    list.forEach(p => {
+      const el = document.createElement('button');
+      el.className = 'pack';
+      el.innerHTML =
+        '<div class="preview">' + thumbs(p, 3) + '</div>' +
+        '<div class="packfoot">' +
+          '<img src="sonar/stickers/' + p.id + '-0.png" alt="" />' +
+          '<div class="packinfo">' +
+            '<div class="packname">' + p.name + (p.verified ? vbadge() : '') + '</div>' +
+            '<div class="packby">by ' + p.by + '</div>' +
+          '</div>' +
+          '<span class="pcount">' + p.count + '</span>' +
+        '</div>' +
+        '<div class="tagrow">' + p.tags.map(t => '<span class="tag">#' + t + '</span>').join('') + '</div>';
+      el.onclick = () => openModal(p);
+      grid.appendChild(el);
+    });
+  }
+
+  const scrim = document.getElementById('scrim');
+  const modal = document.getElementById('modal');
+  function openModal(p) {
+    let mg = '';
+    for (let i = 0; i < p.count; i++) mg += '<img loading="lazy" src="sonar/stickers/' + p.id + '-' + i + '.png" alt="" />';
+    modal.innerHTML =
+      '<div class="modalhead">' +
+        '<img src="sonar/stickers/' + p.id + '-0.png" alt="" />' +
+        '<div class="mh">' +
+          '<h2>' + p.name + (p.verified ? vbadge() : '') + '</h2>' +
+          '<div class="mby">by ' + p.by + ' · ' + p.cat + '</div>' +
+        '</div>' +
+        '<button class="modalclose" id="mclose" aria-label="Close"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 6l12 12M18 6 6 18"></path></svg></button>' +
+      '</div>' +
+      '<p class="modaldesc">' + p.desc + '</p>' +
+      '<div class="mgrid">' + mg + '</div>' +
+      '<div class="mmeta">' +
+        '<div class="mm"><b>' + p.count + '</b><span>stickers</span></div>' +
+        '<div class="mm"><b>' + (p.verified ? 'Verified' : 'Community') + '</b><span>maker</span></div>' +
+        '<div class="mm"><b>Nostr</b><span>kind 30030</span></div>' +
+      '</div>' +
+      '<div class="naddr"><span>' + p.npub + '</span><button id="copynpub">Copy</button></div>' +
+      '<div class="modalbtns">' +
+        '<a class="btn primary" href="Sonar Prototype.html">Add to Sonar</a>' +
+        '<a class="btn ghost" href="#">View on Nostr</a>' +
+      '</div>';
+    scrim.classList.add('open');
+    document.getElementById('mclose').onclick = closeModal;
+    document.getElementById('copynpub').onclick = (e) => {
+      try { navigator.clipboard.writeText(p.npub); } catch (err) {}
+      e.target.textContent = 'Copied';
+      setTimeout(() => { e.target.textContent = 'Copy'; }, 1500);
+    };
+  }
+  function closeModal() { scrim.classList.remove('open'); }
+  scrim.onclick = (e) => { if (e.target === scrim) closeModal(); };
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+  qEl.addEventListener('input', () => { query = qEl.value.trim().toLowerCase(); render(); });
+  render();
+</script>
+
+</body>
+</html>

@@ -7,6 +7,52 @@ import kotlin.test.assertTrue
 
 class SonarReplyTest {
     @Test
+    fun longPressPreviewMatchesSignalAndroidPressStates() {
+        assertEquals(1f, sonarMessagePressScale(pressed = false, menuOpen = false, delayElapsed = false))
+        assertEquals(1f, sonarMessagePressScale(pressed = true, menuOpen = false, delayElapsed = false))
+        assertEquals(
+            SONAR_MESSAGE_PRESS_SCALE_FACTOR,
+            sonarMessagePressScale(pressed = true, menuOpen = false, delayElapsed = true),
+        )
+        assertEquals(
+            SONAR_MESSAGE_PRESS_SCALE_FACTOR,
+            sonarMessagePressScale(pressed = false, menuOpen = true, delayElapsed = false),
+        )
+        assertEquals(100L, SONAR_MESSAGE_PRESS_SCALE_DELAY_MS)
+    }
+
+    @Test
+    fun longPressOverlayKeepsSignalAnchorUntilItWouldOverflow() {
+        assertEquals(
+            320f,
+            sonarMessageMenuTopPx(
+                anchorTopPx = 320f,
+                overlayHeightPx = 240,
+                viewportHeightPx = 800,
+                paddingPx = 16f,
+            ),
+        )
+        assertEquals(
+            544f,
+            sonarMessageMenuTopPx(
+                anchorTopPx = 720f,
+                overlayHeightPx = 240,
+                viewportHeightPx = 800,
+                paddingPx = 16f,
+            ),
+        )
+        assertEquals(
+            16f,
+            sonarMessageMenuTopPx(
+                anchorTopPx = -20f,
+                overlayHeightPx = 240,
+                viewportHeightPx = 800,
+                paddingPx = 16f,
+            ),
+        )
+    }
+
+    @Test
     fun nipC7RequiresEventIdHexAndNpub() {
         val id = "a".repeat(64)
         assertTrue(sonarCanEmitNipC7(id, "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"))
@@ -26,6 +72,18 @@ class SonarReplyTest {
         assertFalse(sonarCanReply(live.copy(state = "Uploading")))
         assertFalse(sonarCanReply(live.copy(content = TrillLine("deadbeef").encoded())))
         assertFalse(sonarCanReply(live.copy(classification = SonarMsgClass.CallControl)))
+    }
+
+    @Test
+    fun copyUsesFullSourceAndSkipsNonTextRows() {
+        val live = SonarMsg("ab".repeat(32), "npub1peer", "  hello  ", mine = false, tsSecs = 1)
+        assertEquals("  hello  ", sonarCopyableText(live))
+        assertFalse(sonarCopyableText(live)!!.contains(SonarClock.hourMinute(live.tsSecs)))
+        assertEquals("  hello  ", sonarCopyableText(live.copy(state = "Sending")))
+        assertEquals(null, sonarCopyableText(live.copy(content = "   ")))
+        assertEquals(null, sonarCopyableText(live.copy(classification = SonarMsgClass.CallControl)))
+        assertEquals(null, sonarCopyableText(live.copy(classification = SonarMsgClass.PayReceipt("abc", 21))))
+        assertEquals(null, sonarCopyableText(live.copy(content = TrillLine("deadbeef").encoded())))
     }
 
     @Test
@@ -115,5 +173,18 @@ class SonarReplyTest {
                 stickerLabel = "Sticker",
             ),
         )
+    }
+
+    @Test
+    fun meshReplyHydratesPreviewFromParentInWindow() {
+        val parent = SonarMsg("parent-mid", "npub1peer", "see you at 9", mine = false, tsSecs = 1)
+        val child = sonarMeshReplyRef("parent-mid", listOf(parent))
+        assertEquals("parent-mid", child?.parentId)
+        assertEquals("see you at 9", child?.preview)
+        assertEquals("npub1peer", child?.parentNpub)
+        assertEquals(null, sonarMeshReplyRef(" ", listOf(parent)))
+        assertEquals("", sonarMeshReplyRef("missing", listOf(parent))?.preview)
+        assertEquals("parent-mid", sonarMeshReplyToWire(child))
+        assertEquals(null, sonarMeshReplyToWire(null))
     }
 }

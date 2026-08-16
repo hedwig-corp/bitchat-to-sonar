@@ -649,6 +649,11 @@ public protocol MeshLinkEngineProtocol: AnyObject, Sendable {
      */
     func sendTextNow(fingerprint: String, messageId: String, text: String, nowMs: Int64)  -> MeshEngineOutput?
 
+    /**
+     * Same as [`Self::send_text`], with an optional parent message id (TLV 0x04).
+     */
+    func sendTextWithReply(fingerprint: String, messageId: String, text: String, replyTo: String?, nowMs: Int64)  -> MeshEngineOutput?
+
     func setAllowlist(allowed: [String]?)  -> MeshEngineOutput
 
     func setNickname(nickname: String, nowMs: Int64)  -> MeshEngineOutput
@@ -972,6 +977,22 @@ open func sendTextNow(fingerprint: String, messageId: String, text: String, nowM
         FfiConverterString.lower(fingerprint),
         FfiConverterString.lower(messageId),
         FfiConverterString.lower(text),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * Same as [`Self::send_text`], with an optional parent message id (TLV 0x04).
+     */
+open func sendTextWithReply(fingerprint: String, messageId: String, text: String, replyTo: String?, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_send_text_with_reply(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(text),
+        FfiConverterOptionString.lower(replyTo),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -1795,7 +1816,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Send an account-level direct NIP-17 DM to a plain bitchat peer. The
      * content is wrapped as `bitchat1:` so iOS/stock bitchat can decode it.
      */
-    func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String) throws
+    func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String, replyTo: String?) throws
 
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
@@ -2838,14 +2859,15 @@ open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiE
      * Send an account-level direct NIP-17 DM to a plain bitchat peer. The
      * content is wrapped as `bitchat1:` so iOS/stock bitchat can decode it.
      */
-open func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String, replyTo: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_direct_dm(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(recipientHex),
         FfiConverterString.lower(senderPeerIdHex),
         FfiConverterString.lower(recipientPeerIdHex),
         FfiConverterString.lower(messageId),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),
+        FfiConverterOptionString.lower(replyTo),$0
     )
 }
 }
@@ -4046,15 +4068,17 @@ public struct DirectDmInfo: Equatable, Hashable {
     public var senderPubkeyHex: String
     public var content: String
     public var createdAtSecs: UInt64
+    public var replyTo: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(eventIdHex: String, idHex: String, senderPubkeyHex: String, content: String, createdAtSecs: UInt64) {
+    public init(eventIdHex: String, idHex: String, senderPubkeyHex: String, content: String, createdAtSecs: UInt64, replyTo: String?) {
         self.eventIdHex = eventIdHex
         self.idHex = idHex
         self.senderPubkeyHex = senderPubkeyHex
         self.content = content
         self.createdAtSecs = createdAtSecs
+        self.replyTo = replyTo
     }
 
 
@@ -4077,7 +4101,8 @@ public struct FfiConverterTypeDirectDmInfo: FfiConverterRustBuffer {
                 idHex: FfiConverterString.read(from: &buf),
                 senderPubkeyHex: FfiConverterString.read(from: &buf),
                 content: FfiConverterString.read(from: &buf),
-                createdAtSecs: FfiConverterUInt64.read(from: &buf)
+                createdAtSecs: FfiConverterUInt64.read(from: &buf),
+                replyTo: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -4087,6 +4112,7 @@ public struct FfiConverterTypeDirectDmInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.senderPubkeyHex, into: &buf)
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
+        FfiConverterOptionString.write(value.replyTo, into: &buf)
     }
 }
 
@@ -6424,7 +6450,7 @@ public enum MeshEngineEvent: Equatable, Hashable {
     )
     case sonarPayload(fingerprint: String, payload: Data
     )
-    case textReceived(fingerprint: String, messageId: String, content: String
+    case textReceived(fingerprint: String, messageId: String, content: String, replyTo: String?
     )
     case deliveryReceived(fingerprint: String, messageId: String
     )
@@ -6461,7 +6487,7 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
         case 2: return .sonarPayload(fingerprint: try FfiConverterString.read(from: &buf), payload: try FfiConverterData.read(from: &buf)
         )
 
-        case 3: return .textReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf)
+        case 3: return .textReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf), replyTo: try FfiConverterOptionString.read(from: &buf)
         )
 
         case 4: return .deliveryReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf)
@@ -6498,11 +6524,12 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
             FfiConverterData.write(payload, into: &buf)
 
 
-        case let .textReceived(fingerprint,messageId,content):
+        case let .textReceived(fingerprint,messageId,content,replyTo):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(fingerprint, into: &buf)
             FfiConverterString.write(messageId, into: &buf)
             FfiConverterString.write(content, into: &buf)
+            FfiConverterOptionString.write(replyTo, into: &buf)
 
 
         case let .deliveryReceived(fingerprint,messageId):
@@ -8629,6 +8656,18 @@ public func meshEncodePrivateMessage(messageId: String, content: String)throws  
 })
 }
 /**
+ * Same as [`mesh_encode_private_message`], with an optional parent id (TLV 0x04).
+ */
+public func meshEncodePrivateMessageWithReply(messageId: String, content: String, replyTo: String?)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_encode_private_message_with_reply(
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(content),
+        FfiConverterOptionString.lower(replyTo),$0
+    )
+})
+}
+/**
  * Split `data` into bitchat-compatible 0x20 fragment payloads (each carries
  * `original_type`). Wrap each returned payload in a 0x20 packet to send.
  */
@@ -9030,6 +9069,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message() != 50193) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message_with_reply() != 12898) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_mesh_fragment() != 41072) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9172,6 +9214,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text_now() != 30800) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text_with_reply() != 47494) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_set_allowlist() != 36838) {
@@ -9393,7 +9438,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 21048) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_direct_dm() != 11322) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_direct_dm() != 59899) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {

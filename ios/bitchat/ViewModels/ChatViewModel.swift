@@ -618,8 +618,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             }
             .store(in: &cancellables)
         
-        // Request notification permission (guards test environment internally)
+        // Request notification permission (guards test/bench/CI internally).
+        // Extra env gate here so a stale NotificationService build cannot leave
+        // the unsigned simulator harness behind the system alert.
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"] == nil {
+            NotificationService.shared.requestAuthorization()
+        }
+        #else
         NotificationService.shared.requestAuthorization()
+        #endif
         
         
         // Listen for favorite status changes

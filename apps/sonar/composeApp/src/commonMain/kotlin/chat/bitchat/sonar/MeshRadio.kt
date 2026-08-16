@@ -296,7 +296,7 @@ expect object MeshRadio {
     /** Send an encrypted DM over a live BLE mesh route to stable [peerId].
      * Returns false when no write can be started; later platform failures are
      * exposed through [drainMeshSendFailures]. */
-    fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean
+    fun sendMeshDm(peerId: String, messageId: String, text: String, replyTo: String? = null): Boolean
     /** Pull (and clear) sends that crossed the synchronous API boundary but
      * failed at Android's asynchronous GATT completion boundary. */
     fun drainMeshSendFailures(): List<MeshSendFailure>

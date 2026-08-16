@@ -2,7 +2,7 @@
 window.BC_DATA = {
   // Explicitly joined/saved channels only — NOT every place you pass through
   channels: [
-    { id: 'centro', name: 'Lugano · Centro', sub: 'Public · 12 here now', preview: 'Maya: in. I’ll bring the speaker', time: '17:51', unread: 3, count: 12 },
+    { id: 'centro', name: 'Lugano · Centro', sub: 'Public · 12 here now', preview: 'Maya: in. I\u2019ll bring the speaker', time: '17:51', unread: 3, count: 12 },
     { id: 'city', name: 'Milano · Navigli', sub: 'Public · joined Apr 3', preview: 'Saved — quiet right now', time: '', unread: 0, count: 30 },
   ],
   // The single place you're standing in, at every precision level (narrow → wide).
@@ -44,27 +44,27 @@ window.BC_DATA = {
   ],
   groupMsgs: {
     lake: [
-      { author: 'Luca', text: 'lake later? water’s unreal', time: '17:40', via: 'internet' },
-      { author: 'nettle', text: 'i’m down, leaving in 20', time: '17:43', via: 'internet' },
+      { author: 'Luca', text: 'lake later? water\u2019s unreal', time: '17:40', via: 'internet', reactions: [{ e: '🔥', who: ['Maya', 'Tomas'] }] },
+      { author: 'nettle', text: 'i\u2019m down, leaving in 20', time: '17:43', via: 'internet' },
       { author: 'Maya', media: { type: 'image', shape: 'landscape', name: 'lake_now.jpg', cap: 'view from the dock' }, time: '17:55', via: 'internet' },
       { author: 'Maya', text: 'bringing the speaker', time: '17:58', via: 'internet' },
     ],
     trip: [
-      { author: 'Sofia', text: 'ok who’s actually coming this time', time: 'Tue', via: 'internet' },
+      { author: 'Sofia', text: 'ok who\u2019s actually coming this time', time: 'Tue', via: 'internet' },
       { mine: true, text: 'me + Maya for sure', time: 'Tue', via: 'internet', state: 'Delivered' },
       { author: 'Tomas', text: 'in. trains are cheap if we book now', time: 'Tue', via: 'internet' },
       { author: 'Sofia', text: 'booked the cabin!', time: 'Tue', via: 'internet' },
     ],
   },
   chMsgs: [
-    { author: 'Luca', text: 'anyone at the lake later? water’s perfect', time: '17:42', via: 'mesh' },
+    { author: 'Luca', text: 'anyone at the lake later? water\u2019s perfect', time: '17:42', via: 'mesh' },
     { author: 'nettle', text: 'so much nicer than scrolling maps for plans', time: '17:44', via: 'internet' },
-    { author: 'Luca', media: { type: 'image', shape: 'landscape', name: 'lake_now.jpg', cap: 'water’s perfect rn' }, time: '17:50', via: 'mesh' },
-    { author: 'Maya', text: 'in. I’ll bring the speaker', time: '17:51', via: 'mesh' },
+    { author: 'Luca', media: { type: 'image', shape: 'landscape', name: 'lake_now.jpg', cap: 'water\u2019s perfect rn' }, time: '17:50', via: 'mesh' },
+    { author: 'Maya', text: 'in. I\u2019ll bring the speaker', time: '17:51', via: 'mesh' },
   ],
   dmMsgs: [
     { author: 'Maya', text: 'hey, did you make it to the meetup?', time: '18:02', via: 'mesh' },
-    { mine: true, text: 'just got here — it’s packed', time: '18:04', via: 'mesh' },
+    { mine: true, text: 'just got here \u2014 it\u2019s packed', time: '18:04', via: 'mesh', reactions: [{ e: '😂', who: ['Maya'] }] },
     { author: 'Maya', text: 'find me by the coffee table', time: '18:05', via: 'mesh' },
     { author: 'Maya', media: { type: 'image', shape: 'portrait', name: 'IMG_0421.jpg' }, time: '18:05', via: 'mesh' },
     { mine: true, media: { type: 'audio', name: 'vn-01', dur: '0:07' }, time: '18:06', via: 'mesh', state: 'Delivered' },
@@ -72,7 +72,7 @@ window.BC_DATA = {
   ],
   dmMsgsSofia: [
     { author: 'Sofia', text: 'the photos from saturday are up', time: 'Mon', via: 'internet' },
-    { mine: true, text: 'these are great — send me the lake one?', time: 'Mon', via: 'internet', state: 'Delivered' },
+    { mine: true, text: 'these are great \u2014 send me the lake one?', time: 'Mon', via: 'internet', state: 'Delivered' },
     { author: 'Sofia', media: { type: 'video', shape: 'landscape', name: 'VID_0218.mp4', dur: '0:24' }, time: 'Mon', via: 'internet' },
     { author: 'Sofia', media: { type: 'file', name: 'Saturday set.zip', ext: 'ZIP', size: '48.2 MB' }, time: 'Mon', via: 'internet' },
     { author: 'Sofia', text: 'done! check your downloads', time: 'Mon', via: 'internet' },

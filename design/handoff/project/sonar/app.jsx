@@ -92,6 +92,25 @@ function SonarApp() {
     ...a, dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), m] },
   }));
 
+  // Toggle a reaction (one per person, Signal-style) on any message list
+  const BC_MSG_KEYS = { ch: 'chMsgs', dm: 'dmMsgs', group: 'groupMsgs' };
+  const reactMsg = (kind) => (id, idx, emoji) => setApp((a) => {
+    const key = BC_MSG_KEYS[kind];
+    const meName = a.nick || 'you';
+    const list = (a[key][id] || []).map((m, i) => {
+      if (i !== idx) return m;
+      const had = (m.reactions || []).some((r) => r.e === emoji && r.who.includes(meName));
+      let rx = (m.reactions || []).map((r) => ({ e: r.e, who: r.who.filter((w) => w !== meName) }));
+      if (!had) {
+        const t = rx.find((r) => r.e === emoji);
+        if (t) t.who.push(meName); else rx.push({ e: emoji, who: [meName] });
+      }
+      rx = rx.filter((r) => r.who.length);
+      return { ...m, reactions: rx };
+    });
+    return { ...a, [key]: { ...a[key], [id]: list } };
+  });
+
   // ── Nudge (MSN-style "trillo"): shake the frame + play a bell ──
   const [shake, setShake] = React.useState(0);
   const buzz = () => {
@@ -133,19 +152,19 @@ function SonarApp() {
   };
 
   // Channel routing: Nostr when online, Bluetooth mesh when offline
-  const sendCh = (chId, text) => setApp((a) => ({
+  const sendCh = (chId, text, reply) => setApp((a) => ({
     ...a,
     chMsgs: {
       ...a.chMsgs,
       [chId]: [...(a.chMsgs[chId] || []), {
-        mine: true, author: a.nick || 'you', text, time: bcNow(),
+        mine: true, author: a.nick || 'you', text, replyTo: reply || undefined, time: bcNow(),
         via: a.network === 'online' ? 'internet' : 'mesh', state: 'Delivered',
       }],
     },
   }));
 
   // DM routing: Bluetooth if the peer is in range, otherwise Nostr over the internet
-  const sendDm = (peerId, text) => setApp((a) => {
+  const sendDm = (peerId, text, reply) => setApp((a) => {
     const peer = BC_DATA.peers.find((p) => p.id === peerId);
     const inRange = peer && peer.inRange;
     const via = inRange ? 'mesh' : 'internet';
@@ -154,7 +173,7 @@ function SonarApp() {
       ...a,
       dmMsgs: {
         ...a.dmMsgs,
-        [peerId]: [...(a.dmMsgs[peerId] || []), { mine: true, text, time: bcNow(), via, state }],
+        [peerId]: [...(a.dmMsgs[peerId] || []), { mine: true, text, replyTo: reply || undefined, time: bcNow(), via, state }],
       },
     };
   });
@@ -239,10 +258,10 @@ function SonarApp() {
 
   // Group chats: route to members in range over Bluetooth, the rest over internet
   const groupVia = (groupId) => 'internet';
-  const sendGroup = (groupId, text) => setApp((a) => ({
+  const sendGroup = (groupId, text, reply) => setApp((a) => ({
     ...a,
     groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), {
-      mine: true, text, time: bcNow(), via: groupVia(groupId), state: 'Delivered',
+      mine: true, text, replyTo: reply || undefined, time: bcNow(), via: groupVia(groupId), state: 'Delivered',
     }] },
   }));
   const sendMediaGroup = (groupId, type) => setApp((a) => ({
@@ -288,13 +307,13 @@ function SonarApp() {
   if (top.s === 'home') {
     screen = <HomeScreen key={screenKey} app={app} t={t} nav={app.nav} push={push} toggleNetwork={toggleNetwork} onWipe={wipe} onMute={muteConv} onUnmute={unmuteConv} />;
   } else if (top.s === 'channel') {
-    screen = <ChannelScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} chId={top.id} onSend={sendCh} onCommand={onCommand} onMedia={sendMediaCh} onVoice={sendVoiceCh} />;
+    screen = <ChannelScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} chId={top.id} onSend={sendCh} onReact={reactMsg('ch')} onCommand={onCommand} onMedia={sendMediaCh} onVoice={sendVoiceCh} />;
   } else if (top.s === 'dm') {
-    screen = <DMScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onSend={sendDm} onNudge={sendNudge} onCommand={onCommand} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} onPay={(sats) => sendPay(top.id, sats)} onClaimPay={claimPay} openPay={!!top.pay} onMedia={sendMediaDm} onVoice={sendVoiceDm} onMute={muteConv} onUnmute={unmuteConv} />;
+    screen = <DMScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onSend={sendDm} onReact={reactMsg('dm')} onNudge={sendNudge} onCommand={onCommand} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} onPay={(sats) => sendPay(top.id, sats)} onClaimPay={claimPay} openPay={!!top.pay} onMedia={sendMediaDm} onVoice={sendVoiceDm} onMute={muteConv} onUnmute={unmuteConv} />;
   } else if (top.s === 'nearby') {
     screen = <SonarScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} />;
   } else if (top.s === 'group') {
-    screen = <GroupScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onSend={sendGroup} onNudge={sendNudgeGroup} onCommand={onCommand} onMedia={sendMediaGroup} onVoice={sendVoiceGroup} />;
+    screen = <GroupScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onSend={sendGroup} onReact={reactMsg('group')} onNudge={sendNudgeGroup} onCommand={onCommand} onMedia={sendMediaGroup} onVoice={sendVoiceGroup} />;
   } else if (top.s === 'groupinfo') {
     screen = <GroupInfoScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onLeave={leaveGroup} />;
   } else if (top.s === 'newgroup') {
@@ -313,7 +332,9 @@ function SonarApp() {
   } else if (top.s === 'backup') {
     screen = <BackupScreen key={screenKey} app={app} nav={app.nav} pop={pop} onPref={setPref} />;
   } else if (top.s === 'pay') {
-    screen = <SendPaymentScreen key={screenKey} app={app} nav={app.nav} pop={pop} onPaid={(target, sats) => { payExternal(target, sats); pop(); }} />;
+    screen = <SendPaymentScreen key={screenKey} app={app} nav={app.nav} pop={pop} onPaid={(target, sats) => { payExternal(target, sats); setApp((a) => ({ ...a, stack: [...a.stack.slice(0, -1), { s: 'paystatus', target, sats }], nav: 'push' })); }} />;
+  } else if (top.s === 'paystatus') {
+    screen = <PayStatusScreen key={screenKey} app={app} nav={app.nav} pop={pop} target={top.target} sats={top.sats} />;
   } else if (top.s === 'peer') {
     screen = <PeerProfileScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} />;
   }

@@ -4,6 +4,7 @@ import uniffi.sonar_ffi.SonarNoise
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshDecodePrivateMessage
 import uniffi.sonar_ffi.meshEncodePrivateMessage
+import uniffi.sonar_ffi.meshEncodePrivateMessageWithReply
 import uniffi.sonar_ffi.meshParseAnnounce
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -196,9 +197,9 @@ object MeshLink {
 
     fun hasLink(fp: String): Boolean = sessions[fp]?.established == true
 
-    fun sendDm(fp: String, messageId: String, text: String): Boolean {
+    fun sendDm(fp: String, messageId: String, text: String, replyTo: String? = null): Boolean {
         val s = sessions[fp]?.takeIf { it.established } ?: return false
-        return encryptAndSend(fp, s, messageId, text)
+        return encryptAndSend(fp, s, messageId, text, replyTo)
     }
 
     fun sendDmNow(fp: String, messageId: String, text: String): Boolean {
@@ -220,11 +221,22 @@ object MeshLink {
         }
     }
 
-    private fun encryptAndSend(fp: String, s: Session, messageId: String, text: String): Boolean {
+    private fun encryptAndSend(
+        fp: String,
+        s: Session,
+        messageId: String,
+        text: String,
+        replyTo: String? = null,
+    ): Boolean {
         val peerId = peerIdByFp[fp] ?: return false
         return synchronized(s) {
             runCatching {
-                val plain = meshEncodePrivateMessage(messageId, text)
+                val parent = replyTo?.trim()?.takeIf { it.isNotEmpty() }
+                val plain = if (parent == null) {
+                    meshEncodePrivateMessage(messageId, text)
+                } else {
+                    meshEncodePrivateMessageWithReply(messageId, text, parent)
+                }
                 val ct = s.noise.encrypt(plain)
                 BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct))
                 sonarLog("MeshLink", "TX DM to ${nameByFp[fp] ?: fp.take(8)} (${text.length} chars)")

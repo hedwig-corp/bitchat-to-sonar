@@ -1689,6 +1689,7 @@ struct RawDirectDm {
     sender: PublicKey,
     content: String,
     ts: u64,
+    reply_to: Option<String>,
 }
 
 type DirectDmBuf = Arc<Mutex<Vec<RawDirectDm>>>;
@@ -1700,6 +1701,7 @@ pub struct DirectDm {
     pub sender_pubkey: String,
     pub content: String,
     pub created_at: u64,
+    pub reply_to: Option<String>,
 }
 
 /// Live presence (kind-20001) per geohash channel: participant pubkey hex →
@@ -6698,6 +6700,7 @@ impl SonarClient {
                                     sender: unwrapped.sender,
                                     content: dm.content,
                                     ts: unwrapped.rumor.created_at.as_secs(),
+                                    reply_to: dm.reply_to,
                                 });
                             }
                             report.record_retryable(event.created_at.as_secs());
@@ -7344,6 +7347,7 @@ impl SonarClient {
         recipient_peer_id_hex: &str,
         message_id: &str,
         text: &str,
+        reply_to: Option<&str>,
     ) -> Result<()> {
         let recipient = PublicKey::parse(recipient_hex)?;
         let sender_peer_id = parse_mesh_id8_hex(sender_peer_id_hex, "sender peer id")?;
@@ -7352,7 +7356,10 @@ impl SonarClient {
         let msg = crate::mesh::PrivateMessage {
             message_id: message_id.to_string(),
             content: text.to_string(),
-            reply_to: None,
+            reply_to: reply_to
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
         let timestamp_ms = Timestamp::now().as_secs().saturating_mul(1000);
         let embedded = crate::mesh::encode_nip17_private_message_content(
@@ -7383,6 +7390,7 @@ impl SonarClient {
                 sender_pubkey: r.sender.to_hex(),
                 content: r.content,
                 created_at: r.ts,
+                reply_to: r.reply_to,
             })
             .collect();
         out.sort_by_key(|m| m.created_at);

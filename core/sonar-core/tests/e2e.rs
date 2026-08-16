@@ -691,6 +691,7 @@ async fn direct_nip17_bitchat_dm_drains_from_account_gift_wraps() {
             "",
             "direct-mid-1",
             "plain bitchat fallback",
+            None,
         ),
     )
     .await

@@ -92,6 +92,17 @@
   font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
 }
 .dk-morebtn:hover { background: var(--press); color: var(--text); }
+.dk-rowhead { display: flex; align-items: center; justify-content: space-between; padding-right: 10px; }
+.dk-newgroup {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: none; background: none; cursor: pointer;
+  font-family: inherit; font-size: 12px; font-weight: 700;
+  color: var(--accent-deep); padding: 4px 6px; border-radius: 8px;
+}
+.dk-newgroup:hover { background: var(--accent-soft); }
+.dk-overlay { z-index: 70; border-radius: 16px; overflow: hidden; }
+.dk-overlay .bc-scroll { max-width: 520px; margin: 0 auto; width: 100%; }
+.dk-overlay .bc-composerwrap { max-width: 520px; margin: 0 auto; }
 
 .dk-me {
   display: flex; align-items: center; gap: 10px;

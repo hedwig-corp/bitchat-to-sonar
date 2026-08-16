@@ -22,7 +22,7 @@ function bcNow() {
 
 function dkFreshState() {
   return {
-    v: 2,
+    v: 3,
     nick: 'quietfox',
     network: 'online',
     balance: 182400,
@@ -33,15 +33,17 @@ function dkFreshState() {
     prefs: { appLock: false, readReceipts: true, notifs: true, btcMode: false, currency: 'EUR' },
     chMsgs: { centro: BC_DATA.chMsgs.slice(), city: [] },
     dmMsgs: { maya: BC_DATA.dmMsgs.slice(), sofia: BC_DATA.dmMsgsSofia.slice() },
+    txns: BC_DATA.txns.slice(),
+    groupMsgs: { lake: BC_DATA.groupMsgs.lake.slice(), trip: BC_DATA.groupMsgs.trip.slice() },
   };
 }
 
 function dkLoadState() {
   try {
     const s = JSON.parse(localStorage.getItem('sn_desk_v1'));
-    if (s && s.v === 2) {
+    if (s && s.v === 3) {
       const d = dkFreshState();
-      return { ...d, ...s, prefs: { ...d.prefs, ...(s.prefs || {}) }, chMsgs: { ...d.chMsgs, ...(s.chMsgs || {}) }, dmMsgs: { ...d.dmMsgs, ...(s.dmMsgs || {}) } };
+      return { ...d, ...s, prefs: { ...d.prefs, ...(s.prefs || {}) }, chMsgs: { ...d.chMsgs, ...(s.chMsgs || {}) }, dmMsgs: { ...d.dmMsgs, ...(s.dmMsgs || {}) }, groupMsgs: { ...d.groupMsgs, ...(s.groupMsgs || {}) }, txns: s.txns || d.txns };
     }
   } catch (e) { /* fall through */ }
   return dkFreshState();
@@ -51,6 +53,7 @@ function SonarDesktop() {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [app, setApp] = React.useState(dkLoadState);
   const [settings, setSettings] = React.useState(false);
+  const [donate, setDonate] = React.useState(false);
   const [scale, setScale] = React.useState(1);
   const winW = t.windowWidth;
   const winH = 780;
@@ -75,8 +78,9 @@ function SonarDesktop() {
 
   const select = (type, id, extra) => setApp((a) => ({
     ...a,
+    prevSel: (a.sel && a.sel.type !== 'newgroup') ? a.sel : a.prevSel,
     sel: { type, id, ...(extra || {}) },
-    read: id ? { ...a.read, [id]: true } : a.read,
+    read: id ? { ...a.read, [id]: true, ['g-' + id]: true } : a.read,
   }));
   const toggleNetwork = () => setApp((a) => ({ ...a, network: a.network === 'online' ? 'offline' : 'online' }));
   const toggleRail = () => setApp((a) => ({ ...a, rail: !a.rail }));
@@ -118,36 +122,33 @@ function SonarDesktop() {
     if (cmd === 'who' || cmd === 'msg') { select('radar'); return; }
     if (cmd === 'slap') {
       const m = { action: true, text: '* ' + (app.nick || 'you') + ' slaps ' + ctx.target + ' around a bit with a large trout', time: bcNow() };
-      if (ctx.type === 'ch') appendCh(ctx.id, m); else appendDm(ctx.id, m);
+      if (ctx.type === 'ch') appendCh(ctx.id, m);
+      else if (ctx.type === 'group') setApp((a) => ({ ...a, groupMsgs: { ...a.groupMsgs, [ctx.id]: [...(a.groupMsgs[ctx.id] || []), m] } }));
+      else appendDm(ctx.id, m);
     }
   };
 
-  // Payments ride the same rails: ecash over Bluetooth in range, Lightning otherwise
+  // Direct payment: pending → paid → confirmed (signed receipt); records a wallet txn
+  const setPayState = (peerId, key, state) => setApp((a) => ({
+    ...a,
+    dmMsgs: { ...a.dmMsgs, [peerId]: (a.dmMsgs[peerId] || []).map((m) => (m.payKey === key ? { ...m, state } : m)) },
+    txns: (a.txns || []).map((t) => (t.key === key ? { ...t, state } : t)),
+  }));
   const sendPay = (peerId, sats) => {
-    setApp((a) => {
-      const peer = BC_DATA.peers.find((p) => p.id === peerId);
-      const via = peer && peer.inRange ? 'mesh' : 'internet';
-      return {
-        ...a,
-        balance: Math.max(0, (a.balance || 0) - sats),
-        dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), { pay: true, mine: true, amount: sats, via, state: 'sealed', time: bcNow() }] },
-      };
-    });
-    setTimeout(() => setApp((a) => {
-      const list = (a.dmMsgs[peerId] || []).slice();
-      for (let i = list.length - 1; i >= 0; i--) {
-        if (list[i].pay && list[i].mine && list[i].state === 'sealed') { list[i] = { ...list[i], state: 'claimed' }; break; }
-      }
-      return { ...a, dmMsgs: { ...a.dmMsgs, [peerId]: list } };
-    }), 2600);
+    const key = 'tx' + Date.now();
+    const peer = BC_DATA.peers.find((p) => p.id === peerId);
+    const via = peer && peer.inRange ? 'mesh' : 'internet';
+    const time = bcNow();
+    setApp((a) => ({
+      ...a,
+      balance: Math.max(0, (a.balance || 0) - sats),
+      dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), { pay: true, mine: true, amount: sats, via, state: 'pending', time, payKey: key }] },
+      txns: [{ key, dir: 'out', who: peer ? peer.name : 'unknown', amount: sats, via, state: 'pending', time }, ...((a.txns) || [])],
+    }));
+    setTimeout(() => setPayState(peerId, key, 'paid'), 1400);
+    setTimeout(() => setPayState(peerId, key, 'confirmed'), 3200);
   };
-  const claimPay = (peerId, idx) => setApp((a) => {
-    const list = (a.dmMsgs[peerId] || []).slice();
-    const m = list[idx];
-    if (!m || !m.pay || m.mine || m.state !== 'sealed') return a;
-    list[idx] = { ...m, state: 'claimed' };
-    return { ...a, balance: (a.balance || 0) + m.amount, dmMsgs: { ...a.dmMsgs, [peerId]: list } };
-  });
+  const claimPay = () => {};
 
   const sendMediaCh = (chId, type) => setApp((a) => ({
     ...a,
@@ -181,6 +182,33 @@ function SonarDesktop() {
   });
   const sendVoice = (id, sec) => (app.sel.type === 'channel' ? sendVoiceCh(id, sec) : sendVoiceDm(id, sec));
 
+  // Group chats (desktop) — internet only, secured by White Noise
+  const groupVia = (groupId) => 'internet';
+  const sendGroup = (groupId, text) => setApp((a) => ({
+    ...a, groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), {
+      mine: true, text, time: bcNow(), via: groupVia(groupId), state: 'Delivered',
+    }] },
+  }));
+  const sendMediaGroup = (groupId, type) => setApp((a) => ({
+    ...a, groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), {
+      mine: true, media: bcSampleMedia(type), time: bcNow(), via: groupVia(groupId), state: 'Delivered',
+    }] },
+  }));
+  const sendVoiceGroup = (groupId, sec) => setApp((a) => ({
+    ...a, groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), {
+      mine: true, media: bcVoiceMedia(sec), time: bcNow(), via: groupVia(groupId), state: 'Delivered',
+    }] },
+  }));
+  const createGroup = (name, memberIds) => {
+    const id = 'g' + Date.now().toString(36);
+    BC_DATA.groups = [{ id, name, members: memberIds, preview: 'New group', time: 'now', unread: 0 }, ...(BC_DATA.groups || [])];
+    setApp((a) => ({ ...a, groupMsgs: { ...a.groupMsgs, [id]: [] }, sel: { type: 'group', id } }));
+  };
+  const leaveGroup = (groupId) => {
+    BC_DATA.groups = (BC_DATA.groups || []).filter((g) => g.id !== groupId);
+    setApp((a) => ({ ...a, sel: { type: 'dm', id: 'maya' } }));
+  };
+
   const [call, setCall] = React.useState(null); // { id, kind }
   const endCall = (peerId, kind, sec) => {
     setCall(null);
@@ -193,7 +221,7 @@ function SonarDesktop() {
   };
 
   const fontStack = BC_FONTS[t.typeface] || BC_FONTS.Figtree;
-  const showRail = app.rail && app.sel.type !== 'radar';
+  const showRail = app.rail && app.sel.type !== 'radar' && app.sel.type !== 'newgroup';
 
   return (
     <React.Fragment>
@@ -209,6 +237,15 @@ function SonarDesktop() {
             <DkSidebar app={app} sel={app.sel} onSelect={select} toggleNetwork={toggleNetwork} onSettings={() => setSettings(true)} />
             {app.sel.type === 'radar'
               ? <DkRadarPane app={app} onSelect={select} />
+              : app.sel.type === 'newgroup'
+              ? <NewGroupScreen app={app} nav="" pop={() => select(app.prevSel ? app.prevSel.type : 'dm', app.prevSel ? app.prevSel.id : 'maya')} onCreate={createGroup} />
+              : app.sel.type === 'group'
+              ? <DkGroupPane
+                  app={app} sel={app.sel}
+                  railOpen={app.rail} onToggleRail={toggleRail}
+                  onSendGroup={sendGroup} onMediaGroup={sendMediaGroup} onVoiceGroup={sendVoiceGroup}
+                  onCommand={onCommand} onSelect={select}
+                />
               : <DkChatPane
                   app={app} sel={app.sel}
                   railOpen={app.rail} onToggleRail={toggleRail}
@@ -221,6 +258,8 @@ function SonarDesktop() {
               <DkRail
                 app={app} sel={app.sel}
                 onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))}
+                onSelect={select}
+                onLeave={leaveGroup}
               />
             )}
             {settings && (
@@ -231,7 +270,15 @@ function SonarDesktop() {
                 onPref={setPref}
                 onRename={(n) => setApp((a) => ({ ...a, nick: n }))}
                 onWipe={wipe}
+                push={(s) => { if (s === 'donate') { setSettings(false); setDonate(true); } }}
                 onClose={() => setSettings(false)}
+              />
+            )}
+            {donate && (
+              <DonateScreen
+                app={app} nav="" overlay
+                pop={() => setDonate(false)}
+                onBecomeSupporter={() => setPref('supporter', true)}
               />
             )}
             {call && (() => {

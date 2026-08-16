@@ -101,8 +101,8 @@ actual object MeshRadio {
     actual fun sonarPeers(): Map<String, ByteArray> =
         MeshLink.sonarPeers().filterKeys { isKnownPeer(it) }
 
-    actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
-        MeshLink.sendDm(peerId, messageId, text)
+    actual fun sendMeshDm(peerId: String, messageId: String, text: String, replyTo: String?): Boolean =
+        MeshLink.sendDm(peerId, messageId, text, replyTo)
     actual fun drainMeshSendFailures(): List<MeshSendFailure> = emptyList()
     actual fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean =
         MeshLink.sendDmNow(peerId, messageId, text)

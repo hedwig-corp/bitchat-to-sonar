@@ -412,6 +412,17 @@ func snCanReply(to message: SNMessage) -> Bool {
     return true
 }
 
+/// Full source text for Signal-style Copy. Nil when the row is not text
+/// (media / sticker / pay / call / nudge / system). Sending rows stay
+/// copyable — reply is gated separately. Never includes timestamp, via
+/// glyph, or delivery state — those are chrome, not user content.
+func snCopyableText(of message: SNMessage) -> String? {
+    if message.action || message.call != nil || message.trill { return nil }
+    if message.stickerRef != nil || !message.media.isEmpty || message.pay != nil { return nil }
+    let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : message.text
+}
+
 /// Signal-iOS `CVComponentMessage` swipe-to-reply metrics (55pt threshold,
 /// rubber-band overflow/4, icon travels at 1/8 bubble speed).
 enum SNSwipeReplyMetrics {

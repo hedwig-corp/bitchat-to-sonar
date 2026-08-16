@@ -2200,6 +2200,47 @@ cellular for a day, cross-checked against `SecureLogger` `.session` lines
   loop), and relay sync is watermark-scoped and event-driven. Neither is a
   GB/day source, and gating chat traffic on Wi-Fi would break the product.
 
+## R-034 — Reply decoration must never claim transcript height
+
+**Invariant:** quote decoration and the composer reply preview size to their
+content. A decorative stripe, icon, or background may not accept the
+transcript viewport's proposed height or inflate the collection's owned
+composer inset.
+
+**Breaks as:** a quoted bubble becomes a screen-tall color panel, or tapping
+Reply makes every transcript row disappear while the compact reply composer
+remains visible at the bottom.
+
+**Why:** both iOS reply surfaces used `Rectangle().frame(maxHeight: .infinity)`.
+The quote row's custom layout forwarded the viewport-height proposal, and the
+collection host deliberately measures composer chrome against an expanded
+height. The decorative rectangles therefore became the tallest children. The
+quote layout now measures with unconstrained child height; the composer follows
+the handoff's fixed reply icon instead of a height-owning stripe.
+
+**Apple call sites:** `SonarComponents.swift::SNFillWidestVStack`,
+`SNQuoteChip`, and `SNComposerReplyBanner`, measured by
+`TranscriptCollectionHost.swift::updateOwnedInsetsFromChrome`.
+
+**Compose call sites:** `App.kt::QuoteChip` and `ComposerReplyBanner`. Compose's
+old banner happened to contain the stripe with `IntrinsicSize.Min`, so it did
+not reproduce the iOS viewport-inheritance failure; it now mirrors the same
+icon-based handoff structure and has a bounded-height UI test.
+
+**Guarded by:** `SonarReplyTests.quoteBubbleDoesNotInheritTranscriptViewportHeight`
+
+**Also guarded by:** `SonarReplyTests.replyComposerDoesNotInheritTranscriptViewportHeight`, `ComposerReplyBannerUiTest.replyComposerStaysBoundedInsideATallTranscript`
+
+**Not guarded:** the tests pin intrinsic/bounded height, not a full device tap
+from context menu through keyboard animation. The iOS test target is not
+currently part of CI.
+
+**Rejected:**
+- *Clamping the collection host's bottom inset.* That hides the bad measurement
+  but can put a legitimate multiline composer under the keyboard.
+- *Giving decorative rectangles a guessed fixed height.* It drifts with Dynamic
+  Type and localization; decoration follows content, never the reverse.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

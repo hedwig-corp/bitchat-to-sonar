@@ -172,6 +172,7 @@
   "app_info.tagline": "app_info_tagline",
   "app_info.warning.message": "app_info_warning_message",
   "app_info.warning.title": "app_info_warning_title",
+  "chat.copy": "chat_copy",
   "chat.reply": "chat_reply",
   "chat.reply.cancel": "chat_reply_cancel",
   "chat.reply.fallback": "chat_reply_fallback",

@@ -2,14 +2,14 @@
 // Display adapts to prefs: fiat by default (bitcoin hidden), or sats when btcMode is on.
 
 const PAY_RATES = { EUR: 0.00058, USD: 0.00063, GBP: 0.00049, CHF: 0.00057 }; // fiat per 1 sat
-const PAY_SYM   = { EUR: '€', USD: '$', GBP: '£', CHF: 'CHF ' };
-const PAY_COIN  = { EUR: '€', USD: '$', GBP: '£', CHF: 'Fr' };
+const PAY_SYM   = { EUR: '\u20ac', USD: '$', GBP: '\u00a3', CHF: 'CHF\u00a0' };
+const PAY_COIN  = { EUR: '\u20ac', USD: '$', GBP: '\u00a3', CHF: 'Fr' };
 const PAY_NAMES = { EUR: 'Euro', USD: 'US Dollar', GBP: 'British Pound', CHF: 'Swiss Franc' };
 const PAY_CURRENCIES = ['EUR', 'USD', 'GBP', 'CHF'];
 
 function payFmt(sats) { return (sats || 0).toLocaleString('en-US'); }
 function payFiatVal(sats, cur) { return (sats || 0) * (PAY_RATES[cur] || PAY_RATES.EUR); }
-function payFiatStr(sats, cur) { return (PAY_SYM[cur] || '€') + payFiatVal(sats, cur).toFixed(2); }
+function payFiatStr(sats, cur) { return (PAY_SYM[cur] || '\u20ac') + payFiatVal(sats, cur).toFixed(2); }
 function satsFromFiat(fiat, cur) { return Math.round(fiat / (PAY_RATES[cur] || PAY_RATES.EUR)); }
 
 // Pull display prefs off app state (defaults: fiat / EUR)
@@ -47,17 +47,17 @@ function PayAmount({ sats, pay }) {
 function PayBubble({ m, peerName, onTap, pay }) {
   const btc = pay && pay.btcMode;
   const cur = (pay && pay.currency) || 'EUR';
-  const coin = btc ? '₿' : (PAY_COIN[cur] || '€');
+  const coin = btc ? '\u20bf' : (PAY_COIN[cur] || '\u20ac');
   const viaIcon = m.via === 'mesh' ? 'mesh' : (btc ? 'bolt' : 'globe');
   const st = m.state || (m.mine ? 'paid' : 'received');
   let stateEl;
   if (m.mine) {
-    if (st === 'pending') stateEl = <><span className="pay-spin"></span>Sending…</>;
-    else if (st === 'failed') stateEl = <><BCIcon name="x" size={11} weight={2.6} style={{ color: 'var(--danger)' }} />{'Couldn’t send · tap to retry'}</>;
-    else if (st === 'confirmed') stateEl = <><BCIcon name="shieldCheck" size={11} weight={2.4} style={{ color: 'var(--green)' }} />{'Confirmed by ' + peerName + ' · ' + m.time}</>;
-    else stateEl = <><BCIcon name={viaIcon} size={11} weight={2.4} />{'Sent · ' + m.time}</>;
+    if (st === 'pending') stateEl = <><span className="pay-spin"></span>Sending\u2026</>;
+    else if (st === 'failed') stateEl = <><BCIcon name="x" size={11} weight={2.6} style={{ color: 'var(--danger)' }} />{'Couldn\u2019t send \u00b7 tap to retry'}</>;
+    else if (st === 'confirmed') stateEl = <><BCIcon name="shieldCheck" size={11} weight={2.4} style={{ color: 'var(--green)' }} />{'Confirmed by ' + peerName + ' \u00b7 ' + m.time}</>;
+    else stateEl = <><BCIcon name={viaIcon} size={11} weight={2.4} />{'Sent \u00b7 ' + m.time}</>;
   } else {
-    stateEl = <><BCIcon name={viaIcon} size={11} weight={2.4} />{'Received · ' + m.time}</>;
+    stateEl = <><BCIcon name={viaIcon} size={11} weight={2.4} />{'Received \u00b7 ' + m.time}</>;
   }
   return (
     <div className={'bc-msg' + (m.mine ? ' mine' : '')}>
@@ -99,9 +99,89 @@ function PayDetailSheet({ m, peerName, pay, onClose }) {
       <p className="pay-note" style={{ padding: '8px 18px 2px' }}>
         {proven
           ? 'Receipt signed by ' + peerName + '. Note: a receipt proves the sender trusts the signer — not cryptographic settlement, until BOLT12 payer proofs ship.'
-          : 'Waiting for ' + peerName + '’s wallet to settle and post a signed receipt.'}
+          : 'Waiting for ' + peerName + '\u2019s wallet to settle and post a signed receipt.'}
       </p>
     </Sheet>
+  );
+}
+
+/* ── Payment status (Direction B · one sentence) — external/off-app sends ── */
+const PS_COPY = {
+  resolving: ['Finding {who}', 'Checking the destination is payable.'],
+  paying:    ['Sending {amt}', 'Your payment is hopping through the Lightning network.'],
+  slow:      ['Taking longer than usual', 'The first route didn\u2019t answer. Trying another \u2014 this can take a minute.'],
+  sent:      ['Paid {who}', 'They received {amt}. You have cryptographic proof of payment.'],
+  failed:    ['Couldn\u2019t send', 'No route to {who} right now. You were not charged.'],
+};
+const PS_MONEY = {
+  resolving: ['safe', 'Nothing sent yet \u2014 still yours'],
+  paying:    ['flight', '{amt} in flight \u2014 not yet settled'],
+  slow:      ['warn', 'Still in flight \u2014 held, not lost'],
+  sent:      ['good', '{amt} delivered \u00b7 proof received'],
+  failed:    ['safe', 'Nothing left your wallet \u2014 balance unchanged'],
+};
+const PS_PCT = { resolving: 12, paying: 58, slow: 70, sent: 100, failed: 100 };
+
+function PayStatusScreen({ app, nav, pop, target, sats }) {
+  const [st, setSt] = React.useState('resolving');
+  const [open, setOpen] = React.useState(false);
+  const pp = payPrefs(app);
+  const who = (target && target.name) || 'recipient';
+  const amt = pp.btcMode ? payFmt(sats) + ' sats' : payFiatStr(sats, pp.currency);
+  React.useEffect(() => {
+    const t1 = setTimeout(() => setSt('paying'), 900);
+    const t2 = setTimeout(() => setSt('sent'), 2600);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, []);
+  const fill = (s) => s.replace('{who}', who).replace(/\{amt\}/g, amt);
+  const good = st === 'sent', bad = st === 'failed', warn = st === 'slow';
+  const R = 58, C = 2 * Math.PI * R;
+  const stroke = good ? 'var(--green)' : bad ? 'var(--danger)' : warn ? 'var(--gold-fill)' : 'var(--accent)';
+  const glyph = good ? 'check' : bad ? 'x' : warn ? 'shield' : 'bolt';
+  const [h, sub] = PS_COPY[st];
+  const [tone, mtext] = PS_MONEY[st];
+  return (
+    <div className="bc-screen" data-nav={nav} data-screen-label={'Payment status: ' + who}>
+      <NavHeader onBack={pop} hairline={false}><div className="bc-hname"><span>Payment</span></div></NavHeader>
+      <div className="bc-scroll">
+        <div className="ps-one">
+          <div className={'ps-ring' + (good ? ' good' : bad ? ' bad' : warn ? ' warn' : '')}>
+            <svg width="132" height="132">
+              <circle cx="66" cy="66" r={R} fill="none" stroke="var(--surface2)" strokeWidth="7" />
+              <circle cx="66" cy="66" r={R} fill="none" stroke={stroke} strokeWidth="7" strokeLinecap="round"
+                strokeDasharray={C} strokeDashoffset={C * (1 - PS_PCT[st] / 100)}
+                className={!good && !bad && !warn ? 'ps-spin' : ''} style={{ transition: 'stroke-dashoffset 0.7s ease' }} />
+            </svg>
+            <span className="ps-glyph"><BCIcon name={glyph} size={34} weight={2.2} /></span>
+          </div>
+          <h2 className="ps-h">{fill(h)}</h2>
+          <p className="ps-s">{fill(sub)}</p>
+          <span className={'ps-money ' + tone}>{fill(mtext)}</span>
+          <div className="ps-disc">
+            <button className="ps-discbtn" onClick={() => setOpen(!open)}>
+              <BCIcon name="info" size={15} weight={2} />
+              <span>{'What\u2019s happening?'}</span>
+              <BCIcon name="chevron" size={13} weight={2.2} style={{ marginLeft: 'auto', transform: open ? 'rotate(90deg)' : 'none', transition: 'transform 0.18s' }} />
+            </button>
+            {open && (
+              <div className="ps-discbody">
+                <div className="ok">{'\u2713'} destination resolved</div>
+                <div className={st !== 'resolving' ? 'ok' : ''}>{st !== 'resolving' ? '\u2713' : '\u00b7'} route found</div>
+                <div className={good ? 'ok' : ''}>{good ? '\u2713' : '\u00b7'} htlc {good ? 'settled' : bad ? 'cancelled' : 'in flight'}</div>
+                <div>{good ? 'proof stored in wallet' : 'proof \u2014'}</div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+      {good || bad ? (
+        <div className="bc-composerwrap">
+          <div style={{ padding: '10px 14px 30px' }}>
+            <button className="bc-primary" onClick={pop}>Done</button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -282,7 +362,7 @@ function PaySheet({ peer, balance, transport, pay, fixed, onClose, onSend }) {
     subLine = over ? 'Not enough sats' : payFiatStr(sats, cur);
     sendLabel = mesh ? 'Send over Bluetooth' : 'Send over Lightning';
   } else {
-    subLine = over ? 'Not enough balance' : ' ';
+    subLine = over ? 'Not enough balance' : '\u00a0';
     sendLabel = can ? 'Send ' + payFiatStr(sats, cur) : 'Enter an amount';
   }
 
@@ -373,7 +453,7 @@ function WalletActivity({ app, txns }) {
 }
 
 Object.assign(window, {
-  PayBubble, PaySheet, PayAmount, PayDetailSheet, WalletActivity, SendPaymentScreen, ScanQrSheet,
+  PayBubble, PaySheet, PayAmount, PayDetailSheet, WalletActivity, SendPaymentScreen, ScanQrSheet, PayStatusScreen,
   payFmt, payFiatStr, payFiatVal, satsFromFiat, payPrefs, walletStr,
   PAY_CURRENCIES, PAY_NAMES, PAY_SYM,
 });

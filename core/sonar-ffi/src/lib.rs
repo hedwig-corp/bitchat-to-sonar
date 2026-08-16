@@ -779,6 +779,7 @@ pub struct DirectDmInfo {
     pub sender_pubkey_hex: String,
     pub content: String,
     pub created_at_secs: u64,
+    pub reply_to: Option<String>,
 }
 
 /// Callback interface for conversation-summary changes. The host implements
@@ -2075,6 +2076,7 @@ impl SonarNode {
         recipient_peer_id_hex: String,
         message_id: String,
         text: String,
+        reply_to: Option<String>,
     ) -> FfiResult<()> {
         self.runtime.block_on(self.client.send_direct_dm(
             &recipient_hex,
@@ -2082,6 +2084,10 @@ impl SonarNode {
             &recipient_peer_id_hex,
             &message_id,
             &text,
+            reply_to
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
         ))?;
         Ok(())
     }
@@ -2894,10 +2900,22 @@ pub fn mesh_build_signed_packet_v2(
 /// The inner noiseEncrypted plaintext for a private message: `[0x01][TLV]`.
 #[uniffi::export]
 pub fn mesh_encode_private_message(message_id: String, content: String) -> FfiResult<Vec<u8>> {
+    mesh_encode_private_message_with_reply(message_id, content, None)
+}
+
+/// Same as [`mesh_encode_private_message`], with an optional parent id (TLV 0x04).
+#[uniffi::export]
+pub fn mesh_encode_private_message_with_reply(
+    message_id: String,
+    content: String,
+    reply_to: Option<String>,
+) -> FfiResult<Vec<u8>> {
     let pm = mesh::PrivateMessage {
         message_id,
         content,
-        reply_to: None,
+        reply_to: reply_to
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     };
     mesh::encode_private_message_plaintext(&pm)
         .ok_or_else(|| SonarFfiError::Core("private message encode failed".into()))
@@ -3126,6 +3144,7 @@ fn direct_dm_info(m: sonar_core::client::DirectDm) -> DirectDmInfo {
         sender_pubkey_hex: m.sender_pubkey,
         content: m.content,
         created_at_secs: m.created_at,
+        reply_to: m.reply_to,
     }
 }
 
@@ -3317,6 +3336,7 @@ pub enum MeshEngineEvent {
         fingerprint: String,
         message_id: String,
         content: String,
+        reply_to: Option<String>,
     },
     DeliveryReceived {
         fingerprint: String,
@@ -3415,10 +3435,12 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
                     fingerprint,
                     message_id,
                     content,
+                    reply_to,
                 } => MeshEngineEvent::TextReceived {
                     fingerprint,
                     message_id,
                     content,
+                    reply_to,
                 },
                 mesh_engine::AppEvent::DeliveryReceived {
                     fingerprint,
@@ -3613,6 +3635,24 @@ impl MeshLinkEngine {
     ) -> Option<MeshEngineOutput> {
         self.lock()
             .send_text(&fingerprint, &message_id, &text, ms(now_ms))
+            .map(engine_output)
+    }
+
+    /// Same as [`Self::send_text`], with an optional parent message id (TLV 0x04).
+    pub fn send_text_with_reply(
+        &self,
+        fingerprint: String,
+        message_id: String,
+        text: String,
+        reply_to: Option<String>,
+        now_ms: i64,
+    ) -> Option<MeshEngineOutput> {
+        let reply = reply_to
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        self.lock()
+            .send_text_with_reply(&fingerprint, &message_id, &text, reply, ms(now_ms))
             .map(engine_output)
     }
 

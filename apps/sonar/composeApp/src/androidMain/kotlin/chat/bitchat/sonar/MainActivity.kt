@@ -303,7 +303,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             } else {
-                MeshRadio.sendMeshDm(peerId, messageId, text.orEmpty()).also {
+                MeshRadio.sendMeshDm(peerId, messageId, text.orEmpty(), null).also {
                     android.util.Log.i(
                         DEBUG_MESH_TAG,
                         "run=$runId kind=text peer=${peerId.take(16)} message=$messageId accepted=$it",

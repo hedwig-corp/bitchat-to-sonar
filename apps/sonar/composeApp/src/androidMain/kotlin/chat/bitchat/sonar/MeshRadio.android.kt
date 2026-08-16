@@ -103,9 +103,9 @@ actual object MeshRadio {
         // (SHA256 of its noise static key), so a peer stays ONE radar node + ONE
         // conversation across peerID + BLE-address rotation (issue #12).
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
-        MeshGatt.addMessageListener { fingerprint, messageId, text ->
+        MeshGatt.addMessageListener { fingerprint, messageId, text, replyTo ->
             if (!isKnownPeer(fingerprint)) return@addMessageListener
-            meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
+            meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000, replyTo))
         }
         MeshGatt.addDeliveryListener { fingerprint, messageId ->
             if (isKnownPeer(fingerprint)) {
@@ -397,8 +397,8 @@ actual object MeshRadio {
     actual fun sonarPeers(): Map<String, ByteArray> =
         sonarProfiles.filterKeys { isKnownPeer(it) }
 
-    actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
-        MeshGatt.sendTextToPeer(peerId, messageId, text)
+    actual fun sendMeshDm(peerId: String, messageId: String, text: String, replyTo: String?): Boolean =
+        MeshGatt.sendTextToPeer(peerId, messageId, text, replyTo)
     actual fun drainMeshSendFailures(): List<MeshSendFailure> {
         val out = ArrayList<MeshSendFailure>()
         while (true) out.add(meshSendFailureInbox.poll() ?: break)

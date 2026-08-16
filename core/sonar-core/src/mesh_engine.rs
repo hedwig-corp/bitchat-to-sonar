@@ -155,6 +155,7 @@ pub enum AppEvent {
         fingerprint: String,
         message_id: String,
         content: String,
+        reply_to: Option<String>,
     },
     DeliveryReceived {
         fingerprint: String,
@@ -1943,6 +1944,7 @@ impl Engine {
                     fingerprint: id_fp,
                     message_id: pm.message_id,
                     content: pm.content,
+                    reply_to: pm.reply_to,
                 });
             }
             noise_payload::DELIVERED => {
@@ -2444,6 +2446,34 @@ mod tests {
             "B must receive the DM, got {got:?}"
         );
         let _ = link;
+    }
+
+    #[test]
+    fn send_text_with_reply_round_trips_parent_id() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "vincent-osx");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+        let out = a
+            .send_text_with_reply(&fp_of(&b), "child-1", "ok", Some("parent-mid"), 2_000)
+            .expect("allowed");
+        let mut got = Vec::new();
+        for c in out.commands {
+            if let Command::WriteLink { bytes, .. } = c {
+                got.extend(b.on_server_rx("droid", &bytes, 2_000).events);
+            }
+        }
+        assert!(
+            got.iter().any(|e| matches!(
+                e,
+                AppEvent::TextReceived {
+                    content,
+                    reply_to: Some(parent),
+                    ..
+                } if content == "ok" && parent == "parent-mid"
+            )),
+            "B must receive the parent id on the wire, got {got:?}"
+        );
     }
 
     /// The failure this guards is invisible from the sending side: Android's GATT

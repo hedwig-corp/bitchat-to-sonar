@@ -199,21 +199,64 @@ function isSupporterAuthor(name) {
   return !!(p && p.supporter);
 }
 
-/* ── Message bubble + list — bubble color encodes transport (BLE vs internet) ── */
-function MsgBubble({ m, showAuthor, cont, showState }) {
-  const hue = bcHash(m.author || '') % 360;
+/* ── Reactions & replies ── */
+const BC_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🔥'];
+
+function bcReplyFrom(m, peerName) {
+  return { author: m.mine ? 'You' : m.author || peerName || 'Them', text: m.text || bcMediaWord(m.media) };
+}
+
+/* long-press (or right-click) handlers for message bubbles */
+function useBcPress(cb) {
+  const t = React.useRef(null);
+  const down = () => { if (!cb) return; t.current = setTimeout(() => { t.current = null; cb(); }, 420); };
+  const up = () => { if (t.current) { clearTimeout(t.current); t.current = null; } };
+  if (!cb) return {};
+  return {
+    onMouseDown: down, onMouseUp: up, onMouseLeave: up,
+    onTouchStart: down, onTouchEnd: up, onTouchMove: up,
+    onContextMenu: (e) => { e.preventDefault(); up(); cb(); },
+  };
+}
+
+function ReplyQuote({ r }) {
   return (
-    <div className={'bc-msg' + (m.mine ? ' mine' : '') + (cont ? ' cont' : '')} data-via={m.via || null}>
+    <div className="bc-quote">
+      <span className="bc-quotename">{r.author}</span>
+      <span className="bc-quotetext">{r.text}</span>
+    </div>);
+}
+
+function ReactionRow({ m, me, onReact }) {
+  if (!m.reactions || !m.reactions.length) return null;
+  return (
+    <div className="bc-reacts">
+      {m.reactions.map((r) =>
+      <button key={r.e} className={'bc-react' + (me && r.who.includes(me) ? ' mine' : '')} title={r.who.join(', ')} onClick={() => onReact && onReact(r.e)}>
+          {r.e}{r.who.length > 1 ? <b>{r.who.length}</b> : null}
+        </button>
+      )}
+    </div>);
+}
+
+/* ── Message bubble + list — bubble color encodes transport (BLE vs internet) ── */
+function MsgBubble({ m, showAuthor, cont, showState, me, onPress, onReact }) {
+  const hue = bcHash(m.author || '') % 360;
+  const press = useBcPress(onPress);
+  return (
+    <div className={'bc-msg' + (m.mine ? ' mine' : '') + (cont ? ' cont' : '')} data-via={m.via || null} {...press}>
       {showAuthor &&
       <div className="bc-author" style={{ color: `hsl(${hue} var(--author-s) var(--author-l))` }}>{m.author}{isSupporterAuthor(m.author) ? <SupporterBadge size={12} /> : null}</div>
       }
       <div className="bc-bubble">
+        {m.replyTo ? <ReplyQuote r={m.replyTo} /> : null}
         {m.text}
         <span className="bc-meta">
           {m.time}
           {m.via ? <BCIcon name={m.via === 'mesh' ? 'mesh' : 'globe'} size={11} weight={2.2} /> : null}
         </span>
       </div>
+      <ReactionRow m={m} me={me} onReact={onReact} />
       {showState && m.state ?
       <div className="bc-state"><BCIcon name="check" size={11} weight={2.6} />{m.state} · {m.via === 'mesh' ? 'Bluetooth' : 'internet'}</div> :
       null}
@@ -251,14 +294,15 @@ function MetaChip({ m, glass }) {
 
 }
 
-function MediaBubble({ m, showAuthor, cont, showState }) {
+function MediaBubble({ m, showAuthor, cont, showState, me, onPress, onReact }) {
   const md = m.media;
   const hue = bcHash(m.author || '') % 360;
   const phue = bcHash((md.name || '') + (md.shape || '')) % 360;
   const isVisual = md.type === 'image' || md.type === 'video';
   const [w, hgt] = MEDIA_SHAPE[md.shape || 'landscape'];
+  const press = useBcPress(onPress);
   return (
-    <div className={'bc-msg' + (m.mine ? ' mine' : '') + (cont ? ' cont' : '') + (md.type === 'sticker' || md.type === 'gif' ? ' mediabare' : '')} data-via={m.via || null}>
+    <div className={'bc-msg' + (m.mine ? ' mine' : '') + (cont ? ' cont' : '') + (md.type === 'sticker' || md.type === 'gif' ? ' mediabare' : '')} data-via={m.via || null} {...press}>
       {showAuthor &&
       <div className="bc-author" style={{ color: `hsl(${hue} var(--author-s) var(--author-l))` }}>{m.author}{isSupporterAuthor(m.author) ? <SupporterBadge size={12} /> : null}</div>
       }
@@ -318,6 +362,7 @@ function MediaBubble({ m, showAuthor, cont, showState }) {
 
       {md.cap ? <div className="media-cap">{md.cap}</div> : null}
       {(md.type === 'audio' || md.type === 'file') && <MetaChip m={m} />}
+      <ReactionRow m={m} me={me} onReact={onReact} />
       {showState && m.state && md.type !== 'sticker' && md.type !== 'gif' ?
       <div className="bc-state"><BCIcon name="check" size={11} weight={2.6} />{m.state} · {m.via === 'mesh' ? 'Bluetooth' : 'internet'}</div> :
       null}
@@ -334,12 +379,16 @@ function NudgeMsg({ m, peerName }) {
   );
 }
 
-function MsgList({ msgs, showAuthors, peerName, onClaim, pay }) {
+function MsgList({ msgs, showAuthors, peerName, onClaim, pay, me, onReact, onReply }) {
   const ref = React.useRef(null);
+  const [menu, setMenu] = React.useState(null);
   React.useEffect(() => {
     if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
   }, [msgs.length]);
+  const interactive = !!(onReact || onReply);
+  const mm = menu != null ? msgs[menu] : null;
   return (
+    <React.Fragment>
     <div className="bc-msgs" ref={ref}>
       <div className="bc-datechip">Today</div>
       {msgs.map((m, i) => {
@@ -349,10 +398,12 @@ function MsgList({ msgs, showAuthors, peerName, onClaim, pay }) {
         if (m.action) return <div key={i} className="bc-action-msg">{m.text}</div>;
         const prev = msgs[i - 1];
         const cont = !!prev && !prev.action && !prev.pay && !prev.call && prev.author === m.author && !!prev.mine === !!m.mine;
+        const press = interactive ? () => setMenu(i) : null;
+        const react = onReact ? (e) => onReact(i, e) : null;
         if (m.media) {
           return (
             <MediaBubble
-              key={i} m={m} cont={cont}
+              key={i} m={m} cont={cont} me={me} onPress={press} onReact={react}
               showAuthor={showAuthors && !m.mine && !cont}
               showState={!!m.mine && i === msgs.length - 1} />);
 
@@ -360,13 +411,31 @@ function MsgList({ msgs, showAuthors, peerName, onClaim, pay }) {
         }
         return (
           <MsgBubble
-            key={i} m={m} cont={cont}
+            key={i} m={m} cont={cont} me={me} onPress={press} onReact={react}
             showAuthor={showAuthors && !m.mine && !cont}
             showState={!!m.mine && i === msgs.length - 1} />);
 
 
       })}
-    </div>);
+    </div>
+    {mm ?
+    <div className="bc-ctxwrap" onClick={(e) => { if (e.target === e.currentTarget) setMenu(null); }}>
+        <div className={'bc-ctx' + (mm.mine ? ' mine' : '')}>
+          <div className="bc-ctxpreview">{mm.text || bcMediaWord(mm.media)}</div>
+          {onReact ?
+        <div className="bc-ctxpicker">
+            {BC_REACTIONS.map((e) => {
+            const on = (mm.reactions || []).some((r) => r.e === e && me && r.who.includes(me));
+            return <button key={e} className={on ? 'on' : ''} onClick={() => { onReact(menu, e); setMenu(null); }}>{e}</button>;
+          })}
+          </div> : null}
+          <div className="bc-ctxmenu">
+            {onReply ? <button onClick={() => { onReply(menu); setMenu(null); }}><BCIcon name="reply" size={17} />Reply</button> : null}
+            <button onClick={() => setMenu(null)}><BCIcon name="copy" size={16} />Copy</button>
+          </div>
+        </div>
+      </div> : null}
+    </React.Fragment>);
 
 }
 
@@ -608,7 +677,7 @@ function EmojiKeyboard({ onEmoji, onSticker, onGif, onClose }) {
 
 }
 
-function Composer({ placeholder, transport, onSend, onPlus, onCommand, onVoice, onSticker }) {
+function Composer({ placeholder, transport, onSend, onPlus, onCommand, onVoice, onSticker, reply, onCancelReply }) {
   const [text, setText] = React.useState('');
   const [recording, setRecording] = React.useState(false);
   const [kbOpen, setKbOpen] = React.useState(false);
@@ -633,6 +702,13 @@ function Composer({ placeholder, transport, onSend, onPlus, onCommand, onVoice, 
   };
   return (
     <div className="bc-composerwrap">
+      {reply && !recording &&
+      <div className="bc-replybar">
+          <BCIcon name="reply" size={16} weight={2.1} />
+          <span className="bc-replymain"><b>{reply.author}</b><span>{reply.text}</span></span>
+          <button className="bc-replyx" onClick={onCancelReply} aria-label="Cancel reply"><BCIcon name="x" size={13} weight={2.4} /></button>
+        </div>
+      }
       {slash && !recording &&
       <div className="bc-cmdstrip">
           {BC_COMMANDS.map(([c, d]) =>
@@ -800,5 +876,6 @@ function SettingsRow({ icon, tone = '', label, sub, value, danger, onClick, chev
 Object.assign(window, {
   bcHash, Avatar, PlaceTile, GroupAvatar, SupporterBadge, StatusChip, ConvRow, MuteSheet, MUTE_DURATIONS, SectionLabel,
   NavHeader, Banner, MsgBubble, MediaBubble, NudgeMsg, MsgList, Composer, Sheet, ActionRow, AttachActions, Bars,
+  BC_REACTIONS, bcReplyFrom, ReplyQuote, ReactionRow, useBcPress,
   SettingsCard, SettingsRow, bcSampleMedia, bcVoiceMedia, bcMediaWord, fmtDur
 });

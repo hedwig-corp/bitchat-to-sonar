@@ -849,8 +849,9 @@ actual object SonarCore {
         recipientPeerIdHex: String,
         messageId: String,
         text: String,
+        replyTo: String?,
     ) = withContext(Dispatchers.IO) {
-        requireNode().sendDirectDm(recipientHex, senderPeerIdHex, recipientPeerIdHex, messageId, text)
+        requireNode().sendDirectDm(recipientHex, senderPeerIdHex, recipientPeerIdHex, messageId, text, replyTo)
     }
 
     actual suspend fun drainDirectDms(): List<SonarDirectDm> = withContext(Dispatchers.IO) {
@@ -863,6 +864,7 @@ actual object SonarCore {
                     senderPubkeyHex = it.senderPubkeyHex,
                     content = it.content,
                     tsSecs = it.createdAtSecs.toLong(),
+                    replyTo = it.replyTo,
                 )
             }
         }.getOrDefault(emptyList())

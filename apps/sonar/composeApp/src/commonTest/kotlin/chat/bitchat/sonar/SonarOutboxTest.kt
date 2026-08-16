@@ -70,4 +70,13 @@ class SonarOutboxTest {
 
         assertEquals(listOf("three"), outbox.snapshot("peer-1").map { it.content })
     }
+
+    @Test
+    fun enqueuePreservesReplyPointerForBleFlush() {
+        val outbox = SonarOutbox(maxPerPeer = 3, ttlSecs = 100)
+        val reply = SonarReplyRef(parentId = "parent-mid", preview = "see you at 9")
+        outbox.enqueue("peer-1", "ok", "child-id", timestampSecs = 1, reply = reply)
+        assertEquals("parent-mid", outbox.snapshot("peer-1").single().reply?.parentId)
+        assertEquals("see you at 9", outbox.snapshot("peer-1").single().reply?.preview)
+    }
 }

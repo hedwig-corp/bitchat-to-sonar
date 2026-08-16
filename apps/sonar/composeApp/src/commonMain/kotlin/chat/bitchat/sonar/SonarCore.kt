@@ -78,6 +78,20 @@ fun sonarCanReply(message: SonarMsg): Boolean {
     return true
 }
 
+/** Full source text for Signal-style Copy. Null when the row is not text
+ *  (media / sticker / pay / call / nudge). Sending rows stay copyable —
+ *  reply is gated separately. Never includes timestamp, via glyph, or
+ *  delivery state — those are chrome, not user content. */
+fun sonarCopyableText(message: SonarMsg): String? {
+    if (message.classification is SonarMsgClass.CallControl) return null
+    if (message.classification is SonarMsgClass.PayReceipt) return null
+    if (TrillLine.isTrillLine(message.content)) return null
+    if (message.stickerRef != null) return null
+    if (message.media.isNotEmpty()) return null
+    val trimmed = message.content.trim()
+    return if (trimmed.isEmpty()) null else message.content
+}
+
 /** Signal-Android `ConversationSwipeAnimationHelper.TRIGGER_DX`. */
 const val SONAR_SWIPE_REPLY_TRIGGER_DP = 64f
 
@@ -170,6 +184,25 @@ fun sonarCanEmitNipC7(parentId: String, parentNpub: String?): Boolean {
     return parentNpub?.startsWith("npub1") == true
 }
 
+/** Parent id carried on the BLE / NIP-17 private-message TLV. */
+fun sonarMeshReplyToWire(reply: SonarReplyRef?): String? =
+    reply?.parentId?.trim()?.takeIf { it.isNotEmpty() }
+
+/**
+ * Reconstruct a quote snapshot from a mesh parent id. Mirrors iOS
+ * `snMeshReplyRef`: the wire only carries the parent id, so preview/author
+ * come from the local transcript when the parent is still in the window.
+ */
+fun sonarMeshReplyRef(parentId: String?, parents: List<SonarMsg>): SonarReplyRef? {
+    val id = parentId?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val parent = parents.firstOrNull { it.id.equals(id, ignoreCase = true) }
+    return SonarReplyRef(
+        parentId = id,
+        parentNpub = parent?.senderNpub?.takeIf { it.startsWith("npub1") },
+        preview = parent?.content.orEmpty().trim().take(140),
+    )
+}
+
 fun sonarResolvedReplyPreview(
     reply: SonarReplyRef,
     parentContent: String?,
@@ -209,6 +242,7 @@ data class SonarDirectDm(
     val senderPubkeyHex: String,
     val content: String,
     val tsSecs: Long,
+    val replyTo: String? = null,
 )
 
 /** A sticker reference carried on a chat message. */
@@ -1107,6 +1141,7 @@ expect object SonarCore {
         recipientPeerIdHex: String,
         messageId: String,
         text: String,
+        replyTo: String? = null,
     )
     suspend fun drainDirectDms(): List<SonarDirectDm>
     suspend fun acknowledgeDirectDms(eventIds: List<String>)
