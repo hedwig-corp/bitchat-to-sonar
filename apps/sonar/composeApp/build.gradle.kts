@@ -365,6 +365,15 @@ android {
     namespace = "chat.bitchat.sonar"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
 
+    testOptions {
+        unitTests {
+            // Unit tests exercise pure decision layers that log through
+            // android.util.Log; without this every such call throws
+            // "not mocked" and the policy stays untestable off-device.
+            isReturnDefaultValues = true
+        }
+    }
+
     defaultConfig {
         applicationId = "chat.bitchat.sonar"
         minSdk = libs.versions.android.minSdk.get().toInt()

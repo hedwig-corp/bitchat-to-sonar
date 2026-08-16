@@ -1047,7 +1047,9 @@ close) -> this fix.
   whose only callers are `SonarAppState.onProcessBackgrounded()` (gated on
   `shouldInvalidateOnBackground()`, and `SonarDesktopRoot` installs only
   `onForeground`, so it is never even reached) and Android's
-  `SonarPushProcessingService`. Epoch frozen ⇒ `latchAfterAttach` always `true`
+  `SonarPushProcessingService` (since #203, its shared wake single-flight
+  `SonarMarmotWakeSync`, which the denied-FGS inline fallback also routes
+  through — still Android push paths only, so the argument below is unchanged). Epoch frozen ⇒ `latchAfterAttach` always `true`
   ⇒ no desktop attach is ever superseded. The change would have bought nothing
   and loosened the gate this entry exists to keep tight. `connectRetryDelayMs`
   was a legitimate case because it only scales a delay inside a loop already

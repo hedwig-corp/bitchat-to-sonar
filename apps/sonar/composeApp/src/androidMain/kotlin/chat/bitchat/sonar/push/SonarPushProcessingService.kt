@@ -10,24 +10,12 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
-import chat.bitchat.sonar.MUTE_BLOB_KEY
 import chat.bitchat.sonar.Notifier
-import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
 import chat.bitchat.sonar.RelayConnectionPolicy
-import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarLifecycle
-import chat.bitchat.sonar.SonarNotificationKind
 import chat.bitchat.sonar.SonarNotificationPrefs
 import chat.bitchat.sonar.SonarNotificationRouter
-import chat.bitchat.sonar.SonarNotificationSound
-import chat.bitchat.sonar.SonarProfile
-import chat.bitchat.sonar.canonicalProfileKey
-import chat.bitchat.sonar.decodeMuteMap
-import chat.bitchat.sonar.decodeProfileCache
-import chat.bitchat.sonar.isMutedAt
-import chat.bitchat.sonar.resolvePushSenderName
-import chat.bitchat.sonar.shortNpubLabel
 import chat.bitchat.sonar.wallet.InvoiceRequestPayload
 import chat.bitchat.sonar.wallet.JsonLite
 import chat.bitchat.sonar.BuildConfig
@@ -73,6 +61,14 @@ class SonarPushProcessingService : Service() {
      *  wake work (Breez connect / invoice create / POST) — without a legal
      *  foreground service the process can be killed mid-answer or ANR. */
     @Volatile private var fgsReady = false
+
+    /// True once startForeground has succeeded at least once on this instance.
+    ///
+    /// `fgsReady` is also cleared deliberately by `stopWakeWork`/`onTimeout`
+    /// to gate later deliveries, so it cannot answer "did Android ever grant
+    /// us a foreground service?" — and the denied-FGS fallback must run only
+    /// for the genuine denial, not for a wake we cancelled ourselves.
+    @Volatile private var fgsEverGranted = false
 
     /**
      * Wakes currently running on [scope].
@@ -120,6 +116,7 @@ class SonarPushProcessingService : Service() {
             }
         }
         fgsReady = enterForeground()
+        if (fgsReady) fgsEverGranted = true
         if (!fgsReady) {
             // e.g. the background-start allowlist expired before we reached
             // startForeground. Nothing can run without the FGS; stop cleanly
@@ -207,7 +204,38 @@ class SonarPushProcessingService : Service() {
         // process could be killed mid-answer. Stop cleanly; the app reconciles
         // on next open / next high-priority wake.
         if (!fgsReady) {
-            Log.w(TAG, "onStartCommand: no foreground service, skipping wake work")
+            // The start was ACCEPTED but startForeground() was refused in
+            // onCreate (the allowlist expired in between). The FCM handler has
+            // already returned, so its inline fallback cannot cover this —
+            // run the same bounded fallback here instead of dropping the wake
+            // silently (#203, the other half of the denial). It is best-effort
+            // by definition: no foreground service means no execution
+            // guarantee, which is exactly why the money-path settle wait is
+            // still refused below.
+            if (fgsEverGranted) {
+                // We closed our own gate (suspend/timeout/cancelled wake), not
+                // a platform denial. The historical early-return is correct
+                // here; running the fallback would turn every later delivery
+                // on this instance into extra background work.
+                Log.w(TAG, "onStartCommand: wake gate closed by us, skipping work")
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+            Log.w(TAG, "onStartCommand: startForeground was refused, running inline fallback")
+            val type = intent?.getStringExtra(EXTRA_PUSH_TYPE) ?: TYPE_MARMOT
+            val notifType = intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: ""
+            val payload = intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: ""
+            val app = applicationContext
+            // MUST hop off this thread: onStartCommand is a MAIN-THREAD
+            // callback and the fallback blocks for seconds — running it here
+            // is a guaranteed ANR. (The FCM handler's own call is fine: that
+            // one already runs on a Firebase background executor.) Fire and
+            // forget on a scope that outlives this service instance, since we
+            // stop immediately below.
+            fallbackScope.launch {
+                runCatching { SonarPushInlineFallback.run(app, type, notifType, payload) }
+                    .onFailure { Log.w(TAG, "Inline fallback after refused startForeground failed", it) }
+            }
             stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -286,231 +314,21 @@ class SonarPushProcessingService : Service() {
         }
     }
 
-    /**
-     * Single-flight relay reconnect + gap-recovery sync for a Marmot wake
-     * (mirrors iOS `marmotWakeInFlight` / `marmotWakeNeedsRerun` in
-     * `SonarPushProcessor`).
-     *
-     * Two FCM deliveries arrive as two independent coroutines. Left concurrent,
-     * the second wake's [SonarCore.invalidateRelayConnection] supersedes the
-     * first wake's in-flight attach and then replaces and closes its node while
-     * it is inside [SonarCore.syncForce] — and syncForce swallows node failures,
-     * so the first wake is recorded as synced without ever fetching its message.
-     * Followers join the owner instead of starting their own reconnect, and a
-     * push observed while the owner is already draining sets the rerun flag so
-     * its own row is still fetched before the owner completes.
-     */
-    private suspend fun syncMarmotForWake(): Boolean {
-        val owner = marmotWakeLock.withLock {
-            // Only an in-flight owner can be joined: a leftover completed (or
-            // cancelled-with-the-service) Deferred must not swallow this wake.
-            // An owner that already closed its rerun gate has cleared the slot,
-            // so a late delivery becomes a new owner instead of setting a flag
-            // nobody will read.
-            marmotWakeInFlight?.takeIf { it.isActive }?.also { marmotWakeNeedsRerun = true }
-                ?: run {
-                    val generation = ++marmotWakeOwnerGeneration
-                    scope.async { runMarmotWakeSync(generation) }
-                        .also { marmotWakeInFlight = it }
-                }
-        }
-        return owner.await()
-    }
+    /** Delegates to the process-wide single-flight (shared with the denied-FGS
+     *  inline fallback — see SonarMarmotWakeSync). */
+    private suspend fun syncMarmotForWake(): Boolean =
+        SonarMarmotWakeSync.syncForWake(scope, MARMOT_PUSH_SYNC_TIMEOUT_MS)
 
-    /** Owner body: reconnect + force the batched fetch, repeating while another
-     *  push landed mid-drain. Failures surface through [Deferred.await] to every
-     *  joined wake, which each fall back to the generic notification. */
-    private suspend fun runMarmotWakeSync(generation: Long): Boolean =
-        // Claim the node for the whole wake: this process has no UI session, so
-        // without the claim a scheduled auto-backup seal would close the node
-        // underneath the drain.
-        chat.bitchat.sonar.backup.withMarmotSessionClaim {
-            runMarmotWakeSyncLocked(generation)
-        }
-
-    private suspend fun runMarmotWakeSyncLocked(generation: Long): Boolean {
-        try {
-            while (true) {
-                marmotWakeLock.withLock { marmotWakeNeedsRerun = false }
-                val synced = withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
-                    SonarCore.start()
-                    // Doze/freeze can leave the host latch true after sockets die.
-                    // Without this, connectRelays() no-ops and syncForce talks to a
-                    // dead node — the killed-app path works only because a fresh
-                    // process starts with relayConnected=false. A push that lands
-                    // while the UI is visible reaches a healthy node, so leave it
-                    // alone: rebuilding would close a node in-flight sends hold.
-                    if (RelayConnectionPolicy.shouldInvalidateOnPushWake(SonarLifecycle.appVisible)) {
-                        SonarCore.invalidateRelayConnection()
-                    }
-                    SonarCore.connectRelays()
-                    // Push wake: force the batched gap-recovery fetch. A routine
-                    // sync() would short-circuit while live subscriptions are marked
-                    // active even though the socket was torn down while backgrounded,
-                    // leaving the pushed message unfetched.
-                    SonarCore.syncForce()
-                } != null
-                // Close the rerun gate and retire this owner in ONE locked
-                // section. Checking the flag, releasing, then clearing the slot
-                // leaves a window where a delivery still sees an active owner and
-                // sets a flag that owner will never read — its message goes
-                // unfetched while it inherits synced=true and skips the fallback
-                // notification.
-                val retired = marmotWakeLock.withLock {
-                    if (marmotWakeNeedsRerun) {
-                        false
-                    } else {
-                        retireWake(generation)
-                        true
-                    }
-                }
-                if (retired) return synced
-            }
-        } finally {
-            // Must run even when the service scope is cancelled mid-wake, or the
-            // stale owner would be joined by the next process-alive wake. No-op
-            // once the loop retired us, so it cannot clear a newer owner.
-            withContext(NonCancellable) {
-                marmotWakeLock.withLock { retireWake(generation) }
-            }
-        }
-    }
-
-    /** Clear the owner slot iff [generation] is still the installed owner, so a
-     *  retired wake's cleanup cannot evict the owner that replaced it. Caller
-     *  must hold [marmotWakeLock]. */
-    private fun retireWake(generation: Long) {
-        if (marmotWakeOwnerGeneration != generation) return
-        marmotWakeInFlight = null
-        marmotWakeNeedsRerun = false
-    }
-
-    /** Render titled notifications for every unread conversation from local
-     *  storage. Returns how many conversations were notified. */
-    private suspend fun notifyUnreadConversations(prefs: SonarNotificationPrefs): Int {
-        val summaries = SonarCore.conversationSummaries()
-        val unread = summaries.filter { it.unreadCount > 0 }
-        if (unread.isEmpty()) return 0
-
-        // The drain runs while the UI may be dead, so resolve nicknames the
-        // same way the foreground path does: persisted kind-0 cache first,
-        // then a bounded relay fetch (relays are already connected here).
-        // Never title a notification with the raw npub when a name exists.
-        // Skip the network entirely when names are hidden -- the router
-        // discards senderName in that case, so the fetches would be wasted.
-        val cachedProfiles = decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY))
-        val fetchedProfiles =
-            if (prefs.showNames) prefetchSenderProfiles(unread, cachedProfiles)
-            else emptyMap()
-
-        // Per-chat mute is honored on the killed-app drain too: rows and unread
-        // counts still accrued in local storage — only the banner is skipped.
-        // muteChat persists the whole folded-id set, so a direct group-id
-        // lookup is sufficient here.
-        val mutes = decodeMuteMap(SonarCore.loadBlob(MUTE_BLOB_KEY))
-        val nowSecs = System.currentTimeMillis() / 1000
-
-        var notified = 0
-        for (summary in unread) {
-            if (isMutedAt(mutes[summary.groupIdHex], nowSecs)) continue
-            val kind = SonarNotificationRouter.classifyContent(
-                summary.latestContent,
-                isCallControl = { SonarCore.callParseControl(it) != null },
-            )
-            if (kind == SonarNotificationKind.Call) continue
-
-            val notif = SonarNotificationRouter.build(
-                idKey = summary.groupIdHex,
-                kind = kind,
-                conversationTitle = summary.name.ifBlank { null },
-                senderName = if (!prefs.showNames) null else summary.latestSenderNpub
-                    .takeIf { it.isNotBlank() }
-                    ?.let { npub ->
-                        // Everything is prefetched above under one budget, so
-                        // the fetch lambda is a pure map read (no network).
-                        resolvePushSenderName(npub, cachedProfiles) { missing ->
-                            fetchedProfiles[canonicalProfileKey(missing)]
-                        }
-                    },
-                preview = summary.latestContent,
-                unreadCount = summary.unreadCount,
-                prefs = prefs,
-            )
-            if (notif != null) {
-                Notifier.notify(
-                    id = notif.id,
-                    title = notif.title,
-                    body = notif.body,
-                    // A trill rings its distinct bell on background drains too.
-                    sound = if (kind == SonarNotificationKind.Trill) {
-                        SonarNotificationSound.Trill
-                    } else {
-                        SonarNotificationSound.Default
-                    },
-                    conversationId = summary.groupIdHex,
-                )
-                notified++
-            }
-        }
-        return notified
-    }
-
-    /**
-     * Resolve every uncached sender's kind-0 profile for this wakeup under ONE
-     * total budget, keyed by [canonicalProfileKey].
-     *
-     * Fetches run in parallel and, crucially, are launched on the service's own
-     * [scope] rather than as children of the timeout block: [SonarCore.fetchProfile]
-     * hops to `Dispatchers.IO` and makes a blocking UniFFI call (with its own
-     * ~10s core-internal timeout), so a `withTimeoutOrNull` wrapped directly
-     * around it could not actually cancel the blocking child and would wait the
-     * full core timeout anyway. By awaiting orphaned [scope] jobs inside the
-     * budget, the await is genuinely cancellable -- when the budget expires we
-     * fall back to the npub label immediately while the stragglers finish
-     * harmlessly in the background. A single budget also bounds total wall time
-     * regardless of how many distinct uncached senders are unread (otherwise it
-     * would grow as senderCount x timeout, delaying later notifications and
-     * stopSelf).
-     */
-    private suspend fun prefetchSenderProfiles(
-        unread: List<SonarConversationSummary>,
-        cachedProfiles: Map<String, SonarProfile>,
-    ): Map<String, SonarProfile?> {
-        // canonicalKey -> npub, de-duplicated and skipping cache hits.
-        val missing = LinkedHashMap<String, String>()
-        for (summary in unread) {
-            val npub = summary.latestSenderNpub.takeIf { it.isNotBlank() } ?: continue
-            val key = canonicalProfileKey(npub)
-            if (cachedProfiles[key]?.bestName != null) continue
-            missing.putIfAbsent(key, npub)
-        }
-        if (missing.isEmpty()) return emptyMap()
-
-        val jobs = missing.map { (key, npub) ->
-            scope.async { key to runCatching { SonarCore.fetchProfile(npub) }.getOrNull() }
-        }
-        val resolved = HashMap<String, SonarProfile?>()
-        withTimeoutOrNull(PROFILE_FETCH_BUDGET_MS) {
-            jobs.forEach { job ->
-                val (key, profile) = job.await()
-                resolved[key] = profile
-            }
-        }
-        return resolved
-    }
+    /** Delegates to the shared renderer so the foreground-service wake and the
+     *  denied-FGS inline fallback cannot drift (see SonarWakeNotifications). */
+    private suspend fun notifyUnreadConversations(prefs: SonarNotificationPrefs): Int =
+        SonarWakeNotifications.notifyUnreadConversations(prefs, scope)
 
     private fun notificationPrefs(): SonarNotificationPrefs =
         SonarPushPrefs.notificationPrefs(this)
 
-    private fun notifyFallback(prefs: SonarNotificationPrefs) {
-        val notif = SonarNotificationRouter.build(
-            idKey = "marmot-push",
-            kind = SonarNotificationKind.Message,
-            unreadCount = 1,
-            prefs = prefs.copy(showPreview = false),
-        ) ?: return
-        Notifier.notify(notif.id, notif.title, notif.body)
-    }
+    private fun notifyFallback(prefs: SonarNotificationPrefs) =
+        SonarWakeNotifications.notifyFallback(prefs)
 
     /**
      * A Breez offline receive is a swap the SDK claims only while connected —
@@ -678,7 +496,13 @@ class SonarPushProcessingService : Service() {
         // From here a payer is blocked on us, so a cancelled wake owes them an
         // error reply — see stopWakeWork. Cleared on every exit path below.
         pendingReplyUrl = req.replyUrl
-        val answered = withTimeoutOrNull(remainingMs) {
+        // The reply slot is ONE-SHOT: whoever POSTs to /api/v1/response/{id}
+        // first decides the answer. So the POST is owned by a job that
+        // outlives our deadline — otherwise a POST that starts before the
+        // budget and lands after it gets raced by the bail-out error below,
+        // and the payer can receive "timed out" for an invoice we actually
+        // produced. We only bound how long we WAIT.
+        val answerJob = bailoutScope.async {
             val invoice = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest)
             val body = invoice.fold(
                 onSuccess = { JsonLite.encodeObject("invoice", it) },
@@ -692,12 +516,12 @@ class SonarPushProcessingService : Service() {
             )
             postNdsReply(req.replyUrl, body) to invoice.isSuccess
         }
+        val answered = withTimeoutOrNull(remainingMs) { answerJob.await() }
         pendingReplyUrl = null
         if (answered == null) {
-            // Our own bound tripped before the SDK produced anything. Still owe
-            // the payer an answer rather than the NDS's 60s expiry.
-            Log.w(TAG, "invoice_request: timed out producing the invoice, sending error")
-            postNdsReply(req.replyUrl, JsonLite.encodeObject("error", "timed out"))
+            // Our bound tripped while the job still owns the reply slot: do
+            // NOT post a competing error — let it finish.
+            Log.w(TAG, "invoice_request: still answering past our budget; leaving it to finish")
         }
         // `posted` is only the HTTP 2xx — BOTH an invoice and an {"error": ...}
         // reply post successfully, so log the outcome separately. Without this
@@ -826,22 +650,11 @@ class SonarPushProcessingService : Service() {
          */
         private val bailoutScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-        private val marmotWakeLock = Mutex()
+        /** Runs the denied-FGS fallback off the main thread. Process-scoped on
+         *  purpose: `onStartCommand` stops the service immediately after
+         *  dispatching, so a service-scoped job would be cancelled at birth. */
+        private val fallbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-        /** The wake currently reconnecting + draining. Later deliveries join it
-         *  instead of invalidating and replacing the node underneath it. */
-        private var marmotWakeInFlight: Deferred<Boolean>? = null
-
-        /** Set when a delivery joins an owner that may already be past the
-         *  drain, so the owner runs one more fetch before completing — otherwise
-         *  the joining push's own message can be missed. */
-        private var marmotWakeNeedsRerun = false
-
-        /** Identifies the installed owner so a retiring wake only clears its own
-         *  slot. Without it, the `finally` cleanup of a wake that already retired
-         *  normally could null out the owner a later delivery installed, and two
-         *  owners would reconnect concurrently again. */
-        private var marmotWakeOwnerGeneration = 0L
 
         // Marmot push-triggered background sync budget.
         // On a cold wake the core must start, connect relays, and reach EOSE
@@ -854,12 +667,6 @@ class SonarPushProcessingService : Service() {
         // must also fit inside this budget.)
         private const val MARMOT_PUSH_SYNC_TIMEOUT_MS = 25_000L
 
-        // Total kind-0 lookup budget for the WHOLE wakeup (not per sender) when
-        // the persisted profile cache misses. All uncached senders are fetched
-        // in parallel under this single budget after the sync above, so the
-        // relay pool is already connected; whatever has not resolved when it
-        // expires falls back to the npub label.
-        private const val PROFILE_FETCH_BUDGET_MS = 5_000L
         // Breez settlement budget: the SDK claims the swap only while we stay
         // alive. shortService gives ~3 min (no dataSync cap), so this is a
         // battery/latency choice, not an OS-imposed ceiling: 45s covers a cold
