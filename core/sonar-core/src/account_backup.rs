@@ -825,6 +825,7 @@ fn checkpoint_sqlcipher_file(path: &Path, db_key_hex: &str) -> Result<()> {
     if !path.is_file() {
         return Ok(());
     }
+    crate::sqlcipher_runtime::ensure_no_checkpoint_on_close()?;
     // Wrong SQLCipher keys often "succeed" as an empty DB — require user tables
     // before sealing so we never backup garbage under a bad key.
     verify_sqlcipher_opens(path, db_key_hex)?;
