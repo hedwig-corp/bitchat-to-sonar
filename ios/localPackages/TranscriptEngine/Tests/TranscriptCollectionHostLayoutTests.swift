@@ -150,6 +150,31 @@ struct TranscriptCollectionHostLayoutTests {
         #expect(abs(gapBelowLastRow(collection)) < 1)
     }
 
+    /// A scroll that has already ENDED still holds the 200 ms `isUserScrolling`
+    /// latch. When a viewport / keyboard inset change lands inside that window,
+    /// the short-feed re-alignment must still run: there is no finger left on
+    /// the scroll view, so nothing rubber-bands the stale offset back and the
+    /// transcript stays parked at the PREVIOUS top inset — outside the visible
+    /// band, i.e. the reported "open the keyboard and the chat goes blank until
+    /// I scroll".
+    @Test
+    func shortFeedRealignsWhenAnEndedScrollStillHoldsTheUserScrollLatch() async {
+        let (window, vc) = await makeHost(rows: 2, viewportHeight: 844)
+        defer { window.isHidden = true }
+        let collection = vc.collectionView
+        #expect(collection.contentInset.top > 0)
+
+        // Finger already lifted: the latch is hot, but no touch is in flight.
+        vc.scrollViewWillBeginDragging(collection)
+
+        window.frame.size.height = 500
+        await settle(window)
+
+        // Resting above the top inset means the rows sit below the viewport.
+        #expect(collection.contentOffset.y >= -collection.adjustedContentInset.top - 1)
+        #expect(abs(gapBelowLastRow(collection)) < 1)
+    }
+
     /// The same shrink on a feed that fit before but no longer does: it must
     /// bottom-align rather than stay parked at the top with its tail clipped.
     @Test

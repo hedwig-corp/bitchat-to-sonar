@@ -335,6 +335,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             }
             guard height > self.lastContentHeight + 0.5 else {
                 self.lastContentHeight = height
+                // A shrink (trimmed window, collapsed row, removed media) moves
+                // maxY down under a resting offset nothing else re-runs for —
+                // the transcript would read as blank until the reader scrolled.
+                self.settleRestingOffsetIfNeeded()
                 return
             }
             // Always advance the watermark (MsgList shape). Freezing it while
@@ -867,7 +871,13 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             // the offset out from under a finger is the complaint this file has
             // collected the most often. UIScrollView bounces back to the single
             // valid offset on release, so nothing is stranded.
-            guard !userScrolling else { return }
+            //
+            // That bounce-back argument only covers a REAL gesture. The 200 ms
+            // `isUserScrolling` latch outlives the finger, and a bare touch-down
+            // never bounces, so treating either as "in flight" left the feed
+            // resting at the PREVIOUS top inset — off-screen, until the reader
+            // scrolled (blank chat on keyboard open).
+            guard !collectionView.isDragging, !collectionView.isDecelerating else { return }
             collectionView.setContentOffset(
                 CGPoint(x: collectionView.contentOffset.x, y: -shortFeedTop),
                 animated: false
@@ -883,7 +893,9 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         case .lockstep:
             applyLockstep(offsetY: oldOffset.y, delta: delta, bottomInset: owned)
         case .ignore:
-            break
+            // Keeping the reader's position never means keeping an invalid one:
+            // a shrinking bottom inset can push maxY under the restored offset.
+            settleRestingOffsetIfNeeded()
         }
         if needsLiveEdgeOpen {
             resnapFullyReadOpenIfNeeded()
@@ -980,18 +992,20 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        if !decelerate { clampRestingOffsetIfNeeded() }
+        if !decelerate { settleRestingOffsetIfNeeded() }
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        clampRestingOffsetIfNeeded()
+        settleRestingOffsetIfNeeded()
     }
 
-    /// Keyboard dismiss / rubber-band can leave offset past maxY — the blank
-    /// band under the last message. Clamp when the user finishes scrolling.
-    private func clampRestingOffsetIfNeeded() {
+    /// Keyboard dismiss / rubber-band can leave the offset past maxY (blank band
+    /// under the last message) or, with a short-feed top inset, above minY (the
+    /// whole feed below the viewport). Settle back into range whenever the
+    /// scroll view comes to rest.
+    private func settleRestingOffsetIfNeeded() {
         guard !collectionView.isDragging, !collectionView.isDecelerating else { return }
-        guard let y = transcriptRestingOffsetOvershootCorrection(
+        guard let y = transcriptRestingOffsetCorrection(
             offsetY: collectionView.contentOffset.y,
             boundsHeight: collectionView.bounds.height,
             contentHeight: collectionView.contentSize.height,

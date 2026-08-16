@@ -35,3 +35,25 @@ public func transcriptRestingOffsetOvershootCorrection(
     let maxY = max(minY, contentHeight + bottomInset - boundsHeight)
     return offsetY > maxY + 1 ? maxY : nil
 }
+
+/// Correction for a resting offset that has ended up outside the valid range in
+/// EITHER direction.
+///
+/// Overshoot past `maxY` leaves a blank band under the last message. Undershoot
+/// above `minY` is worse: with the short-feed top inset it parks the whole feed
+/// below the viewport, so the transcript reads as empty. `UIScrollView` only
+/// rubber-bands back at the end of a real drag, so an offset left out of range
+/// by an inset / content change stays there until the reader scrolls.
+public func transcriptRestingOffsetCorrection(
+    offsetY: CGFloat,
+    boundsHeight: CGFloat,
+    contentHeight: CGFloat,
+    topInset: CGFloat,
+    bottomInset: CGFloat
+) -> CGFloat? {
+    let minY = -topInset
+    let maxY = max(minY, contentHeight + bottomInset - boundsHeight)
+    if offsetY > maxY + 1 { return maxY }
+    if offsetY < minY - 1 { return minY }
+    return nil
+}

@@ -235,4 +235,46 @@ struct TranscriptScrollPolicyTests {
             )
         )
     }
+
+    /// A resting offset above `minY` is the blank-chat shape: with a short-feed
+    /// top inset the rows sit entirely below the viewport, and the overshoot-only
+    /// correction returned nil for it.
+    @Test
+    func restingOffsetCorrectionPullsBackFromBothEnds() {
+        // Short feed: content 120, viewport 500, composer 56 ⇒ topInset 324,
+        // and -324 is the single valid resting offset.
+        #expect(
+            transcriptRestingOffsetCorrection(
+                offsetY: -664, boundsHeight: 500, contentHeight: 120,
+                topInset: 324, bottomInset: 56
+            ) == -324
+        )
+        #expect(
+            transcriptRestingOffsetCorrection(
+                offsetY: -324, boundsHeight: 500, contentHeight: 120,
+                topInset: 324, bottomInset: 56
+            ) == nil
+        )
+        // Overshoot past the live edge still clamps down (tall feed).
+        #expect(
+            transcriptRestingOffsetCorrection(
+                offsetY: 2400, boundsHeight: 500, contentHeight: 2672,
+                topInset: 0, bottomInset: 56
+            ) == 2228
+        )
+        // In-range reading position is left alone.
+        #expect(
+            transcriptRestingOffsetCorrection(
+                offsetY: 1200, boundsHeight: 500, contentHeight: 2672,
+                topInset: 0, bottomInset: 56
+            ) == nil
+        )
+        // Sub-pixel drift is not a correction (avoids offset ping-pong).
+        #expect(
+            transcriptRestingOffsetCorrection(
+                offsetY: -324.4, boundsHeight: 500, contentHeight: 120,
+                topInset: 324, bottomInset: 56
+            ) == nil
+        )
+    }
 }
