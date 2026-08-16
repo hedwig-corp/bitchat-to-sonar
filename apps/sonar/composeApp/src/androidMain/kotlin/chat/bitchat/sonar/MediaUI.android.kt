@@ -591,6 +591,51 @@ actual fun deleteTempMediaFile(path: String) {
 actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
     val bmp = BitmapFactory.decodeByteArray(data, 0, data.size) ?: return null
     val out = ByteArrayOutputStream()
-    if (!bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)) return null
+    if (!bmp.compress(Bitmap.CompressFormat.JPEG, INTERNET_IMAGE_JPEG_QUALITY, out)) return null
     return out.toByteArray().takeIf { it.isNotEmpty() }
+}
+
+actual fun downscaleJpegForMesh(data: ByteArray): ByteArray? {
+    val (width, height) = decodeImageBounds(data) ?: return null
+    var scaled: Bitmap? = null
+    var scaledFor = -1
+    try {
+        return compressToMeshBudget(maxOf(width, height)) { edgePx, quality ->
+            if (scaledFor != edgePx) {
+                scaled?.recycle()
+                scaled = decodeScaledBitmap(data, width, height, edgePx)
+                scaledFor = edgePx
+            }
+            val bitmap = scaled ?: return@compressToMeshBudget null
+            val out = ByteArrayOutputStream()
+            if (bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)) {
+                out.toByteArray().takeIf { it.isNotEmpty() }
+            } else {
+                null
+            }
+        }
+    } finally {
+        scaled?.recycle()
+    }
+}
+
+/** Decode [data] with its longest edge at most [maxEdgePx], sampling first so
+ *  the full-resolution bitmap is never materialised. */
+private fun decodeScaledBitmap(data: ByteArray, width: Int, height: Int, maxEdgePx: Int): Bitmap? {
+    val longestEdge = maxOf(width, height)
+    var sample = 1
+    while (longestEdge / (sample * 2) >= maxEdgePx) sample *= 2
+    val options = BitmapFactory.Options().apply { inSampleSize = sample }
+    val sampled = BitmapFactory.decodeByteArray(data, 0, data.size, options) ?: return null
+    val sampledEdge = maxOf(sampled.width, sampled.height)
+    if (sampledEdge <= maxEdgePx) return sampled
+    val ratio = maxEdgePx.toFloat() / sampledEdge
+    val target = Bitmap.createScaledBitmap(
+        sampled,
+        (sampled.width * ratio).toInt().coerceAtLeast(1),
+        (sampled.height * ratio).toInt().coerceAtLeast(1),
+        /* filter = */ true,
+    )
+    if (target !== sampled) sampled.recycle()
+    return target
 }
