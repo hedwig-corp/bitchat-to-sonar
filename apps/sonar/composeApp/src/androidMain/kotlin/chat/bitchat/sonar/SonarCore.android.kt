@@ -1217,6 +1217,9 @@ actual object SonarCore {
 
     // ── P2P voice calls (delegate to the generated SonarNode call_* binding) ──
 
+    // The Android AAR is built with calls-audio.
+    actual val callsSupported: Boolean = true
+
     actual suspend fun callStart(): Unit = withContext(Dispatchers.IO) { requireNode().callStart() }
 
     actual suspend fun callLocalAddress(): String =

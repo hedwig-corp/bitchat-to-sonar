@@ -1708,6 +1708,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("SonarCall", "ignoring blocked call control chatId=$callChatId")
             return
         }
+        // Before the no-route branch below, which would first defer for a Sonar
+        // descriptor lookup that cannot change the answer: no engine is no engine.
+        // Declines rather than dropping, so the caller stops ringing instead of
+        // waiting out their own timeout.
+        if (ctrl is SonarCallControl.Offer && !SonarCore.callsSupported) {
+            sonarLog("SonarCall", "declining offer: this build has no call engine")
+            runCatching { sendCallControl(chatId, SonarCore.callEncodeAnswer(ctrl.callId, SonarAnswer.Decline, "")) }
+            return
+        }
         if (ctrl is SonarCallControl.Offer && !canCall(callChatId)) {
             if (shouldDeferOfferForSonarDescriptor(callChatId)) {
                 sonarLog("SonarCall", "deferring offer until Sonar descriptor lookup completes chatId=$chatId folded=$callChatId")
@@ -2901,7 +2910,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (offer != null) refreshHandleOfferIfNeeded(offer)
             if (!force && publishedSonarDescriptor && publishedSonarDescriptorBolt12Offer == offer) return
             val published = runCatching {
-                SonarCore.publishSonarDescriptor(callsEnabled = true, bolt12Offer = offer)
+                // Not hardcoded true: a desktop that advertises calls makes the
+                // PEER's call button light up, and dialling it gets an instant
+                // decline their UI renders as "declined". That moves the dead
+                // affordance onto someone else's phone.
+                SonarCore.publishSonarDescriptor(
+                    callsEnabled = SonarCore.callsSupported,
+                    bolt12Offer = offer,
+                )
             }.isSuccess
             if (published) {
                 publishedSonarDescriptor = true
@@ -3741,10 +3757,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     suspend fun resolveHandleForChat(input: String): String? =
         SonarCore.resolveHandle(input)?.npub
 
-    /** Capabilities this node advertises in its Sonar announce (0x53). This build
-     *  speaks Sonar voice/video calls, so it always advertises CAP_CALLS. */
-    private fun capabilities(): Int =
-        SonarAnnounce.CAP_MARMOT or SonarAnnounce.CAP_CALLS or
+    /** Capabilities this node advertises in its Sonar announce (0x53). CAP_CALLS
+     *  only when this build actually has a call engine: a peer in BLE range reads
+     *  this to decide whether to offer a call button for us, so advertising it
+     *  from a build that cannot answer lights a dead button on their device.
+     *  Internal so a test can pin what desktop puts on the wire. */
+    internal fun capabilities(): Int =
+        SonarAnnounce.CAP_MARMOT or
+            (if (SonarCore.callsSupported) SonarAnnounce.CAP_CALLS else 0) or
             (if (walletAvailable) SonarAnnounce.CAP_PAY else 0)
 
     /** Build our local Sonar Discovery announce from the current identity. The
@@ -10957,7 +10977,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True if [chatId]'s peer can be voice/video called: calls are Sonar-only
      *  (CAP_CALLS from 0x53) and require either live BLE or the npub needed to
      *  create/reuse White Noise signaling for that same discovered peer. */
-    fun canCall(chatId: String): Boolean {
+    /**
+     * Whether a call button may be shown for this chat.
+     *
+     * Platform capability AND a route. Split so a test can assert the two halves
+     * separately: on a state with no route [hasCallRoute] is false anyway, so a test
+     * that only checked `canCall` passed with the capability gate deleted and proved
+     * nothing. Pinning it needs a fixture whose route half is demonstrably true.
+     *
+     * Three of the four call buttons already asked this; the desktop detail rail did
+     * not, and offered a dead affordance on every install. Answering the capability
+     * here fixes the ungated site at the source rather than per button.
+     */
+    fun canCall(chatId: String): Boolean = SonarCore.callsSupported && hasCallRoute(chatId)
+
+    /** The route half of [canCall]: is there a way to reach this peer for a call. */
+    internal fun hasCallRoute(chatId: String): Boolean {
         val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
         if (peerId == null) return marmotChatCallCapable(chatId)
         return callCapablePeer(peerId) &&
@@ -10983,6 +11018,26 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  authoritative when present; only defer for npub-only Marmot contacts
      *  whose public Sonar descriptor is still unknown (and not recently
      *  missed). Kicks the background fetch so a later scan pass can ring. */
+    /**
+     * Test seam: seed the state a call route needs.
+     *
+     * `chats` and `sonarDescriptorsByNpubHex` have private setters, and the platform
+     * gate in [canCall] cannot be pinned without a peer that is otherwise callable.
+     * On an empty state `canCall` returns false for want of a route, so a test would
+     * pass with the gate deleted. That is not hypothetical: it is how the first
+     * version of this test passed while the bug was fully restorable.
+     */
+    internal fun seedCallableChatForTest(chatId: String, peerNpub: String, descriptor: SonarDescriptor) {
+        chats = listOf(SonarChat(id = chatId, name = "Peer", members = listOf(peerNpub, npub)))
+        // Keyed exactly the way the lookup keys it. Keying it by the bech32 npub
+        // instead produced a fixture that silently had no route, which made the
+        // capability assertion pass for the wrong reason. Loud rather than silent:
+        // an unusable fixture must fail the test, not weaken it.
+        val key = canonicalNpubHex(canonicalProfileKey(peerNpub))
+            ?: error("test peer npub is not a valid npub, so it can never resolve a route")
+        sonarDescriptorsByNpubHex = mapOf(key to descriptor)
+    }
+
     private fun shouldDeferOfferForSonarDescriptor(chatId: String): Boolean {
         val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
         if (peerId != null && sonarProfile(peerId) != null) return false

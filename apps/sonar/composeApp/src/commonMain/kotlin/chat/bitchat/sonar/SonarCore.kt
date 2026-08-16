@@ -1079,6 +1079,17 @@ expect object SonarCore {
 
     // ── P2P voice calls (iroh transport; ☎CALL rides chat signaling) ──
 
+    /**
+     * Whether this build can actually place or take a call.
+     *
+     * True on Android, whose AAR is built with `calls-audio`. False on desktop,
+     * where the iroh call engine is not compiled into the `sonar_ffi` dylib.
+     *
+     * Gates the call buttons, the incoming-offer path, and what this node
+     * advertises to peers.
+     */
+    val callsSupported: Boolean
+
     /** Bind the iroh call endpoint once for this session. The Ed25519 call key is
      *  derived in-core from our Nostr identity, so nothing is passed. Idempotent-ish. */
     suspend fun callStart()
