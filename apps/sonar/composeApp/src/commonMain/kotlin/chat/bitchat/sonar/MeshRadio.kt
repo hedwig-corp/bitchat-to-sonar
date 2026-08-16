@@ -11,7 +11,7 @@ data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: 
 /** An incoming mesh DM (decrypted Noise text). [peerId] is the sender's STABLE
  *  fingerprint (not the rotating bitchat peerID), so messages stay in one
  *  conversation across rotation. Drained by the app into the mesh-chat store. */
-data class MeshDmIn(val peerId: String, val messageId: String, val text: String, val tsSecs: Long)
+data class MeshDmIn(val peerId: String, val messageId: String, val text: String, val tsSecs: Long, val replyTo: String? = null)
 
 /** An encrypted recipient receipt for a private text or media message. */
 data class MeshDeliveryReceipt(val peerId: String, val messageId: String)
@@ -296,7 +296,7 @@ expect object MeshRadio {
     /** Send an encrypted DM over a live BLE mesh route to stable [peerId].
      * Returns false when no write can be started; later platform failures are
      * exposed through [drainMeshSendFailures]. */
-    fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean
+    fun sendMeshDm(peerId: String, messageId: String, text: String, replyTo: String? = null): Boolean
     /** Pull (and clear) sends that crossed the synchronous API boundary but
      * failed at Android's asynchronous GATT completion boundary. */
     fun drainMeshSendFailures(): List<MeshSendFailure>

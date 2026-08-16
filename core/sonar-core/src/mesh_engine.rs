@@ -155,6 +155,7 @@ pub enum AppEvent {
         fingerprint: String,
         message_id: String,
         content: String,
+        reply_to: Option<String>,
     },
     DeliveryReceived {
         fingerprint: String,
@@ -766,11 +767,23 @@ impl Engine {
         text: &str,
         now_ms: u64,
     ) -> Option<Output> {
+        self.send_text_with_reply(fingerprint, message_id, text, None, now_ms)
+    }
+
+    /// Same as [`send_text`], with an optional parent message id (TLV 0x04).
+    pub fn send_text_with_reply(
+        &mut self,
+        fingerprint: &str,
+        message_id: &str,
+        text: &str,
+        reply_to: Option<&str>,
+        now_ms: u64,
+    ) -> Option<Output> {
         if !self.fp_allowed(fingerprint) {
             return None;
         }
         let mut out = Output::default();
-        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
+        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out, reply_to) {
             return None;
         }
         Some(out)
@@ -790,7 +803,7 @@ impl Engine {
         }
         let route = self.sendable_route(fingerprint)?;
         let mut out = self.discovery_to_route(&route, now_ms);
-        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
+        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out, None) {
             return None;
         }
         Some(out)
@@ -1198,6 +1211,7 @@ impl Engine {
         text: &str,
         now_ms: u64,
         out: &mut Output,
+        reply_to: Option<&str>,
     ) -> bool {
         let Some(route) = self.sendable_route(fingerprint) else {
             return false;
@@ -1211,6 +1225,10 @@ impl Engine {
         let pm = mesh::PrivateMessage {
             message_id: message_id.to_string(),
             content: text.to_string(),
+            reply_to: reply_to
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
         let Some(plain) = mesh::encode_private_message_plaintext(&pm) else {
             return false;
@@ -1926,6 +1944,7 @@ impl Engine {
                     fingerprint: id_fp,
                     message_id: pm.message_id,
                     content: pm.content,
+                    reply_to: pm.reply_to,
                 });
             }
             noise_payload::DELIVERED => {
@@ -2427,6 +2446,34 @@ mod tests {
             "B must receive the DM, got {got:?}"
         );
         let _ = link;
+    }
+
+    #[test]
+    fn send_text_with_reply_round_trips_parent_id() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "vincent-osx");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+        let out = a
+            .send_text_with_reply(&fp_of(&b), "child-1", "ok", Some("parent-mid"), 2_000)
+            .expect("allowed");
+        let mut got = Vec::new();
+        for c in out.commands {
+            if let Command::WriteLink { bytes, .. } = c {
+                got.extend(b.on_server_rx("droid", &bytes, 2_000).events);
+            }
+        }
+        assert!(
+            got.iter().any(|e| matches!(
+                e,
+                AppEvent::TextReceived {
+                    content,
+                    reply_to: Some(parent),
+                    ..
+                } if content == "ok" && parent == "parent-mid"
+            )),
+            "B must receive the parent id on the wire, got {got:?}"
+        );
     }
 
     /// The failure this guards is invisible from the sending side: Android's GATT

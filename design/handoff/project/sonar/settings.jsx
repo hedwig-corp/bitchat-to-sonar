@@ -349,7 +349,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
 
         <SectionLabel>Data &amp; storage</SectionLabel>
         <div className="st-card">
-          <StRow icon="backup" tone="cyan" label="Chat backup" sub={prefs.backupOn ? 'On \u00b7 last backup today' : 'Off'} value={prefs.backupOn ? '' : 'Set up'} onClick={() => push('backup')} />
+          <StRow icon="backup" tone="cyan" label="Chat backup" sub={prefs.backupOn ? 'On · last backup today' : 'Off'} value={prefs.backupOn ? '' : 'Set up'} onClick={() => push('backup')} />
           <StRow icon="drive" label="Storage" value="124 MB" onClick={() => {}} />
           <StRow icon="data" label="Data usage" value="Wi-Fi only" onClick={() => {}} />
         </div>
@@ -502,48 +502,80 @@ function DonateScreen({ app, nav, pop, onBecomeSupporter, overlay }) {
   );
 }
 
-/* ── Backup: Signal-style encrypted backups with a recovery passphrase ── */
-const BACKUP_RECOVERY = ['SNR2', '9F4K', 'DQ7M', 'X2AE', '61PU', 'WL0C', '3JHV', 'K8ZT', 'RY5N', 'M4QD', '02BF', 'HE9W'];
-
+/* ── Backup: encrypted by default with your identity key — no separate passphrase ── */
 function BackupSetupSheet({ onClose, onDone }) {
-  const [step, setStep] = React.useState('key'); // key -> confirm
-  const [copied, setCopied] = React.useState(false);
-  const copy = () => {
-    try { navigator.clipboard && navigator.clipboard.writeText(BACKUP_RECOVERY.join(' ')); } catch (e) {}
-    setCopied(true); setTimeout(() => setCopied(false), 1600);
-  };
-  if (step === 'key') {
-    return (
-      <Sheet onClose={onClose} title="Your recovery key">
-        <div className="nsec-warn">
-          <BCIcon name="shield" size={18} weight={2} />
-          <span>Write down these 12 words. They’re the <b>only</b> way to restore your backup — Sonar never sees them and can’t reset them for you.</span>
-        </div>
-        <div className="bk-reckey">
-          {BACKUP_RECOVERY.map((w, i) => (
-            <span key={i} className="bk-recword"><i>{i + 1}</i>{w}</span>
-          ))}
-        </div>
-        <div className="keyshare-btns" style={{ padding: '0 8px' }}>
-          <button className={'keyshare-btn primary' + (copied ? ' done' : '')} onClick={copy}>
-            <BCIcon name={copied ? 'check' : 'copy'} size={17} weight={2.2} />{copied ? 'Copied' : 'Copy recovery key'}
-          </button>
-        </div>
-        <div className="bc-sheetactions">
-          <button className="bc-primary" onClick={() => setStep('confirm')}>I’ve saved it</button>
-        </div>
-      </Sheet>
-    );
-  }
   return (
-    <Sheet onClose={onClose} title="Backups on">
+    <Sheet onClose={onClose} title="Turn on backup">
       <div className="bk-donehead">
         <span className="bk-doneic"><BCIcon name="backup" size={34} /></span>
-        <div className="bk-donetitle">Encrypted backup enabled</div>
-        <p className="bk-donesub">Your messages, groups and settings are backed up daily, encrypted with your recovery key. Your identity key is never included — export it separately.</p>
+        <div className="bk-donetitle">Encrypted automatically</div>
+        <p className="bk-donesub">Your backup is locked with the key already on this phone — there’s nothing extra to write down. Sonar’s servers only ever see ciphertext.</p>
+      </div>
+      <div className="st-card" style={{ margin: '10px 8px 0' }}>
+        <div className="bk-feat"><span className="bk-featic"><BCIcon name="lock" size={17} /></span><span className="bk-featmain"><b>No passphrase to lose</b><span>Sealed with your existing identity key.</span></span></div>
+        <div className="bk-feat"><span className="bk-featic"><BCIcon name="importKey" size={17} /></span><span className="bk-featmain"><b>Restores itself</b><span>Sign in on a new phone and it recovers in the background.</span></span></div>
       </div>
       <div className="bc-sheetactions">
-        <button className="bc-primary" onClick={() => { onDone(); onClose(); }}>Done</button>
+        <button className="bc-primary" onClick={() => { onDone(); onClose(); }}>Turn on backup</button>
+        <button className="bc-ghost" onClick={onClose}>Not now</button>
+      </div>
+    </Sheet>
+  );
+}
+
+/* Restore runs automatically. The button is a dry run — a preview of what would come back. */
+const DRY_CHATS = [
+  { n: 'Lake crew', k: 'group', c: 412, t: 'Maya: bringing the speaker' },
+  { n: 'Maya', k: 'dm', c: 286, t: 'find me by the coffee table' },
+  { n: 'Weekend trip', k: 'group', c: 173, t: 'Sofia: booked the cabin!' },
+  { n: 'Sofia', k: 'dm', c: 158, t: 'done! check your downloads' },
+  { n: 'Luca', k: 'dm', c: 121, t: 'see you tomorrow' },
+  { n: 'Lugano · Centro', k: 'place', c: 54, t: 'public channel history' },
+];
+
+function BackupRestoreSheet({ onClose }) {
+  const [phase, setPhase] = React.useState('scan');
+  const [step, setStep] = React.useState(0);
+  React.useEffect(() => {
+    if (phase !== 'scan') return;
+    const id = setInterval(() => setStep((s) => {
+      if (s >= DRY_CHATS.length) { clearInterval(id); setPhase('preview'); return s; }
+      return s + 1;
+    }), 420);
+    return () => clearInterval(id);
+  }, [phase]);
+  const found = DRY_CHATS.slice(0, step);
+  const msgs = found.reduce((a, c) => a + c.c, 0);
+  const ic = (k) => k === 'group' ? 'people' : k === 'place' ? 'pin' : 'lock';
+  return (
+    <Sheet onClose={onClose} title="Dry run · restore preview">
+      <div className="bk-dryhead">
+        <span className="bk-drytag">Nothing is changed on your device</span>
+        <div className="bk-donetitle">{phase === 'scan' ? 'Reading your backup…' : 'This is what would come back'}</div>
+        <p className="bk-donesub">{phase === 'scan'
+          ? 'Decrypting the index to show you exactly what a restore would bring back.'
+          : found.length + ' conversations · ' + msgs.toLocaleString('en-US') + ' messages · from Today, 04:12'}</p>
+      </div>
+      <div className="bk-drylist">
+        {found.map((c) => (
+          <div className="bk-dryrow" key={c.n}>
+            <span className="bk-dryic"><BCIcon name={ic(c.k)} size={16} weight={2.1} /></span>
+            <span className="bk-drymain">
+              <b>{c.n}</b>
+              <span>{c.t}</span>
+            </span>
+            <span className="bk-drycount">{c.c.toLocaleString('en-US')}</span>
+          </div>
+        ))}
+        {phase === 'scan' ? (
+          <div className="bk-dryrow scanning">
+            <span className="bk-dryic"><svg width="16" height="16" viewBox="0 0 16 16"><circle className="ps-spin" cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeDasharray="12 26" /></svg></span>
+            <span className="bk-drymain"><b>Scanning…</b></span>
+          </div>
+        ) : null}
+      </div>
+      <div className="bc-sheetactions">
+        <button className="bc-ghost" onClick={onClose}>Close preview</button>
       </div>
     </Sheet>
   );
@@ -555,7 +587,6 @@ function BackupScreen({ app, nav, pop, onPref }) {
   const [setup, setSetup] = React.useState(false);
   const [freqSheet, setFreqSheet] = React.useState(false);
   const [restore, setRestore] = React.useState(false);
-  const [showKey, setShowKey] = React.useState(false);
   const freq = prefs.backupFreq || 'Daily';
   return (
     <div className="bc-screen" data-nav={nav} data-screen-label="Chat backup">
@@ -565,7 +596,7 @@ function BackupScreen({ app, nav, pop, onPref }) {
           <span className={'bk-heroic' + (on ? ' on' : '')}><BCIcon name="backup" size={34} /></span>
           <h2 className="bk-herotitle">{on ? 'Backups are on' : 'Back up your chats'}</h2>
           <p className="bk-herosub">{on
-            ? 'Your history is encrypted end-to-end and restorable only with your recovery key.'
+            ? 'Your history is encrypted with the key on this phone — nothing extra to remember.'
             : 'Keep an encrypted copy of your messages, groups and settings so you can restore on a new phone.'}</p>
         </div>
 
@@ -574,8 +605,7 @@ function BackupScreen({ app, nav, pop, onPref }) {
             <div className="st-card">
               <StRow icon="backup" tone="cyan" label="Backup" value="On" onClick={() => onPref('backupOn', false)} toggle={true} />
               <StRow icon="data" label="Frequency" value={freq} onClick={() => setFreqSheet(true)} />
-              <StRow icon="drive" label="Last backup" value="Today, 04:12" chevron={false} onClick={() => {}} />
-              <StRow icon="key" label="Recovery key" sub="12 words — view again" onClick={() => setShowKey(true)} />
+              <StRow icon="drive" label="Last backup" sub="Restores automatically · tap for a dry run" value="Today, 04:12" onClick={() => setRestore(true)} />
             </div>
             <div className="bk-stats">
               <div className="bk-stat"><b>128 MB</b><span>backup size</span></div>
@@ -584,18 +614,18 @@ function BackupScreen({ app, nav, pop, onPref }) {
             </div>
             <p className="st-note">Backups are encrypted on this device before upload. Sonar’s servers only ever see ciphertext.</p>
             <div className="st-card" style={{ marginTop: 8 }}>
-              <StRow icon="importKey" label="Restore from backup" sub="Recover history on this device" onClick={() => setRestore(true)} />
+              <StRow icon="importKey" label="Dry run a restore" sub="Preview what would come back — changes nothing" onClick={() => setRestore(true)} />
             </div>
           </React.Fragment>
         ) : (
           <React.Fragment>
             <div className="st-card">
-              <div className="bk-feat"><span className="bk-featic"><BCIcon name="lock" size={17} /></span><span className="bk-featmain"><b>End-to-end encrypted</b><span>Locked with a 12-word recovery key only you hold.</span></span></div>
+              <div className="bk-feat"><span className="bk-featic"><BCIcon name="lock" size={17} /></span><span className="bk-featmain"><b>Encrypted by default</b><span>Sealed with the key already on this phone.</span></span></div>
               <div className="bk-feat"><span className="bk-featic"><BCIcon name="data" size={17} /></span><span className="bk-featmain"><b>Automatic</b><span>Runs quietly in the background, on your schedule.</span></span></div>
-              <div className="bk-feat"><span className="bk-featic"><BCIcon name="importKey" size={17} /></span><span className="bk-featmain"><b>Restore anywhere</b><span>Bring your history to a new phone with your key.</span></span></div>
+              <div className="bk-feat"><span className="bk-featic"><BCIcon name="importKey" size={17} /></span><span className="bk-featmain"><b>Restores automatically</b><span>Sign in on a new phone and your history comes back on its own.</span></span></div>
             </div>
             <div className="st-card" style={{ marginTop: 8 }}>
-              <StRow icon="importKey" label="Restore from backup" sub="Already have a recovery key?" onClick={() => setRestore(true)} />
+              <StRow icon="importKey" label="Dry run a restore" sub="Preview what would come back — changes nothing" onClick={() => setRestore(true)} />
             </div>
           </React.Fragment>
         )}
@@ -606,7 +636,7 @@ function BackupScreen({ app, nav, pop, onPref }) {
         <div className="bc-composerwrap">
           <div style={{ padding: '10px 14px 30px' }}>
             <button className="bc-primary" onClick={() => setSetup(true)}>Turn on backup</button>
-            <p className="dn-paynote">You’ll get a recovery key. Keep it safe — it can’t be reset.</p>
+            <p className="dn-paynote">Encrypted with the key already on this phone — nothing to write down.</p>
           </div>
         </div>
       )}
@@ -620,25 +650,7 @@ function BackupScreen({ app, nav, pop, onPref }) {
           <div className="bc-sheetactions"><button className="bc-ghost" onClick={() => setFreqSheet(false)}>Done</button></div>
         </Sheet>
       )}
-      {showKey && (
-        <Sheet onClose={() => setShowKey(false)} title="Recovery key">
-          <div className="bk-reckey">
-            {BACKUP_RECOVERY.map((w, i) => (<span key={i} className="bk-recword"><i>{i + 1}</i>{w}</span>))}
-          </div>
-          <p className="bc-note" style={{ textAlign: 'center', padding: '10px 18px 4px' }}>Store these 12 words offline. They restore your encrypted backup.</p>
-          <div className="bc-sheetactions"><button className="bc-ghost" onClick={() => setShowKey(false)}>Done</button></div>
-        </Sheet>
-      )}
-      {restore && (
-        <Sheet onClose={() => setRestore(false)} title="Restore from backup">
-          <p className="bc-verifycopy">Enter your 12-word recovery key to decrypt and restore your chat history on this device.</p>
-          <textarea className="bc-nsecinput" rows={3} placeholder="word1 word2 word3 …" spellCheck={false} autoCapitalize="none" autoCorrect="off"></textarea>
-          <div className="bc-sheetactions">
-            <button className="bc-primary" onClick={() => setRestore(false)}>Restore backup</button>
-            <button className="bc-ghost" onClick={() => setRestore(false)}>Cancel</button>
-          </div>
-        </Sheet>
-      )}
+      {restore && <BackupRestoreSheet onClose={() => setRestore(false)} />}
     </div>
   );
 }

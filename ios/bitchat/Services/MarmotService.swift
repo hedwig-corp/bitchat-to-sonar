@@ -123,6 +123,8 @@ final class MarmotService: @unchecked Sendable {
         /// Core-computed classification; `.text` for local echoes and rows
         /// decoded from older on-disk encodes.
         let classification: MarmotMessageClass
+        /// NIP-C7 reply pointer. Content is already the display body.
+        let reply: MarmotReplyRef?
 
         init(
             id: String,
@@ -133,7 +135,8 @@ final class MarmotService: @unchecked Sendable {
             deliveryState: String? = nil,
             media: [MarmotMedia],
             stickerRef: MarmotStickerRef? = nil,
-            classification: MarmotMessageClass = .text
+            classification: MarmotMessageClass = .text,
+            reply: MarmotReplyRef? = nil
         ) {
             self.id = id
             self.senderNpub = senderNpub
@@ -144,6 +147,7 @@ final class MarmotService: @unchecked Sendable {
             self.media = media
             self.stickerRef = stickerRef
             self.classification = classification
+            self.reply = reply
         }
 
         enum CodingKeys: String, CodingKey {
@@ -156,6 +160,7 @@ final class MarmotService: @unchecked Sendable {
             case media
             case stickerRef
             case classification
+            case reply
         }
 
         init(from decoder: Decoder) throws {
@@ -170,7 +175,14 @@ final class MarmotService: @unchecked Sendable {
             self.stickerRef = try container.decodeIfPresent(MarmotStickerRef.self, forKey: .stickerRef)
             self.classification =
                 try container.decodeIfPresent(MarmotMessageClass.self, forKey: .classification) ?? .text
+            self.reply = try container.decodeIfPresent(MarmotReplyRef.self, forKey: .reply)
         }
+    }
+
+    struct MarmotReplyRef: Sendable, Equatable, Codable {
+        let parentId: String
+        let parentNpub: String?
+        let preview: String?
     }
 
     struct RecentMessagePage: Sendable, Equatable {
@@ -906,6 +918,24 @@ final class MarmotService: @unchecked Sendable {
         try await sendLane { try $0.sendText(groupIdHex: groupId, text: text) }
     }
 
+    func sendTextReply(
+        groupId: String,
+        text: String,
+        replyToHex: String,
+        replyToNpub: String,
+        preview: String?
+    ) async throws {
+        try await sendLane {
+            try $0.sendTextReply(
+                groupIdHex: groupId,
+                text: text,
+                replyToHex: replyToHex,
+                replyToNpub: replyToNpub,
+                preview: preview
+            )
+        }
+    }
+
     /// Republish one failed message from the durable local outbox.
     func retryMessage(messageId: String) async throws -> String {
         try await run {
@@ -1283,7 +1313,14 @@ final class MarmotService: @unchecked Sendable {
                     plaintextSha256: $0.plaintextSha256
                 )
             },
-            classification: Self.marmotMessageClass(message.classification)
+            classification: Self.marmotMessageClass(message.classification),
+            reply: message.reply.map {
+                MarmotReplyRef(
+                    parentId: $0.parentIdHex,
+                    parentNpub: $0.parentNpub,
+                    preview: $0.preview
+                )
+            }
         )
     }
 

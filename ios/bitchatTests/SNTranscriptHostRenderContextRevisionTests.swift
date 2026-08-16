@@ -48,7 +48,9 @@ struct SNTranscriptHostRenderContextRevisionTests {
             onTapPack: nil,
             onRetry: nil,
             onCancelUpload: nil,
-            uploadProgressSource: nil
+            uploadProgressSource: nil,
+            onReply: nil,
+            onJumpQuote: nil
         )
     }
 

@@ -8,6 +8,7 @@ internal data class QueuedMessage(
     val peerId: String,
     val messageId: String,
     val timestampSecs: Long,
+    val reply: SonarReplyRef? = null,
 )
 
 internal data class OutboxEnqueueResult(
@@ -34,7 +35,13 @@ internal class SonarOutbox(
 
     fun snapshot(peerId: String): List<QueuedMessage> = queues[peerId]?.toList().orEmpty()
 
-    fun enqueue(peerId: String, content: String, messageId: String, timestampSecs: Long): OutboxEnqueueResult {
+    fun enqueue(
+        peerId: String,
+        content: String,
+        messageId: String,
+        timestampSecs: Long,
+        reply: SonarReplyRef? = null,
+    ): OutboxEnqueueResult {
         val queue = queues.getOrPut(peerId) { mutableListOf() }
         queue.firstOrNull { it.messageId == messageId }?.let { existing ->
             return OutboxEnqueueResult(existing, evicted = null, depth = queue.size)
@@ -44,6 +51,7 @@ internal class SonarOutbox(
             peerId = peerId,
             messageId = messageId,
             timestampSecs = timestampSecs,
+            reply = reply,
         )
         queue.add(message)
         val evicted = if (queue.size > maxPerPeer) queue.removeAt(0) else null

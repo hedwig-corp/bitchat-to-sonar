@@ -103,7 +103,8 @@ struct SonarChannelScreen: View {
                     onTapPack: { previewPackCoordinate = $0 })
             }
 
-            SNComposer(
+            VStack(spacing: 0) {
+                SNComposer(
                 text: store.composerDraftBinding(for: chId),
                 placeholder: "Message \(ch.name)",
                 transport: transport,
@@ -125,6 +126,7 @@ struct SonarChannelScreen: View {
                 cachedStickerPacks: { store.cachedStickerPacks() },
                 voiceEnabled: false
             )
+            }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
         .overlay {

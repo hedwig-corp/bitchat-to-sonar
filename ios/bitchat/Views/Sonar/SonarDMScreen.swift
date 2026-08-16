@@ -119,7 +119,13 @@ struct SonarDMScreenContent: View {
 
     @ViewBuilder
     private var dmComposer: some View {
-        SNComposer(
+        VStack(spacing: 0) {
+            if let reply = store.composerReply(for: peerId) {
+                SNComposerReplyBanner(reply: reply) {
+                    store.cancelReply(chatId: peerId)
+                }
+            }
+            SNComposer(
             text: store.composerDraftBinding(for: peerId),
             placeholder: "Message \(peer.name)" + (transport == .internet ? " · via internet" : ""),
             transport: transport,
@@ -162,6 +168,7 @@ struct SonarDMScreenContent: View {
                 ? []
                 : store.mentionRoster(forConversationId: peerId)
         )
+        }
     }
 
     var body: some View {
@@ -234,6 +241,8 @@ struct SonarDMScreenContent: View {
                     onRetry: { store.retryDm(peerId, message: $0) },
                     onCancelUpload: { store.cancelMediaUpload($0) },
                     uploadProgressSource: store.marmot.mediaUploadProgressSource,
+                    onReply: { store.beginReply(chatId: peerId, to: $0) },
+                    onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
@@ -262,6 +271,8 @@ struct SonarDMScreenContent: View {
                     onRetry: { store.retryDm(peerId, message: $0) },
                     onCancelUpload: { store.cancelMediaUpload($0) },
                     uploadProgressSource: store.marmot.mediaUploadProgressSource,
+                    onReply: { store.beginReply(chatId: peerId, to: $0) },
+                    onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     // Captured by push() at navigation time, before this screen

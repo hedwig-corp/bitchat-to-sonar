@@ -607,12 +607,17 @@ pub mod noise_payload {
 pub struct PrivateMessage {
     pub message_id: String,
     pub content: String,
+    /// Parent message id for a Signal-style reply. Optional TLV 0x04; unknown
+    /// to older clients (Rust already skips unknown types; iOS must too).
+    pub reply_to: Option<String>,
 }
 
 const PM_TLV_MESSAGE_ID: u8 = 0x00;
 const PM_TLV_CONTENT: u8 = 0x01;
 const PM_TLV_MESSAGE_ID_LONG: u8 = 0x02;
 const PM_TLV_CONTENT_LONG: u8 = 0x03;
+const PM_TLV_REPLY_TO: u8 = 0x04;
+const PM_TLV_REPLY_TO_LONG: u8 = 0x05;
 
 impl PrivateMessage {
     /// Encode the TLV (messageID 0x00, content 0x01) — order matches Swift.
@@ -625,6 +630,14 @@ impl PrivateMessage {
         let mut out = Vec::with_capacity(8 + id.len() + content.len());
         Self::encode_field(&mut out, PM_TLV_MESSAGE_ID, PM_TLV_MESSAGE_ID_LONG, id)?;
         Self::encode_field(&mut out, PM_TLV_CONTENT, PM_TLV_CONTENT_LONG, content)?;
+        if let Some(reply) = self.reply_to.as_ref().filter(|s| !s.is_empty()) {
+            Self::encode_field(
+                &mut out,
+                PM_TLV_REPLY_TO,
+                PM_TLV_REPLY_TO_LONG,
+                reply.as_bytes(),
+            )?;
+        }
         Some(out)
     }
 
@@ -652,10 +665,13 @@ impl PrivateMessage {
         let mut o = 0usize;
         let mut message_id: Option<String> = None;
         let mut content: Option<String> = None;
+        let mut reply_to: Option<String> = None;
         while o < data.len() {
             let t = data[o];
             o += 1;
-            let is_long = t == PM_TLV_MESSAGE_ID_LONG || t == PM_TLV_CONTENT_LONG;
+            let is_long = t == PM_TLV_MESSAGE_ID_LONG
+                || t == PM_TLV_CONTENT_LONG
+                || t == PM_TLV_REPLY_TO_LONG;
             let len = if is_long {
                 if o + 2 > data.len() {
                     return None;
@@ -683,12 +699,18 @@ impl PrivateMessage {
                 PM_TLV_CONTENT | PM_TLV_CONTENT_LONG => {
                     content = String::from_utf8(value.to_vec()).ok()
                 }
+                PM_TLV_REPLY_TO | PM_TLV_REPLY_TO_LONG => {
+                    reply_to = String::from_utf8(value.to_vec())
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                }
                 _ => {} // unknown TLV: skip (forward-compat)
             }
         }
         Some(PrivateMessage {
             message_id: message_id?,
             content: content?,
+            reply_to,
         })
     }
 }
@@ -723,6 +745,7 @@ pub struct EmbeddedPrivateMessage {
     pub recipient_id: Option<[u8; 8]>,
     pub message_id: String,
     pub content: String,
+    pub reply_to: Option<String>,
     pub timestamp: u64,
 }
 
@@ -778,6 +801,7 @@ pub fn decode_nip17_private_message_content(content: &str) -> Option<EmbeddedPri
         recipient_id: packet.recipient_id,
         message_id: private.message_id,
         content: private.content,
+        reply_to: private.reply_to,
         timestamp: packet.timestamp,
     })
 }
@@ -1607,6 +1631,7 @@ mod tests {
         let pm = PrivateMessage {
             message_id: "abc-123".into(),
             content: "ciao mesh".into(),
+            reply_to: None,
         };
         let enc = pm.encode().unwrap();
         // First TLV is messageID (0x00), then content (0x01).
@@ -1619,6 +1644,7 @@ mod tests {
         let pm = PrivateMessage {
             message_id: "call-offer".into(),
             content: "x".repeat(700),
+            reply_to: None,
         };
         let enc = pm.encode().unwrap();
         assert_eq!(enc[0], PM_TLV_MESSAGE_ID);
@@ -1631,6 +1657,7 @@ mod tests {
         let pm = PrivateMessage {
             message_id: "m1".into(),
             content: "hello".into(),
+            reply_to: None,
         };
         let mut data = pm.encode().unwrap();
         // Append two unknown short TLVs (1-byte length): decoder skips both.
@@ -1645,10 +1672,34 @@ mod tests {
     }
 
     #[test]
+    fn private_message_reply_to_tlv_roundtrip() {
+        let pm = PrivateMessage {
+            message_id: "child".into(),
+            content: "ok".into(),
+            reply_to: Some("parent-mid".into()),
+        };
+        let enc = pm.encode().unwrap();
+        assert_eq!(PrivateMessage::decode(&enc).unwrap(), pm);
+        // Old decoder path: content+id still present if 0x04 is skipped.
+        let without_reply = PrivateMessage {
+            message_id: "child".into(),
+            content: "ok".into(),
+            reply_to: None,
+        };
+        assert_eq!(
+            PrivateMessage::decode(&without_reply.encode().unwrap())
+                .unwrap()
+                .reply_to,
+            None
+        );
+    }
+
+    #[test]
     fn noise_private_message_plaintext_framing() {
         let pm = PrivateMessage {
             message_id: "id".into(),
             content: "hi".into(),
+            reply_to: None,
         };
         let plain = encode_private_message_plaintext(&pm).unwrap();
         let (t, rest) = split_noise_plaintext(&plain).unwrap();

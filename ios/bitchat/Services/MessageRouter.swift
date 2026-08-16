@@ -12,6 +12,7 @@ final class MessageRouter {
         let nickname: String
         let messageID: String
         let timestamp: Date
+        let replyTo: String?
     }
 
     private var outbox: [PeerID: [QueuedMessage]] = [:]
@@ -59,15 +60,15 @@ final class MessageRouter {
 
     // MARK: - Message Sending
 
-    func sendPrivate(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
+    func sendPrivate(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String, replyTo: String? = nil) {
         if let transport = reachableTransport(for: peerID) {
             SecureLogger.debug("Routing PM via \(type(of: transport)) to \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
-            transport.sendPrivateMessage(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
+            transport.sendPrivateMessage(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID, replyTo: replyTo)
         } else {
             // Queue for later with timestamp for TTL tracking
             if outbox[peerID] == nil { outbox[peerID] = [] }
 
-            let message = QueuedMessage(content: content, nickname: recipientNickname, messageID: messageID, timestamp: Date())
+            let message = QueuedMessage(content: content, nickname: recipientNickname, messageID: messageID, timestamp: Date(), replyTo: replyTo)
             outbox[peerID]?.append(message)
 
             // Enforce per-peer size limit with FIFO eviction
@@ -122,7 +123,7 @@ final class MessageRouter {
 
             if let transport = reachableTransport(for: peerID) {
                 SecureLogger.debug("Outbox -> \(type(of: transport)) for \(peerID.id.prefix(8))… id=\(message.messageID.prefix(8))…", category: .session)
-                transport.sendPrivateMessage(message.content, to: peerID, recipientNickname: message.nickname, messageID: message.messageID)
+                transport.sendPrivateMessage(message.content, to: peerID, recipientNickname: message.nickname, messageID: message.messageID, replyTo: message.replyTo)
             } else {
                 remaining.append(message)
             }

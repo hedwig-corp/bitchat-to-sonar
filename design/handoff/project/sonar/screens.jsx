@@ -414,10 +414,11 @@ function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe, onMute, onUnmute
 }
 
 /* ── Location channel (public) ── */
-function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand, onMedia, onVoice }) {
+function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand, onMedia, onVoice, onReact }) {
   const ch = BC_DATA.channels.find((c) => c.id === chId) || (BC_DATA.here || []).find((c) => c.id === chId) || BC_DATA.channels[0];
   const msgs = app.chMsgs[ch.id] || [];
   const [sheet, setSheet] = React.useState(false);
+  const [reply, setReply] = React.useState(null);
   const transport = app.network === 'online' ? 'internet' : 'mesh';
   return (
     <div className="bc-screen" data-nav={nav} data-screen-label={'Channel: ' + ch.name}>
@@ -445,12 +446,13 @@ function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand, onMedia, 
           <div className="bc-emptydesc">{ch.count} people are in range of this channel today. Say hi.</div>
         </div>
       ) : (
-        <MsgList msgs={msgs} showAuthors />
+        <MsgList msgs={msgs} showAuthors me={app.nick || 'you'} onReact={onReact ? (i, e) => onReact(ch.id, i, e) : null} onReply={(i) => setReply(bcReplyFrom(msgs[i]))} />
       )}
       <Composer
         placeholder={'Message ' + ch.name}
         transport={transport}
-        onSend={(tx) => onSend(ch.id, tx)}
+        reply={reply} onCancelReply={() => setReply(null)}
+        onSend={(tx) => { onSend(ch.id, tx, reply); setReply(null); }}
         onPlus={() => setSheet(true)}
         onVoice={(sec) => onVoice(ch.id, sec)}
         onSticker={(s) => onMedia(ch.id, s)}
@@ -468,10 +470,11 @@ function ChannelScreen({ app, nav, pop, push, chId, onSend, onCommand, onMedia, 
   );
 }
 
-function GroupScreen({ app, nav, pop, push, groupId, onSend, onCommand, onMedia, onVoice, onNudge }) {
+function GroupScreen({ app, nav, pop, push, groupId, onSend, onCommand, onMedia, onVoice, onNudge, onReact }) {
   const group = (BC_DATA.groups || []).find((g) => g.id === groupId) || BC_DATA.groups[0];
   const msgs = (app.groupMsgs && app.groupMsgs[group.id]) || [];
   const [sheet, setSheet] = React.useState(false);
+  const [reply, setReply] = React.useState(null);
   const { mem, transport, label } = groupReach(group);
   return (
     <div className="bc-screen" data-nav={nav} data-screen-label={'Group: ' + group.name}>
@@ -501,12 +504,13 @@ function GroupScreen({ app, nav, pop, push, groupId, onSend, onCommand, onMedia,
           <div className="bc-emptydesc">Say hi to the group. Messages are end-to-end encrypted for all {mem.length + 1} members.</div>
         </div>
       ) : (
-        <MsgList msgs={msgs} showAuthors />
+        <MsgList msgs={msgs} showAuthors me={app.nick || 'you'} onReact={onReact ? (i, e) => onReact(group.id, i, e) : null} onReply={(i) => setReply(bcReplyFrom(msgs[i]))} />
       )}
       <Composer
         placeholder={'Message ' + group.name}
         transport={transport}
-        onSend={(tx) => onSend(group.id, tx)}
+        reply={reply} onCancelReply={() => setReply(null)}
+        onSend={(tx) => { onSend(group.id, tx, reply); setReply(null); }}
         onPlus={() => setSheet(true)}
         onVoice={(sec) => onVoice(group.id, sec)}
         onSticker={(s) => onMedia(group.id, s)}
@@ -979,9 +983,10 @@ function PeerProfileScreen({ app, nav, pop, push, peerId, onVerify }) {
 }
 
 /* ── Direct message (encrypted, transport-aware) ── */
-function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, onPay, onClaimPay, openPay, onMedia, onVoice, onMute, onUnmute, onNudge }) {
+function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, onPay, onClaimPay, openPay, onMedia, onVoice, onMute, onUnmute, onNudge, onReact }) {
   const peer = BC_DATA.peers.find((p) => p.id === peerId) || BC_DATA.peers[0];
   const msgs = app.dmMsgs[peer.id] || [];
+  const [reply, setReply] = React.useState(null);
   const [sheet, setSheet] = React.useState(false);
   const [verify, setVerify] = React.useState(false);
   const [showKey, setShowKey] = React.useState(false);
@@ -1058,12 +1063,13 @@ function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, on
           <div className="bc-emptydesc">Messages here are end-to-end encrypted. Only the two of you can read them.</div>
         </div>
       ) : (
-        <MsgList msgs={msgs} showAuthors={false} peerName={peer.name} onClaim={(i) => setPayDetail(msgs[i])} pay={pp} />
+        <MsgList msgs={msgs} showAuthors={false} peerName={peer.name} me={app.nick || 'you'} onReact={onReact ? (i, e) => onReact(peer.id, i, e) : null} onReply={(i) => setReply(bcReplyFrom(msgs[i], peer.name))} onClaim={(i) => setPayDetail(msgs[i])} pay={pp} />
       )}
       <Composer
         placeholder={'Message ' + peer.name + (peer.inRange ? '' : ' · via internet')}
         transport={transport}
-        onSend={(tx) => onSend(peer.id, tx)}
+        reply={reply} onCancelReply={() => setReply(null)}
+        onSend={(tx) => { onSend(peer.id, tx, reply); setReply(null); }}
         onPlus={() => setSheet(true)}
         onVoice={(sec) => onVoice(peer.id, sec)}
         onSticker={(s) => onMedia(peer.id, s)}
@@ -1321,4 +1327,4 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
   );
 }
 
-Object.assign(window, { Onboarding, HomeScreen, ChannelScreen, GroupScreen, GroupInfoScreen, NewGroupScreen, StartChatSheet, PeerProfileScreen, InviteLinkSheet, PendingRequestsSheet, JoinViaLinkSheet, DMScreen, SonarScreen, SettingsScreen, WipeSheet });
+Object.assign(window, { Onboarding, HomeScreen, HereCard, ChannelScreen, GroupScreen, GroupInfoScreen, NewGroupScreen, StartChatSheet, PeerProfileScreen, InviteLinkSheet, PendingRequestsSheet, JoinViaLinkSheet, DMScreen, SonarScreen, SettingsScreen, WipeSheet });

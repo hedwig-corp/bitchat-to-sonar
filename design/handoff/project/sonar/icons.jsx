@@ -15,6 +15,7 @@ const BC_ICONS = {
   shield: <path d="M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z" />,
   shieldCheck: <><path d="M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z" /><path d="M8.8 12.1l2.3 2.3 4.3-4.6" /></>,
   x: <path d="M6.5 6.5l11 11M17.5 6.5l-11 11" />,
+  reply: <path d="M9.6 6.4 4.4 11.2l5.2 4.8M4.8 11.2h8.7a6 6 0 0 1 6 6v.9" />,
   smile: <><circle cx="12" cy="12" r="8.2" data-comment-anchor="2decdc16a3-circle-18-12" /><circle cx="9.1" cy="10.2" r="1.1" fill="currentColor" stroke="none" /><circle cx="14.9" cy="10.2" r="1.1" fill="currentColor" stroke="none" /><path d="M8.7 14.2a4.5 4.5 0 0 0 6.6 0" /></>,
   navArrow: <path d="M20.4 3.6 3.8 10.2l6.6 3.4 3.4 6.6z" />,
   dice: <><rect x="4.2" y="4.2" width="15.6" height="15.6" rx="4" /><circle cx="8.8" cy="8.8" r="1.2" fill="currentColor" stroke="none" /><circle cx="15.2" cy="8.8" r="1.2" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" /><circle cx="8.8" cy="15.2" r="1.2" fill="currentColor" stroke="none" /><circle cx="15.2" cy="15.2" r="1.2" fill="currentColor" stroke="none" /></>,

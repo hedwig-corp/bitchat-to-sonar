@@ -116,7 +116,7 @@ object MeshGatt {
 
     // Listeners (fired from BLE callback threads → concurrent lists). The
     // String identity is the peer's stable FINGERPRINT.
-    private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String, String) -> Unit>()
+    private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String?) -> Unit>()
     private val onDelivery = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Unit>()
     private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
@@ -157,7 +157,7 @@ object MeshGatt {
         override val tsSecs: Long,
     ) : OutboundDelivery
 
-    fun addMessageListener(cb: (fingerprint: String, messageId: String, text: String) -> Unit) { onText.add(cb) }
+    fun addMessageListener(cb: (fingerprint: String, messageId: String, text: String, replyTo: String?) -> Unit) { onText.add(cb) }
     fun addDeliveryListener(cb: (fingerprint: String, messageId: String) -> Unit) { onDelivery.add(cb) }
     fun addSonarListener(cb: (fingerprint: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
     /** Fired when a peer's signed announce is received + verified. The third arg
@@ -372,7 +372,7 @@ object MeshGatt {
     // write-queue enqueue must be one atomic step, or two threads' ciphertexts
     // can invert their nonce order on the wire.
 
-    fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
+    fun sendTextToPeer(fingerprint: String, messageId: String, text: String, replyTo: String? = null): Boolean {
         return transactDelivery(
             delivery = { generation, epoch ->
                 TextDelivery(
@@ -380,7 +380,11 @@ object MeshGatt {
                     System.currentTimeMillis() / 1000,
                 )
             },
-        ) { engine.sendText(fingerprint, messageId, text, nowMs()) } != null
+        ) {
+            val parent = replyTo?.trim()?.takeIf { it.isNotEmpty() }
+            if (parent == null) engine.sendText(fingerprint, messageId, text, nowMs())
+            else engine.sendTextWithReply(fingerprint, messageId, text, parent, nowMs())
+        } != null
     }
 
     /** Immediate send for real-time controls. Never queues. */
@@ -550,7 +554,7 @@ object MeshGatt {
             is MeshEngineEvent.SonarPayload ->
                 onSonar.forEach { it(event.fingerprint, event.payload) }
             is MeshEngineEvent.TextReceived ->
-                onText.forEach { it(event.fingerprint, event.messageId, event.content) }
+                onText.forEach { it(event.fingerprint, event.messageId, event.content, event.replyTo) }
             is MeshEngineEvent.DeliveryReceived -> {
                 if (BuildConfig.DEBUG) {
                     android.util.Log.i(

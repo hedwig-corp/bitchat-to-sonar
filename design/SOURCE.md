@@ -4,6 +4,12 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
 (checked in) so agents read it from disk instead of re-fetching every time.
 
 - **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design) — **dead (404)**; refresh through the `DesignSync` MCP tool against the project id below instead.
+- **Full bundle sync (2026-08-16)** — imported the latest Claude Design export.
+  The app prototype adds compact quoted replies (`.bc-quote`), reply composer
+  chrome, long-press actions and reactions. The export also adds the design
+  system, stickers, Fight Chat Control and Sonar AI reference surfaces plus
+  their assets. The native reply bubbles track `project/sonar/components.jsx`
+  and the exact `.bc-quote` metrics in `project/sonar/theme.css`.
 - **Payment-status refresh (2026-07-28)** — Claude Design project
   `c6936a45-1fde-470e-9d0b-56b04428e60b`
   ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Payment+Status.html)):
@@ -87,7 +93,7 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
   "Open the prototype" link was replaced by a **Docs** link. The same project
   also carries a newer Stickers directory (`Sonar Stickers.html`,
   `sonar/stickers/*`) that is out of scope for this refresh.
-- **Last synced:** 2026-06-16. Three design refreshes landed this day, all vendored here:
+- **2026-06-16 app refreshes** — three design refreshes landed this day, all vendored here:
   - **Profile key-management** (`UQethAMsRlMNd4xMzNISTA`): reworks the profile view key
     management. ADDS a `KeyShareCard` in `project/sonar/settings.jsx` (QR + tap-to-expand
     full key + "Copy key"/"Share" buttons); renames the "Keys" section to **Safety** with the

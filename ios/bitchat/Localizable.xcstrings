@@ -37066,7 +37066,116 @@
     },
     "Your nickname is what people see. Your key stays on this device unless you explicitly export it." : {
 
+    }    ,
+    "chat.copy" : {
+      "comment" : "Context-menu action to copy the full message text, Signal-style",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy"
+          }
+        }
+      }
+    },
+    "chat.reply" : {
+      "comment" : "Context-menu and composer-banner label for quote-reply",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reply"
+          }
+        }
+      }
+    },
+    "chat.reply.cancel" : {
+      "comment" : "Dismiss the composer reply banner",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel reply"
+          }
+        }
+      }
+    },
+    "chat.reply.fallback" : {
+      "comment" : "Generic quoted-message chip when preview is empty",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Message"
+          }
+        }
+      }
+    },
+    "chat.reply.payment" : {
+      "comment" : "Quoted preview for a payment receipt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Payment"
+          }
+        }
+      }
+    },
+    "chat.reply.photo" : {
+      "comment" : "Quoted preview for a media attachment",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Photo"
+          }
+        }
+      }
+    },
+    "chat.reply.sticker" : {
+      "comment" : "Quoted preview for a sticker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sticker"
+          }
+        }
+      }
+    },
+    "chat.reply.them" : {
+      "comment" : "Quoted-author fallback when the peer has no display name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Them"
+          }
+        }
+      }
+    },
+    "chat.reply.you" : {
+      "comment" : "Quoted-author label when the parent message is ours",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "You"
+          }
+        }
+      }
     }
+
   },
   "version" : "1.1"
 }

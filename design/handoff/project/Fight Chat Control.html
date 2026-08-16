@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fight Chat Control · with Sonar &amp; White Noise</title>
+<link rel="icon" href="sonar/brand/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="sonar/brand/sonar-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800;900&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #070607; --panel: #0E0B0C; --card: #161112; --card2: #1C1517;
+    --text: #F4EFEF; --text2: #ADA3A4; --text3: #776C6E;
+    --hairline: rgba(255,255,255,0.08);
+    --alert: #F0453E; --alert-deep: #FF6A63; --alert-soft: rgba(240,69,62,0.13);
+    --cyan: #22D3EE; --cyan-deep: #67E2F4; --cyan-fill: #1FC0DE; --on-cyan: #04222B; --cyan-soft: rgba(34,211,238,0.12);
+    --gold: #F0B03A; --ok: #41BC76;
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Figtree', system-ui, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.6; }
+  a { color: var(--cyan-deep); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; padding: 13px 22px; border-radius: 999px; border: none; font-family: inherit; font-size: 15px; font-weight: 700; cursor: pointer; transition: transform 0.12s, background 0.15s; }
+  .btn:active { transform: scale(0.97); }
+  .btn:hover { text-decoration: none; }
+  .btn.alert { background: var(--alert); color: #fff; }
+  .btn.alert:hover { background: var(--alert-deep); }
+  .btn.ghost { background: transparent; color: var(--text); box-shadow: inset 0 0 0 1px var(--hairline); }
+  .btn.ghost:hover { background: var(--card); }
+  .btn.cyan { background: var(--cyan-fill); color: var(--on-cyan); }
+  .btn.cyan:hover { background: var(--cyan); }
+  .btn.sm { padding: 9px 16px; font-size: 13.5px; }
+
+  /* nav */
+  nav { position: sticky; top: 0; z-index: 40; background: rgba(7,6,7,0.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--hairline); }
+  .navin { display: flex; align-items: center; justify-content: space-between; max-width: 1040px; margin: 0 auto; padding: 14px 24px; }
+  .brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 800; font-size: 16px; letter-spacing: -0.01em; }
+  .brand:hover { text-decoration: none; }
+  .brand .mk { width: 30px; height: 30px; border-radius: 9px; background: var(--alert); display: flex; align-items: center; justify-content: center; color: #fff; }
+  .navlinks { display: flex; align-items: center; gap: 8px; }
+  .navlinks .hidem { }
+
+  /* hero */
+  .hero { position: relative; padding: 60px 0 54px; text-align: center; overflow: hidden; }
+  .hero::before { content: ''; position: absolute; inset: 0; background: radial-gradient(80% 60% at 50% -10%, var(--alert-soft), transparent 62%); pointer-events: none; }
+  .hero > * { position: relative; }
+  .siren { display: inline-flex; align-items: center; gap: 9px; font-size: 13px; font-weight: 700; color: var(--alert-deep); background: var(--alert-soft); border-radius: 999px; padding: 7px 15px; margin-bottom: 22px; letter-spacing: 0.02em; }
+  .siren .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--alert); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 var(--alert-soft); } 50% { box-shadow: 0 0 0 6px transparent; } }
+  h1 { font-size: clamp(38px, 6.5vw, 68px); font-weight: 900; letter-spacing: -0.035em; line-height: 1.02; margin: 0 auto 20px; max-width: 15ch; }
+  h1 .u { color: var(--alert-deep); }
+  .herolede { font-size: 19px; color: var(--text2); max-width: 58ch; margin: 0 auto 30px; text-wrap: pretty; }
+  .heroctas { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .herofine { font-size: 13px; color: var(--text3); margin-top: 20px; }
+
+  /* stat strip */
+  .stats { border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); background: var(--panel); }
+  .statsin { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .stat { padding: 26px 20px; text-align: center; border-right: 1px solid var(--hairline); }
+  .stat:last-child { border-right: none; }
+  .statn { font-size: 34px; font-weight: 800; letter-spacing: -0.02em; }
+  .statn.alert { color: var(--alert-deep); }
+  .statl { font-size: 13.5px; color: var(--text2); margin-top: 3px; }
+
+  section { padding: 68px 0; }
+  .label { font-size: 12.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--alert-deep); margin: 0 0 12px; }
+  h2 { font-size: clamp(27px, 3.6vw, 38px); font-weight: 800; letter-spacing: -0.02em; line-height: 1.14; margin: 0 0 16px; }
+  .lede { font-size: 17px; color: var(--text2); max-width: 60ch; margin: 0; text-wrap: pretty; }
+  p.body { font-size: 16.5px; color: #DAD2D3; max-width: 62ch; }
+
+  /* what is it — cards */
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 40px; }
+  .card { background: var(--card); border: 1px solid var(--hairline); border-radius: 18px; padding: 24px; }
+  .card .ic { width: 42px; height: 42px; border-radius: 12px; background: var(--alert-soft); color: var(--alert-deep); display: flex; align-items: center; justify-content: center; margin-bottom: 16px; }
+  .card h3 { font-size: 17px; font-weight: 750; margin: 0 0 7px; }
+  .card p { font-size: 14px; color: var(--text2); margin: 0; }
+
+  /* stakes list */
+  .stakes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 30px; margin-top: 34px; }
+  .stake { display: flex; gap: 12px; align-items: flex-start; }
+  .stake .x { width: 26px; height: 26px; border-radius: 8px; flex: none; background: var(--alert-soft); color: var(--alert-deep); display: flex; align-items: center; justify-content: center; margin-top: 2px; }
+  .stake b { font-weight: 700; }
+  .stake span { font-size: 15px; color: var(--text2); }
+  .stake span b { color: var(--text); }
+
+  /* action */
+  .action { background: var(--panel); border-top: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); }
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 38px; }
+  .step { background: var(--card); border: 1px solid var(--hairline); border-radius: 18px; padding: 24px; position: relative; }
+  .stepn { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--alert-deep); }
+  .step h3 { font-size: 18px; font-weight: 750; margin: 8px 0 8px; }
+  .step p { font-size: 14px; color: var(--text2); margin: 0 0 16px; }
+  .step .btn { width: 100%; justify-content: center; }
+
+  /* countries */
+  .maprow { display: grid; grid-template-columns: 1.1fr 1fr; gap: 40px; align-items: center; margin-top: 20px; }
+  .countries { display: flex; flex-direction: column; gap: 2px; }
+  .country { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border-radius: 11px; background: var(--card); }
+  .country .cn { flex: 1; font-size: 14.5px; font-weight: 600; }
+  .cstat { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; }
+  .cstat.against { background: rgba(65,188,118,0.14); color: var(--ok); }
+  .cstat.for { background: var(--alert-soft); color: var(--alert-deep); }
+  .cstat.undecided { background: rgba(240,176,58,0.14); color: var(--gold); }
+  .maptext .lede { margin-bottom: 20px; }
+
+  /* sonar tie-in */
+  .tools { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 38px; }
+  .tool { background: var(--card); border: 1px solid var(--hairline); border-radius: 20px; padding: 26px; }
+  .tool .th { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+  .tool .tm { width: 44px; height: 44px; border-radius: 12px; flex: none; box-shadow: inset 0 0 0 1px var(--hairline); }
+  .tool .tm.wn { background: linear-gradient(135deg, #2A2438, #4341B5); display: flex; align-items: center; justify-content: center; color: #fff; }
+  .tool h3 { font-size: 19px; font-weight: 800; letter-spacing: -0.01em; margin: 0; }
+  .tool .sub { font-size: 12.5px; color: var(--text3); }
+  .tool p { font-size: 14.5px; color: var(--text2); margin: 0 0 16px; }
+  .tool ul { margin: 0 0 18px; padding-left: 18px; }
+  .tool li { font-size: 14px; color: var(--text2); margin: 6px 0; }
+  .tool li::marker { color: var(--cyan); }
+
+  /* final cta */
+  .final { text-align: center; background: radial-gradient(70% 90% at 50% 120%, var(--alert-soft), transparent 60%), var(--panel); border-top: 1px solid var(--hairline); }
+  .final h2 { max-width: 20ch; margin-left: auto; margin-right: auto; }
+  .final .lede { margin: 0 auto 30px; }
+  .final .heroctas { justify-content: center; }
+
+  footer { border-top: 1px solid var(--hairline); padding: 28px 0 46px; }
+  .footin { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--text3); }
+  .footbrand { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 700; }
+  .footbrand img { width: 22px; height: 22px; border-radius: 6px; }
+  .disc { font-size: 12px; color: var(--text3); max-width: 60ch; margin: 14px auto 0; text-align: center; line-height: 1.5; }
+
+  @media (max-width: 860px) {
+    .statsin { grid-template-columns: 1fr; } .stat { border-right: none; border-bottom: 1px solid var(--hairline); }
+    .cards, .steps { grid-template-columns: 1fr; }
+    .stakes, .maprow, .tools { grid-template-columns: 1fr; }
+    .navlinks .hidem { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="navin">
+    <a class="brand" href="Sonar Landing.html">
+      <span class="mk"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 7v7"></path><path d="M12 17.4v.1"></path></svg></span>
+      Fight Chat Control
+    </a>
+    <div class="navlinks">
+      <a class="btn ghost sm hidem" href="Sonar Blog.html">Blog</a>
+      <a class="btn ghost sm hidem" href="Sonar Landing.html">About Sonar</a>
+      <a class="btn alert sm" href="#act">Take action</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="siren"><span class="pulse"></span>EU · Chat Control 2.0 is advancing</span>
+    <h1>They want to scan <span class="u">every message</span> you send.</h1>
+    <p class="herolede">Chat Control would force your phone to inspect your private messages before they’re even encrypted — photos, texts, everything. It’s mass surveillance of 450 million Europeans, sold as safety. You can still stop it.</p>
+    <div class="heroctas">
+      <a class="btn alert" href="#act">Contact your representatives</a>
+      <a class="btn ghost" href="#what">Understand the threat</a>
+    </div>
+    <p class="herofine">Independent, non-partisan, and run by the people building <a href="Sonar Landing.html">Sonar</a> &amp; White Noise.</p>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="wrap statsin">
+    <div class="stat"><div class="statn alert">450M</div><div class="statl">Europeans whose chats would be scanned</div></div>
+    <div class="stat"><div class="statn">0</div><div class="statl">Messages a backdoor can keep private</div></div>
+    <div class="stat"><div class="statn">1</div><div class="statl">Blocking minority needed in Council to stop it</div></div>
+  </div>
+</div>
+
+<section id="what">
+  <div class="wrap">
+    <p class="label">What is Chat Control?</p>
+    <h2>A backdoor on every phone, by law</h2>
+    <p class="body">Chat Control (the EU’s CSA Regulation) would require messaging apps to run <b>client-side scanning</b> — software on your own device that checks your messages against a government-linked database and reports matches, before end-to-end encryption is ever applied. It doesn’t break the lock on the door. It puts a camera inside the room.</p>
+    <div class="cards">
+      <div class="card">
+        <span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="5" y="10.5" width="14" height="10" rx="2.5"></rect><path d="M8 10.5V8a4 4 0 018 0v2.5"></path><path d="M12 14v3"></path></svg></span>
+        <h3>Scans before encryption</h3>
+        <p>Your messages are read on your device before they’re sealed. "End-to-end encrypted" becomes meaningless the moment scanning is inserted at the source.</p>
+      </div>
+      <div class="card">
+        <span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="11" cy="11" r="7"></circle><path d="M16 16l4 4"></path></svg></span>
+        <h3>Scope creep is built in</h3>
+        <p>A system that can match one kind of content can match any kind. The list of what’s reportable is a policy choice — one that can quietly expand.</p>
+      </div>
+      <div class="card">
+        <span class="ic"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 4l8 3v5c0 4.4-3 7.4-8 9-5-1.6-8-4.6-8-9V7z"></path><path d="M9.5 15.5l5-5M14.5 15.5l-5-5"></path></svg></span>
+        <h3>It makes everyone less safe</h3>
+        <p>A backdoor can’t tell friend from foe. The same weakness that lets a government scan lets criminals and hostile states in too.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="action" id="act" style="padding-top:60px;">
+  <div class="wrap">
+    <p class="label">Take action — it works</p>
+    <h2>Three things you can do in the next 10 minutes</h2>
+    <p class="lede">Chat Control has been pushed back before by ordinary people calling their governments. Pressure on your national representatives in the EU Council is what stops it.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="stepn">01</div>
+        <h3>Contact your reps</h3>
+        <p>fightchatcontrol.eu gives you the exact phone numbers and a script for your country’s ministers. A two-minute call counts more than any petition.</p>
+        <a class="btn alert" href="https://fightchatcontrol.eu/" target="_blank" rel="noopener">Open fightchatcontrol.eu ↗</a>
+      </div>
+      <div class="step">
+        <div class="stepn">02</div>
+        <h3>Spread the word</h3>
+        <p>Most people have never heard of this. Share what it does in plain language — group chats, family, coworkers. Silence is how it passes.</p>
+        <a class="btn ghost" href="Sonar Blog.html#chat-control-back-door">Read &amp; share the explainer</a>
+      </div>
+      <div class="step">
+        <div class="stepn">03</div>
+        <h3>Use tools they can’t scan</h3>
+        <p>Move conversations to software that has nothing to hand over — no accounts, no servers, open source. Make surveillance-proof the default.</p>
+        <a class="btn cyan" href="Sonar Landing.html#download">Get Sonar</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="label">What’s at stake</p>
+    <h2>Who loses privacy first</h2>
+    <div class="stakes">
+      <div class="stake"><span class="x"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path d="M6 6l12 12M18 6L6 18"></path></svg></span><span><b>Journalists &amp; their sources</b> — confidential tips become scannable and reportable.</span></div>
+      <div class="stake"><span class="x"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path d="M6 6l12 12M18 6L6 18"></path></svg></span><span><b>Abuse survivors</b> — the private channels they rely on to seek help are exposed.</span></div>
+      <div class="stake"><span class="x"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path d="M6 6l12 12M18 6L6 18"></path></svg></span><span><b>Doctors &amp; patients</b> — medical conversations lose confidentiality by default.</span></div>
+      <div class="stake"><span class="x"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path d="M6 6l12 12M18 6L6 18"></path></svg></span><span><b>Activists &amp; dissidents</b> — organizing becomes visible to whoever controls the list.</span></div>
+      <div class="stake"><span class="x"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path d="M6 6l12 12M18 6L6 18"></path></svg></span><span><b>Every ordinary person</b> — your family photos, run through a matcher that makes mistakes.</span></div>
+      <div class="stake"><span class="x"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"><path d="M6 6l12 12M18 6L6 18"></path></svg></span><span><b>Businesses</b> — trade secrets and legal privilege, scanned on the device.</span></div>
+    </div>
+  </div>
+</section>
+
+<section class="action">
+  <div class="wrap">
+    <p class="label">Where it stands</p>
+    <div class="maprow">
+      <div class="countries" id="countries"></div>
+      <div class="maptext">
+        <h2>The Council vote is close</h2>
+        <p class="lede">The regulation needs a qualified majority in the EU Council. A handful of undecided governments will decide it — which is exactly why calls to national ministers matter right now.</p>
+        <a class="btn alert" href="https://fightchatcontrol.eu/" target="_blank" rel="noopener">See the live country tracker ↗</a>
+        <p class="herofine" style="margin-top:14px;">Positions shift week to week. fightchatcontrol.eu keeps the authoritative, up-to-date count.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="tools">
+  <div class="wrap">
+    <p class="label">Built to resist this</p>
+    <h2>Privacy that’s a property of the architecture</h2>
+    <p class="lede">The strongest answer to "hand over the messages" is having nothing to hand over. That’s the principle behind the tools we build.</p>
+    <div class="tools">
+      <div class="tool">
+        <div class="th"><img class="tm" src="sonar/brand/sonar-icon.png" alt=""><div><h3>Sonar</h3><div class="sub">Private messenger · mesh + Nostr</div></div></div>
+        <p>Messaging with no accounts, no phone numbers, and no servers to subpoena. Works offline over a Bluetooth mesh, and open source — so a scanner can’t hide in it.</p>
+        <ul>
+          <li>Nothing to compel: your identity is a key on your device</li>
+          <li>Client-side scanning is impossible to bolt on quietly</li>
+          <li>Works with no internet at all, phone-to-phone</li>
+        </ul>
+        <a class="btn cyan" href="Sonar Landing.html">Explore Sonar</a>
+      </div>
+      <div class="tool">
+        <div class="th"><span class="tm wn"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12c3-6 6-6 9 0s6 6 9 0"></path><path d="M3 17c3-5 6-5 9 0s6 5 9 0"></path></svg></span><div><h3>White Noise</h3><div class="sub">Identity-free messenger · Marmot Protocol</div></div></div>
+        <p>A secure, private messenger that’s lightning fast, scalable, and identity-free — built on open standards (Nostr, Blossom, MLS). Non-profit and community-driven, with no corporate servers to compel.</p>
+        <ul>
+          <li>End-to-end encrypted with forward secrecy &amp; post-compromise security</li>
+          <li>Distributed &amp; uncensorable — run your own relay in minutes</li>
+          <li>No phone number or email — your identity, your rules</li>
+        </ul>
+        <a class="btn ghost" href="https://www.whitenoise.chat/" target="_blank" rel="noopener">Visit whitenoise.chat ↗</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap">
+    <p class="label" style="color:var(--alert-deep)">The window is open now</p>
+    <h2>Don’t wait for it to pass to care about it.</h2>
+    <p class="lede">Chat Control has been stopped before, and it can be stopped again — but only while it’s still a vote and not yet a law. Make the call. Share the facts. Use tools that can’t betray you.</p>
+    <div class="heroctas">
+      <a class="btn alert" href="https://fightchatcontrol.eu/" target="_blank" rel="noopener">Contact your reps now ↗</a>
+      <a class="btn cyan" href="Sonar Landing.html#download">Get Sonar</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="footin">
+      <a class="footbrand" href="Sonar Landing.html"><img src="sonar/brand/sonar-icon.png" alt="">Sonar &amp; White Noise</a>
+      <span>Action tool by <a href="https://fightchatcontrol.eu/" target="_blank" rel="noopener">fightchatcontrol.eu</a> · Learn more at <a href="https://edri.org/" target="_blank" rel="noopener">EDRi</a></span>
+    </div>
+    <p class="disc">This page is an independent informational campaign. It is not affiliated with the European Union. Country positions and vote status change frequently — always check fightchatcontrol.eu for the current, authoritative figures before acting.</p>
+  </div>
+</footer>
+
+<script>
+  var COUNTRIES = [
+    ['Germany','undecided','Undecided'], ['France','for','Supports'], ['Poland','against','Opposes'],
+    ['Netherlands','undecided','Undecided'], ['Austria','against','Opposes'], ['Italy','undecided','Undecided'],
+    ['Spain','for','Supports'], ['Belgium','undecided','Undecided'], ['Finland','against','Opposes']
+  ];
+  document.getElementById('countries').innerHTML = COUNTRIES.map(function(c){
+    return '<div class="country"><span class="cn">'+c[0]+'</span><span class="cstat '+c[1]+'">'+c[2]+'</span></div>';
+  }).join('');
+</script>
+</body>
+</html>

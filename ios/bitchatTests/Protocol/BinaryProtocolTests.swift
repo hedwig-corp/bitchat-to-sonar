@@ -462,6 +462,27 @@ struct BinaryProtocolTests {
         #expect(decoded.messageID == "call-offer")
         #expect(decoded.content == content)
     }
+
+    @Test func privateMessagePacketSkipsUnknownTlv() throws {
+        let packet = PrivateMessagePacket(messageID: "m1", content: "hello")
+        var encoded = try #require(packet.encode())
+        encoded.append(0x10)
+        encoded.append(3)
+        encoded.append(contentsOf: [0xAA, 0xBB, 0xCC])
+        let decoded = try #require(PrivateMessagePacket.decode(from: encoded))
+        #expect(decoded.messageID == "m1")
+        #expect(decoded.content == "hello")
+        #expect(decoded.replyTo == nil)
+    }
+
+    @Test func privateMessagePacketReplyToRoundTrip() throws {
+        let packet = PrivateMessagePacket(messageID: "child", content: "ok", replyTo: "parent-mid")
+        let encoded = try #require(packet.encode())
+        let decoded = try #require(PrivateMessagePacket.decode(from: encoded))
+        #expect(decoded.messageID == "child")
+        #expect(decoded.content == "ok")
+        #expect(decoded.replyTo == "parent-mid")
+    }
     
     @Test func messageWithMentions() throws {
         let mentions = [TestConstants.testNickname2, TestConstants.testNickname3]

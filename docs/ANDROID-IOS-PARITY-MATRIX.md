@@ -131,6 +131,7 @@ Slice-5 verification against current code:
 | Multi-item media model | single picker | `List<SonarMedia>` | PARITY | — | Compose structurally ahead |
 | Cleanup on exit paths | `onDisappear` chains | `cleanupPreviewTempFiles()` `App.kt:2333,2344` | PARITY | — | |
 | Stickers send/receive/pack install | composer + views | `StickerBubble`/`StickerPackPreviewSheet` | PARITY | — | |
+| **Reply-to-message (Signal quote chip)** | `SNReplyChrome` + `sendTextReply` NIP-C7 | `ReplyDecorated` + `SonarCore.sendReply` NIP-C7 | PARITY | — | Marmot kind-9 `q`+nevent; display body stripped in `to_chat_message`. Mesh TLV 0x04 skip-unknown is lockstep; BLE encode of `replyTo` and geohash `q` host wiring are follow-ups. Kill-switch `SONAR_REPLY_UI=0` hides chips/banner, strip stays. |
 | Settings screens (appearance, wallet, notifications, export key, erase, wipe, about) | full | full | PARITY | — | Compose ahead on app-lock/app-icon/data-storage rows (iOS hides, no backend) |
 | Profile nickname/QR/npub share | `SonarProfileScreen.swift:54-120` | `SonarProfileScreen.kt:75` (+ QR presence to verify) | PARITY | S | Spot-verify Compose QR share |
 | Search/start affordances (invite links, shared text, npub, geohash) | app-level invite handling | search-sheet + queued handlers `App.kt:103-132` | PARTIAL | M | Flows differ; align or document |

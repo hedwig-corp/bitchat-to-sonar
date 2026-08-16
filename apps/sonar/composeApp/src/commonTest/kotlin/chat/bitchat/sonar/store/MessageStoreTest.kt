@@ -3,6 +3,7 @@ package chat.bitchat.sonar.store
 import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.SonarMedia
 import chat.bitchat.sonar.SonarMsg
+import chat.bitchat.sonar.SonarReplyRef
 import chat.bitchat.sonar.SonarStickerRef
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -136,6 +137,24 @@ class MessageCodecTest {
         assertEquals(msgs, decoded)
         assertEquals(media.caption, decoded[0].media.single().caption)
         assertNull(decoded[1].media.single().caption)
+    }
+
+    @Test fun dmRoundTripWithReplySnapshot() {
+        val reply = SonarReplyRef(
+            parentId = "parent-mid",
+            parentNpub = "npub1peer",
+            author = "morningstatic",
+            preview = "see you at 9\twith|pipes",
+        )
+        val msgs = listOf(
+            SonarMsg("parent-mid", "npub1peer", "see you at 9", mine = false, tsSecs = 1),
+            SonarMsg("child", "", "ok", mine = true, tsSecs = 2, reply = reply),
+            SonarMsg("plain", "", "later", mine = true, tsSecs = 3),
+        )
+        val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(msgs))
+        assertEquals(msgs, decoded)
+        assertEquals(reply, decoded[1].reply)
+        assertEquals(null, decoded[2].reply)
     }
 
     @Test fun dmDecodeToleratesPreCaptionEnvelopes() {

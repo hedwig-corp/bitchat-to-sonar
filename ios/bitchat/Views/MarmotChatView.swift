@@ -3793,6 +3793,7 @@ final class MarmotChatModel: ObservableObject {
     func send(
         _ text: String,
         to groupId: String,
+        reply: MarmotService.MarmotReplyRef? = nil,
         onEchoVisible: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
@@ -3805,7 +3806,8 @@ final class MarmotChatModel: ObservableObject {
             content: trimmed,
             createdAt: Date(),
             isMine: true,
-            media: []
+            media: [],
+            reply: reply
         )
         appendOptimistic(echo, to: groupId)
         onEchoVisible?()
@@ -3822,7 +3824,7 @@ final class MarmotChatModel: ObservableObject {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await self.service.sendText(groupId: groupId, text: trimmed)
+                try await self.publishText(trimmed, to: groupId, reply: reply)
             } catch {
                 self.discardOptimistic(id: echo.id, from: groupId)
                 onFailure?()
@@ -3835,7 +3837,34 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func send(_ texts: [String], to groupId: String) async -> Bool {
+    /// Publish one kind-9 rumor, attaching NIP-C7 when the parent id is a
+    /// real event hex and we have the author's npub.
+    private func publishText(
+        _ text: String,
+        to groupId: String,
+        reply: MarmotService.MarmotReplyRef?
+    ) async throws {
+        if let reply,
+           snCanEmitNipC7(parentId: reply.parentId, parentNpub: reply.parentNpub),
+           let npub = reply.parentNpub
+        {
+            try await service.sendTextReply(
+                groupId: groupId,
+                text: text,
+                replyToHex: reply.parentId,
+                replyToNpub: npub,
+                preview: reply.preview
+            )
+        } else {
+            try await service.sendText(groupId: groupId, text: text)
+        }
+    }
+
+    func send(
+        _ texts: [String],
+        to groupId: String,
+        reply: MarmotService.MarmotReplyRef? = nil
+    ) async -> Bool {
         let trimmed = texts
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -3844,12 +3873,13 @@ final class MarmotChatModel: ObservableObject {
         // Still paints a group optimistic — used when a pending-chat echo was
         // already transferred/removed. Mesh→WN flush uses `sendQueuedText`.
         var allOk = true
-        for text in trimmed {
+        for (index, text) in trimmed.enumerated() {
             // A batch spans multiple awaits, so an erase can begin between items.
             // Each iteration assigns a NEW sendChain tail, which a quiesce that
             // already snapshotted the chain would never see — so re-check here
             // instead of relying on the entry guard alone.
             guard !sendsSuspendedForAccountMutation, !Task.isCancelled else { return false }
+            let itemReply = index == 0 ? reply : nil
             var succeeded = false
             let echo = MarmotService.MarmotMessage(
                 id: Self.optimisticIDPrefix + UUID().uuidString,
@@ -3857,7 +3887,8 @@ final class MarmotChatModel: ObservableObject {
                 content: text,
                 createdAt: Date(),
                 isMine: true,
-                media: []
+                media: [],
+                reply: itemReply
             )
             appendOptimistic(echo, to: groupId)
             let previous = sendChain
@@ -3874,7 +3905,7 @@ final class MarmotChatModel: ObservableObject {
                         throw MarmotService.ServiceError.notConnected
                     }
                     guard self.isCurrentAccountWork(generation) else { return }
-                    try await self.service.sendText(groupId: groupId, text: text)
+                    try await self.publishText(text, to: groupId, reply: itemReply)
                     succeeded = true
                 } catch {
                     guard self.isCurrentAccountWork(generation) else { return }
@@ -3892,7 +3923,11 @@ final class MarmotChatModel: ObservableObject {
     /// Flush text that already owns a mesh/pending echo. Unlike `send(_:to:)`,
     /// this must not create a second optimistic row, and it reports the chain
     /// task's own success flag (Compose / `sendQueuedSticker` parity).
-    func sendQueuedText(groupId: String, text: String) async -> Bool {
+    func sendQueuedText(
+        groupId: String,
+        text: String,
+        reply: MarmotService.MarmotReplyRef? = nil
+    ) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !sendsSuspendedForAccountMutation else { return false }
         var succeeded = false
@@ -3910,7 +3945,7 @@ final class MarmotChatModel: ObservableObject {
                     throw MarmotService.ServiceError.notConnected
                 }
                 guard self.isCurrentAccountWork(generation) else { return }
-                try await self.service.sendText(groupId: groupId, text: trimmed)
+                try await self.publishText(trimmed, to: groupId, reply: reply)
                 succeeded = true
             } catch {
                 guard self.isCurrentAccountWork(generation) else { return }

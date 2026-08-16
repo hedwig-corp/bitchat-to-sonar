@@ -1666,6 +1666,7 @@ struct RawGeo {
     nickname: String,
     content: String,
     ts: u64,
+    reply_to: Option<String>,
 }
 
 /// One received geohash 1:1 DM (NIP-17 over the per-geohash identity).
@@ -1688,6 +1689,7 @@ struct RawDirectDm {
     sender: PublicKey,
     content: String,
     ts: u64,
+    reply_to: Option<String>,
 }
 
 type DirectDmBuf = Arc<Mutex<Vec<RawDirectDm>>>;
@@ -1699,6 +1701,7 @@ pub struct DirectDm {
     pub sender_pubkey: String,
     pub content: String,
     pub created_at: u64,
+    pub reply_to: Option<String>,
 }
 
 /// Live presence (kind-20001) per geohash channel: participant pubkey hex →
@@ -2216,6 +2219,8 @@ impl SonarClient {
                                 nickname,
                                 content: event.content.clone(),
                                 ts,
+                                reply_to: crate::reply::parse_quote_tag(event.tags.iter())
+                                    .map(|r| r.parent_id.to_hex()),
                             });
                         }
                     }
@@ -3482,6 +3487,15 @@ impl SonarClient {
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+        self.send_text_with_reply(group_id, text, None).await
+    }
+
+    pub async fn send_text_with_reply(
+        &self,
+        group_id: &GroupId,
+        text: &str,
+        reply: Option<&crate::reply::ReplyTo>,
+    ) -> Result<()> {
         let local_started = Instant::now();
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
@@ -3489,7 +3503,7 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_text_message(group_id, text)?
+                .create_and_process_text_message_with_reply(group_id, text, reply)?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -6686,6 +6700,7 @@ impl SonarClient {
                                     sender: unwrapped.sender,
                                     content: dm.content,
                                     ts: unwrapped.rumor.created_at.as_secs(),
+                                    reply_to: dm.reply_to,
                                 });
                             }
                             report.record_retryable(event.created_at.as_secs());
@@ -7312,6 +7327,7 @@ impl SonarClient {
                         content: r.content.clone(),
                         created_at: r.ts,
                         mine: r.mine,
+                        reply_to: None,
                     })
                     .collect()
             })
@@ -7331,6 +7347,7 @@ impl SonarClient {
         recipient_peer_id_hex: &str,
         message_id: &str,
         text: &str,
+        reply_to: Option<&str>,
     ) -> Result<()> {
         let recipient = PublicKey::parse(recipient_hex)?;
         let sender_peer_id = parse_mesh_id8_hex(sender_peer_id_hex, "sender peer id")?;
@@ -7339,6 +7356,10 @@ impl SonarClient {
         let msg = crate::mesh::PrivateMessage {
             message_id: message_id.to_string(),
             content: text.to_string(),
+            reply_to: reply_to
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         };
         let timestamp_ms = Timestamp::now().as_secs().saturating_mul(1000);
         let embedded = crate::mesh::encode_nip17_private_message_content(
@@ -7369,6 +7390,7 @@ impl SonarClient {
                 sender_pubkey: r.sender.to_hex(),
                 content: r.content,
                 created_at: r.ts,
+                reply_to: r.reply_to,
             })
             .collect();
         out.sort_by_key(|m| m.created_at);
@@ -7403,10 +7425,21 @@ impl SonarClient {
     /// identity's stable per-geohash ephemeral key, carrying the display
     /// nickname in an `n` tag.
     pub async fn send_geohash(&self, geohash: &str, text: &str, nickname: &str) -> Result<()> {
+        self.send_geohash_with_reply(geohash, text, nickname, None)
+            .await
+    }
+
+    pub async fn send_geohash_with_reply(
+        &self,
+        geohash: &str,
+        text: &str,
+        nickname: &str,
+        reply_to_hex: Option<&str>,
+    ) -> Result<()> {
         self.subscribe_geohash(geohash).await?;
         let secret = self.identity().keys().secret_key().to_secret_bytes();
         let geo = crate::geohash::derive_geohash_keys(&secret, geohash)?;
-        let tags = vec![
+        let mut tags = vec![
             Tag::custom(
                 TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::G)),
                 [geohash.to_string()],
@@ -7416,6 +7449,15 @@ impl SonarClient {
                 [nickname.to_string()],
             ),
         ];
+        if let Some(parent) = reply_to_hex.filter(|s| !s.is_empty()) {
+            let parent_id = EventId::from_hex(parent)
+                .map_err(|e| Error::InvalidInput(format!("reply_to: {e}")))?;
+            tags.push(Tag::from_standardized_without_cell(TagStandard::Quote {
+                event_id: parent_id,
+                relay_url: None,
+                public_key: None,
+            }));
+        }
         let event = EventBuilder::new(Kind::Custom(20000), text)
             .tags(tags)
             .sign_with_keys(&geo)?;
@@ -7443,6 +7485,9 @@ impl SonarClient {
                     nickname: nickname.to_string(),
                     content: text.to_string(),
                     ts,
+                    reply_to: reply_to_hex
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string()),
                 });
             }
         }
@@ -7527,6 +7572,7 @@ impl SonarClient {
                         content: r.content.clone(),
                         created_at: r.ts,
                         mine: r.pubkey == my_pk,
+                        reply_to: r.reply_to.clone(),
                     })
                     .collect()
             })
@@ -8380,6 +8426,7 @@ mod tests {
             media: vec![],
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of(content),
+            reply: None,
         };
 
         client.upsert_index_for_message(&incoming(1, 100, "hey"), Some("Chat"));
@@ -8447,6 +8494,7 @@ mod tests {
             media: vec![],
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("hey"),
+            reply: None,
         };
 
         client.upsert_index_for_message(&msg(1, 100, false), Some("Chat"));
@@ -8475,6 +8523,7 @@ mod tests {
             media: vec![],
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
+            reply: None,
         };
         // Bot/agent JSON payloads preview as a label, never raw JSON.
         assert_eq!(index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")), "JSON payload");
@@ -8506,6 +8555,7 @@ mod tests {
             media,
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
+            reply: None,
         };
         // Caption/text always wins.
         assert_eq!(

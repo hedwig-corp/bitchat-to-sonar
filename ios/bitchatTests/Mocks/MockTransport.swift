@@ -120,7 +120,7 @@ final class MockTransport: Transport {
         sentMessages.append((content, mentions, messageID, timestamp))
     }
 
-    func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
+    func sendPrivateMessage(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String, replyTo: String?) {
         sentPrivateMessages.append((content, peerID, recipientNickname, messageID))
     }
 

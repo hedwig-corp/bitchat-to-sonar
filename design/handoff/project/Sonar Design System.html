@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sonar — Design System</title>
+<link rel="icon" href="sonar/brand/favicon.ico" sizes="any">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=IBM+Plex+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+  /* ===== SONAR DESIGN TOKENS (dark-first, the product default) ===== */
+  :root {
+    --bg: #060809; --panel: #0C1013; --surface: #15191C; --surface2: #1F2529;
+    --text: #EFF3F4; --text2: #9AA6AB; --text3: #657177;
+    --hairline: rgba(255,255,255,0.09); --hairline2: rgba(255,255,255,0.05); --press: rgba(255,255,255,0.07);
+    --accent: #22D3EE; --accent-deep: #67E2F4; --accent-fill: #1FC0DE; --on-accent: #04222B; --accent-soft: rgba(34,211,238,0.15);
+    --net: #7B79F7; --net-deep: #A5A3FA; --net-fill: #5E5CE6; --on-net: #F2F2FF; --net-soft: rgba(123,121,247,0.18);
+    --green: #41BC76; --green-deep: #84DCAA; --green-soft: rgba(65,188,118,0.17);
+    --danger: #F16A6A;
+    --gold: #F0B03A; --gold-fill: #F0B03A; --on-gold: #241500; --gold-soft: rgba(240,176,58,0.16); --gold-deep: #F5C56B;
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+    --r: 18px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Figtree', system-ui, sans-serif; -webkit-font-smoothing: antialiased; line-height: 1.6; }
+  a { color: var(--accent-deep); text-decoration: none; }
+
+  nav { position: sticky; top: 0; z-index: 40; height: 60px; background: rgba(6,8,9,0.85); backdrop-filter: blur(12px); border-bottom: 1px solid var(--hairline); }
+  .navin { display: flex; align-items: center; gap: 14px; height: 100%; padding: 0 24px; max-width: 1180px; margin: 0 auto; }
+  .wm { display: flex; align-items: center; gap: 9px; font-size: 19px; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }
+  .wm img { width: 27px; height: 27px; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--hairline); }
+  .wm .tag { font-size: 12px; font-weight: 600; color: var(--text3); background: var(--panel); border-radius: 6px; padding: 2px 8px; }
+  .sp { flex: 1; }
+  .navlink { font-size: 13.5px; font-weight: 650; color: var(--text2); padding: 8px 13px; border-radius: 999px; }
+  .navlink:hover { color: var(--text); background: var(--hairline2); }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
+  header.hero { padding: 60px 0 34px; border-bottom: 1px solid var(--hairline); }
+  .eyebrow { font-family: var(--mono); font-size: 12.5px; color: var(--accent-deep); letter-spacing: 0.05em; margin-bottom: 14px; }
+  h1 { font-size: clamp(34px, 5vw, 52px); font-weight: 800; letter-spacing: -0.03em; line-height: 1.05; margin: 0 0 14px; }
+  .lede { font-size: 18px; color: var(--text2); max-width: 62ch; margin: 0; }
+  .heropills { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 22px; }
+  .hp { font-size: 12.5px; font-weight: 650; padding: 5px 12px; border-radius: 999px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--hairline); color: var(--text2); }
+
+  section { padding: 46px 0; border-bottom: 1px solid var(--hairline); }
+  .sechead { display: flex; align-items: baseline; gap: 12px; margin-bottom: 6px; }
+  .secnum { font-family: var(--mono); font-size: 13px; color: var(--text3); }
+  h2 { font-size: 26px; font-weight: 750; letter-spacing: -0.02em; margin: 0; }
+  .secsub { font-size: 15px; color: var(--text2); margin: 4px 0 26px; max-width: 64ch; }
+
+  /* color swatches */
+  .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 14px; }
+  .swgroup-title { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text3); margin: 26px 0 12px; }
+  .sw { border: 1px solid var(--hairline); border-radius: 14px; overflow: hidden; background: var(--surface); cursor: pointer; transition: transform 0.12s; }
+  .sw:hover { transform: translateY(-2px); }
+  .sw .chip { height: 76px; display: flex; align-items: flex-end; justify-content: flex-end; padding: 8px; }
+  .sw .meta { padding: 9px 11px 11px; }
+  .sw .nm { font-size: 13px; font-weight: 700; }
+  .sw .hex { font-family: var(--mono); font-size: 11.5px; color: var(--text3); margin-top: 1px; text-transform: uppercase; }
+  .sw .role { font-size: 11px; color: var(--text3); margin-top: 3px; line-height: 1.3; }
+  .copied { font-size: 10px; font-weight: 700; color: #fff; background: rgba(0,0,0,0.35); border-radius: 5px; padding: 2px 6px; opacity: 0; transition: opacity 0.15s; }
+  .sw.on .copied { opacity: 1; }
+
+  /* type scale */
+  .typerow { display: flex; align-items: baseline; gap: 20px; padding: 14px 0; border-top: 1px solid var(--hairline2); }
+  .typerow:first-child { border-top: none; }
+  .typerow .spec { flex: none; width: 150px; font-family: var(--mono); font-size: 12px; color: var(--text3); }
+  .typerow .sample { min-width: 0; }
+  .mono-sample { font-family: var(--mono); }
+
+  /* generic card grid */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 16px; }
+  .card { background: var(--surface); border: 1px solid var(--hairline); border-radius: 16px; padding: 18px; }
+  .card h4 { margin: 0 0 4px; font-size: 15px; font-weight: 700; }
+  .card p { margin: 0; font-size: 13px; color: var(--text2); }
+  .demo { background: var(--panel); border: 1px solid var(--hairline); border-radius: 16px; padding: 22px; display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  .demo.col { flex-direction: column; align-items: stretch; }
+  .lbl { font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text3); margin: 22px 0 10px; }
+
+  /* ==== live component styles (lifted from the product) ==== */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: none; border-radius: 16px; font-family: inherit; font-weight: 700; font-size: 15px; padding: 13px 20px; cursor: pointer; }
+  .btn.primary { background: var(--accent-fill); color: var(--on-accent); }
+  .btn.net { background: var(--net-fill); color: var(--on-net); }
+  .btn.gold { background: var(--gold-fill); color: var(--on-gold); }
+  .btn.ghost { background: transparent; color: var(--text2); box-shadow: inset 0 0 0 1px var(--hairline); }
+  .btn.danger { background: var(--danger); color: #2a0808; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px; background: var(--surface2); font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .dot.g { background: var(--green); } .dot.a { background: var(--accent); }
+  .chip-status { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 999px; background: var(--surface); box-shadow: 0 1px 3px rgba(0,0,0,0.2), inset 0 0 0 1px var(--hairline); font-size: 13px; color: var(--text2); }
+  .chip-status b { color: var(--text); }
+
+  .bubble { max-width: 78%; padding: 9px 13px; border-radius: var(--r); font-size: 15.5px; line-height: 1.4; }
+  .bubble .meta { font-size: 10.5px; opacity: 0.72; margin-left: 8px; }
+  .bubble.them { background: var(--surface2); border-bottom-left-radius: 5px; align-self: flex-start; }
+  .bubble.ble { background: var(--accent-fill); color: var(--on-accent); border-bottom-right-radius: 5px; align-self: flex-end; }
+  .bubble.net { background: var(--net-fill); color: var(--on-net); border-bottom-right-radius: 5px; align-self: flex-end; }
+  .bubble.pay { background: var(--gold-fill); color: var(--on-gold); display: flex; align-items: center; gap: 11px; align-self: flex-end; min-width: 200px; }
+  .pay-coin { width: 38px; height: 38px; border-radius: 50%; background: rgba(0,0,0,0.16); display: flex; align-items: center; justify-content: center; font-size: 19px; font-weight: 800; }
+  .pay-amt { font-size: 18px; font-weight: 800; } .pay-amt small { font-size: 11px; opacity: 0.7; }
+  .pay-fiat { font-size: 11px; opacity: 0.72; }
+
+  .av { border-radius: 50%; display: block; }
+  .supporter { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; color: #fff; background: linear-gradient(135deg, var(--gold-fill), #E0941C); }
+  .presence { width: 13px; height: 13px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 2.5px var(--bg); }
+
+  .banner { display: flex; align-items: center; gap: 9px; padding: 10px 13px; border-radius: 13px; font-size: 13px; }
+  .banner.enc { background: var(--green-soft); color: var(--green-deep); }
+  .banner.net { background: var(--net-soft); color: var(--net-deep); }
+  .banner.pub { background: var(--accent-soft); color: var(--accent-deep); }
+  .banner b { font-weight: 700; }
+
+  .radii { display: flex; gap: 16px; flex-wrap: wrap; }
+  .radii .r { text-align: center; }
+  .radii .box { width: 84px; height: 60px; background: var(--surface2); box-shadow: inset 0 0 0 1px var(--hairline); }
+  .radii .cap { font-family: var(--mono); font-size: 11px; color: var(--text3); margin-top: 6px; }
+
+  .spacescale { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+  .spacescale .s { text-align: center; }
+  .spacescale .bar { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); width: 30px; border-radius: 4px; }
+  .spacescale .cap { font-family: var(--mono); font-size: 10.5px; color: var(--text3); margin-top: 6px; }
+
+  .iconwrap { display: grid; grid-template-columns: repeat(auto-fill, minmax(94px, 1fr)); gap: 10px; }
+  .ic { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 14px 6px; background: var(--surface); border: 1px solid var(--hairline); border-radius: 12px; color: var(--text); }
+  .ic span { font-family: var(--mono); font-size: 10.5px; color: var(--text3); }
+
+  code.tok { font-family: var(--mono); font-size: 0.86em; background: var(--panel); border: 1px solid var(--hairline); border-radius: 5px; padding: 1px 6px; color: var(--accent-deep); }
+  footer { padding: 40px 0 70px; color: var(--text3); font-size: 13px; }
+  @media (max-width: 640px) { .typerow { flex-direction: column; gap: 4px; } .typerow .spec { width: auto; } }
+</style>
+</head>
+<body>
+<template id="__bundler_thumbnail" data-bg-color="#060809">
+  <svg viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg">
+    <rect width="1200" height="800" fill="#060809"/>
+    <circle cx="600" cy="360" r="60" fill="none" stroke="#22D3EE" stroke-width="10" opacity="0.9"/>
+    <circle cx="600" cy="360" r="130" fill="none" stroke="#22D3EE" stroke-width="8" opacity="0.55"/>
+    <circle cx="600" cy="360" r="200" fill="none" stroke="#22D3EE" stroke-width="6" opacity="0.28"/>
+    <circle cx="600" cy="360" r="18" fill="#1FC0DE"/>
+    <rect x="470" y="520" width="120" height="40" rx="20" fill="#5E5CE6"/>
+    <rect x="610" y="520" width="120" height="40" rx="20" fill="#F0B03A"/>
+    <text x="600" y="640" font-family="system-ui,sans-serif" font-size="46" font-weight="800" fill="#EFF3F4" text-anchor="middle" letter-spacing="-1">sonar design</text>
+  </svg>
+</template>
+
+<nav><div class="navin">
+  <a class="wm" href="Sonar Landing.html"><img src="sonar/brand/sonar-icon.png" alt="">sonar<span class="tag">design</span></a>
+  <div class="sp"></div>
+  <a class="navlink" href="#color">Color</a>
+  <a class="navlink" href="#type">Type</a>
+  <a class="navlink" href="#components">Components</a>
+  <a class="navlink" href="Sonar Docs.html">Docs</a>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <div class="eyebrow">design system · v1</div>
+  <h1>The Sonar design system</h1>
+  <p class="lede">The tokens, type, color and components behind the Sonar apps. Calm, cool-neutral, dark-first — with two semantic accents that always mean the same thing: <b style="color:var(--accent)">cyan for nearby / Bluetooth</b> and <b style="color:var(--net-deep)">indigo for internet</b>, plus <b style="color:var(--gold)">gold reserved for money</b>.</p>
+  <div class="heropills">
+    <span class="hp">Dark-first, light supported</span>
+    <span class="hp">Figtree + IBM Plex Mono</span>
+    <span class="hp">Transport-colored UI</span>
+    <span class="hp">Click any swatch to copy</span>
+  </div>
+</div></header>
+
+<section id="principles"><div class="wrap">
+  <div class="sechead"><span class="secnum">01</span><h2>Principles</h2></div>
+  <p class="secsub">Every visual decision serves clarity and trust. The interface stays quiet so the meaningful signals stand out.</p>
+  <div class="cards">
+    <div class="card"><h4>Color carries meaning</h4><p>Accents aren't decoration. Cyan = reachable over Bluetooth, indigo = over the internet, gold = money, green = verified/online. Never mix these roles.</p></div>
+    <div class="card"><h4>Dark-first, calm surfaces</h4><p>Near-black cool neutrals, hairline borders, soft elevation. Light mode is a faithful mirror, not an afterthought.</p></div>
+    <div class="card"><h4>Monospace for truth</h4><p>Keys, fingerprints, geohashes and offers render in IBM Plex Mono — the technical bits look technical, everything else stays human.</p></div>
+    <div class="card"><h4>One radius language</h4><p>Bubbles, cards and sheets share a rounded, friendly radius scale. Tightened opposite-corner on chat bubbles gives direction.</p></div>
+  </div>
+</div></section>
+
+<section id="color"><div class="wrap">
+  <div class="sechead"><span class="secnum">02</span><h2>Color</h2></div>
+  <p class="secsub">Values shown are the dark-mode defaults. Click any swatch to copy its hex.</p>
+
+  <div class="swgroup-title">Surfaces &amp; text</div>
+  <div class="swatches" id="sw-neutral"></div>
+  <div class="swgroup-title">Accent · nearby / Bluetooth</div>
+  <div class="swatches" id="sw-accent"></div>
+  <div class="swgroup-title">Internet / Nostr</div>
+  <div class="swatches" id="sw-net"></div>
+  <div class="swgroup-title">Money · gold</div>
+  <div class="swatches" id="sw-gold"></div>
+  <div class="swgroup-title">Status · verified, online, danger</div>
+  <div class="swatches" id="sw-status"></div>
+</div></section>
+
+<section id="type"><div class="wrap">
+  <div class="sechead"><span class="secnum">03</span><h2>Typography</h2></div>
+  <p class="secsub"><b>Figtree</b> for all UI text; <b>IBM Plex Mono</b> reserved for keys, amounts and technical identifiers.</p>
+  <div class="typerow"><div class="spec">Display · 800 · -0.03em</div><div class="sample" style="font-size:40px;font-weight:800;letter-spacing:-0.03em;line-height:1.05">Sense who's nearby</div></div>
+  <div class="typerow"><div class="spec">Title · 800 · 27px</div><div class="sample" style="font-size:27px;font-weight:800;letter-spacing:-0.02em">Lugano · Centro</div></div>
+  <div class="typerow"><div class="spec">Heading · 750 · 23px</div><div class="sample" style="font-size:23px;font-weight:750">Group info</div></div>
+  <div class="typerow"><div class="spec">Row title · 650 · 16.5px</div><div class="sample" style="font-size:16.5px;font-weight:650">Maya</div></div>
+  <div class="typerow"><div class="spec">Body / bubble · 16px</div><div class="sample" style="font-size:16px">find me by the coffee table</div></div>
+  <div class="typerow"><div class="spec">Subtext · 14px · text2</div><div class="sample" style="font-size:14px;color:var(--text2)">End-to-end encrypted · Bluetooth</div></div>
+  <div class="typerow"><div class="spec">Caption · 12.5px · text3</div><div class="sample" style="font-size:12.5px;color:var(--text3)">2 weeks ago · on mesh</div></div>
+  <div class="typerow"><div class="spec">Mono · keys &amp; amounts</div><div class="sample mono-sample" style="font-size:13px;color:var(--text2)">npub1w4j8mc7…q4k9dj · a3f9 2c41 770e 5b2d</div></div>
+</div></section>
+
+<section id="foundations"><div class="wrap">
+  <div class="sechead"><span class="secnum">04</span><h2>Radius &amp; spacing</h2></div>
+  <p class="secsub">Corner radius scales from control to sheet. Spacing follows a soft 4-based rhythm.</p>
+  <div class="lbl">Corner radius</div>
+  <div class="radii">
+    <div class="r"><div class="box" style="border-radius:8px"></div><div class="cap">8 · chips</div></div>
+    <div class="r"><div class="box" style="border-radius:12px"></div><div class="cap">12 · fields</div></div>
+    <div class="r"><div class="box" style="border-radius:16px"></div><div class="cap">16 · buttons</div></div>
+    <div class="r"><div class="box" style="border-radius:18px"></div><div class="cap">18 · bubbles/cards</div></div>
+    <div class="r"><div class="box" style="border-radius:24px"></div><div class="cap">24 · sheets</div></div>
+    <div class="r"><div class="box" style="border-radius:50%"></div><div class="cap">full · avatars</div></div>
+  </div>
+  <div class="lbl">Spacing scale</div>
+  <div class="spacescale">
+    <div class="s"><div class="bar" style="height:4px"></div><div class="cap">4</div></div>
+    <div class="s"><div class="bar" style="height:8px"></div><div class="cap">8</div></div>
+    <div class="s"><div class="bar" style="height:12px"></div><div class="cap">12</div></div>
+    <div class="s"><div class="bar" style="height:16px"></div><div class="cap">16</div></div>
+    <div class="s"><div class="bar" style="height:22px"></div><div class="cap">22</div></div>
+    <div class="s"><div class="bar" style="height:32px"></div><div class="cap">32</div></div>
+  </div>
+</div></section>
+
+<section id="components"><div class="wrap">
+  <div class="sechead"><span class="secnum">05</span><h2>Components</h2></div>
+  <p class="secsub">The reusable parts, rendered live from the same tokens.</p>
+
+  <div class="lbl">Buttons</div>
+  <div class="demo">
+    <button class="btn primary">Send over Bluetooth</button>
+    <button class="btn net">Send over Lightning</button>
+    <button class="btn gold">Donate 21,000 sats</button>
+    <button class="btn ghost">Cancel</button>
+    <button class="btn danger">Wipe everything</button>
+  </div>
+
+  <div class="lbl">Status chips &amp; presence</div>
+  <div class="demo">
+    <span class="chip-status"><span class="dot g"></span><b>Online</b> · reaches anyone</span>
+    <span class="chip-status"><span class="dot a"></span><b>Offline</b> · 4 nearby on Bluetooth</span>
+    <span class="pill"><span class="dot g"></span>Verified</span>
+  </div>
+
+  <div class="lbl">Message bubbles — color encodes transport</div>
+  <div class="demo col">
+    <div class="bubble them">did you make it to the meetup?<span class="meta">18:02</span></div>
+    <div class="bubble ble">just got here — it's packed<span class="meta">18:04 · BT</span></div>
+    <div class="bubble net">home safe! same time next week?<span class="meta">22:31 · net</span></div>
+    <div class="bubble pay"><span class="pay-coin">₿</span><span><span class="pay-amt">5,000 <small>sats</small></span><br><span class="pay-fiat">€2.90 · claimed</span></span></div>
+  </div>
+
+  <div class="lbl">Avatars, presence &amp; supporter badge</div>
+  <div class="demo" id="avatars"></div>
+
+  <div class="lbl">Banners</div>
+  <div class="demo col">
+    <div class="banner enc"><b>End-to-end encrypted</b> — only you and Maya can read this</div>
+    <div class="banner net"><b>Out of Bluetooth range</b> — encrypted over the internet instead</div>
+    <div class="banner pub"><b>Public channel</b> — anyone nearby can read</div>
+  </div>
+</div></section>
+
+<section id="icons"><div class="wrap">
+  <div class="sechead"><span class="secnum">06</span><h2>Iconography</h2></div>
+  <p class="secsub">A single line set at 1.8–2.2 stroke weight, 24px grid, <code class="tok">currentColor</code>. A sample below.</p>
+  <div class="iconwrap" id="icons"></div>
+</div></section>
+
+<footer><div class="wrap">Sonar design system · extracted from the product theme · <a href="Sonar Docs.html">Docs</a> · <a href="Sonar Landing.html">Home</a></div></footer>
+
+<script>
+  // ── color data ──
+  var COLORS = {
+    'sw-neutral': [
+      ['bg', '#060809', 'app background'], ['panel', '#0C1013', 'raised background'],
+      ['surface', '#15191C', 'cards, rows'], ['surface2', '#1F2529', 'inputs, chips'],
+      ['text', '#EFF3F4', 'primary text'], ['text2', '#9AA6AB', 'secondary'],
+      ['text3', '#657177', 'muted / captions'], ['hairline', 'rgba(255,255,255,0.09)', 'borders']
+    ],
+    'sw-accent': [
+      ['accent', '#22D3EE', 'nearby / Bluetooth'], ['accent-deep', '#67E2F4', 'text on dark'],
+      ['accent-fill', '#1FC0DE', 'filled buttons'], ['on-accent', '#04222B', 'text on fill'],
+      ['accent-soft', 'rgba(34,211,238,0.15)', 'soft background']
+    ],
+    'sw-net': [
+      ['net', '#7B79F7', 'internet / Nostr'], ['net-deep', '#A5A3FA', 'text on dark'],
+      ['net-fill', '#5E5CE6', 'filled buttons'], ['on-net', '#F2F2FF', 'text on fill'],
+      ['net-soft', 'rgba(123,121,247,0.18)', 'soft background']
+    ],
+    'sw-gold': [
+      ['gold-fill', '#F0B03A', 'money / payments'], ['gold-deep', '#F5C56B', 'text on dark'],
+      ['on-gold', '#241500', 'text on fill'], ['gold-soft', 'rgba(240,176,58,0.16)', 'soft background']
+    ],
+    'sw-status': [
+      ['green', '#41BC76', 'verified / online'], ['green-deep', '#84DCAA', 'text on dark'],
+      ['green-soft', 'rgba(65,188,118,0.17)', 'soft background'], ['danger', '#F16A6A', 'wipe / errors']
+    ]
+  };
+  function lum(hex){ if(!/^#/.test(hex))return 0.2; var c=hex.slice(1); if(c.length===3)c=c.replace(/./g,'$&$&'); var r=parseInt(c.slice(0,2),16),g=parseInt(c.slice(2,4),16),b=parseInt(c.slice(4,6),16); return (0.299*r+0.587*g+0.114*b)/255; }
+  Object.keys(COLORS).forEach(function(gid){
+    var host = document.getElementById(gid);
+    COLORS[gid].forEach(function(c){
+      var el = document.createElement('div'); el.className = 'sw';
+      var dark = lum(c[1]) < 0.5;
+      el.innerHTML = '<div class="chip" style="background:'+c[1]+'"><span class="copied" style="color:'+(dark?'#fff':'#000')+'">copied</span></div>'+
+        '<div class="meta"><div class="nm">'+c[0]+'</div><div class="hex">'+c[1]+'</div><div class="role">'+c[2]+'</div></div>';
+      el.onclick = function(){ try{navigator.clipboard.writeText(c[1]);}catch(e){} el.classList.add('on'); setTimeout(function(){el.classList.remove('on');},900); };
+      host.appendChild(el);
+    });
+  });
+
+  // ── avatars (identicon like the app) ──
+  function bcHash(s){ var h=2166136261>>>0; for(var i=0;i<s.length;i++){ h=(h^s.charCodeAt(i))>>>0; h=Math.imul(h,16777619)>>>0; } return h; }
+  function identicon(name, size, opts){
+    opts = opts || {};
+    var h=bcHash(name), hue=h%360, lite='hsl('+hue+' 64% 70%)', liter='hsl('+hue+' 72% 82%)', cells='';
+    for(var r=0;r<5;r++)for(var c=0;c<3;c++){ if((h>>>(r*3+c))&1){ var f=((h>>>(r+c+4))&1)?lite:liter; cells+='<rect x="'+(8+c*10)+'" y="'+(8+r*10)+'" width="10" height="10" fill="'+f+'"/>'; if(c<2)cells+='<rect x="'+(8+(4-c)*10)+'" y="'+(8+r*10)+'" width="10" height="10" fill="'+f+'"/>'; } }
+    var wrap = document.createElement('div'); wrap.style.position='relative'; wrap.style.width=size+'px'; wrap.style.height=size+'px';
+    wrap.innerHTML = '<svg class="av" width="'+size+'" height="'+size+'" viewBox="0 0 66 66"><rect width="66" height="66" fill="hsl('+hue+' 40% 36%)"/>'+cells+'</svg>';
+    if(opts.presence){ var p=document.createElement('span'); p.className='presence'; p.style.position='absolute'; p.style.right='-1px'; p.style.bottom='-1px'; wrap.appendChild(p); }
+    if(opts.supporter){ var s=document.createElement('span'); s.className='supporter'; s.style.position='absolute'; s.style.right='-3px'; s.style.top='-3px'; s.innerHTML='<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M12 20.3 4.6 13a4.6 4.6 0 0 1 6.5-6.5l.9.9.9-.9A4.6 4.6 0 0 1 19.4 13z"/></svg>'; wrap.appendChild(s); }
+    return wrap;
+  }
+  var av = document.getElementById('avatars');
+  [['Maya',56,{presence:1,supporter:1}],['Luca',56,{presence:1}],['nettle',56,{supporter:1}],['Sofia',56,{}],['koi_',44,{presence:1}],['tomas',44,{}]].forEach(function(a){ av.appendChild(identicon(a[0],a[1],a[2])); });
+
+  // ── icons ──
+  var ICONS = {
+    lock:'<rect x="5.5" y="10.5" width="13" height="9.5" rx="2.6"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>',
+    mesh:'<circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/><path d="M8.7 8.7a4.7 4.7 0 0 0 0 6.6M15.3 8.7a4.7 4.7 0 0 1 0 6.6M6.2 6.2a8.2 8.2 0 0 0 0 11.6M17.8 6.2a8.2 8.2 0 0 1 0 11.6"/>',
+    globe:'<circle cx="12" cy="12" r="8.2"/><path d="M3.8 12h16.4M12 3.8c-2.7 2.5-4.1 5.2-4.1 8.2s1.4 5.7 4.1 8.2c2.7-2.5 4.1-5.2 4.1-8.2S14.7 6.3 12 3.8z"/>',
+    rings:'<circle cx="12" cy="12" r="2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="5.8"/><circle cx="12" cy="12" r="9.4"/>',
+    shieldCheck:'<path d="M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z"/><path d="M8.8 12.1l2.3 2.3 4.3-4.6"/>',
+    coin:'<circle cx="12" cy="12" r="8.4"/><path d="M9.9 8.2h3a1.9 1.9 0 0 1 0 3.8h-3zM9.9 12h3.5a1.9 1.9 0 0 1 0 3.8H9.9zM9.9 8.2V16M11.4 6.6v1.6M11.4 16v1.6"/>',
+    bolt:'<path d="M13 3 6 13.5h4.5L11 21l7-10.5h-4.5z"/>',
+    phone:'<path d="M6.5 4.5c-1 0-2 .9-2 2 0 7 6 13 13 13 1.1 0 2-1 2-2v-2.6c0-.5-.4-.9-.9-1l-3-.6c-.4-.1-.9.1-1.1.5l-1 1.6a11 11 0 0 1-5-5l1.6-1c.4-.2.6-.7.5-1.1l-.6-3c-.1-.5-.5-.9-1-.9z"/>',
+    videocam:'<rect x="3.5" y="6.5" width="12" height="11" rx="3"/><path d="M15.5 10.5l5-3v9l-5-3"/>',
+    heart:'<path d="M12 20.3 4.6 13a4.6 4.6 0 0 1 6.5-6.5l.9.9.9-.9A4.6 4.6 0 0 1 19.4 13z" fill="currentColor" stroke="none"/>',
+    nudge:'<path d="M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z"/><path d="M10 18.8a2.1 2.1 0 0 0 4 0"/>',
+    key:'<circle cx="8.5" cy="12" r="3.4"/><path d="M11.9 12h8M17 12v2.8M19.9 12v2"/>',
+    pin:'<path d="M12 20.8s-6.3-5.3-6.3-10.2a6.3 6.3 0 0 1 12.6 0c0 4.9-6.3 10.2-6.3 10.2z"/><circle cx="12" cy="10.4" r="2.2"/>',
+    people:'<circle cx="9" cy="8.4" r="3.1"/><path d="M3.6 19.4c.6-3.3 2.8-5 5.4-5s4.8 1.7 5.4 5"/><circle cx="16.8" cy="9.4" r="2.5"/><path d="M16.6 14.5c2.1.4 3.5 2 3.9 4.7"/>',
+    send:'<path d="M12 18.5v-13M6.5 11 12 5.5 17.5 11"/>',
+    link:'<path d="M10.2 13.8a4 4 0 0 1 0-3.6l1.2-.9M13.8 10.2a4 4 0 0 1 0 3.6l-1.2.9"/><path d="M9 16.2 6.5 18a3.2 3.2 0 0 1-1-4.4l2.2-3.4a3.2 3.2 0 0 1 4.4-1"/><path d="M15 7.8l2.5-1.8a3.2 3.2 0 0 1 1 4.4l-2.2 3.4a3.2 3.2 0 0 1-4.4 1"/>'
+  };
+  var ih = document.getElementById('icons');
+  Object.keys(ICONS).forEach(function(n){
+    var d = document.createElement('div'); d.className='ic';
+    d.innerHTML = '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">'+ICONS[n]+'</svg><span>'+n+'</span>';
+    ih.appendChild(d);
+  });
+</script>
+</body>
+</html>

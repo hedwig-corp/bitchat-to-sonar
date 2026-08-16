@@ -1,9 +1,13 @@
 package chat.bitchat.sonar
 
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -14,6 +18,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.clickable
@@ -33,10 +38,12 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
@@ -54,6 +61,10 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -70,13 +81,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -87,9 +105,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
@@ -99,7 +123,9 @@ import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.Placeholder
@@ -109,6 +135,14 @@ import chat.bitchat.sonar.resources.content_message_collapsed
 import chat.bitchat.sonar.resources.content_message_expanded
 import chat.bitchat.sonar.resources.content_message_show_less
 import chat.bitchat.sonar.resources.content_message_show_more
+import chat.bitchat.sonar.resources.chat_copy
+import chat.bitchat.sonar.resources.chat_reply
+import chat.bitchat.sonar.resources.chat_reply_cancel
+import chat.bitchat.sonar.resources.chat_reply_fallback
+import chat.bitchat.sonar.resources.chat_reply_payment
+import chat.bitchat.sonar.resources.chat_reply_photo
+import chat.bitchat.sonar.resources.chat_reply_sticker
+import chat.bitchat.sonar.resources.chat_reply_you
 import chat.bitchat.sonar.resources.sonar_icon
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.screens.shouldCloseEmojiTrayOnComposerFocus
@@ -141,7 +175,11 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.isSecondaryPressed
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /** Bridges Android activity foreground state into the commonMain UI without
@@ -1580,6 +1618,18 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         }
     }
 
+    // Quote tap after the transcript has already opened: the open-path
+    // LaunchedEffect above only runs while `didInitialScroll` is false.
+    LaunchedEffect(screen.id, state.openChatJumpMessageId[screen.id], feed.size, didInitialScroll) {
+        if (!didInitialScroll) return@LaunchedEffect
+        val jumpId = state.openChatJumpMessageId[screen.id] ?: return@LaunchedEffect
+        val jumpIdx = feed.indexOfFirst { transcriptFeedKey(it) == jumpId }
+        if (jumpIdx < 0) return@LaunchedEffect
+        val idx = chatFeedListIndexForFeedRow(listItems, jumpIdx).coerceAtLeast(0)
+        listState.scrollToItem(idx)
+        state.clearOpenChatJump(screen.id)
+    }
+
     // Load one local cursor page when the reader reaches the top. Capture a
     // stable visible message and pixel offset, then restore it after prepend so
     // the existing content does not jump under the reader's finger.
@@ -1723,6 +1773,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                     CallLogRow(item)
                                 } else {
                                     val m = item as SonarMsg
+                                    ReplyDecorated(
+                                        m,
+                                        chatId = screen.id,
+                                        state = state,
+                                        isGroup = isGroup,
+                                        peerName = peerName,
+                                    ) { resolvedReply ->
                                     val msgMesh = isMeshRoute && !m.viaInternet
                                     // Contiguity from adjacent feed message rows only.
                                     val prevMsg = prevAny as? SonarMsg
@@ -1785,7 +1842,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                                 Screen.ContactProfile(npub, state.contactTitle(npub))
                                             )
                                         },
+                                        reply = resolvedReply,
+                                        onJumpQuote = { state.jumpToQuotedMessage(screen.id, it) },
                                     )
+                                    }
                                 }
                             }
                         }
@@ -1804,6 +1864,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // still visible. One Column root keeps tray + composer vertically stacked
         // in both the legacy Column shell and the Phase-2 Box host.
         Column(Modifier.fillMaxWidth()) {
+            val pendingReply = state.composerReply(screen.id)
+            if (pendingReply != null) {
+                ComposerReplyBanner(
+                    reply = pendingReply,
+                    onCancel = { state.cancelReply(screen.id) },
+                )
+            }
             if (draft.startsWith("/")) SlashHints(draft) { state.setComposerDraft(screen.id, it) }
             MentionHints(mentionRoster, draft) { state.setComposerDraft(screen.id, it) }
             if (emojiTray && !recording) {
@@ -2603,7 +2670,20 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             LazyColumn(
                 Modifier.weight(1f).fillMaxWidth(), state = listState,
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
-            ) { items(state.messages, key = { it.id }) { m -> MessageBubble(m) } }
+            ) {
+                items(state.messages, key = { it.id }) { m ->
+                    ReplyDecorated(
+                        m,
+                        chatId = draftKey,
+                        state = state,
+                        isGroup = false,
+                        peerName = screen.name,
+                        enableReply = false,
+                    ) { resolvedReply ->
+                        MessageBubble(m, reply = resolvedReply)
+                    }
+                }
+            }
         }
         Row(
             Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
@@ -2642,8 +2722,594 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     }
 }
 
-/** Meta (time + via-transport icon) inline id — design .bc-meta. */
+/** Meta (time + via-transport icon) inline ids — design .bc-meta.
+ *  Alternate text is empty so Copy / selection never pick up the clock. */
+private const val BUBBLE_META_TIME = "sn.meta.time"
 private const val BUBBLE_META_ICON = "sn.meta.via"
+
+// Signal-Android ConversationItem: shrink after 100 ms, to 95%, while the
+// platform owns long-press timeout, touch slop, cancellation and initial haptic.
+internal const val SONAR_MESSAGE_PRESS_SCALE_DELAY_MS = 100L
+internal const val SONAR_MESSAGE_PRESS_SCALE_FACTOR = 0.95f
+
+internal fun sonarMessagePressScale(
+    pressed: Boolean,
+    menuOpen: Boolean,
+    delayElapsed: Boolean,
+): Float = if (menuOpen || (pressed && delayElapsed)) SONAR_MESSAGE_PRESS_SCALE_FACTOR else 1f
+
+internal fun sonarMessageMenuTopPx(
+    anchorTopPx: Float,
+    overlayHeightPx: Int,
+    viewportHeightPx: Int,
+    paddingPx: Float,
+): Float {
+    val maxTop = (viewportHeightPx - overlayHeightPx).toFloat() - paddingPx
+    return anchorTopPx.coerceIn(paddingPx, maxOf(paddingPx, maxTop))
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ReplyDecorated(
+    m: SonarMsg,
+    chatId: String,
+    state: SonarAppState,
+    isGroup: Boolean,
+    peerName: String,
+    enableReply: Boolean = true,
+    content: @Composable (SonarReplyRef?) -> Unit,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val replyPreview = when {
+        m.classification is SonarMsgClass.PayReceipt -> stringResource(Res.string.chat_reply_payment)
+        m.stickerRef != null -> stringResource(Res.string.chat_reply_sticker)
+        m.media.isNotEmpty() -> stringResource(Res.string.chat_reply_photo)
+        else -> m.content.trim()
+    }.ifBlank { stringResource(Res.string.chat_reply_fallback) }.take(140)
+    val youLabel = stringResource(Res.string.chat_reply_you)
+    val canReply = enableReply && sonarCanReply(m)
+    val copyText = sonarCopyableText(m)
+    val showActions = canReply || copyText != null
+    var menuOpen by remember(m.id) { mutableStateOf(false) }
+    var anchorTopPx by remember(m.id) { mutableStateOf(0f) }
+    val isPressed by interaction.collectIsPressedAsState()
+    var pressDelayElapsed by remember(m.id) { mutableStateOf(false) }
+    LaunchedEffect(isPressed, menuOpen, m.id) {
+        if (menuOpen) {
+            pressDelayElapsed = true
+        } else if (isPressed) {
+            kotlinx.coroutines.delay(SONAR_MESSAGE_PRESS_SCALE_DELAY_MS)
+            pressDelayElapsed = true
+        } else {
+            pressDelayElapsed = false
+        }
+    }
+    val messageScale by animateFloatAsState(
+        sonarMessagePressScale(isPressed, menuOpen, pressDelayElapsed),
+        animationSpec = tween(durationMillis = 100),
+        label = "message-long-press-scale",
+    )
+    val clipboard = LocalClipboardManager.current
+    val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
+    val layoutDirection = LocalLayoutDirection.current
+    val triggerPx = with(density) { SONAR_SWIPE_REPLY_TRIGGER_DP.dp.toPx() }
+    val maxPx = with(density) { SONAR_SWIPE_REPLY_MAX_DP.dp.toPx() }
+    val iconTravelPx = with(density) { 10.dp.toPx() }
+    val edgeGuardPx = with(density) { 24.dp.toPx() }
+    val offsetPx = remember(m.id) { mutableStateOf(0f) }
+    val scope = rememberCoroutineScope()
+    val armReply = rememberUpdatedState {
+        val author = if (m.mine) youLabel else state.groupAuthorName(m, isGroup) ?: peerName
+        state.beginReply(chatId, m, replyPreview, author)
+    }
+    val replyActionLabel = stringResource(Res.string.chat_reply)
+    val copyActionLabel = stringResource(Res.string.chat_copy)
+    val accessibilityActions = buildList {
+        if (canReply) {
+            add(CustomAccessibilityAction(replyActionLabel) {
+                armReply.value()
+                true
+            })
+        }
+        if (copyText != null) {
+            add(CustomAccessibilityAction(copyActionLabel) {
+                clipboard.setText(AnnotatedString(copyText))
+                true
+            })
+        }
+    }
+    val progress = sonarSwipeReplyProgress(abs(offsetPx.value), triggerPx)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .onGloballyPositioned { anchorTopPx = it.boundsInWindow().top }
+            .semantics { customActions = accessibilityActions }
+            .combinedClickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = {},
+                onLongClick = {
+                    if (showActions) {
+                        menuOpen = true
+                    }
+                },
+            )
+            .pointerInput(showActions, m.id) {
+                if (!showActions) return@pointerInput
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.type == PointerEventType.Press && event.buttons.isSecondaryPressed) {
+                            menuOpen = true
+                        }
+                    }
+                }
+            }
+            .pointerInput(canReply, m.id, m.mine, triggerPx, maxPx, edgeGuardPx, layoutDirection) {
+                if (!canReply) return@pointerInput
+                val ltr = layoutDirection == LayoutDirection.Ltr
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    if (!sonarSwipeReplyAllowsStart(down.position.x, size.width.toFloat(), m.mine, edgeGuardPx, ltr)) {
+                        return@awaitEachGesture
+                    }
+                    var rawDx = 0f
+                    var accepted = false
+                    var armed = false
+                    val slop = viewConfiguration.touchSlop
+                    val pointerId = down.id
+                    var totalDx = 0f
+                    var totalDy = 0f
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == pointerId } ?: break
+                        if (change.changedToUpIgnoreConsumed()) break
+                        val dx = change.positionChange().x
+                        val dy = change.positionChange().y
+                        if (!accepted) {
+                            totalDx += dx
+                            totalDy += dy
+                            if (abs(totalDx) < slop && abs(totalDy) < slop) continue
+                            val towardReply = if (ltr) totalDx > 0f else totalDx < 0f
+                            if (!towardReply || abs(totalDy) > abs(totalDx)) {
+                                return@awaitEachGesture
+                            }
+                            accepted = true
+                            menuOpen = false
+                            rawDx = abs(totalDx)
+                            change.consume()
+                        } else {
+                            val delta = if (ltr) dx else -dx
+                            rawDx = (rawDx + delta).coerceAtLeast(0f)
+                            change.consume()
+                        }
+                        offsetPx.value = sonarSwipeReplySignedOffset(
+                            sonarSwipeReplyBubbleOffset(rawDx, triggerPx, maxPx),
+                            ltr,
+                        )
+                        if (!armed && sonarSwipeReplyTriggered(rawDx, triggerPx)) {
+                            armed = true
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                    }
+                    val triggered = accepted && sonarSwipeReplyTriggered(rawDx, triggerPx)
+                    val start = offsetPx.value
+                    scope.launch {
+                        val anim = Animatable(start)
+                        anim.animateTo(0f, spring(stiffness = Spring.StiffnessMedium)) {
+                            offsetPx.value = value
+                        }
+                    }
+                    if (triggered) armReply.value()
+                }
+            },
+        horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start,
+    ) {
+        val reply = m.reply
+        val resolvedReply = if (sonarReplyUiEnabled() && reply != null) {
+            val fallback = stringResource(Res.string.chat_reply_fallback)
+            val parent = state.messages.firstOrNull { it.id.equals(reply.parentId, ignoreCase = true) }
+            val paymentLabel = stringResource(Res.string.chat_reply_payment)
+            val photoLabel = stringResource(Res.string.chat_reply_photo)
+            val stickerLabel = stringResource(Res.string.chat_reply_sticker)
+            val typed = parent?.let {
+                sonarTypedReplyPreview(
+                    it.classification,
+                    it.stickerRef != null,
+                    it.media.isNotEmpty(),
+                    paymentLabel,
+                    photoLabel,
+                    stickerLabel,
+                )
+            }
+            reply.copy(
+                author = reply.author ?: parent?.let {
+                    if (it.mine) youLabel else state.groupAuthorName(it, isGroup) ?: peerName
+                },
+                preview = sonarResolvedReplyPreview(reply, parent?.content, fallback, typed),
+            )
+        } else null
+        Box {
+            if (canReply && progress > 0.05f) {
+                Box(
+                    Modifier
+                        .align(if (layoutDirection == LayoutDirection.Ltr) Alignment.CenterStart else Alignment.CenterEnd)
+                        .padding(
+                            start = if (layoutDirection == LayoutDirection.Ltr) 8.dp else 0.dp,
+                            end = if (layoutDirection == LayoutDirection.Ltr) 0.dp else 8.dp,
+                        )
+                        .graphicsLayer {
+                            alpha = progress
+                            val scale = 1f + 0.2f * progress
+                            scaleX = scale
+                            scaleY = scale
+                            val dir = if (layoutDirection == LayoutDirection.Ltr) 1f else -1f
+                            translationX = dir * iconTravelPx * progress
+                        },
+                ) {
+                    SNIcon(SNIconName.Reply, 18.dp, sonar.accent, weight = 2.1f)
+                }
+            }
+            Box(
+                Modifier
+                    .graphicsLayer {
+                        scaleX = messageScale
+                        scaleY = messageScale
+                        alpha = if (menuOpen) 0f else 1f
+                    }
+                    .offset { IntOffset(offsetPx.value.roundToInt(), 0) },
+            ) {
+                content(resolvedReply)
+            }
+            SonarMessageActionSheet(
+                expanded = menuOpen,
+                mine = m.mine,
+                canReply = canReply,
+                copyLabel = copyText != null,
+                onDismiss = { menuOpen = false },
+                onReply = {
+                    menuOpen = false
+                    armReply.value()
+                },
+                onCopy = copyText?.let { text ->
+                    {
+                        clipboard.setText(AnnotatedString(text))
+                        menuOpen = false
+                    }
+                },
+                preview = { content(resolvedReply) },
+                anchorTopPx = anchorTopPx,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SonarMessageActionSheet(
+    expanded: Boolean,
+    mine: Boolean,
+    canReply: Boolean,
+    copyLabel: Boolean,
+    onDismiss: () -> Unit,
+    onReply: () -> Unit,
+    onCopy: (() -> Unit)?,
+    preview: @Composable () -> Unit,
+    anchorTopPx: Float,
+) {
+    if (!expanded) return
+    val s = sonar
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            dismissOnBackPress = true,
+            dismissOnClickOutside = true,
+            usePlatformDefaultWidth = false,
+        ),
+    ) {
+        var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+        var overlaySize by remember { mutableStateOf(IntSize.Zero) }
+        val paddingPx = with(LocalDensity.current) { 16.dp.toPx() }
+        val overlayTop = sonarMessageMenuTopPx(
+            anchorTopPx = anchorTopPx,
+            overlayHeightPx = overlaySize.height,
+            viewportHeightPx = viewportSize.height,
+            paddingPx = paddingPx,
+        )
+        Box(
+            Modifier
+                .fillMaxSize()
+                .onGloballyPositioned { viewportSize = it.size }
+                .background(Color.Black.copy(alpha = 0.42f))
+                .clickable(onClick = onDismiss),
+        ) {
+            Column(
+                Modifier
+                    .align(Alignment.TopCenter)
+                    .widthIn(max = 480.dp)
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .offset { IntOffset(0, overlayTop.roundToInt()) }
+                    .onGloballyPositioned { overlaySize = it.size }
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {},
+                    ),
+                horizontalAlignment = if (mine) Alignment.End else Alignment.Start,
+            ) {
+                Box(
+                    Modifier.graphicsLayer {
+                        scaleX = SONAR_MESSAGE_PRESS_SCALE_FACTOR
+                        scaleY = SONAR_MESSAGE_PRESS_SCALE_FACTOR
+                    },
+                ) {
+                    preview()
+                }
+                Spacer(Modifier.height(12.dp))
+                Column(
+                    Modifier
+                        .shadow(16.dp, RoundedCornerShape(14.dp))
+                        .widthIn(min = 172.dp, max = 250.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(s.surface)
+                        .border(1.dp, s.hairline, RoundedCornerShape(14.dp)),
+                ) {
+                    if (canReply) {
+                        SonarMessageActionRow(
+                            icon = SNIconName.Reply,
+                            label = stringResource(Res.string.chat_reply),
+                            onClick = onReply,
+                        )
+                    }
+                    if (canReply && onCopy != null) {
+                        Box(Modifier.fillMaxWidth().height(1.dp).background(s.hairline))
+                    }
+                    if (onCopy != null && copyLabel) {
+                        SonarMessageActionRow(
+                            icon = SNIconName.Copy,
+                            label = stringResource(Res.string.chat_copy),
+                            onClick = onCopy,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SonarMessageActionRow(
+    icon: SNIconName,
+    label: String,
+    onClick: () -> Unit,
+) {
+    val s = sonar
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SNIcon(icon, 17.dp, s.accent, weight = 2.1f)
+        Spacer(Modifier.width(12.dp))
+        Text(label, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun QuoteChip(
+    reply: SonarReplyRef,
+    mine: Boolean,
+    onMine: Color,
+    transportAccent: Color,
+    transportAccentDeep: Color,
+    modifier: Modifier = Modifier,
+    onTap: () -> Unit,
+) {
+    val s = sonar
+    // design/handoff `.bc-quote`: compact single-line quote, with outgoing
+    // content inverted over a 20% wash and incoming accents following transport.
+    val stripe = if (mine) onMine.copy(alpha = 0.85f) else transportAccent
+    val authorColor = if (mine) onMine else transportAccentDeep
+    val previewColor = (if (mine) onMine else s.text).copy(alpha = 0.82f)
+    val fill = if (mine) Color.White.copy(alpha = 0.20f) else Color(0xFF7F8A8E).copy(alpha = 0.16f)
+    Box(
+        modifier
+            .clip(RoundedCornerShape(9.dp))
+            .background(fill)
+            .clickable(onClick = onTap),
+    ) {
+        Box(
+            Modifier
+                .align(Alignment.CenterStart)
+                .matchParentSize(),
+        ) {
+            Box(
+                Modifier
+                    .align(Alignment.CenterStart)
+                    .fillMaxHeight()
+                    .width(3.dp)
+                    .background(stripe),
+            )
+        }
+        Column(
+            Modifier.padding(start = 12.dp, end = 9.dp, top = 5.dp, bottom = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(1.dp),
+        ) {
+            reply.author?.takeIf { it.isNotBlank() }?.let {
+                Text(
+                    it,
+                    color = authorColor,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                reply.preview,
+                color = previewColor,
+                fontSize = 12.5.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/** Signal-Android `quoteView.width = availableWidth`: size to the body, then
+ *  stretch the quote to that width (or to the quote's own width if it is wider). */
+@Composable
+private fun QuoteThenBody(
+    quote: @Composable () -> Unit,
+    body: @Composable () -> Unit,
+) {
+    val spacing = with(LocalDensity.current) { 6.dp.roundToPx() }
+    Layout(
+        content = {
+            Box { quote() }
+            Box { body() }
+        },
+    ) { measurables, constraints ->
+        val bodyPlaceable = measurables[1].measure(constraints)
+        val quotePlaceable = measurables[0].measure(
+            constraints.copy(
+                minWidth = bodyPlaceable.width.coerceAtMost(constraints.maxWidth),
+                maxWidth = constraints.maxWidth,
+            ),
+        )
+        val width = maxOf(quotePlaceable.width, bodyPlaceable.width)
+        val height = quotePlaceable.height + spacing + bodyPlaceable.height
+        layout(width, height) {
+            quotePlaceable.placeRelative(0, 0)
+            bodyPlaceable.placeRelative(0, quotePlaceable.height + spacing)
+        }
+    }
+}
+
+@Composable
+private fun MessageBubbleBody(
+    m: SonarMsg,
+    annotated: AnnotatedString,
+    inline: Map<String, InlineTextContent>,
+    onMine: Color,
+    preview: TranscriptPreview,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    textLayout: TextLayoutResult?,
+    onTextLayout: (TextLayoutResult) -> Unit,
+    onMentionTap: ((String) -> Unit)?,
+    uriHandler: androidx.compose.ui.platform.UriHandler,
+) {
+    val s = sonar
+    Column {
+        Text(
+            annotated, color = if (m.mine) onMine else s.text,
+            fontSize = 16.sp, lineHeight = 22.4.sp,
+            inlineContent = inline,
+            onTextLayout = onTextLayout,
+            modifier = Modifier.pointerInput(annotated) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                        waitForUpOrCancellation()
+                    } ?: return@awaitEachGesture
+                    if (!down.isConsumed) {
+                        val offset = textLayout?.getOffsetForPosition(down.position)
+                        offset?.let {
+                            val mention = annotated
+                                .getStringAnnotations(MENTION_ANNOTATION_TAG, it, it)
+                                .firstOrNull()
+                            if (mention != null && onMentionTap != null) {
+                                onMentionTap(mention.item)
+                            } else {
+                                annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
+                                    .firstOrNull()
+                                    ?.let { link -> uriHandler.openUri(link.item) }
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        if (preview.truncated) {
+            val expandLabel = stringResource(
+                if (expanded) Res.string.content_message_show_less
+                else Res.string.content_message_show_more,
+            )
+            val expandState = stringResource(
+                if (expanded) Res.string.content_message_expanded
+                else Res.string.content_message_collapsed,
+            )
+            Text(
+                expandLabel,
+                color = if (m.mine) onMine else s.accentDeep,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier
+                    .heightIn(min = 44.dp)
+                    .semantics { stateDescription = expandState }
+                    .clickable(role = Role.Button) { onExpandedChange(!expanded) }
+                    .padding(top = 8.dp),
+            )
+        }
+    }
+}
+
+@Composable
+internal fun ComposerReplyBanner(
+    reply: SonarReplyRef,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val s = sonar
+    Row(
+        modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .padding(bottom = 6.dp)
+            .clip(RoundedCornerShape(13.dp))
+            .background(s.surface)
+            .border(1.dp, s.hairline, RoundedCornerShape(13.dp))
+            .padding(horizontal = 11.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        SNIcon(SNIconName.Reply, 16.dp, s.accent, weight = 2.1f)
+        Column(
+            Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(1.dp),
+        ) {
+            Text(
+                reply.author ?: stringResource(Res.string.chat_reply),
+                color = s.text,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.ExtraBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                reply.preview,
+                color = s.text2,
+                fontSize = 12.5.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Box(
+            Modifier
+                .size(26.dp)
+                .clip(CircleShape)
+                .background(s.surface2)
+                .clickable { onCancel() },
+            contentAlignment = Alignment.Center,
+        ) {
+            SNIcon(SNIconName.X, 12.dp, s.text3, weight = 2.2f)
+        }
+    }
+}
 
 /** bc-msg / bc-bubble (components.jsx MsgBubble): max-width 78%, transport-
  *  colored own bubbles (cyan mesh / indigo internet), tail corner at 28% of the
@@ -2660,6 +3326,8 @@ private fun MessageBubble(
     maxBubbleWidth: Dp = Dp.Infinity,
     mentions: MentionInfo = MentionInfo.EMPTY,
     onMentionTap: ((String) -> Unit)? = null,
+    reply: SonarReplyRef? = null,
+    onJumpQuote: ((String) -> Unit)? = null,
 ) {
     val s = sonar
     // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
@@ -2683,17 +3351,29 @@ private fun MessageBubble(
     // matching iOS, where the preview is trimmed at BOTH ends and the offsets
     // genuinely do shift.
     val renderableMentions = if (visibleText == m.content) mentions.mentions else emptyList()
-    val annotated = remember(visibleText, m.mine, mesh, timeLabel, s, renderableMentions, mentionColor) {
+    val annotated = remember(visibleText, m.mine, mesh, s, renderableMentions, mentionColor) {
         buildAnnotatedString {
             append(decorateMessage(visibleText, linkColor, renderableMentions, mentionColor))
-            // bc-meta: 10.5px time + transport glyph riding the last line.
-            withStyle(SpanStyle(fontSize = 10.5.sp, color = metaColor)) { append(" " + timeLabel) }
-            appendInlineContent(BUBBLE_META_ICON, "·")
+            // Time + via ride the last line as inline widgets, not copyable spans.
+            appendInlineContent(BUBBLE_META_TIME, "")
+            appendInlineContent(BUBBLE_META_ICON, "")
         }
     }
     var textLayout by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+    val timePlaceholderWidth = (10.5f * timeLabel.length * 0.62f + 8f).sp
     val inline = mapOf(
+        BUBBLE_META_TIME to InlineTextContent(
+            Placeholder(timePlaceholderWidth, 12.sp, PlaceholderVerticalAlign.TextCenter)
+        ) {
+            Text(
+                timeLabel,
+                color = metaColor,
+                fontSize = 10.5.sp,
+                maxLines = 1,
+                modifier = Modifier.padding(start = 4.dp),
+            )
+        },
         BUBBLE_META_ICON to InlineTextContent(
             Placeholder(14.sp, 11.sp, PlaceholderVerticalAlign.TextCenter)
         ) {
@@ -2726,69 +3406,50 @@ private fun MessageBubble(
                 .background(if (m.mine) mineBg else s.bubbleOther)
                 .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 9.dp)
         ) {
-            Column {
-                // Selectable (long-press → Copy); each visible link keeps its own target.
-                androidx.compose.foundation.text.selection.SelectionContainer {
-                    Text(
-                        annotated, color = if (m.mine) onMine else s.text,
-                        fontSize = 16.sp, lineHeight = 22.4.sp,
-                        inlineContent = inline,
-                        onTextLayout = { textLayout = it },
-                        modifier = Modifier.pointerInput(annotated) {
-                            awaitEachGesture {
-                                val down = awaitFirstDown(requireUnconsumed = false)
-                                val up = waitForUpOrCancellation()
-                                if (up != null && !down.isConsumed) {
-                                    val offset = textLayout?.getOffsetForPosition(down.position)
-                                    offset?.let {
-                                        val mention = annotated
-                                            .getStringAnnotations(MENTION_ANNOTATION_TAG, it, it)
-                                            .firstOrNull()
-                                        if (mention != null && onMentionTap != null) {
-                                            onMentionTap(mention.item)
-                                        } else {
-                                            annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
-                                                .firstOrNull()
-                                                ?.let { link -> uriHandler.openUri(link.item) }
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                    )
-                }
-                if (preview.truncated) {
-                    // Deliberately inside the truncated branch: only these rows
-                    // have the control, so hoisting to the top of MessageBubble
-                    // would turn two lookups on *some* rows into four on *every*
-                    // row. `stringResource` is remember-backed and synchronous on
-                    // Android/JVM (CMP 1.7.3 uses the blocking resource state),
-                    // so two per truncated row is already the floor. `semantics {}`
-                    // is not a composable scope, hence the local vals.
-                    val expandLabel = stringResource(
-                        if (expanded) Res.string.content_message_show_less
-                        else Res.string.content_message_show_more,
-                    )
-                    val expandState = stringResource(
-                        if (expanded) Res.string.content_message_expanded
-                        else Res.string.content_message_collapsed,
-                    )
-                    Text(
-                        expandLabel,
-                        color = if (m.mine) onMine else s.accentDeep,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier
-                            // heightIn stays OUTSIDE clickable so the 44pt
-                            // constraint propagates into the clickable node —
-                            // the structural equivalent of iOS keeping frame +
-                            // contentShape inside the Button label (#358).
-                            .heightIn(min = 44.dp)
-                            .semantics { stateDescription = expandState }
-                            .clickable(role = Role.Button) { expanded = !expanded }
-                            .padding(top = 8.dp),
-                    )
-                }
+            if (reply != null) {
+                QuoteThenBody(
+                    quote = {
+                        QuoteChip(
+                            reply = reply,
+                            mine = m.mine,
+                            onMine = onMine,
+                            transportAccent = if (mesh) s.accent else s.net,
+                            transportAccentDeep = if (mesh) s.accentDeep else s.netDeep,
+                            modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+                        ) {
+                            onJumpQuote?.invoke(reply.parentId)
+                        }
+                    },
+                    body = {
+                        MessageBubbleBody(
+                            m = m,
+                            annotated = annotated,
+                            inline = inline,
+                            onMine = onMine,
+                            preview = preview,
+                            expanded = expanded,
+                            onExpandedChange = { expanded = it },
+                            textLayout = textLayout,
+                            onTextLayout = { textLayout = it },
+                            onMentionTap = onMentionTap,
+                            uriHandler = uriHandler,
+                        )
+                    },
+                )
+            } else {
+                MessageBubbleBody(
+                    m = m,
+                    annotated = annotated,
+                    inline = inline,
+                    onMine = onMine,
+                    preview = preview,
+                    expanded = expanded,
+                    onExpandedChange = { expanded = it },
+                    textLayout = textLayout,
+                    onTextLayout = { textLayout = it },
+                    onMentionTap = onMentionTap,
+                    uriHandler = uriHandler,
+                )
             }
         }
         if (showState) MessageStatusFooter(m, mesh, onRetry)

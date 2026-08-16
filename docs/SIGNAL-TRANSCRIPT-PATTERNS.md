@@ -126,7 +126,8 @@ Policy helpers are production; list hosting cut over in Phase 2/3 below.
   - **Sticky day headers** — `ChatFeedList` emits each Day item as a `stickyHeader` (same one-entry-one-index order, so continuity/open index math is unchanged); floating `StickyDayHeader` pill.
   - Row geometry was already data-driven (reserved media boxes), so LazyColumn item-index anchoring stays exact.
 - Tests: `SNTranscriptDaySectionTests` (sections + height cache), `ChatFeedListItemsTest` (flattened list + index math), `TranscriptPhase2CutoverJvmTest` (default-ON kill-switch shape).
-- Remaining follow-ups (tracked, non-blocking): Spike B reverseLayout product decision; Jump(id) entry points (search/reply); Mac AppKit list engine; off-main pre-measure if profile shows first-open measure cost on very large windows.
+- Remaining follow-ups (tracked, non-blocking): Spike B reverseLayout product decision; Jump(id) from search; Mac AppKit list engine; off-main pre-measure if profile shows first-open measure cost on very large windows.
+- **Jump(id) from reply chips:** quote-chip tap sets the existing open-action Jump target (`jumpMessageIdAtOpenByDM` / `openChatJumpMessageId`) while the chat is already open. Paint from the denormalized snapshot; do not fetch the parent on open.
 
 ---
 

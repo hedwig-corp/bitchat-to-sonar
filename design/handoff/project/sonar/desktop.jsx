@@ -84,7 +84,36 @@ function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
             </span>
           </button>
         ))}
-        <SectionLabel>Messages</SectionLabel>
+        <div className="dk-rowhead">
+          <SectionLabel>Messages</SectionLabel>
+          <button className="dk-newgroup" onClick={() => onSelect('newgroup')} title="New group">
+            <BCIcon name="plus" size={15} weight={2.2} />New group
+          </button>
+        </div>
+        {(BC_DATA.groups || []).map((g) => {
+          const gm = app.groupMsgs && app.groupMsgs[g.id];
+          const last = gm && gm.length ? gm[gm.length - 1] : null;
+          const preview = last
+            ? (last.media ? (last.mine ? 'You' : last.author) + ': ' + bcMediaWord(last.media)
+               : (last.mine ? 'You: ' : (last.author ? last.author + ': ' : '')) + (last.text || ''))
+            : g.preview;
+          return (
+            <button key={g.id} className={'dk-row' + (isSel('group', g.id) ? ' sel' : '')} onClick={() => onSelect('group', g.id)}>
+              <GroupAvatar members={g.members} size={40} />
+              <span className="dk-rowmain">
+                <span className="dk-rowtitle">{g.name}</span>
+                <span className="dk-rowsub">
+                  <BCIcon name="people" size={11} weight={2.2} style={{ flex: 'none', color: 'var(--text3)' }} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{preview}</span>
+                </span>
+              </span>
+              <span className="dk-rowend">
+                <span className="dk-time">{g.time}</span>
+                {!app.read['g-' + g.id] && g.unread ? <span className="bc-unreaddot"></span> : null}
+              </span>
+            </button>
+          );
+        })}
         {BC_DATA.homeDMs.map((d) => {
           const peer = BC_DATA.peers.find((p) => p.id === d.peer);
           const msgs = app.dmMsgs[d.peer];
@@ -96,6 +125,7 @@ function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
               <span className="dk-rowmain">
                 <span className="dk-rowtitle">
                   {peer.name}
+                  {peer.supporter ? <SupporterBadge size={13} /> : null}
                   {app.verified[d.peer]
                     ? <BCIcon name="shieldCheck" size={13} weight={2.1} style={{ color: 'var(--green)', flex: 'none' }} />
                     : null}
@@ -131,6 +161,7 @@ function DkSidebar({ app, sel, onSelect, toggleNetwork, onSettings }) {
 function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCommand, onSelect, onPay, onClaimPay, openPay, onMedia, onVoice, onCall }) {
   const [pop, setPop] = React.useState(false);
   const [pay, setPay] = React.useState(false);
+  const [payDetail, setPayDetail] = React.useState(null);
   React.useEffect(() => { setPay(!!openPay); }, [openPay, sel.id]);
   const isCh = sel.type === 'channel';
   const ch = isCh ? (BC_DATA.channels.find((c) => c.id === sel.id) || (BC_DATA.here || []).find((c) => c.id === sel.id) || BC_DATA.channels[0]) : null;
@@ -154,6 +185,7 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
         <span className="titles">
           <div className="bc-hname">
             <span>{isCh ? ch.name : peer.name}</span>
+            {!isCh && peer.supporter ? <SupporterBadge size={15} /> : null}
             {verified ? <BCIcon name="shieldCheck" size={15} weight={2.1} style={{ color: 'var(--green)', flex: 'none' }} /> : null}
           </div>
           <div className="bc-hsub">
@@ -200,7 +232,7 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
           </div>
         )
       ) : (
-        <MsgList msgs={msgs} showAuthors={isCh} peerName={isCh ? undefined : peer.name} onClaim={isCh ? undefined : (i) => onClaimPay(peer.id, i)} pay={pp} />
+        <MsgList msgs={msgs} showAuthors={isCh} peerName={isCh ? undefined : peer.name} onClaim={isCh ? undefined : (i) => setPayDetail(msgs[i])} pay={pp} />
       )}
       <div style={{ position: 'relative' }}>
         {pop && (
@@ -220,6 +252,7 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
           onSend={(tx) => isCh ? onSendCh(ch.id, tx) : onSendDm(peer.id, tx)}
           onPlus={() => setPop(!pop)}
           onVoice={(sec) => onVoice(isCh ? ch.id : peer.id, sec)}
+          onSticker={(s) => onMedia(isCh ? ch.id : peer.id, s)}
           onCommand={(c) => onCommand({ type: isCh ? 'ch' : 'dm', id: isCh ? ch.id : peer.id, target: isCh ? 'Luca' : peer.name }, c)}
         />
       </div>
@@ -229,6 +262,60 @@ function DkChatPane({ app, sel, railOpen, onToggleRail, onSendCh, onSendDm, onCo
           onClose={() => setPay(false)} onSend={(sats) => onPay(peer.id, sats)}
         />
       )}
+      {payDetail && !isCh && (
+        <PayDetailSheet m={payDetail} peerName={peer.name} pay={pp} onClose={() => setPayDetail(null)} />
+      )}
+    </div>
+  );
+}
+
+function DkGroupPane({ app, sel, railOpen, onToggleRail, onSendGroup, onMediaGroup, onVoiceGroup, onCommand, onSelect }) {
+  const [pop, setPop] = React.useState(false);
+  const group = (BC_DATA.groups || []).find((g) => g.id === sel.id) || BC_DATA.groups[0];
+  const msgs = (app.groupMsgs && app.groupMsgs[group.id]) || [];
+  const mem = group.members.map((id) => BC_DATA.peers.find((p) => p.id === id)).filter(Boolean);
+  const transport = 'internet';
+  const label = 'White Noise · internet';
+  return (
+    <div className="dk-main" data-screen-label={'Group: ' + group.name}>
+      <div className="dk-chathead">
+        <GroupAvatar members={group.members} size={38} />
+        <span className="titles">
+          <div className="bc-hname"><span>{group.name}</span></div>
+          <div className="bc-hsub"><BCIcon name="globe" size={11} weight={2.2} />{mem.length + 1} members · {label}</div>
+        </span>
+        <button className={'dk-iconbtn' + (railOpen ? ' on' : '')} onClick={onToggleRail} title="Group info">
+          <BCIcon name="info" size={18} />
+        </button>
+      </div>
+      <Banner icon="globe" tone="net"><b>Group · end-to-end encrypted</b> — over the internet with White Noise</Banner>
+      {msgs.length === 0 ? (
+        <div className="bc-empty">
+          <span className="bc-emptyicon"><BCIcon name="people" size={24} /></span>
+          <div className="bc-emptytitle">{group.name}</div>
+          <div className="bc-emptydesc">Say hi to the group. Messages are end-to-end encrypted for all {mem.length + 1} members.</div>
+        </div>
+      ) : (
+        <MsgList msgs={msgs} showAuthors />
+      )}
+      <div style={{ position: 'relative' }}>
+        {pop && (
+          <div className="dk-pop">
+            <AttachActions transport={transport} onPick={(t) => { setPop(false); onMediaGroup(group.id, t); }} />
+            <ActionRow icon="navArrow" label="Share location" desc="Show the group where you are" onClick={() => setPop(false)} />
+            <ActionRow icon="smile" label="Reactions" desc="A little fun, no noise" onClick={() => setPop(false)} />
+          </div>
+        )}
+        <Composer
+          placeholder={'Message ' + group.name}
+          transport={transport}
+          onSend={(tx) => onSendGroup(group.id, tx)}
+          onPlus={() => setPop(!pop)}
+          onVoice={(sec) => onVoiceGroup(group.id, sec)}
+          onSticker={(s) => onMediaGroup(group.id, s)}
+          onCommand={(c) => onCommand({ type: 'group', id: group.id, target: mem[0] ? mem[0].name : 'everyone' }, c)}
+        />
+      </div>
     </div>
   );
 }
@@ -342,7 +429,7 @@ function DkRadarPane({ app, onSelect }) {
 }
 
 /* ── Detail rail ── */
-function DkRail({ app, sel, onVerify }) {
+function DkRail({ app, sel, onVerify, onSelect, onLeave }) {
   const [showKey, setShowKey] = React.useState(false);
   const [precision, setPrecision] = React.useState('block');
   if (sel.type === 'channel') {
@@ -358,6 +445,42 @@ function DkRail({ app, sel, onVerify }) {
           ))}
         </div>
         <p className="dk-railnote">Channels are tied to a place, not to you. Anyone in this area can read and write — nothing here is encrypted.</p>
+      </div>
+    );
+  }
+  if (sel.type === 'group') {
+    const group = (BC_DATA.groups || []).find((g) => g.id === sel.id) || BC_DATA.groups[0];
+    const gmem = group.members.map((id) => BC_DATA.peers.find((p) => p.id === id)).filter(Boolean);
+    const glabel = 'White Noise · internet';
+    return (
+      <div className="dk-rail" data-screen-label="Group details" style={{ alignItems: 'stretch' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+          <GroupAvatar members={group.members} size={72} />
+          <div className="dk-railname">{group.name}</div>
+          <div className="dk-railsub">{gmem.length + 1} members · {glabel}</div>
+        </div>
+        <div className="dk-verifiedpill" style={{ alignSelf: 'center', background: 'var(--net-soft)', color: 'var(--net-deep)' }}>
+          <BCIcon name="globe" size={13} weight={2.2} />Encrypted · White Noise
+        </div>
+        <div className="bc-sect" style={{ paddingLeft: 2 }}>{gmem.length + 1} members</div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 11, padding: '7px 2px' }}>
+          <Avatar name={app.nick || 'you'} size={38} />
+          <span style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 14.5, fontWeight: 650 }}>You</div>
+            <div style={{ fontSize: 12.5, color: 'var(--text2)' }}>Admin</div>
+          </span>
+        </div>
+        {gmem.map((p) => (
+          <button key={p.id} className="dk-row" style={{ width: '100%', margin: '1px 0' }} onClick={() => onSelect('dm', p.id)}>
+            <Avatar name={p.name} size={38} presence={p.inRange} />
+            <span className="dk-rowmain">
+              <span className="dk-rowtitle">{p.name}{p.supporter ? <SupporterBadge size={13} /> : null}{app.verified[p.id] ? <BCIcon name="shieldCheck" size={13} weight={2.1} style={{ color: 'var(--green)', flex: 'none' }} /> : null}</span>
+              <span className="dk-rowsub"><span>{p.inRange ? p.hint + ' · nearby' : 'reachable over internet'}</span></span>
+            </span>
+          </button>
+        ))}
+        <button className="bc-ghost" style={{ marginTop: 8 }} onClick={() => onSelect('radar')}>Add people</button>
+        <button className="bc-ghost" style={{ color: 'var(--danger)' }} onClick={() => onLeave && onLeave(group.id)}>Leave group</button>
       </div>
     );
   }
@@ -397,7 +520,7 @@ function DkRail({ app, sel, onVerify }) {
 }
 
 /* ── Settings modal ── */
-function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRename, onWipe, onClose }) {
+function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRename, onWipe, onClose, push }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(app.nick || '');
   const [wipeAsk, setWipeAsk] = React.useState(false);
@@ -464,11 +587,6 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
 
         <SectionLabel>Wallet</SectionLabel>
         <div className="st-card">
-          <StRow icon="coin" tone="gold" label="Bitcoin" sub="Pays like you message — Bluetooth or Lightning" value={payFmt(app.balance || 0) + ' sats'} onClick={() => {}} />
-        </div>
-
-        <SectionLabel>Wallet</SectionLabel>
-        <div className="st-card">
           <StRow icon="coin" tone="gold" label="Balance" value={walletStr(app)} trail={null} onClick={() => {}} />
           <StRow icon="globe" label="Currency" value={(prefs.currency || 'EUR')} onClick={() => setCurOpen(!curOpen)} />
           <StRow icon="bolt" label="Bitcoin mode" sub="Show sats and bitcoin networks" onClick={() => onPref('btcMode', !prefs.btcMode)} toggle={!!prefs.btcMode} />
@@ -480,6 +598,10 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
             ))}
           </div>
         )}
+        <div className="bc-sect" style={{ paddingLeft: 18 }}>Activity</div>
+        <div className="st-card" style={{ padding: '4px 0' }}>
+          <WalletActivity app={app} txns={app.txns} />
+        </div>
 
         <SectionLabel>Privacy &amp; safety</SectionLabel>
         <div className="st-card">
@@ -494,6 +616,19 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
             <button className="pf-smallbtn" onClick={() => setWipeAsk(false)}>Cancel</button>
           </div>
         )}
+
+        <SectionLabel>Support Sonar</SectionLabel>
+        <button className="st-donate" onClick={() => { onClose(); push('donate'); }}>
+          <span className="st-donateic"><BCIcon name="heart" size={20} /></span>
+          <span className="st-donatemain">
+            <span className="st-donatetitle">
+              {prefs.supporter ? 'You\u2019re a Sonar supporter' : 'Become a supporter'}
+              {prefs.supporter ? <SupporterBadge size={15} /> : null}
+            </span>
+            <span className="st-donatesub">{prefs.supporter ? 'Thank you for keeping Sonar independent' : 'Fund development \u00b7 get a badge \u00b7 no ads, ever'}</span>
+          </span>
+          <BCIcon name="chevron" size={15} weight={2.2} style={{ color: 'var(--text3)', flex: 'none' }} />
+        </button>
 
         <SectionLabel>About</SectionLabel>
         <div className="st-card">

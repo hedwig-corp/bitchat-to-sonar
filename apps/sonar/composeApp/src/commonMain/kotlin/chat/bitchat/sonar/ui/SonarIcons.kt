@@ -29,7 +29,7 @@ import kotlin.math.sqrt
  * and filled sub-shapes are drawn from the same SVG path data.
  */
 enum class SNIconName {
-    Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield, Send,
+    Back, Chevron, Lock, Plus, Pin, People, Mesh, Globe, Check, Shield, Send, Reply,
     ShieldCheck, X, Smile, NavArrow, Dice, Rings, Moon, Trash, Info, Coin, Bolt,
     Pencil, Key, Search, Mic, Play, Pause, Bookmark, BookmarkFill,
     // Call glyphs (design icons.jsx): voice/video buttons + in-call controls.
@@ -74,6 +74,7 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Mesh to listOf(Shape.C(12f, 12f, 1.7f, fill = true), Shape.P("M8.7 8.7a4.7 4.7 0 0 0 0 6.6M15.3 8.7a4.7 4.7 0 0 1 0 6.6M6.2 6.2a8.2 8.2 0 0 0 0 11.6M17.8 6.2a8.2 8.2 0 0 1 0 11.6")),
     SNIconName.Globe to listOf(Shape.C(12f, 12f, 8.2f), Shape.P("M3.8 12h16.4M12 3.8c-2.7 2.5-4.1 5.2-4.1 8.2s1.4 5.7 4.1 8.2c2.7-2.5 4.1-5.2 4.1-8.2S14.7 6.3 12 3.8z")),
     SNIconName.Check to listOf(Shape.P("M5 12.8l4.3 4.3L19 7.4")),
+    SNIconName.Reply to listOf(Shape.P("M9.6 6.4 4.4 11.2l5.2 4.8M4.8 11.2h8.7a6 6 0 0 1 6 6v.9")),
     // design icons.jsx `send` — the composer send arrow.
     SNIconName.Send to listOf(Shape.P("M12 18.5v-13M6.5 11 12 5.5 17.5 11")),
     // design icons.jsx `qr`: three finder squares + the data corner.

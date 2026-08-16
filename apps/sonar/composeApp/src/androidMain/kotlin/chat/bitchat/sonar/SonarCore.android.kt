@@ -22,6 +22,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
 
+actual fun sonarReplyUiEnabled(): Boolean = System.getenv("SONAR_REPLY_UI") != "0"
+
 /**
  * Android `actual`: drive the Rust core (Marmot/White Noise) through the
  * UniFFI Kotlin/JNA bindings. The FFI is blocking (owns a tokio runtime), so
@@ -251,6 +253,16 @@ actual object SonarCore {
 
     actual suspend fun send(chatId: String, text: String) = withContext(Dispatchers.IO) {
         requireNode().sendText(chatId, text)
+    }
+
+    actual suspend fun sendReply(
+        chatId: String,
+        text: String,
+        replyToHex: String,
+        replyToNpub: String,
+        preview: String?,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendTextReply(chatId, text, replyToHex, replyToNpub, preview)
     }
 
     actual suspend fun retryMessage(messageId: String): String = withContext(Dispatchers.IO) {
@@ -533,6 +545,14 @@ actual object SonarCore {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         },
         classification = classification.toCommon(),
+        reply = reply?.let { r ->
+            SonarReplyRef(
+                parentId = r.parentIdHex,
+                parentNpub = r.parentNpub,
+                // Keep blank blank — QuoteChip resolves from the local parent.
+                preview = r.preview.orEmpty(),
+            )
+        },
     )
 
     /** Core-computed classification; the host must not re-derive it from text. */
@@ -835,8 +855,9 @@ actual object SonarCore {
         recipientPeerIdHex: String,
         messageId: String,
         text: String,
+        replyTo: String?,
     ) = withContext(Dispatchers.IO) {
-        requireNode().sendDirectDm(recipientHex, senderPeerIdHex, recipientPeerIdHex, messageId, text)
+        requireNode().sendDirectDm(recipientHex, senderPeerIdHex, recipientPeerIdHex, messageId, text, replyTo)
     }
 
     actual suspend fun drainDirectDms(): List<SonarDirectDm> = withContext(Dispatchers.IO) {
@@ -849,6 +870,7 @@ actual object SonarCore {
                     senderPubkeyHex = it.senderPubkeyHex,
                     content = it.content,
                     tsSecs = it.createdAtSecs.toLong(),
+                    replyTo = it.replyTo,
                 )
             }
         }.getOrDefault(emptyList())

@@ -649,6 +649,11 @@ public protocol MeshLinkEngineProtocol: AnyObject, Sendable {
      */
     func sendTextNow(fingerprint: String, messageId: String, text: String, nowMs: Int64)  -> MeshEngineOutput?
 
+    /**
+     * Same as [`Self::send_text`], with an optional parent message id (TLV 0x04).
+     */
+    func sendTextWithReply(fingerprint: String, messageId: String, text: String, replyTo: String?, nowMs: Int64)  -> MeshEngineOutput?
+
     func setAllowlist(allowed: [String]?)  -> MeshEngineOutput
 
     func setNickname(nickname: String, nowMs: Int64)  -> MeshEngineOutput
@@ -972,6 +977,22 @@ open func sendTextNow(fingerprint: String, messageId: String, text: String, nowM
         FfiConverterString.lower(fingerprint),
         FfiConverterString.lower(messageId),
         FfiConverterString.lower(text),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * Same as [`Self::send_text`], with an optional parent message id (TLV 0x04).
+     */
+open func sendTextWithReply(fingerprint: String, messageId: String, text: String, replyTo: String?, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_send_text_with_reply(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(text),
+        FfiConverterOptionString.lower(replyTo),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -1795,7 +1816,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Send an account-level direct NIP-17 DM to a plain bitchat peer. The
      * content is wrapped as `bitchat1:` so iOS/stock bitchat can decode it.
      */
-    func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String) throws
+    func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String, replyTo: String?) throws
 
     /**
      * Send a 1:1 encrypted DM to a geohash channel participant (NIP-17).
@@ -1848,6 +1869,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Encrypt + publish a text message to the group.
      */
     func sendText(groupIdHex: String, text: String) throws
+
+    /**
+     * Like `send_text`, attaching a NIP-C7 reply pointer.
+     */
+    func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?) throws
 
     func setConversationChangeListener(listener: ConversationChangeListener)
 
@@ -2833,14 +2859,15 @@ open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiE
      * Send an account-level direct NIP-17 DM to a plain bitchat peer. The
      * content is wrapped as `bitchat1:` so iOS/stock bitchat can decode it.
      */
-open func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func sendDirectDm(recipientHex: String, senderPeerIdHex: String, recipientPeerIdHex: String, messageId: String, text: String, replyTo: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_send_direct_dm(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(recipientHex),
         FfiConverterString.lower(senderPeerIdHex),
         FfiConverterString.lower(recipientPeerIdHex),
         FfiConverterString.lower(messageId),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),
+        FfiConverterOptionString.lower(replyTo),$0
     )
 }
 }
@@ -2975,6 +3002,21 @@ open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithEr
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
         FfiConverterString.lower(text),$0
+    )
+}
+}
+
+    /**
+     * Like `send_text`, attaching a NIP-C7 reply pointer.
+     */
+open func sendTextReply(groupIdHex: String, text: String, replyToHex: String, replyToNpub: String, preview: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_text_reply(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterString.lower(text),
+        FfiConverterString.lower(replyToHex),
+        FfiConverterString.lower(replyToNpub),
+        FfiConverterOptionString.lower(preview),$0
     )
 }
 }
@@ -4026,15 +4068,17 @@ public struct DirectDmInfo: Equatable, Hashable {
     public var senderPubkeyHex: String
     public var content: String
     public var createdAtSecs: UInt64
+    public var replyTo: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(eventIdHex: String, idHex: String, senderPubkeyHex: String, content: String, createdAtSecs: UInt64) {
+    public init(eventIdHex: String, idHex: String, senderPubkeyHex: String, content: String, createdAtSecs: UInt64, replyTo: String?) {
         self.eventIdHex = eventIdHex
         self.idHex = idHex
         self.senderPubkeyHex = senderPubkeyHex
         self.content = content
         self.createdAtSecs = createdAtSecs
+        self.replyTo = replyTo
     }
 
 
@@ -4057,7 +4101,8 @@ public struct FfiConverterTypeDirectDmInfo: FfiConverterRustBuffer {
                 idHex: FfiConverterString.read(from: &buf),
                 senderPubkeyHex: FfiConverterString.read(from: &buf),
                 content: FfiConverterString.read(from: &buf),
-                createdAtSecs: FfiConverterUInt64.read(from: &buf)
+                createdAtSecs: FfiConverterUInt64.read(from: &buf),
+                replyTo: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -4067,6 +4112,7 @@ public struct FfiConverterTypeDirectDmInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.senderPubkeyHex, into: &buf)
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
+        FfiConverterOptionString.write(value.replyTo, into: &buf)
     }
 }
 
@@ -4166,16 +4212,18 @@ public struct GeoMessageInfo: Equatable, Hashable {
     public var content: String
     public var createdAtSecs: UInt64
     public var mine: Bool
+    public var replyToHex: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(idHex: String, senderPubkeyHex: String, nickname: String, content: String, createdAtSecs: UInt64, mine: Bool) {
+    public init(idHex: String, senderPubkeyHex: String, nickname: String, content: String, createdAtSecs: UInt64, mine: Bool, replyToHex: String?) {
         self.idHex = idHex
         self.senderPubkeyHex = senderPubkeyHex
         self.nickname = nickname
         self.content = content
         self.createdAtSecs = createdAtSecs
         self.mine = mine
+        self.replyToHex = replyToHex
     }
 
 
@@ -4199,7 +4247,8 @@ public struct FfiConverterTypeGeoMessageInfo: FfiConverterRustBuffer {
                 nickname: FfiConverterString.read(from: &buf),
                 content: FfiConverterString.read(from: &buf),
                 createdAtSecs: FfiConverterUInt64.read(from: &buf),
-                mine: FfiConverterBool.read(from: &buf)
+                mine: FfiConverterBool.read(from: &buf),
+                replyToHex: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -4210,6 +4259,7 @@ public struct FfiConverterTypeGeoMessageInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
         FfiConverterBool.write(value.mine, into: &buf)
+        FfiConverterOptionString.write(value.replyToHex, into: &buf)
     }
 }
 
@@ -4852,12 +4902,14 @@ public func FfiConverterTypeMeshPacketInfo_lower(_ value: MeshPacketInfo) -> Rus
 public struct MeshPrivateMessage: Equatable, Hashable {
     public var messageId: String
     public var content: String
+    public var replyTo: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(messageId: String, content: String) {
+    public init(messageId: String, content: String, replyTo: String?) {
         self.messageId = messageId
         self.content = content
+        self.replyTo = replyTo
     }
 
 
@@ -4877,13 +4929,15 @@ public struct FfiConverterTypeMeshPrivateMessage: FfiConverterRustBuffer {
         return
             try MeshPrivateMessage(
                 messageId: FfiConverterString.read(from: &buf),
-                content: FfiConverterString.read(from: &buf)
+                content: FfiConverterString.read(from: &buf),
+                replyTo: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: MeshPrivateMessage, into buf: inout [UInt8]) {
         FfiConverterString.write(value.messageId, into: &buf)
         FfiConverterString.write(value.content, into: &buf)
+        FfiConverterOptionString.write(value.replyTo, into: &buf)
     }
 }
 
@@ -4994,6 +5048,10 @@ public struct MessageInfo: Equatable, Hashable {
      * Precomputed content classification (pay/call control vs plain text).
      */
     public var classification: MessageClassInfo
+    /**
+     * NIP-C7 reply pointer. `content` is the display body (nevent already stripped).
+     */
+    public var reply: ReplyRefInfo?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5012,7 +5070,10 @@ public struct MessageInfo: Equatable, Hashable {
          */stickerRef: StickerRefInfo?,
         /**
          * Precomputed content classification (pay/call control vs plain text).
-         */classification: MessageClassInfo) {
+         */classification: MessageClassInfo,
+        /**
+         * NIP-C7 reply pointer. `content` is the display body (nevent already stripped).
+         */reply: ReplyRefInfo?) {
         self.idHex = idHex
         self.senderNpub = senderNpub
         self.content = content
@@ -5022,6 +5083,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.media = media
         self.stickerRef = stickerRef
         self.classification = classification
+        self.reply = reply
     }
 
 
@@ -5048,7 +5110,8 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 deliveryState: FfiConverterString.read(from: &buf),
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf),
                 stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf),
-                classification: FfiConverterTypeMessageClassInfo.read(from: &buf)
+                classification: FfiConverterTypeMessageClassInfo.read(from: &buf),
+                reply: FfiConverterOptionTypeReplyRefInfo.read(from: &buf)
         )
     }
 
@@ -5062,6 +5125,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
         FfiConverterOptionTypeStickerRefInfo.write(value.stickerRef, into: &buf)
         FfiConverterTypeMessageClassInfo.write(value.classification, into: &buf)
+        FfiConverterOptionTypeReplyRefInfo.write(value.reply, into: &buf)
     }
 }
 
@@ -5278,6 +5342,67 @@ public func FfiConverterTypeRecentMessagePageInfo_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeRecentMessagePageInfo_lower(_ value: RecentMessagePageInfo) -> RustBuffer {
     return FfiConverterTypeRecentMessagePageInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly NIP-C7 quote pointer.
+ */
+public struct ReplyRefInfo: Equatable, Hashable {
+    public var parentIdHex: String
+    public var parentNpub: String?
+    public var preview: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(parentIdHex: String, parentNpub: String?, preview: String?) {
+        self.parentIdHex = parentIdHex
+        self.parentNpub = parentNpub
+        self.preview = preview
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ReplyRefInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReplyRefInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReplyRefInfo {
+        return
+            try ReplyRefInfo(
+                parentIdHex: FfiConverterString.read(from: &buf),
+                parentNpub: FfiConverterOptionString.read(from: &buf),
+                preview: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReplyRefInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.parentIdHex, into: &buf)
+        FfiConverterOptionString.write(value.parentNpub, into: &buf)
+        FfiConverterOptionString.write(value.preview, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReplyRefInfo_lift(_ buf: RustBuffer) throws -> ReplyRefInfo {
+    return try FfiConverterTypeReplyRefInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReplyRefInfo_lower(_ value: ReplyRefInfo) -> RustBuffer {
+    return FfiConverterTypeReplyRefInfo.lower(value)
 }
 
 
@@ -6325,7 +6450,7 @@ public enum MeshEngineEvent: Equatable, Hashable {
     )
     case sonarPayload(fingerprint: String, payload: Data
     )
-    case textReceived(fingerprint: String, messageId: String, content: String
+    case textReceived(fingerprint: String, messageId: String, content: String, replyTo: String?
     )
     case deliveryReceived(fingerprint: String, messageId: String
     )
@@ -6362,7 +6487,7 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
         case 2: return .sonarPayload(fingerprint: try FfiConverterString.read(from: &buf), payload: try FfiConverterData.read(from: &buf)
         )
 
-        case 3: return .textReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf)
+        case 3: return .textReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf), replyTo: try FfiConverterOptionString.read(from: &buf)
         )
 
         case 4: return .deliveryReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf)
@@ -6399,11 +6524,12 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
             FfiConverterData.write(payload, into: &buf)
 
 
-        case let .textReceived(fingerprint,messageId,content):
+        case let .textReceived(fingerprint,messageId,content,replyTo):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(fingerprint, into: &buf)
             FfiConverterString.write(messageId, into: &buf)
             FfiConverterString.write(content, into: &buf)
+            FfiConverterOptionString.write(replyTo, into: &buf)
 
 
         case let .deliveryReceived(fingerprint,messageId):
@@ -7538,6 +7664,30 @@ fileprivate struct FfiConverterOptionTypeProfileInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeReplyRefInfo: FfiConverterRustBuffer {
+    typealias SwiftType = ReplyRefInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeReplyRefInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeReplyRefInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeSonarDescriptorInfo: FfiConverterRustBuffer {
     typealias SwiftType = SonarDescriptorInfo?
 
@@ -8506,6 +8656,18 @@ public func meshEncodePrivateMessage(messageId: String, content: String)throws  
 })
 }
 /**
+ * Same as [`mesh_encode_private_message`], with an optional parent id (TLV 0x04).
+ */
+public func meshEncodePrivateMessageWithReply(messageId: String, content: String, replyTo: String?)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_mesh_encode_private_message_with_reply(
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(content),
+        FfiConverterOptionString.lower(replyTo),$0
+    )
+})
+}
+/**
  * Split `data` into bitchat-compatible 0x20 fragment payloads (each carries
  * `original_type`). Wrap each returned payload in a 0x20 packet to send.
  */
@@ -8907,6 +9069,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message() != 50193) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message_with_reply() != 12898) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_mesh_fragment() != 41072) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9049,6 +9214,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text_now() != 30800) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text_with_reply() != 47494) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_set_allowlist() != 36838) {
@@ -9270,7 +9438,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 21048) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_direct_dm() != 11322) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_direct_dm() != 59899) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_geo_dm() != 38953) {
@@ -9298,6 +9466,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text_reply() != 3890) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {
