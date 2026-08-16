@@ -34,6 +34,8 @@ enum SNIconName: String {
     case download
     // Send payment: "Scan a QR code" (design icons.jsx `qr`).
     case qr
+    // Reply (design icons.jsx `reply`) — swipe-to-reply + composer banner.
+    case reply
 }
 
 private enum SNIconElement {
@@ -48,6 +50,7 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
     .lock: [.rect(5.5, 10.5, 13, 9.5, 2.6), .path("M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5")],
     .plus: [.path("M12 5.5v13M5.5 12h13")],
     .send: [.path("M12 18.5v-13M6.5 11 12 5.5 17.5 11")],
+    .reply: [.path("M9.6 6.4 4.4 11.2l5.2 4.8M4.8 11.2h8.7a6 6 0 0 1 6 6v.9")],
     // design icons.jsx `qr`: three finder squares + the data corner.
     .qr: [
         .rect(4, 4, 6.5, 6.5, 1.5),

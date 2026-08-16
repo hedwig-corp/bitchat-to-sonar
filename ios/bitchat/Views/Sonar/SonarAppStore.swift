@@ -394,6 +394,8 @@ struct SNMessage: Identifiable, Equatable {
 struct SNReplyRef: Equatable {
     let parentId: String
     let parentNpub: String?
+    /// Display-only snapshot for the quoted sender ("You", contact, or member).
+    let author: String?
     let preview: String
 }
 
@@ -410,15 +412,62 @@ func snCanReply(to message: SNMessage) -> Bool {
     return true
 }
 
-func snReplyRef(from message: MarmotService.MarmotMessage) -> SNReplyRef? {
+/// Signal-iOS `CVComponentMessage` swipe-to-reply metrics (55pt threshold,
+/// rubber-band overflow/4, icon travels at 1/8 bubble speed).
+enum SNSwipeReplyMetrics {
+    static let trigger: CGFloat = 55
+    static let edgeGuard: CGFloat = 20
+
+    static func bubbleOffset(_ raw: CGFloat) -> CGFloat {
+        let x = max(0, raw)
+        if x <= trigger { return x }
+        return trigger + (x - trigger) / 4
+    }
+
+    static func iconOffset(_ raw: CGFloat) -> CGFloat {
+        bubbleOffset(raw) / 8
+    }
+
+    static func iconAlpha(_ raw: CGFloat) -> CGFloat {
+        min(1, max(0, raw / trigger))
+    }
+
+    static func isTriggered(_ raw: CGFloat) -> Bool {
+        raw >= trigger
+    }
+
+    static func allowsStart(localX: CGFloat, rowWidth: CGFloat, mine: Bool) -> Bool {
+        if localX < edgeGuard { return false }
+        guard rowWidth > 0 else { return true }
+        if mine { return localX > rowWidth * 0.22 }
+        return localX < rowWidth * 0.82
+    }
+}
+
+func snReplyRef(
+    from message: MarmotService.MarmotMessage,
+    parentPreviewById: [String: String] = [:],
+    parentAuthorById: [String: String] = [:]
+) -> SNReplyRef? {
     guard let r = message.reply else { return nil }
-    let preview = (r.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    let fallback = String(localized: "chat.reply.fallback", defaultValue: "Message")
+    let snapshot = (r.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let parentText = parentPreviewById[r.parentId]
     return SNReplyRef(
         parentId: r.parentId,
         parentNpub: r.parentNpub,
-        preview: preview.isEmpty ? fallback : String(preview.prefix(140))
+        author: parentAuthorById[r.parentId],
+        preview: snResolvedReplyPreview(snapshot: snapshot, parentText: parentText)
     )
+}
+
+/// Signal-style quote text: prefer the denormalized snapshot, else the local
+/// parent body, else the generic fallback.
+func snResolvedReplyPreview(snapshot: String, parentText: String?) -> String {
+    let snap = snapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !snap.isEmpty { return String(snap.prefix(140)) }
+    let fromParent = (parentText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if !fromParent.isEmpty { return String(fromParent.prefix(140)) }
+    return String(localized: "chat.reply.fallback", defaultValue: "Message")
 }
 
 func snCanEmitNipC7(parentId: String, parentNpub: String?) -> Bool {
@@ -1261,6 +1310,9 @@ final class SonarAppStore: ObservableObject {
         composerReplyByChat[chatId] = SNReplyRef(
             parentId: message.id,
             parentNpub: message.senderNpub,
+            author: message.mine
+                ? String(localized: "chat.reply.you", defaultValue: "You")
+                : message.author,
             preview: previewSource.isEmpty ? fallback : String(previewSource.prefix(140))
         )
     }
@@ -2074,10 +2126,15 @@ final class SonarAppStore: ObservableObject {
         // Smoke-test hook: `simctl launch <sim> <bundle> -sonar.debug.route
         // settings` lands in the argument domain (volatile, this launch
         // only) and deep-opens a screen for screenshot verification.
+        // `marmotFirst` / `replyFirst` open the first Marmot conversation
+        // (optional: arm Reply on the latest inbound text) — for unsigned
+        // sim smoke without Accessibility click automation.
         if onboarded, let route = defaults.string(forKey: "sonar.debug.route") {
             switch route {
             case "settings": path = [.settings]
             case "nearby": path = [.nearby]
+            case "marmotFirst", "replyFirst":
+                scheduleDebugOpenFirstMarmot(beginReply: route == "replyFirst")
             default: break
             }
         }
@@ -2189,6 +2246,76 @@ final class SonarAppStore: ObservableObject {
                 self.scheduleDebugMarmot(text, attempt: attempt + 1)
             } else {
                 SecureLogger.warning("🧪 debug.sendMarmot: gave up — no Sonar peer discovered (no npub)", category: .session)
+            }
+        }
+    }
+
+    /// Open the first Marmot DM for unsigned-sim smoke (no Accessibility).
+    /// When `beginReply` is true, arm Reply on the latest inbound text row and
+    /// send a short reply so the quote chrome can be screenshot-verified.
+    private func scheduleDebugOpenFirstMarmot(beginReply: Bool, attempt: Int = 0) {
+        let delay: Double = attempt == 0 ? 2.5 : 2.0
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            let group = self.marmot.groups.first { self.marmot.isDirectGroup($0) }
+                ?? self.marmot.groups.first
+            guard let group else {
+                if attempt < 12 {
+                    self.scheduleDebugOpenFirstMarmot(beginReply: beginReply, attempt: attempt + 1)
+                } else {
+                    SecureLogger.warning("🧪 debug.route marmotFirst: no Marmot groups yet", category: .session)
+                    self.writeDebugReport("debug.route marmotFirst gave up — no groups")
+                }
+                return
+            }
+            // Prefer the folded home-row id (npub/peer key), not the raw group
+            // hex — `push(.dm(group.id))` paints the mesh empty-state.
+            let chatId: String
+            if let row = self.dmRows.first(where: { $0.marmotGroupId == group.id }) {
+                chatId = row.id
+                self.openDM(row.id, marmotGroupId: row.marmotGroupId)
+            } else if let folded = self.foldedConversationId(forMarmotGroupId: group.id) {
+                chatId = folded
+                self.openDM(folded, marmotGroupId: group.id)
+            } else {
+                chatId = group.id
+                self.openDM(group.id, marmotGroupId: group.id)
+            }
+            SecureLogger.info("🧪 debug.route opened marmot DM \(chatId.prefix(12))", category: .session)
+            self.writeDebugReport("debug.route opened marmot DM \(chatId) group=\(group.id)")
+            guard beginReply else { return }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                let raw = self.marmot.messagesByGroup[group.id] ?? []
+                let target = raw.last(where: { !$0.isMine && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+                    ?? raw.last(where: { !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+                guard let target else {
+                    SecureLogger.warning("🧪 debug.route replyFirst: no replyable message", category: .session)
+                    self.writeDebugReport("debug.route replyFirst — no replyable message")
+                    return
+                }
+                let sn = SNMessage(
+                    id: target.id,
+                    mine: target.isMine,
+                    text: target.content,
+                    time: "",
+                    sortDate: target.createdAt,
+                    senderNpub: target.senderNpub
+                )
+                guard snCanReply(to: sn) else {
+                    SecureLogger.warning("🧪 debug.route replyFirst: snCanReply=false", category: .session)
+                    return
+                }
+                self.beginReply(chatId: chatId, to: sn)
+                SecureLogger.info(
+                    "🧪 debug.route replyFirst armed parent=\(target.id.prefix(12)) preview=\(target.content.prefix(40))",
+                    category: .session
+                )
+                self.writeDebugReport(
+                    "debug.route replyFirst armed parent=\(target.id) preview=\(target.content.prefix(80))"
+                )
+                self.sendDm(chatId, "iOS_reply_to_B_parent")
+                self.writeDebugReport("debug.route replyFirst sent iOS_reply_to_B_parent")
             }
         }
     }
@@ -5666,13 +5793,33 @@ final class SonarAppStore: ObservableObject {
             // every group member on every message.
             let mentionCtx = mentionContext(forConversationId: id)
             for group in sourceGroups {
+                let groupMessages = marmot.messagesByGroup[group.id] ?? []
+                let parentPreviewById = Dictionary(
+                    uniqueKeysWithValues: groupMessages.map { ($0.id, $0.content) }
+                )
+                let parentAuthorById = Dictionary(
+                    uniqueKeysWithValues: groupMessages.map {
+                        (
+                            $0.id,
+                            $0.isMine
+                                ? String(localized: "chat.reply.you", defaultValue: "You")
+                                : (marmot.marmotAuthorName($0)
+                                    ?? String(localized: "chat.reply.them", defaultValue: "Them"))
+                        )
+                    }
+                )
                 dated += Self.transcriptSource(
-                    marmot.messagesByGroup[group.id] ?? [],
+                    groupMessages,
                     limit: limit
                 ).compactMap { m in
                     // Drop a blocked person's messages from the transcript, the
                     // same way the mesh inbound path drops them via `isNostrBlocked`.
                     if !m.isMine, isMarmotSenderBlocked(m.senderNpub) { return nil }
+                    let reply = snReplyRef(
+                        from: m,
+                        parentPreviewById: parentPreviewById,
+                        parentAuthorById: parentAuthorById
+                    )
                     switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
@@ -5685,7 +5832,7 @@ final class SonarAppStore: ObservableObject {
                             transcriptSourceID: group.id,
                             via: .internet,
                             trill: true,
-                            reply: snReplyRef(from: m),
+                            reply: reply,
                             senderNpub: m.senderNpub
                         ))
                     case .bubble(let pay, let payVia):
@@ -5695,7 +5842,7 @@ final class SonarAppStore: ObservableObject {
                             transcriptSourceID: group.id,
                             via: payVia,
                             pay: pay,
-                            reply: snReplyRef(from: m),
+                            reply: reply,
                             senderNpub: m.senderNpub
                         ))
                     case .notPay:
@@ -5714,7 +5861,7 @@ final class SonarAppStore: ObservableObject {
                             // Decoded here, at row build, so the bubble never
                             // crosses the FFI while rendering a frame.
                             mentions: mentionInfo(content: m.content, context: mentionCtx),
-                            reply: snReplyRef(from: m),
+                            reply: reply,
                             senderNpub: m.senderNpub
                         ))
                     }
@@ -6239,7 +6386,7 @@ final class SonarAppStore: ObservableObject {
             return
         }
         queuePendingMeshMarmotSend(text: text, npub: npub, reply: reply.map {
-            SNReplyRef(parentId: $0.parentId, parentNpub: $0.parentNpub, preview: $0.preview ?? "")
+            SNReplyRef(parentId: $0.parentId, parentNpub: $0.parentNpub, author: nil, preview: $0.preview ?? "")
         })
         showToast("Out of range — continuing over White Noise…")
         startSecureMeshMarmotChat(npub: npub)

@@ -14,6 +14,7 @@
 //!   has been published; see MDK docs.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::Path;
 
 use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
@@ -1799,7 +1800,7 @@ impl MarmotEngine {
     /// Decrypted message history for a group (storage-backed).
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
         let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, None))?;
-        Ok(msgs
+        let mut mapped: Vec<ChatMessage> = msgs
             .into_iter()
             // Only surface real chat messages (kind-9). MDK's store ALSO keeps
             // non-chat entries (group-membership / commit / proposal / reaction
@@ -1807,7 +1808,9 @@ impl MarmotEngine {
             // as empty message bubbles in the UI.
             .filter(|m| m.kind.as_u16() == CHAT_RUMOR_KIND)
             .map(|m| self.to_chat_message(m))
-            .collect())
+            .collect();
+        hydrate_page_reply_previews(&mut mapped);
+        Ok(mapped)
     }
 
     /// Bounded decrypted chat-message window for a group, newest window first
@@ -1865,6 +1868,7 @@ impl MarmotEngine {
             }
         }
 
+        hydrate_page_reply_previews(&mut page_messages);
         Ok(page_messages)
     }
 
@@ -2011,6 +2015,7 @@ impl MarmotEngine {
 
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
+        hydrate_page_reply_previews(&mut candidates);
         Ok(candidates)
     }
 
@@ -2262,6 +2267,17 @@ fn overlay_reply_preview(incoming: Incoming, reply: Option<&ReplyTo>) -> Incomin
         }
     }
     Incoming::Message(message)
+}
+
+/// Denormalize quote chip text from other rows in the same bounded local page.
+/// NIP-C7 does not carry a preview; never full-scan the group to fill one.
+fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
+    let by_id: HashMap<EventId, String> =
+        msgs.iter().map(|m| (m.id, m.content.clone())).collect();
+    for m in msgs.iter_mut() {
+        let Some(reply) = m.reply.as_mut() else { continue };
+        crate::reply::hydrate_reply_preview(reply, by_id.get(&reply.parent_id).map(String::as_str));
+    }
 }
 
 /// The database file plus the SQLite sidecar files that may exist alongside it.

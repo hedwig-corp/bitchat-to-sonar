@@ -141,6 +141,22 @@ pub fn truncate_preview(text: &str) -> String {
     out
 }
 
+/// Fill a missing quote snapshot from a locally stored parent body.
+/// NIP-C7 does not carry preview text; Signal-style chips denormalize it here.
+pub fn hydrate_reply_preview(reply: &mut ReplyRef, parent_content: Option<&str>) {
+    if reply
+        .preview
+        .as_ref()
+        .is_some_and(|p| !p.trim().is_empty())
+    {
+        return;
+    }
+    let Some(parent) = parent_content.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    reply.preview = Some(truncate_preview(parent));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +245,19 @@ mod tests {
         let (display, reply) = project_application_content(&wire, std::iter::once(&tag));
         assert_eq!(display, "yes");
         assert_eq!(reply.unwrap().parent_id, id);
+    }
+
+    #[test]
+    fn hydrate_fills_empty_preview_from_parent_body() {
+        let (id, pk) = ids();
+        let mut reply = ReplyRef {
+            parent_id: id,
+            parent_pubkey: Some(pk),
+            preview: None,
+        };
+        hydrate_reply_preview(&mut reply, Some("  parent body  "));
+        assert_eq!(reply.preview.as_deref(), Some("parent body"));
+        hydrate_reply_preview(&mut reply, Some("ignored once filled"));
+        assert_eq!(reply.preview.as_deref(), Some("parent body"));
     }
 }

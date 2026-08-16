@@ -572,17 +572,24 @@ struct SNQuoteChip: View {
                 RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                     .fill(mine ? Color.white.opacity(0.85) : SonarTheme.accent)
                     .frame(width: 3)
-                Text(verbatim: reply.preview)
-                    .font(SonarTheme.uiFont(size: 13))
-                    .foregroundColor(mine ? Color.white.opacity(0.9) : SonarTheme.text2)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
+                VStack(alignment: .leading, spacing: 1) {
+                    if let author = reply.author, !author.isEmpty {
+                        Text(verbatim: author)
+                            .font(SonarTheme.uiFont(size: 11.5, weight: .bold))
+                            .foregroundColor(mine ? Color.white.opacity(0.95) : SonarTheme.accentDeep)
+                    }
+                    Text(verbatim: reply.preview)
+                        .font(SonarTheme.uiFont(size: 12.5))
+                        .foregroundColor(mine ? Color.white.opacity(0.82) : SonarTheme.text2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .multilineTextAlignment(.leading)
+                }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(EdgeInsets(top: 5, leading: 9, bottom: 6, trailing: 9))
             .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(mine ? Color.white.opacity(0.16) : SonarTheme.surface2)
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(mine ? Color.white.opacity(0.20) : Color(sonarHex: 0x7F8A8E, opacity: 0.16))
             )
         }
         .buttonStyle(.plain)
@@ -597,32 +604,42 @@ struct SNComposerReplyBanner: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 10) {
-            RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                .fill(SonarTheme.accent)
-                .frame(width: 3, height: 28)
+            SNIcon(name: .reply, size: 16, weight: 2.1)
+                .foregroundColor(SonarTheme.accent)
             VStack(alignment: .leading, spacing: 1) {
-                Text(String(localized: "chat.reply", defaultValue: "Reply"))
-                    .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                    .foregroundColor(SonarTheme.accentDeep)
+                Text(verbatim: reply.author ?? String(localized: "chat.reply", defaultValue: "Reply"))
+                    .font(SonarTheme.uiFont(size: 12, weight: .bold))
+                    .foregroundColor(SonarTheme.text)
                 Text(verbatim: reply.preview)
-                    .font(SonarTheme.uiFont(size: 13))
+                    .font(SonarTheme.uiFont(size: 12.5))
                     .foregroundColor(SonarTheme.text2)
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
             Spacer(minLength: 8)
             Button(action: onCancel) {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(SonarTheme.text3)
-                    .frame(width: 28, height: 28)
+                    .frame(width: 26, height: 26)
+                    .background(Circle().fill(SonarTheme.surface2))
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(String(localized: "chat.reply.cancel", defaultValue: "Cancel reply"))
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 11)
         .padding(.vertical, 8)
-        .background(SonarTheme.surface2)
+        .background(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(SonarTheme.surface)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .stroke(SonarTheme.hairline, lineWidth: 1)
+                )
+        )
+        .padding(.horizontal, 12)
+        .padding(.bottom, 6)
     }
 }
 
@@ -632,14 +649,40 @@ struct SNReplyChrome<Content: View>: View {
     var onJumpQuote: ((String) -> Void)? = nil
     @ViewBuilder var content: () -> Content
 
+    @State private var dragX: CGFloat = 0
+    @State private var armed = false
+    @State private var rowWidth: CGFloat = 0
+
+    private var canSwipe: Bool { snCanReply(to: m) && onReply != nil }
+    private var progress: CGFloat { SNSwipeReplyMetrics.iconAlpha(dragX) }
+
     var body: some View {
-        VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
-            if snReplyUIEnabled(), let reply = m.reply {
-                SNQuoteChip(reply: reply, mine: m.mine) {
-                    onJumpQuote?(reply.parentId)
-                }
+        ZStack(alignment: .leading) {
+            if canSwipe, progress > 0.05 {
+                SNIcon(name: .reply, size: 18, weight: 2.1)
+                    .foregroundColor(SonarTheme.accent)
+                    .opacity(progress)
+                    .scaleEffect(armed ? 1.16 : 1.0)
+                    .animation(
+                        .interpolatingSpring(stiffness: 400, damping: 12),
+                        value: armed
+                    )
+                    .offset(x: 8 + SNSwipeReplyMetrics.iconOffset(dragX))
+                    .allowsHitTesting(false)
             }
             content()
+                .offset(x: canSwipe ? SNSwipeReplyMetrics.bubbleOffset(dragX) : 0)
+        }
+        .background(
+            GeometryReader { geo in
+                Color.clear.preference(key: SNSwipeReplyRowWidthKey.self, value: geo.size.width)
+            }
+        )
+        .onPreferenceChange(SNSwipeReplyRowWidthKey.self) { rowWidth = $0 }
+        .simultaneousGesture(swipeGesture, including: canSwipe ? .all : .none)
+        .onChange(of: m.id) { _ in
+            dragX = 0
+            armed = false
         }
         .contextMenu {
             if snCanReply(to: m), let onReply {
@@ -651,6 +694,51 @@ struct SNReplyChrome<Content: View>: View {
                 }
             }
         }
+    }
+
+    private var swipeGesture: some Gesture {
+        DragGesture(minimumDistance: 20, coordinateSpace: .local)
+            .onChanged { value in
+                guard canSwipe else { return }
+                let dx = value.translation.width
+                let dy = value.translation.height
+                guard abs(dx) >= abs(dy), dx > 0 else { return }
+                guard SNSwipeReplyMetrics.allowsStart(
+                    localX: value.startLocation.x,
+                    rowWidth: rowWidth,
+                    mine: m.mine
+                ) else { return }
+                dragX = dx
+                let nowArmed = SNSwipeReplyMetrics.isTriggered(dx)
+                if nowArmed != armed {
+                    armed = nowArmed
+                    if nowArmed {
+                        #if os(iOS)
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        #endif
+                    }
+                }
+            }
+            .onEnded { value in
+                let started = SNSwipeReplyMetrics.allowsStart(
+                    localX: value.startLocation.x,
+                    rowWidth: rowWidth,
+                    mine: m.mine
+                )
+                let triggered = canSwipe && started && SNSwipeReplyMetrics.isTriggered(value.translation.width)
+                withAnimation(.easeOut(duration: 0.2)) {
+                    dragX = 0
+                    armed = false
+                }
+                if triggered { onReply?(m) }
+            }
+    }
+}
+
+private struct SNSwipeReplyRowWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
@@ -669,6 +757,9 @@ struct SNMsgBubble: View {
     /// built and cached there — never per frame.
     var mentions: SNMentionInfo = .empty
     var onReply: ((SNMessage) -> Void)? = nil
+    var onJumpQuote: ((String) -> Void)? = nil
+    /// Direct-message rows prefer the conversation name over a raw npub.
+    var quotedPeerName: String? = nil
 
     @Environment(\.openURL) private var openURL
     /// Tap a resolved `@mention` to open that member's profile. Injected by the
@@ -775,7 +866,23 @@ struct SNMsgBubble: View {
                     .contentShape(Rectangle())
                     .onTapGesture { if tappable { onTapAuthor?(m) } }
             }
-            HStack(alignment: .bottom, spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
+                if snReplyUIEnabled(), let reply = m.reply {
+                    let you = String(localized: "chat.reply.you", defaultValue: "You")
+                    let displayReply = reply.author == you || quotedPeerName == nil
+                        ? reply
+                        : SNReplyRef(
+                            parentId: reply.parentId,
+                            parentNpub: reply.parentNpub,
+                            author: quotedPeerName,
+                            preview: reply.preview
+                        )
+                    SNQuoteChip(reply: displayReply, mine: mine) {
+                        onJumpQuote?(reply.parentId)
+                    }
+                    .padding(.bottom, 6)
+                }
+                HStack(alignment: .bottom, spacing: 8) {
                 Text(linkified)
                     .font(SonarTheme.uiFont(size: 16))
                     .lineSpacing(16 * 0.2)
@@ -823,6 +930,7 @@ struct SNMsgBubble: View {
                             Label("Open link", systemImage: "safari")
                         }
                     }
+                }
                 }
             }
             .padding(EdgeInsets(top: 8, leading: 12, bottom: 9, trailing: 12))
@@ -1752,7 +1860,9 @@ struct SNMsgList: View {
                                     maxBubbleWidth: geo.size.width * 0.78,
                                     onTapAuthor: onTapAuthor,
                                     mentions: m.mentions,
-                                    onReply: onReply
+                                    onReply: onReply,
+                                    onJumpQuote: onJumpQuote,
+                                    quotedPeerName: showAuthors ? nil : peerName
                                 )
                             }
                             }

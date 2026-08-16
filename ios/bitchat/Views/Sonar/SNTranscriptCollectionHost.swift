@@ -334,7 +334,9 @@ struct SNCollectionHostMessageRow: View {
                     maxBubbleWidth: textMax,
                     onTapAuthor: onTapAuthor,
                     mentions: m.mentions,
-                    onReply: onReply
+                    onReply: onReply,
+                    onJumpQuote: onJumpQuote,
+                    quotedPeerName: showAuthor ? nil : peerName
                 )
             }
         }

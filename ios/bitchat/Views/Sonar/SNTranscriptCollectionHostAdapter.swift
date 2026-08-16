@@ -113,7 +113,7 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             // Nudge and pay rows render (and wrap on) the peer's display name;
             // a resolved name must re-measure and reconfigure exactly those.
             let nameKey = (m.trill || m.pay != nil) ? "|\(peerName)" : ""
-            let replyKey = m.reply.map { "|r:\($0.parentId):\($0.preview)" } ?? ""
+            let replyKey = m.reply.map { "|r:\($0.parentId):\($0.author ?? ""):\($0.preview)" } ?? ""
             return "m|\(id)|\(m.text)|\(m.state ?? "")|\(mediaKey)|\(bits)\(nameKey)\(replyKey)"
         }
     }

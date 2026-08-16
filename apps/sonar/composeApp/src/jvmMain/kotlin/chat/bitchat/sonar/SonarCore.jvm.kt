@@ -552,7 +552,8 @@ actual object SonarCore {
             SonarReplyRef(
                 parentId = r.parentIdHex,
                 parentNpub = r.parentNpub,
-                preview = r.preview.orEmpty().ifBlank { "Message" },
+                // Keep blank blank — QuoteChip resolves from the local parent.
+                preview = r.preview.orEmpty(),
             )
         },
     )

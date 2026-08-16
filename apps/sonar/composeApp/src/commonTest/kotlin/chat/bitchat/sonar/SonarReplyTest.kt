@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -23,5 +24,62 @@ class SonarReplyTest {
         assertFalse(sonarCanReply(live.copy(id = "optimistic-1")))
         assertFalse(sonarCanReply(live.copy(state = "Sending")))
         assertFalse(sonarCanReply(live.copy(state = "Uploading")))
+        assertFalse(sonarCanReply(live.copy(content = TrillLine("deadbeef").encoded())))
+        assertFalse(sonarCanReply(live.copy(classification = SonarMsgClass.CallControl)))
+    }
+
+    @Test
+    fun androidSwipeInterpolatorMatchesSignalUntilTriggerThenRubberBands() {
+        val trigger = 64f
+        val max = 96f
+        assertEquals(0f, sonarSwipeReplyBubbleOffset(-8f, trigger, max))
+        assertEquals(32f, sonarSwipeReplyBubbleOffset(32f, trigger, max))
+        assertEquals(63.9f, sonarSwipeReplyBubbleOffset(63.9f, trigger, max), 0.01f)
+        val past = sonarSwipeReplyBubbleOffset(80f, trigger, max)
+        assertTrue(past > trigger)
+        assertTrue(past < 80f)
+        assertTrue(past <= max)
+        val far = sonarSwipeReplyBubbleOffset(400f, trigger, max)
+        assertTrue(far > past)
+        assertTrue(far < max)
+        assertFalse(sonarSwipeReplyTriggered(63.9f, trigger))
+        assertTrue(sonarSwipeReplyTriggered(64f, trigger))
+        assertEquals(0.5f, sonarSwipeReplyProgress(32f, trigger))
+        assertEquals(1f, sonarSwipeReplyProgress(80f, trigger))
+    }
+
+    @Test
+    fun iosSwipeInterpolatorRubberBandsAtQuarterOverflow() {
+        val trigger = SONAR_SWIPE_REPLY_IOS_TRIGGER_PT
+        assertEquals(40f, sonarSwipeReplyIosOffset(40f, trigger))
+        assertEquals(55f, sonarSwipeReplyIosOffset(55f, trigger))
+        assertEquals(55f + 20f / 4f, sonarSwipeReplyIosOffset(75f, trigger))
+        assertEquals(0f, sonarSwipeReplyIosOffset(-12f, trigger))
+    }
+
+    @Test
+    fun swipeStartIgnoresSystemBackEdgeAndBlankSide() {
+        assertFalse(sonarSwipeReplyAllowsStart(localX = 10f, rowWidth = 400f, mine = false, edgeGuardPx = 24f))
+        assertTrue(sonarSwipeReplyAllowsStart(localX = 40f, rowWidth = 400f, mine = false, edgeGuardPx = 24f))
+        assertFalse(sonarSwipeReplyAllowsStart(localX = 360f, rowWidth = 400f, mine = false, edgeGuardPx = 24f))
+        assertTrue(sonarSwipeReplyAllowsStart(localX = 320f, rowWidth = 400f, mine = true, edgeGuardPx = 24f))
+        assertFalse(sonarSwipeReplyAllowsStart(localX = 40f, rowWidth = 400f, mine = true, edgeGuardPx = 24f))
+    }
+
+    @Test
+    fun resolvedPreviewPrefersSnapshotThenParentThenFallback() {
+        val reply = SonarReplyRef(parentId = "ab".repeat(32), parentNpub = "npub1peer", preview = "")
+        assertEquals(
+            "parent body",
+            sonarResolvedReplyPreview(reply, parentContent = "parent body", fallback = "Message"),
+        )
+        assertEquals(
+            "snap",
+            sonarResolvedReplyPreview(reply.copy(preview = "snap"), parentContent = "parent body", fallback = "Message"),
+        )
+        assertEquals(
+            "Message",
+            sonarResolvedReplyPreview(reply, parentContent = "  ", fallback = "Message"),
+        )
     }
 }

@@ -2790,13 +2790,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         return composerReplyByChat[chatId]
     }
 
-    fun beginReply(chatId: String, message: SonarMsg, preview: String) {
+    fun beginReply(chatId: String, message: SonarMsg, preview: String, author: String? = null) {
         if (!sonarCanReply(message)) return
         val trimmed = preview.trim()
         if (trimmed.isEmpty()) return
         composerReplyByChat[chatId] = SonarReplyRef(
             parentId = message.id,
             parentNpub = message.senderNpub.takeIf { it.startsWith("npub1") },
+            author = author?.trim()?.takeIf { it.isNotEmpty() },
             preview = trimmed.take(140),
         )
     }

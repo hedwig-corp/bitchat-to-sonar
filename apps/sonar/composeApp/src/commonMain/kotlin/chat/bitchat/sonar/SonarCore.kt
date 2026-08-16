@@ -58,6 +58,8 @@ data class SonarMsg(
 data class SonarReplyRef(
     val parentId: String,
     val parentNpub: String? = null,
+    /** Display-only sender snapshot used by the quote and composer chrome. */
+    val author: String? = null,
     val preview: String,
 )
 
@@ -71,7 +73,66 @@ fun sonarCanReply(message: SonarMsg): Boolean {
         return false
     }
     if (message.state == "Sending" || message.state == "Uploading") return false
+    if (message.classification is SonarMsgClass.CallControl) return false
+    if (TrillLine.isTrillLine(message.content)) return false
     return true
+}
+
+/** Signal-Android `ConversationSwipeAnimationHelper.TRIGGER_DX`. */
+const val SONAR_SWIPE_REPLY_TRIGGER_DP = 64f
+
+/** Signal-Android `ConversationSwipeAnimationHelper.MAX_DX`. */
+const val SONAR_SWIPE_REPLY_MAX_DP = 96f
+
+/** Signal-iOS `CVComponentMessage.swipeActionOffsetThreshold`. */
+const val SONAR_SWIPE_REPLY_IOS_TRIGGER_PT = 55f
+
+/**
+ * Signal-Android bubble translation: 1:1 until [triggerPx], then rubber-band
+ * toward [maxPx] (`BubblePositionInterpolator`).
+ */
+fun sonarSwipeReplyBubbleOffset(rawDx: Float, triggerPx: Float, maxPx: Float): Float {
+    if (rawDx <= 0f) return 0f
+    if (rawDx < triggerPx) return rawDx
+    val segmentLength = maxPx - triggerPx
+    if (segmentLength <= 0f) return triggerPx
+    val segmentTraveled = rawDx - triggerPx
+    val segmentCompletion = segmentTraveled / segmentLength
+    val scaleDownFactor = triggerPx / (rawDx * 2f)
+    val output = triggerPx + (segmentLength * segmentCompletion * scaleDownFactor)
+    return minOf(output, maxPx)
+}
+
+/**
+ * Signal-iOS swipe translation: 1:1 until [triggerPx], then
+ * `threshold + overflow / 4`.
+ */
+fun sonarSwipeReplyIosOffset(rawDx: Float, triggerPx: Float = SONAR_SWIPE_REPLY_IOS_TRIGGER_PT): Float {
+    val x = maxOf(0f, rawDx)
+    if (x <= triggerPx) return x
+    return triggerPx + (x - triggerPx) / 4f
+}
+
+fun sonarSwipeReplyProgress(rawDx: Float, triggerPx: Float): Float {
+    if (triggerPx <= 0f) return 0f
+    return (rawDx / triggerPx).coerceIn(0f, 1f)
+}
+
+fun sonarSwipeReplyTriggered(rawDx: Float, triggerPx: Float): Boolean = rawDx >= triggerPx
+
+/**
+ * Ignore blank trailing space and the system-back / interactive-pop edge.
+ * Incoming bubbles live on the leading ~78% of the row; outgoing on the trailing side.
+ */
+fun sonarSwipeReplyAllowsStart(
+    localX: Float,
+    rowWidth: Float,
+    mine: Boolean,
+    edgeGuardPx: Float,
+): Boolean {
+    if (localX < edgeGuardPx) return false
+    if (rowWidth <= 0f) return true
+    return if (mine) localX > rowWidth * 0.22f else localX < rowWidth * 0.82f
 }
 
 fun sonarCanEmitNipC7(parentId: String, parentNpub: String?): Boolean {
@@ -79,6 +140,18 @@ fun sonarCanEmitNipC7(parentId: String, parentNpub: String?): Boolean {
         return false
     }
     return parentNpub?.startsWith("npub1") == true
+}
+
+fun sonarResolvedReplyPreview(
+    reply: SonarReplyRef,
+    parentContent: String?,
+    fallback: String,
+): String {
+    val snapshot = reply.preview.trim()
+    if (snapshot.isNotEmpty()) return snapshot.take(140)
+    val fromParent = parentContent?.trim().orEmpty()
+    if (fromParent.isNotEmpty()) return fromParent.take(140)
+    return fallback
 }
 
 /**

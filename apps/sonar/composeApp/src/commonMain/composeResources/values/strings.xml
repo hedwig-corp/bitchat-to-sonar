@@ -53,6 +53,7 @@
     <string name="chat_backup_is_on_encrypted_backups">Chat backup is on — encrypted backups upload automatically. Manage in Settings.</string>
     <string name="chat_backup_uploaded">Chat backup uploaded</string>
     <string name="chat_reply">Reply</string>
+    <string name="chat_reply_you">You</string>
     <string name="chat_reply_cancel">Cancel reply</string>
     <string name="chat_reply_fallback">Message</string>
     <string name="chat_reply_payment">Payment</string>
