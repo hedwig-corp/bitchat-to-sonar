@@ -997,13 +997,20 @@ final class BLEService: NSObject {
                 version: 2
             )
 
-            let senderHex = packet.senderID.hexEncodedString()
-            let dedupID = "\(senderHex)-\(packet.timestamp)-\(packet.type)"
+            // Sign public files like `sendFilePrivate` already does. Receivers
+            // can only hold a sender to its pinned key if the sender actually
+            // signs; an unsigned broadcast is unverifiable by construction.
+            // Signing failure is not fatal — send unsigned rather than drop
+            // the user's media.
+            let signedPacket = self.noiseService.signPacket(packet) ?? packet
+
+            let senderHex = signedPacket.senderID.hexEncodedString()
+            let dedupID = "\(senderHex)-\(signedPacket.timestamp)-\(signedPacket.type)"
             self.messageDeduplicator.markProcessed(dedupID)
 
             SecureLogger.debug("📁 Broadcasting file transfer payload bytes=\(payload.count)", category: .session)
-            self.broadcastPacket(packet, transferId: transferId)
-            self.gossipSyncManager?.onPublicPacketSeen(packet)
+            self.broadcastPacket(signedPacket, transferId: transferId)
+            self.gossipSyncManager?.onPublicPacketSeen(signedPacket)
         }
     }
 
@@ -1400,6 +1407,47 @@ final class BLEService: NSObject {
         }
     }
 
+    /// #425 (mirror of the Rust #422 `handle_broadcast` gate): a public
+    /// packet attributed to a peer with a PINNED signing key must carry a
+    /// valid signature under that exact key. The pin comes from the peer's
+    /// verified announce; the 8-byte wire sender id is public and reusable
+    /// by anyone in radio range, so "the id belongs to a verified peer" is
+    /// evidence about the VICTIM, not about the packet.
+    ///
+    /// Verify-when-pinned, exactly like the Rust gate: with no pin recorded
+    /// there is nothing to hold the packet against, and nothing to steal —
+    /// the attribution is only ever as strong as the pin. A verified announce
+    /// always records the signing key, so the no-pin arm is unreachable for
+    /// production verified peers (it keeps test preseeds on their pre-#425
+    /// behavior). With a pin: missing signature or failed verification
+    /// rejects.
+    private func pinnedSenderSignatureValid(_ packet: BitchatPacket, info: PeerInfo) -> Bool {
+        guard let signingKey = info.signingPublicKey else { return true }
+        guard let signature = packet.signature,
+              let packetData = packet.toBinaryDataForSigning() else {
+            return false
+        }
+        return noiseService.verifySignature(signature, for: packetData, publicKey: signingKey)
+    }
+
+    /// Weaker sibling of `pinnedSenderSignatureValid` for FILE packets.
+    ///
+    /// The Rust gate this mirrors covers text broadcasts only — `mesh_engine`
+    /// has no file-transfer arm — and public files are not signed by every
+    /// sender on the network (this app only started signing them alongside
+    /// this change; stock bitchat may not). Requiring a signature here would
+    /// drop every public image/video from an older or third-party sender, so
+    /// an UNSIGNED file keeps its pre-#425 treatment while a file that DOES
+    /// carry a signature must verify under the pin — which closes the forgery
+    /// case without breaking interop.
+    ///
+    /// Tracked gap: once both platforms sign public files, this should become
+    /// `pinnedSenderSignatureValid`.
+    private func pinnedSenderFileSignatureAcceptable(_ packet: BitchatPacket, info: PeerInfo) -> Bool {
+        guard packet.signature != nil else { return true }
+        return pinnedSenderSignatureValid(packet, info: info)
+    }
+
     /// Returns true when this exact (sender, wire message id) file was already
     /// stored, so the caller should re-ACK and drop instead of storing it again.
     private func isDuplicatePrivateFile(peerID: PeerID, messageID: String) -> Bool {
@@ -1426,15 +1474,23 @@ final class BLEService: NSObject {
             accepted = true
             senderNickname = myNickname
         } else if let info = peersSnapshot[peerID], info.isVerifiedNickname {
+            // #425 (mirror of the Rust #422 fix): a public packet claiming a
+            // KNOWN peer's 8-byte sender id must still prove possession of
+            // that peer's pinned signing key — the sender id is public, so
+            // without this check an attacker reusing it gets a forged file
+            // rendered under the victim's nickname. Applies to the
+            // previously-weaker `isConnected` arm too: mere connection is
+            // even less evidence of identity than a verified nickname, so
+            // that arm is folded into this signature-gated one.
+            guard pinnedSenderFileSignatureAcceptable(packet, info: info) else {
+                SecureLogger.warning("🚫 Dropping file transfer failing pinned-key signature for \(peerID.id.prefix(8))…", category: .security)
+                #if DEBUG
+                appendBleDebugReport("file rejected peer=\(peerID.id) reason=pinned-signature")
+                #endif
+                return
+            }
             accepted = true
             senderNickname = info.nickname
-            let hasCollision = peersSnapshot.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.peerID != peerID } || (myNickname == info.nickname)
-            if hasCollision {
-                senderNickname += "#" + String(peerID.id.prefix(4))
-            }
-        } else if let info = peersSnapshot[peerID], info.isConnected {
-            accepted = true
-            senderNickname = info.nickname.isEmpty ? "anon" + String(peerID.id.prefix(4)) : info.nickname
             let hasCollision = peersSnapshot.values.contains { $0.isConnected && $0.nickname == info.nickname && $0.peerID != peerID } || (myNickname == info.nickname)
             if hasCollision {
                 senderNickname += "#" + String(peerID.id.prefix(4))
@@ -4822,7 +4878,16 @@ extension BLEService {
             senderNickname = myNickname
         }
         else if let info = peersSnapshot[peerID], info.isVerifiedNickname {
-            // Known verified peer path
+            // Known verified peer path. #425 (mirror of the Rust #422 fix in
+            // `handle_broadcast`): the 8-byte sender id is public, so a
+            // packet claiming a known peer must still prove possession of
+            // that peer's pinned signing key — otherwise an attacker reusing
+            // the victim's sender id gets a forged public message rendered
+            // under the victim's verified nickname.
+            guard pinnedSenderSignatureValid(packet, info: info) else {
+                SecureLogger.warning("🚫 Dropping public message failing pinned-key signature for \(peerID.id.prefix(8))…", category: .security)
+                return
+            }
             accepted = true
             senderNickname = info.nickname
             // Handle nickname collisions
