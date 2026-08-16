@@ -7659,7 +7659,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                     val safeFilename = encryptedAttachmentFilename(preview.filename)
                     prepared += Triple(preview.chatId, PickedPhoto(raw, safeFilename, safeMime), true)
                 } else {
-                    val jpeg = withContext(Dispatchers.Default) { reencodeToJpeg(raw) }
+                    // A mesh-routed photo travels as BLE fragments capped at
+                    // MAX_MESH_ATTACHMENT_BYTES, so it is downscaled to the
+                    // mesh budget here instead of being rejected at send. A
+                    // route lost between here and the send only means the
+                    // smaller image goes over White Noise.
+                    val meshBound = routesOverMesh(preview.chatId)
+                    val jpeg = withContext(Dispatchers.Default) {
+                        if (meshBound) downscaleJpegForMesh(raw) else reencodeToJpeg(raw)
+                    }
                     if (jpeg == null) {
                         encodeFailed = true
                     } else {
@@ -8003,6 +8011,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
     }
+
+    /** True when a media send for [chatId] would take the BLE mesh leg — the
+     *  same condition [sendMediaAttachment] uses to pick a route. */
+    private fun routesOverMesh(chatId: String): Boolean =
+        isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null
 
     /** True if [chatId] can carry media over live BLE mesh or an existing Marmot group. */
     fun canSendMedia(chatId: String): Boolean =

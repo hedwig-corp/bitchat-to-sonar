@@ -118,8 +118,83 @@ expect fun readTempMediaFile(path: String): ByteArray?
 /** Delete a temp file. Safe to call if the file doesn't exist. */
 expect fun deleteTempMediaFile(path: String)
 
-/** Re-encode raw image bytes to JPEG at quality 0.85, or null if decoding fails. */
+/**
+ * Re-encode raw image bytes to JPEG for an internet (Blossom) send, or null if
+ * decoding fails. The re-encode is what strips EXIF/GPS, so already-JPEG bytes
+ * are normalized here too rather than passed through. Quality is high
+ * ([INTERNET_IMAGE_JPEG_QUALITY]) because the receiver cap is 25 MiB — the
+ * bandwidth saved by a lossier encode is not worth the visible ringing on
+ * screenshots and text.
+ */
 expect fun reencodeToJpeg(data: ByteArray): ByteArray?
+
+/** JPEG quality for an internet-routed photo (0-100). */
+const val INTERNET_IMAGE_JPEG_QUALITY = 92
+
+/**
+ * Re-encode raw image bytes to a JPEG that fits the BLE mesh file packet, or
+ * null if decoding fails. Mesh media has no Blossom upload: the bytes travel
+ * as fire-and-forget BLE fragments capped at [MAX_MESH_ATTACHMENT_BYTES], so a
+ * full-resolution photo is either rejected outright or a very long fragment
+ * train. Downscaling here is what makes a mesh photo both deliverable and
+ * legible.
+ */
+expect fun downscaleJpegForMesh(data: ByteArray): ByteArray?
+
+/**
+ * Longest edge for a mesh-routed image. 1600 px still reads as a photo (and
+ * keeps screenshot text legible) in a 3x phone bubble, and the transcript
+ * decodes thumbnails at [TRANSCRIPT_THUMB_MAX_EDGE_PX] anyway, so this leaves
+ * headroom for the viewer without paying for pixels nobody sees.
+ */
+const val MESH_IMAGE_MAX_EDGE_PX = 1600
+
+/** Floor for the mesh downscale ladder. */
+const val MESH_IMAGE_MIN_EDGE_PX = 640
+
+/**
+ * Soft byte budget for a mesh image: stop compressing once the JPEG fits.
+ * Well under [MAX_MESH_ATTACHMENT_BYTES] because BLE fragments are
+ * fire-and-forget (no retransmit), so a shorter train is a likelier delivery.
+ */
+const val MESH_IMAGE_TARGET_BYTES = 320 * 1024
+
+const val MESH_IMAGE_MAX_QUALITY = 85
+const val MESH_IMAGE_MIN_QUALITY = 60
+private const val MESH_IMAGE_QUALITY_STEP = 5
+
+/**
+ * Pick the largest edge and quality that fit the mesh budget: drop quality
+ * first (cheap, keeps detail), and only then halve the edge. [encode] renders
+ * the source at the given longest edge and JPEG quality.
+ *
+ * Returns the smallest JPEG produced when nothing fits the hard limit — the
+ * caller still enforces [MAX_MESH_ATTACHMENT_BYTES] and can fall back to the
+ * White Noise route, which is strictly better than dropping the send.
+ */
+internal fun compressToMeshBudget(
+    sourceLongestEdgePx: Int,
+    hardLimitBytes: Int = MAX_MESH_ATTACHMENT_BYTES.toInt(),
+    encode: (edgePx: Int, quality: Int) -> ByteArray?,
+): ByteArray? {
+    var edgePx = minOf(sourceLongestEdgePx, MESH_IMAGE_MAX_EDGE_PX)
+        .coerceAtLeast(MESH_IMAGE_MIN_EDGE_PX)
+    var best: ByteArray? = null
+    while (true) {
+        var quality = MESH_IMAGE_MAX_QUALITY
+        while (true) {
+            val encoded = encode(edgePx, quality) ?: break
+            best = encoded
+            if (encoded.size <= MESH_IMAGE_TARGET_BYTES) return encoded
+            if (quality <= MESH_IMAGE_MIN_QUALITY) break
+            quality = maxOf(MESH_IMAGE_MIN_QUALITY, quality - MESH_IMAGE_QUALITY_STEP)
+        }
+        val candidate = best
+        if (candidate != null && candidate.size <= hardLimitBytes) return candidate
+        if (edgePx <= MESH_IMAGE_MIN_EDGE_PX) return best
+        edgePx = maxOf(MESH_IMAGE_MIN_EDGE_PX, edgePx / 2)
+    }
+}
 
 /** Platform share/download/open integration for media viewer actions. */
 @Composable

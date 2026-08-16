@@ -1502,9 +1502,15 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Re-encode a staged photo to JPEG for an internet (Blossom) send. The
+    /// re-encode is what strips EXIF/GPS, so a source that is already JPEG is
+    /// NOT passed through — it is normalized here like every other format.
+    /// Quality is high (0.92) because the receiver cap is 25 MiB: the
+    /// bandwidth saved by a lossier encode is not worth the visible ringing on
+    /// screenshots and text.
     private nonisolated static func reencodeToJpeg(_ data: Data) -> Data? {
         #if canImport(UIKit)
-        return UIImage(data: data)?.jpegData(compressionQuality: 0.85)
+        return UIImage(data: data)?.jpegData(compressionQuality: 0.92)
         #else
         return data
         #endif

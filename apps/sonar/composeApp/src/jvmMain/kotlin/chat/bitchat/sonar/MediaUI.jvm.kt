@@ -300,10 +300,43 @@ actual fun deleteTempMediaFile(path: String) {
 
 actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
     val src = ImageIO.read(ByteArrayInputStream(data)) ?: return null
-    val rgb = BufferedImage(src.width, src.height, BufferedImage.TYPE_INT_RGB)
+    return encodeJpeg(flattenToRgb(src, src.width, src.height), INTERNET_IMAGE_JPEG_QUALITY / 100f)
+}
+
+actual fun downscaleJpegForMesh(data: ByteArray): ByteArray? {
+    val src = ImageIO.read(ByteArrayInputStream(data)) ?: return null
+    var scaled: BufferedImage? = null
+    var scaledFor = -1
+    return compressToMeshBudget(maxOf(src.width, src.height)) { edgePx, quality ->
+        if (scaledFor != edgePx) {
+            val longestEdge = maxOf(src.width, src.height)
+            val ratio = if (longestEdge > edgePx) edgePx.toFloat() / longestEdge else 1f
+            scaled = flattenToRgb(
+                src,
+                (src.width * ratio).toInt().coerceAtLeast(1),
+                (src.height * ratio).toInt().coerceAtLeast(1),
+            )
+            scaledFor = edgePx
+        }
+        scaled?.let { encodeJpeg(it, quality / 100f) }
+    }
+}
+
+/** Draw [src] into an opaque RGB image of the given size (JPEG has no alpha,
+ *  and the redraw is what drops the source's metadata). */
+private fun flattenToRgb(src: BufferedImage, width: Int, height: Int): BufferedImage {
+    val rgb = BufferedImage(width, height, BufferedImage.TYPE_INT_RGB)
     val g = rgb.createGraphics()
-    g.drawImage(src, 0, 0, java.awt.Color.WHITE, null)
+    g.setRenderingHint(
+        java.awt.RenderingHints.KEY_INTERPOLATION,
+        java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR,
+    )
+    g.drawImage(src, 0, 0, width, height, java.awt.Color.WHITE, null)
     g.dispose()
+    return rgb
+}
+
+private fun encodeJpeg(image: BufferedImage, quality: Float): ByteArray? {
     val writers = ImageIO.getImageWritersByFormatName("jpg")
     if (!writers.hasNext()) return null
     val writer = writers.next()
@@ -313,9 +346,9 @@ actual fun reencodeToJpeg(data: ByteArray): ByteArray? {
             writer.output = ios
             val param = writer.defaultWriteParam.apply {
                 compressionMode = ImageWriteParam.MODE_EXPLICIT
-                compressionQuality = 0.85f
+                compressionQuality = quality
             }
-            writer.write(null, IIOImage(rgb, null, null), param)
+            writer.write(null, IIOImage(image, null, null), param)
         }
         return out.toByteArray().takeIf { it.isNotEmpty() }
     } finally {
