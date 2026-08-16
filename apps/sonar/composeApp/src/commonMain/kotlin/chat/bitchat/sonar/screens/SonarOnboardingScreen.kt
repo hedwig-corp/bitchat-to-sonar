@@ -8,7 +8,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -211,10 +213,28 @@ fun SonarOnboardingScreen(state: SonarAppState) {
     }
 }
 
+/**
+ * A step keeps its centred layout while it fits, and scrolls once it does not
+ * (short screens, large font scales, keyboard up). The footer stays put.
+ */
+@Composable
+private fun StepBody(content: @Composable ColumnScope.() -> Unit) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val viewport = maxHeight
+        Column(
+            Modifier.fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .heightIn(min = viewport),
+            verticalArrangement = Arrangement.Center,
+            content = content,
+        )
+    }
+}
+
 @Composable
 private fun StepIntro() {
     val s = sonar
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
+    StepBody {
         Box(
             Modifier.size(74.dp).clip(RoundedCornerShape(23.dp)).background(s.accentFill),
             contentAlignment = Alignment.Center
@@ -255,7 +275,7 @@ private fun FeatureRow(icon: SNIconName, title: String, desc: String) {
 @Composable
 private fun StepNickname(nick: String, trimmed: String, onChange: (String) -> Unit) {
     val s = sonar
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
+    StepBody {
         Text(stringResource(Res.string.pick_a_nickname), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
         Text(stringResource(Res.string.it_s_just_what_people_see_change_it), color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
@@ -305,7 +325,7 @@ private fun StepRestore(
     onPaste: () -> Unit,
 ) {
     val s = sonar
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.Center) {
+    StepBody {
         Text(stringResource(Res.string.restore_account), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
         Text(
@@ -349,7 +369,7 @@ private fun StepRestore(
 private fun StepDone(nick: String, fingerprint: String) {
     val s = sonar
     val generatingLabel = stringResource(Res.string.generating)
-    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
+    StepBody {
         SonarAvatar(nick.ifEmpty { "?" }, 92.dp)
         Spacer(Modifier.height(22.dp))
         Text(stringResource(Res.string.you_re_in, nick), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
