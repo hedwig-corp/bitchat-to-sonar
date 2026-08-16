@@ -744,12 +744,22 @@ struct SNMsgBubble: View {
     }
 }
 
+/// Stable invalidation source for transfer-state changes. UIKit transcript cells
+/// retain their SwiftUI hierarchy while downloads advance, so closure reads
+/// alone are not reactive; media bubbles observe this source directly.
+final class SNMediaPipelineUpdates: ObservableObject {
+    func invalidate() {
+        objectWillChange.send()
+    }
+}
+
 struct SNMediaPipeline {
     var state: (SNMediaItem) -> SNMediaTransferState
     var prepare: (SNMediaItem, Bool) -> Void
     var request: (SNMediaItem) -> Void
     var cancel: (SNMediaItem) -> Void
     var loadLocal: (SNMediaItem) async -> Data?
+    var updates: SNMediaPipelineUpdates = SNMediaPipelineUpdates()
 
     static let unavailable = SNMediaPipeline(
         state: { _ in .notDownloaded },
@@ -2489,23 +2499,25 @@ struct SNMediaBubble: View {
     }
 
     var body: some View {
-        Group {
-            #if os(iOS)
-            bubble
-                .fullScreenCover(isPresented: $viewerOpen) { viewer }
-                .quickLookPreview($nativePreviewURL)
-            #else
-            bubble
-                .sheet(isPresented: $viewerOpen) {
-                    viewer.frame(minWidth: 620, minHeight: 520)
-                }
-                .quickLookPreview($nativePreviewURL)
-            #endif
-        }
-            .onChange(of: nativePreviewURL) { url in
-                if url == nil { cleanupNativePreview() }
+        SNMediaPipelineUpdateObserver(updates: pipeline.updates) {
+            Group {
+                #if os(iOS)
+                bubble
+                    .fullScreenCover(isPresented: $viewerOpen) { viewer }
+                    .quickLookPreview($nativePreviewURL)
+                #else
+                bubble
+                    .sheet(isPresented: $viewerOpen) {
+                        viewer.frame(minWidth: 620, minHeight: 520)
+                    }
+                    .quickLookPreview($nativePreviewURL)
+                #endif
             }
-            .onDisappear { cleanupNativePreview() }
+                .onChange(of: nativePreviewURL) { url in
+                    if url == nil { cleanupNativePreview() }
+                }
+                .onDisappear { cleanupNativePreview() }
+        }
     }
 
     @ViewBuilder private var viewer: some View {
@@ -2823,6 +2835,15 @@ struct SNMediaBubble: View {
         }
         nativePreviewURL = nil
         nativePreviewDirectory = nil
+    }
+}
+
+private struct SNMediaPipelineUpdateObserver<Content: View>: View {
+    @ObservedObject var updates: SNMediaPipelineUpdates
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        content()
     }
 }
 

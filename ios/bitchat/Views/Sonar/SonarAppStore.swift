@@ -6643,7 +6643,12 @@ final class SonarAppStore: ObservableObject {
     /// In-memory decrypted-media cache (raw bytes), keyed by the ciphertext's
     /// Blossom URL. Cleared by `wipe()` and `eraseAllChats()`.
     private var mediaImageCache: [String: Data] = [:]
-    @Published private var mediaTransferStates: [String: SNMediaTransferState] = [:]
+    let mediaPipelineUpdates = SNMediaPipelineUpdates()
+    @Published private var mediaTransferStates: [String: SNMediaTransferState] = [:] {
+        didSet {
+            mediaPipelineUpdates.invalidate()
+        }
+    }
     private var mediaDownloadTasks: [String: Task<Void, Never>] = [:]
     private var mediaDownloadListeners: [String: SNMediaDownloadListener] = [:]
     private var mediaDownloadGenerations: [String: UUID] = [:]

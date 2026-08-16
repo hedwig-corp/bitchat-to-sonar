@@ -3870,7 +3870,8 @@ private struct MacDMTranscript: View {
                     prepare: { store.prepareMedia($0, autoDownload: $1) },
                     request: { store.requestMediaDownload($0) },
                     cancel: { store.cancelMediaDownload($0) },
-                    loadLocal: { await store.mediaData($0) }
+                    loadLocal: { await store.mediaData($0) },
+                    updates: store.mediaPipelineUpdates
                 ),
                 loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                 onTapPack: onTapPack,
@@ -3938,7 +3939,8 @@ private struct MacCollectionHostDM<Composer: View>: View {
                     prepare: { store.prepareMedia($0, autoDownload: $1) },
                     request: { store.requestMediaDownload($0) },
                     cancel: { store.cancelMediaDownload($0) },
-                    loadLocal: { await store.mediaData($0) }
+                    loadLocal: { await store.mediaData($0) },
+                    updates: store.mediaPipelineUpdates
                 ),
                 loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                 onTapPack: onTapPack,
@@ -4009,7 +4011,8 @@ private struct MacSpikeADMHost<Composer: View>: View {
                     prepare: { store.prepareMedia($0, autoDownload: $1) },
                     request: { store.requestMediaDownload($0) },
                     cancel: { store.cancelMediaDownload($0) },
-                    loadLocal: { await store.mediaData($0) }
+                    loadLocal: { await store.mediaData($0) },
+                    updates: store.mediaPipelineUpdates
                 ),
                 loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                 onTapPack: onTapPack,
