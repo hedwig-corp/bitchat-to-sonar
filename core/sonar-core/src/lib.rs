@@ -26,6 +26,7 @@ pub mod push;
 pub mod relay_directory;
 pub mod reply;
 pub mod sonar_descriptor;
+pub mod sqlcipher_runtime;
 pub mod sticker_cache;
 
 pub use error::Error;

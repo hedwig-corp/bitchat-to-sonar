@@ -5,6 +5,13 @@ import chat.bitchat.sonar.push.InlineFallbackPlan
 import chat.bitchat.sonar.push.SonarPushInlineFallback
 import chat.bitchat.sonar.push.SonarPushProcessingService
 import chat.bitchat.sonar.push.inlineFallbackPlan
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -79,9 +86,9 @@ class PushInlineFallbackPlanTest {
             return syncResult
         }
 
-        override suspend fun notifyUnread(): Int {
+        override suspend fun notifyUnread(tryClaimPost: () -> Boolean): Int {
             notifyCalls++
-            return unread
+            return if (tryClaimPost()) unread else 0
         }
 
         override fun notifyGeneric() {
@@ -150,6 +157,75 @@ class PushInlineFallbackPlanTest {
         assertEquals(1, effects.syncCalls, "local storage must still catch up")
         assertEquals(0, effects.notifyCalls)
         assertEquals(0, effects.genericCalls)
+    }
+
+    @Test
+    fun timedOutUnreadJobCannotPostAfterGenericFallback() = runBlocking {
+        val titledPosts = AtomicInteger(0)
+        val unreadFinished = CountDownLatch(1)
+        var genericPosts = 0
+        val effects = object : InlineFallbackEffects {
+            override suspend fun syncMarmot() = false
+
+            override suspend fun notifyUnread(tryClaimPost: () -> Boolean): Int {
+                try {
+                    // Models cancellation-unaware conversationSummaries().
+                    withContext(NonCancellable) { delay(75) }
+                    return if (tryClaimPost()) titledPosts.incrementAndGet() else 0
+                } finally {
+                    unreadFinished.countDown()
+                }
+            }
+
+            override fun notifyGeneric() {
+                genericPosts++
+            }
+
+            override fun notificationsEnabled() = true
+
+            override suspend fun answerInvoiceRequest(payload: String) = false
+        }
+
+        SonarPushInlineFallback.marmotBoundedSync(effects, notifyBudgetMs = 10)
+
+        assertEquals(1, genericPosts, "timed-out render must degrade exactly once")
+        assertTrue(unreadFinished.await(1, TimeUnit.SECONDS), "orphan did not finish")
+        assertEquals(0, titledPosts.get(), "late orphan posted after generic fallback")
+    }
+
+    @Test
+    fun titledPostClaimedBeforeTimeoutSuppressesGenericFallback() = runBlocking {
+        val unreadFinished = CountDownLatch(1)
+        val titledPosts = AtomicInteger(0)
+        var genericPosts = 0
+        val effects = object : InlineFallbackEffects {
+            override suspend fun syncMarmot() = false
+
+            override suspend fun notifyUnread(tryClaimPost: () -> Boolean): Int {
+                try {
+                    if (tryClaimPost()) titledPosts.incrementAndGet()
+                    // The renderer can still overrun after one banner landed.
+                    withContext(NonCancellable) { delay(75) }
+                    return titledPosts.get()
+                } finally {
+                    unreadFinished.countDown()
+                }
+            }
+
+            override fun notifyGeneric() {
+                genericPosts++
+            }
+
+            override fun notificationsEnabled() = true
+
+            override suspend fun answerInvoiceRequest(payload: String) = false
+        }
+
+        SonarPushInlineFallback.marmotBoundedSync(effects, notifyBudgetMs = 10)
+
+        assertEquals(1, titledPosts.get())
+        assertEquals(0, genericPosts, "claimed titled banner must prevent a generic duplicate")
+        assertTrue(unreadFinished.await(1, TimeUnit.SECONDS), "orphan did not finish")
     }
 
     @Test

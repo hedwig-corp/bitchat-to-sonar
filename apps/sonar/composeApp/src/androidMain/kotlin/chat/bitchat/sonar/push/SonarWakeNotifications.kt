@@ -43,6 +43,7 @@ internal object SonarWakeNotifications {
         prefs: SonarNotificationPrefs,
         scope: CoroutineScope,
         profileFetchBudgetMs: Long = PROFILE_FETCH_BUDGET_MS,
+        tryClaimPost: () -> Boolean = { true },
     ): Int {
         val summaries = SonarCore.conversationSummaries()
         val unread = summaries.filter { it.unreadCount > 0 }
@@ -95,7 +96,10 @@ internal object SonarWakeNotifications {
                 unreadCount = summary.unreadCount,
                 prefs = prefs,
             )
-            if (notif != null) {
+            // The inline fallback can stop awaiting us while a blocking UniFFI
+            // call is still running. Its gate is the final authority: never
+            // post a titled banner after that caller has degraded to generic.
+            if (notif != null && tryClaimPost()) {
                 Notifier.notify(
                     id = notif.id,
                     title = notif.title,

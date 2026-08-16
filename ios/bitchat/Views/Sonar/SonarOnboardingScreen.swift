@@ -65,21 +65,29 @@ struct SonarOnboardingScreen: View {
             .frame(height: 40)
             .padding(.leading, -10)
 
-            // bc-obbody
-            Group {
-                if restoring {
-                    stepRestore
-                } else {
-                    switch step {
-                    case 0: stepIntro
-                    case 1: stepNickname
-                    default: stepDone
+            // bc-obbody — the step keeps its centred layout while it fits, and
+            // scrolls once it does not (short devices, longer translations, the
+            // keyboard up on the nickname/restore steps). The footer stays put.
+            GeometryReader { proxy in
+                ScrollView {
+                    Group {
+                        if restoring {
+                            stepRestore
+                        } else {
+                            switch step {
+                            case 0: stepIntro
+                            case 1: stepNickname
+                            default: stepDone
+                            }
+                        }
                     }
+                    .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .leading)
+                    .transition(reduceMotion ? .opacity : .offset(y: 10).combined(with: .opacity))
+                    .id(restoring ? -1 : step)
                 }
+                .scrollBounceBasedOnSize()
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-            .transition(reduceMotion ? .opacity : .offset(y: 10).combined(with: .opacity))
-            .id(restoring ? -1 : step)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             // bc-obfooter
             VStack(spacing: 16) {
@@ -377,6 +385,19 @@ struct SonarOnboardingScreen: View {
                     ?? "That key couldn\u{2019}t be imported. Check you pasted the full nsec1\u{2026} key."
                 restoreInFlight = false
             }
+        }
+    }
+}
+
+private extension View {
+    /// Rubber-banding a scroll view whose content already fits reads as a bug,
+    /// so bouncing is limited to the overflow case where it is available.
+    @ViewBuilder
+    func scrollBounceBasedOnSize() -> some View {
+        if #available(iOS 16.4, macOS 13.3, *) {
+            self.scrollBounceBehavior(.basedOnSize)
+        } else {
+            self
         }
     }
 }
