@@ -481,6 +481,25 @@ func snReplyRef(
     )
 }
 
+func snReplyParentAuthorsById(
+    _ entries: [(id: String, author: String)]
+) -> [String: String] {
+    entries.reduce(into: [:]) { authors, entry in
+        // A transient duplicate row must not turn transcript hydration into
+        // Dictionary(uniqueKeysWithValues:)'s fatal duplicate-key trap.
+        if authors[entry.id] == nil {
+            authors[entry.id] = entry.author
+        }
+    }
+}
+
+func snDeduplicateTranscriptRowsFirstWins(
+    _ rows: [(date: Date, message: SNMessage)]
+) -> [(date: Date, message: SNMessage)] {
+    var seen = Set<String>()
+    return rows.filter { seen.insert($0.message.id).inserted }
+}
+
 func snMeshReplyRef(from message: BitchatMessage, parents: [BitchatMessage]) -> SNReplyRef? {
     guard let parentId = message.replyTo?.trimmingCharacters(in: .whitespacesAndNewlines),
           !parentId.isEmpty
@@ -5868,11 +5887,11 @@ final class SonarAppStore: ObservableObject {
             let mentionCtx = mentionContext(forConversationId: id)
             for group in sourceGroups {
                 let groupMessages = marmot.messagesByGroup[group.id] ?? []
-                let parentAuthorById = Dictionary(
-                    uniqueKeysWithValues: groupMessages.map {
+                let parentAuthorById = snReplyParentAuthorsById(
+                    groupMessages.map {
                         (
-                            $0.id,
-                            $0.isMine
+                            id: $0.id,
+                            author: $0.isMine
                                 ? String(localized: "chat.reply.you", defaultValue: "You")
                                 : (marmot.marmotAuthorName($0)
                                     ?? String(localized: "chat.reply.them", defaultValue: "Them"))
@@ -6174,7 +6193,7 @@ final class SonarAppStore: ObservableObject {
             message.transcriptSourceID = SNConversationTranscriptSource.callLogID
             combined.append((c.date, message))
         }
-        return combined.enumerated()
+        return snDeduplicateTranscriptRowsFirstWins(combined).enumerated()
             .sorted {
                 if $0.element.0 == $1.element.0 { return $0.offset < $1.offset }
                 return $0.element.0 < $1.element.0

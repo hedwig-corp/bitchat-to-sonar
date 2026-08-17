@@ -94,6 +94,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
@@ -1131,6 +1132,32 @@ private fun ChannelHint() {
 internal fun transcriptFeedKey(item: Any): String =
     if (item is CallRecord) "c:${item.id}" else "m:${(item as SonarMsg).id}"
 
+/**
+ * Last-wins call-log dedupe. Hangup/decline used to append immediately and
+ * [finalizeCall] appended again for the same callId — LazyColumn keys are
+ * `c:<id>`, so a duplicate crashes chat open on Android.
+ */
+internal fun dedupeCallRecordsLastWins(rows: List<CallRecord>): List<CallRecord> {
+    // Always return a fresh list: ChatScreen remembers by reference, and an
+    // in-place upsert must not leave a stale singleton backing the feed.
+    if (rows.isEmpty()) return emptyList()
+    if (rows.size == 1) return listOf(rows[0])
+    return rows.asReversed().distinctBy { it.id }.asReversed()
+}
+
+/** Last-wins message id collapse before LazyColumn `m:<id>` keys. */
+internal fun dedupeTranscriptMessagesLastWins(rows: List<SonarMsg>): List<SonarMsg> {
+    if (rows.size <= 1) return rows.toList()
+    return rows.asReversed().distinctBy { it.id }.asReversed()
+}
+
+/** Hangup/decline and finalize share one callId — replace in place, never append twice. */
+internal fun upsertCallRecordList(list: MutableList<CallRecord>, record: CallRecord) {
+    // Legacy lists may already contain duplicates; drop every match, then keep one.
+    list.removeAll { it.id == record.id }
+    list.add(record)
+}
+
 /** Flattened LazyColumn rows so day chips / unread own stable keys (Signal).
  *  Internal (not private) so tests pin the real feed-flattening call site. */
 internal sealed interface ChatFeedListItem {
@@ -1353,7 +1380,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // filter runs PayLine.decode per row (and an FFI call for ☎CALL rows) and
     // the merge sorts — per-recomposition work the render path must not repeat
     // when unrelated state (media decode, presence) invalidates the screen.
-    val calls = run { state.callVersion; state.callRecords(screen.id) }
+    // callRecords() already last-wins-dedupes; key on callVersion so an upsert
+    // that replaces duration/ts rebuilds the feed even when list size is unchanged.
+    val calls = remember(screen.id, state.callVersion) {
+        state.callRecords(screen.id)
+    }
     val feed: List<Any> = remember(state.messages, calls) {
         // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines.
         // Core rows answer from their precomputed classification, which is also
@@ -1361,12 +1392,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // never anchor on a row the transcript refuses to show. Only rows
         // without one (mesh, optimistic echoes) pay the string decode, and the
         // cheap ☎CALL prefix check keeps ordinary chat off the FFI path.
-        val visible = state.messages.filter { msg ->
-            isTranscriptVisibleRow(msg) { content ->
-                content.trimStart().startsWith("☎CALL") &&
-                    SonarCore.callParseControl(content) != null
-            }
-        }
+        // Last-wins on message id: LazyColumn keys are m:<id>; first-wins would
+        // hide a newer folded/mesh row while keeping the list "green".
+        val visible = dedupeTranscriptMessagesLastWins(
+            state.messages.filter { msg ->
+                isTranscriptVisibleRow(msg) { content ->
+                    content.trimStart().startsWith("☎CALL") &&
+                        SonarCore.callParseControl(content) != null
+                }
+            },
+        )
         (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
     }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
@@ -3111,31 +3146,27 @@ private fun QuoteChip(
     val s = sonar
     // design/handoff `.bc-quote`: compact single-line quote, with outgoing
     // content inverted over a 20% wash and incoming accents following transport.
+    // Stripe uses IntrinsicSize.Min (R-035): never claim a LazyColumn viewport
+    // height via fillMaxHeight under unbounded maxHeight.
     val stripe = if (mine) onMine.copy(alpha = 0.85f) else transportAccent
     val authorColor = if (mine) onMine else transportAccentDeep
     val previewColor = (if (mine) onMine else s.text).copy(alpha = 0.82f)
     val fill = if (mine) Color.White.copy(alpha = 0.20f) else Color(0xFF7F8A8E).copy(alpha = 0.16f)
-    Box(
+    Row(
         modifier
+            .height(IntrinsicSize.Min)
             .clip(RoundedCornerShape(9.dp))
             .background(fill)
             .clickable(onClick = onTap),
     ) {
         Box(
             Modifier
-                .align(Alignment.CenterStart)
-                .matchParentSize(),
-        ) {
-            Box(
-                Modifier
-                    .align(Alignment.CenterStart)
-                    .fillMaxHeight()
-                    .width(3.dp)
-                    .background(stripe),
-            )
-        }
+                .width(3.dp)
+                .fillMaxHeight()
+                .background(stripe),
+        )
         Column(
-            Modifier.padding(start = 12.dp, end = 9.dp, top = 5.dp, bottom = 6.dp),
+            Modifier.padding(start = 9.dp, end = 9.dp, top = 5.dp, bottom = 6.dp),
             verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
             reply.author?.takeIf { it.isNotBlank() }?.let {
@@ -3160,9 +3191,10 @@ private fun QuoteChip(
 }
 
 /** Signal-Android `quoteView.width = availableWidth`: size to the body, then
- *  stretch the quote to that width (or to the quote's own width if it is wider). */
+ *  stretch the quote to that width (or to the quote's own width if it is wider).
+ *  Children are measured with unconstrained height (R-035 / iOS SNFillWidestVStack). */
 @Composable
-private fun QuoteThenBody(
+internal fun QuoteThenBody(
     quote: @Composable () -> Unit,
     body: @Composable () -> Unit,
 ) {
@@ -3173,15 +3205,19 @@ private fun QuoteThenBody(
             Box { body() }
         },
     ) { measurables, constraints ->
-        val bodyPlaceable = measurables[1].measure(constraints)
+        val heightLoose = constraints.copy(minHeight = 0, maxHeight = Constraints.Infinity)
+        val bodyPlaceable = measurables[1].measure(heightLoose)
         val quotePlaceable = measurables[0].measure(
-            constraints.copy(
-                minWidth = bodyPlaceable.width.coerceAtMost(constraints.maxWidth),
+            heightLoose.copy(
+                minWidth = bodyPlaceable.width.coerceIn(0, constraints.maxWidth),
                 maxWidth = constraints.maxWidth,
             ),
         )
         val width = maxOf(quotePlaceable.width, bodyPlaceable.width)
-        val height = quotePlaceable.height + spacing + bodyPlaceable.height
+            .coerceIn(constraints.minWidth, constraints.maxWidth)
+        val height = (quotePlaceable.height + spacing + bodyPlaceable.height)
+            .coerceAtLeast(constraints.minHeight)
+            .let { if (constraints.hasBoundedHeight) it.coerceAtMost(constraints.maxHeight) else it }
         layout(width, height) {
             quotePlaceable.placeRelative(0, 0)
             bodyPlaceable.placeRelative(0, quotePlaceable.height + spacing)

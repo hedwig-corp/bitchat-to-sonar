@@ -7,6 +7,10 @@ internal actual fun sonarLog(tag: String, message: String) {
     SonarFileLog.append(tag, message)
 }
 
+internal actual fun noteCrashBreadcrumb(message: String) {
+    AndroidCrashDiagnostics.note(message)
+}
+
 // Never emit bench markers from a Release build (same rule as iOS, where
 // SecureLogger renders them <private> in Release).
 internal actual val sonarBenchMarkersEnabled: Boolean = BuildConfig.DEBUG

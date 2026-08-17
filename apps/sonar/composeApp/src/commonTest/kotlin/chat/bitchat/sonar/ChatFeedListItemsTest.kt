@@ -78,4 +78,59 @@ class ChatFeedListItemsTest {
         val items = buildChatFeedListItems(feed, unreadAnchorIndex = -1)
         assertEquals(chatFeedListTailIndex(items), chatFeedListOpenIndex(items, null, -1))
     }
+
+    @Test
+    fun duplicateCallRecordsCollapseLastWinsAndKeepUniqueKeys() {
+        val first = CallRecord(id = "call-1", video = false, mine = true, durSecs = 0, tsSecs = t0)
+        val second = first.copy(durSecs = 42, tsSecs = t0 + 5)
+        val duplicates = listOf(first, second)
+        val deduped = dedupeCallRecordsLastWins(duplicates)
+        assertEquals(1, deduped.size)
+        assertEquals(42, deduped.single().durSecs)
+        val one = listOf(first)
+        val singleton = dedupeCallRecordsLastWins(one)
+        // Singleton path must not leak the mutable/input list into remember().
+        assertTrue(singleton !== one)
+        assertEquals(first, singleton.single())
+
+        // Production path: feed builder sees already-deduped callRecords(), but
+        // also tolerate a duplicate list if a caller forgets the read seam.
+        val keys = buildChatFeedListItems(
+            listOf(msg("a", t0)) + dedupeCallRecordsLastWins(duplicates),
+            unreadAnchorIndex = -1,
+        ).map(::chatFeedListKey)
+        assertEquals(keys.size, keys.toSet().size)
+        assertTrue(keys.contains("c:call-1"))
+    }
+
+    @Test
+    fun hangupThenFinalizeUpsertsOneCallRecord() {
+        val list = mutableListOf(
+            CallRecord(id = "call-1", video = false, mine = true, durSecs = 0, tsSecs = t0),
+            CallRecord(id = "call-1", video = false, mine = true, durSecs = 1, tsSecs = t0 + 1),
+        )
+        upsertCallRecordList(
+            list,
+            CallRecord(id = "call-1", video = false, mine = true, durSecs = 42, tsSecs = t0 + 5),
+        )
+        assertEquals(1, list.size)
+        assertEquals(42, list.single().durSecs)
+
+        val keys = buildChatFeedListItems(
+            listOf(msg("a", t0), list.single()),
+            unreadAnchorIndex = -1,
+        ).map(::chatFeedListKey)
+        assertEquals(keys.size, keys.toSet().size)
+    }
+
+    @Test
+    fun duplicateMessageIdsCollapseLastWinsAndKeepUniqueKeys() {
+        val first = msg("same", t0)
+        val second = first.copy(content = "newer", tsSecs = t0 + 1)
+        val collapsed = dedupeTranscriptMessagesLastWins(listOf(first, second))
+        assertEquals(listOf("newer"), collapsed.map { it.content })
+        val keys = buildChatFeedListItems(collapsed, unreadAnchorIndex = -1).map(::chatFeedListKey)
+        assertEquals(keys.size, keys.toSet().size)
+        assertEquals(listOf("m:same"), keys.filter { it.startsWith("m:") })
+    }
 }

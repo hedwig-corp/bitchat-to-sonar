@@ -1409,8 +1409,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     var callVersion by mutableStateOf(0)
         private set
 
-    /** Call-log records for [chatId] (oldest first). */
-    fun callRecords(chatId: String): List<CallRecord> = callLogs[chatId].orEmpty()
+    /** Call-log records for [chatId] (oldest first). Deduped last-wins so a
+     *  hangup-then-finalize race never feeds duplicate LazyColumn keys. */
+    fun callRecords(chatId: String): List<CallRecord> =
+        dedupeCallRecordsLastWins(callLogs[chatId].orEmpty())
+
+    /** Insert or replace by call id — hangup/decline and finalize share one id. */
+    private fun upsertCallRecord(chatId: String, record: CallRecord) {
+        val list = callLogs.getOrPut(chatId) { mutableListOf() }
+        upsertCallRecordList(list, record)
+        callVersion++
+    }
 
     // ── Real P2P voice calls (iroh transport; ☎CALL over the chat) ──
     /** The in-flight call the [CallScreen] renders, or null. [phase] tracks the
@@ -1581,10 +1590,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val c = activeCall ?: return
         callTicker?.cancel(); callTicker = null
         CallAudioRoute.configure(active = false, speakerOn = false)
-        callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
-            CallRecord(id = c.callId, video = c.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs())
+        upsertCallRecord(
+            c.chatId,
+            CallRecord(id = c.callId, video = c.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()),
         )
-        callVersion++
         activeCall = null
         popCallScreenIfNeeded()
         scope.launch {
@@ -1599,10 +1608,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val c = activeCall ?: return
         callTicker?.cancel(); callTicker = null
         CallAudioRoute.configure(active = false, speakerOn = false)
-        callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
-            CallRecord(id = c.callId, video = c.video, mine = !c.incoming, durSecs = c.connectedSecs, tsSecs = SonarClock.nowSecs())
+        upsertCallRecord(
+            c.chatId,
+            CallRecord(id = c.callId, video = c.video, mine = !c.incoming, durSecs = c.connectedSecs, tsSecs = SonarClock.nowSecs()),
         )
-        callVersion++
         activeCall = null
         popCallScreenIfNeeded()
         scope.launch {
@@ -1677,10 +1686,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         callTicker?.cancel(); callTicker = null
         CallAudioRoute.configure(active = false, speakerOn = false)
         val connected = ev.durationSecs > 0
-        callLogs.getOrPut(c.chatId) { mutableListOf() }.add(
-            CallRecord(id = c.callId, video = c.video, mine = !c.incoming, durSecs = ev.durationSecs.toInt(), tsSecs = SonarClock.nowSecs())
+        upsertCallRecord(
+            c.chatId,
+            CallRecord(id = c.callId, video = c.video, mine = !c.incoming, durSecs = ev.durationSecs.toInt(), tsSecs = SonarClock.nowSecs()),
         )
-        callVersion++
         activeCall = null
         popCallScreenIfNeeded()
     }
@@ -1745,9 +1754,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // A stale offer (peer rang while we were offline) is a missed call.
                 if (SonarClock.nowSecs() - ctrl.unixSecs > 60) {
                     runCatching { SonarCore.callHangup(ctrl.callId) }
-                    callLogs.getOrPut(callChatId) { mutableListOf() }
-                        .add(CallRecord(id = ctrl.callId, video = ctrl.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()))
-                    callVersion++
+                    upsertCallRecord(
+                        callChatId,
+                        CallRecord(id = ctrl.callId, video = ctrl.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()),
+                    )
                     return
                 }
                 val name = callPeerName(callChatId)
@@ -6021,9 +6031,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         writeContactCacheNow(PROFILE_CACHE_BLOB_KEY, encoded)
     }
 
+    private fun noteTranscriptOpen(
+        route: String,
+        chatId: String,
+        phase: String,
+        rows: List<SonarMsg> = messages,
+    ) {
+        // No stable conversation id — shareable crash reports must not become
+        // correlators for Marmot group / mesh peer identities.
+        noteCrashBreadcrumb(
+            "transcript_open route=$route phase=$phase " +
+                "rows=${rows.size} replies=${rows.count { it.reply != null }} " +
+                "calls=${callLogs[chatId]?.size ?: 0}",
+        )
+    }
+
     fun openChat(chat: SonarChat, jumpMessageId: String? = null) {
         // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
         // empty home leftover messages, then rebuild when the page lands.
+        noteTranscriptOpen("marmot", chat.id, "begin", emptyList())
         clearNotificationsForChat(chat.id)
         val generation = beginTranscriptSession(chat.id)
         resolveMarmotGroupId(chat.id)?.let { groupId ->
@@ -6031,6 +6057,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         pendingMarmotNpub(chat.id)?.let { pendingNpub ->
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
+            noteTranscriptOpen("marmot", chat.id, "push-pending")
             push(Screen.Chat(chat.id, chatTitle(chat)))
             ensureProfile(pendingNpub)
             ensureSonarDescriptor(pendingNpub)
@@ -6039,6 +6066,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (isPendingMarmotGroup(chat.id)) {
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
+            noteTranscriptOpen("marmot", chat.id, "push-pending-group")
             push(Screen.Chat(chat.id, chatTitle(chat)))
             return
         }
@@ -6054,6 +6082,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         retainedTranscriptByChat[chat.id]?.takeIf { it.isNotEmpty() }?.let { retained ->
             messages = retained
             warmOpenTranscriptThumbs(messages)
+            noteTranscriptOpen("marmot", chat.id, "push-retained")
             push(Screen.Chat(chat.id, title))
             scope.launch {
                 val local = withSendEchoes(
@@ -6084,6 +6113,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = visibleLocal
             retainOpenTranscript(chat.id, visibleLocal)
             warmOpenTranscriptThumbs(visibleLocal)
+            noteTranscriptOpen("marmot", chat.id, "push-local", visibleLocal)
             push(Screen.Chat(chat.id, title))
             if (isCurrentTranscriptSession(chat.id, generation)) {
                 markTranscriptHydrated(chat.id)
@@ -6104,6 +6134,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openDm(peerId: String, name: String, pay: Boolean = false, jumpMessageId: String? = null) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val id = meshChatId(canonicalPeerId)
+        noteTranscriptOpen("mesh-folded", id, "begin", emptyList())
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         clearNotificationsForChat(id)
         captureOpenChatUnread(id, jumpMessageId = jumpMessageId)
@@ -6120,6 +6151,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = retained
             processPayLines(id, messages)
             warmOpenTranscriptThumbs(messages)
+            noteTranscriptOpen("mesh-folded", id, "push-retained")
             push(Screen.Chat(id, name, pay))
             scope.launch {
                 refreshOpenDm(canonicalPeerId)
@@ -6146,6 +6178,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             retainOpenTranscript(id, visible)
             processPayLines(id, visible)
             warmOpenTranscriptThumbs(visible)
+            noteTranscriptOpen("mesh-folded", id, "push-local", visible)
             push(Screen.Chat(id, name, pay))
             if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
             // Opened blank on a conversation we know has history: re-read local
@@ -6446,9 +6479,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             putPendingMarmotChat(pendingId, canonicalPeer)
             ensureProfile(canonicalPeer)
             ensureSonarDescriptor(canonicalPeer)
-            push(Screen.Chat(pendingId, profilesByNpub[canonicalProfileKey(canonicalPeer)]?.bestName ?: shortNpub(canonicalPeer)))
             beginTranscriptSession(pendingId)
             messages = visibleMessagesForChat(pendingId, withSendEchoes(pendingId, emptyList()))
+            noteTranscriptOpen("marmot", pendingId, "push-start-pending")
+            push(Screen.Chat(pendingId, profilesByNpub[canonicalProfileKey(canonicalPeer)]?.bestName ?: shortNpub(canonicalPeer)))
             startPendingMarmotChat(canonicalPeer, pendingId)
             return
         }
@@ -6461,6 +6495,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (chat != null) {
                     openChat(chat)
                 } else {
+                    // Push immediately, then hydrate — same order as before the
+                    // crash-breadcrumb work. Network setup already finished;
+                    // do not invent a local-first reorder here.
+                    noteTranscriptOpen("marmot", chatId, "push-start-fallback", emptyList())
                     push(Screen.Chat(chatId, shortNpub(p)))
                     val generation = beginTranscriptSession(chatId)
                     val local = marmotMessagesPageForChat(chatId, generation)
@@ -6593,9 +6631,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun openPendingMarmotGroup(pendingId: String, pending: PendingMarmotGroup) {
         pendingMarmotGroups = pendingMarmotGroups + (pendingId to pending)
-        push(Screen.Chat(pendingId, pending.name))
         beginTranscriptSession(pendingId)
         messages = visibleMessagesForChat(pendingId, withSendEchoes(pendingId, emptyList()))
+        noteTranscriptOpen("marmot", pendingId, "push-pending-group-create")
+        push(Screen.Chat(pendingId, pending.name))
     }
 
     private fun startPendingMarmotGroupCreation(pendingChatId: String) {
