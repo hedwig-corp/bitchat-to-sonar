@@ -1,14 +1,12 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.13.1 (42)** · release tag **v0.1-alpha.13.1** (pre-alpha.14)
+Build: **Sonar 1.13.2 (43)** · release tag **v0.1-alpha.13.2** (pre-alpha.14)
 
-Cautious cut after alpha.13. Headline: **Signal-style reply-to-message**
-(White Noise NIP-C7). Also: @mention by Sonar name, bounded BLE reassembly,
-WAL-checkpoint skip on Marmot store drop, auto-backup data-plan cap, kind-0
-republish no longer wiping foreign profile fields, duplicate push banners
-fixed, scrollable onboarding, desktop no longer offers calls it can't make,
-mesh packet verify against pinned signing key, Android FCM foreground-service
-fallback. Opening a chat should paint from local storage first; missed
+Cautious cut after 13.1. Headline: **Android chat-open crash fix** (#597) —
+opening a chat with duplicate call/reply rows must not crash; crash
+diagnostics persist for share. Also: short iOS transcripts stay visible when
+the keyboard opens (#595), Signal-style transcript scroll + Home invalidation
+perf (#598). Opening a chat should paint from local storage first; missed
 messages catch up in the background.
 
 ## 1. Sync speed & catching up (headline)

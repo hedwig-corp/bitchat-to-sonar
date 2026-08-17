@@ -1,11 +1,11 @@
-MARKETING_VERSION = 1.13.1
+MARKETING_VERSION = 1.13.2
 // App Store Connect rejects a second upload of a (MARKETING_VERSION,
 // CURRENT_PROJECT_VERSION) pair it has already accepted — it fails the
 // whole submission with "the state of the relationship 'buildUpload'".
 // A re-archive of the same marketing version therefore needs a fresh build
 // number, even when no source changed. 35 was consumed on 2026-07-31.
 // v0.1-alpha.13 shipped as 1.13.0/41; alpha.13.1 pre-14 cut uses build 42.
-CURRENT_PROJECT_VERSION = 42
+CURRENT_PROJECT_VERSION = 43
 
 IPHONEOS_DEPLOYMENT_TARGET = 16.0
 MACOSX_DEPLOYMENT_TARGET = 15.0
