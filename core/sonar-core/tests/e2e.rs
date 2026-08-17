@@ -116,6 +116,76 @@ async fn two_instances_exchange_dms_through_a_relay() {
 }
 
 #[tokio::test]
+async fn kind7_reaction_tallies_and_is_not_a_transcript_row() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    let alice_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    alice
+        .send_text(&alice_group, "react to me")
+        .await
+        .expect("alice sends");
+
+    bob.sync().await.expect("bob syncs");
+    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let parent = bob
+        .messages(&bob_group)
+        .expect("bob messages")
+        .into_iter()
+        .find(|m| m.content == "react to me")
+        .expect("parent");
+    bob.send_reaction(&bob_group, &parent.id, &parent.sender, "👍")
+        .await
+        .expect("bob reacts");
+    alice.sync().await.expect("alice syncs reaction");
+
+    let alice_view = alice.messages(&alice_group).expect("alice messages");
+    assert_eq!(
+        alice_view.len(),
+        1,
+        "kind-7 must not appear as a chat body row"
+    );
+    assert_eq!(alice_view[0].content, "react to me");
+    assert_eq!(alice_view[0].reactions.len(), 1);
+    assert_eq!(alice_view[0].reactions[0].emoji, "👍");
+    assert_eq!(alice_view[0].reactions[0].count, 1);
+    assert!(!alice_view[0].reactions[0].mine);
+    let list_page = alice
+        .messages_page(&alice_group, 10, 0)
+        .expect("chat-list page");
+    assert_eq!(list_page.len(), 1);
+    assert!(
+        list_page[0].reactions.is_empty(),
+        "messages_page must not hydrate tallies (chat-list path)"
+    );
+
+    let page = alice
+        .messages_cursor_page(&alice_group, None, None, 10)
+        .expect("cursor page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].reactions.len(), 1);
+
+    bob.send_reaction(&bob_group, &parent.id, &parent.sender, "🔥")
+        .await
+        .expect("bob second emoji");
+    alice.sync().await.expect("alice syncs second emoji");
+    let multi = alice.messages(&alice_group).expect("alice messages");
+    assert_eq!(multi.len(), 1);
+    assert_eq!(multi[0].reactions.len(), 2, "multi-emoji per sender");
+}
+
+#[tokio::test]
 async fn start_dm_reuses_existing_direct_group() {
     let relay = MockRelay::run().await.expect("mock relay starts");
     let relay_url = relay.url().await;

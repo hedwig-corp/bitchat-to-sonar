@@ -604,6 +604,16 @@ pub struct MessageInfo {
     pub classification: MessageClassInfo,
     /// NIP-C7 reply pointer. `content` is the display body (nevent already stripped).
     pub reply: Option<ReplyRefInfo>,
+    /// Aggregated kind-7 chips. Empty when nobody has reacted.
+    pub reactions: Vec<ReactionTallyInfo>,
+}
+
+/// FFI-friendly aggregated emoji chip.
+#[derive(uniffi::Record)]
+pub struct ReactionTallyInfo {
+    pub emoji: String,
+    pub count: u32,
+    pub mine: bool,
 }
 
 /// FFI-friendly NIP-C7 quote pointer.
@@ -1448,6 +1458,27 @@ impl SonarNode {
             &group_id,
             &text,
             Some(&reply),
+        ))?;
+        Ok(())
+    }
+
+    /// Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message.
+    pub fn send_reaction(
+        &self,
+        group_id_hex: String,
+        target_id_hex: String,
+        target_npub: String,
+        emoji: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let target_id = nostr::EventId::from_hex(&target_id_hex)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("target_id: {e}")))?;
+        let target_pk = PublicKey::parse(&target_npub).map_err(invalid("target npub"))?;
+        self.runtime.block_on(self.client.send_reaction(
+            &group_id,
+            &target_id,
+            &target_pk,
+            &emoji,
         ))?;
         Ok(())
     }
@@ -3201,6 +3232,15 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             parent_npub: r.parent_pubkey.and_then(|pk| pk.to_bech32().ok()),
             preview: r.preview,
         }),
+        reactions: m
+            .reactions
+            .into_iter()
+            .map(|t| ReactionTallyInfo {
+                emoji: t.emoji,
+                count: t.count,
+                mine: t.mine,
+            })
+            .collect(),
     }
 }
 

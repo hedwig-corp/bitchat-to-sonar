@@ -2679,6 +2679,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                         isGroup = false,
                         peerName = screen.name,
                         enableReply = false,
+                        enableReact = false,
                     ) { resolvedReply ->
                         MessageBubble(m, reply = resolvedReply)
                     }
@@ -2757,6 +2758,7 @@ private fun ReplyDecorated(
     isGroup: Boolean,
     peerName: String,
     enableReply: Boolean = true,
+    enableReact: Boolean = true,
     content: @Composable (SonarReplyRef?) -> Unit,
 ) {
     val interaction = remember { MutableInteractionSource() }
@@ -2768,8 +2770,9 @@ private fun ReplyDecorated(
     }.ifBlank { stringResource(Res.string.chat_reply_fallback) }.take(140)
     val youLabel = stringResource(Res.string.chat_reply_you)
     val canReply = enableReply && sonarCanReply(m)
+    val canReact = enableReact && sonarCanReact(m)
     val copyText = sonarCopyableText(m)
-    val showActions = canReply || copyText != null
+    val showActions = canReply || copyText != null || canReact
     var menuOpen by remember(m.id) { mutableStateOf(false) }
     var anchorTopPx by remember(m.id) { mutableStateOf(0f) }
     val isPressed by interaction.collectIsPressedAsState()
@@ -2962,15 +2965,30 @@ private fun ReplyDecorated(
             ) {
                 content(resolvedReply)
             }
+            if (m.reactions.isNotEmpty() && m.classification !is SonarMsgClass.CallControl &&
+                !TrillLine.isTrillLine(m.content)
+            ) {
+                ReactionRow(
+                    reactions = m.reactions,
+                    viaInternet = m.viaInternet,
+                    onTap = { emoji -> state.sendReaction(chatId, m, emoji) },
+                )
+            }
             SonarMessageActionSheet(
                 expanded = menuOpen,
                 mine = m.mine,
                 canReply = canReply,
+                canReact = canReact,
+                mineEmojis = m.reactions.filter { it.mine }.map { it.emoji }.toSet(),
                 copyLabel = copyText != null,
                 onDismiss = { menuOpen = false },
                 onReply = {
                     menuOpen = false
                     armReply.value()
+                },
+                onReact = { emoji ->
+                    menuOpen = false
+                    state.sendReaction(chatId, m, emoji)
                 },
                 onCopy = copyText?.let { text ->
                     {
@@ -2990,9 +3008,12 @@ private fun SonarMessageActionSheet(
     expanded: Boolean,
     mine: Boolean,
     canReply: Boolean,
+    canReact: Boolean,
+    mineEmojis: Set<String>,
     copyLabel: Boolean,
     onDismiss: () -> Unit,
     onReply: () -> Unit,
+    onReact: (String) -> Unit,
     onCopy: (() -> Unit)?,
     preview: @Composable () -> Unit,
     anchorTopPx: Float,
@@ -3046,6 +3067,13 @@ private fun SonarMessageActionSheet(
                 ) {
                     preview()
                 }
+                if (canReact) {
+                    Spacer(Modifier.height(8.dp))
+                    ReactionPickerRow(
+                        mineEmojis = mineEmojis,
+                        onReact = onReact,
+                    )
+                }
                 Spacer(Modifier.height(12.dp))
                 Column(
                     Modifier
@@ -3095,6 +3123,81 @@ private fun SonarMessageActionRow(
         SNIcon(icon, 17.dp, s.accent, weight = 2.1f)
         Spacer(Modifier.width(12.dp))
         Text(label, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun ReactionPickerRow(
+    mineEmojis: Set<String>,
+    onReact: (String) -> Unit,
+) {
+    val s = sonar
+    Row(
+        Modifier
+            .shadow(16.dp, RoundedCornerShape(50.dp))
+            .clip(RoundedCornerShape(50.dp))
+            .background(s.surface)
+            .padding(5.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SONAR_QUICK_REACTIONS.forEach { emoji ->
+            val on = emoji in mineEmojis
+            Box(
+                Modifier
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(if (on) s.accentSoft else Color.Transparent)
+                    .clickable(role = Role.Button, onClick = { onReact(emoji) }),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(emoji, fontSize = 21.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReactionRow(
+    reactions: List<SonarReactionTally>,
+    viaInternet: Boolean,
+    onTap: (String) -> Unit,
+) {
+    val s = sonar
+    Row(
+        Modifier
+            .padding(horizontal = 6.dp)
+            .offset(y = (-7).dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        reactions.forEach { tally ->
+            val mineStroke = if (viaInternet) s.net else s.accent
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(s.surface)
+                    .border(
+                        width = if (tally.mine) 1.5.dp else 1.dp,
+                        color = if (tally.mine) mineStroke else s.hairline,
+                        shape = RoundedCornerShape(50),
+                    )
+                    .clickable(role = Role.Button, onClick = { onTap(tally.emoji) })
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(tally.emoji, fontSize = 13.sp)
+                if (tally.count > 1) {
+                    Text(
+                        tally.count.toString(),
+                        color = s.text2,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
     }
 }
 

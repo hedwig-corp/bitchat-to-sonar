@@ -2810,6 +2810,35 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatJumpMessageId = openChatJumpMessageId + (chatId to parentId)
     }
 
+    fun sendReaction(chatId: String, message: SonarMsg, emoji: String) {
+        if (!sonarCanReact(message)) return
+        if (message.reactions.any { it.emoji == emoji && it.mine }) return
+        if (pendingMarmotNpub(chatId) != null || isPendingMarmotGroup(chatId)) return
+        val groupId = marmotGroupIdForReaction(chatId, message) ?: return
+        val trimmed = emoji.trim()
+        if (trimmed.isEmpty()) return
+        scope.launch {
+            runCatching {
+                runMarmotAccountOperation {
+                    SonarCore.sendReaction(groupId, message.id, message.senderNpub, trimmed)
+                }
+            }.onFailure { e ->
+                toast = e.message ?: "Couldn't react"
+            }
+            reloadNewestAfterSendIfNeeded(chatId)
+        }
+    }
+
+    /** MLS group that actually holds [message]. Mesh-folded chats are keyed by
+     *  `mesh:<peer>` — passing that to core would fail `parse_group_id`. */
+    private fun marmotGroupIdForReaction(chatId: String, message: SonarMsg): String? {
+        if (isMeshChat(chatId) && !message.viaInternet) return null
+        transcriptWindows.entries.firstOrNull { (_, window) ->
+            window.rows.any { it.id.equals(message.id, ignoreCase = true) }
+        }?.let { return it.key }
+        return resolveMarmotGroupId(chatId)
+    }
+
     private fun consumeComposerReply(chatId: String): SonarReplyRef? =
         composerReplyByChat.remove(chatId)
 

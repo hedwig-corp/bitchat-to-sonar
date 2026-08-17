@@ -714,6 +714,7 @@ struct SNComposerReplyBanner: View {
 struct SNReplyChrome<Content: View>: View {
     let m: SNMessage
     var onReply: ((SNMessage) -> Void)? = nil
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
     @ViewBuilder var content: () -> Content
 
@@ -725,6 +726,9 @@ struct SNReplyChrome<Content: View>: View {
     private var canSwipe: Bool { snCanReply(to: m) && onReply != nil }
     private var progress: CGFloat { SNSwipeReplyMetrics.iconAlpha(dragX) }
     private var isLTR: Bool { layoutDirection == .leftToRight }
+    private var showsChips: Bool {
+        !m.reactions.isEmpty && !m.action && m.call == nil && !m.trill
+    }
 
     var body: some View {
         ZStack(alignment: isLTR ? .leading : .trailing) {
@@ -740,8 +744,17 @@ struct SNReplyChrome<Content: View>: View {
                     .offset(x: (isLTR ? 1 : -1) * (8 + abs(SNSwipeReplyMetrics.iconOffset(dragX))))
                     .allowsHitTesting(false)
             }
-            content()
-                .offset(x: canSwipe ? SNSwipeReplyMetrics.bubbleOffset(dragX) : 0)
+            VStack(alignment: m.mine ? .trailing : .leading, spacing: 0) {
+                content()
+                if showsChips {
+                    SNReactionRow(
+                        reactions: m.reactions,
+                        viaInternet: m.via == .internet,
+                        onTap: { emoji in onReact?(m, emoji) }
+                    )
+                }
+            }
+            .offset(x: canSwipe ? SNSwipeReplyMetrics.bubbleOffset(dragX) : 0)
         }
         .background(
             GeometryReader { geo in
@@ -755,7 +768,7 @@ struct SNReplyChrome<Content: View>: View {
             armed = false
         }
         .contentShape(Rectangle())
-        .modifier(SNMessageActionMenu(m: m, onReply: onReply))
+        .modifier(SNMessageActionMenu(m: m, onReply: onReply, onReact: onReact))
     }
 
     private var swipeGesture: some Gesture {
@@ -815,14 +828,27 @@ private struct SNSwipeReplyRowWidthKey: PreferenceKey {
 private struct SNMessageActionMenu: ViewModifier {
     let m: SNMessage
     var onReply: ((SNMessage) -> Void)?
+    var onReact: ((SNMessage, String) -> Void)?
 
     func body(content: Content) -> some View {
         let canReply = snCanReply(to: m) && onReply != nil
+        let canReact = snCanReact(to: m) && onReact != nil
         let copy = snCopyableText(of: m)
         let replyLabel = String(localized: "chat.reply", defaultValue: "Reply")
         let copyLabel = String(localized: "chat.copy", defaultValue: "Copy")
-        if canReply || copy != nil {
+        if canReply || copy != nil || canReact {
             content.contextMenu {
+                if canReact, let onReact {
+                    ControlGroup {
+                        ForEach(SNQuickReactions, id: \.self) { emoji in
+                            Button {
+                                onReact(m, emoji)
+                            } label: {
+                                Text(verbatim: emoji)
+                            }
+                        }
+                    }
+                }
                 if canReply, let onReply {
                     Button { onReply(m) } label: {
                         Label(replyLabel, systemImage: "arrowshape.turn.up.left")
@@ -847,6 +873,48 @@ private struct SNMessageActionMenu: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+struct SNReactionRow: View {
+    let reactions: [SNReactionTally]
+    var viaInternet: Bool = false
+    var onTap: ((String) -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(reactions, id: \.emoji) { tally in
+                Button {
+                    onTap?(tally.emoji)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(verbatim: tally.emoji)
+                            .font(.system(size: 13))
+                        if tally.count > 1 {
+                            Text(verbatim: "\(tally.count)")
+                                .font(SonarTheme.uiFont(size: 11, weight: .bold))
+                                .foregroundColor(SonarTheme.text2)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(SonarTheme.surface)
+                    .clipShape(Capsule())
+                    .overlay(
+                        Capsule().strokeBorder(
+                            tally.mine
+                                ? (viaInternet ? SonarTheme.net : SonarTheme.accent)
+                                : SonarTheme.hairline,
+                            lineWidth: tally.mine ? 1.5 : 1
+                        )
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.top, -7)
+        .zIndex(2)
     }
 }
 
@@ -1694,6 +1762,8 @@ struct SNMsgList: View {
     var uploadProgressSource: SNMediaUploadProgressSource? = nil
     /// Long-press Reply; quote-chip tap Jump.
     var onReply: ((SNMessage) -> Void)? = nil
+    /// Long-press / chip tap kind-7 reaction.
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
     var loadOlder: (() async -> Bool)? = nil
@@ -1914,7 +1984,7 @@ struct SNMsgList: View {
                             if m.id == unreadAnchorId {
                                 SNUnreadDivider().id("sn-unread")
                             }
-                            SNReplyChrome(m: m, onReply: onReply, onJumpQuote: onJumpQuote) {
+                            SNReplyChrome(m: m, onReply: onReply, onReact: onReact, onJumpQuote: onJumpQuote) {
                             if let call = m.call {
                                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
                             } else if m.trill {

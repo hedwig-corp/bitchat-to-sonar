@@ -23,6 +23,7 @@ pub mod notification;
 pub mod outbox;
 pub mod own_profile;
 pub mod push;
+pub mod reaction;
 pub mod relay_directory;
 pub mod reply;
 pub mod sonar_descriptor;

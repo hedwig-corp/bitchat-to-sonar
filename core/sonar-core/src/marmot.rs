@@ -14,7 +14,7 @@
 //!   has been published; see MDK docs.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
@@ -31,12 +31,16 @@ use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
+use crate::reaction::ReactionTally;
 use crate::reply::{ReplyRef, ReplyTo};
 use crate::{Error, Result};
 
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
 /// MDK examples: NIP-C7-style chat message).
 pub const CHAT_RUMOR_KIND: u16 = 9;
+
+/// NIP-25 reaction rumor inside MLS. Re-exported so hosts/tests share one constant.
+pub use crate::reaction::REACTION_RUMOR_KIND;
 
 /// Marmot KeyPackage event kind (MIP-00). nostr 0.44 has no named constant
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
@@ -229,6 +233,8 @@ pub struct ChatMessage {
     pub classification: MessageClassification,
     /// NIP-C7 reply pointer. `content` is already the display body (nevent stripped).
     pub reply: Option<ReplyRef>,
+    /// Aggregated kind-7 chips for this row. Empty when nobody has reacted.
+    pub reactions: Vec<ReactionTally>,
 }
 
 /// Compare render messages in the stable newest-first order used by transcript
@@ -292,6 +298,10 @@ pub enum Incoming {
     Failed,
     /// A join request was received for a group we administer.
     JoinRequest(crate::invite_link::JoinRequest),
+    /// A kind-7 reaction was persisted. Not a transcript row — hosts must
+    /// invalidate the conversation so tallies refresh, and must not count
+    /// unread or ring a notification (R-017).
+    Reaction { group_id: GroupId },
     /// The event was valid but produced nothing actionable (duplicates,
     /// ignored proposals, non-Marmot gift wraps, ...).
     None,
@@ -430,9 +440,7 @@ impl DmAutoacceptBudget {
                     Self::exhausted_window()
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::collections::VecDeque::new()
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::collections::VecDeque::new(),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -1243,6 +1251,37 @@ impl MarmotEngine {
         Ok((event, incoming))
     }
 
+    /// Encrypt a NIP-25 kind-7 reaction into a signed kind-445 and process it
+    /// locally under one MLS write guard (same shape as text send).
+    pub fn create_and_process_reaction(
+        &self,
+        group_id: &GroupId,
+        target_id: &EventId,
+        target_pubkey: &PublicKey,
+        emoji: &str,
+    ) -> Result<(Event, Incoming)> {
+        let _mls = self.mls_write();
+        let event = self.create_reaction_event_inner(group_id, target_id, target_pubkey, emoji)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    fn create_reaction_event_inner(
+        &self,
+        group_id: &GroupId,
+        target_id: &EventId,
+        target_pubkey: &PublicKey,
+        emoji: &str,
+    ) -> Result<Event> {
+        let content = crate::reaction::normalize_emoji(emoji)?;
+        let rumor = EventBuilder::new(Kind::Reaction, content)
+            .tags(crate::reaction::reaction_tags(target_id, target_pubkey))
+            .build(self.identity.public_key());
+        let event = dispatch!(&self.storage, |mdk| mdk
+            .create_message(group_id, rumor, None))?;
+        Ok(event)
+    }
+
     /// Encrypt a sticker message into a signed kind-445 event for `group_id`.
     /// The rumor carries the sticker ref tag so the receiver can resolve the
     /// sticker image from the pack's Blossom URL.
@@ -1560,9 +1599,7 @@ impl MarmotEngine {
                                     }
                                 };
                             if reserved {
-                                match dispatch!(&self.storage, |mdk| mdk
-                                    .accept_welcome(&welcome))
-                                {
+                                match dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome)) {
                                     Ok(()) => {
                                         return Ok(Incoming::GroupUpdated(welcome.mls_group_id))
                                     }
@@ -1620,13 +1657,14 @@ impl MarmotEngine {
     fn process_group_message(&self, event: &Event) -> Result<Incoming> {
         match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
             MessageProcessingResult::ApplicationMessage(msg) => {
-                // Only kind-9 chat rumors are chat messages. MDK also delivers
-                // other application kinds (reactions/deletes from White Noise
-                // peers) which `messages()` / `messages_page()` filter out of
-                // the transcript — surfacing them as `Incoming::Message` would
-                // index them, count them as unread and ring a notification for
-                // a row no host can ever render. MDK has already persisted the
-                // rumor, so future features can still read it from storage.
+                // Kind-7 reactions stay out of the transcript/unread/notify
+                // path (R-017) but must invalidate the conversation so hosts
+                // re-page and pick up tallies. Other non-chat kinds remain None.
+                if crate::reaction::is_reaction_kind(msg.kind) {
+                    return Ok(Incoming::Reaction {
+                        group_id: msg.mls_group_id,
+                    });
+                }
                 if msg.kind.as_u16() != CHAT_RUMOR_KIND {
                     return Ok(Incoming::None);
                 }
@@ -1804,15 +1842,19 @@ impl MarmotEngine {
     /// Decrypted message history for a group (storage-backed).
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
         let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, None))?;
-        let mut mapped: Vec<ChatMessage> = msgs
-            .into_iter()
-            // Only surface real chat messages (kind-9). MDK's store ALSO keeps
-            // non-chat entries (group-membership / commit / proposal / reaction
-            // kinds) which carry no chat text — without this filter they render
-            // as empty message bubbles in the UI.
-            .filter(|m| m.kind.as_u16() == CHAT_RUMOR_KIND)
-            .map(|m| self.to_chat_message(m))
-            .collect();
+        let mut reactions = Vec::new();
+        let mut mapped: Vec<ChatMessage> = Vec::new();
+        for m in msgs {
+            if let Some(reaction) = crate::reaction::parse_stored(&m) {
+                reactions.push(reaction);
+                continue;
+            }
+            if m.kind.as_u16() != CHAT_RUMOR_KIND {
+                continue;
+            }
+            mapped.push(self.to_chat_message(m));
+        }
+        crate::reaction::attach_tallies(&mut mapped, &reactions, self.identity.public_key());
         hydrate_page_reply_previews(&mut mapped);
         Ok(mapped)
     }
@@ -1873,6 +1915,9 @@ impl MarmotEngine {
         }
 
         hydrate_page_reply_previews(&mut page_messages);
+        // Chat-list / index / recovery callers use this API. Kind-7 hydrate
+        // is a newest-first raw scan; keep it off this path so list paint
+        // stays Signal-local. Transcript pages use `messages_cursor_page`.
         Ok(page_messages)
     }
 
@@ -1908,12 +1953,10 @@ impl MarmotEngine {
         // stuck/laggy backscroll with no network (e.g. airplane mode).
         let mut raw_offset = match before_secs {
             Some(cursor_secs) => {
-                let first = Pagination::with_sort_order(
-                    Some(1),
-                    Some(0),
-                    MessageSortOrder::CreatedAtFirst,
-                );
-                let newest = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(first)))?;
+                let first =
+                    Pagination::with_sort_order(Some(1), Some(0), MessageSortOrder::CreatedAtFirst);
+                let newest =
+                    dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(first)))?;
                 match newest.first() {
                     None => 0,
                     // Everything retained is already at/below the cursor.
@@ -1930,7 +1973,8 @@ impl MarmotEngine {
                                 Some(hi),
                                 MessageSortOrder::CreatedAtFirst,
                             );
-                            let row = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(probe)))?;
+                            let row = dispatch!(&self.storage, |mdk| mdk
+                                .get_messages(group_id, Some(probe)))?;
                             match row.first() {
                                 Some(m) if m.created_at.as_secs() > cursor_secs => {
                                     lo = hi;
@@ -1946,7 +1990,8 @@ impl MarmotEngine {
                                 Some(mid),
                                 MessageSortOrder::CreatedAtFirst,
                             );
-                            let row = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(probe)))?;
+                            let row = dispatch!(&self.storage, |mdk| mdk
+                                .get_messages(group_id, Some(probe)))?;
                             match row.first() {
                                 Some(m) if m.created_at.as_secs() > cursor_secs => lo = mid,
                                 _ => hi = mid,
@@ -2020,6 +2065,7 @@ impl MarmotEngine {
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
         hydrate_page_reply_previews(&mut candidates);
+        self.hydrate_page_reactions(group_id, &mut candidates)?;
         Ok(candidates)
     }
 
@@ -2257,7 +2303,49 @@ impl MarmotEngine {
             media,
             sticker_ref,
             reply,
+            reactions: Vec::new(),
         }
+    }
+
+    /// Attach kind-7 tallies for the messages in `msgs`. Scans raw MDK rows
+    /// newest-first (same cap as chat paging) so a later reaction on an older
+    /// parent is still found. Misses only pathological histories past the cap.
+    fn hydrate_page_reactions(&self, group_id: &GroupId, msgs: &mut [ChatMessage]) -> Result<()> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        let targets: HashSet<EventId> = msgs.iter().map(|m| m.id).collect();
+        let mut reactions = Vec::new();
+        let mut raw_offset = 0usize;
+        let mut raw_scanned = 0usize;
+        let batch = 500usize;
+        while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
+            let remaining = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
+            let page = Pagination::with_sort_order(
+                Some(batch.min(remaining)),
+                Some(raw_offset),
+                MessageSortOrder::CreatedAtFirst,
+            );
+            let raw = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page)))?;
+            if raw.is_empty() {
+                break;
+            }
+            let raw_len = raw.len();
+            raw_scanned += raw_len;
+            raw_offset += raw_len;
+            for m in raw {
+                if let Some(r) = crate::reaction::parse_stored(&m) {
+                    if targets.contains(&r.target_id) {
+                        reactions.push(r);
+                    }
+                }
+            }
+            if raw_len < batch {
+                break;
+            }
+        }
+        crate::reaction::attach_tallies(msgs, &reactions, self.identity.public_key());
+        Ok(())
     }
 }
 
@@ -2289,7 +2377,9 @@ fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
         })
         .collect();
     for m in msgs.iter_mut() {
-        let Some(reply) = m.reply.as_mut() else { continue };
+        let Some(reply) = m.reply.as_mut() else {
+            continue;
+        };
         crate::reply::hydrate_reply_preview(reply, by_id.get(&reply.parent_id).map(String::as_str));
     }
 }
@@ -2325,7 +2415,10 @@ pub(crate) fn key_package_slot_path_for(db: &Path) -> std::path::PathBuf {
 /// this crate uses. Kept as a function so the writer and `sidecar_paths` cannot
 /// disagree about what a wipe has to remove.
 pub(crate) fn key_package_slot_tmp_path(path: &Path) -> std::path::PathBuf {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     path.with_file_name(format!("{name}.tmp"))
 }
 

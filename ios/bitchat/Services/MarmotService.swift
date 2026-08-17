@@ -125,6 +125,8 @@ final class MarmotService: @unchecked Sendable {
         let classification: MarmotMessageClass
         /// NIP-C7 reply pointer. Content is already the display body.
         let reply: MarmotReplyRef?
+        /// Aggregated kind-7 chips. Empty when nobody has reacted.
+        let reactions: [MarmotReactionTally]
 
         init(
             id: String,
@@ -136,7 +138,8 @@ final class MarmotService: @unchecked Sendable {
             media: [MarmotMedia],
             stickerRef: MarmotStickerRef? = nil,
             classification: MarmotMessageClass = .text,
-            reply: MarmotReplyRef? = nil
+            reply: MarmotReplyRef? = nil,
+            reactions: [MarmotReactionTally] = []
         ) {
             self.id = id
             self.senderNpub = senderNpub
@@ -148,6 +151,7 @@ final class MarmotService: @unchecked Sendable {
             self.stickerRef = stickerRef
             self.classification = classification
             self.reply = reply
+            self.reactions = reactions
         }
 
         enum CodingKeys: String, CodingKey {
@@ -161,6 +165,7 @@ final class MarmotService: @unchecked Sendable {
             case stickerRef
             case classification
             case reply
+            case reactions
         }
 
         init(from decoder: Decoder) throws {
@@ -176,7 +181,14 @@ final class MarmotService: @unchecked Sendable {
             self.classification =
                 try container.decodeIfPresent(MarmotMessageClass.self, forKey: .classification) ?? .text
             self.reply = try container.decodeIfPresent(MarmotReplyRef.self, forKey: .reply)
+            self.reactions = try container.decodeIfPresent([MarmotReactionTally].self, forKey: .reactions) ?? []
         }
+    }
+
+    struct MarmotReactionTally: Sendable, Equatable, Codable {
+        let emoji: String
+        let count: UInt32
+        let mine: Bool
     }
 
     struct MarmotReplyRef: Sendable, Equatable, Codable {
@@ -936,6 +948,22 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    func sendReaction(
+        groupId: String,
+        targetIdHex: String,
+        targetNpub: String,
+        emoji: String
+    ) async throws {
+        try await sendLane {
+            try $0.sendReaction(
+                groupIdHex: groupId,
+                targetIdHex: targetIdHex,
+                targetNpub: targetNpub,
+                emoji: emoji
+            )
+        }
+    }
+
     /// Republish one failed message from the durable local outbox.
     func retryMessage(messageId: String) async throws -> String {
         try await run {
@@ -1320,6 +1348,9 @@ final class MarmotService: @unchecked Sendable {
                     parentNpub: $0.parentNpub,
                     preview: $0.preview
                 )
+            },
+            reactions: message.reactions.map {
+                MarmotReactionTally(emoji: $0.emoji, count: $0.count, mine: $0.mine)
             }
         )
     }

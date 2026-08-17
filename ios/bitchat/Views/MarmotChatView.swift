@@ -3860,6 +3860,38 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    func sendReaction(
+        _ emoji: String,
+        to messageId: String,
+        targetNpub: String,
+        groupId: String
+    ) {
+        guard !sendsSuspendedForAccountMutation else { return }
+        let prev = sendChain
+        let generation = sendGeneration
+        sendChain = Task { [weak self] in
+            _ = await prev?.result
+            guard let self,
+                  !Task.isCancelled,
+                  self.sendGeneration == generation,
+                  !self.sendsSuspendedForAccountMutation
+            else { return }
+            do {
+                guard await self.ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                try await self.service.sendReaction(
+                    groupId: groupId,
+                    targetIdHex: messageId,
+                    targetNpub: targetNpub,
+                    emoji: emoji
+                )
+            } catch {
+                self.errorText = Self.describe(error)
+            }
+        }
+    }
+
     func send(
         _ texts: [String],
         to groupId: String,

@@ -52,7 +52,19 @@ data class SonarMsg(
     val classification: SonarMsgClass? = null,
     /// Signal-style quote snapshot. Null for ordinary messages.
     val reply: SonarReplyRef? = null,
+    /// Aggregated kind-7 chips. Empty when nobody has reacted.
+    val reactions: List<SonarReactionTally> = emptyList(),
 )
+
+/** Aggregated emoji chip for one parent message. */
+data class SonarReactionTally(
+    val emoji: String,
+    val count: Int,
+    val mine: Boolean,
+)
+
+/** Design-handoff quick picker (`BC_REACTIONS`). */
+val SONAR_QUICK_REACTIONS = listOf("❤️", "👍", "😂", "😮", "😢", "🔥")
 
 /** Quoted parent pointer projected from NIP-C7 / mesh TLV. */
 data class SonarReplyRef(
@@ -76,6 +88,19 @@ fun sonarCanReply(message: SonarMsg): Boolean {
     if (message.classification is SonarMsgClass.CallControl) return false
     if (TrillLine.isTrillLine(message.content)) return false
     return true
+}
+
+fun sonarCanReact(message: SonarMsg): Boolean {
+    if (!message.viaInternet) return false
+    if (message.id.startsWith("optimistic-") || message.id.startsWith("echo-") ||
+        message.id.startsWith("failed-")
+    ) {
+        return false
+    }
+    if (message.state == "Sending" || message.state == "Uploading") return false
+    if (message.classification is SonarMsgClass.CallControl) return false
+    if (TrillLine.isTrillLine(message.content)) return false
+    return sonarCanEmitNipC7(message.id, message.senderNpub)
 }
 
 /** Full source text for Signal-style Copy. Null when the row is not text
@@ -897,6 +922,14 @@ expect object SonarCore {
         replyToHex: String,
         replyToNpub: String,
         preview: String?,
+    )
+
+    /** Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message. */
+    suspend fun sendReaction(
+        chatId: String,
+        targetIdHex: String,
+        targetNpub: String,
+        emoji: String,
     )
 
     /** Republish one failed message from the durable local outbox. */

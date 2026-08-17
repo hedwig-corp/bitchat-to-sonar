@@ -86,6 +86,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var onCancelUpload: ((SNMessage) -> Void)? = nil
     var uploadProgressSource: SNMediaUploadProgressSource? = nil
     var onReply: ((SNMessage) -> Void)? = nil
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
     var loadOlder: (() async -> Bool)? = nil
     var loadNewest: (() async -> Void)? = nil
@@ -117,6 +118,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             onCancelUpload: onCancelUpload,
             uploadProgressSource: uploadProgressSource,
             onReply: onReply,
+            onReact: onReact,
             onJumpQuote: onJumpQuote,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
@@ -142,6 +144,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             onCancelUpload: onCancelUpload,
             uploadProgressSource: uploadProgressSource,
             onReply: onReply,
+            onReact: onReact,
             onJumpQuote: onJumpQuote,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
@@ -175,6 +178,7 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
     var onCancelUpload: ((SNMessage) -> Void)?
     var uploadProgressSource: SNMediaUploadProgressSource?
     var onReply: ((SNMessage) -> Void)? = nil
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
     var loadOlder: (() async -> Bool)?
     var loadNewest: (() async -> Void)?
@@ -200,6 +204,7 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
                 onCancelUpload: onCancelUpload,
                 uploadProgressSource: uploadProgressSource,
                 onReply: onReply,
+                onReact: onReact,
                 onJumpQuote: onJumpQuote,
                 loadOlder: loadOlder,
                 loadNewest: loadNewest,
@@ -268,6 +273,7 @@ struct SNCollectionHostMessageRow: View {
     let onCancelUpload: ((SNMessage) -> Void)?
     let uploadProgressSource: SNMediaUploadProgressSource?
     var onReply: ((SNMessage) -> Void)? = nil
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
     /// Collection column width (margins already subtracted). Never UIScreen —
     /// measure and cell must agree under Split View.
@@ -279,7 +285,7 @@ struct SNCollectionHostMessageRow: View {
         let m = message
         let textMax = columnWidth * 0.78
         let mediaMax = columnWidth * 0.72
-        SNReplyChrome(m: m, onReply: onReply, onJumpQuote: onJumpQuote) {
+        SNReplyChrome(m: m, onReply: onReply, onReact: onReact, onJumpQuote: onJumpQuote) {
             if let call = m.call {
                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
             } else if m.trill {

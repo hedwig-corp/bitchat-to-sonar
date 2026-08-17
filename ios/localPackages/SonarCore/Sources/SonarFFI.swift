@@ -1861,6 +1861,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func sendMediaWithProgress(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String, clientPendingId: String, listener: MediaUploadListener) throws
 
     /**
+     * Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message.
+     */
+    func sendReaction(groupIdHex: String, targetIdHex: String, targetNpub: String, emoji: String) throws
+
+    /**
      * Encrypt + publish a sticker message to the group.
      */
     func sendSticker(groupIdHex: String, packCoordinate: String, shortcode: String, plaintextSha256: String) throws
@@ -2976,6 +2981,20 @@ open func sendMediaWithProgress(groupIdHex: String, data: Data, filename: String
         FfiConverterString.lower(serverUrl),
         FfiConverterString.lower(clientPendingId),
         FfiConverterCallbackInterfaceMediaUploadListener_lower(listener),$0
+    )
+}
+}
+
+    /**
+     * Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message.
+     */
+open func sendReaction(groupIdHex: String, targetIdHex: String, targetNpub: String, emoji: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_reaction(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterString.lower(targetIdHex),
+        FfiConverterString.lower(targetNpub),
+        FfiConverterString.lower(emoji),$0
     )
 }
 }
@@ -5052,6 +5071,10 @@ public struct MessageInfo: Equatable, Hashable {
      * NIP-C7 reply pointer. `content` is the display body (nevent already stripped).
      */
     public var reply: ReplyRefInfo?
+    /**
+     * Aggregated kind-7 chips. Empty when nobody has reacted.
+     */
+    public var reactions: [ReactionTallyInfo]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5073,7 +5096,10 @@ public struct MessageInfo: Equatable, Hashable {
          */classification: MessageClassInfo,
         /**
          * NIP-C7 reply pointer. `content` is the display body (nevent already stripped).
-         */reply: ReplyRefInfo?) {
+         */reply: ReplyRefInfo?,
+        /**
+         * Aggregated kind-7 chips. Empty when nobody has reacted.
+         */reactions: [ReactionTallyInfo]) {
         self.idHex = idHex
         self.senderNpub = senderNpub
         self.content = content
@@ -5084,6 +5110,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.stickerRef = stickerRef
         self.classification = classification
         self.reply = reply
+        self.reactions = reactions
     }
 
 
@@ -5111,7 +5138,8 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf),
                 stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf),
                 classification: FfiConverterTypeMessageClassInfo.read(from: &buf),
-                reply: FfiConverterOptionTypeReplyRefInfo.read(from: &buf)
+                reply: FfiConverterOptionTypeReplyRefInfo.read(from: &buf),
+                reactions: FfiConverterSequenceTypeReactionTallyInfo.read(from: &buf)
         )
     }
 
@@ -5126,6 +5154,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterOptionTypeStickerRefInfo.write(value.stickerRef, into: &buf)
         FfiConverterTypeMessageClassInfo.write(value.classification, into: &buf)
         FfiConverterOptionTypeReplyRefInfo.write(value.reply, into: &buf)
+        FfiConverterSequenceTypeReactionTallyInfo.write(value.reactions, into: &buf)
     }
 }
 
@@ -5269,6 +5298,67 @@ public func FfiConverterTypeProfileInfo_lift(_ buf: RustBuffer) throws -> Profil
 #endif
 public func FfiConverterTypeProfileInfo_lower(_ value: ProfileInfo) -> RustBuffer {
     return FfiConverterTypeProfileInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly aggregated emoji chip.
+ */
+public struct ReactionTallyInfo: Equatable, Hashable {
+    public var emoji: String
+    public var count: UInt32
+    public var mine: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(emoji: String, count: UInt32, mine: Bool) {
+        self.emoji = emoji
+        self.count = count
+        self.mine = mine
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ReactionTallyInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReactionTallyInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReactionTallyInfo {
+        return
+            try ReactionTallyInfo(
+                emoji: FfiConverterString.read(from: &buf),
+                count: FfiConverterUInt32.read(from: &buf),
+                mine: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReactionTallyInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.emoji, into: &buf)
+        FfiConverterUInt32.write(value.count, into: &buf)
+        FfiConverterBool.write(value.mine, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReactionTallyInfo_lift(_ buf: RustBuffer) throws -> ReactionTallyInfo {
+    return try FfiConverterTypeReactionTallyInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReactionTallyInfo_lower(_ value: ReactionTallyInfo) -> RustBuffer {
+    return FfiConverterTypeReactionTallyInfo.lower(value)
 }
 
 
@@ -8182,6 +8272,31 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeReactionTallyInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [ReactionTallyInfo]
+
+    public static func write(_ value: [ReactionTallyInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeReactionTallyInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ReactionTallyInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ReactionTallyInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeReactionTallyInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRustBuffer {
     typealias SwiftType = [RecentMessagePageInfo]
 
@@ -9460,6 +9575,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_with_progress() != 21692) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_reaction() != 5002) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 28650) {
