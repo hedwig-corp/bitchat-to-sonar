@@ -2758,9 +2758,18 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
 }
 
 /** Meta (time + via-transport icon) inline ids — design .bc-meta.
- *  Alternate text is empty so Copy / selection never pick up the clock. */
-private const val BUBBLE_META_TIME = "sn.meta.time"
-private const val BUBBLE_META_ICON = "sn.meta.via"
+ *
+ *  Compose `appendInlineContent` requires non-empty alternateText and throws
+ *  `IllegalArgumentException` otherwise, which crashes chat open on Android.
+ *  Copy still uses `sonarCopyableText` from the source row, not these
+ *  placeholders (default U+FFFC). */
+internal const val BUBBLE_META_TIME = "sn.meta.time"
+internal const val BUBBLE_META_ICON = "sn.meta.via"
+
+internal fun AnnotatedString.Builder.appendBubbleMetaInlineContent() {
+    appendInlineContent(BUBBLE_META_TIME)
+    appendInlineContent(BUBBLE_META_ICON)
+}
 
 // Signal-Android ConversationItem: shrink after 100 ms, to 95%, while the
 // platform owns long-press timeout, touch slop, cancellation and initial haptic.
@@ -3391,8 +3400,7 @@ private fun MessageBubble(
         buildAnnotatedString {
             append(decorateMessage(visibleText, linkColor, renderableMentions, mentionColor))
             // Time + via ride the last line as inline widgets, not copyable spans.
-            appendInlineContent(BUBBLE_META_TIME, "")
-            appendInlineContent(BUBBLE_META_ICON, "")
+            appendBubbleMetaInlineContent()
         }
     }
     var textLayout by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
