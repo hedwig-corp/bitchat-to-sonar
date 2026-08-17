@@ -92,6 +92,36 @@ struct SonarReplyTests {
     }
 
     @Test
+    func duplicateParentRowsDoNotCrashTranscriptHydration() {
+        let authors = snReplyParentAuthorsById([
+            (id: "same-event", author: "First"),
+            (id: "same-event", author: "Duplicate"),
+            (id: "other-event", author: "Other"),
+        ])
+
+        #expect(authors == [
+            "same-event": "First",
+            "other-event": "Other",
+        ])
+    }
+
+    @Test
+    func duplicateTranscriptRowsCollapseFirstWinsBeforeRendering() {
+        let first = SNMessage(id: "same-event", mine: false, text: "First", time: "12:00")
+        let duplicate = SNMessage(id: "same-event", mine: false, text: "Duplicate", time: "12:01")
+        let other = SNMessage(id: "other-event", mine: true, text: "Other", time: "12:02")
+
+        let rows = snDeduplicateTranscriptRowsFirstWins([
+            (date: Date(timeIntervalSince1970: 1), message: first),
+            (date: Date(timeIntervalSince1970: 2), message: duplicate),
+            (date: Date(timeIntervalSince1970: 3), message: other),
+        ])
+
+        #expect(rows.map(\.message.id) == ["same-event", "other-event"])
+        #expect(rows.first?.message.text == "First")
+    }
+
+    @Test
     func meshReplyHydratesPreviewFromParentInWindow() {
         let parent = BitchatMessage(
             id: "parent-mid",

@@ -1186,6 +1186,10 @@ actual object SonarCore {
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {
+                // Drop in-memory crash breadcrumb before deleting log files so a
+                // later crash under a new account cannot recreate sonar-crash.log
+                // with the previous account's open-chat context.
+                AndroidCrashDiagnostics.clear()
                 closeNode()
                 npub = ""; pubkeyHex = ""
                 // Drop the encrypted Marmot DB + all prefs. The diagnostics logs

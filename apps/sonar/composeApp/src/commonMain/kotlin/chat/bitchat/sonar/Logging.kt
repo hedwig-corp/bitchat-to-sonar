@@ -10,6 +10,16 @@ package chat.bitchat.sonar
 internal expect fun sonarLog(tag: String, message: String)
 
 /**
+ * Synchronous, memory-only breadcrumb copied into Android's next uncaught
+ * exception report. Desktop has no process crash bundle and ignores it.
+ *
+ * Platform gap (Cross-Platform Feature Rule): iOS has no twin — Apple `.ips` /
+ * Xcode Organizer remain the crash source there. Optional follow-up is a
+ * last-exception breadcrumb in `SonarDiagnostics`, not blocking this Android path.
+ */
+internal expect fun noteCrashBreadcrumb(message: String)
+
+/**
  * Whether `SONAR_BENCH` timing markers may be emitted (scripts/bench/ parses
  * them; see docs/PERFORMANCE.md). Debug builds only — mirrors the iOS rule
  * that a benchmark hook must never change Release behavior:

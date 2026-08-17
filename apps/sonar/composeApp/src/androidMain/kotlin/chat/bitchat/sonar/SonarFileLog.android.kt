@@ -45,7 +45,7 @@ internal object SonarFileLog {
     /** Current log file family (newest first) for the debug bundle. */
     fun files(): List<File> {
         val dir = directory()
-        return (listOf(File(dir, FILE_NAME)) +
+        return (listOf(AndroidCrashDiagnostics.crashFile(), File(dir, FILE_NAME)) +
             (1..MAX_ROTATIONS).map { File(dir, "$FILE_NAME.$it") })
             .filter { it.exists() }
     }

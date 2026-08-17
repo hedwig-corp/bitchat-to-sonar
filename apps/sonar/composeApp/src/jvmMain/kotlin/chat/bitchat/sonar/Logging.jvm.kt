@@ -7,6 +7,8 @@ internal actual fun sonarLog(tag: String, message: String) {
     SonarFileLog.append(tag, message)
 }
 
+internal actual fun noteCrashBreadcrumb(message: String) = Unit
+
 // Desktop has no debug/release split; markers are opt-in per run:
 // ./gradlew :composeApp:run -Dsonar.bench.markers=1
 internal actual val sonarBenchMarkersEnabled: Boolean =

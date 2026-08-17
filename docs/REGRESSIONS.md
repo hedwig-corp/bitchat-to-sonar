@@ -2287,14 +2287,14 @@ the handoff's fixed reply icon instead of a height-owning stripe.
 `SNQuoteChip`, and `SNComposerReplyBanner`, measured by
 `TranscriptCollectionHost.swift::updateOwnedInsetsFromChrome`.
 
-**Compose call sites:** `App.kt::QuoteChip` and `ComposerReplyBanner`. Compose's
-old banner happened to contain the stripe with `IntrinsicSize.Min`, so it did
-not reproduce the iOS viewport-inheritance failure; it now mirrors the same
-icon-based handoff structure and has a bounded-height UI test.
+**Compose call sites:** `App.kt::QuoteThenBody` (measures children with
+unconstrained height), `QuoteChip` (IntrinsicSize.Min stripe — never
+`fillMaxHeight` under a LazyColumn Infinity proposal), and
+`ComposerReplyBanner`.
 
 **Guarded by:** `SonarReplyTests.quoteBubbleDoesNotInheritTranscriptViewportHeight`
 
-**Also guarded by:** `SonarReplyTests.replyComposerDoesNotInheritTranscriptViewportHeight`, `ComposerReplyBannerUiTest.replyComposerStaysBoundedInsideATallTranscript`
+**Also guarded by:** `SonarReplyTests.replyComposerDoesNotInheritTranscriptViewportHeight`, `ComposerReplyBannerUiTest.replyComposerStaysBoundedInsideATallTranscript`, `QuoteThenBodyUiTest.quotedBubbleStaysBoundedInsideATallTranscript`
 
 **Not guarded:** the tests pin intrinsic/bounded height, not a full device tap
 from context menu through keyboard animation. The iOS test target is not
@@ -2305,6 +2305,45 @@ currently part of CI.
   but can put a legitimate multiline composer under the keyboard.
 - *Giving decorative rectangles a guessed fixed height.* It drifts with Dynamic
   Type and localization; decoration follows content, never the reverse.
+
+## R-036 — Transcript LazyColumn keys must be unique per open
+
+**Invariant:** every flattened chat-feed row key (`m:<id>`, `c:<callId>`,
+`day:…`, `unread`) is unique for the list the open-chat LazyColumn renders.
+
+**Breaks as:** tapping one DM crashes on Android with
+`IllegalArgumentException: Key "c:…" was already used` (or `m:…`) while the
+home list still paints.
+
+**Why:** `hangupCall` / `declineCall` appended a `CallRecord` immediately, then
+`finalizeCall` appended again for the same `callId` after the engine Ended
+event. Keys are `c:<callId>`, so the second row is fatal. Upsert + last-wins
+dedupe on read, and feed construction runs the same dedupe.
+
+**Compose call sites:** `SonarAppState.kt::upsertCallRecord` (via
+`upsertCallRecordList`), `callRecords` / `dedupeCallRecordsLastWins`, and
+`App.kt::dedupeTranscriptMessagesLastWins` before LazyColumn keys.
+
+**iOS call site:** `SonarAppStore.swift::mergeCallLogs` runs
+`snDeduplicateTranscriptRowsFirstWins` over every folded source before the
+render list reaches SwiftUI `ForEach`. iOS still appends call-log rows with a
+fresh `UUID()` (history duplicates possible; not a LazyColumn crash). Crash
+capture itself is Android-only — see `Logging.kt` / `CrashReport.kt` platform
+gap note.
+
+**Guarded by:** `ChatFeedListItemsTest.hangupThenFinalizeUpsertsOneCallRecord`
+
+**Also guarded by:** `ChatFeedListItemsTest.duplicateCallRecordsCollapseLastWinsAndKeepUniqueKeys`, `ChatFeedListItemsTest.duplicateMessageIdsCollapseLastWinsAndKeepUniqueKeys`, `SonarReplyTests.duplicateTranscriptRowsCollapseFirstWinsBeforeRendering`
+
+**Not guarded:** a constructible `SonarAppState` proving hangup+finalize only
+calls upsert once end-to-end; a full SwiftUI render containing duplicate source
+rows (iOS tests currently do not run in CI).
+
+**Rejected:**
+- *Suffixing keys with list index.* Hides duplicates and breaks scroll restore
+  by stable id.
+- *Dropping call rows from the feed.* Removes the Signal-style call history the
+  UI already shows.
 
 ## Unguarded
 

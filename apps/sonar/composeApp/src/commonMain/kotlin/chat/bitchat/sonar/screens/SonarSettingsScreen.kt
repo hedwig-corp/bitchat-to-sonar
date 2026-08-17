@@ -823,7 +823,7 @@ private fun DiagnosticsSheet(state: SonarAppState, onClose: () -> Unit) {
         }
         Spacer(Modifier.height(10.dp))
         Text(
-            "Logs stay on this device until you share them. They contain relay and sync events — no message text and no keys.",
+            "Logs stay on this device until you share them. They include relay/sync events and, after an Android crash, a last-exception report (stack + open-chat phase counts). Private keys are scrubbed; message bodies are not intentionally included.",
             color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
         )
     }

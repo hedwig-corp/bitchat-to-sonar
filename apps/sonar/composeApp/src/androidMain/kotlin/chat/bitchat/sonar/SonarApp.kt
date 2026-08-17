@@ -40,6 +40,9 @@ class SonarApp : Application() {
     override fun onCreate() {
         super.onCreate()
         AppContextHolder.ctx = this
+        // Install before native/bootstrap work: the ordinary file logger is
+        // asynchronous and cannot preserve a fatal stack after process death.
+        AndroidCrashDiagnostics.install()
         // Publish JavaVM + app Context to Rust's ndk_context BEFORE any FFI call
         // (iroh DNS on bind, cpal/oboe audio read it). Once per process.
         NdkContext.install(this)
