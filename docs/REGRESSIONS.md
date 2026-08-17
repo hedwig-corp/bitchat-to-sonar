@@ -2344,6 +2344,318 @@ rows (iOS tests currently do not run in CI).
   by stable id.
 - *Dropping call rows from the feed.* Removes the Signal-style call history the
   UI already shows.
+## R-037 — Store-wide invalidation budgets are shared, not per source
+
+**Invariant:** upstream service changes may invalidate `SonarAppStore` at most
+once per shared 100 ms window. Adding another observed service must not multiply
+the maximum SwiftUI render rate.
+
+**Breaks as:** Home and open conversations become visibly less responsive as
+BLE announces, relay state, wallet state, presence, and Marmot updates overlap.
+Each render recomputes the folded conversation rows; the effect became
+device-visible on an iPhone 14 Pro Max with 278 Marmot groups.
+
+**Why:** the first performance fix put `.throttle(100 ms)` inside
+`republish(_:)`. That method is called once per publisher, so every upstream
+received an independent 10 Hz allowance even though its comment claimed a
+store-wide 10 Hz ceiling. Nine observed publishers could therefore request up
+to 90 full-store renders per second. All upstreams now feed one
+`SNStoreInvalidationCoalescer` before `objectWillChange`.
+
+**Apple call site:** `SonarAppStore.republish(_:)`.
+
+**Compose call site:** not applicable. Compose publishes scoped `StateFlow`
+state and does not funnel unrelated services through one global
+`objectWillChange` publisher.
+
+**Guarded by:** `SNStoreInvalidationCoalescerTests.independentSourcesShareOneThrottleWindow`
+
+**Not guarded:** the test pins the shared coalescer, not that every future
+`SonarAppStore` service is attached through `republish(_:)`. iOS tests are not
+currently part of CI. Physical-device verification remains the Home/chat
+smoothness check under simultaneous BLE and relay traffic.
+
+**Rejected:**
+- *Keep one throttle per publisher and increase its interval.* The aggregate
+  ceiling still grows with every new source; it only changes the multiplier.
+- *Cache `dmRows` without fixing invalidation fan-in.* That can reduce one
+  computed-property cost but still permits unrelated services to rebuild the
+  entire observed store at their combined event rate.
+
+## R-038 — Retained transcripts must not keep rebuilding after leave
+
+**Invariant:** a closed conversation may keep its last `[SNMessage]` for reopen
+paint, but it must not stay subscribed to `SonarAppStore.objectWillChange`. Only
+on-screen conversations rebuild on store invalidation.
+
+**Breaks as:** opening one busy chat (for example Giulia) feels fine the first
+time, then after visiting a handful of conversations every subsequent open —
+and typing inside any open chat — gets progressively slower. Each retained
+`ConversationViewState` was still running a full `dmMsgs` rebuild on every
+store invalidation.
+
+**Why:** leave paint kept the live coordinator (subscription + rebuild
+pipeline) for Signal-style reopen. Compose retains plain rows in
+`retainedTranscriptByChat` and recomputes for the open chat alone. Apple now
+mirrors that: `deactivate()` on `closedDM` detaches
+`SNTranscriptRebuildSubscription`, `activate()` on reopen rebuilds once and
+reattaches, and at most eight inactive transcripts stay retained.
+
+**Apple call site:** `ConversationViewState.activate()` /
+`ConversationViewState.deactivate()`; `SonarAppStore.openedDM` /
+`SonarAppStore.closedDM` / `SonarAppStore.conversationViewState(_:)`.
+
+**Compose call site:** not applicable as a bug — Compose already retains
+immutable rows without a live rebuild subscription
+(`SonarAppState.retainedTranscriptByChat`).
+
+**Guarded by:** `SNTranscriptRebuildSubscriptionTests.detachStopsRebuildsWithoutClearingAttachmentContract`
+
+**Not guarded:** the test pins the subscription attach/detach contract, not
+that every future leave path calls `closedDM` / `deactivate()`. Mac already
+documents the `.id(id)` requirement so pane reuse cannot skip `closedDM`.
+iOS tests are not currently part of CI. Physical-device verification is the
+Giulia open + multi-chat session smoothness check with
+`SONAR_BENCH transcript_rebuild` showing `conversations=1` while one chat is
+open.
+
+**Rejected:**
+- *Keep the live subscription and raise the debounce.* Cost still scales with
+  visited conversations; a 278-group account makes that linear.
+- *Drop retained transcripts entirely.* That reintroduces the empty-first-frame
+  flash on reopen that the leave-paint path was added to prevent.
+- *Cache `dmMsgs` output without detaching.* Helps one chat's CPU, but every
+  retained coordinator still wakes and compares on every store tick.
+
+## R-039 — Home conversation projection is memoized and side-effect free
+
+**Invariant:** reading `SonarAppStore.dmRows` at an unchanged conversation
+revision returns the cached `[SNDMRow]` without re-folding all groups, and
+never performs a UserDefaults write mid-projection. Fold mappings collected
+during a rebuild are applied in one batch (`snBatchedMarmotFoldMap`) with at
+most one persistence write. The Home message list materializes only viewport
+rows (`LazyVStack`), matching Compose `LazyColumn`.
+
+**Breaks as:** Home scroll/jank with hundreds of Marmot groups — every store
+invalidation rebuilt all conversation rows, linearly scanned Sonar profiles per
+group, and could JSON-encode the fold map once per alias while SwiftUI was
+evaluating `body`.
+
+**Why:** `dmRows` was a pure-looking computed property with persistence side
+effects and no memo key. The first attempted key recomputed titles, mute aliases,
+profiles, presence and unread state over all 278 groups; physical-device markers
+measured that "fingerprint" itself at **2.8–3.8 seconds per read** and Home at
+**8.96 seconds median after local model readiness**. Explicit revisions from
+conversation-relevant publishers reduced model-ready → Home-appear to **195 ms
+median** (3 cold runs, same account/device). Compose already memoizes
+`visibleChats` behind identity/version inputs and uses a lazy list.
+
+**Apple call site:** `SonarAppStore.dmRows` / `buildHomeDMRows(now:)` /
+`rememberMarmotGroups(_:)`; `SonarHomeScreen` ScrollView `LazyVStack`.
+
+**Compose call site:** not applicable as a bug — Compose already memoizes
+`SonarAppState.visibleChats` and renders with `LazyColumn`.
+
+**Guarded by:** `SNHomeDMRowsProjectionTests.batchedFoldMapPersistsOnlyWhenSomethingChanged`
+
+**Not guarded:** the test pins batch fold-map application, not the revision
+cache wiring or that Home stays a `LazyVStack`. iOS tests are not currently part of CI.
+Physical-device verification is Home scroll smoothness on the 278-group account
+under BLE + relay traffic. **Mac gap (tracked):** `SonarMacRootView` Messages
+sidebar still uses an eager `VStack`/`ForEach(store.dmRows)` — LazyVStack parity
+is a follow-up, not part of this iPhone scroll pass.
+
+**Rejected:**
+- *Keep eager `VStack` and only memoize `dmRows`.* Off-screen rows still
+  materialize on every cache miss / first paint.
+- *Compute a value fingerprint inside the getter.* This was slower than the
+  projection itself (2.8–3.8 s measured) because producing the key repeated the
+  same title/mute/profile resolution it was supposed to avoid. Revisions must
+  advance at mutation boundaries.
+- *Publish `@Published dmRows` from every upstream without scoped revisions.*
+  Still rebuilds on wallet/relay noise; scoped conversation revisions are what
+  make unrelated invalidations O(1).
+
+## R-040 — Message side-effect scanners are watermark-gated per chat
+
+**Invariant:** notification / pay / trill / call / pending-upload media scanners
+walk only chats whose in-memory `(latestSecs, messageCount)` advanced since the
+last scan (`snChatsNeedingMessageScan`). Marmot `$messagesByGroup` UI invalidation
+goes through `SNStoreInvalidationCoalescer`, not a direct `objectWillChange.send()`.
+
+**Breaks as:** every Marmot publication (and every BLE tick that previously
+re-entered the Marmot loops) walked all ~278 groups on the main actor, decoding
+control lines and consulting notification dedup sets, even when only one chat
+gained a message. That stack sat on the same path as typing and Home refresh.
+
+**Why:** Apple mirrored Compose's pre-watermark shape: full nested loops over
+`messagesByGroup` / `privateChats` on every publish. Compose already gates with
+`chatsNeedingPageScan`. Message-id sets (`seenMarmotNotificationMessageIDs`,
+`scannedPayMessageIDs`, …) remain the R-004 / pay / trill / call dedup floor;
+watermarks only skip the walk. Push-wake catch-up still force-scans all groups
+for notify/trill after ownership ends.
+
+**Apple call site:** `SonarAppStore.processIncomingMarmotMessageSideEffects()` /
+`processIncomingPrivateChatMessageSideEffects()`; helpers `snChatsNeedingMessageScan`
+/ `SNScanMark`.
+
+**Compose call site:** already correct —
+`SonarAppState` + `chatsNeedingPageScan` / `ScanMark`
+(`EventDrivenRefreshTest`).
+
+**Guarded by:** `SNMessageScanWatermarkTests.laterTimestampNeedsScan` /
+`SNMessageScanWatermarkTests.sameSecondHigherCountNeedsScan` /
+`SNMessageScanWatermarkTests.stagedPageForcesRescanEvenWhenWatermarkMatches`
+
+**Not guarded:** the tests pin the pure gate, not that every future
+`$messagesByGroup` / mesh sink calls the watermarked orchestrators, or that
+`loadOlderDM` keeps inserting into `marmotStagedPageRescanIds`. iOS tests
+are not currently part of CI. Physical-device verification is
+`SONAR_BENCH message_scan marmot needing=` staying near 1 under single-chat
+traffic on the 278-group account, without missing pay/trill/call/notify.
+
+**Rejected:**
+- *Keep whole-history walks and only coalesce UI invalidation.* R-037 bounds
+  renders; the scanner CPU still scales with group count × publish rate.
+- *Advance a single global watermark from the newest message across all chats.*
+  That is the R-005 class of bug: activity in chat A can skip recovery work in
+  chat B. Per-chat marks only.
+
+## R-041 — Transcript host skip is O(1) end-to-end (render revision)
+
+**Invariant:** after `ConversationViewState` decides visible rows are unchanged,
+the UIKit transcript adapter must not re-compare `[SNMessage]` arrays or rebuild
+the ID index / host entries on SwiftUI body evaluation. Skip is driven by
+`SNConversationRenderState.revision` (+ showAuthors / peerName chrome).
+
+**Breaks as:** composer keystrokes and unrelated store ticks still cost O(n) in
+the adapter before the host's O(1) `shouldSkipUnchangedApply`, so typing/scroll
+in a long Giulia chat stays janky even when rebuild equality no-ops.
+
+**Why:** the host skip was correct; the adapter still walked messages twice and
+mapped entries every body. Publishing an atomic render snapshot moves entry/index
+construction to the producer change boundary.
+
+**Apple call site:** `ConversationViewState.publishMessages` /
+`SNTranscriptHostRenderContext.sync(renderState:)` /
+`SNTranscriptCollectionRepresentable`.
+
+**Compose call site:** not applicable as a bug — Compose recomposes scoped
+state without a global `objectWillChange` array equality pass.
+
+**Guarded by:** `SNTranscriptHostRenderContextRevisionTests.unchangedPassStillSkips` /
+`SNTranscriptHostRenderContextRevisionTests.unchangedRevisionDoesNotRebuildMessageIndex` /
+`SNTranscriptHostRenderContextRevisionTests.advancedRenderStateKeepsRevisionWhenMessagesUnchanged`
+
+**Not guarded:** wiring that every future DM screen passes `convo.renderState`
+(not a bare rebuilt array). Physical-device: `SONAR_BENCH transcript_apply`
+shows skip ≫ apply while typing in an unchanged transcript.
+
+**Rejected:**
+- *Keep array equality in the adapter and only cache entries.* Still O(n) before
+  skip on every body.
+- *Bump contentVersion from body without pairing entries.* Reintroduces the
+  blank-band / swallowed send apply hazard.
+
+## R-042 — Mention suggestions stay composer-local
+
+**Invariant:** typing an `@token` must not mutate `@Published` store state for a
+per-keystroke mention query. Suggestions derive from the bound draft + roster
+inside `SNComposer` (Compose `Mentions.matches` shape). `composerDraftHasText`
+still publishes only on the empty↔non-empty boundary.
+
+**Breaks as:** every `@` keystroke invalidated `SonarAppStore`, re-ran
+`ConversationViewState.dmMsgs`, and bumped hosted `composerVersion`.
+
+**Apple call site:** `SonarAppStore.setComposerDraft` (no mention query);
+`SonarDMScreenContent.dmComposer` always passes `mentionRoster`;
+`SNComposer.mentionSuggestions`.
+
+**Compose call site:** already correct — `composerDrafts` + local
+`Mentions.matches` in `App.kt`.
+
+**Guarded by:** `SNComposerMentionLocalityTests.mentionSuggestionsDeriveFromDraftWithoutStoreQuery` /
+`SNComposerMentionLocalityTests.draftHasTextFlagOnlyFlipsOnEmptyBoundary`
+
+**Not guarded:** that `composerMentionQuery` stays deleted (no future re-add),
+and that `SNComposer.fieldText` stays the TextField source of truth (a
+regression that binds the field back to the non-publishing store draft alone
+silently kills autocomplete). iOS tests are not in CI.
+
+**Rejected:**
+- *Throttle mention-query publishes.* Still store-wide invalidation during `@…`.
+
+## R-043 — Decoded transcript thumbnails use a bounded LRU
+
+**Invariant:** static transcript thumbnails decode at most once per media URL
+within a 48 MB process-wide LRU (`SNDecodedMediaCache`), clear on account
+wipe/restore, and trim under memory warnings. GIF `WKWebView` must not
+`loadHTMLString` again when the GIF bytes fingerprint is unchanged.
+
+**Breaks as:** scrolling back through Giulia media re-runs ImageIO every cell
+appear; GIF representable updates reload base64 HTML every SwiftUI turn.
+
+**Apple call site:** `SNDecodedMediaCache`; media bubble / deck `.task` load
+paths; `SNGifWebView` coordinator fingerprint.
+
+**Compose call site:** already correct — `MediaImageMemoryCache` (48 MB).
+
+**Guarded by:** `SNDecodedMediaCacheTests.lruEvictsEldestWhenOverBudget` /
+`SNDecodedMediaCacheTests.getPromotesToNewest` /
+`SNDecodedMediaCacheTests.gifFingerprintStableForSameBytes`
+
+**Not guarded:** native animated-GIF replacement for WKWebView (tracked
+follow-up if `gif_reload` stays hot after the fingerprint guard).
+
+**Rejected:**
+- *Cache only raw `Data` in `mediaImageCache`.* Still re-decodes pixels per
+  cell appear.
+
+## R-044 — Plain text rows are pre-measured UIKit cells, not SwiftUI hosting cells
+
+**Invariant:** the common transcript row (no media/sticker/pay/call/nudge/action)
+renders through `SNTextBubbleCell`, whose frames come from
+`SNTextBubbleLayout.geometry` — the *same* geometry the collection host measures
+with. Nothing on the scroll path may build a SwiftUI graph, and nothing may
+re-derive a row's paint state per configure: models are cached per
+`(id, height key)` and geometry per `(measurement key, width, direction)`.
+Row height keys hash message text instead of embedding it, because the flow
+layout derives a key for every loaded row on each `invalidateLayout`.
+
+**Breaks as:** scrolling a long chat (Giulia) stutters. Each cell appearance
+constructs a `UIHostingConfiguration` graph and lays out text, and the layout
+pass measures misses through `UIHostingController.sizeThatFits`, so a width
+change or a snapshot apply re-measures the whole loaded window through SwiftUI.
+
+**Apple call site:** `SNTextBubbleLayout` / `SNTextBubbleCell`;
+`SNTranscriptHostRenderContext.heightKey` + `provideCell` + `itemHeight`;
+`TranscriptCollectionHostCallbacks.registerCells` / `provideCell` (the engine
+seam that lets one transcript mix UIKit and hosted rows). Rich row kinds stay on
+the hosting path deliberately — `SNTextBubbleModel.handles` is the fork.
+
+**Compose call site:** not applicable. The Compose transcript already paints
+native rows in a `LazyColumn`; this closes an iOS-only gap against it, so there
+is no mirror change to make.
+
+**Guarded by:** `SNTextBubbleLayoutTests.heightStaysCloseToTheSwiftUIRow`
+(UIKit height == hosted SwiftUI row height, so the two paths cannot render the
+same chat at different sizes) / `SNTextBubbleLayoutTests.handlesOnlyPlainTextRows`
+(the routing fork, which is the real call site) /
+`SNTextBubbleLayoutTests.paintedFramesStayInsideTheMeasuredRow`
+
+**Not guarded:** no test asserts pixel-level appearance, gesture behaviour
+(swipe-to-reply, context menu, link/mention hit-testing) or that a *specific*
+row kind reaches the UIKit path from a live transcript — those stay manual. The
+flag `snUIKitTextBubblesEnabled()` (`SONAR_UIKIT_BUBBLES=0`, or the
+`sonar.uikitTextBubbles` default) restores the hosting path without a rebuild;
+keep it until the UIKit path has device mileage.
+
+**Rejected:**
+- *Keep SwiftUI cells and only cache measurement.* The per-appearance graph
+  construction is the dominant cost, not the measure; caching heights alone left
+  the stutter in place (that is R-041's ground already covered).
+- *Port every row kind to UIKit.* Media/sticker/pay/call chrome is rare on the
+  scroll path and would double a large amount of layout for no measured win.
 
 ## Unguarded
 

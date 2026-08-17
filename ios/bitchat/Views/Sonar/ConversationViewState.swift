@@ -15,6 +15,9 @@
 
 import Combine
 import Foundation
+#if DEBUG
+import BitLogger
+#endif
 
 struct SNConversationTranscriptSource {
     static let meshID = "$mesh"
@@ -204,6 +207,138 @@ enum SNConversationTranscriptWindow {
     }
 }
 
+#if DEBUG
+/// SONAR_BENCH: aggregate meter for transcript rebuild cost.
+///
+/// A rebuild is triggered per store invalidation for every retained
+/// `ConversationViewState`, so the diagnostic signal is the per-second total
+/// across conversations, not one line per rebuild. Logging per rebuild would
+/// itself be part of the cost being measured.
+@MainActor
+enum SNTranscriptRebuildMeter {
+    private static var rebuilds = 0
+    private static var totalMs = 0.0
+    private static var maxMs = 0.0
+    private static var conversationIds = Set<String>()
+    private static var windowStart = CFAbsoluteTimeGetCurrent()
+
+    static func record(conversationId: String, rows: Int, ms: Double) {
+        _ = rows
+        rebuilds += 1
+        totalMs += ms
+        maxMs = max(maxMs, ms)
+        conversationIds.insert(conversationId)
+        let now = CFAbsoluteTimeGetCurrent()
+        let window = now - windowStart
+        guard window >= 1 else { return }
+        SecureLogger.info(
+            "SONAR_BENCH transcript_rebuild window_s=\(String(format: "%.2f", window)) "
+                + "rebuilds=\(rebuilds) conversations=\(conversationIds.count) "
+                + "total_ms=\(Int(totalMs.rounded())) max_ms=\(Int(maxMs.rounded()))",
+            category: .session
+        )
+        rebuilds = 0
+        totalMs = 0
+        maxMs = 0
+        conversationIds.removeAll()
+        windowStart = now
+    }
+}
+
+/// SONAR_BENCH: counts UIKit host applies that skip vs rebuild after the
+/// adapter has already decided content is unchanged (true O(1) path).
+@MainActor
+enum SNTranscriptApplyMeter {
+    private static var skips = 0
+    private static var applies = 0
+    private static var windowStart = CFAbsoluteTimeGetCurrent()
+
+    static func record(skipped: Bool, revision: UInt64) {
+        if skipped { skips += 1 } else { applies += 1 }
+        let now = CFAbsoluteTimeGetCurrent()
+        let window = now - windowStart
+        guard window >= 1 else { return }
+        SecureLogger.info(
+            "SONAR_BENCH transcript_apply window_s=\(String(format: "%.2f", window)) "
+                + "skip=\(skips) apply=\(applies) last_revision=\(revision)",
+            category: .session
+        )
+        skips = 0
+        applies = 0
+        windowStart = now
+    }
+}
+#endif
+
+/// Immutable transcript snapshot published by `ConversationViewState`.
+///
+/// The revision advances only when `messages` change. Downstream UIKit hosts
+/// compare this revision instead of re-walking the message array on every
+/// SwiftUI body evaluation (composer keystrokes, unrelated store ticks).
+struct SNConversationRenderState: Equatable {
+    let revision: UInt64
+    let messages: [SNMessage]
+    let messageIndexByID: [String: Int]
+
+    static let empty = SNConversationRenderState(revision: 0, messages: [], messageIndexByID: [:])
+
+    static func make(messages: [SNMessage], revision: UInt64) -> SNConversationRenderState {
+        var indexByID: [String: Int] = [:]
+        indexByID.reserveCapacity(messages.count)
+        for (i, message) in messages.enumerated() where indexByID[message.id] == nil {
+            indexByID[message.id] = i
+        }
+        return SNConversationRenderState(
+            revision: revision,
+            messages: messages,
+            messageIndexByID: indexByID
+        )
+    }
+}
+
+/// Advance the render snapshot only when the visible row list actually changed.
+func snAdvancedConversationRenderState(
+    previous: SNConversationRenderState,
+    messages: [SNMessage]
+) -> SNConversationRenderState {
+    if messages == previous.messages { return previous }
+    return .make(messages: messages, revision: previous.revision &+ 1)
+}
+
+/// Store-invalidation subscription for ONE conversation transcript.
+///
+/// Retained (closed) conversations keep their last transcript so reopening
+/// paints without an empty first frame, but they must not keep rebuilding it:
+/// the store's invalidation stream is shared, so every attached conversation
+/// adds a full transcript pass to EVERY invalidation for the rest of the
+/// session. Owning attachment separately is what makes retention cost memory
+/// only — the Compose side retains plain rows in `retainedTranscriptByChat` and
+/// recomputes for the open chat alone.
+final class SNTranscriptRebuildSubscription {
+    private let debounceInterval: DispatchQueue.SchedulerTimeType.Stride
+    private var cancellable: AnyCancellable?
+
+    var isAttached: Bool { cancellable != nil }
+
+    init(debounceInterval: DispatchQueue.SchedulerTimeType.Stride = .milliseconds(80)) {
+        self.debounceInterval = debounceInterval
+    }
+
+    func attach<P: Publisher>(
+        to invalidations: P,
+        onInvalidate: @escaping () -> Void
+    ) where P.Output == Void, P.Failure == Never {
+        guard cancellable == nil else { return }
+        cancellable = invalidations
+            .debounce(for: debounceInterval, scheduler: DispatchQueue.main)
+            .sink { _ in onInvalidate() }
+    }
+
+    func detach() {
+        cancellable = nil
+    }
+}
+
 /// Precomputed transcript for ONE open conversation.
 ///
 /// Rebuilds are triggered by the store's (already throttled) invalidation
@@ -219,16 +354,19 @@ enum SNConversationTranscriptWindow {
 /// input surface and is tracked as a follow-up.
 @MainActor
 final class ConversationViewState: ObservableObject {
-    /// Immutable, render-ready transcript (oldest first, control lines
-    /// resolved, pay bubbles and call rows folded in).
-    @Published private(set) var messages: [SNMessage] = []
+    /// Immutable render snapshot (revision + messages + first-id index).
+    /// Screens that only need rows read `messages`; the UIKit host consumes
+    /// `renderState` so skip stays O(1) in the adapter.
+    @Published private(set) var renderState = SNConversationRenderState.empty
+    /// Convenience for SwiftUI lists / empty checks — same rows as `renderState`.
+    var messages: [SNMessage] { renderState.messages }
     @Published private(set) var hasOlderMessages = false
     @Published private(set) var isLoadingOlder = false
 
     let conversationId: String
 
     private weak var store: SonarAppStore?
-    private var invalidationSub: AnyCancellable?
+    private let rebuildSubscription: SNTranscriptRebuildSubscription
     private var rebuildScheduled = false
     /// Render budget grows a page at a time and remains independent from the
     /// Marmot database cache window. It therefore bounds pure mesh and folded
@@ -247,30 +385,55 @@ final class ConversationViewState: ObservableObject {
     private var lastCallRecordCount = 0
     private static let olderSourceLoadAttemptLimit = 3
 
-    init(conversationId: String, store: SonarAppStore) {
+    private func publishMessages(_ next: [SNMessage]) {
+        renderState = snAdvancedConversationRenderState(previous: renderState, messages: next)
+    }
+
+    init(
+        conversationId: String,
+        store: SonarAppStore,
+        rebuildSubscription: SNTranscriptRebuildSubscription = SNTranscriptRebuildSubscription()
+    ) {
         self.conversationId = conversationId
         self.store = store
+        self.rebuildSubscription = rebuildSubscription
         self.lastMeshMessageCount = store.cachedMeshMessageCount(conversationId)
         self.lastPaymentActivityCount = store.cachedPaymentActivityCount(conversationId)
         self.lastCallRecordCount = store.cachedCallRecordCount(conversationId)
         // First build is synchronous so the opening chat paints from local
         // state immediately (local-first rule) instead of after a debounce.
         rebuildNow()
+    }
+
+    var isActive: Bool { rebuildSubscription.isAttached }
+
+    /// Follow store invalidations while this conversation is on screen. The
+    /// synchronous rebuild is what makes reopen paint current: a retained
+    /// transcript stopped following the store when the chat was closed.
+    func activate() {
+        guard let store, !rebuildSubscription.isAttached else { return }
+        rebuildNow()
         // The store already coalesces upstream invalidations (~10/sec cap);
         // the extra debounce collapses those bursts into one rebuild.
-        self.invalidationSub = store.objectWillChange
-            .debounce(for: .milliseconds(80), scheduler: DispatchQueue.main)
-            .sink { [weak self] _ in self?.scheduleRebuild() }
+        rebuildSubscription.attach(to: store.objectWillChange) { [weak self] in
+            self?.scheduleRebuild()
+        }
+    }
+
+    /// Stop following store invalidations. `messages` is kept for reopen paint.
+    func deactivate() {
+        rebuildSubscription.detach()
     }
 
     /// Coalesce rebuild requests: at most one queued build at a time. A change
     /// arriving mid-build is covered by the next invalidation tick.
     private func scheduleRebuild() {
-        guard !rebuildScheduled else { return }
+        guard rebuildSubscription.isAttached, !rebuildScheduled else { return }
         rebuildScheduled = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.rebuildScheduled = false
+            guard self.rebuildSubscription.isAttached else { return }
             self.rebuildNow()
         }
     }
@@ -279,6 +442,16 @@ final class ConversationViewState: ObservableObject {
     /// what turns unrelated store invalidations into no-ops for SwiftUI.
     func rebuildNow() {
         guard let store else { return }
+        #if DEBUG
+        let rebuildStarted = CFAbsoluteTimeGetCurrent()
+        defer {
+            SNTranscriptRebuildMeter.record(
+                conversationId: conversationId,
+                rows: messages.count,
+                ms: (CFAbsoluteTimeGetCurrent() - rebuildStarted) * 1000
+            )
+        }
+        #endif
         let meshCount = store.cachedMeshMessageCount(conversationId)
         let paymentCount = store.cachedPaymentActivityCount(conversationId)
         let callCount = store.cachedCallRecordCount(conversationId)
@@ -321,9 +494,7 @@ final class ConversationViewState: ObservableObject {
             pinningOlderEdgeAtCapacity: !needsNewestReload
                 && visibleMessageLimit >= TransportConfig.sonarTranscriptRetainedCount
         )
-        if visible != messages {
-            messages = visible
-        }
+        publishMessages(visible)
         if !needsNewestReload,
            visibleMessageLimit >= TransportConfig.sonarTranscriptRetainedCount,
            visible.count >= TransportConfig.sonarTranscriptRetainedCount {
@@ -407,7 +578,7 @@ final class ConversationViewState: ObservableObject {
                 needsNewestReload = true
                 store.preserveHistoricalDM(conversationId)
             }
-            if next != previous { messages = next }
+            if next != previous { publishMessages(next) }
 
             hasOlderMessages = SNConversationTranscriptWindow.hasRowsOlder(
                 than: messages.first,

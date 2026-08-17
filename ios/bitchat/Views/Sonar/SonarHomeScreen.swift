@@ -12,6 +12,9 @@
 //
 
 import SwiftUI
+#if DEBUG
+import BitLogger
+#endif
 
 struct SonarHomeScreen: View {
     @EnvironmentObject private var store: SonarAppStore
@@ -41,6 +44,9 @@ struct SonarHomeScreen: View {
     @State private var groupMembersDraft = ""
     @State private var selectedGroupNpubs: Set<String> = []
     @State private var titleTaps: [Date] = []
+    #if DEBUG
+    @State private var didLogFirstHomeAppearance = false
+    #endif
 
     /// Triple-tap on the "sonar" title (taps within 1.2 s) triggers the wipe sheet.
     private func titleTap() {
@@ -61,7 +67,11 @@ struct SonarHomeScreen: View {
                     connSheet = true
                 }
                 ScrollView {
-                    VStack(spacing: 0) {
+                    // LazyVStack is the Compose LazyColumn parity: only the
+                    // viewport (+ small buffer) materializes conversation rows.
+                    // A plain VStack rebuilt all ~278 SNConvRow trees on every
+                    // store invalidation.
+                    LazyVStack(spacing: 0, pinnedViews: []) {
                         // H1 pinned strip (design: paystatus.jsx). An external
                         // payment has no conversation to live in, so while one
                         // is in flight it sits above the list; it clears itself
@@ -72,14 +82,42 @@ struct SonarHomeScreen: View {
                         let saved = store.savedChannels
                         if !saved.isEmpty {
                             SNSectionLabel("Saved channels")
-                            savedList(saved)
+                            savedChannelRows(saved)
                         }
                         SNSectionLabel("Messages")
-                        dmList
+                        dmRows
                     }
                     .padding(.bottom, 120)
                 }
-                .onAppear { store.resolveSavedChannelNames() }
+                .onAppear {
+                    store.resolveSavedChannelNames()
+                    #if DEBUG
+                    guard !didLogFirstHomeAppearance else { return }
+                    didLogFirstHomeAppearance = true
+                    // Queue behind this SwiftUI transaction: this is not a GPU
+                    // frame-present callback, but it bounds model-ready → Home
+                    // hierarchy materialized without adding Instruments-only
+                    // code to Release.
+                    DispatchQueue.main.async {
+                        SecureLogger.info("SONAR_BENCH t1b_home_appear", category: .session)
+                    }
+                    #endif
+                }
+                .confirmationDialog(
+                    "Delete this chat?",
+                    isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+                    titleVisibility: .visible,
+                    presenting: pendingDelete
+                ) { row in
+                    Button(store.isMultiMemberMarmotGroupId(row.id) ? "Leave \(row.title)" : "Delete \(row.title)", role: .destructive) { store.deleteChat(row.id) }
+                    Button("Cancel", role: .cancel) {}
+                } message: { row in
+                    if store.isMultiMemberMarmotGroupId(row.id) {
+                        Text("This sends a leave update to the group and removes the conversation from this device.")
+                    } else {
+                        Text("This removes the conversation from this device only. The other person isn't notified.")
+                    }
+                }
             }
             floatingBar
         }
@@ -196,92 +234,77 @@ struct SonarHomeScreen: View {
     // Design HomeScreen "Saved channels": a flat list of explicitly bookmarked
     // channels (BC_DATA.channels), each a PlaceTile + humanized name row that
     // opens the channel. Live "N here now" count, else "Saved channel".
-    private func savedList(_ saved: [SNChannelItem]) -> some View {
-        VStack(spacing: 0) {
-            ForEach(Array(saved.enumerated()), id: \.element.id) { i, c in
-                SNConvRow(
-                    title: c.name,
-                    divider: i < saved.count - 1,
-                    action: { store.openChannel(c) },
-                    avatar: { SNPlaceTile(size: 52) },
-                    sub: {
-                        Text(verbatim: c.preview)
-                            .font(SonarTheme.uiFont(size: 14))
-                            .foregroundColor(SonarTheme.text2)
-                    }
-                )
-            }
+    // Emitted as sibling LazyVStack children (not a nested VStack) so off-screen
+    // rows stay unmaterialized.
+    @ViewBuilder
+    private func savedChannelRows(_ saved: [SNChannelItem]) -> some View {
+        ForEach(Array(saved.enumerated()), id: \.element.id) { i, c in
+            SNConvRow(
+                title: c.name,
+                divider: i < saved.count - 1,
+                action: { store.openChannel(c) },
+                avatar: { SNPlaceTile(size: 52) },
+                sub: {
+                    Text(verbatim: c.preview)
+                        .font(SonarTheme.uiFont(size: 14))
+                        .foregroundColor(SonarTheme.text2)
+                }
+            )
         }
     }
 
-    private var dmList: some View {
+    @ViewBuilder
+    private var dmRows: some View {
         let rows = store.dmRows
         let invites = store.marmot.pendingGroupInvites
-        return VStack(spacing: 0) {
-            if rows.isEmpty && invites.isEmpty {
-                SNEmptyState(
-                    icon: .lock,
-                    iconSize: 24,
-                    title: "No messages yet",
-                    desc: "Find people nearby with the radar, or start a secure chat with the + button."
+        if rows.isEmpty && invites.isEmpty {
+            SNEmptyState(
+                icon: .lock,
+                iconSize: 24,
+                title: "No messages yet",
+                desc: "Find people nearby with the radar, or start a secure chat with the + button."
+            )
+            .padding(.vertical, 28)
+        } else {
+            ForEach(Array(invites.enumerated()), id: \.element.id) { i, invite in
+                let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
+                SNConvRow(
+                    title: title,
+                    verified: false,
+                    time: "",
+                    unread: false,
+                    divider: i < invites.count - 1 || !rows.isEmpty,
+                    action: { pendingInvite = invite },
+                    avatar: { SonarAvatar(name: title, size: 52, presence: false) },
+                    sub: {
+                        SNLockedPreview(preview: "\(invite.memberCount) members · invite")
+                    }
                 )
-                .padding(.vertical, 28)
-            } else {
-                ForEach(Array(invites.enumerated()), id: \.element.id) { i, invite in
-                    let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
-                    SNConvRow(
-                        title: title,
-                        verified: false,
-                        time: "",
-                        unread: false,
-                        divider: i < invites.count - 1 || !rows.isEmpty,
-                        action: { pendingInvite = invite },
-                        avatar: { SonarAvatar(name: title, size: 52, presence: false) },
-                        sub: {
-                            SNLockedPreview(preview: "\(invite.memberCount) members · invite")
-                        }
-                    )
-                }
-                ForEach(Array(rows.enumerated()), id: \.element.id) { i, d in
-                    SNConvRow(
-                        title: d.title,
-                        verified: d.verified,
-                        time: d.time,
-                        unread: d.unread,
-                        muted: d.muted,
-                        divider: i < rows.count - 1,
-                        action: {
-                            store.openDM(d.id, marmotGroupId: d.marmotGroupId)
-                        },
-                        avatar: { SonarAvatar(name: d.title, size: 52, presence: d.presence) },
-                        sub: { SNLockedPreview(preview: d.preview) }
-                    )
-                    .contextMenu {
-                        Button { muteRow = d } label: {
-                            Label(d.muted ? "Muted" : "Mute", systemImage: d.muted ? "bell.slash.fill" : "bell.slash")
-                        }
-                        if !store.isPendingSecureChat(d.id) {
-                            Button(role: .destructive) { pendingDelete = d } label: {
-                                Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
-                            }
+            }
+            ForEach(Array(rows.enumerated()), id: \.element.id) { i, d in
+                SNConvRow(
+                    title: d.title,
+                    verified: d.verified,
+                    time: d.time,
+                    unread: d.unread,
+                    muted: d.muted,
+                    divider: i < rows.count - 1,
+                    action: {
+                        store.openDM(d.id, marmotGroupId: d.marmotGroupId)
+                    },
+                    avatar: { SonarAvatar(name: d.title, size: 52, presence: d.presence) },
+                    sub: { SNLockedPreview(preview: d.preview) }
+                )
+                .contextMenu {
+                    Button { muteRow = d } label: {
+                        Label(d.muted ? "Muted" : "Mute", systemImage: d.muted ? "bell.slash.fill" : "bell.slash")
+                    }
+                    if !store.isPendingSecureChat(d.id) {
+                        Button(role: .destructive) { pendingDelete = d } label: {
+                            Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
                         }
                     }
                 }
-            }
-        }
-        .confirmationDialog(
-            "Delete this chat?",
-            isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
-            titleVisibility: .visible,
-            presenting: pendingDelete
-        ) { row in
-            Button(store.isMultiMemberMarmotGroupId(row.id) ? "Leave \(row.title)" : "Delete \(row.title)", role: .destructive) { store.deleteChat(row.id) }
-            Button("Cancel", role: .cancel) {}
-        } message: { row in
-            if store.isMultiMemberMarmotGroupId(row.id) {
-                Text("This sends a leave update to the group and removes the conversation from this device.")
-            } else {
-                Text("This removes the conversation from this device only. The other person isn't notified.")
             }
         }
     }

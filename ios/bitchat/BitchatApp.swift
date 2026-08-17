@@ -152,6 +152,13 @@ struct BitchatApp: App {
                         NostrRelayManager.shared.disconnect()
                         didEnterBackground = true
                     case .active:
+                        #if DEBUG
+                        // SONAR_BENCH: split process-launch delay (which can be
+                        // CoreDevice/iOS foreground scheduling) from Sonar's
+                        // active → local-paint work. Emit before restarting any
+                        // service so the marker itself is the phase boundary.
+                        SecureLogger.info("SONAR_BENCH t0a_became_active", category: .session)
+                        #endif
                         // Restart services when becoming active
                         chatViewModel.meshService.startServices()
                         // Resume Unify receiver advertising (gated internally on a

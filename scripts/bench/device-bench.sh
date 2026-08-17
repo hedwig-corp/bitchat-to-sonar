@@ -191,6 +191,10 @@ def d(r, a, b):
 # t3a is off the sync critical path (and often lands after t4). Prefer t3→t4 /
 # t2→t4 for the pain-point comparison; keep t3→t3a as an off-path note.
 PHASES = [
+    ("t0 → t0a  (iOS foreground delay) ", "t0_launch", "t0a_became_active"),
+    ("t0a → t1  (active → local paint)  ", "t0a_became_active", "t1_local_paint"),
+    ("t1 → t1b  (model → Home appear)   ", "t1_local_paint", "t1b_home_appear"),
+    ("t0a → t1b (active → Home appear)  ", "t0a_became_active", "t1b_home_appear"),
     ("t0 → t1   (open DB, local paint)", "t0_launch", "t1_local_paint"),
     ("t1 → t2   (pre-relay window)    ", "t1_local_paint", "t2_relay_connect_begin"),
     ("t2 → t3   (relay quorum connect)", "t2_relay_connect_begin", "t3_relay_connected"),

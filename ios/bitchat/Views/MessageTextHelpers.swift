@@ -33,7 +33,7 @@ enum SonarMessageTextFormatter {
     ) -> AttributedString {
         let matches = textMatches(
             in: text,
-            mentionFont: mentionFont,
+            mentionStyled: mentionFont != nil,
             mentions: mentions,
             detectBareDomains: detectBareDomains,
             excludeLinkBeforeTrailingEllipsis: excludeLinkBeforeTrailingEllipsis
@@ -73,9 +73,71 @@ enum SonarMessageTextFormatter {
         return result
     }
 
+    #if canImport(UIKit)
+    /// UIKit sibling of `attributedBubbleText` for the pre-measured transcript
+    /// cell. Same match scan, TextKit attributes: `.link` carries both URLs and
+    /// `SNMentions` deep links so the cell can hit-test one attribute.
+    static func nsAttributedBubbleText(
+        _ text: String,
+        font: UIFont,
+        baseColor: UIColor,
+        lineSpacing: CGFloat,
+        lineBreakMode: NSLineBreakMode,
+        linkColor: UIColor? = nil,
+        mentionFont: UIFont? = nil,
+        mentionColor: UIColor? = nil,
+        mentions: [SNResolvedMention]? = nil,
+        detectBareDomains: Bool = false,
+        excludeLinkBeforeTrailingEllipsis: Bool = false
+    ) -> NSAttributedString {
+        let matches = textMatches(
+            in: text,
+            mentionStyled: mentionFont != nil,
+            mentions: mentions,
+            detectBareDomains: detectBareDomains,
+            excludeLinkBeforeTrailingEllipsis: excludeLinkBeforeTrailingEllipsis
+        )
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = lineSpacing
+        paragraph.lineBreakMode = lineBreakMode
+        let base: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: baseColor,
+            .paragraphStyle: paragraph,
+        ]
+        let result = NSMutableAttributedString()
+        var cursor = text.startIndex
+
+        for match in matches {
+            guard match.range.lowerBound >= cursor else { continue }
+            if cursor < match.range.lowerBound {
+                result.append(NSAttributedString(string: String(text[cursor..<match.range.lowerBound]), attributes: base))
+            }
+            var attributes = base
+            switch match.kind {
+            case .link(let url):
+                attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                attributes[.foregroundColor] = linkColor ?? baseColor
+                if let url { attributes[.link] = url }
+            case .mention(let npub):
+                if let mentionFont { attributes[.font] = mentionFont }
+                if let mentionColor { attributes[.foregroundColor] = mentionColor }
+                if let npub, let url = SNMentions.url(forNpub: npub) { attributes[.link] = url }
+            }
+            result.append(NSAttributedString(string: String(text[match.range]), attributes: attributes))
+            cursor = match.range.upperBound
+        }
+
+        if cursor < text.endIndex {
+            result.append(NSAttributedString(string: String(text[cursor...]), attributes: base))
+        }
+        return result
+    }
+    #endif
+
     private static func textMatches(
         in text: String,
-        mentionFont: Font?,
+        mentionStyled: Bool,
         mentions: [SNResolvedMention]?,
         detectBareDomains: Bool,
         excludeLinkBeforeTrailingEllipsis: Bool
@@ -110,7 +172,7 @@ enum SonarMessageTextFormatter {
                     to: &matches
                 )
             }
-        } else if mentionFont != nil, text.contains("@") {
+        } else if mentionStyled, text.contains("@") {
             for match in MessageFormattingEngine.Patterns.mention.matches(in: text, options: [], range: fullRange) {
                 appendMatch(match.range(at: 0), kind: .mention(npub: nil), priority: 1, in: text, to: &matches)
             }

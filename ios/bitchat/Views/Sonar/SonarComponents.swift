@@ -2385,6 +2385,14 @@ let snQuickEmojis: [String] = ["👍", "❤️", "😂", "🔥", "🙏", "👏",
 private struct SNDecodedPlatformImage {
     let image: Image
     let size: CGSize
+
+    var asCachedThumb: SNCachedDecodedThumb {
+        SNCachedDecodedThumb(
+            image: image,
+            pixelWidth: max(1, Int(size.width.rounded())),
+            pixelHeight: max(1, Int(size.height.rounded()))
+        )
+    }
 }
 
 /// Carrier so ImageIO can run off-main without requiring `Image` to be Sendable.
@@ -2416,7 +2424,8 @@ func snPlatformImage(_ data: Data) -> Image? {
 }
 
 /// Signal/Compose-style bounded thumbnail: ImageIO never materialises the full
-/// ARGB bitmap. Safe to call off the main actor.
+/// ARGB bitmap. Safe to call off the main actor. Prefer the cache helpers below
+/// for list cells so reopening/scrolling back skips a re-decode.
 private func snDecodeTranscriptThumbnail(
     url: URL,
     maxEdge: CGFloat = snTranscriptThumbMaxEdgePx
@@ -2439,6 +2448,9 @@ private func snDecodeTranscriptThumbnail(
     }
     return snThumbnail(from: source, maxEdge: maxEdge)
 }
+
+/// Cache-aware helpers are inlined at call sites (MainActor get/put around
+/// off-main ImageIO) so list cells never block the main thread on decode.
 
 private func snThumbnail(from source: CGImageSource, maxEdge: CGFloat) -> SNDecodedPlatformImage? {
     let thumbOpts: [CFString: Any] = [
@@ -2915,7 +2927,16 @@ struct SNMediaBubble: View {
             if keepThumb { return }
             if item.isImage, !(item.isGif) {
                 // Signal-style: bounded ImageIO thumbnail off-main; never
-                // UIImage(data:) full-res in the list body.
+                // UIImage(data:) full-res in the list body. Decoded LRU paints
+                // immediately when scrolling back to an already-seen URL.
+                let cacheKey = item.url
+                if let hit = SNDecodedMediaCache.shared.get(cacheKey) {
+                    thumb = SNDecodedPlatformImage(
+                        image: hit.image,
+                        size: CGSize(width: hit.pixelWidth, height: hit.pixelHeight)
+                    )
+                    return
+                }
                 let localURL = transfer.localURL
                 let box = await Task.detached(priority: .userInitiated) {
                     if let localURL {
@@ -2924,6 +2945,7 @@ struct SNMediaBubble: View {
                     return SNThumbBox(nil)
                 }.value
                 if let decoded = box.value {
+                    SNDecodedMediaCache.shared.put(cacheKey, decoded.asCachedThumb)
                     thumb = decoded
                     return
                 }
@@ -2932,6 +2954,7 @@ struct SNMediaBubble: View {
                         SNThumbBox(snDecodeTranscriptThumbnail(data: d))
                     }.value
                     if let t = tBox.value {
+                        SNDecodedMediaCache.shared.put(cacheKey, t.asCachedThumb)
                         thumb = t
                     } else {
                         snLogRecoveredUndecodableImage(item, bytes: d)
@@ -3221,6 +3244,14 @@ private struct SNMediaCardImage: View {
                     }
                     return
                 }
+                let cacheKey = item.url
+                if let hit = SNDecodedMediaCache.shared.get(cacheKey) {
+                    thumb = SNDecodedPlatformImage(
+                        image: hit.image,
+                        size: CGSize(width: hit.pixelWidth, height: hit.pixelHeight)
+                    )
+                    return
+                }
                 let localURL = transfer.localURL
                 let box = await Task.detached(priority: .userInitiated) {
                     if let localURL {
@@ -3229,6 +3260,7 @@ private struct SNMediaCardImage: View {
                     return SNThumbBox(nil)
                 }.value
                 if let decoded = box.value {
+                    SNDecodedMediaCache.shared.put(cacheKey, decoded.asCachedThumb)
                     thumb = decoded
                     return
                 }
@@ -3236,7 +3268,12 @@ private struct SNMediaCardImage: View {
                     let tBox = await Task.detached(priority: .userInitiated) {
                         SNThumbBox(snDecodeTranscriptThumbnail(data: d))
                     }.value
-                    if let t = tBox.value { thumb = t } else { failed = true }
+                    if let t = tBox.value {
+                        SNDecodedMediaCache.shared.put(cacheKey, t.asCachedThumb)
+                        thumb = t
+                    } else {
+                        failed = true
+                    }
                 } else {
                     failed = true
                 }
@@ -3998,6 +4035,12 @@ struct SNGifView: View {
 struct SNGifWebView: UIViewRepresentable {
     let data: Data
 
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var loadedFingerprint: Int?
+    }
+
     func makeUIView(context: Context) -> WKWebView {
         let view = WKWebView(frame: .zero)
         view.isOpaque = false
@@ -4008,6 +4051,17 @@ struct SNGifWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ view: WKWebView, context: Context) {
+        let fingerprint = snGifDataFingerprint(data)
+        if context.coordinator.loadedFingerprint == fingerprint {
+            #if DEBUG
+            snLogGifReload(skipped: true)
+            #endif
+            return
+        }
+        context.coordinator.loadedFingerprint = fingerprint
+        #if DEBUG
+        snLogGifReload(skipped: false)
+        #endif
         view.loadHTMLString(html, baseURL: nil)
     }
 
@@ -4024,6 +4078,12 @@ struct SNGifWebView: UIViewRepresentable {
 struct SNGifWebView: NSViewRepresentable {
     let data: Data
 
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var loadedFingerprint: Int?
+    }
+
     func makeNSView(context: Context) -> WKWebView {
         let view = WKWebView(frame: .zero)
         view.setValue(false, forKey: "drawsBackground")
@@ -4031,6 +4091,9 @@ struct SNGifWebView: NSViewRepresentable {
     }
 
     func updateNSView(_ view: WKWebView, context: Context) {
+        let fingerprint = snGifDataFingerprint(data)
+        if context.coordinator.loadedFingerprint == fingerprint { return }
+        context.coordinator.loadedFingerprint = fingerprint
         view.loadHTMLString(html, baseURL: nil)
     }
 
@@ -4042,6 +4105,40 @@ struct SNGifWebView: NSViewRepresentable {
         </head><body><img src="data:image/gif;base64,\(base64)" /></body></html>
         """
     }
+}
+#endif
+
+func snGifDataFingerprint(_ data: Data) -> Int {
+    var hasher = Hasher()
+    hasher.combine(data.count)
+    if data.count >= 8 {
+        hasher.combine(data.prefix(4))
+        hasher.combine(data.suffix(4))
+    } else {
+        hasher.combine(data)
+    }
+    return hasher.finalize()
+}
+
+#if DEBUG
+@MainActor
+private func snLogGifReload(skipped: Bool) {
+    struct Gate {
+        static var last: CFAbsoluteTime = 0
+        static var loads = 0
+        static var skips = 0
+    }
+    if skipped { Gate.skips += 1 } else { Gate.loads += 1 }
+    let now = CFAbsoluteTimeGetCurrent()
+    guard now - Gate.last >= 1 else { return }
+    SecureLogger.info(
+        "SONAR_BENCH gif_reload window_s=\(String(format: "%.2f", now - Gate.last)) "
+            + "load=\(Gate.loads) skipped=\(Gate.skips)",
+        category: .session
+    )
+    Gate.loads = 0
+    Gate.skips = 0
+    Gate.last = now
 }
 #endif
 
@@ -4325,6 +4422,11 @@ struct SNComposer: View {
 
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
+    /// Local field mirror. The store draft binding deliberately does not
+    /// publish on every keystroke (R-042), so binding `$text` alone would leave
+    /// `mentionSuggestions` stale while typing `@name`. `@State` refreshes the
+    /// composer body on each character; we sync out to the store binding.
+    @State private var fieldText: String = ""
     @FocusState private var composerFocused: Bool
     #if os(iOS)
     @StateObject private var voice = VoiceNoteRecorder()
@@ -4335,11 +4437,11 @@ struct SNComposer: View {
     private var cancelArmed: Bool { dragX < -100 }
     #endif
 
-    private var slash: Bool { text.hasPrefix("/") }
+    private var slash: Bool { fieldText.hasPrefix("/") }
     private var mentionSuggestions: [SNMentionCandidate] {
-        mentionRoster.isEmpty ? [] : SNMentions.matches(draft: text, roster: mentionRoster)
+        mentionRoster.isEmpty ? [] : SNMentions.matches(draft: fieldText, roster: mentionRoster)
     }
-    private var hasText: Bool { snComposerHasText(text) }
+    private var hasText: Bool { snComposerHasText(fieldText) }
     /// Soft-IME platforms only. macOS shares `SNComposer` but has no system
     /// keyboard occupying the transcript — do not steal hardware-keyboard focus.
     private var usesSoftKeyboard: Bool {
@@ -4389,17 +4491,18 @@ struct SNComposer: View {
     private var liveDraft: String {
         #if os(macOS)
         snLiveComposerDraft(
-            binding: text,
+            binding: fieldText,
             fieldEditor: composerFocused ? snFocusedFieldEditorText() : nil
         )
         #else
-        text
+        fieldText
         #endif
     }
 
     private func send(_ live: String? = nil) {
         guard let tx = snPrepareComposerSend(text: live ?? liveDraft) else { return }
         // Clear before the send callback (see snPrepareComposerSend).
+        fieldText = ""
         text = ""
         showEmojiTray = false
         if tx.hasPrefix("/") {
@@ -4410,17 +4513,27 @@ struct SNComposer: View {
         }
     }
 
+    private func syncFieldFromStoreIfNeeded() {
+        // External clears (send from elsewhere, navigation) land on the binding
+        // without going through fieldText — pull them in. Avoid fighting the
+        // field while it is the one writing.
+        if text != fieldText, !composerFocused || text.isEmpty {
+            fieldText = text
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if !mentionSuggestions.isEmpty {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(mentionSuggestions) { candidate in
                         Button {
-                            text = SNMentions.applyPick(
-                                draft: text,
+                            fieldText = SNMentions.applyPick(
+                                draft: fieldText,
                                 pick: candidate,
                                 roster: mentionRoster
                             )
+                            text = fieldText
                         } label: {
                             HStack(spacing: 8) {
                                 Text(verbatim: "@" + candidate.name)
@@ -4539,7 +4652,7 @@ struct SNComposer: View {
 
             HStack {
                 SNMessageComposerField(
-                    text: $text,
+                    text: $fieldText,
                     prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3),
                     onSend: { send($0) }
                 )
@@ -4547,6 +4660,13 @@ struct SNComposer: View {
                     .font(SonarTheme.uiFont(size: 16))
                     .foregroundColor(SonarTheme.text)
                     .focused($composerFocused)
+                    .onAppear { fieldText = text }
+                    .onChange(of: fieldText) { newValue in
+                        if newValue != text { text = newValue }
+                    }
+                    .onChange(of: text) { _ in
+                        syncFieldFromStoreIfNeeded()
+                    }
                     .onChange(of: composerFocused) { focused in
                         if snShouldCloseEmojiTrayOnComposerFocus(
                             composerFocused: focused,

@@ -117,6 +117,29 @@ struct SonarDMScreenContent: View {
         ((isMarmot || isSonar) ? "Sonar" : "bitchat") + " · end-to-end encrypted"
     }
 
+    /// Revision for hosted composer CHROME, independent from transcript/store
+    /// invalidations. The TextField owns ordinary keystrokes internally; only
+    /// send/mic, mention roster membership, reply, route/name and media
+    /// capability need a new SwiftUI composer value from the parent host.
+    private var composerVersion: UInt64 {
+        var hasher = Hasher()
+        hasher.combine(peerId)
+        hasher.combine(peer.name)
+        hasher.combine(transport.rawValue)
+        hasher.combine(store.composerDraftHasText[peerId] ?? false)
+        // Cheap roster identity — npub + cached display name only. Building
+        // full `SNMentionCandidate` (bech32 suffix) on every store-driven body
+        // reintroduces the cost R-042 moved out of keystrokes.
+        hasher.combine(store.mentionRosterFingerprint(forConversationId: peerId))
+        if let reply = store.composerReply(for: peerId) {
+            hasher.combine(reply.parentId)
+            hasher.combine(reply.author)
+            hasher.combine(reply.preview)
+        }
+        hasher.combine(store.canSendMedia(peerId))
+        return UInt64(bitPattern: Int64(hasher.finalize()))
+    }
+
     @ViewBuilder
     private var dmComposer: some View {
         VStack(spacing: 0) {
@@ -161,12 +184,9 @@ struct SonarDMScreenContent: View {
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: store.canSendMedia(peerId),
             onVoice: { store.sendVoiceNote(peerId, url: $0) },
-            // Recomputed only while an `@token` is being typed — the store
-            // publishes `composerMentionQuery` on that boundary, so ordinary
-            // typing never rebuilds the roster.
-            mentionRoster: store.composerMentionQuery[peerId] == nil
-                ? []
-                : store.mentionRoster(forConversationId: peerId)
+            // Always pass the roster; SNComposer derives suggestions from the
+            // bound draft locally (no store-wide mention-query publish).
+            mentionRoster: store.mentionRoster(forConversationId: peerId)
         )
         }
     }
@@ -224,7 +244,7 @@ struct SonarDMScreenContent: View {
                 // owned insets + pre-measured cells + sticky day headers.
                 // SNMsgList below is the kill-switch fallback.
                 SNTranscriptCollectionHost(
-                    msgs: msgs,
+                    renderState: convo.renderState,
                     showAuthors: isMultiMemberMarmot,
                     peerName: peer.name,
                     money: { store.money($0) },
@@ -248,7 +268,8 @@ struct SonarDMScreenContent: View {
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
-                    onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
+                    onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
+                    composerVersion: composerVersion
                 ) {
                     dmComposer
                 }

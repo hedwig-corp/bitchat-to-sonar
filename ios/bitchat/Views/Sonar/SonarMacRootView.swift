@@ -3937,7 +3937,7 @@ private struct MacCollectionHostDM<Composer: View>: View {
             }
         } else {
             SNTranscriptCollectionHost(
-                msgs: msgs,
+                renderState: convo.renderState,
                 showAuthors: isMultiMemberMarmot,
                 peerName: peerName,
                 money: { store.money($0) },
