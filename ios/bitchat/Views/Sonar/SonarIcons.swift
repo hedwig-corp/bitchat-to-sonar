@@ -12,6 +12,9 @@
 //
 
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 // MARK: - Icon definitions (icons.jsx, verbatim path data)
 
@@ -485,6 +488,49 @@ private enum SNIconCache {
         return rendered
     }
 }
+
+// MARK: - UIKit bridge
+
+#if os(iOS)
+private enum SNIconImageCache {
+    static var images: [String: UIImage] = [:]
+    static let lock = NSLock()
+}
+
+/// Template `UIImage` of an icon for pre-measured UIKit cells, cached by
+/// (name, size, weight). Tint comes from the image view, so one image serves
+/// light and dark and every bubble color.
+func snIconImage(_ name: SNIconName, size: CGFloat, weight: CGFloat) -> UIImage {
+    let key = "\(name)|\(size)|\(weight)"
+    SNIconImageCache.lock.lock()
+    defer { SNIconImageCache.lock.unlock() }
+    if let hit = SNIconImageCache.images[key] { return hit }
+    let rendered = SNIconCache.paths(for: name)
+    let scale = CGAffineTransform(scaleX: size / 24, y: size / 24)
+    let format = UIGraphicsImageRendererFormat.preferred()
+    format.opaque = false
+    let image = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: format).image { ctx in
+        let cg = ctx.cgContext
+        cg.setStrokeColor(UIColor.black.cgColor)
+        cg.setFillColor(UIColor.black.cgColor)
+        cg.setLineWidth(weight * size / 24)
+        cg.setLineCap(.round)
+        cg.setLineJoin(.round)
+        let stroked = rendered.stroked.applying(scale)
+        if !stroked.isEmpty {
+            cg.addPath(stroked.cgPath)
+            cg.strokePath()
+        }
+        let filled = rendered.filled.applying(scale)
+        if !filled.isEmpty {
+            cg.addPath(filled.cgPath)
+            cg.fillPath()
+        }
+    }.withRenderingMode(.alwaysTemplate)
+    SNIconImageCache.images[key] = image
+    return image
+}
+#endif
 
 // MARK: - Icon view (BCIcon equivalent)
 

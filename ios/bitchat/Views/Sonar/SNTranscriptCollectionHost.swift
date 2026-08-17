@@ -73,7 +73,7 @@ func snCollectionHostMediaHeightFingerprint(_ media: [SNMediaItem]) -> String {
 /// collection-host flag is on. iOS uses a UIKit collection host; macOS uses a
 /// SwiftUI full-height + overlay-composer ownership model with the same policy.
 struct SNTranscriptCollectionHost<Composer: View>: View {
-    let msgs: [SNMessage]
+    let renderState: SNConversationRenderState
     let showAuthors: Bool
     var peerName: String = ""
     var money: (Int64) -> String = { sonarFormatSats($0) }
@@ -95,7 +95,14 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var jumpMessageId: String? = nil
     /// Cleared by the host after Jump applies (or soft-fails).
     var onJumpSettled: (() -> Void)? = nil
+    /// Changes only when composer chrome inputs change (send/mic boundary,
+    /// mention roster fingerprint, reply, transport, peer title). Unrelated
+    /// store updates then leave the active keyboard hierarchy untouched.
+    var composerVersion: UInt64? = nil
     @ViewBuilder var composer: () -> Composer
+
+    /// Compatibility: kill-switch / Mac SwiftUI host still takes a bare array.
+    var msgs: [SNMessage] { renderState.messages }
 
     var body: some View {
         #if os(iOS)
@@ -104,7 +111,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
         // IME (snCollectionHostFloatingComposerGap). Kill-switch SNMsgList keeps
         // the sibling-composer path and still wants SwiftUI avoidance.
         SNTranscriptCollectionRepresentable(
-            msgs: msgs,
+            renderState: renderState,
             showAuthors: showAuthors,
             peerName: peerName,
             money: money,
@@ -124,6 +131,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,
+            composerVersion: composerVersion,
             composer: composer
         )
         .ignoresSafeArea(.keyboard, edges: .bottom)

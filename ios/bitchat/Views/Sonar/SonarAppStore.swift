@@ -31,6 +31,32 @@ import UIKit
 import BackgroundTasks
 #endif
 
+/// One shared throttle for every service that invalidates the app store.
+///
+/// Throttling each publisher independently does not bound store-wide renders:
+/// N upstream services can each emit 10 times per second and make SwiftUI
+/// rebuild expensive computed chat rows N * 10 times. Funnel them through this
+/// single subject so the 100 ms budget applies to their aggregate.
+final class SNStoreInvalidationCoalescer {
+    private let source = PassthroughSubject<Void, Never>()
+    private let interval: DispatchQueue.SchedulerTimeType.Stride
+
+    init(interval: DispatchQueue.SchedulerTimeType.Stride = .milliseconds(100)) {
+        self.interval = interval
+    }
+
+    func invalidate() {
+        source.send()
+    }
+
+    func publisher() -> AnyPublisher<Void, Never> {
+        source
+            .receive(on: DispatchQueue.main)
+            .throttle(for: interval, scheduler: DispatchQueue.main, latest: true)
+            .eraseToAnyPublisher()
+    }
+}
+
 private enum SonarCallAudioRoute {
     static func configure(active: Bool, speakerOn: Bool, proximityEnabled: Bool = false) {
         #if os(iOS)
@@ -401,6 +427,25 @@ struct SNReplyRef: Equatable {
 
 func snReplyUIEnabled() -> Bool {
     ProcessInfo.processInfo.environment["SONAR_REPLY_UI"] != "0"
+}
+
+/// Pre-measured UIKit text rows (Signal `CVCell` parity). Kill switches match
+/// `SNTranscriptCollectionHostFlag`: env `SONAR_UIKIT_BUBBLES=0`, or (Debug
+/// only) `defaults write … sonar.uikitTextBubbles false`. UserDefaults is
+/// ignored in Release so a dogfood toggle cannot stick TestFlight on SwiftUI
+/// hosting with no UI to recover.
+func snUIKitTextBubblesEnabled() -> Bool {
+    switch ProcessInfo.processInfo.environment["SONAR_UIKIT_BUBBLES"] {
+    case "0": return false
+    case "1": return true
+    default: break
+    }
+    #if DEBUG
+    if UserDefaults.standard.object(forKey: "sonar.uikitTextBubbles") != nil {
+        return UserDefaults.standard.bool(forKey: "sonar.uikitTextBubbles")
+    }
+    #endif
+    return true
 }
 
 func snCanReply(to message: SNMessage) -> Bool {
@@ -828,6 +873,59 @@ func snSortDMRowsByRecency(_ rows: [SNDMRow]) -> [SNDMRow] {
             ? $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
             : lhs > rhs
     }
+}
+
+/// Apply peer↔Marmot-group fold mappings in one pass. Home projection collects
+/// every alias while building rows and persists only when this returns
+/// `changed == true` — never one UserDefaults write per row mid-render.
+func snBatchedMarmotFoldMap(
+    existing: [String: String],
+    mappings: [(conversationId: String, groupId: String)]
+) -> (map: [String: String], changed: Bool) {
+    var map = existing
+    var changed = false
+    for mapping in mappings {
+        let id = mapping.conversationId
+        let groupId = mapping.groupId
+        guard !groupId.isEmpty, !id.isEmpty else { continue }
+        if map[id] == groupId { continue }
+        map[id] = groupId
+        changed = true
+    }
+    return (map, changed)
+}
+
+/// Per-chat probe for message-side-effect scanners (notify / pay / trill / call).
+/// Mirrors Compose `ScanMark` + `chatsNeedingPageScan`: only chats whose latest
+/// timestamp or message count advanced since the last scan need a content walk.
+struct SNScanMark: Equatable, Hashable {
+    let secs: Int64
+    let count: Int64
+
+    static let unseen = SNScanMark(secs: Int64.min, count: Int64.min)
+}
+
+func snChatsNeedingMessageScan(
+    latestByChat: [String: SNScanMark],
+    scannedWatermark: [String: SNScanMark],
+    stagedPageChatIds: Set<String> = []
+) -> Set<String> {
+    var needing = Set<String>()
+    for (chatId, latest) in latestByChat {
+        let seen = scannedWatermark[chatId] ?? .unseen
+        if latest.secs > seen.secs || (latest.secs == seen.secs && latest.count > seen.count) {
+            needing.insert(chatId)
+        }
+    }
+    needing.formUnion(stagedPageChatIds.intersection(latestByChat.keys))
+    return needing
+}
+
+func snScanMark(messageCount: Int, latestDate: Date?) -> SNScanMark {
+    SNScanMark(
+        secs: Int64(latestDate?.timeIntervalSince1970 ?? 0),
+        count: Int64(messageCount)
+    )
 }
 
 /// Stable conversation identity for BLE fingerprints that advertise the same
@@ -1369,13 +1467,6 @@ final class SonarAppStore: ObservableObject {
     /// never per keystroke.
     @Published private(set) var composerDraftHasText: [String: Bool] = [:]
 
-    /// The `@token` currently being typed per chat, or absent. Same
-    /// boundary-mirror trick as `composerDraftHasText`: the draft map stays
-    /// unpublished, but the mention picker has to re-filter on every keystroke
-    /// *while composing a mention*. Outside a mention this never changes, so
-    /// ordinary typing still publishes nothing.
-    @Published private(set) var composerMentionQuery: [String: String] = [:]
-
     func composerDraft(for chatId: String) -> String {
         composerDrafts[chatId] ?? ""
     }
@@ -1436,24 +1527,9 @@ final class SonarAppStore: ObservableObject {
     func setComposerDraft(_ text: String, for chatId: String) {
         let nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
         if nextFlags != composerDraftHasText { composerDraftHasText = nextFlags }
-        updateComposerMentionQuery(text, for: chatId)
         let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
         guard next != composerDrafts else { return }
         composerDrafts = next
-    }
-
-    /// Publishes only while an `@token` is actively being typed, so the picker
-    /// can filter per keystroke without the draft map itself becoming
-    /// `@Published`. Typing ordinary text publishes nothing: the value is nil
-    /// before and after a mention, and only changes inside one.
-    private func updateComposerMentionQuery(_ text: String, for chatId: String) {
-        let query = SNMentions.activeQuery(text)
-        if composerMentionQuery[chatId] == query { return }
-        if let query {
-            composerMentionQuery[chatId] = query
-        } else {
-            composerMentionQuery.removeValue(forKey: chatId)
-        }
     }
 
     func composerDraftBinding(for chatId: String) -> Binding<String> {
@@ -1829,6 +1905,7 @@ final class SonarAppStore: ObservableObject {
     private var scannedCallMessageIDs = Set<String>()
 
     private var cancellables = Set<AnyCancellable>()
+    private let storeInvalidations = SNStoreInvalidationCoalescer()
     @Published private var pendingMarmotChats: [String: SNPendingMarmotChat] = [:]
     @Published private var pendingMarmotGroups: [String: SNPendingMarmotGroup] = [:]
     @Published private var pendingMarmotMessagesByChat: [String: [SNMessage]] = [:]
@@ -1857,6 +1934,17 @@ final class SonarAppStore: ObservableObject {
     private var refreshingDMTasks: [String: Task<Void, Never>] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
+    /// Latest `(secs, count)` already walked by Marmot message side-effect
+    /// scanners. Keeps notify/pay/trill/call/media-cache off the full
+    /// ~278-group main-actor walk on every `$messagesByGroup` tick.
+    private var marmotMessageScanWatermark: [String: SNScanMark] = [:]
+    /// Groups that just received a historical local page replace (count may
+    /// stay flat while the newest-edge timestamp moves backward). Watermark
+    /// advance alone would skip pay/trill/call/notify scans — force one pass.
+    private var marmotStagedPageRescanIds: Set<String> = []
+
+    /// Same watermark for mesh private-chat side-effect scanners.
+    private var privateChatMessageScanWatermark: [String: SNScanMark] = [:]
     /// ⚡TRILL lines already processed for receive effects (buzz/notification),
     /// separate from the pay scan so replaying transcripts stays idempotent.
     private var scannedTrillMessageIDs = Set<String>()
@@ -1989,6 +2077,10 @@ final class SonarAppStore: ObservableObject {
             self?.sendMeshMediaOverInternet(packet, to: peerID) ?? false
         }
 
+        storeInvalidations.publisher()
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+
         // The screens read computed properties off this store; republish
         // whenever any underlying service changes.
         republish(chatViewModel.objectWillChange)
@@ -2003,6 +2095,20 @@ final class SonarAppStore: ObservableObject {
         // changes (fiat<->bitcoin toggle, currency picker, live-rate arrival).
         republish(wallet.moneyDisplayChanged)
 
+        // `dmRows` is an expensive folded projection. Drive its revision from
+        // the narrow conversation inputs instead of recomputing a 278-group
+        // fingerprint inside SwiftUI body (measured at 2.8 s on device).
+        invalidateHomeRows(on: chatViewModel.privateChatManager.objectWillChange)
+        invalidateHomeRows(on: chatViewModel.unifiedPeerService.objectWillChange)
+        invalidateHomeRows(on: marmot.$groups)
+        invalidateHomeRows(on: marmot.$messagesByGroup)
+        invalidateHomeRows(on: marmot.$unreadByGroup)
+        invalidateHomeRows(on: marmot.$profilesByNpub)
+        invalidateHomeRows(on: $sonarProfiles)
+        invalidateHomeRows(on: $marmotVerified)
+        invalidateHomeRows(on: $pendingMarmotChats)
+        invalidateHomeRows(on: $pendingMarmotGroups)
+
         // Sonar discovery: collect verified peer profiles announced over the
         // mesh, and start announcing ours once the Marmot npub is known.
         NotificationCenter.default.publisher(for: .sonarPeerProfileUpdated)
@@ -2015,7 +2121,8 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.invalidatePeerKeysIndex()
-                self?.objectWillChange.send()
+                self?.invalidateHomeDMRows()
+                self?.storeInvalidations.invalidate()
             }
             .store(in: &cancellables)
         #if os(iOS)
@@ -2026,6 +2133,10 @@ final class SonarAppStore: ObservableObject {
         NotificationCenter.default.publisher(for: Notification.Name.NSProcessInfoPowerStateDidChange)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refreshBatterySavingState() }
+            .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { _ in SNDecodedMediaCache.shared.trimForMemoryWarning() }
             .store(in: &cancellables)
         #endif
         wireBLEDiscoveryPolicy()
@@ -2141,21 +2252,17 @@ final class SonarAppStore: ObservableObject {
                     self?.refreshBleKnownContactSnapshot()
                     self?.applyBLEDiscoveryPolicy()
                 }
-                self.processIncomingPayLines()
-                self.processIncomingTrillLines()
-                self.processIncomingCallLines()
+                self.processIncomingPrivateChatMessageSideEffects()
             }
             .store(in: &cancellables)
         marmot.$messagesByGroup
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
-                self.cachePublishedUploadMedia()
-                self.processIncomingMarmotNotifications()
-                self.processIncomingPayLines()
-                self.processIncomingTrillLines()
-                self.processIncomingCallLines()
-                self.objectWillChange.send()
+                self.processIncomingMarmotMessageSideEffects()
+                // Route through the shared coalescer — a direct
+                // `objectWillChange.send()` bypasses R-037's store-wide budget.
+                self.storeInvalidations.invalidate()
             }
             .store(in: &cancellables)
         // Push-wake ownership suppresses live banners; when ownership ends the
@@ -2164,8 +2271,11 @@ final class SonarAppStore: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.processIncomingMarmotNotifications()
-                self?.processIncomingTrillLines()
+                // Ownership may have suppressed banners whose watermarks already
+                // advanced during the wake drain. Re-walk every group; message-id
+                // sets keep R-004 / trill dedup intact.
+                self?.processIncomingMarmotNotifications(groupIDs: nil)
+                self?.processIncomingTrillLines(privateChatIDs: [], marmotGroupIDs: nil)
             }
             .store(in: &cancellables)
 
@@ -2501,16 +2611,22 @@ final class SonarAppStore: ObservableObject {
 
     private func republish<P: Publisher>(_ publisher: P) where P.Output == Void, P.Failure == Never {
         // Coalesce upstream invalidation bursts (BLE announce storms, relay
-        // EOSE bursts, presence heartbeats) into at most ~10 store-wide
+        // EOSE bursts, presence heartbeats) through ONE shared throttle, for at
+        // most ~10 aggregate store-wide
         // re-renders per second. Every screen reads computed properties off
         // this store, so an unthrottled republish makes one chatty upstream
         // service re-render the entire app at its event rate — measured as
         // visible typing/sending lag in open conversations. Throttle keeps the
         // first event immediate and delays followers by at most 100ms.
         publisher
+            .sink { [weak self] _ in self?.storeInvalidations.invalidate() }
+            .store(in: &cancellables)
+    }
+
+    private func invalidateHomeRows<P: Publisher>(on publisher: P) where P.Failure == Never {
+        publisher
             .receive(on: DispatchQueue.main)
-            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
-            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .sink { [weak self] _ in self?.invalidateHomeDMRows() }
             .store(in: &cancellables)
     }
 
@@ -3033,6 +3149,9 @@ final class SonarAppStore: ObservableObject {
         refreshedKnownDescriptorsForRelaySession = false
 
         scannedPayMessageIDs = []
+        marmotMessageScanWatermark = [:]
+        marmotStagedPageRescanIds = []
+        privateChatMessageScanWatermark = [:]
         // Message-id dedup state is account-bound: this store outlives a
         // restore, so the incoming account's messages must not be treated as
         // already-notified. Compose fixed the same gap in #288.
@@ -3049,6 +3168,7 @@ final class SonarAppStore: ObservableObject {
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()
+        SNDecodedMediaCache.shared.clear()
         clearCallLogs()
         resetCallState()
         bip353 = ""
@@ -3542,13 +3662,14 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
-    private func processIncomingMarmotNotifications() {
+    private func processIncomingMarmotNotifications(groupIDs: Set<String>? = nil) {
         // Push-wake owns banners for the current Transponder sync; emitting
         // here as well double-fires (different identifiers) for the same row.
         // Do NOT blanket-mark every in-memory message seen — that drops rows
         // that land via gap recovery after the drain list was returned.
         if marmot.pushWakeOwnsNotifications { return }
-        for group in marmot.groups {
+        let groups = marmot.groups.filter { groupIDs?.contains($0.id) != false }
+        for group in groups {
             let convId = marmotConvId(forGroup: group.id)
             let title = marmot.title(for: group)
             for message in marmot.messagesByGroup[group.id] ?? [] where !message.isMine {
@@ -3957,10 +4078,21 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func rememberMarmotGroup(_ groupId: String, forConversationId id: String) {
-        guard !groupId.isEmpty, !id.isEmpty else { return }
-        if marmotGroupIdsByConversationId[id] == groupId { return }
-        marmotGroupIdsByConversationId[id] = groupId
+        rememberMarmotGroups([(id, groupId)])
+    }
+
+    /// Batch the peer↔group fold map so Home projection can collect every
+    /// alias once and persist a single JSON write — never one write per row
+    /// during SwiftUI body evaluation.
+    private func rememberMarmotGroups(_ mappings: [(conversationId: String, groupId: String)]) {
+        let applied = snBatchedMarmotFoldMap(
+            existing: marmotGroupIdsByConversationId,
+            mappings: mappings
+        )
+        guard applied.changed else { return }
+        marmotGroupIdsByConversationId = applied.map
         persistMarmotConversationGroups()
+        invalidateHomeDMRows()
     }
 
     private func forgetMarmotGroupMappings(forGroupId groupId: String) {
@@ -4297,6 +4429,7 @@ final class SonarAppStore: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + remaining + 0.05) { [weak self] in
             guard let self else { return }
             self.pendingCapabilityRefreshKeys.remove(key)
+            self.invalidateHomeDMRows()
             self.objectWillChange.send()
         }
     }
@@ -5143,6 +5276,26 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Identity of the `@` roster for `composerVersion` — same membership and
+    /// names as `mentionRoster`, without allocating candidates or bech32 work.
+    func mentionRosterFingerprint(forConversationId id: String) -> UInt64 {
+        guard isMultiMemberMarmotGroupId(id) else { return 0 }
+        let members: [String]
+        if let pending = pendingMarmotGroups[id] {
+            members = pending.members
+        } else if let group = marmotGroup(forConversationId: id) {
+            members = marmot.otherMembers(in: group)
+        } else {
+            return 0
+        }
+        var hasher = Hasher()
+        for npub in members {
+            hasher.combine(npub)
+            hasher.combine(marmot.displayName(forNpub: npub))
+        }
+        return UInt64(bitPattern: Int64(hasher.finalize()))
+    }
+
     /// Everything mention decoding needs that is per-CONVERSATION rather than
     /// per-message. Built once per transcript page: resolving the roster costs a
     /// bech32 decode per member, so doing it per row would repeat that work for
@@ -5307,11 +5460,62 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Messages (home rows)
 
+    /// Compose `visibleChats` parity: Home reads this on every store
+    /// invalidation, so the folded projection is memoized. Unrelated
+    /// invalidations (wallet, relay attach, BLE noise that does not change the
+    /// fingerprint) return the cached rows in O(1). Side effects
+    /// (`rememberMarmotGroup` persistence) are batched AFTER the pure build —
+    /// never from inside a SwiftUI body evaluation path mid-loop.
+    private var homeDMRowsCache: (revision: UInt64, rows: [SNDMRow])?
+    private var homeDMRowsRevision: UInt64 = 0
+
     var dmRows: [SNDMRow] {
+        let now = Date()
+        if let cache = homeDMRowsCache, cache.revision == homeDMRowsRevision {
+            return cache.rows
+        }
+        #if DEBUG
+        let buildStarted = CFAbsoluteTimeGetCurrent()
+        #endif
+        let built = buildHomeDMRows(now: now)
+        #if DEBUG
+        let buildMs = (CFAbsoluteTimeGetCurrent() - buildStarted) * 1000
+        SecureLogger.info(
+            "SONAR_BENCH home_rows_cache_miss rows=\(built.rows.count) "
+                + "groups=\(marmot.groups.count) "
+                + "build_ms=\(Int(buildMs.rounded()))",
+            category: .session
+        )
+        #endif
+        rememberMarmotGroups(built.foldMappings)
+        // A capability-settle hold is time-dependent and not fully captured by
+        // the revision; skip the cache until the window closes (Compose
+        // visibleChats does the same).
+        if built.holdActive {
+            homeDMRowsCache = nil
+        } else {
+            homeDMRowsCache = (homeDMRowsRevision, built.rows)
+        }
+        return built.rows
+    }
+
+    private func invalidateHomeDMRows() {
+        homeDMRowsRevision &+= 1
+        homeDMRowsCache = nil
+    }
+
+    private struct HomeDMRowsBuild {
+        var rows: [SNDMRow]
+        var foldMappings: [(conversationId: String, groupId: String)]
+        var holdActive: Bool
+    }
+
+    private func buildHomeDMRows(now: Date) -> HomeDMRowsBuild {
         // Mesh/bitchat chats, deduplicated by fingerprint (the same peer can
         // appear under a short mesh ID and its stable Noise key).
-        let now = Date()
         var byKey: [String: SNDMRow] = [:]
+        var foldMappings: [(conversationId: String, groupId: String)] = []
+        var holdActive = false
         for (peerID, msgs) in chatViewModel.privateChats where !msgs.isEmpty {
             let row = meshRow(peerID: peerID, last: msgs.last)
             let key = canonicalPeerKey(peerID)
@@ -5326,6 +5530,7 @@ final class SonarAppStore: ObservableObject {
             let key = canonicalPeerKey(fav.peerID)
             if (fav.isConnected || fav.isReachable),
                shouldWaitForCapabilities(peerID: fav.peerID, key: key, now: now) {
+                holdActive = true
                 continue
             }
             if byKey[key] == nil {
@@ -5364,6 +5569,13 @@ final class SonarAppStore: ObservableObject {
             )
             if let canonical { canonicalByNpubHex[hex] = canonical }
             return canonical
+        }
+        // Built once per projection: per-group it was a linear scan of every
+        // discovered Sonar profile.
+        var peerIdByNpub: [String: String] = [:]
+        peerIdByNpub.reserveCapacity(sonarProfiles.count)
+        for (peerId, profile) in sonarProfiles {
+            peerIdByNpub[profile.npub] = peerId
         }
         // Marmot (White Noise) groups are internet-transport chats. A group
         // whose counterpart is a Sonar-discovered peer is the SAME
@@ -5411,29 +5623,27 @@ final class SonarAppStore: ObservableObject {
             // Live peer id (when currently discovered over 0x53) gives us mesh
             // presence; the persisted fingerprint still lets us build the SAME
             // Sonar row when BLE is down / after restart.
-            let liveSonarPeerId = otherNpub.flatMap { np in
-                sonarProfiles.first(where: { $0.value.npub == np })?.key
-            }
+            let liveSonarPeerId = otherNpub.flatMap { peerIdByNpub[$0] }
             // Identity is cryptographic: never create a persisted peer↔npub link
             // from a display-title match, even when that title is unique.
             let foldKey = otherNpub.flatMap { sonarPeerKey(forNpub: $0) }
             if let liveSonarPeerId {
-                rememberMarmotGroup(rowGroupId, forConversationId: liveSonarPeerId)
+                foldMappings.append((liveSonarPeerId, rowGroupId))
             }
             if let foldKey {
-                rememberMarmotGroup(rowGroupId, forConversationId: foldKey)
+                foldMappings.append((foldKey, rowGroupId))
             }
             // Persist the fold under every known Noise alias for this npub so
             // an older fingerprint still opens the same conversation.
             if let otherNpub {
                 for alias in peerKeys(linkedToNpub: otherNpub) {
-                    rememberMarmotGroup(rowGroupId, forConversationId: alias)
+                    foldMappings.append((alias, rowGroupId))
                 }
             }
             if let foldKey, let existing = byKey[foldKey] {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
                 // into that one row instead of showing a duplicate conversation.
-                rememberMarmotGroup(rowGroupId, forConversationId: existing.id)
+                foldMappings.append((existing.id, rowGroupId))
                 let rowTitle = snFoldedDirectMarmotHomeTitle(
                     isDirectGroup: marmot.isDirectGroup(rowGroup),
                     marmotProfileTitle: marmot.title(for: rowGroup),
@@ -5473,7 +5683,7 @@ final class SonarAppStore: ObservableObject {
                 // Sonar peer now out of range → one folded row, not a White Noise
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
-                rememberMarmotGroup(rowGroupId, forConversationId: rowId)
+                foldMappings.append((rowId, rowGroupId))
                 let rowTitle = snFoldedDirectMarmotHomeTitle(
                     isDirectGroup: marmot.isDirectGroup(rowGroup),
                     marmotProfileTitle: marmot.title(for: rowGroup),
@@ -5494,6 +5704,7 @@ final class SonarAppStore: ObservableObject {
                 continue
             }
             if shouldHoldStandaloneMarmotGroup(rowGroup, latestMessage: rowLast, now: now) {
+                holdActive = true
                 continue
             }
             marmotRows.append(SNDMRow(
@@ -5511,7 +5722,6 @@ final class SonarAppStore: ObservableObject {
         }
         let pendingRows = pendingMarmotChats.compactMap { id, pending -> SNDMRow? in
             guard marmotGroup(forNpub: pending.npub) == nil else { return nil }
-            marmot.ensureProfile(pending.npub)
             return SNDMRow(
                 id: id,
                 title: marmot.displayName(forNpub: pending.npub) ?? Self.shortNpub(pending.npub),
@@ -5540,11 +5750,12 @@ final class SonarAppStore: ObservableObject {
             )
         }
         let rows = Array(byKey.values) + pendingRows + pendingGroupRows + marmotRows
-        return snSortDMRowsByRecency(rows).map { row in
+        let sorted = snSortDMRowsByRecency(rows).map { row -> SNDMRow in
             var row = row
             row.muted = isChatMuted(row.id)
             return row
         }
+        return HomeDMRowsBuild(rows: sorted, foldMappings: foldMappings, holdActive: holdActive)
     }
 
     private func meshRow(peerID: PeerID, last: BitchatMessage?) -> SNDMRow {
@@ -5565,12 +5776,19 @@ final class SonarAppStore: ObservableObject {
 
     /// Live per-conversation render states, keyed by conversation id. NOT
     /// @Published on purpose: creating one during a SwiftUI body evaluation
-    /// must not invalidate the store. Entries are released on `closedDM`.
+    /// must not invalidate the store. Closing a conversation deactivates its
+    /// state (see `closedDM`) but keeps the rows for reopen paint.
     private var conversationViewStates: [String: ConversationViewState] = [:]
+    /// Least-recently-opened first. Retained transcripts hold up to
+    /// `sonarTranscriptRetainedCount` rows each, so a session that visits many
+    /// of hundreds of conversations must not accumulate all of them.
+    private var retainedConversationOrder: [String] = []
+    private static let retainedConversationLimit = 8
 
     /// Drop leave/reopen paint cache when a conversation is deleted or erased.
     private func discardRetainedConversation(_ id: String) {
         conversationViewStates.removeValue(forKey: id)
+        retainedConversationOrder.removeAll { $0 == id }
     }
 
 
@@ -5578,10 +5796,26 @@ final class SonarAppStore: ObservableObject {
     /// instance across body evaluations so `@ObservedObject` subscriptions
     /// stay stable while the chat is open.
     func conversationViewState(_ id: String) -> ConversationViewState {
+        retainedConversationOrder.removeAll { $0 == id }
+        retainedConversationOrder.append(id)
         if let existing = conversationViewStates[id] { return existing }
         let state = ConversationViewState(conversationId: id, store: self)
         conversationViewStates[id] = state
+        evictRetainedConversationsIfNeeded()
         return state
+    }
+
+    /// Release the oldest inactive retained transcripts. An active (on-screen)
+    /// conversation is never evicted: dropping it would strand the
+    /// `@ObservedObject` the visible screen renders from.
+    private func evictRetainedConversationsIfNeeded() {
+        guard conversationViewStates.count > Self.retainedConversationLimit else { return }
+        for id in retainedConversationOrder {
+            guard conversationViewStates.count > Self.retainedConversationLimit else { return }
+            guard conversationViewStates[id]?.isActive == false else { continue }
+            conversationViewStates.removeValue(forKey: id)
+            retainedConversationOrder.removeAll { $0 == id }
+        }
     }
 
     /// Whether any local Marmot source folded into this visible conversation
@@ -5702,6 +5936,7 @@ final class SonarAppStore: ObservableObject {
         for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
             let before = marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
             if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
+                marmotStagedPageRescanIds.insert(group.id)
                 result.record(
                     before: before,
                     after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
@@ -7126,9 +7361,10 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func cachePublishedUploadMedia() {
+    private func cachePublishedUploadMedia(groupIDs: Set<String>? = nil) {
         guard !pendingUploadMediaCache.isEmpty else { return }
         for (groupId, messages) in marmot.messagesByGroup {
+            if let groupIDs, !groupIDs.contains(groupId) { continue }
             for message in messages where message.isMine {
                 for media in message.media
                     where !media.url.hasPrefix(Self.pendingMediaURLPrefix) && mediaImageCache[media.url] == nil {
@@ -8107,15 +8343,33 @@ final class SonarAppStore: ObservableObject {
         } else {
             pendingJumpMessageIdByDM[id] = nil
         }
+        #if DEBUG
+        // SONAR_BENCH: tap → navigation-present latency for one conversation.
+        let openStarted = CFAbsoluteTimeGetCurrent()
+        let benchChat = String(id.suffix(8))
+        let benchPresent: (String) -> Void = { path in
+            let ms = Int(((CFAbsoluteTimeGetCurrent() - openStarted) * 1000).rounded())
+            SecureLogger.info(
+                "SONAR_BENCH chat_open chat=\(benchChat) path=\(path) present_ms=\(ms)",
+                category: .session
+            )
+        }
+        #endif
         let presentDM = present ?? { self.push(.dm(id)) }
         if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
             openedDM(id, marmotGroupId: knownMarmotGroupId)
             presentDM()
+            #if DEBUG
+            benchPresent("pending")
+            #endif
             return
         }
         if dmHasLocalTranscriptPaint(id, marmotGroupId: knownMarmotGroupId) {
             openedDM(id, marmotGroupId: knownMarmotGroupId)
             presentDM()
+            #if DEBUG
+            benchPresent("retained")
+            #endif
             return
         }
         let generation = UUID()
@@ -8133,10 +8387,14 @@ final class SonarAppStore: ObservableObject {
             self.dmOpenGenerations[id] = nil
             self.conversationViewState(id).rebuildNow()
             presentDM()
+            #if DEBUG
+            benchPresent("hydrated")
+            #endif
         }
     }
 
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
+        conversationViewStates[id]?.activate()
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
             markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
@@ -8270,10 +8528,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
-        // Keep ConversationViewState for Signal-style reopen paint (Compose
-        // retainedTranscriptByChat). Wipe/erase clears the map. Unsubscribe
-        // from store invalidation would still rebuild — acceptable for smoke;
-        // the leave paint avoids first-frame empty → hydrate flash.
+        // Keep ConversationViewState rows for Signal-style reopen paint (Compose
+        // retainedTranscriptByChat), but detach from store invalidation so a
+        // closed chat does not keep rebuilding on every BLE/relay/wallet tick.
+        // Wipe/erase clears the map; `evictRetainedConversationsIfNeeded` bounds
+        // how many closed transcripts stay in memory.
+        conversationViewStates[id]?.deactivate()
         // NB: do NOT stop the Marmot subscription loop here — it now runs for as
         // long as we're connected (started in performConnect) so welcomes +
         // messages keep arriving live in the background list, not only while a
@@ -8778,12 +9038,93 @@ final class SonarAppStore: ObservableObject {
         return nil
     }
 
+    /// Compose-style watermark gate for Marmot message side effects. Only
+    /// groups whose in-memory `(latestSecs, count)` advanced since the last
+    /// scan walk notify/pay/trill/call/media-cache content.
+    private func processIncomingMarmotMessageSideEffects() {
+        let latest = marmotMessageScanMarks()
+        let staged = marmotStagedPageRescanIds
+        if !staged.isEmpty { marmotStagedPageRescanIds.removeAll(keepingCapacity: true) }
+        let needing = snChatsNeedingMessageScan(
+            latestByChat: latest,
+            scannedWatermark: marmotMessageScanWatermark,
+            stagedPageChatIds: staged
+        )
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"] != nil {
+            SecureLogger.info(
+                "SONAR_BENCH message_scan marmot needing=\(needing.count) tracked=\(latest.count)",
+                category: .session
+            )
+        }
+        #endif
+        guard !needing.isEmpty else { return }
+        cachePublishedUploadMedia(groupIDs: needing)
+        processIncomingMarmotNotifications(groupIDs: needing)
+        processIncomingPayLines(privateChatIDs: [], marmotGroupIDs: needing)
+        processIncomingTrillLines(privateChatIDs: [], marmotGroupIDs: needing)
+        processIncomingCallLines(privateChatIDs: [], marmotGroupIDs: needing)
+        for groupId in needing {
+            marmotMessageScanWatermark[groupId] = latest[groupId] ?? .unseen
+        }
+    }
+
+    /// Mesh private-chat side effects only — BLE ticks must not re-walk every
+    /// Marmot group.
+    private func processIncomingPrivateChatMessageSideEffects() {
+        let latest = privateChatMessageScanMarks()
+        let needing = snChatsNeedingMessageScan(
+            latestByChat: latest,
+            scannedWatermark: privateChatMessageScanWatermark
+        )
+        guard !needing.isEmpty else { return }
+        processIncomingPayLines(privateChatIDs: needing, marmotGroupIDs: [])
+        processIncomingTrillLines(privateChatIDs: needing, marmotGroupIDs: [])
+        processIncomingCallLines(privateChatIDs: needing, marmotGroupIDs: [])
+        for peerId in needing {
+            privateChatMessageScanWatermark[peerId] = latest[peerId] ?? .unseen
+        }
+    }
+
+    private func marmotMessageScanMarks() -> [String: SNScanMark] {
+        var marks: [String: SNScanMark] = [:]
+        marks.reserveCapacity(marmot.messagesByGroup.count)
+        for (groupId, messages) in marmot.messagesByGroup {
+            marks[groupId] = snScanMark(
+                messageCount: messages.count,
+                latestDate: messages.last?.createdAt
+            )
+        }
+        // Groups present in the roster with an empty local page still need a
+        // first scan mark so a later non-empty page is detected.
+        for group in marmot.groups where marks[group.id] == nil {
+            marks[group.id] = snScanMark(messageCount: 0, latestDate: nil)
+        }
+        return marks
+    }
+
+    private func privateChatMessageScanMarks() -> [String: SNScanMark] {
+        var marks: [String: SNScanMark] = [:]
+        marks.reserveCapacity(chatViewModel.privateChats.count)
+        for (peerID, messages) in chatViewModel.privateChats {
+            marks[peerID.id] = snScanMark(
+                messageCount: messages.count,
+                latestDate: messages.last?.timestamp
+            )
+        }
+        return marks
+    }
+
     /// Scans both transcript stores for ⚡PAY control lines from the
     /// counterpart. Ledger transitions are idempotent, so replaying
     /// transcripts after a relaunch cannot double-settle.
-    private func processIncomingPayLines() {
+    private func processIncomingPayLines(
+        privateChatIDs: Set<String>? = nil,
+        marmotGroupIDs: Set<String>? = nil
+    ) {
         let my = chatViewModel.meshService.myPeerID
         for (peerID, msgs) in chatViewModel.privateChats {
+            if let privateChatIDs, !privateChatIDs.contains(peerID.id) { continue }
             for m in msgs where m.senderPeerID != my {
                 guard !scannedPayMessageIDs.contains(m.id) else { continue }
                 scannedPayMessageIDs.insert(m.id)
@@ -8809,6 +9150,7 @@ final class SonarAppStore: ObservableObject {
             }
         }
         for (groupId, msgs) in marmot.messagesByGroup {
+            if let marmotGroupIDs, !marmotGroupIDs.contains(groupId) { continue }
             for m in msgs where !m.isMine {
                 guard !scannedPayMessageIDs.contains(m.id) else { continue }
                 scannedPayMessageIDs.insert(m.id)
@@ -8863,9 +9205,13 @@ final class SonarAppStore: ObservableObject {
     /// receive effect (foreground buzz, or a trill-sound notification), with
     /// the per-chat receiver throttle and mute applied. Mirrors
     /// `processIncomingPayLines`; scanning is idempotent across replays.
-    private func processIncomingTrillLines() {
+    private func processIncomingTrillLines(
+        privateChatIDs: Set<String>? = nil,
+        marmotGroupIDs: Set<String>? = nil
+    ) {
         let my = chatViewModel.meshService.myPeerID
         for (peerID, msgs) in chatViewModel.privateChats {
+            if let privateChatIDs, !privateChatIDs.contains(peerID.id) { continue }
             for m in msgs where m.senderPeerID != my {
                 guard !scannedTrillMessageIDs.contains(m.id),
                       SonarTrillMessage.isTrillLine(m.content)
@@ -8888,7 +9234,8 @@ final class SonarAppStore: ObservableObject {
         // (`SonarPushProcessor` classifies + throttles trills itself); catch
         // up after ownership ends, same as processIncomingMarmotNotifications.
         if marmot.pushWakeOwnsNotifications { return }
-        for group in marmot.groups {
+        let groups = marmot.groups.filter { marmotGroupIDs?.contains($0.id) != false }
+        for group in groups {
             let convId = marmotConvId(forGroup: group.id)
             let title = marmot.title(for: group)
             for m in marmot.messagesByGroup[group.id] ?? [] where !m.isMine {
@@ -9016,11 +9363,13 @@ final class SonarAppStore: ObservableObject {
     func muteChat(_ id: String, for duration: TimeInterval?) {
         let until = duration.map { Date().addingTimeInterval($0) } ?? .distantFuture
         SonarChatMuteStore.shared.mute(keys: muteKeys(forChatId: id), until: until)
+        invalidateHomeDMRows()
         objectWillChange.send()
     }
 
     func unmuteChat(_ id: String) {
         SonarChatMuteStore.shared.unmute(keys: muteKeys(forChatId: id))
+        invalidateHomeDMRows()
         objectWillChange.send()
     }
 
@@ -9752,9 +10101,13 @@ final class SonarAppStore: ObservableObject {
         content.drop(while: { $0.isWhitespace }).hasPrefix(callPrefix)
     }
 
-    private func processIncomingCallLines() {
+    private func processIncomingCallLines(
+        privateChatIDs: Set<String>? = nil,
+        marmotGroupIDs: Set<String>? = nil
+    ) {
         let my = chatViewModel.meshService.myPeerID
         for (peerID, msgs) in chatViewModel.privateChats {
+            if let privateChatIDs, !privateChatIDs.contains(peerID.id) { continue }
             for m in msgs where m.senderPeerID != my {
                 guard !scannedCallMessageIDs.contains(m.id) else { continue }
                 // Pure-Swift prefilter: skip the FFI for every non-☎CALL message
@@ -9775,6 +10128,7 @@ final class SonarAppStore: ObservableObject {
             }
         }
         for (groupId, msgs) in marmot.messagesByGroup {
+            if let marmotGroupIDs, !marmotGroupIDs.contains(groupId) { continue }
             for m in msgs where !m.isMine {
                 guard !scannedCallMessageIDs.contains(m.id) else { continue }
                 guard Self.looksLikeCallControl(m.content) else {
@@ -10049,6 +10403,8 @@ final class SonarAppStore: ObservableObject {
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
         conversationViewStates.removeAll()
+        retainedConversationOrder.removeAll()
+        homeDMRowsCache = nil
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
         // Order matters: quiesce sends first (lease held above), then clear all
@@ -10073,6 +10429,9 @@ final class SonarAppStore: ObservableObject {
         cancelPendingSecureChatSetups()
         cancelPendingMarmotGroupSetups()
         scannedPayMessageIDs = []
+        marmotMessageScanWatermark = [:]
+        marmotStagedPageRescanIds = []
+        privateChatMessageScanWatermark = [:]
         scannedTrillMessageIDs = []
         trillCooldownUntilByChat = [:]
         SonarTrillThrottle.shared.reset()
@@ -10101,6 +10460,7 @@ final class SonarAppStore: ObservableObject {
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()
+        SNDecodedMediaCache.shared.clear()
         objectWillChange.send()
     }
 
@@ -10126,6 +10486,9 @@ final class SonarAppStore: ObservableObject {
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
+        conversationViewStates.removeAll()
+        retainedConversationOrder.removeAll()
+        homeDMRowsCache = nil
         // The Breez node must release its SQLite store before wallet files are
         // deleted. Await this before revealing onboarding so a fast re-onboard
         // cannot race a still-running destructive wallet task.
@@ -10210,7 +10573,11 @@ final class SonarAppStore: ObservableObject {
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()
+        SNDecodedMediaCache.shared.clear()
         scannedPayMessageIDs = []
+        marmotMessageScanWatermark = [:]
+        marmotStagedPageRescanIds = []
+        privateChatMessageScanWatermark = [:]
         // Message-id dedup state is account-bound: this store outlives a wipe,
         // so a restored account whose ids collide would be silently swallowed.
         seenMarmotNotificationMessageIDs = []

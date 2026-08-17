@@ -25,6 +25,14 @@ public typealias TranscriptUnreadAnchorResolver = (
 /// Cell + measure hooks supplied by the host app (Sonar bubbles, sample UILabels, …).
 public struct TranscriptCollectionHostCallbacks {
     public var configureCell: (UICollectionView, UICollectionViewCell, IndexPath, TranscriptDayRow) -> Void
+    /// Register app-owned cell classes on the collection view. Paired with
+    /// `provideCell` for rows an app renders with its own pre-measured UIKit
+    /// cells (Signal `CVCell`) instead of the default hosting cell.
+    public var registerCells: ((UICollectionView) -> Void)?
+    /// Dequeue + configure the cell for a row. Returning nil falls back to the
+    /// default cell, which is how an app mixes cheap UIKit rows with hosted
+    /// SwiftUI rows in the same transcript.
+    public var provideCell: ((UICollectionView, IndexPath, TranscriptDayRow) -> UICollectionViewCell?)?
     /// Sticky day header chrome. When nil, the host falls back to a plain `UILabel`.
     /// Apps with custom pills (Sonar `SNStickyDayHeader`) must supply this so measure
     /// (`headerHeight`) and display stay on the same object graph.
@@ -38,10 +46,14 @@ public struct TranscriptCollectionHostCallbacks {
         itemHeight: @escaping (TranscriptDayRow, String, CGFloat) -> CGFloat,
         headerHeight: @escaping (String, CGFloat) -> CGFloat,
         configureHeader: ((UICollectionView, UICollectionViewCell, IndexPath, String) -> Void)? = nil,
+        registerCells: ((UICollectionView) -> Void)? = nil,
+        provideCell: ((UICollectionView, IndexPath, TranscriptDayRow) -> UICollectionViewCell?)? = nil,
         unreadAnchorResolver: TranscriptUnreadAnchorResolver? = nil
     ) {
         self.configureCell = configureCell
         self.configureHeader = configureHeader
+        self.registerCells = registerCells
+        self.provideCell = provideCell
         self.itemHeight = itemHeight
         self.headerHeight = headerHeight
         self.unreadAnchorResolver = unreadAnchorResolver
@@ -75,6 +87,11 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     /// keystrokes and unrelated store publishes must not re-measure rows.
     /// Nil = always apply (generic default). Must cover entries + height keys.
     var contentVersion: UInt64?
+    /// Independent composer/chrome revision. Transcript state can publish at
+    /// BLE/relay cadence while the composer inputs remain unchanged; replacing
+    /// the hosted SwiftUI value on every such tick schedules needless intrinsic
+    /// sizing/layout beside the active keyboard.
+    var composerVersion: UInt64?
     @ViewBuilder var composer: () -> Composer
 
     public init(
@@ -90,6 +107,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         prepareForUpdate: (() -> Void)? = nil,
         onJumpSettled: (() -> Void)? = nil,
         contentVersion: UInt64? = nil,
+        composerVersion: UInt64? = nil,
         @ViewBuilder composer: @escaping () -> Composer
     ) {
         self.entries = entries
@@ -104,6 +122,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.prepareForUpdate = prepareForUpdate
         self.onJumpSettled = onJumpSettled
         self.contentVersion = contentVersion
+        self.composerVersion = composerVersion
         self.composer = composer
     }
 
@@ -117,6 +136,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             heightKey: heightKey,
             transcriptBackgroundColor: transcriptBackgroundColor
         )
+        vc.noteInitialComposerVersion(composerVersion)
         vc.onJumpSettled = onJumpSettled
         vc.apply(
             entries: entries,
@@ -139,7 +159,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         }
         prepareForUpdate?()
         vc.onJumpSettled = onJumpSettled
-        vc.updateComposer(composer())
+        vc.updateComposer(composer(), version: composerVersion)
         vc.apply(
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
@@ -216,6 +236,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var contentSizeObservation: NSKeyValueObservation?
     private var lastContentHeight: CGFloat = 0
     private var lastAppliedContentVersion: UInt64?
+    private var lastAppliedComposerVersion: UInt64?
 
     private let heightCache = TranscriptRowHeightCache()
     private var appliedHeightKeys: [TranscriptDayRow: String] = [:]
@@ -244,7 +265,13 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         super.init(nibName: nil, bundle: nil)
     }
 
-    func updateComposer(_ composer: Composer) {
+    func noteInitialComposerVersion(_ version: UInt64?) {
+        lastAppliedComposerVersion = version
+    }
+
+    func updateComposer(_ composer: Composer, version: UInt64?) {
+        if let version, version == lastAppliedComposerVersion { return }
+        lastAppliedComposerVersion = version
         composerStore.composer = composer
         // Text / tray changes often arrive via a new Composer value; relayout so
         // intrinsic composer height and owned insets catch up in the same pass.
@@ -457,6 +484,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     // MARK: Data source
 
     private func configureDataSource() {
+        callbacks.registerCells?(collectionView)
         let cellReg = UICollectionView.CellRegistration<UICollectionViewCell, TranscriptDayRow> {
             [weak self] cell, indexPath, item in
             guard let self else { return }
@@ -492,8 +520,11 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         }
         let ds = UICollectionViewDiffableDataSource<TranscriptDaySection, TranscriptDayRow>(
             collectionView: collectionView
-        ) { collectionView, indexPath, item in
-            collectionView.dequeueConfiguredReusableCell(using: cellReg, for: indexPath, item: item)
+        ) { [weak self] collectionView, indexPath, item in
+            if let provided = self?.callbacks.provideCell?(collectionView, indexPath, item) {
+                return provided
+            }
+            return collectionView.dequeueConfiguredReusableCell(using: cellReg, for: indexPath, item: item)
         }
         ds.supplementaryViewProvider = { collectionView, kind, indexPath in
             guard kind == UICollectionView.elementKindSectionHeader else { return nil }
@@ -1026,14 +1057,15 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             clearLiveEdgeOpenIfSettled()
             latch.tailVisible(itemCount: entries.count, tailID: entries.last?.id)
             if hasLeftBottom, let loadNewest, !isLoadingNewest, !isLoadingOlder {
-                let anchorId = entries.last?.id ?? "transcript-bottom"
-                let token = captureContinuityToken(anchorId: anchorId)
                 isLoadingNewest = true
                 Task { @MainActor in
                     await loadNewest()
                     self.isLoadingNewest = false
-                    self.applySnapshot()
-                    self.restoreContinuity(token)
+                    // `loadNewest` publishes the new ConversationViewState
+                    // rows. Let the ensuing representable `apply` build that
+                    // snapshot once and follow the already-pinned tail;
+                    // applying here rebuilds the OLD entries, restores against
+                    // stale geometry, then SwiftUI repeats both operations.
                 }
             }
         } else {
@@ -1060,10 +1092,12 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                 let added = await loadOlder()
                 self.isLoadingOlder = false
                 guard added else { return }
+                // The published row change drives `apply`, which consumes this
+                // token after the NEW snapshot has an exact pre-measured size.
+                // Do not apply/restore the old entries here: that doubled the
+                // O(n) diffable + layout pass at the top edge and cleared the
+                // token before the prepend arrived.
                 self.pendingContinuity = token
-                self.applySnapshot()
-                self.restoreContinuity(token)
-                self.pendingContinuity = nil
             }
         }
     }
