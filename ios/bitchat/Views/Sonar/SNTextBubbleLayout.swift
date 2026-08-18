@@ -37,7 +37,7 @@ enum SNTextBubbleStrings {
 
 enum SNTextBubbleFont {
     static let body = UIFont.systemFont(ofSize: 16)
-    static let mention = UIFont.systemFont(ofSize: 16, weight: .semibold)
+    static let mention = UIFont.systemFont(ofSize: 16, weight: .bold)
     static let author = UIFont.systemFont(ofSize: 12, weight: .bold)
     static let meta = UIFont.systemFont(ofSize: 10.5)
     static let quoteAuthor = UIFont.systemFont(ofSize: 11.5, weight: .heavy)
@@ -74,6 +74,8 @@ enum SNTextBubbleMetric {
     static let metaIconSize: CGFloat = 11
     static let metaIconSpacing: CGFloat = 3
     static let metaBottomPad: CGFloat = 1.5
+    /// theme.css `.bc-msg.mention … inset 3px 0 0`
+    static let mentionBarWidth: CGFloat = 3
     static let showMoreMinSide: CGFloat = 44
     static let showMoreHorizontalPad: CGFloat = 6
     static let stateTopPad: CGFloat = 3
@@ -137,6 +139,8 @@ struct SNTextBubbleModel {
     let bubbleInk: UIColor
     let metaColor: UIColor
     let dropsShadow: Bool
+    /// Leading inset bar when an incoming bubble tags you (theme.css `.bc-msg.mention`).
+    let mentionBarColor: UIColor?
     let accessibilityText: String
     /// Identity of everything that can change size or paint — the cell's cache
     /// key and the collection host's height key both derive from it.
@@ -179,9 +183,25 @@ extension SNTextBubbleModel {
         // trimmed as well as cut, so styling it would land on wrong characters.
         let renderableMentions: [SNResolvedMention] =
             (!m.mentions.isEmpty && visibleText == m.text) ? m.mentions.mentions : []
-        let mentionColor: UIColor = (m.mentions.mentionsMe && !m.mine)
-            ? snUIColor(SonarTheme.accentDeep)
-            : ink
+        // theme.css `.bc-mention`: every @token is a chip. Incoming uses the
+        // message's transport colour; own bubbles get white-on-fill. The inset
+        // bar (not the chip) is what calls *you* out — keep in step with
+        // SNMsgBubble.
+        let mentionColor: UIColor
+        let mentionBackground: UIColor
+        if m.mine {
+            mentionColor = ink
+            mentionBackground = snUIColor(SNMentions.onOwnFill)
+        } else if m.via == .internet {
+            mentionColor = snUIColor(SonarTheme.netDeep)
+            mentionBackground = snUIColor(SonarTheme.netSoft)
+        } else {
+            mentionColor = snUIColor(SonarTheme.accentDeep)
+            mentionBackground = snUIColor(SonarTheme.accentSoft)
+        }
+        let mentionBarColor: UIColor? = (m.mentions.mentionsMe && !m.mine)
+            ? snUIColor(m.via == .internet ? SonarTheme.net : SonarTheme.accent)
+            : nil
         let usesCharacterWrapping = visibleText.hasVeryLongToken(
             threshold: SNTextBubbleMetric.longTokenThreshold
         )
@@ -194,6 +214,7 @@ extension SNTextBubbleModel {
             linkColor: m.mine ? ink : snUIColor(SonarTheme.accentDeep),
             mentionFont: renderableMentions.isEmpty ? nil : SNTextBubbleFont.mention,
             mentionColor: renderableMentions.isEmpty ? nil : mentionColor,
+            mentionBackground: renderableMentions.isEmpty ? nil : mentionBackground,
             mentions: renderableMentions.isEmpty ? nil : renderableMentions,
             detectBareDomains: true,
             excludeLinkBeforeTrailingEllipsis: preview.isTruncated && !isExpanded
@@ -256,6 +277,7 @@ extension SNTextBubbleModel {
             bubbleInk: ink,
             metaColor: metaColor,
             dropsShadow: !m.mine,
+            mentionBarColor: mentionBarColor,
             accessibilityText: visibleText,
             measurementKey: measurementKey
         )

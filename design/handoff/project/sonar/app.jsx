@@ -23,7 +23,7 @@ function bcNow() {
 
 function bcFreshState() {
   return {
-    v: 3,
+    v: 4,
     onboarded: false,
     nick: '',
     network: 'online',
@@ -44,7 +44,7 @@ function bcFreshState() {
 function bcLoadState() {
   try {
     const s = JSON.parse(localStorage.getItem('sn_proto_v1'));
-    if (s && s.v === 3) {
+    if (s && s.v === 4) {
       const d = bcFreshState();
       return { ...d, ...s, nav: '', prefs: { ...d.prefs, ...(s.prefs || {}) }, chMsgs: { ...d.chMsgs, ...(s.chMsgs || {}) }, dmMsgs: { ...d.dmMsgs, ...(s.dmMsgs || {}) }, groupMsgs: { ...d.groupMsgs, ...(s.groupMsgs || {}) }, txns: s.txns || d.txns };
     }

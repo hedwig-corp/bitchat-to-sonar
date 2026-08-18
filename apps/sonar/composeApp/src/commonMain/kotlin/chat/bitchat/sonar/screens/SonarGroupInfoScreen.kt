@@ -215,6 +215,26 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                     }
                 }
 
+                // ── Mentions ──
+                SNSectionLabel("Mentions")
+                SNSettingsCard {
+                    SNSettingsRow(
+                        icon = SNIconName.People,
+                        tone = SNTone.Cyan,
+                        label = "Tagging people",
+                        sub = "Type @ to tag a member · @everyone reaches all ${members.size}",
+                        trail = SNTrail.None,
+                        divider = false,
+                    )
+                }
+                Text(
+                    "Mentions are part of the encrypted message — relays never see who you tagged, and someone out of Bluetooth range still gets it over the internet.",
+                    color = s.text3,
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 0.dp, bottom = 8.dp),
+                )
+
                 // ── Members section ──
                 SNSectionLabel("Members (${members.size})")
 

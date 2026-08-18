@@ -508,6 +508,7 @@ function GroupScreen({ app, nav, pop, push, groupId, onSend, onCommand, onMedia,
       )}
       <Composer
         placeholder={'Message ' + group.name}
+        mentions={groupReach(group).mem}
         transport={transport}
         reply={reply} onCancelReply={() => setReply(null)}
         onSend={(tx) => { onSend(group.id, tx, reply); setReply(null); }}
@@ -707,6 +708,18 @@ function GroupInfoScreen({ app, nav, pop, push, groupId, onLeave }) {
             {pendingCount ? <span className="bc-unread" style={{ minWidth: 22 }}>{pendingCount}</span> : null}
           </button>
         </div>
+
+        <SectionLabel>Mentions</SectionLabel>
+        <div className="bc-list">
+          <div className="bc-row" style={{ cursor: 'default' }}>
+            <span className="bc-actionicon"><BCIcon name="people" size={18} /></span>
+            <span className="bc-rowmain">
+              <span className="bc-rowtitle">Tagging people</span>
+              <span className="bc-rowsub"><span>Type <b>@</b> to tag a member · <b>@everyone</b> reaches all {mem.length + 1}</span></span>
+            </span>
+          </div>
+        </div>
+        <div className="bc-note" style={{ padding: '8px 16px 0' }}>Tagged members are notified even if they muted the group. Mentions are part of the encrypted message — relays never see who you tagged, and someone out of Bluetooth range still gets it over the internet.</div>
 
         <SectionLabel>{mem.length + 1} members</SectionLabel>
         <div className="bc-list">

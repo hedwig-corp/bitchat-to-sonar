@@ -1777,6 +1777,25 @@
 .bc-msg:not(.mine) .bc-quotename { color: var(--accent-deep); }
 .bc-msg:not(.mine)[data-via="internet"] .bc-quotename { color: var(--net-deep); }
 .bc-quotetext { font-size: 12.5px; opacity: 0.82; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 210px; }
+/* @mentions */
+.bc-mention { font-weight: 700; color: var(--accent-deep); background: var(--accent-soft); border-radius: 5px; padding: 0 3px; margin: 0 -1px; }
+.bc-msg[data-via="internet"] .bc-mention { color: var(--net-deep); background: var(--net-soft); }
+.bc-msg.mine .bc-bubble .bc-mention { color: inherit; background: rgba(255,255,255,0.26); }
+.bc-app[data-bubble="tinted"] .bc-msg.mine .bc-bubble .bc-mention { color: var(--accent-deep); background: var(--accent-soft); }
+.bc-msg.mention:not(.mine) .bc-bubble { box-shadow: var(--bubble-shadow), inset 3px 0 0 var(--accent); }
+.bc-msg.mention:not(.mine)[data-via="internet"] .bc-bubble { box-shadow: var(--bubble-shadow), inset 3px 0 0 var(--net); }
+.bc-mentions { display: flex; flex-direction: column; margin: 0 12px 6px; border-radius: 14px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--hairline); overflow: hidden; max-height: 214px; }
+.bc-mentionscroll { overflow-y: auto; }
+.bc-mrow { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 12px; border: none; background: none; font-family: inherit; color: inherit; text-align: left; cursor: pointer; }
+.bc-mrow + .bc-mrow { box-shadow: 0 -1px 0 var(--hairline); }
+.bc-mrow:active, .bc-mrow.sel { background: var(--press); }
+.bc-mrowmain { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.bc-mrowname { font-size: 14.5px; font-weight: 700; display: flex; align-items: center; gap: 5px; }
+.bc-mrowsub { font-size: 11.5px; color: var(--text3); }
+.bc-mrowvia { flex: none; display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; font-weight: 700; padding: 3px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-deep); }
+.bc-mrowvia.net { background: var(--net-soft); color: var(--net-deep); }
+.bc-mall { width: 32px; height: 32px; flex: none; border-radius: 50%; background: var(--surface2); color: var(--text2); display: flex; align-items: center; justify-content: center; }
+.bc-mentionhint { padding: 7px 12px 8px; font-size: 11.5px; line-height: 1.4; color: var(--text3); box-shadow: 0 -1px 0 var(--hairline); }
 .bc-replybar { display: flex; align-items: center; gap: 10px; margin: 0 12px 6px; padding: 8px 11px; border-radius: 13px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--hairline); }
 .bc-replybar > svg { color: var(--accent); flex: none; }
 .bc-replymain { flex: 1; min-width: 0; display: flex; flex-direction: column; }

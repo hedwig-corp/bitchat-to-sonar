@@ -917,10 +917,19 @@ struct SNMsgBubble: View {
     private var isExpanded: Bool { expandedMessageIDs.contains(m.id) }
     private var visibleText: String { isExpanded ? m.text : preview.text }
 
-    /// A mention of you is called out in the accent so it is findable by eye in
-    /// a busy group; mentions of other people read as plain references.
+    /// Chip colors from theme.css `.bc-mention`: transport-tinted on incoming
+    /// bubbles, white-on-fill on own. Every mention is chipped, not only ones
+    /// that name you — the inset bar is what calls *you* out.
     private var mentionColor: Color {
-        mentions.mentionsMe && !mine ? SonarTheme.accentDeep : bubbleText
+        if mine { return bubbleText }
+        return m.via == .internet ? SonarTheme.netDeep : SonarTheme.accentDeep
+    }
+    private var mentionBackground: Color {
+        if mine { return SNMentions.onOwnFill }
+        return m.via == .internet ? SonarTheme.netSoft : SonarTheme.accentSoft
+    }
+    private var mentionBarColor: Color {
+        m.via == .internet ? SonarTheme.net : SonarTheme.accent
     }
 
     /// Mention spans are offsets into the FULL message text, decoded at row
@@ -942,8 +951,9 @@ struct SNMsgBubble: View {
             visibleText,
             baseColor: bubbleText,
             linkColor: mine ? bubbleText : SonarTheme.accentDeep,
-            mentionFont: renderableMentions.isEmpty ? nil : SonarTheme.uiFont(size: 16, weight: .semibold),
+            mentionFont: renderableMentions.isEmpty ? nil : SonarTheme.uiFont(size: 16, weight: .bold),
             mentionColor: renderableMentions.isEmpty ? nil : mentionColor,
+            mentionBackground: renderableMentions.isEmpty ? nil : mentionBackground,
             mentions: renderableMentions.isEmpty ? nil : renderableMentions,
             detectBareDomains: true,
             excludeLinkBeforeTrailingEllipsis: preview.isTruncated && !isExpanded
@@ -1046,11 +1056,19 @@ struct SNMsgBubble: View {
                 }
             }
             .padding(EdgeInsets(top: 8, leading: 12, bottom: 9, trailing: 12))
-            .background(
-                bubbleShape
-                    .fill(bubbleFill)
-                    .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
-            )
+            .background {
+                let shape = bubbleShape
+                ZStack(alignment: .leading) {
+                    shape.fill(bubbleFill)
+                    if mentions.mentionsMe && !mine {
+                        Rectangle()
+                            .fill(mentionBarColor)
+                            .frame(width: 3)
+                    }
+                }
+                .clipShape(shape)
+                .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
+            }
             if preview.isTruncated {
                 ShowMoreButton.sonar(isExpanded: isExpanded) {
                     if isExpanded { expandedMessageIDs.remove(m.id) }
@@ -4401,6 +4419,59 @@ func snUpdatedComposerDraftHasText(
     return next
 }
 
+/// `.bc-mrow` — avatar, name, transport subtitle, nearby/internet chip.
+private struct SNMentionPickRow<Avatar: View>: View {
+    let name: String
+    let subtitle: String
+    /// nil hides the via chip (`@everyone`).
+    let inRange: Bool?
+    var disambiguator: String? = nil
+    var showHairline: Bool = true
+    @ViewBuilder let avatar: () -> Avatar
+
+    var body: some View {
+        HStack(spacing: 10) {
+            avatar()
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(verbatim: name)
+                        .font(SonarTheme.uiFont(size: 14.5, weight: .bold))
+                        .foregroundColor(SonarTheme.text)
+                        .lineLimit(1)
+                    if let disambiguator {
+                        Text(verbatim: disambiguator)
+                            .font(SonarTheme.uiFont(size: 11.5))
+                            .foregroundColor(SonarTheme.text3)
+                            .lineLimit(1)
+                    }
+                }
+                Text(verbatim: subtitle)
+                    .font(SonarTheme.uiFont(size: 11.5))
+                    .foregroundColor(SonarTheme.text3)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let inRange {
+                Text(verbatim: inRange ? "nearby" : "internet")
+                    .font(SonarTheme.uiFont(size: 10.5, weight: .bold))
+                    .foregroundColor(inRange ? SonarTheme.accentDeep : SonarTheme.netDeep)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule().fill(inRange ? SonarTheme.accentSoft : SonarTheme.netSoft)
+                    )
+            }
+        }
+        .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+        .contentShape(Rectangle())
+        .overlay(alignment: .top) {
+            if showHairline {
+                Rectangle().fill(SonarTheme.hairline).frame(height: 1)
+            }
+        }
+    }
+}
+
 struct SNComposer: View {
     @Binding var text: String
     let placeholder: String
@@ -4440,6 +4511,9 @@ struct SNComposer: View {
     private var slash: Bool { fieldText.hasPrefix("/") }
     private var mentionSuggestions: [SNMentionCandidate] {
         mentionRoster.isEmpty ? [] : SNMentions.matches(draft: fieldText, roster: mentionRoster)
+    }
+    private var mentionPickerOpen: Bool {
+        !mentionRoster.isEmpty && (SNMentions.showsEveryone(fieldText) || !mentionSuggestions.isEmpty)
     }
     private var hasText: Bool { snComposerHasText(fieldText) }
     /// Soft-IME platforms only. macOS shares `SNComposer` but has no system
@@ -4524,38 +4598,78 @@ struct SNComposer: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !mentionSuggestions.isEmpty {
+            if mentionPickerOpen {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(mentionSuggestions) { candidate in
-                        Button {
-                            fieldText = SNMentions.applyPick(
-                                draft: fieldText,
-                                pick: candidate,
-                                roster: mentionRoster
-                            )
-                            text = fieldText
-                        } label: {
-                            HStack(spacing: 8) {
-                                Text(verbatim: "@" + candidate.name)
-                                    .font(SonarTheme.monoFont(size: 13, weight: .medium))
-                                    .foregroundColor(SonarTheme.accentDeep)
-                                // Two members can share a display name; show the
-                                // npub so the sender can tell which one this is.
-                                if SNMentions.needsSuffix(candidate, roster: mentionRoster) {
-                                    Text(verbatim: snShortNpubLabel(candidate.npub))
-                                        .font(SonarTheme.uiFont(size: 11))
-                                        .foregroundColor(SonarTheme.text2)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 0) {
+                            if SNMentions.showsEveryone(fieldText) {
+                                Button {
+                                    fieldText = SNMentions.applyEveryone(fieldText)
+                                    text = fieldText
+                                } label: {
+                                    SNMentionPickRow(
+                                        name: "@everyone",
+                                        subtitle: "Notifies all \(mentionRoster.count + 1) members",
+                                        inRange: nil,
+                                        showHairline: false,
+                                        avatar: {
+                                            Circle()
+                                                .fill(SonarTheme.surface2)
+                                                .frame(width: 32, height: 32)
+                                                .overlay(
+                                                    SNIcon(name: .people, size: 16)
+                                                        .foregroundColor(SonarTheme.text2)
+                                                )
+                                        }
+                                    )
                                 }
-                                Spacer(minLength: 0)
+                                .buttonStyle(SNRowPressStyle())
                             }
-                            .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
-                            .contentShape(Rectangle())
+                            ForEach(mentionSuggestions) { candidate in
+                                Button {
+                                    fieldText = SNMentions.applyPick(
+                                        draft: fieldText,
+                                        pick: candidate,
+                                        roster: mentionRoster
+                                    )
+                                    text = fieldText
+                                } label: {
+                                    SNMentionPickRow(
+                                        name: candidate.name,
+                                        subtitle: candidate.inRange
+                                            ? "Right here · reachable over Bluetooth"
+                                            : "Out of range · gets it over the internet",
+                                        inRange: candidate.inRange,
+                                        disambiguator: SNMentions.needsSuffix(candidate, roster: mentionRoster)
+                                            ? snShortNpubLabel(candidate.npub) : nil,
+                                        showHairline: SNMentions.showsEveryone(fieldText) || mentionSuggestions.first?.id != candidate.id,
+                                        avatar: { SonarAvatar(name: candidate.name, size: 32) }
+                                    )
+                                }
+                                .buttonStyle(SNRowPressStyle())
+                            }
                         }
-                        .buttonStyle(SNScaleStyle(scale: 0.99))
                     }
+                    .frame(maxHeight: 170)
+                    Text(verbatim: "Mentions stay inside the encryption — relays never learn who you tagged.")
+                        .font(SonarTheme.uiFont(size: 11.5))
+                        .foregroundColor(SonarTheme.text3)
+                        .padding(EdgeInsets(top: 7, leading: 12, bottom: 8, trailing: 12))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .overlay(alignment: .top) {
+                            Rectangle().fill(SonarTheme.hairline).frame(height: 1)
+                        }
                 }
-                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(SonarTheme.surface2))
-                .padding(EdgeInsets(top: 8, leading: 12, bottom: 2, trailing: 12))
+                .background(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(SonarTheme.surface)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .strokeBorder(SonarTheme.hairline, lineWidth: 1)
+                        )
+                )
+                .frame(maxHeight: 214)
+                .padding(EdgeInsets(top: 0, leading: 12, bottom: 6, trailing: 12))
             }
             if slash {
                 ScrollView(.horizontal, showsIndicators: false) {

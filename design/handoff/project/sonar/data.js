@@ -46,6 +46,7 @@ window.BC_DATA = {
     lake: [
       { author: 'Luca', text: 'lake later? water\u2019s unreal', time: '17:40', via: 'internet', reactions: [{ e: '🔥', who: ['Maya', 'Tomas'] }] },
       { author: 'nettle', text: 'i\u2019m down, leaving in 20', time: '17:43', via: 'internet' },
+      { author: 'Maya', text: '@you bring the cooler? @nettle has the towels', time: '17:47', via: 'internet' },
       { author: 'Maya', media: { type: 'image', shape: 'landscape', name: 'lake_now.jpg', cap: 'view from the dock' }, time: '17:55', via: 'internet' },
       { author: 'Maya', text: 'bringing the speaker', time: '17:58', via: 'internet' },
     ],

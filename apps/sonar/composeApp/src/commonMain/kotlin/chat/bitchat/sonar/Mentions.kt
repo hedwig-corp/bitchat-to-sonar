@@ -20,6 +20,8 @@ data class MentionCandidate(
     val npub: String,
     val name: String,
     val suffixHex4: String?,
+    /** Live Bluetooth route to this member, for the picker via-chip. */
+    val inRange: Boolean = false,
 )
 
 /** A mention located in a message, paired with the group member it names.
@@ -49,6 +51,9 @@ object Mentions {
 
     /** Cap on offered suggestions, matching the mesh composer's list. */
     const val MAX_SUGGESTIONS: Int = 5
+
+    /** Broadcast token from the design picker (`@everyone`). */
+    const val EVERYONE: String = "everyone"
 
     /** Mirrors the core scanner's name class (`[\p{L}0-9_]`). */
     private fun isNameChar(c: Char): Boolean = c.isLetter() || c.isDigit() || c == '_'
@@ -121,11 +126,17 @@ object Mentions {
     }
 
     /**
-     * True when [pick] shares a display name with another roster member, so the
-     * inserted token must carry the `#abcd` disambiguator.
+     * True when the inserted token must carry the `#abcd` disambiguator.
+     *
+     * Either another roster member answers to the same display name, or the
+     * wire name is the reserved broadcast token `everyone` — a bare `@everyone`
+     * names the whole group (see `mentions_pubkey`), so a person who happens
+     * to be called that has to go out in the suffix form.
      */
-    fun needsSuffix(pick: MentionCandidate, roster: List<MentionCandidate>): Boolean =
-        roster.any { it.npub != pick.npub && it.name.equals(pick.name, ignoreCase = true) }
+    fun needsSuffix(pick: MentionCandidate, roster: List<MentionCandidate>): Boolean {
+        if (wireName(pick.name).equals(EVERYONE, ignoreCase = true)) return true
+        return roster.any { it.npub != pick.npub && it.name.equals(pick.name, ignoreCase = true) }
+    }
 
     /**
      * The text a picked suggestion contributes: `@name`, or `@name#abcd` when
@@ -158,5 +169,21 @@ object Mentions {
         if (activeQuery(draft) == null) return draft
         val at = draft.lastIndexOf('@')
         return draft.substring(0, at) + token(pick, roster) + " "
+    }
+
+    /**
+     * True when the design's `@everyone` row should appear: the active query
+     * is a prefix of `everyone` (including a lone `@`).
+     */
+    fun showsEveryone(draft: String): Boolean {
+        val query = activeQuery(draft) ?: return false
+        return EVERYONE.startsWith(query.lowercase())
+    }
+
+    /** [draft] with the active `@token` replaced by `@everyone `. */
+    fun applyEveryone(draft: String): String {
+        if (activeQuery(draft) == null) return draft
+        val at = draft.lastIndexOf('@')
+        return draft.substring(0, at) + "@$EVERYONE "
     }
 }

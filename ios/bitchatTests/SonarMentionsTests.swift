@@ -144,6 +144,34 @@ struct SonarMentionsTests {
         #expect(SNMentions.npub(fromURL: URL(string: "https://example.com")!) == nil)
     }
 
+    @Test("@everyone appears for a prefix query")
+    func everyoneRowAppearsForPrefix() {
+        #expect(SNMentions.showsEveryone("@"))
+        #expect(SNMentions.showsEveryone("hey @eve"))
+        #expect(SNMentions.showsEveryone("@everyone"))
+        #expect(!SNMentions.showsEveryone("hey @vin"))
+        #expect(!SNMentions.showsEveryone("hello"))
+    }
+
+    @Test("picking everyone inserts the broadcast token")
+    func pickingEveryoneInsertsBroadcast() {
+        #expect(SNMentions.applyEveryone("hey @eve") == "hey @everyone ")
+        #expect(SNMentions.applyEveryone("@") == "@everyone ")
+        #expect(SNMentions.applyEveryone("already sent") == "already sent")
+    }
+
+    @Test("a person named everyone is forced to the suffix form")
+    func personNamedEveryoneGetsSuffix() {
+        // Bare `@everyone` is the broadcast token; picking the person must not
+        // emit that, or every member would be notified.
+        let person = SNMentionCandidate(npub: "npub1eve", name: "Everyone", suffixHex4: "abcd")
+        #expect(SNMentions.needsSuffix(person, roster: [person]))
+        #expect(SNMentions.token(person, roster: [person]) == "@Everyone#abcd")
+        #expect(SNMentions.applyPick(draft: "hey @Eve", pick: person, roster: [person]) == "hey @Everyone#abcd ")
+        let noKey = SNMentionCandidate(npub: "npub1eve", name: "Everyone", suffixHex4: nil)
+        #expect(!SNMentions.isMentionable(noKey, roster: [noKey]))
+    }
+
     // MARK: - Parity with the core scanner
 
     @Test("the core scanner agrees with the shipped mesh regex on ordinary mentions")

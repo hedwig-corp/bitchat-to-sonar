@@ -126,6 +126,21 @@ struct SonarGroupInfoScreen: View {
                         }
                     }
 
+                    // ── Mentions ──
+                    SNSectionLabel("Mentions")
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon: .people, tone: .cyan,
+                            label: "Tagging people",
+                            sub: "Type @ to tag a member · @everyone reaches all \(members.count + 1)",
+                            trail: .none, divider: false
+                        ) {}
+                    }
+                    Text(verbatim: "Mentions are part of the encrypted message — relays never see who you tagged, and someone out of Bluetooth range still gets it over the internet.")
+                        .font(SonarTheme.uiFont(size: 13))
+                        .foregroundColor(SonarTheme.text3)
+                        .padding(EdgeInsets(top: 0, leading: 16, bottom: 8, trailing: 16))
+
                     // ── Members ──
                     SNSectionLabel("Members")
                     SNSettingsCard {

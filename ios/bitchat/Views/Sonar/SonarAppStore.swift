@@ -5271,7 +5271,8 @@ final class SonarAppStore: ObservableObject {
                 name: name,
                 // The suffix comes from the key, so it stays correct across renames.
                 suffixHex4: SNMentions.pubkeyHex(fromNpubOrHex: npub)
-                    .flatMap { sonarMentionShortSuffix(pubkeyHex: $0) }
+                    .flatMap { sonarMentionShortSuffix(pubkeyHex: $0) },
+                inRange: npubIsInRange(npub)
             )
         }
     }
@@ -5294,6 +5295,18 @@ final class SonarAppStore: ObservableObject {
             hasher.combine(marmot.displayName(forNpub: npub))
         }
         return UInt64(bitPattern: Int64(hasher.finalize()))
+    }
+
+    /// True when this npub currently has a live Bluetooth Noise route.
+    private func npubIsInRange(_ npub: String) -> Bool {
+        guard let hex = SNMentions.pubkeyHex(fromNpubOrHex: npub) else { return false }
+        return nearbyPeers.contains { peer in
+            guard peer.inRange,
+                  let profile = resolvedSonarProfile(peer.id),
+                  let peerHex = SNMentions.pubkeyHex(fromNpubOrHex: profile.npub)
+            else { return false }
+            return peerHex == hex
+        }
     }
 
     /// Everything mention decoding needs that is per-CONVERSATION rather than
