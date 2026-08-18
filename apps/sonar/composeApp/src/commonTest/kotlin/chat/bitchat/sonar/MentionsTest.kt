@@ -167,4 +167,32 @@ class MentionsTest {
         val viktor = MentionCandidate("npub1eee", "Виктор", "1234")
         assertEquals(listOf(viktor), Mentions.matches("ciao @Вик", listOf(viktor, giulia)))
     }
+
+    @Test
+    fun everyoneRowAppearsForAPrefixQuery() {
+        assertTrue(Mentions.showsEveryone("@"))
+        assertTrue(Mentions.showsEveryone("hey @eve"))
+        assertTrue(Mentions.showsEveryone("@everyone"))
+        assertFalse(Mentions.showsEveryone("hey @vin"))
+        assertFalse(Mentions.showsEveryone("hello"))
+    }
+
+    @Test
+    fun pickingEveryoneInsertsTheBroadcastToken() {
+        assertEquals("hey @everyone ", Mentions.applyEveryone("hey @eve"))
+        assertEquals("@everyone ", Mentions.applyEveryone("@"))
+        assertEquals("already sent", Mentions.applyEveryone("already sent"))
+    }
+
+    @Test
+    fun aPersonNamedEveryoneIsForcedToTheSuffixForm() {
+        // Bare `@everyone` is the broadcast token; picking the person must not
+        // emit that, or every member would be notified.
+        val person = MentionCandidate("npub1eve", "Everyone", "abcd")
+        assertTrue(Mentions.needsSuffix(person, listOf(person)))
+        assertEquals("@Everyone#abcd", Mentions.token(person, listOf(person)))
+        assertEquals("hey @Everyone#abcd ", Mentions.applyPick("hey @Eve", person, listOf(person)))
+        val noKey = MentionCandidate("npub1eve", "Everyone", suffixHex4 = null)
+        assertFalse(Mentions.isMentionable(noKey, listOf(noKey)))
+    }
 }

@@ -39,23 +39,30 @@ final class SNBubbleBackgroundView: UIView {
     override class var layerClass: AnyClass { CAShapeLayer.self }
 
     private var shape: CAShapeLayer { layer as! CAShapeLayer }
+    private let mentionBar = CAShapeLayer()
+    private let mentionBarMask = CAShapeLayer()
     private var fill: UIColor = .clear
     private var mine = false
     private var dropsShadow = false
+    private var mentionBarColor: UIColor?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false
         shape.lineWidth = 0
+        mentionBar.fillColor = nil
+        mentionBar.mask = mentionBarMask
+        layer.addSublayer(mentionBar)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func apply(fill: UIColor, mine: Bool, dropsShadow: Bool) {
+    func apply(fill: UIColor, mine: Bool, dropsShadow: Bool, mentionBarColor: UIColor? = nil) {
         self.fill = fill
         self.mine = mine
         self.dropsShadow = dropsShadow
+        self.mentionBarColor = mentionBarColor
         shape.fillColor = fill.resolvedColor(with: traitCollection).cgColor
         if dropsShadow {
             shape.shadowColor = UIColor(Color(sonarHex: 0x0A232D, opacity: 0.07)).cgColor
@@ -70,15 +77,39 @@ final class SNBubbleBackgroundView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let path = Self.bubblePath(in: bounds, mine: mine, leftToRight: effectiveUserInterfaceLayoutDirection == .leftToRight)
+        let leftToRight = effectiveUserInterfaceLayoutDirection == .leftToRight
+        let path = Self.bubblePath(in: bounds, mine: mine, leftToRight: leftToRight)
         shape.path = path
         shape.shadowPath = dropsShadow ? path : nil
+        mentionBar.frame = bounds
+        mentionBarMask.frame = mentionBar.bounds
+        if let barColor = mentionBarColor {
+            mentionBar.isHidden = false
+            let w = SNTextBubbleMetric.mentionBarWidth
+            let barRect = CGRect(
+                x: leftToRight ? 0 : bounds.maxX - w,
+                y: 0,
+                width: w,
+                height: bounds.height
+            )
+            mentionBar.path = CGPath(rect: barRect, transform: nil)
+            mentionBar.fillColor = barColor.resolvedColor(with: traitCollection).cgColor
+            mentionBarMask.path = path
+        } else {
+            mentionBar.isHidden = true
+            mentionBar.path = nil
+            mentionBar.fillColor = nil
+            mentionBarMask.path = nil
+        }
     }
 
     override func traitCollectionDidChange(_ previous: UITraitCollection?) {
         super.traitCollectionDidChange(previous)
         guard traitCollection.hasDifferentColorAppearance(comparedTo: previous) else { return }
         shape.fillColor = fill.resolvedColor(with: traitCollection).cgColor
+        if let barColor = mentionBarColor {
+            mentionBar.fillColor = barColor.resolvedColor(with: traitCollection).cgColor
+        }
     }
 
     /// Mirrors the SwiftUI `UnevenRoundedRectangle`: full radius everywhere but
@@ -373,7 +404,12 @@ final class SNTextBubbleContentView: UIView {
         self.actions = actions
         resetSwipe(animated: false)
 
-        bubble.apply(fill: model.bubbleFill, mine: model.mine, dropsShadow: model.dropsShadow)
+        bubble.apply(
+            fill: model.bubbleFill,
+            mine: model.mine,
+            dropsShadow: model.dropsShadow,
+            mentionBarColor: model.mentionBarColor
+        )
         authorLabel.text = model.author
         authorLabel.textColor = model.authorColor
         authorLabel.isHidden = model.author == nil

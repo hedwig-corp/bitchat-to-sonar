@@ -26,6 +26,7 @@ enum SonarMessageTextFormatter {
         linkColor: Color? = nil,
         mentionFont: Font? = nil,
         mentionColor: Color? = nil,
+        mentionBackground: Color? = nil,
         mentions: [SNResolvedMention]? = nil,
         detectBareDomains: Bool = false,
         includeLinkAttributes: Bool = true,
@@ -59,6 +60,9 @@ enum SonarMessageTextFormatter {
                     if let mentionColor {
                         segment.foregroundColor = mentionColor
                     }
+                    if let mentionBackground {
+                        segment.backgroundColor = mentionBackground
+                    }
                     // Only a mention that resolved to a member is tappable; an
                     // unresolved one still stands out, it just goes nowhere.
                     if let npub, let url = SNMentions.url(forNpub: npub) {
@@ -86,6 +90,7 @@ enum SonarMessageTextFormatter {
         linkColor: UIColor? = nil,
         mentionFont: UIFont? = nil,
         mentionColor: UIColor? = nil,
+        mentionBackground: UIColor? = nil,
         mentions: [SNResolvedMention]? = nil,
         detectBareDomains: Bool = false,
         excludeLinkBeforeTrailingEllipsis: Bool = false
@@ -122,6 +127,7 @@ enum SonarMessageTextFormatter {
             case .mention(let npub):
                 if let mentionFont { attributes[.font] = mentionFont }
                 if let mentionColor { attributes[.foregroundColor] = mentionColor }
+                if let mentionBackground { attributes[.backgroundColor] = mentionBackground }
                 if let npub, let url = SNMentions.url(forNpub: npub) { attributes[.link] = url }
             }
             result.append(NSAttributedString(string: String(text[match.range]), attributes: attributes))

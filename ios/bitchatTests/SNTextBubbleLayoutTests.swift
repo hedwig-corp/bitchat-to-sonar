@@ -186,6 +186,50 @@ struct SNTextBubbleLayoutTests {
         #expect(!model(message(text: "no links here")).hasLinks)
     }
 
+    @Test
+    func mentionChipsMatchSwiftUIDesignAndBarCallsOutSelf() {
+        let text = "hey @alice"
+        // UTF-16: "hey " = 4, "@alice" = 6 → [4, 10).
+        let span = SNMentionSpan(start: 4, end: 10, name: "alice", suffixHex4: nil)
+        let resolved = SNResolvedMention(span: span, npub: "npub1alice")
+
+        var incoming = message(text: text)
+        incoming.mentions = SNMentionInfo(mentions: [resolved], mentionsMe: true)
+        let tagged = model(incoming)
+        #expect(tagged.mentionBarColor != nil)
+        var hasChipBackground = false
+        tagged.text.enumerateAttribute(
+            .backgroundColor,
+            in: NSRange(location: 0, length: tagged.text.length)
+        ) { value, range, stop in
+            if value != nil {
+                hasChipBackground = range == span.nsRange
+                stop.pointee = true
+            }
+        }
+        #expect(hasChipBackground)
+
+        var mine = message(text: text, mine: true)
+        mine.mentions = SNMentionInfo(mentions: [resolved], mentionsMe: false)
+        #expect(model(mine).mentionBarColor == nil)
+
+        var other = message(text: text)
+        other.mentions = SNMentionInfo(mentions: [resolved], mentionsMe: false)
+        let notTagged = model(other)
+        #expect(notTagged.mentionBarColor == nil)
+        var otherHasChip = false
+        notTagged.text.enumerateAttribute(
+            .backgroundColor,
+            in: NSRange(location: 0, length: notTagged.text.length)
+        ) { value, _, stop in
+            if value != nil {
+                otherHasChip = true
+                stop.pointee = true
+            }
+        }
+        #expect(otherHasChip)
+    }
+
     /// The UIKit row replaces a SwiftUI row that is still used for rich kinds
     /// and on macOS. Heights must stay close, or the same chat changes shape
     /// depending on which path rendered it.

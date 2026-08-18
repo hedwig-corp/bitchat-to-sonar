@@ -81,6 +81,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -2527,13 +2528,11 @@ internal fun SlashHints(draft: String, onPick: (String) -> Unit) {
 
 
 /**
- * `@mention` picker for a group composer: the members whose Sonar name starts
- * with what is being typed after `@`.
+ * `@mention` picker for a group composer: `.bc-mentions` / `.bc-mrow` from
+ * theme.css — avatar, transport subtitle, nearby/internet chip, encryption hint.
  *
- * Mirrors [SlashHints] in shape and styling. [roster] is built by the caller
- * from already-cached profiles only ([SonarAppState.mentionRoster]) so typing
- * never kicks a relay fetch, and the whole strip disappears the moment the
- * token stops looking like a mention.
+ * [roster] is built by the caller from already-cached profiles only
+ * ([SonarAppState.mentionRoster]) so typing never kicks a relay fetch.
  */
 @Composable
 internal fun MentionHints(
@@ -2543,24 +2542,116 @@ internal fun MentionHints(
 ) {
     val s = sonar
     val matches = remember(draft, roster) { Mentions.matches(draft, roster) }
-    if (matches.isEmpty()) return
-    Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
-        matches.forEach { candidate ->
-            val ambiguous = Mentions.needsSuffix(candidate, roster)
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-                    .clickable { onPick(Mentions.applyPick(draft, candidate, roster)) }
-                    .padding(horizontal = 12.dp, vertical = 9.dp),
-                verticalAlignment = Alignment.CenterVertically
+    val showEveryone = remember(draft, roster) { roster.isNotEmpty() && Mentions.showsEveryone(draft) }
+    if (matches.isEmpty() && !showEveryone) return
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 12.dp, end = 12.dp, bottom = 6.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(s.surface)
+            .border(1.dp, s.hairline, RoundedCornerShape(14.dp))
+    ) {
+        Column(
+            Modifier
+                .heightIn(max = 170.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            if (showEveryone) {
+                MentionPickRow(
+                    name = "@everyone",
+                    subtitle = "Notifies all ${roster.size + 1} members",
+                    inRange = null,
+                    showHairline = false,
+                    onClick = { onPick(Mentions.applyEveryone(draft)) },
+                ) {
+                    Box(
+                        Modifier.size(32.dp).clip(CircleShape).background(s.surface2),
+                        contentAlignment = Alignment.Center,
+                    ) { SNIcon(SNIconName.People, 16.dp, s.text2) }
+                }
+            }
+            matches.forEachIndexed { index, candidate ->
+                val ambiguous = Mentions.needsSuffix(candidate, roster)
+                MentionPickRow(
+                    name = candidate.name,
+                    subtitle = if (candidate.inRange) {
+                        "Right here · reachable over Bluetooth"
+                    } else {
+                        "Out of range · gets it over the internet"
+                    },
+                    inRange = candidate.inRange,
+                    disambiguator = if (ambiguous) shortNpub(candidate.npub) else null,
+                    showHairline = showEveryone || index > 0,
+                    onClick = { onPick(Mentions.applyPick(draft, candidate, roster)) },
+                ) { SonarAvatar(candidate.name, 32.dp) }
+            }
+        }
+        Text(
+            "Mentions stay inside the encryption — relays never learn who you tagged.",
+            color = s.text3,
+            fontSize = 11.5.sp,
+            lineHeight = 16.sp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .drawWithContent {
+                    drawContent()
+                    drawRect(s.hairline, size = size.copy(height = 1.dp.toPx()))
+                }
+                .padding(start = 12.dp, end = 12.dp, top = 7.dp, bottom = 8.dp),
+        )
+    }
+}
+
+@Composable
+private fun MentionPickRow(
+    name: String,
+    subtitle: String,
+    inRange: Boolean?,
+    disambiguator: String? = null,
+    showHairline: Boolean = true,
+    onClick: () -> Unit,
+    avatar: @Composable () -> Unit,
+) {
+    val s = sonar
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .then(
+                if (showHairline) Modifier.drawWithContent {
+                    drawContent()
+                    drawRect(s.hairline, size = size.copy(height = 1.dp.toPx()))
+                } else Modifier
+            )
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        avatar()
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(name, color = s.text, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                if (disambiguator != null) {
+                    Spacer(Modifier.width(5.dp))
+                    Text(disambiguator, color = s.text3, fontSize = 11.5.sp, maxLines = 1)
+                }
+            }
+            Text(subtitle, color = s.text3, fontSize = 11.5.sp, maxLines = 1)
+        }
+        if (inRange != null) {
+            val nearby = inRange
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(if (nearby) s.accentSoft else s.netSoft)
+                    .padding(horizontal = 7.dp, vertical = 3.dp)
             ) {
-                Text("@${candidate.name}", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.width(10.dp))
-                // Two members can share a display name; show the npub so the
-                // sender can tell which one they are about to mention.
                 Text(
-                    if (ambiguous) shortNpub(candidate.npub) else "",
-                    color = s.text3,
-                    fontSize = 13.sp,
+                    if (nearby) "nearby" else "internet",
+                    color = if (nearby) s.accentDeep else s.netDeep,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Bold,
                 )
             }
         }
@@ -3386,9 +3477,11 @@ private fun MessageBubble(
     val preview = remember(m.content) { transcriptPreview(m.content) }
     var expanded by remember(m.id) { mutableStateOf(false) }
     val visibleText = if (expanded || !preview.truncated) m.content else preview.text
-    // A mention of you is called out in the accent; mentions of other people
-    // stay in the link colour so they read as references, not alerts.
-    val mentionColor = if (mentions.mentionsMe && !m.mine) s.accent else linkColor
+    // theme.css `.bc-mention`: every @token is a chip. Incoming uses the
+    // message's transport colour; own bubbles get white-on-fill.
+    val mentionColor = if (m.mine) onMine else if (mesh) s.accentDeep else s.netDeep
+    val mentionBg = if (m.mine) Color.White.copy(alpha = 0.26f) else if (mesh) s.accentSoft else s.netSoft
+    val mentionBar = if (mesh) s.accent else s.net
     // Spans are offsets into the FULL message, decoded at row build. A collapsed
     // long message renders a shortened string, so styling it would depend on the
     // preview staying a pure prefix. Re-deriving per frame would mean an FFI call
@@ -3396,9 +3489,9 @@ private fun MessageBubble(
     // matching iOS, where the preview is trimmed at BOTH ends and the offsets
     // genuinely do shift.
     val renderableMentions = if (visibleText == m.content) mentions.mentions else emptyList()
-    val annotated = remember(visibleText, m.mine, mesh, s, renderableMentions, mentionColor) {
+    val annotated = remember(visibleText, m.mine, mesh, s, renderableMentions, mentionColor, mentionBg) {
         buildAnnotatedString {
-            append(decorateMessage(visibleText, linkColor, renderableMentions, mentionColor))
+            append(decorateMessage(visibleText, linkColor, renderableMentions, mentionColor, mentionBg))
             // Time + via ride the last line as inline widgets, not copyable spans.
             appendBubbleMetaInlineContent()
         }
@@ -3448,6 +3541,12 @@ private fun MessageBubble(
         Box(
             Modifier.widthIn(max = maxBubbleWidth).clip(shape)
                 .background(if (m.mine) mineBg else s.bubbleOther)
+                .then(
+                    if (mentions.mentionsMe && !m.mine) Modifier.drawWithContent {
+                        drawContent()
+                        drawRect(mentionBar, size = size.copy(width = 3.dp.toPx()))
+                    } else Modifier
+                )
                 .padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 9.dp)
         ) {
             if (reply != null) {
@@ -5239,6 +5338,7 @@ private fun decorateMessage(
     linkColor: androidx.compose.ui.graphics.Color,
     mentions: List<ResolvedMention>,
     mentionColor: androidx.compose.ui.graphics.Color,
+    mentionBackground: androidx.compose.ui.graphics.Color,
 ) = androidx.compose.ui.text.buildAnnotatedString {
     append(linkify(text, linkColor))
     if (mentions.isEmpty()) return@buildAnnotatedString
@@ -5250,7 +5350,15 @@ private fun decorateMessage(
         val end = mention.span.end.coerceIn(start, text.length)
         if (start == end) continue
         if (urlRanges.any { start <= it.last && it.first < end }) continue
-        addStyle(SpanStyle(color = mentionColor, fontWeight = FontWeight.Bold), start, end)
+        addStyle(
+            SpanStyle(
+                color = mentionColor,
+                fontWeight = FontWeight.Bold,
+                background = mentionBackground,
+            ),
+            start,
+            end,
+        )
         // Only a mention that resolves to a real member is tappable; an
         // unresolved one still highlights, it just goes nowhere.
         mention.npub?.let { addStringAnnotation(MENTION_ANNOTATION_TAG, it, start, end) }

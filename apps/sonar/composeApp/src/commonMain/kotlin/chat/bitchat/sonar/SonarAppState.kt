@@ -2622,7 +2622,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 npub = member,
                 name = name,
                 suffixHex4 = canonicalNpubHex(member)?.let { SonarCore.mentionShortSuffix(it) },
+                inRange = npubInRange(member),
             )
+        }
+    }
+
+    /** True when this npub currently has a live Bluetooth Noise route. */
+    private fun npubInRange(npub: String): Boolean {
+        val hex = canonicalNpubHex(npub) ?: return false
+        return linkByFp.any { (peerId, linked) ->
+            linked.equals(hex, ignoreCase = true) && hasLiveMeshRoute(peerId)
         }
     }
 

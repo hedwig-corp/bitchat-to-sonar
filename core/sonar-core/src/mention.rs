@@ -165,9 +165,10 @@ pub fn mentions_pubkey(content: &str, pubkey_hex: &str, display_name: Option<&st
 
     spans.iter().any(|span| match &span.suffix_hex4 {
         Some(found) => suffix.as_deref() == Some(found.as_str()),
-        None => name
-            .as_deref()
-            .is_some_and(|n| span.name.to_lowercase() == n),
+        None => span.name.eq_ignore_ascii_case("everyone")
+            || name
+                .as_deref()
+                .is_some_and(|n| span.name.to_lowercase() == n),
     })
 }
 
@@ -300,5 +301,14 @@ mod tests {
         let key = "aabbccddeeff0011";
         assert!(!mentions_pubkey("hi @vincenzo", key, None));
         assert!(!mentions_pubkey("hi @vincenzo", key, Some("   ")));
+    }
+
+    #[test]
+    fn everyone_mentions_every_member() {
+        let key = "aabbccddeeff0011";
+        assert!(mentions_pubkey("hi @everyone", key, Some("vincenzo")));
+        assert!(mentions_pubkey("hi @Everyone", key, None));
+        // Suffixed form is a person named everyone, not the broadcast.
+        assert!(!mentions_pubkey("hi @everyone#ffff", key, Some("vincenzo")));
     }
 }

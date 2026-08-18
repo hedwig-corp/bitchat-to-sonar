@@ -202,6 +202,23 @@ function isSupporterAuthor(name) {
 /* ── Reactions & replies ── */
 const BC_REACTIONS = ['❤️', '👍', '😂', '😮', '😢', '🔥'];
 
+/* render @mentions inside message text */
+function bcRenderText(text) {
+  if (!text || text.indexOf('@') === -1) return text;
+  const out = [];
+  let last = 0;
+  const re = /@([A-Za-z0-9_]+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(<span key={m.index} className="bc-mention">@{m[1]}</span>);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+const bcMentionsMe = (text, me) => !!text && new RegExp('@(' + (me || 'you') + '|you|everyone)\\b', 'i').test(text);
+
 function bcReplyFrom(m, peerName) {
   return { author: m.mine ? 'You' : m.author || peerName || 'Them', text: m.text || bcMediaWord(m.media) };
 }
@@ -244,13 +261,13 @@ function MsgBubble({ m, showAuthor, cont, showState, me, onPress, onReact }) {
   const hue = bcHash(m.author || '') % 360;
   const press = useBcPress(onPress);
   return (
-    <div className={'bc-msg' + (m.mine ? ' mine' : '') + (cont ? ' cont' : '')} data-via={m.via || null} {...press}>
+    <div className={'bc-msg' + (m.mine ? ' mine' : '') + (cont ? ' cont' : '') + (bcMentionsMe(m.text, me) && !m.mine ? ' mention' : '')} data-via={m.via || null} {...press}>
       {showAuthor &&
       <div className="bc-author" style={{ color: `hsl(${hue} var(--author-s) var(--author-l))` }}>{m.author}{isSupporterAuthor(m.author) ? <SupporterBadge size={12} /> : null}</div>
       }
       <div className="bc-bubble">
         {m.replyTo ? <ReplyQuote r={m.replyTo} /> : null}
-        {m.text}
+        {bcRenderText(m.text)}
         <span className="bc-meta">
           {m.time}
           {m.via ? <BCIcon name={m.via === 'mesh' ? 'mesh' : 'globe'} size={11} weight={2.2} /> : null}
@@ -677,11 +694,16 @@ function EmojiKeyboard({ onEmoji, onSticker, onGif, onClose }) {
 
 }
 
-function Composer({ placeholder, transport, onSend, onPlus, onCommand, onVoice, onSticker, reply, onCancelReply }) {
+function Composer({ placeholder, transport, onSend, onPlus, onCommand, onVoice, onSticker, reply, onCancelReply, mentions }) {
   const [text, setText] = React.useState('');
   const [recording, setRecording] = React.useState(false);
   const [kbOpen, setKbOpen] = React.useState(false);
   const slash = text.startsWith('/');
+  const mTok = mentions && mentions.length ? /(?:^|\s)@([A-Za-z0-9_]*)$/.exec(text) : null;
+  const mQ = mTok ? mTok[1].toLowerCase() : null;
+  const mHits = mTok ? mentions.filter((p) => p.name.toLowerCase().startsWith(mQ)) : [];
+  const mAll = !!mTok && 'everyone'.startsWith(mQ);
+  const pickMention = (name) => setText((t) => t.replace(/(?:^|\s)@([A-Za-z0-9_]*)$/, (s) => (s.startsWith(' ') ? ' ' : '') + '@' + name + ' '));
   const hasText = !!text.trim();
   const net = transport === 'internet';
   const send = () => {
@@ -707,6 +729,32 @@ function Composer({ placeholder, transport, onSend, onPlus, onCommand, onVoice, 
           <BCIcon name="reply" size={16} weight={2.1} />
           <span className="bc-replymain"><b>{reply.author}</b><span>{reply.text}</span></span>
           <button className="bc-replyx" onClick={onCancelReply} aria-label="Cancel reply"><BCIcon name="x" size={13} weight={2.4} /></button>
+        </div>
+      }
+      {mTok && !recording && (mHits.length > 0 || mAll) &&
+      <div className="bc-mentions">
+          <div className="bc-mentionscroll">
+            {mAll &&
+          <button className="bc-mrow" onClick={() => pickMention('everyone')}>
+                <span className="bc-mall"><BCIcon name="people" size={16} /></span>
+                <span className="bc-mrowmain">
+                  <span className="bc-mrowname">@everyone</span>
+                  <span className="bc-mrowsub">Notifies all {mentions.length + 1} members, even on mute</span>
+                </span>
+              </button>
+          }
+            {mHits.map((p) =>
+          <button key={p.id} className="bc-mrow" onClick={() => pickMention(p.name)}>
+                <Avatar name={p.name} size={32} />
+                <span className="bc-mrowmain">
+                  <span className="bc-mrowname">{p.name}{p.supporter ? <SupporterBadge size={12} /> : null}</span>
+                  <span className="bc-mrowsub">{p.inRange ? 'Right here · reachable over Bluetooth' : 'Out of range · gets it over the internet'}</span>
+                </span>
+                <span className={'bc-mrowvia' + (p.inRange ? '' : ' net')}>{p.inRange ? 'nearby' : 'internet'}</span>
+              </button>
+          )}
+          </div>
+          <div className="bc-mentionhint">Mentions stay inside the encryption — relays never learn who you tagged.</div>
         </div>
       }
       {slash && !recording &&
@@ -876,6 +924,6 @@ function SettingsRow({ icon, tone = '', label, sub, value, danger, onClick, chev
 Object.assign(window, {
   bcHash, Avatar, PlaceTile, GroupAvatar, SupporterBadge, StatusChip, ConvRow, MuteSheet, MUTE_DURATIONS, SectionLabel,
   NavHeader, Banner, MsgBubble, MediaBubble, NudgeMsg, MsgList, Composer, Sheet, ActionRow, AttachActions, Bars,
-  BC_REACTIONS, bcReplyFrom, ReplyQuote, ReactionRow, useBcPress,
+  BC_REACTIONS, bcReplyFrom, ReplyQuote, ReactionRow, useBcPress, bcRenderText, bcMentionsMe,
   SettingsCard, SettingsRow, bcSampleMedia, bcVoiceMedia, bcMediaWord, fmtDur
 });

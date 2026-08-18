@@ -4,6 +4,13 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
 (checked in) so agents read it from disk instead of re-fetching every time.
 
 - **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design) — **dead (404)**; refresh through the `DesignSync` MCP tool against the project id below instead.
+- **Mentions refresh (2026-08-17)** — imported the Claude Design export that
+  adds `@mention` chips (`.bc-mention`), the composer picker (`.bc-mentions` /
+  `.bc-mrow` / `.bc-mrowvia`), the inset bar on incoming bubbles that tag you,
+  `@everyone`, and the group-info Mentions row. Native chips, picker, and
+  group-info copy track `project/sonar/components.jsx` and the exact metrics in
+  `project/sonar/theme.css`. Mentions still do **not** pierce mute (R-022);
+  `@everyone` notifies every member subject to that rule.
 - **Full bundle sync (2026-08-16)** — imported the latest Claude Design export.
   The app prototype adds compact quoted replies (`.bc-quote`), reply composer
   chrome, long-press actions and reactions. The export also adds the design

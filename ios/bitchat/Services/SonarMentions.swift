@@ -50,8 +50,17 @@ struct SNMentionCandidate: Equatable, Hashable, Identifiable {
     let npub: String
     let name: String
     let suffixHex4: String?
+    /// Live Bluetooth route to this member, for the picker via-chip.
+    let inRange: Bool
 
     var id: String { npub }
+
+    init(npub: String, name: String, suffixHex4: String?, inRange: Bool = false) {
+        self.npub = npub
+        self.name = name
+        self.suffixHex4 = suffixHex4
+        self.inRange = inRange
+    }
 }
 
 /// A mention paired with the group member it names. `npub` is nil when the name
@@ -86,6 +95,12 @@ struct SNMentionInfo: Equatable, Hashable {
 enum SNMentions {
     /// Cap on offered suggestions, matching the mesh composer's list.
     static let maxSuggestions = 5
+
+    /// Broadcast token from the design picker (`@everyone`).
+    static let everyone = "everyone"
+
+    /// Own-bubble mention chip fill: `rgba(255,255,255,0.26)` in theme.css.
+    static let onOwnFill = Color.white.opacity(0.26)
 
     /// URL scheme a rendered mention links to. Intercepted by the bubble's own
     /// `OpenURLAction`, so it never reaches the system opener.
@@ -183,10 +198,15 @@ enum SNMentions {
         return !needsKey || pick.suffixHex4 != nil
     }
 
-    /// True when `pick` shares a display name with another roster member, so the
-    /// inserted token must carry the `#abcd` disambiguator.
+    /// True when the inserted token must carry the `#abcd` disambiguator.
+    ///
+    /// Either another roster member answers to the same display name, or the
+    /// wire name is the reserved broadcast token `everyone` — a bare `@everyone`
+    /// names the whole group (see `mentions_pubkey`), so a person who happens
+    /// to be called that has to go out in the suffix form.
     static func needsSuffix(_ pick: SNMentionCandidate, roster: [SNMentionCandidate]) -> Bool {
-        roster.contains { $0.npub != pick.npub && $0.name.lowercased() == pick.name.lowercased() }
+        if wireName(pick.name).lowercased() == everyone { return true }
+        return roster.contains { $0.npub != pick.npub && $0.name.lowercased() == pick.name.lowercased() }
     }
 
     /// The text a picked suggestion contributes: `@name`, or `@name#abcd` when
@@ -217,6 +237,19 @@ enum SNMentions {
     ) -> String {
         guard activeQuery(draft) != nil, let at = draft.lastIndex(of: "@") else { return draft }
         return String(draft[draft.startIndex..<at]) + token(pick, roster: roster) + " "
+    }
+
+    /// True when the design's `@everyone` row should appear: the active query
+    /// is a prefix of `everyone` (including a lone `@`).
+    static func showsEveryone(_ draft: String) -> Bool {
+        guard let query = activeQuery(draft) else { return false }
+        return everyone.hasPrefix(query.lowercased())
+    }
+
+    /// `draft` with the active `@token` replaced by `@everyone `.
+    static func applyEveryone(_ draft: String) -> String {
+        guard activeQuery(draft) != nil, let at = draft.lastIndex(of: "@") else { return draft }
+        return String(draft[draft.startIndex..<at]) + "@\(everyone) "
     }
 
     /// The group member a rendered mention points at, or nil when the name
