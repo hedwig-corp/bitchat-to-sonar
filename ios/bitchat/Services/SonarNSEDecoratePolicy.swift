@@ -326,6 +326,26 @@ enum SonarNSEDecoratePolicy {
         return withPreview.isEmpty ? groupIdHexes : withPreview
     }
 
+    /// Empty-drain / expire-placeholder: the generic banner stands in for the
+    /// hinted chat. If that chat is muted, do not keep a sounding placeholder
+    /// (R-022). Missing hint fails open — we must not silence an unmuted chat
+    /// we cannot name. Does NOT skip hydrate: a wake can drain other groups.
+    static func shouldSuppressGenericBanner(
+        hintGroupIdHex: String?,
+        mutes: [String: Date],
+        now: Date = Date()
+    ) -> Bool {
+        guard let hint = hintGroupIdHex?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !hint.isEmpty else { return false }
+        return isMuted(
+            groupIdHex: hint,
+            senderNpub: "",
+            groupName: "group",
+            mutes: mutes,
+            now: now
+        )
+    }
+
     static func hintGroupIdHex(from userInfo: [AnyHashable: Any]) -> String? {
         let keys = ["group_id", "groupId", "group_id_hex", "gid", "conversation_id"]
         for key in keys {

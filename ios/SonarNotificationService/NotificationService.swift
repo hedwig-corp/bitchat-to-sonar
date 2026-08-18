@@ -120,8 +120,12 @@ class NotificationService: SDKNotificationService {
             if SonarNSEDecoratePolicy.shouldReapplyPlaceholderOnExpire(
                 isPlaceholder: stillPlaceholder
             ) {
-                Self.configureTransponderNotification(content)
-                Self.recordDiagnostic("expire:stillPlaceholder")
+                if Self.suppressGenericBannerIfHintMuted(content) {
+                    Self.recordDiagnostic("expire:suppressedMutedHint")
+                } else {
+                    Self.configureTransponderNotification(content)
+                    Self.recordDiagnostic("expire:stillPlaceholder")
+                }
             } else {
                 Self.recordDiagnostic(
                     SonarNSEDecoratePolicy.diagnosticExpireKeepingDecorated(
@@ -172,6 +176,13 @@ class NotificationService: SDKNotificationService {
                     return
                 }
                 if notifications.isEmpty {
+                    if Self.suppressGenericBannerIfHintMuted(content) {
+                        os_log("NSE: empty drain for muted hint — suppressing banner",
+                               log: Self.log, type: .info)
+                        Self.recordDiagnostic("emptyDrain:suppressedMutedHint")
+                        finish(with: content)
+                        return
+                    }
                     os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
                            log: Self.log, type: .info)
                     Self.recordDiagnostic("emptyDrain:keepingGeneric")
@@ -781,6 +792,30 @@ class NotificationService: SDKNotificationService {
         }
         let typeName = String(describing: type(of: error))
         return "other:\(typeName)"
+    }
+
+    /// Empty drain / expire still on the placeholder: if the push names a
+    /// muted chat, blank it instead of delivering the generic sounding banner.
+    @discardableResult
+    private static func suppressGenericBannerIfHintMuted(
+        _ content: UNMutableNotificationContent
+    ) -> Bool {
+        let hint = SonarNSEDecoratePolicy.hintGroupIdHex(from: content.userInfo)
+        let mutes = SonarNSEDecoratePolicy.decodeMutes(
+            UserDefaults(suiteName: appGroupId)?
+                .data(forKey: SonarNSEDecoratePolicy.mutesUserDefaultsKey)
+        )
+        guard SonarNSEDecoratePolicy.shouldSuppressGenericBanner(
+            hintGroupIdHex: hint,
+            mutes: mutes
+        ) else { return false }
+        if let hint, !hint.isEmpty {
+            var info = content.userInfo
+            info[conversationIdKey] = marmotConversationPrefix + hint
+            content.userInfo = info
+        }
+        suppressTransponderNotification(content)
+        return true
     }
 
     private static func suppressTransponderNotification(_ content: UNMutableNotificationContent) {
