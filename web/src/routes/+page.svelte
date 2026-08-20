@@ -7,6 +7,7 @@
     TESTFLIGHT_URL,
     TESTFLIGHT_MACOS_URL,
     ANDROID_APK_URL,
+    LINUX_RELEASES_URL,
     ZAPSTORE_URL
   } from '$lib/links.js';
   import { t } from '$lib/i18n/i18n.svelte.js';
@@ -188,6 +189,7 @@
       <a class="btn primary" href={TESTFLIGHT_MACOS_URL} target="_blank" rel="noopener">{t('home.download.mac')}</a>
       <a class="btn primary" href={ZAPSTORE_URL} target="_blank" rel="noopener">{t('home.download.zapstore')}</a>
       <a class="btn primary" href={ANDROID_APK_URL}>{t('home.download.apk')}</a>
+      <a class="btn primary" href={LINUX_RELEASES_URL} target="_blank" rel="noopener">{t('home.download.linux')}</a>
     </div>
     <p class="heronote">{t('home.download.note')}</p>
   </div>

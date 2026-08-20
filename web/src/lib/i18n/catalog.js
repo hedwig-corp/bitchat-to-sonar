@@ -93,6 +93,7 @@ const en = {
 	'home.download.mac': 'Join the Mac beta (TestFlight)',
 	'home.download.zapstore': 'Get Android on Zapstore',
 	'home.download.apk': 'Download for Android (APK)',
+	'home.download.linux': 'Download for Linux (.deb)',
 	'home.download.note':
 		'Android: Zapstore (signed updates) or direct APK · phone ABIs arm64 + armeabi-v7a',
 
@@ -289,6 +290,7 @@ const it = {
 	'home.download.mac': 'Unisciti alla beta Mac (TestFlight)',
 	'home.download.zapstore': 'Android su Zapstore',
 	'home.download.apk': 'Scarica per Android (APK)',
+	'home.download.linux': 'Scarica per Linux (.deb)',
 	'home.download.note':
 		'Android: Zapstore (aggiornamenti firmati) o APK diretto · ABI telefono arm64 + armeabi-v7a',
 	'blog.title': 'Sonar Blog — note su privacy, policy e rete',
@@ -476,6 +478,7 @@ const de = {
 	'home.download.mac': 'Mac-Beta (TestFlight)',
 	'home.download.zapstore': 'Android auf Zapstore',
 	'home.download.apk': 'Für Android laden (APK)',
+	'home.download.linux': 'Für Linux laden (.deb)',
 	'home.download.note':
 		'Android: Zapstore (signierte Updates) oder direktes APK · Telefon-ABIs arm64 + armeabi-v7a',
 	'blog.title': 'Sonar Blog — Notizen zu Privacy, Policy & Netz',
@@ -663,6 +666,7 @@ const es = {
 	'home.download.mac': 'Únete a la beta de Mac (TestFlight)',
 	'home.download.zapstore': 'Android en Zapstore',
 	'home.download.apk': 'Descargar para Android (APK)',
+	'home.download.linux': 'Descargar para Linux (.deb)',
 	'home.download.note':
 		'Android: Zapstore (actualizaciones firmadas) o APK directo · ABI de teléfono arm64 + armeabi-v7a',
 	'blog.title': 'Sonar Blog — notas sobre privacidad, política y la red',
@@ -850,6 +854,7 @@ const pt = {
 	'home.download.mac': 'Entrar na beta do Mac (TestFlight)',
 	'home.download.zapstore': 'Android no Zapstore',
 	'home.download.apk': 'Baixar para Android (APK)',
+	'home.download.linux': 'Baixar para Linux (.deb)',
 	'home.download.note':
 		'Android: Zapstore (atualizações assinadas) ou APK direto · ABIs de telefone arm64 + armeabi-v7a',
 	'blog.title': 'Sonar Blog — notas sobre privacidade, política e a rede',
@@ -1037,6 +1042,7 @@ const fr = {
 	'home.download.mac': 'Rejoindre la bêta Mac (TestFlight)',
 	'home.download.zapstore': 'Android sur Zapstore',
 	'home.download.apk': 'Télécharger pour Android (APK)',
+	'home.download.linux': 'Télécharger pour Linux (.deb)',
 	'home.download.note':
 		'Android : Zapstore (mises à jour signées) ou APK direct · ABI téléphone arm64 + armeabi-v7a',
 	'blog.title': 'Sonar Blog — notes sur la confidentialité, la politique et le réseau',
