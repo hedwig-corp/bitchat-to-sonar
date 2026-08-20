@@ -94,3 +94,7 @@ ios/bitchat/GoogleService-Info.plist
 
 # Locally downloaded tool tarballs (never belongs in history)
 goose-*.tar.*
+
+# Release artifacts staged by scripts/package-linux-desktop.sh and
+# scripts/zapstore-publish.sh.
+dist/
