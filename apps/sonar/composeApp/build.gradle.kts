@@ -315,12 +315,27 @@ compose.desktop {
                 shortcut = true
                 // NOTE: Compose Desktop 1.7.3's linux{} DSL has no way to declare
                 // Deb dependencies (verified against LinuxPlatformSettings), and
-                // jpackage only derives them from linked native libraries. Sonar
-                // needs `libsecret-tools` at RUNTIME so DesktopSecrets can reach
-                // the Secret Service; without it the account key falls back to a
-                // local file. Until the release job patches the control file, the
-                // app surfaces that state itself (SecretStorageStatus) rather
-                // than failing silently.
+                // jpackage only derives them from linked native libraries, so it
+                // cannot see either of Sonar's two RUNTIME dependencies:
+                //   libsecret-tools  `secret-tool`, how DesktopSecrets reaches the
+                //                    Secret Service. Without it the account key,
+                //                    which also derives the wallet seed, falls back
+                //                    to a local file.
+                //   ffmpeg           `ffplay`, the only voice-note player Sonar
+                //                    will spawn. Without it a received voice note
+                //                    reports itself unplayable.
+                // scripts/deb-add-runtime-deps.sh adds both as Recommends after
+                // packaging, and .github/workflows/desktop-release.yml runs it.
+                // Recommends rather than Depends so the package stays installable
+                // where they are unavailable; apt pulls them by default but
+                // `dpkg -i` does not.
+                //
+                // The two are not equally visible when missing, and that asymmetry
+                // is the weak point of the choice. secret-tool's absence raises a
+                // banner (SecretStorageStatus -> SonarDesktopRoot). ffplay's shows
+                // only as "install ffmpeg" inside a voice-note bubble, so a
+                // `dpkg -i` user learns voice notes are dead only when one arrives.
+                // Worth a startup surface for ffplay before this stops being alpha.
             }
             macOS {
                 bundleID = "chat.bitchat.sonar.desktop"
@@ -348,11 +363,6 @@ compose.desktop {
         }
     }
 }
-                // Second one now: `ffplay` (Debian/Ubuntu package `ffmpeg`) for
-                // voice-note playback. Unlike libsecret its absence has no global
-                // status surface, only the per-bubble "install ffmpeg" string, so
-                // the release job's control-file patch must cover both.
-
 
 // The jvm resources must carry the generated key file before packaging.
 tasks.named("jvmProcessResources") { dependsOn(generateBreezKeyResource) }
