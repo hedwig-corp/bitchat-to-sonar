@@ -1,13 +1,13 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.13.2 (43)** · release tag **v0.1-alpha.13.2** (pre-alpha.14)
+Build: **Sonar 1.14.0 (44)** · release tag **v0.1-alpha.14**
 
-Cautious cut after 13.1. Headline: **Android chat-open crash fix** (#597) —
-opening a chat with duplicate call/reply rows must not crash; crash
-diagnostics persist for share. Also: short iOS transcripts stay visible when
-the keyboard opens (#595), Signal-style transcript scroll + Home invalidation
-perf (#598). Opening a chat should paint from local storage first; missed
-messages catch up in the background.
+First alpha.14 cut after the 13.x hotfix train. Headline since 13.3: **group
+@mention chips/picker match the design** (#601), **Android bubble send time
+no longer clipped** (#600). Also still exercise: Android chat-open stability
+(#597/#599), reply-to-message, short-transcript + keyboard on iOS, Signal-style
+scroll/Home invalidation. Opening a chat should paint from local storage first;
+missed messages catch up in the background.
 
 ## 1. Sync speed & catching up (headline)
 
