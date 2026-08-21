@@ -15,6 +15,16 @@ sealed interface WalletState {
 /** Result of a wallet send: success flag plus the Lightning preimage and the
  *  settlement details the payment-activity ledger records (iOS
  *  `SonarWalletPayment`: id, feesSats, timestamp). */
+/**
+ * A priced, not-yet-paid send. [id] is an opaque handle into the wallet's
+ * pending-quote table.
+ */
+data class PreparedSendQuote(
+    val id: String,
+    val amountSats: Long,
+    val feesSats: Long?,
+)
+
 data class SendResult(
     val ok: Boolean,
     val preimage: String? = null,
@@ -29,6 +39,20 @@ data class SendResult(
      * generic failure path, which behaves as before.
      */
     val error: String? = null,
+)
+
+enum class WalletPaymentLookupStatus {
+    Pending,
+    Complete,
+    Failed,
+    Refundable,
+    Unknown,
+}
+
+data class WalletPaymentLookup(
+    val status: WalletPaymentLookupStatus,
+    val id: String? = null,
+    val feesSats: Long? = null,
 )
 
 /**
@@ -101,6 +125,33 @@ expect object WalletBridge {
     /** Pay a destination (BOLT11/BOLT12/LNURL/BIP-353). amountSats=0 ⇒ amount from
      *  the invoice/offer. Returns [SendResult] with preimage when available. */
     suspend fun send(destination: String, amountSats: Long, note: String): SendResult
+
+    /**
+     * Price a send WITHOUT paying it, so a caller can show the fee and take
+     * consent first. Returns null when the wallet cannot quote.
+     *
+     * Needed by the Breez→Cashu migration (quote → consent → pay); [send]
+     * prepares and pays in one step and cannot surface a fee for confirmation.
+     */
+    suspend fun prepareSend(destination: String, amountSats: Long): PreparedSendQuote?
+
+    /**
+     * Why the most recent [prepareSend] returned null, or null when the last
+     * one succeeded.
+     *
+     * [prepareSend] answers with a bare null, which is enough for a UI that
+     * only needs "no quote" but loses the distinction the migration engine
+     * depends on: a wallet that cannot afford the amount must be reported as
+     * insufficient funds so the engine plans a smaller one, while any other
+     * failure must not trigger that retry.
+     */
+    fun lastPrepareFailure(): String?
+
+    /** Pay a quote from [prepareSend]. Single-use — the quote is consumed. */
+    suspend fun sendPrepared(id: String, note: String): SendResult
+
+    /** Reconcile an outgoing Lightning payment by its durable payment hash. */
+    suspend fun lookupPayment(paymentHash: String): WalletPaymentLookup
 
     /** Fetch + cache live BTC→fiat rates. */
     suspend fun fetchRates(): List<ExchangeRate>

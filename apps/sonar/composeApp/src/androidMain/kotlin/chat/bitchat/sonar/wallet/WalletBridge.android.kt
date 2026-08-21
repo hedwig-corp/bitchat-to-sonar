@@ -14,6 +14,7 @@ import breez_sdk_liquid.PaymentState
 import breez_sdk_liquid.PaymentType
 import breez_sdk_liquid.PrepareReceiveRequest
 import breez_sdk_liquid.PrepareSendRequest
+import breez_sdk_liquid.PrepareSendResponse
 import breez_sdk_liquid.ReceivePaymentRequest
 import breez_sdk_liquid.PaymentDetails
 import breez_sdk_liquid.SdkEvent
@@ -441,6 +442,105 @@ actual object WalletBridge {
             }
         }
     }
+
+    /** Live quotes from [prepareSend], consumed by [sendPrepared]. Bounded:
+     *  an abandoned confirmation sheet leaves an entry and there is no drop
+     *  hook, so the oldest is evicted rather than growing or refusing. */
+    private val pendingQuotes = LinkedHashMap<String, PrepareSendResponse>()
+    private const val MAX_PENDING_QUOTES = 16
+
+    /** Reason the last [prepareSend] failed; see the expect declaration. */
+    @Volatile
+    private var lastPrepareError: String? = null
+
+    actual fun lastPrepareFailure(): String? = lastPrepareError
+
+    actual suspend fun prepareSend(destination: String, amountSats: Long): PreparedSendQuote? =
+        withContext(Dispatchers.IO) {
+            val node = lock.withLock { sdk } ?: return@withContext null
+            if (amountSats < 0) return@withContext null
+            try {
+                val amount: PayAmount? =
+                    if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
+                val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
+                val quoted = (prepared.amount as? PayAmount.Bitcoin)
+                    ?.receiverAmountSat?.toLong() ?: amountSats
+                val id = java.util.UUID.randomUUID().toString()
+                synchronized(pendingQuotes) {
+                    if (pendingQuotes.size >= MAX_PENDING_QUOTES) {
+                        pendingQuotes.keys.firstOrNull()?.let { pendingQuotes.remove(it) }
+                    }
+                    pendingQuotes[id] = prepared
+                }
+                lastPrepareError = null
+                PreparedSendQuote(id = id, amountSats = quoted, feesSats = prepared.feesSat?.toLong())
+            } catch (t: Throwable) {
+                lastPrepareError = t.message ?: t.toString()
+                // Returning a bare null discards WHY Breez refused (amount
+                // below the swap minimum, no route, service down). Callers
+                // turn that into "could not price this payment", which is
+                // undiagnosable in the field — log the cause before dropping
+                // it. The destination is omitted: it is a payment instrument.
+                android.util.Log.w(
+                    "SonarWallet",
+                    "prepareSend($amountSats sats) failed: ${t.message ?: t.toString()}",
+                )
+                null
+            }
+        }
+
+    actual suspend fun sendPrepared(id: String, note: String): SendResult =
+        withContext(Dispatchers.IO) {
+            val node = lock.withLock { sdk } ?: return@withContext SendResult(false)
+            val prepared = synchronized(pendingQuotes) { pendingQuotes.remove(id) }
+                ?: return@withContext SendResult(
+                    ok = false,
+                    error = "prepared send is expired or already used",
+                )
+            try {
+                val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
+                val payment = resp.payment
+                val lightning = payment.details as? PaymentDetails.Lightning
+                refreshBalance()
+                SendResult(
+                    ok = true,
+                    preimage = lightning?.preimage,
+                    paymentId = payment.txId ?: lightning?.paymentHash ?: payment.destination,
+                    feesSats = payment.feesSat.toLong(),
+                    settledAtSecs = payment.timestamp.toLong(),
+                )
+            } catch (t: Throwable) {
+                SendResult(false)
+            }
+        }
+
+    actual suspend fun lookupPayment(paymentHash: String): WalletPaymentLookup =
+        withContext(Dispatchers.IO) {
+            lock.withLock {
+                val node = sdk ?: return@withLock WalletPaymentLookup(WalletPaymentLookupStatus.Unknown)
+                val payment = node.listPayments(
+                    ListPaymentsRequest(
+                        filters = listOf(PaymentType.SEND),
+                        sortAscending = false,
+                    )
+                ).firstOrNull {
+                    (it.details as? PaymentDetails.Lightning)?.paymentHash == paymentHash
+                } ?: return@withLock WalletPaymentLookup(WalletPaymentLookupStatus.Unknown)
+                WalletPaymentLookup(
+                    status = when (payment.status) {
+                        PaymentState.COMPLETE -> WalletPaymentLookupStatus.Complete
+                        PaymentState.FAILED, PaymentState.TIMED_OUT -> WalletPaymentLookupStatus.Failed
+                        PaymentState.REFUNDABLE, PaymentState.REFUND_PENDING ->
+                            WalletPaymentLookupStatus.Refundable
+                        else -> WalletPaymentLookupStatus.Pending
+                    },
+                    id = (payment.details as? PaymentDetails.Lightning)?.paymentHash
+                        ?: payment.txId
+                        ?: payment.destination,
+                    feesSats = payment.feesSat.toLong(),
+                )
+            }
+        }
 
     actual suspend fun send(destination: String, amountSats: Long, note: String): SendResult =
         withContext(Dispatchers.IO) {

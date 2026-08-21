@@ -1,6 +1,114 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%@ sats" : {
+
+    },
+    "%@ sats are now in your Cashu wallet." : {
+
+    },
+    "Arrives in Cashu" : {
+
+    },
+    "Cashu wallet" : {
+
+    },
+    "Check again" : {
+
+    },
+    "Check amount and fee" : {
+
+    },
+    "Could not locate wallet storage." : {
+
+    },
+    "Could not open the migration: %@" : {
+
+    },
+    "Could not price the migration." : {
+
+    },
+    "Could not price the migration: %@" : {
+
+    },
+    "Could not read the Cashu balance: %@" : {
+
+    },
+    "Fee unknown" : {
+
+    },
+    "Migration complete" : {
+
+    },
+    "Migration stopped" : {
+
+    },
+    "Move %@ sats to %@" : {
+
+    },
+    "Move to Cashu" : {
+
+    },
+    "Move to ecash" : {
+
+    },
+    "Move your Lightning balance into ecash" : {
+
+    },
+    "Move your Lightning balance into ecash held on this device." : {
+
+    },
+    "Network fee" : {
+
+    },
+    "No migration plan; check the amount and fee again." : {
+
+    },
+    "Paid — waiting on the mint" : {
+
+    },
+    "Paying from the Lightning wallet…" : {
+
+    },
+    "Pricing the migration…" : {
+
+    },
+    "The Lightning payment failed without moving funds." : {
+
+    },
+    "The Lightning wallet is not available on this device." : {
+
+    },
+    "The migration could not be opened." : {
+
+    },
+    "The payment did not go through." : {
+
+    },
+    "The payment did not go through: %@" : {
+
+    },
+    "This changes who holds your money" : {
+
+    },
+    "This pays now. It cannot be undone from then." : {
+
+    },
+    "Today your balance is self-custodial. After moving, you hold ecash tokens on this device and %@ holds the Lightning side. If that mint disappears, the ecash it issued cannot be redeemed." : {
+
+    },
+    "Try again" : {
+
+    },
+    "Your payment went out. The mint has not issued the ecash yet; your wallet keeps trying. Current Cashu balance: %@ sats." : {
+
+    },
+    "Your tokens are recoverable from your account key on this mint, so a reinstall does not lose them." : {
+
+    },
+    "Waiting for the mint to issue your ecash…" : {
+
+    },
     "Restoring..." : {
 
     },

@@ -80,6 +80,7 @@ import chat.bitchat.sonar.resources.chat_backup
 import chat.bitchat.sonar.resources.encrypted_cloud_backup_recover_chats
 import chat.bitchat.sonar.resources.encrypted_cloud_backup_when_chats_change
 import chat.bitchat.sonar.resources.i_understand_chats_on_this_phone_will
+import chat.bitchat.sonar.resources.move_to_ecash
 import chat.bitchat.sonar.resources.paste_from_clipboard
 import chat.bitchat.sonar.resources.replace_this_account_with_an_nsec_from
 import chat.bitchat.sonar.resources.restore_account
@@ -190,6 +191,11 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     divider = state.walletAvailable,
                 ) { if (state.walletAvailable) state.push(Screen.WalletActivity) }
                 if (state.walletAvailable) {
+                    SNSettingsRow(
+                        icon = SNIconName.Coin,
+                        tone = SNTone.Gold,
+                        label = stringResource(Res.string.move_to_ecash),
+                    ) { state.push(Screen.WalletMigration) }
                     SNSettingsRow(
                         icon = SNIconName.Globe, label = "Currency", value = state.currency.code,
                     ) { currencyPick = true }

@@ -29,6 +29,14 @@ calls-audio = ["sonar-core/calls-audio"]
 [dependencies]
 sonar-core = { path = "../sonar-core" }
 sonar-stickers = { path = "../sonar-stickers" }
+# Wallet: the CDK (Cashu) backend and the migration engine. Breez-rust can
+# NEVER live here — its forked libsqlite3-sys links plain sqlite3 and would
+# collide with sonar-core's SQLCipher — so the Breez side of a migration is
+# injected by the host apps over their existing native SDKs, as a foreign
+# trait (see HostMigrationSource below).
+sonar-wallet = { path = "../sonar-wallet" }
+sonar-wallet-cdk = { path = "../sonar-wallet-cdk" }
+sonar-wallet-migrate = { path = "../sonar-wallet-migrate" }
 uniffi = "0.31"
 nostr.workspace = true
 tokio.workspace = true

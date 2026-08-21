@@ -31,4 +31,8 @@ pub enum WalletError {
     Backend(String),
     #[error("network error: {0}")]
     Network(String),
+    #[error("wallet operation timed out")]
+    Timeout,
+    #[error("tracked receive outcome is unknown: {0}")]
+    UnknownReceive(String),
 }

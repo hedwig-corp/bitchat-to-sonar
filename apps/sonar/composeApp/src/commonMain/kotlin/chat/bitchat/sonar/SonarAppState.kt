@@ -26,6 +26,7 @@ import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.wipeCashuMigrationStorage
 import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.wallet.paymentDestinationHash
 import kotlinx.coroutines.CompletableDeferred
@@ -364,6 +365,8 @@ sealed interface Screen {
     data class ContactProfile(val chatId: String, val name: String) : Screen
     data class GroupInfo(val chatId: String) : Screen
     data object WalletActivity : Screen
+    /** Move the Lightning balance into ecash held on this device. */
+    data object WalletMigration : Screen
     /** Standalone send-payment picker (new-chat sheet → "Send a payment"). */
     data object SendPayment : Screen
     /**
@@ -990,6 +993,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             cancelPendingMarmotGroupSetups()
             val walletShutdownFailure = runCatching { WalletBridge.shutdown() }.exceptionOrNull()
             val walletWipeFailure = runCatching { WalletBridge.wipeLocalStorage() }.exceptionOrNull()
+            val cashuWipeFailure = runCatching { wipeCashuMigrationStorage() }.exceptionOrNull()
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
@@ -1055,7 +1059,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             pollJob?.cancel(); pollJob = null
             housekeepingJob?.cancel(); housekeepingJob = null
             stopMarmotWakeLoop()
-            if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
+            if (coreWipeFailure != null || walletShutdownFailure != null ||
+                walletWipeFailure != null || cashuWipeFailure != null
+            ) {
                 toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
             }
             } finally {
@@ -3944,6 +3950,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 try {
                     WalletBridge.shutdown()
                     WalletBridge.wipeLocalStorage()
+                    wipeCashuMigrationStorage()
                 } catch (error: Throwable) {
                     throw SonarAccountRestoreException(
                         "Wallet storage couldn't be cleared. Restart Sonar and try again.",

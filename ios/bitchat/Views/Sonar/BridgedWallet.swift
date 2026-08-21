@@ -272,7 +272,9 @@ final class BridgedWallet: SonarWalletProviding {
     ) throws {
         let roots = [
             appGroupContainer?.appendingPathComponent("breez-sdk", isDirectory: true),
+            appGroupContainer?.appendingPathComponent("sonar-cashu", isDirectory: true),
             applicationSupportDirectory?.appendingPathComponent("sonar-wallet", isDirectory: true),
+            applicationSupportDirectory?.appendingPathComponent("sonar-cashu", isDirectory: true),
         ].compactMap { $0 }
         for root in roots where fileManager.fileExists(atPath: root.path) {
             do {

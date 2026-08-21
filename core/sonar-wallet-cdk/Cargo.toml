@@ -1,0 +1,34 @@
+[package]
+name = "sonar-wallet-cdk"
+description = "Cashu (CDK) implementation of the sonar-wallet interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# A normal workspace member, unlike sonar-wallet-breez: the cdk + cdk-redb
+# tree carries NO libsqlite3-sys (redb storage), so there is no
+# `links = "sqlite3"` conflict with the workspace's SQLCipher, and the full
+# tree type-checks in ~35s — light enough for `cargo test --workspace`.
+
+[[bin]]
+name = "sonar-cashu-cli"
+path = "src/bin/sonar-cashu-cli.rs"
+
+[dependencies]
+sonar-wallet = { path = "../sonar-wallet" }
+# Wallet side only: the default feature set includes `mint` (the mint SERVER)
+# whose cdk-signatory build.rs needs protoc — a toolchain requirement the
+# workspace CI job rightly does not have, for server code a client never runs.
+cdk = { version = "0.17.3", default-features = false, features = ["wallet", "bip353"] }
+cdk-redb = "0.17.3"
+# Same version cdk itself uses; decodes BOLT11 invoices so an amount-bearing
+# invoice satisfies resolve_send_amount without the host re-supplying it.
+lightning-invoice = "0.34"
+clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+hex.workspace = true
+sha2 = "0.10"
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

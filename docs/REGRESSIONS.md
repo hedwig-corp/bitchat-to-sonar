@@ -2659,7 +2659,170 @@ keep it until the UIKit path has device mileage.
 - *Port every row kind to UIKit.* Media/sticker/pay/call chrome is rare on the
   scroll path and would double a large amount of layout for no measured win.
 
+## R-045 — An ambiguous migration send must never be sent twice
+
+**Invariant:** the migration journal reaches durable `Sending` before the
+source wallet is called, and no state other than `AwaitingConsent` may enter
+`execute_once`. Corrupt, unsupported, account-mismatched, or mint-mismatched
+journal bytes fail closed.
+
+**Breaks as:** after an app kill or ambiguous Breez error, retry pays the same
+Cashu invoice twice; alternatively a damaged journal is treated as empty and
+offers a second payment.
+
+**Call sites:** core
+`sonar-wallet-migrate::MigrationEngine.execute_once` /
+`MigrationJournal.store_unlocked`; iOS
+`WalletMigration.swift::SonarMigrationModel.confirmAndMigrate` and
+`resumeSettlement`; Compose `WalletMigrationRoute.kt::onConfirm` /
+`onResume` through the Android and JVM `WalletMigrationController`.
+
+**Guarded by:** `lib.rs::durable_sending_state_prevents_resend`,
+`lib.rs::corrupt_journal_fails_closed`,
+`lib.rs::planning_refuses_an_in_flight_send`
+
+**Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
+journal and fail-closed parsing. They do not kill either app between fsync and
+the source return, do not prove the host calls `resume` after relaunch, and do
+not inject filesystem or parent-directory-fsync failures on a device.
+
+**History:** the production migration replaced process-local plan ownership
+with `cashu.migration.v1.json` and a take-before-send barrier.
+
+**Rejected:** using an in-memory "already sent" flag, deleting the journal on
+parse failure, or resetting `Sending` to `AwaitingConsent`; all three convert
+uncertainty into permission to spend again.
+
+---
+
+## R-046 — Only the migration's exact Cashu quote may settle it
+
+**Invariant:** source resume is keyed by the journaled BOLT11 `payment_hash`,
+and destination resume is keyed by the journaled `settlement_id`. Aggregate
+Cashu balance growth is never settlement evidence.
+
+**Breaks as:** an unrelated incoming payment makes the UI report "Migration
+complete" while the paid migration quote is still pending or lost.
+
+**Call sites:** core
+`sonar-wallet-migrate::MigrationEngine.resume` /
+`WalletBackend.reconcile_tracked_receive`; iOS
+`WalletMigration.swift::BreezMigrationSource.lookupPayment` and
+`SonarMigrationModel.resumeSettlement`; Compose
+`WalletMigration.android.kt::BreezMigrationSource.lookupPayment`,
+`WalletMigration.jvm.kt::BreezMigrationSource.lookupPayment`, and
+`WalletMigrationRoute.kt::onResume`.
+
+**Guarded by:** `lib.rs::exact_quote_not_unrelated_credit_settles`,
+`lib.rs::resume_reports_settled_idempotently`,
+`mock.rs::tracked_receive_requires_its_exact_quote`
+
+**Coverage (honest):** the tests pin the engine and wallet contracts with exact
+quote identities. They do not exercise a live CDK mint, Breez payment lookup,
+UniFFI lifting, or either app's pending/settled rendering.
+
+**History:** baseline-balance settlement was removed in favor of tracked
+receive identity plus source payment-hash reconciliation.
+
+**Rejected:** `cashu_balance >= baseline + amount`. It confuses unrelated
+credits with the paid quote and cannot prove which invoice issued tokens.
+
+---
+
+## R-047 — Migration limits and typed insufficiency must fail before consent
+
+**Invariant:** destination maximum and fee cap are hard pre-spend gates.
+Whole-balance planning may step down only through bounded candidates when the
+source reports typed `InsufficientFunds` or a recognized legacy opaque
+insufficiency; every other host failure aborts.
+
+**Breaks as:** the app pays more fee or moves more principal than displayed, or
+a valid whole-balance migration dies on the first "not enough funds" quote.
+
+**Call sites:** core `sonar-wallet-migrate::MigrationEngine.plan_drain` /
+`check_fee_and_capacity` and
+`sonar-ffi::wallet::HostWalletError` / `HostSourceBackend`; iOS
+`WalletMigration.swift::BreezMigrationSource.hostError`; Compose
+`WalletMigration.android.kt::BreezMigrationSource.looksInsufficient` and
+`WalletMigration.jvm.kt::BreezMigrationSource.looksInsufficient`.
+
+**Guarded by:** `lib.rs::drain_steps_down_for_opaque_insufficient_funds`,
+`lib.rs::drain_refuses_destination_max_and_fee_cap`
+
+**Coverage (honest):** these tests pin the Rust planner's bounded step-down and
+both hard limits. They only partly guard the host-error work: no test crosses
+UniFFI with `HostWalletError`, and no app test proves Android/JVM throws
+`HostWalletException.InsufficientFunds` or Apple lifts its Swift
+`HostWalletError.InsufficientFunds` back into Rust. The Apple message fallback
+is intentionally weaker than a native typed WalletKit error.
+
+**History:** the first Pixel drain exposed a flat foreign-trait error
+(`Can't lift flat errors`) that prevented the existing planner from seeing the
+insufficiency branch.
+
+**Rejected:** flattening host errors to strings at the FFI adapter, retrying
+all errors as insufficient funds, or accepting an unknown/over-cap fee. The
+first disables typed control flow; the latter two can repeat unrelated faults
+or violate consent.
+
+---
+
+## R-048 — Partial Cashu identity and migration artifacts must be recoverable
+
+**Invariant:** a partial account marker without a Cashu database is repaired
+from the current account, while destructive wallet replacement removes the
+database, account marker, restore markers, and exact migration journal/temp/lock
+artifacts without matching unrelated files.
+
+**Breaks as:** an interrupted first open permanently bricks Cashu restore, or
+an account wipe leaves a migration journal that is later resumed under the
+wrong identity.
+
+**Call sites:** core `sonar-wallet-cdk::CdkWallet.check_account_binding` /
+`is_our_artifact`; iOS `BridgedWallet.swift::wipeWalletFilesAndDefaults`;
+Compose Android
+`WalletMigrationController.android.kt::wipeCashuMigrationStorage` and Desktop
+`WalletMigrationController.jvm.kt::wipeCashuMigrationStorage`.
+
+**Guarded by:** `lib.rs::partial_account_marker_without_database_is_recovered`,
+`lib.rs::wipe_predicate_matches_exact_artifacts_only`
+
+**Coverage (honest):** the CDK tests pin marker recovery and the exact artifact
+predicate, including `cashu.migration.v1.json`, its temp forms, and lock file.
+They do not prove either host invokes its wipe root during account replacement;
+that remains the same call-site gap documented for R-023/R-004 below.
+
+**History:** journal durability added new identity-bearing files to an existing
+Cashu store whose first-open marker can itself be interrupted.
+
+**Rejected:** treating any marker as authoritative without a database, matching
+all `cashu.*` files, or preserving the migration journal across account wipe.
+Those choices respectively brick recovery, delete foreign files, or permit a
+cross-account resume.
+
 ## Unguarded
+
+- **Post-payment pending migration after an app kill.** R-045 pins the durable
+  engine state, but no Apple or Compose test kills the process after Breez
+  accepts the payment, relaunches, opens `WalletMigrationRoute`, and proves the
+  UI enters "Paid — waiting on the mint" without invoking `send` again. This
+  needs a process-death/device harness with an injectable source and a delayed
+  mint; helper tests cannot pin the host lifecycle call site.
+- **Apple `HostWalletError` lifting across the foreign-trait boundary.** The
+  non-flat Rust enum and planner branch are covered only on the Rust side.
+  Nothing constructs the generated Swift `HostMigrationSource` callback,
+  throws `HostWalletError.InsufficientFunds`, and proves UniFFI lifts it back as
+  `WalletError::InsufficientFunds`. This is specifically weaker than Compose,
+  where generated `HostWalletException` subclasses compile in Android/JVM
+  sources, though their runtime crossing is also untested. A generated-binding
+  integration test is required; a direct `hostError(_:)` unit test would not
+  guard the boundary that failed on device.
+- **Live Breez → Cashu value transfer.** Fake-mint simulation and Rust tests
+  cannot prove Breez payment lookup, real Lightning routing/fees, mint issuance,
+  NUT-13 recovery, or app-kill resume as one production path. Verification must
+  use a deliberately budgeted device run with a real Breez wallet and target
+  mint; it must record the journal identities and balances before/after. It
+  must never run as an unattended unit or CI test because it spends real funds.
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
   #498 made core stop filtering `member_count <= 2` out of

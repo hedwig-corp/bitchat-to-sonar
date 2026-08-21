@@ -30,6 +30,27 @@ pub fn entropy_hex(secret: &[u8; 32]) -> String {
     hex::encode(wallet_entropy(secret))
 }
 
+/// HKDF info for the Cashu (CDK) wallet seed. A DIFFERENT domain from
+/// [`SEED_INFO`] on purpose: the ecash wallet and the Breez wallet are
+/// separate funds domains, and sharing key material across custody models
+/// would let a compromise of one derive the other. Same salt, same ikm, so
+/// both remain restorable from the nsec alone.
+pub const CASHU_SEED_INFO: &[u8] = b"sonar-cashu-v1";
+
+/// Derive the 64-byte Cashu wallet seed (CDK's `WalletBuilder::seed` takes
+/// exactly 64 bytes; NUT-13 deterministic secrets derive from it, which is
+/// what makes ecash proofs recoverable from the account key).
+///
+/// HKDF-SHA256(ikm = secret, salt = [`SEED_SALT`], info =
+/// [`CASHU_SEED_INFO`], L = 64).
+pub fn cashu_wallet_seed(secret: &[u8; 32]) -> [u8; 64] {
+    let hk = Hkdf::<Sha256>::new(Some(SEED_SALT), secret);
+    let mut out = [0u8; 64];
+    hk.expand(CASHU_SEED_INFO, &mut out)
+        .expect("64 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
 /// Decode an account secret from `nsec1…` bech32 or 64-char hex (the same two
 /// forms `sonar-cli` accepts for identity import).
 pub fn nsec_to_secret(input: &str) -> Result<[u8; 32]> {
@@ -54,6 +75,24 @@ pub fn nsec_to_secret(input: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden vector computed with an independent HKDF implementation
+    /// (python hmac/hashlib) that also reproduces the iOS vector below — pins
+    /// the Cashu seed derivation before any funds ever depend on it.
+    #[test]
+    fn cashu_seed_matches_golden_vector() {
+        let secret: [u8; 32] = core::array::from_fn(|i| i as u8);
+        assert_eq!(
+            hex::encode(cashu_wallet_seed(&secret)),
+            "a4c269b1558bf9951e4ff497ea3ccc0c27ea70d914ea4846c58a91ea68e6d32b\
+             b46e47af092552d3a23c11b421d39aecb31bc9bfe03bbc4c062c1423ddb5954a"
+        );
+        // Distinct domain from the Breez entropy: no shared prefix.
+        assert_ne!(
+            cashu_wallet_seed(&secret)[..32],
+            wallet_entropy(&secret)[..]
+        );
+    }
 
     /// Golden vector shared with
     /// `ios/bitchatTests/Services/SonarWalletDerivationTests.swift` — pins
