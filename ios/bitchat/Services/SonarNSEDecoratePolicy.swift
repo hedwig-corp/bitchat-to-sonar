@@ -326,6 +326,23 @@ enum SonarNSEDecoratePolicy {
         return withPreview.isEmpty ? groupIdHexes : withPreview
     }
 
+    /// Policy for the still-generic NSE banner after empty drain or expire
+    /// before decorate. Production Transponder APNS is plaintext-free and
+    /// carries only an NSE marker — no group id (`docs/SONAR-NOTIFICATIONS.md`)
+    /// — so a mute lookup cannot name the chat. Attaching a sound would ring
+    /// muted chats (R-022). Keep the privacy copy; never sound. Decorated
+    /// drains still attach sound for unmuted rows after hydrate.
+    struct UndecoratedPlaceholderAlert: Equatable {
+        /// When false, the NSE must clear `content.sound`.
+        var attachesSound: Bool
+        /// When true, use `.passive` so the row does not break through Focus.
+        var passiveInterruption: Bool
+    }
+
+    static func undecoratedPlaceholderAlert() -> UndecoratedPlaceholderAlert {
+        UndecoratedPlaceholderAlert(attachesSound: false, passiveInterruption: true)
+    }
+
     static func hintGroupIdHex(from userInfo: [AnyHashable: Any]) -> String? {
         let keys = ["group_id", "groupId", "group_id_hex", "gid", "conversation_id"]
         for key in keys {

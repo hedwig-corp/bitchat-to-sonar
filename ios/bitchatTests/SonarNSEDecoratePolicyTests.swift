@@ -304,6 +304,15 @@ struct SonarNSEDecoratePolicyTests {
         ))
     }
 
+    @Test("undecorated placeholder must not sound — Transponder APNS has no chat hint")
+    func undecoratedPlaceholderIsSilent() {
+        // Production pushes carry wn_nse_prototype (etc.), not group_id. A
+        // muted-hint gate would never fire; silence is the R-022 fallback.
+        let alert = SonarNSEDecoratePolicy.undecoratedPlaceholderAlert()
+        #expect(alert.attachesSound == false)
+        #expect(alert.passiveInterruption == true)
+    }
+
     @Test("a muted DM must not silence that peer inside an unmuted group")
     func mutedDMSenderDoesNotSilenceGroups() throws {
         // The host refuses this asymmetry in SonarPushProcessor (sender-keyed
