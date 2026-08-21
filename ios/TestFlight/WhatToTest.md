@@ -1,122 +1,66 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.13.2 (43)** · release tag **v0.1-alpha.13.2** (pre-alpha.14)
+Build: **Sonar 1.14 (44)** · release tag **v0.1-alpha.14**
 
-Cautious cut after 13.1. Headline: **Android chat-open crash fix** (#597) —
-opening a chat with duplicate call/reply rows must not crash; crash
-diagnostics persist for share. Also: short iOS transcripts stay visible when
-the keyboard opens (#595), Signal-style transcript scroll + Home invalidation
-perf (#598). Opening a chat should paint from local storage first; missed
-messages catch up in the background.
+Headline: **reply to any message** (#587) and **@mentions in groups** (#561, #601).
+Reliability pass on chat-open crashes (#597, #599), duplicate push banners (#590),
+and the backup data-plan fix (#567). Mesh hardening: verified public packets (#505),
+reassembly expiry (#494), welcome auto-accept gating (#498).
 
-## 1. Sync speed & catching up (headline)
+## 1. Reply to a message (headline)
 
-Missed messages should arrive quickly on wake/foreground, and one chat’s
-activity must never hold back another’s resync.
+Swipe/long-press a bubble → Reply → send. The quoted parent must render on both
+ends and survive app restarts, on iOS and Android, in DMs and groups.
 
-- Leave the app **closed/backgrounded**, have a peer send several messages,
-  then **open the app**. Confirm missed messages appear promptly without a
-  stuck “syncing” state.
-- Open an existing chat: it should **paint instantly from local history** and
-  fill gaps in the background — not blank/spinner while talking to relays.
-- Send in one chat, then open a **different** chat that still has older
-  unreceived peer messages. The second chat must still pull the missing ones
-  (a newer send elsewhere must not skip them).
-- Fire several messages in a row; sending stays snappy and is not blocked
-  behind background sync.
-- On Android/desktop: after a welcome creates a group or a live event arrives,
-  the open chat / list should refresh within seconds without a manual pull.
+- Reply over **internet (Marmot)**: quote renders on the peer's device.
+- Reply over **Bluetooth/mesh**: same. On the sending device, verify the reply row
+  carries the quoted parent, not just a bare message.
+- **Known gap (α.15 target, #594):** if you arm a reply against a mesh-delivered
+  row and the Bluetooth link drops before you hit send, the message goes out as
+  ordinary Marmot text **without the quote**. Known — don't file new reports;
+  do note how often you hit it in the wild.
+- Reply rows in a transcript with many replies: no duplicated/mis-nested quotes
+  after fast scrolling (crash fix territory from #597/#599).
 
-## 2. Home list & conversation correctness
+## 2. @mention people in groups
 
-- Home / Messages should order by **latest activity across transports** (mesh +
-  relay), not leave a busy chat buried under an idle one.
-- A peer you talk to over **mesh and Sonar/relay** is **one conversation**, not
-  two rows. Moving in/out of BLE range must not create a duplicate pubkey chat.
-- Peer **nickname changes** should update list + transcript (not stick on the
-  old name or a raw key).
-- You should **not** get spammy system “reconnected” alerts when BLE flaps.
+In a group, type `@` → member picker appears; pick a member (or keep typing to
+filter). The mention renders as a chip matching the design (#601); the picked
+member should be notifiable by name.
 
-## 3. Multi-photo & media
+- Chips must render on the **other side** too, not just for the author.
+- A mention of a member who then leaves the group must not crash the transcript.
 
-- Send **multiple photos** in one go: the transcript should show an album-style
-  card deck (xChat-style), not only a single image bubble.
-- Open the album / individual photos fullscreen; confirm save still works.
-- Animated GIFs still **animate** (not a frozen frame).
-- Stickers still send/receive (sticker kinds were moved to 30031/10031 — old
-  packs may need a re-publish if something looks empty).
-- Reopen a chat with stickers / attachments: previews should appear from
-  **local cache** immediately, not wait on Blossom/network.
-- In a **folded** mesh+relay chat, scroll up to load older history — older
-  pages must keep loading (not stop after the first window).
+## 3. Backup stops eating the data plan (#567)
 
-## 4. Stability / crash fixes
+With Backup on, background upload traffic must be bounded — no more
+multi-GB uploads on metered connections (66 GB in one billing period was the
+report). Leave Backup on over cellular for a day and watch the app's data usage.
 
-- Mixed content (emoji, long text, links, reactions) renders without crashing.
-- Open a chat, **lock the phone** 30–60s, unlock — app should still be running
-  and the chat intact (no 0xdead10cc / cold relaunch from wallet work).
-- Send or receive a **payment**, then immediately lock or background for a
-  minute. Come back: no crash, correct payment state.
-- Leave the app backgrounded several minutes locked, then reopen — resume, not
-  crash-loop.
+## 4. Chat-open reliability
 
-## 5. Wallet & offline payments
+- Open chats rapidly, including conversations with call rows and reply rows —
+  no crash (#597), no crash on rows with empty inline metadata (#599).
+- iOS: opening a chat paints from local history instantly, never a blank
+  transcript while waiting for sync (#507); cold start must not stall behind
+  identity publishes (#508).
+- One notification per event: no duplicate inline banners after a timed-out
+  notify job (#590).
 
-- After update: **identity, nickname, contacts, and wallet balance** survive.
-- Published **BOLT12 offer / payment address** still set; you remain payable
-  after reconnect / rename (offer must not get wiped by a later publish).
-- **Offline payments**: pay a peer whose app is closed/backgrounded; your
-  bubble moves sending → paid; they get woken to receive.
-- Direct wallet payments: gold payment bubble appears immediately; activity
-  list newest-first with amount, peer, rail, fee, status. Paying a peer with
-  **no** payment address is blocked, not a crash.
+## 5. Mesh hardening spot-checks
 
-## 6. Notifications
+- Public mesh messages/files from a **pinned peer** must still be signature-verified (#505).
+- Leave an idle BLE session half-open; new sessions after the idle window must
+  reassemble fine instead of the pool being permanently wedged (#494).
+- An unsolicited 2-member "welcome" from an unknown sender must not auto-accept
+  or grow local storage (#498).
 
-- App backgrounded: message and payment produce **meaningful** notifications
-  (who/what), not generic placeholders; privacy toggle changes lock-screen
-  detail.
-- Push wake / foreground should kick Marmot relay sync so chats catch up after
-  a notification.
+## 6. Smaller
 
-## 7. Diagnostics (please use this)
-
-- **Settings → Diagnostics → Share** exports a log.
-- Try verbose + privacy/redaction levels; confirm a shareable file is produced.
-- After slow sync, missing message, or crash: export **right away** and attach
-  to the report.
-
-## 8. Account key durability
-
-- Updating must **not** mint a new account / nsec. If prefs are lost but the
-  keychain key remains, you should recover into the same account, not onboarding.
-
-## 8b. Restore account (nsec)
-
-- Fresh install: onboarding shows a clear **Restore account with private key**
-  button (not easy to miss). Paste a valid `nsec1…` → same identity + wallet
-  balance after Breez sync. If you previously used **Backup chats**, Marmot
-  history comes back from Blossom; otherwise local chats start empty.
-- Settings → **Backup chats**: uploads an encrypted Marmot backup (needs
-  network). Settings → **Restore account**: replace the current account with a
-  pasted nsec; confirm wipe; wallet rebuilds from that key; chats restore from
-  Blossom when a backup exists.
-- Invalid nsec shows an error and does not corrupt the current account.
-
-## Regression pass (still expected)
-
-- Group invite links (QR / share / paste / join).
-- Calls: mute icon/label correct, hang-up dismisses immediately, no phantom
-  missed-call rows.
-- Voice notes play on the platform you test (iOS / Android / desktop).
-- Profile edit on iOS matches Compose (name / photo) where parity shipped.
-
-## Known gaps
-
-- Some newer payment/onboarding/safety-number strings are **English-only**;
-  other languages fall back to English — expected, not a bug.
-- In-app QR camera scanning may still be limited; paste/share links work.
-- Archive for this cut was verified as a valid **iOS App Archive** (single
-  `Sonar.app`, both extensions in `PlugIns`, `ApplicationProperties` present).
-  TestFlight upload still needs App Store Connect distribution signing via
-  Xcode Organizer / `xcodebuild -exportArchive`.
+- Onboarding screens scroll when content overflows (#591).
+- Short iOS transcripts stay visible when the keyboard opens (#595); Signal-style
+  transcript scroll and Home invalidation perf (#598).
+- Desktop: no more offer of calls it cannot make or take (#589); Linux voice
+  notes actually play (#568).
+- Mesh photos arrive at full intended quality, not crushed to 448px (#593).
+- Profile fields set by other Nostr clients survive Sonar's kind-0 republish (#584).
