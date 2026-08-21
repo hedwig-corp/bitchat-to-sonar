@@ -2862,6 +2862,23 @@ internal fun AnnotatedString.Builder.appendBubbleMetaInlineContent() {
     appendInlineContent(BUBBLE_META_ICON)
 }
 
+/**
+ * Design .bc-meta clock. Android's default includeFontPadding makes a 10.5.sp
+ * Text taller than 12.sp; InlineTextContent clips children to the placeholder,
+ * which sliced the send time through the midline. Keep this slot ≥ ~1.5× fontSize.
+ */
+internal const val BUBBLE_META_TIME_FONT_SP = 10.5f
+internal const val BUBBLE_META_TIME_PLACEHOLDER_HEIGHT_SP = 16f
+
+internal fun bubbleMetaTimePlaceholder(label: String): Placeholder {
+    val widthSp = BUBBLE_META_TIME_FONT_SP * label.length * 0.62f + 8f
+    return Placeholder(
+        width = widthSp.sp,
+        height = BUBBLE_META_TIME_PLACEHOLDER_HEIGHT_SP.sp,
+        placeholderVerticalAlign = PlaceholderVerticalAlign.TextCenter,
+    )
+}
+
 // Signal-Android ConversationItem: shrink after 100 ms, to 95%, while the
 // platform owns long-press timeout, touch slop, cancellation and initial haptic.
 internal const val SONAR_MESSAGE_PRESS_SCALE_DELAY_MS = 100L
@@ -3498,18 +3515,22 @@ private fun MessageBubble(
     }
     var textLayout by remember(annotated) { mutableStateOf<TextLayoutResult?>(null) }
     val uriHandler = androidx.compose.ui.platform.LocalUriHandler.current
-    val timePlaceholderWidth = (10.5f * timeLabel.length * 0.62f + 8f).sp
     val inline = mapOf(
         BUBBLE_META_TIME to InlineTextContent(
-            Placeholder(timePlaceholderWidth, 12.sp, PlaceholderVerticalAlign.TextCenter)
+            bubbleMetaTimePlaceholder(timeLabel)
         ) {
-            Text(
-                timeLabel,
-                color = metaColor,
-                fontSize = 10.5.sp,
-                maxLines = 1,
-                modifier = Modifier.padding(start = 4.dp),
-            )
+            Box(
+                Modifier.fillMaxSize().padding(start = 4.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                Text(
+                    timeLabel,
+                    color = metaColor,
+                    fontSize = BUBBLE_META_TIME_FONT_SP.sp,
+                    lineHeight = BUBBLE_META_TIME_PLACEHOLDER_HEIGHT_SP.sp,
+                    maxLines = 1,
+                )
+            }
         },
         BUBBLE_META_ICON to InlineTextContent(
             Placeholder(14.sp, 11.sp, PlaceholderVerticalAlign.TextCenter)
