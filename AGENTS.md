@@ -56,11 +56,21 @@ Non-obvious gotchas discovered during setup:
   + UniFFI Kotlin bindings, and it fetches a pinned Breez native lib over the
   network). Re-run `core/build-desktop.sh` manually after `core/` changes if the
   desktop app doesn't pick them up.
-- **Android native build is NOT set up.** The JVM/desktop path needs no NDK, but
-  `:composeApp:installDebug` / `assembleRelease` / `buildAndroidRustCore` require
-  NDK r27d + `cargo-ndk` + `uniffi` CLI (see `compose-tests.yml`
-  `android-device-test`), which are not installed. Install them if you need
-  Android APKs.
+- **Android APK build IS set up.** NDK r27d (`$HOME/android-sdk/ndk/27.3.13750724`),
+  `cargo-ndk`, `uniffi` CLI, and the three `*-linux-android` Rust targets are
+  installed, plus SDK platform/build-tools 35. Build for the x86_64 emulator ABI
+  like CI's `android-device-test`:
+  `SONAR_ABIS='-t x86_64' SONAR_BINDINGS_ABI=x86_64 ./gradlew :composeApp:assembleDebug -Psonar.androidDebugAbi=x86_64 -Psonar.skipGoogleServices=true`
+  (default `sonar.androidDebugAbi` is arm64-v8a). Gradle runs `core/build-android.sh`
+  via `:composeApp:buildAndroidRustCore`. Android **host-side unit tests** run
+  without a device: `xvfb-run -a ./gradlew :composeApp:testDebugUnitTest …`.
+- **The Android EMULATOR does not run on this VM.** `emulator -accel-check` says
+  KVM is usable, but the guest vCPU never executes in the Firecracker microVM
+  (qemu ~0% CPU, no kernel output, adb stays `offline`) regardless of
+  KVM/TCG/`-gpu`/RAM/window flags. So `:composeApp:installDebug` and
+  `connectedDebugAndroidTest` can't be run here — verify Android via the APK
+  build + `testDebugUnitTest`, and exercise the shared UI/`sonar-core` at runtime
+  through the Compose **Desktop** app (same `commonMain`).
 - **Wallet island:** `core/sonar-wallet-breez` is excluded from the core
   workspace and needs `protoc` (installed); test it with `cargo test --locked`
   in that directory (CI: `core-tests.yml` `wallet-breez-island`).
