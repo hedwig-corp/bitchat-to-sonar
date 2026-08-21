@@ -120,12 +120,10 @@ class NotificationService: SDKNotificationService {
             if SonarNSEDecoratePolicy.shouldReapplyPlaceholderOnExpire(
                 isPlaceholder: stillPlaceholder
             ) {
-                if Self.suppressGenericBannerIfHintMuted(content) {
-                    Self.recordDiagnostic("expire:suppressedMutedHint")
-                } else {
-                    Self.configureTransponderNotification(content)
-                    Self.recordDiagnostic("expire:stillPlaceholder")
-                }
+                // Same as empty drain: no chat id on the wire, so a sounding
+                // placeholder would ring muted chats (R-022).
+                Self.configureTransponderNotification(content, silent: true)
+                Self.recordDiagnostic("expire:stillPlaceholderSilent")
             } else {
                 Self.recordDiagnostic(
                     SonarNSEDecoratePolicy.diagnosticExpireKeepingDecorated(
@@ -176,16 +174,15 @@ class NotificationService: SDKNotificationService {
                     return
                 }
                 if notifications.isEmpty {
-                    if Self.suppressGenericBannerIfHintMuted(content) {
-                        os_log("NSE: empty drain for muted hint — suppressing banner",
-                               log: Self.log, type: .info)
-                        Self.recordDiagnostic("emptyDrain:suppressedMutedHint")
-                        finish(with: content)
-                        return
-                    }
-                    os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
+                    // Production Transponder APNS has no group id — only an NSE
+                    // marker — so we cannot mute-gate this placeholder by chat.
+                    // Clearing sound (policy: undecoratedPlaceholderAlert) stops
+                    // muted chats from ringing when hydrate found nothing; the
+                    // host may still replace the row after open (R-022).
+                    Self.applyUndecoratedPlaceholderSilence(content)
+                    os_log("NSE: Marmot wake drained 0 notifications — keeping silent generic banner",
                            log: Self.log, type: .info)
-                    Self.recordDiagnostic("emptyDrain:keepingGeneric")
+                    Self.recordDiagnostic("emptyDrain:keepingGenericSilent")
                     finish(with: content)
                     return
                 }
@@ -725,7 +722,10 @@ class NotificationService: SDKNotificationService {
         return source == "breez" || userInfo["notification_type"] != nil
     }
 
-    private static func configureTransponderNotification(_ content: UNMutableNotificationContent) {
+    private static func configureTransponderNotification(
+        _ content: UNMutableNotificationContent,
+        silent: Bool = false
+    ) {
         // Placeholder until hydrate decorates (or the app replaces this banner).
         // Mark with sonar.nsePlaceholder so SonarPushProcessor can remove THIS
         // banner by identity — never by matching title/body (those strings are
@@ -733,14 +733,18 @@ class NotificationService: SDKNotificationService {
         let showNames = notificationPrefs().showNames
         content.title = showNames ? "New Sonar message" : "Sonar"
         content.body = "Open Sonar to read it."
-        content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
         var info = content.userInfo
         info[SonarNSEDecoratePolicy.nsePlaceholderUserInfoKey] = true
         info.removeValue(forKey: SonarNSEDecoratePolicy.nseDecoratedUserInfoKey)
         content.userInfo = info
-        if #available(iOS 15.0, *) {
-            content.interruptionLevel = .active
+        if silent {
+            applyUndecoratedPlaceholderSilence(content)
+        } else {
+            content.sound = notificationSound
+            if #available(iOS 15.0, *) {
+                content.interruptionLevel = .active
+            }
         }
     }
 
@@ -794,28 +798,18 @@ class NotificationService: SDKNotificationService {
         return "other:\(typeName)"
     }
 
-    /// Empty drain / expire still on the placeholder: if the push names a
-    /// muted chat, blank it instead of delivering the generic sounding banner.
-    @discardableResult
-    private static func suppressGenericBannerIfHintMuted(
+    /// Strip sound from a still-generic placeholder. Call sites: empty drain
+    /// and expire-before-decorate. See `undecoratedPlaceholderAlert`.
+    private static func applyUndecoratedPlaceholderSilence(
         _ content: UNMutableNotificationContent
-    ) -> Bool {
-        let hint = SonarNSEDecoratePolicy.hintGroupIdHex(from: content.userInfo)
-        let mutes = SonarNSEDecoratePolicy.decodeMutes(
-            UserDefaults(suiteName: appGroupId)?
-                .data(forKey: SonarNSEDecoratePolicy.mutesUserDefaultsKey)
-        )
-        guard SonarNSEDecoratePolicy.shouldSuppressGenericBanner(
-            hintGroupIdHex: hint,
-            mutes: mutes
-        ) else { return false }
-        if let hint, !hint.isEmpty {
-            var info = content.userInfo
-            info[conversationIdKey] = marmotConversationPrefix + hint
-            content.userInfo = info
+    ) {
+        let alert = SonarNSEDecoratePolicy.undecoratedPlaceholderAlert()
+        if !alert.attachesSound {
+            content.sound = nil
         }
-        suppressTransponderNotification(content)
-        return true
+        if alert.passiveInterruption, #available(iOS 15.0, *) {
+            content.interruptionLevel = .passive
+        }
     }
 
     private static func suppressTransponderNotification(_ content: UNMutableNotificationContent) {

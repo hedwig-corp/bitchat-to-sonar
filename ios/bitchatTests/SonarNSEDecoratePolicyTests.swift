@@ -304,27 +304,13 @@ struct SonarNSEDecoratePolicyTests {
         ))
     }
 
-    @Test("empty-drain generic banner is suppressed when the push hint is muted")
-    func emptyDrainMutedHintSuppressesGenericBanner() {
-        let now = Date(timeIntervalSince1970: 1_700_000_000)
-        let gid = String(repeating: "ab", count: 32)
-        let until = now.addingTimeInterval(3600)
-        let mutes = ["marmot:" + gid: until]
-        #expect(SonarNSEDecoratePolicy.shouldSuppressGenericBanner(
-            hintGroupIdHex: gid, mutes: mutes, now: now
-        ))
-        // Missing hint fails open — the wake may be for an unmuted chat.
-        #expect(!SonarNSEDecoratePolicy.shouldSuppressGenericBanner(
-            hintGroupIdHex: nil, mutes: mutes, now: now
-        ))
-        #expect(!SonarNSEDecoratePolicy.shouldSuppressGenericBanner(
-            hintGroupIdHex: "", mutes: mutes, now: now
-        ))
-        // A different group's mute must not silence this hint.
-        let other = String(repeating: "cd", count: 32)
-        #expect(!SonarNSEDecoratePolicy.shouldSuppressGenericBanner(
-            hintGroupIdHex: gid, mutes: ["marmot:" + other: until], now: now
-        ))
+    @Test("undecorated placeholder must not sound — Transponder APNS has no chat hint")
+    func undecoratedPlaceholderIsSilent() {
+        // Production pushes carry wn_nse_prototype (etc.), not group_id. A
+        // muted-hint gate would never fire; silence is the R-022 fallback.
+        let alert = SonarNSEDecoratePolicy.undecoratedPlaceholderAlert()
+        #expect(alert.attachesSound == false)
+        #expect(alert.passiveInterruption == true)
     }
 
     @Test("a muted DM must not silence that peer inside an unmuted group")

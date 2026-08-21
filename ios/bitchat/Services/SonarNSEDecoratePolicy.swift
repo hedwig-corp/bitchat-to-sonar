@@ -326,24 +326,21 @@ enum SonarNSEDecoratePolicy {
         return withPreview.isEmpty ? groupIdHexes : withPreview
     }
 
-    /// Empty-drain / expire-placeholder: the generic banner stands in for the
-    /// hinted chat. If that chat is muted, do not keep a sounding placeholder
-    /// (R-022). Missing hint fails open — we must not silence an unmuted chat
-    /// we cannot name. Does NOT skip hydrate: a wake can drain other groups.
-    static func shouldSuppressGenericBanner(
-        hintGroupIdHex: String?,
-        mutes: [String: Date],
-        now: Date = Date()
-    ) -> Bool {
-        guard let hint = hintGroupIdHex?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !hint.isEmpty else { return false }
-        return isMuted(
-            groupIdHex: hint,
-            senderNpub: "",
-            groupName: "group",
-            mutes: mutes,
-            now: now
-        )
+    /// Policy for the still-generic NSE banner after empty drain or expire
+    /// before decorate. Production Transponder APNS is plaintext-free and
+    /// carries only an NSE marker — no group id (`docs/SONAR-NOTIFICATIONS.md`)
+    /// — so a mute lookup cannot name the chat. Attaching a sound would ring
+    /// muted chats (R-022). Keep the privacy copy; never sound. Decorated
+    /// drains still attach sound for unmuted rows after hydrate.
+    struct UndecoratedPlaceholderAlert: Equatable {
+        /// When false, the NSE must clear `content.sound`.
+        var attachesSound: Bool
+        /// When true, use `.passive` so the row does not break through Focus.
+        var passiveInterruption: Bool
+    }
+
+    static func undecoratedPlaceholderAlert() -> UndecoratedPlaceholderAlert {
+        UndecoratedPlaceholderAlert(attachesSound: false, passiveInterruption: true)
     }
 
     static func hintGroupIdHex(from userInfo: [AnyHashable: Any]) -> String? {

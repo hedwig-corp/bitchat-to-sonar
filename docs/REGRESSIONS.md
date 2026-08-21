@@ -1128,19 +1128,20 @@ muted chats regardless. #443 mirrors the map into the App Group and gates the
 NSE decorate on it.
 
 **Call sites:**
-- iOS `SonarNotificationService/NotificationService.swift` (killed-app hydrate) → `SonarNSEDecoratePolicy.isMuted` over the App Group mirror written by `SonarChatMuteStore.mirrorToAppGroup`; empty-drain / expire placeholder also calls `shouldSuppressGenericBanner` so a muted hint cannot keep the generic sounding banner
+- iOS `SonarNotificationService/NotificationService.swift` (killed-app hydrate) → `SonarNSEDecoratePolicy.isMuted` over the App Group mirror written by `SonarChatMuteStore.mirrorToAppGroup`; empty-drain / expire-before-decorate clear sound via `undecoratedPlaceholderAlert` because production Transponder APNS carries no group id
 - iOS `SonarPushProcessor.swift` (drain + summary paths) and `NotificationService.sendLocalNotification` (central in-process gate)
 - Compose `SonarPushProcessingService.notifyUnreadConversations` → `decodeMuteMap(SonarCore.loadBlob("mute.byChat"))`
 
 **Guarded by:** `SonarNSEDecoratePolicyTests.nseMuteCheck`
 
-**Also guarded by:** `SonarNSEDecoratePolicyTests.mutedDMSenderDoesNotSilenceGroups` (a muted DM's sender key must not silence that peer's messages in unmuted groups — the NSE judges directness with `meaningfulGroupName`, mirroring the host's gate in `SonarPushProcessor`), `SonarNSEDecoratePolicyTests.nseMuteCandidatesMatchStoreNormalization`, `SonarNSEDecoratePolicyTests.emptyDrainMutedHintSuppressesGenericBanner` (killed-app empty drain / expire placeholder must not keep a sounding generic banner when the push hint is a muted chat), `SonarTrillMessageTests.testMutedChatTrillIsRowOnly`, `SonarTrillMessageTests.testMuteKeyNormalizationBridgesIdShapes`, `SonarTrillTest.muteSuppressesUntilExpiryAndForeverNeverExpires`, `SonarTrillTest.muteMapRoundTripsThroughBlob`
+**Also guarded by:** `SonarNSEDecoratePolicyTests.mutedDMSenderDoesNotSilenceGroups` (a muted DM's sender key must not silence that peer's messages in unmuted groups — the NSE judges directness with `meaningfulGroupName`, mirroring the host's gate in `SonarPushProcessor`), `SonarNSEDecoratePolicyTests.nseMuteCandidatesMatchStoreNormalization`, `SonarNSEDecoratePolicyTests.undecoratedPlaceholderIsSilent` (empty drain / expire placeholder must not attach sound — Transponder APNS has no chat hint, so a muted-hint gate never fires), `SonarTrillMessageTests.testMutedChatTrillIsRowOnly`, `SonarTrillMessageTests.testMuteKeyNormalizationBridgesIdShapes`, `SonarTrillTest.muteSuppressesUntilExpiryAndForeverNeverExpires`, `SonarTrillTest.muteMapRoundTripsThroughBlob`
 
 **Not guarded:** The NSE `apply()` call-site wiring. The cited tests pin
 `SonarNSEDecoratePolicy.isMuted` and the key-shape agreement, not the filter
 inside `hydrateMarmotAndDecorate`, so a call-site regression keeps them green —
-the exact failure mode R-001 warns about. The empty-drain muted-hint helper is
-pinned; the NSE `suppressGenericBannerIfHintMuted` call site is not. Nothing pins the host's
+the exact failure mode R-001 warns about. The undecorated-placeholder silence
+policy is pinned; the NSE `applyUndecoratedPlaceholderSilence` call site is not.
+Nothing pins the host's
 `removeDeliveredNSEOwnedBanners` backstop on the mute branches. Pre-existing
 mutes are not mirrored until `SonarChatMuteStore.shared` is first constructed,
 so an app updated but never launched fails open. Compose
