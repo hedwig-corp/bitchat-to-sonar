@@ -64,6 +64,20 @@ public final class SonarWallet {
         public let preimage: String?
     }
 
+    public enum PaymentLookupStatus: Sendable, Equatable {
+        case pending
+        case complete
+        case failed
+        case refundable
+        case unknown
+    }
+
+    public struct PaymentLookup: Sendable, Equatable {
+        public let status: PaymentLookupStatus
+        public let id: String?
+        public let feesSats: Int64?
+    }
+
     public struct Destination: Sendable, Equatable {
         public let raw: String
         /// "bolt11", "bolt12_offer", "lightning_address", "lnurl_pay", "unknown".
@@ -425,6 +439,46 @@ public final class SonarWallet {
         }
     }
 
+    /// Reconcile an outgoing Lightning payment by its durable BOLT11 hash.
+    public func lookupPayment(paymentHash: String) async throws -> PaymentLookup {
+        guard let node = sdk else { throw WalletError.notConfigured }
+        return try await run {
+            let payments = try node.listPayments(
+                req: ListPaymentsRequest(
+                    filters: [.send],
+                    states: nil,
+                    fromTimestamp: nil,
+                    toTimestamp: nil,
+                    offset: nil,
+                    limit: nil,
+                    details: nil,
+                    sortAscending: false
+                )
+            )
+            guard let payment = payments.first(where: {
+                Self.lightningPaymentHash($0) == paymentHash
+            }) else {
+                return PaymentLookup(status: .unknown, id: nil, feesSats: nil)
+            }
+            let status: PaymentLookupStatus
+            switch payment.status {
+            case .complete:
+                status = .complete
+            case .failed, .timedOut:
+                status = .failed
+            case .refundable, .refundPending:
+                status = .refundable
+            default:
+                status = .pending
+            }
+            return PaymentLookup(
+                status: status,
+                id: Self.lightningPaymentHash(payment) ?? payment.txId ?? payment.destination,
+                feesSats: Int64(payment.feesSat)
+            )
+        }
+    }
+
     @discardableResult
     public func send(destination: String, amountSats: Int64 = 0, note: String = "") async throws -> Payment {
         guard let node = sdk else { throw WalletError.notConfigured }
@@ -607,6 +661,29 @@ public final class SonarWallet {
             feesSats: Int64(p.feesSat),
             preimage: preimage
         )
+    }
+
+    private static func lightningPaymentHash(_ payment: BreezSDKLiquid.Payment) -> String? {
+        if case let .lightning(
+            swapId: _,
+            description: _,
+            liquidExpirationBlockheight: _,
+            preimage: _,
+            invoice: _,
+            bolt12Offer: _,
+            paymentHash: paymentHash,
+            destinationPubkey: _,
+            lnurlInfo: _,
+            bip353Address: _,
+            payerNote: _,
+            claimTxId: _,
+            refundTxId: _,
+            refundTxAmountSat: _,
+            settledAt: _
+        ) = payment.details {
+            return paymentHash
+        }
+        return nil
     }
 
     private static func bytes(fromHex hex: String) -> [UInt8]? {

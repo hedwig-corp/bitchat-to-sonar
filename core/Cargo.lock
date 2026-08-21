@@ -6237,7 +6237,14 @@ dependencies = [
 name = "sonar-wallet-migrate"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "libc",
+ "lightning-invoice",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "sonar-wallet",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::error::{Result, WalletError};
 use crate::types::{
-    Balance, Destination, ExchangeRate, Payment, PreparedSend, ReceiveMethod, ReceiveRequest,
-    WalletCapabilities, WalletEvent,
+    Balance, Destination, ExchangeRate, Payment, PaymentLookup, PreparedSend, ReceiveMethod,
+    ReceiveRequest, TrackedReceive, TrackedReceiveState, WalletCapabilities, WalletEvent,
 };
 
 /// Host-side observer for wallet events. Callbacks are synchronous and must
@@ -106,6 +107,13 @@ pub trait WalletBackend: Send + Sync {
     /// Most recent payments, newest first.
     fn list_recent_payments(&self, limit: u32) -> Result<Vec<Payment>>;
 
+    /// Reconcile a source payment by the BOLT11 payment hash. Implementations
+    /// must return `Unknown` rather than guessing when their durable payment
+    /// store cannot establish the outcome.
+    fn lookup_payment(&self, _payment_hash: &str) -> Result<PaymentLookup> {
+        Ok(PaymentLookup::unknown())
+    }
+
     fn fetch_fiat_rates(&self) -> Result<Vec<ExchangeRate>> {
         Err(WalletError::Unsupported("fiat rates".into()))
     }
@@ -130,6 +138,19 @@ pub trait WalletBackend: Send + Sync {
     /// [`WalletError::Backend`] rather than pulling the database out from
     /// under a live backend.
     fn wipe_local_storage(&self) -> Result<()>;
+}
+
+/// Destination-side exact receive tracking. A migration settles only when the
+/// specific quote created during planning is issued; aggregate balance changes
+/// are deliberately not evidence for this contract.
+pub trait TrackedReceiveBackend: Send + Sync {
+    fn create_tracked_receive(&self, request: &ReceiveRequest) -> Result<TrackedReceive>;
+
+    fn reconcile_tracked_receive(
+        &self,
+        id: &str,
+        request_timeout: Duration,
+    ) -> Result<TrackedReceiveState>;
 }
 
 /// Convenience for the common "prepare then immediately send" path, used by

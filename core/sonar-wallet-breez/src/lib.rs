@@ -34,9 +34,9 @@ use breez_sdk_liquid::sdk::LiquidSdk;
 use breez_sdk_liquid::InputType;
 use sonar_wallet::{
     classify_destination, resolve_send_amount, Balance, Destination, DestinationKind, ExchangeRate,
-    ListenerRegistry, Network, PaymentStatus, PreparedSend, PreparedSendToken, ReceiveMethod,
-    ReceiveRequest, Result, WalletBackend, WalletCapabilities, WalletConfig, WalletError,
-    WalletEvent, WalletEventListener,
+    ListenerRegistry, Network, PaymentLookup, PaymentLookupStatus, PaymentStatus, PreparedSend,
+    PreparedSendToken, ReceiveMethod, ReceiveRequest, Result, WalletBackend, WalletCapabilities,
+    WalletConfig, WalletError, WalletEvent, WalletEventListener,
 };
 
 /// Description attached to receive offers/invoices — matches the existing iOS
@@ -802,6 +802,34 @@ impl WalletBackend for BreezWallet {
         Ok(payments.iter().filter_map(map_payment).collect())
     }
 
+    fn lookup_payment(&self, payment_hash: &str) -> Result<PaymentLookup> {
+        let sdk = self.sdk()?;
+        let payments = self
+            .rt()
+            .block_on(sdk.list_payments(&ListPaymentsRequest {
+                filters: None,
+                states: None,
+                from_timestamp: None,
+                to_timestamp: None,
+                offset: None,
+                limit: None,
+                details: None,
+                sort_ascending: Some(false),
+            }))
+            .map_err(map_payment_error)?;
+        let Some(payment) = payments.iter().find(|payment| {
+            payment.payment_type == PaymentType::Send
+                && extract_details(payment).payment_hash.as_deref() == Some(payment_hash)
+        }) else {
+            return Ok(PaymentLookup::unknown());
+        };
+        Ok(PaymentLookup {
+            status: map_lookup_status(payment.status),
+            id: stable_id(payment),
+            fees_sats: Some(payment.fees_sat),
+        })
+    }
+
     fn fetch_fiat_rates(&self) -> Result<Vec<ExchangeRate>> {
         let sdk = self.sdk()?;
         let rates = self
@@ -1134,6 +1162,15 @@ fn map_status(s: PaymentState) -> PaymentStatus {
         PaymentState::Created | PaymentState::Pending | PaymentState::WaitingFeeAcceptance => {
             PaymentStatus::Pending
         }
+    }
+}
+
+fn map_lookup_status(s: PaymentState) -> PaymentLookupStatus {
+    match map_status(s) {
+        PaymentStatus::Pending => PaymentLookupStatus::Pending,
+        PaymentStatus::Complete => PaymentLookupStatus::Complete,
+        PaymentStatus::Failed => PaymentLookupStatus::Failed,
+        PaymentStatus::Refundable => PaymentLookupStatus::Refundable,
     }
 }
 
@@ -1674,5 +1711,21 @@ mod tests {
         ] {
             assert_eq!(map_status(pending), PaymentStatus::Pending);
         }
+        assert_eq!(
+            map_lookup_status(PaymentState::Complete),
+            PaymentLookupStatus::Complete
+        );
+        assert_eq!(
+            map_lookup_status(PaymentState::TimedOut),
+            PaymentLookupStatus::Failed
+        );
+        assert_eq!(
+            map_lookup_status(PaymentState::RefundPending),
+            PaymentLookupStatus::Refundable
+        );
+        assert_eq!(
+            map_lookup_status(PaymentState::Pending),
+            PaymentLookupStatus::Pending
+        );
     }
 }

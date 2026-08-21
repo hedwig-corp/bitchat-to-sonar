@@ -130,9 +130,20 @@ struct SonarSettingsScreen: View {
                             SNSettingsRow(
                                 icon: .coin, tone: .gold, label: "Currency",
                                 value: store.displayCurrency,
-                                divider: false
+                                divider: true
                             ) {
                                 currencySheet = true
+                            }
+                            SNSettingsRow(
+                                icon: .coin,
+                                tone: .gold,
+                                label: String(localized: "Move to Cashu"),
+                                sub: String(localized: "Move your Lightning balance into ecash"),
+                                divider: false
+                            ) {
+                                if case .ready = store.walletState {
+                                    store.push(.walletMigration)
+                                }
                             }
                         }
                     }

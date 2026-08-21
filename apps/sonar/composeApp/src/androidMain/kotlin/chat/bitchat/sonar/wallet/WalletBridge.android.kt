@@ -514,6 +514,34 @@ actual object WalletBridge {
             }
         }
 
+    actual suspend fun lookupPayment(paymentHash: String): WalletPaymentLookup =
+        withContext(Dispatchers.IO) {
+            lock.withLock {
+                val node = sdk ?: return@withLock WalletPaymentLookup(WalletPaymentLookupStatus.Unknown)
+                val payment = node.listPayments(
+                    ListPaymentsRequest(
+                        filters = listOf(PaymentType.SEND),
+                        sortAscending = false,
+                    )
+                ).firstOrNull {
+                    (it.details as? PaymentDetails.Lightning)?.paymentHash == paymentHash
+                } ?: return@withLock WalletPaymentLookup(WalletPaymentLookupStatus.Unknown)
+                WalletPaymentLookup(
+                    status = when (payment.status) {
+                        PaymentState.COMPLETE -> WalletPaymentLookupStatus.Complete
+                        PaymentState.FAILED, PaymentState.TIMED_OUT -> WalletPaymentLookupStatus.Failed
+                        PaymentState.REFUNDABLE, PaymentState.REFUND_PENDING ->
+                            WalletPaymentLookupStatus.Refundable
+                        else -> WalletPaymentLookupStatus.Pending
+                    },
+                    id = (payment.details as? PaymentDetails.Lightning)?.paymentHash
+                        ?: payment.txId
+                        ?: payment.destination,
+                    feesSats = payment.feesSat.toLong(),
+                )
+            }
+        }
+
     actual suspend fun send(destination: String, amountSats: Long, note: String): SendResult =
         withContext(Dispatchers.IO) {
             // Capture the handle under [lock] so a concurrent Breez wake cannot

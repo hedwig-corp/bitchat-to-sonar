@@ -9,6 +9,7 @@
 //! are the crash-resume path.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
@@ -18,7 +19,7 @@ use sonar_wallet::{
 };
 use sonar_wallet_breez::BreezWallet;
 use sonar_wallet_cdk::CdkWallet;
-use sonar_wallet_migrate::{MigrationEngine, MigrationLimits, Settlement};
+use sonar_wallet_migrate::{MigrationEngine, MigrationJournal, MigrationLimits, Settlement};
 
 #[derive(Parser)]
 #[command(
@@ -113,12 +114,6 @@ struct SimFundArgs {
 
 #[derive(Args)]
 struct SettleArgs {
-    /// Destination confirmed balance BEFORE the migration (from `status`).
-    #[arg(long)]
-    baseline_sats: u64,
-    /// Amount expected to arrive.
-    #[arg(long)]
-    expected_sats: u64,
     #[arg(long, default_value_t = 24)]
     settle_polls: u32,
 }
@@ -195,12 +190,15 @@ fn main() -> Result<(), WalletError> {
             working_dir: expand_home(&cli.breez_dir),
         })?),
     };
+    let cashu_dir = expand_home(&cli.cashu_dir);
+    let journal = MigrationJournal::new(&cashu_dir, secret.as_slice(), mint.as_bytes())
+        .map_err(|e| WalletError::Backend(e.to_string()))?;
     let dest = CdkWallet::new(
         WalletConfig {
             seed: Zeroizing::new(cashu_wallet_seed(&secret).to_vec()),
             network,
             api_key: None,
-            working_dir: expand_home(&cli.cashu_dir),
+            working_dir: cashu_dir,
         },
         &mint,
     )?;
@@ -208,7 +206,7 @@ fn main() -> Result<(), WalletError> {
     source.connect()?;
     let result = (|| {
         dest.connect()?;
-        let r = run(&cli, source.as_ref(), &dest);
+        let r = run(&cli, source.as_ref(), &dest, &journal);
         let _ = dest.disconnect();
         r
     })();
@@ -217,7 +215,12 @@ fn main() -> Result<(), WalletError> {
     result
 }
 
-fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), WalletError> {
+fn run(
+    cli: &Cli,
+    source: &dyn WalletBackend,
+    dest: &CdkWallet,
+    journal: &MigrationJournal,
+) -> Result<(), WalletError> {
     let to_wallet_err = |e: sonar_wallet_migrate::MigrateError| WalletError::Backend(e.to_string());
     match &cli.command {
         Command::Status => {
@@ -228,13 +231,24 @@ fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), Wa
                     dest_max_sats: None,
                     fee_cap_sats: None,
                 },
+                journal,
             );
-            let (s, d) = engine.balances().map_err(to_wallet_err)?;
+            let s = source.balance()?;
+            let d = dest.balance()?;
+            let attempt = engine.status().map_err(to_wallet_err)?;
             println!(
                 "{}",
                 json!({
                     "breez": { "confirmed_sats": s.confirmed_sats, "pending_send_sats": s.pending_send_sats },
                     "cashu": { "confirmed_sats": d.confirmed_sats, "pending_receive_sats": d.pending_receive_sats },
+                    "migration": attempt.map(|a| json!({
+                        "settlement_id": a.settlement_id,
+                        "payment_hash": a.payment_hash,
+                        "amount_sats": a.amount_sats,
+                        "source_fee_sats": a.source_fee_sats,
+                        "source_payment_id": a.source_payment_id,
+                        "state": format!("{:?}", a.state),
+                    })),
                 })
             );
         }
@@ -246,6 +260,7 @@ fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), Wa
                     dest_max_sats: Some(args.dest_max_sats),
                     fee_cap_sats: None,
                 },
+                journal,
             );
             let plan = match args.amount_sats {
                 Some(a) => engine.plan_amount(a),
@@ -260,6 +275,10 @@ fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), Wa
                     "note": "quote only; nothing was paid and the created mint invoice will expire unused",
                 })
             );
+            // A quote-only process cannot execute this prepared token later.
+            // Remove the unspent attempt rather than leaving an unusable
+            // AwaitingConsent journal entry behind.
+            engine.cancel_unspent().map_err(to_wallet_err)?;
         }
         Command::Migrate(args) => {
             if !args.accept_custody_change {
@@ -277,8 +296,8 @@ fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), Wa
                     dest_max_sats: Some(args.dest_max_sats),
                     fee_cap_sats: Some(args.max_fee_sats),
                 },
+                journal,
             );
-            let baseline = engine.balances().map_err(to_wallet_err)?.1.confirmed_sats;
             let plan = match args.amount_sats {
                 Some(a) => engine.plan_amount(a),
                 None => engine.plan_drain(),
@@ -290,19 +309,41 @@ fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), Wa
                     "plan": {
                         "amount_sats": plan.amount_sats,
                         "source_fee_sats": plan.source_fee_sats,
-                        "destination_baseline_sats": baseline,
+                        "settlement_id": plan.settlement_id,
+                        "payment_hash": plan.payment_hash,
                     }
                 })
             );
-            let payment = engine.execute(&plan).map_err(to_wallet_err)?;
+            let payment = engine.execute_once(&plan);
+            // execute_once durably writes Sending before calling the source.
+            // Print the journal identity even when that call returns an
+            // ambiguous error, so the operator has the exact resume command.
+            if let Some(attempt) = engine.status().map_err(to_wallet_err)? {
+                println!(
+                    "{}",
+                    json!({
+                        "resume": {
+                            "settlement_id": attempt.settlement_id,
+                            "payment_hash": attempt.payment_hash,
+                            "state": format!("{:?}", attempt.state),
+                            "command": "sonar-migrate-cli settle",
+                        }
+                    })
+                );
+            }
+            let payment = payment.map_err(to_wallet_err)?;
             println!(
                 "{}",
                 json!({ "paid": { "id": payment.id, "amount_sats": payment.amount_sats, "fees_sats": payment.fees_sats, "status": format!("{:?}", payment.status) } })
             );
             let outcome = engine
-                .settle(baseline, plan.amount_sats, args.settle_polls)
+                .settle(
+                    &plan.settlement_id,
+                    args.settle_polls,
+                    Duration::from_secs(15),
+                )
                 .map_err(to_wallet_err)?;
-            print_settlement(&outcome, baseline, plan.amount_sats);
+            print_settlement(&outcome);
         }
         Command::SimFund(args) => {
             if cli.source_mint.is_none() {
@@ -352,34 +393,35 @@ fn run(cli: &Cli, source: &dyn WalletBackend, dest: &CdkWallet) -> Result<(), Wa
                     dest_max_sats: None,
                     fee_cap_sats: None,
                 },
+                journal,
             );
+            let attempt = engine.status().map_err(to_wallet_err)?.ok_or_else(|| {
+                WalletError::InvalidInput("no migration attempt is journaled".into())
+            })?;
             let outcome = engine
-                .settle(args.baseline_sats, args.expected_sats, args.settle_polls)
+                .settle(
+                    &attempt.settlement_id,
+                    args.settle_polls,
+                    Duration::from_secs(15),
+                )
                 .map_err(to_wallet_err)?;
-            print_settlement(&outcome, args.baseline_sats, args.expected_sats);
+            print_settlement(&outcome);
         }
     }
     Ok(())
 }
 
-fn print_settlement(outcome: &Settlement, baseline: u64, expected: u64) {
+fn print_settlement(outcome: &Settlement) {
     match outcome {
-        Settlement::Settled {
-            destination_confirmed_sats,
-        } => println!(
-            "{}",
-            json!({ "settled": true, "cashu_confirmed_sats": destination_confirmed_sats })
-        ),
-        Settlement::Pending {
-            destination_confirmed_sats,
-        } => println!(
+        Settlement::Settled { amount_sats } => {
+            println!("{}", json!({ "settled": true, "amount_sats": amount_sats }))
+        }
+        Settlement::Pending { amount_sats } => println!(
             "{}",
             json!({
                 "settled": false,
-                "cashu_confirmed_sats": destination_confirmed_sats,
-                "resume": format!(
-                    "funds not visible yet; the destination keeps reconciling — re-run: sonar-migrate-cli settle --baseline-sats {baseline} --expected-sats {expected}"
-                ),
+                "amount_sats": amount_sats,
+                "resume": "funds are not settled yet; re-run: sonar-migrate-cli settle",
             })
         ),
     }

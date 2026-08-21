@@ -42,6 +42,51 @@
 >    which derives a different wallet. Pinned by a golden vector shared with
 >    `ios/bitchatTests/Services/SonarWalletDerivationTests.swift`.
 
+## Breez → Cashu migration
+
+`core/sonar-wallet-migrate` owns the funds-safety state machine. The apps host
+the existing Breez wallet behind sonar-ffi's `HostMigrationSource`; Cashu is
+the Rust `SonarCashuWallet` destination. Apple implements the host in
+`ios/bitchat/Views/Sonar/WalletMigration.swift`, while Compose Android and
+Desktop implement it through `WalletMigrationController` and the platform
+`WalletBridge`.
+
+The Cashu working directory contains the durable, account-and-mint-bound
+`cashu.migration.v1.json` journal. Its normal progression is
+`AwaitingConsent` → `Sending` → `PaymentUnknown` / `SourcePending` /
+`SourcePaid` → `MintPaid` → `Settled`. `Sending` is atomically persisted and
+fsynced before the source `send`, so an app restart cannot resend an ambiguous
+payment. Corrupt or misbound journal data fails closed. Wallet replacement and
+emergency wipe remove the Cashu root, including the journal, temp, and lock
+artifacts.
+
+Every plan records two independent identities:
+
+- `payment_hash` identifies the outgoing Lightning payment.
+  `HostMigrationSource.lookup_payment(payment_hash)` returns a typed
+  `HostPaymentLookupStatus`, allowing resume to distinguish pending, complete,
+  failed/refundable, and unknown outcomes.
+- `settlement_id` identifies the exact Cashu mint quote.
+  `reconcile_tracked_receive(settlement_id, timeout)` settles only that quote;
+  unrelated Cashu credits and aggregate balance deltas do not count.
+
+`SonarMigration.status()` exposes the journaled state without spending.
+`resume(polls:)` first reconciles the source payment when its outcome is
+ambiguous, then reconciles the exact destination quote. A post-payment timeout
+or app restart remains a pending migration with a safe "check again" path; only
+an `AwaitingConsent`/`ExpiredUnsent` attempt may be cancelled and replanned.
+The headless `sonar-migrate-cli status`/`settle --settle-polls N` commands use
+the same journal. `settle` has no baseline-balance argument, and `migrate`
+prints the settlement id, payment hash, current state, and resume command after
+the source attempt returns and before settlement polling begins.
+
+Host errors are non-flat `HostWalletError` values. `InsufficientFunds` must
+remain a distinct variant across UniFFI so bounded whole-balance drain
+step-down can run; all other failures retain diagnostic text. The Compose host
+maps the typed variant directly. Apple currently maps its native
+`insufficientAfterFee` case directly and retains a message fallback for native
+errors that WalletKit has not typed yet.
+
 ## Current iOS integration (Breez SDK Liquid via unify-wallet)
 
 Sonar embeds a Lightning wallet (Breez SDK Liquid, BOLT12/BIP-353 capable)

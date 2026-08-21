@@ -189,6 +189,7 @@ enum SonarRoute: Hashable {
     case contactProfile(String, String)
     case groupInfo(String)
     case walletActivity
+    case walletMigration
     /// Standalone send-payment picker (new-chat sheet → "Send a payment").
     case sendPayment
     /// Status of one external payment, by activity id (design: paystatus.jsx

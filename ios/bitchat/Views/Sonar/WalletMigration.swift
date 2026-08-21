@@ -1,6 +1,7 @@
 #if os(iOS) || os(macOS)
 
 import Foundation
+import CryptoKit
 import SonarCore
 import SwiftUI
 @preconcurrency import WalletKit
@@ -40,9 +41,23 @@ final class BreezMigrationSource: HostMigrationSource, @unchecked Sendable {
         semaphore.wait()
         switch box.value {
         case .success(let value): return value
-        case .failure(let error): throw SonarFfiError.Core(message: "\(error)")
-        case .none: throw SonarFfiError.Core(message: "wallet call produced no result")
+        case .failure(let error): throw hostError(error)
+        case .none: throw HostWalletError.Failed(reason: "wallet call produced no result")
         }
+    }
+
+    private func hostError(_ error: Error) -> HostWalletError {
+        if let walletError = error as? SonarWallet.WalletError,
+           case .insufficientAfterFee = walletError {
+            return .InsufficientFunds
+        }
+        let message = "\(error)"
+        if message.localizedCaseInsensitiveContains("insufficient")
+            || message.localizedCaseInsensitiveContains("not enough funds")
+            || message.localizedCaseInsensitiveContains("balance too low") {
+            return .InsufficientFunds
+        }
+        return .Failed(reason: message)
     }
 
     func balanceSats() throws -> UInt64 {
@@ -75,11 +90,95 @@ final class BreezMigrationSource: HostMigrationSource, @unchecked Sendable {
             complete: true
         )
     }
+
+    func lookupPayment(paymentHash: String) throws -> HostPaymentLookup {
+        let lookup = try blocking { [wallet] in
+            try await wallet.lookupPayment(paymentHash: paymentHash)
+        }
+        let status: HostPaymentLookupStatus = switch lookup.status {
+        case .pending: .pending
+        case .complete: .complete
+        case .failed: .failed
+        case .refundable: .refundable
+        case .unknown: .unknown
+        }
+        return HostPaymentLookup(
+            status: status,
+            id: lookup.id,
+            feesSats: lookup.feesSats.map { UInt64(max(0, $0)) }
+        )
+    }
 }
 
 /// Mutable box so the detached task can hand a value back across the semaphore.
 private final class ResultBox<T>: @unchecked Sendable {
     var value: Result<T, Error>?
+}
+
+struct SonarWalletMigrationRoute: View {
+    @EnvironmentObject private var store: SonarAppStore
+    @State private var model: SonarMigrationModel?
+    @State private var source: BreezMigrationSource?
+    @State private var nsec: String?
+    @State private var failure: String?
+
+    private let mintUrl = "https://mint.hedwig.sh"
+
+    var body: some View {
+        Group {
+            if let model, let source, let nsec {
+                SonarWalletMigrationScreen(
+                    model: model,
+                    mintHost: "mint.hedwig.sh",
+                    source: source,
+                    nsec: nsec
+                )
+            } else if let failure {
+                Text(failure).padding()
+            } else {
+                ProgressView().task { await load() }
+            }
+        }
+    }
+
+    @MainActor
+    private func load() async {
+        guard let bridged = store.wallet as? BridgedWallet,
+              let nsec = await store.exportNsec()
+        else {
+            failure = String(localized: "The Lightning wallet is not available on this device.")
+            return
+        }
+        let digest = SHA256.hash(data: Data(nsec.utf8))
+        let accountId = digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+        guard let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            failure = String(localized: "Could not locate wallet storage.")
+            return
+        }
+        let directory = support
+            .appendingPathComponent("sonar-cashu", isDirectory: true)
+            .appendingPathComponent(accountId, isDirectory: true)
+            .appendingPathComponent("mainnet", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            failure = String(localized: "Could not locate wallet storage.")
+            return
+        }
+        self.nsec = nsec
+        source = BreezMigrationSource(wallet: bridged.walletService.migrationWallet)
+        model = SonarMigrationModel(
+            mintUrl: mintUrl,
+            walletDir: directory.path,
+            feeCapSats: 5_000
+        )
+    }
 }
 
 // MARK: - Model
@@ -95,7 +194,7 @@ final class SonarMigrationModel: ObservableObject {
         case watching
         case settled(cashuSats: UInt64)
         /// Paid, funds not visible yet. Recoverable — not a failure.
-        case pendingSettlement(cashuSats: UInt64, expectedSats: UInt64, baselineSats: UInt64)
+        case pendingSettlement(cashuSats: UInt64)
         case failed(String)
     }
 
@@ -108,8 +207,6 @@ final class SonarMigrationModel: ObservableObject {
     private var engine: SonarMigration?
     private var cashu: SonarCashuWallet?
     private var planId: String?
-    private var baselineSats: UInt64 = 0
-    private var expectedSats: UInt64 = 0
 
     /// The mint's per-quote ceiling and the fail-closed fee cap. A quote above
     /// the cap — or a source that cannot quote a fee at all — refuses to plan.
@@ -133,8 +230,8 @@ final class SonarMigrationModel: ObservableObject {
         do {
             // Detached: the engine calls back into `source` synchronously, so
             // this must not run on the main actor.
-            let (engine, cashu, quote) = try await Task.detached {
-                () -> (SonarMigration, SonarCashuWallet, MigrationQuote) in
+            let (engine, cashu, quote, status) = try await Task.detached {
+                () -> (SonarMigration, SonarCashuWallet, MigrationQuote?, MigrationAttemptStatus?) in
                 let cashu = try SonarCashuWallet.open(
                     nsec: nsec, mintUrl: mintUrl, workingDir: walletDir
                 )
@@ -144,38 +241,69 @@ final class SonarMigrationModel: ObservableObject {
                     destMaxSats: destMax,
                     feeCapSats: feeCap
                 )
-                return (engine, cashu, try engine.plan(amountSats: nil))
+                let status = try engine.status()
+                if let status {
+                    switch status.state {
+                    case .awaitingConsent, .expiredUnsent:
+                        try engine.cancelUnspent()
+                    case .sourceFailed:
+                        break
+                    default:
+                        return (engine, cashu, nil, status)
+                    }
+                }
+                return (engine, cashu, try engine.plan(amountSats: nil), nil)
             }.value
             self.engine = engine
             self.cashu = cashu
+            if let status {
+                apply(status)
+                return
+            }
+            guard let quote else {
+                phase = .failed(String(localized: "The migration could not be opened."))
+                return
+            }
             self.planId = quote.planId
-            self.baselineSats = quote.destinationBaselineSats
-            self.expectedSats = quote.amountSats
             phase = .awaitingConsent(amountSats: quote.amountSats, feeSats: quote.sourceFeeSats)
         } catch {
-            phase = .failed("\(error)")
+            phase = .failed(
+                String(
+                    format: String(localized: "Could not price the migration: %@"),
+                    String(describing: error)
+                )
+            )
         }
     }
 
     /// Pay. Only reachable from the consent screen's explicit confirm.
     func confirmAndMigrate() async {
         guard let engine, let planId else {
-            phase = .failed("no migration plan; quote again")
+            phase = .failed(String(localized: "No migration plan; check the amount and fee again."))
             return
         }
         phase = .paying
-        let baseline = baselineSats
-        let expected = expectedSats
         do {
             _ = try await Task.detached { try engine.execute(planId: planId) }.value
             self.planId = nil
             phase = .watching
             let outcome = try await Task.detached {
-                try engine.settle(baselineSats: baseline, expectedSats: expected, polls: 24)
+                try engine.resume(polls: 24)
             }.value
             apply(outcome)
         } catch {
-            phase = .failed("\(error)")
+            let status = try? await Task.detached { try engine.status() }.value
+            if let status, status.state != .awaitingConsent, status.state != .expiredUnsent,
+               status.state != .sourceFailed {
+                phase = .pendingSettlement(cashuSats: cashuBalanceSats)
+            } else {
+                phase = .failed(
+                    String(
+                        format: String(localized: "The payment did not go through: %@"),
+                        String(describing: error)
+                    )
+                )
+            }
         }
     }
 
@@ -185,15 +313,13 @@ final class SonarMigrationModel: ObservableObject {
     func resumeSettlement() async {
         guard let engine else { return }
         phase = .watching
-        let baseline = baselineSats
-        let expected = expectedSats
         do {
             let outcome = try await Task.detached {
-                try engine.settle(baselineSats: baseline, expectedSats: expected, polls: 24)
+                try engine.resume(polls: 24)
             }.value
             apply(outcome)
         } catch {
-            phase = .failed("\(error)")
+            phase = .pendingSettlement(cashuSats: cashuBalanceSats)
         }
     }
 
@@ -206,6 +332,14 @@ final class SonarMigrationModel: ObservableObject {
             (try? await Task.detached { try source.balanceSats() }.value) ?? breezBalanceSats
     }
 
+    func cancelUnspentOnLeave() async {
+        guard let engine else { return }
+        let status = try? await Task.detached { try engine.status() }.value
+        guard status?.state == .awaitingConsent || status?.state == .expiredUnsent else { return }
+        _ = try? await Task.detached { try engine.cancelUnspent() }.value
+        planId = nil
+    }
+
     private func apply(_ outcome: MigrationOutcome) {
         switch outcome {
         case .settled(let cashuConfirmedSats):
@@ -213,11 +347,22 @@ final class SonarMigrationModel: ObservableObject {
             phase = .settled(cashuSats: cashuConfirmedSats)
         case .pending(let cashuConfirmedSats):
             cashuBalanceSats = cashuConfirmedSats
-            phase = .pendingSettlement(
-                cashuSats: cashuConfirmedSats,
-                expectedSats: expectedSats,
-                baselineSats: baselineSats
-            )
+            phase = .pendingSettlement(cashuSats: cashuConfirmedSats)
+        }
+    }
+
+    private func apply(_ status: MigrationAttemptStatus) {
+        switch status.state {
+        case .settled:
+            phase = .settled(cashuSats: status.amountSats)
+        case .sourceFailed:
+            phase = .failed(String(localized: "The Lightning payment failed without moving funds."))
+        case .awaitingConsent:
+            phase = .awaitingConsent(amountSats: status.amountSats, feeSats: status.feeSats)
+        case .expiredUnsent:
+            phase = .idle
+        default:
+            phase = .pendingSettlement(cashuSats: cashuBalanceSats)
         }
     }
 }
@@ -239,47 +384,60 @@ struct SonarWalletMigrationScreen: View {
                 switch model.phase {
                 case .idle:
                     custodyExplainer
-                    actionButton("Check amount and fee") {
+                    actionButton(String(localized: "Check amount and fee")) {
                         Task { await model.quote(nsec: nsec, source: source) }
                     }
                 case .quoting:
-                    progressRow("Pricing the migration…")
+                    progressRow(String(localized: "Pricing the migration…"))
                 case .awaitingConsent(let amount, let fee):
                     custodyExplainer
                     quoteSummary(amount: amount, fee: fee)
-                    actionButton("Move \(amount) sats to \(mintHost)") {
+                    actionButton(
+                        String(
+                            format: String(localized: "Move %@ sats to %@"),
+                            String(amount),
+                            mintHost
+                        )
+                    ) {
                         Task { await model.confirmAndMigrate() }
                     }
-                    Text("This pays now. It cannot be undone from here.")
+                    Text("This pays now. It cannot be undone from then.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 case .paying:
-                    progressRow("Paying from the Lightning wallet…")
+                    progressRow(String(localized: "Paying from the Lightning wallet…"))
                 case .watching:
-                    progressRow("Waiting for the mint to issue your ecash…")
+                    progressRow(String(localized: "Waiting for the mint to issue your ecash…"))
                 case .settled(let sats):
                     resultRow(
-                        title: "Migration complete",
-                        detail: "\(sats) sats are now in your Cashu wallet.",
+                        title: String(localized: "Migration complete"),
+                        detail: String(
+                            format: String(localized: "%@ sats are now in your Cashu wallet."),
+                            String(sats)
+                        ),
                         systemImage: "checkmark.circle"
                     )
-                case .pendingSettlement(let sats, _, _):
+                case .pendingSettlement(let sats):
                     resultRow(
-                        title: "Paid — waiting on the mint",
-                        detail: "Your payment went out. The mint has not issued the ecash yet; "
-                            + "your wallet keeps trying. Current Cashu balance: \(sats) sats.",
+                        title: String(localized: "Paid — waiting on the mint"),
+                        detail: String(
+                            format: String(
+                                localized: "Your payment went out. The mint has not issued the ecash yet; your wallet keeps trying. Current Cashu balance: %@ sats."
+                            ),
+                            String(sats)
+                        ),
                         systemImage: "clock"
                     )
-                    actionButton("Check again") {
+                    actionButton(String(localized: "Check again")) {
                         Task { await model.resumeSettlement() }
                     }
                 case .failed(let message):
                     resultRow(
-                        title: "Migration stopped",
+                        title: String(localized: "Migration stopped"),
                         detail: message,
                         systemImage: "exclamationmark.triangle"
                     )
-                    actionButton("Try again") {
+                    actionButton(String(localized: "Try again")) {
                         Task { await model.quote(nsec: nsec, source: source) }
                     }
                 }
@@ -287,8 +445,11 @@ struct SonarWalletMigrationScreen: View {
             }
             .padding(20)
         }
-        .navigationTitle("Move to Cashu")
+        .navigationTitle(String(localized: "Move to Cashu"))
         .task { await model.refreshBalances(source: source) }
+        .onDisappear {
+            Task { await model.cancelUnspentOnLeave() }
+        }
     }
 
     private var header: some View {
@@ -302,14 +463,14 @@ struct SonarWalletMigrationScreen: View {
             Label("This changes who holds your money", systemImage: "info.circle")
                 .font(.headline)
             Text(
-                "Today your balance is self-custodial. After moving, you hold ecash tokens on "
-                + "this device and **\(mintHost)** holds the Lightning side. If that mint "
-                + "disappears, the ecash it issued cannot be redeemed."
+                String(
+                    format: String(
+                        localized: "Today your balance is self-custodial. After moving, you hold ecash tokens on this device and %@ holds the Lightning side. If that mint disappears, the ecash it issued cannot be redeemed."
+                    ),
+                    mintHost
+                )
             )
-            Text(
-                "Your tokens are recoverable from your account key on this mint, so a reinstall "
-                + "does not lose them."
-            )
+            Text("Your tokens are recoverable from your account key on this mint, so a reinstall does not lose them.")
             .foregroundStyle(.secondary)
         }
         .font(.callout)
@@ -319,8 +480,16 @@ struct SonarWalletMigrationScreen: View {
 
     private func quoteSummary(amount: UInt64, fee: UInt64?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            row("Arrives in Cashu", "\(amount) sats")
-            row("Network fee", fee.map { "\($0) sats" } ?? "unknown")
+            row(
+                String(localized: "Arrives in Cashu"),
+                String(format: String(localized: "%@ sats"), String(amount))
+            )
+            row(
+                String(localized: "Network fee"),
+                fee.map {
+                    String(format: String(localized: "%@ sats"), String($0))
+                } ?? String(localized: "Fee unknown")
+            )
         }
         .padding(14)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
@@ -328,8 +497,14 @@ struct SonarWalletMigrationScreen: View {
 
     private var balances: some View {
         VStack(alignment: .leading, spacing: 6) {
-            row("Lightning wallet", "\(model.breezBalanceSats) sats")
-            row("Cashu wallet", "\(model.cashuBalanceSats) sats")
+            row(
+                String(localized: "Lightning wallet"),
+                String(format: String(localized: "%@ sats"), String(model.breezBalanceSats))
+            )
+            row(
+                String(localized: "Cashu wallet"),
+                String(format: String(localized: "%@ sats"), String(model.cashuBalanceSats))
+            )
         }
         .font(.footnote)
         .foregroundStyle(.secondary)

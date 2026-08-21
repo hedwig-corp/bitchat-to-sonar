@@ -9,7 +9,7 @@ package chat.bitchat.sonar.wallet
  * exists so [WalletMigrationScreen] can drive it without knowing about UniFFI.
  *
  * Lifecycle mirrors the engine's own: [quote] → (consent UI) → [execute] →
- * [settle]. `execute` is the only call that spends, and it consumes the plan,
+ * [resume]. `execute` is the only call that spends, and it consumes the plan,
  * so a double-tap cannot pay twice.
  */
 interface WalletMigrationController {
@@ -27,10 +27,16 @@ interface WalletMigrationController {
      * crash between [execute] and settlement — this only observes the wallet's
      * own reconciliation.
      */
-    suspend fun settle(baselineSats: ULong, expectedSats: ULong, polls: UInt): MigrationResultUi
+    suspend fun resume(polls: UInt): MigrationResultUi
+
+    /** Durable attempt state, available after process restart. */
+    suspend fun status(): MigrationAttemptStatusUi?
+
+    /** Remove an unspent consent/expired attempt; refuses ambiguous/paid states. */
+    suspend fun cancelUnspent()
 
     /** Release the destination wallet's store. */
-    fun close()
+    suspend fun close()
 }
 
 /** What the consent screen shows. `planId` is single-use. */
@@ -39,6 +45,26 @@ data class MigrationQuoteUi(
     val amountSats: ULong,
     val feeSats: ULong?,
     val baselineSats: ULong,
+)
+
+enum class MigrationAttemptStateUi {
+    AwaitingConsent,
+    Sending,
+    PaymentUnknown,
+    SourcePending,
+    SourcePaid,
+    MintPaid,
+    Settled,
+    SourceFailed,
+    ExpiredUnsent,
+}
+
+data class MigrationAttemptStatusUi(
+    val settlementId: String,
+    val amountSats: ULong,
+    val feeSats: ULong?,
+    val state: MigrationAttemptStateUi,
+    val paymentHash: String,
 )
 
 sealed interface MigrationResultUi {
@@ -63,3 +89,6 @@ expect suspend fun createWalletMigrationController(
     destMaxSats: ULong?,
     feeCapSats: ULong?,
 ): WalletMigrationController?
+
+/** Remove only Cashu-derived state and migration journals, never the account key. */
+expect suspend fun wipeCashuMigrationStorage()

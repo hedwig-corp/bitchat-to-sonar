@@ -5,6 +5,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import chat.bitchat.sonar.SonarCore
 import uniffi.sonar_ffi.MigrationOutcome
+import uniffi.sonar_ffi.MigrationAttemptState
 import uniffi.sonar_ffi.SonarCashuWallet
 import uniffi.sonar_ffi.SonarMigration
 
@@ -38,27 +39,50 @@ private class JvmWalletMigrationController(
         engine.execute(planId).`amountSats`
     }
 
-    override suspend fun settle(
-        baselineSats: ULong,
-        expectedSats: ULong,
-        polls: UInt,
-    ): MigrationResultUi = withContext(Dispatchers.IO) {
-        when (val outcome = engine.settle(baselineSats, expectedSats, polls)) {
+    override suspend fun resume(polls: UInt): MigrationResultUi = withContext(Dispatchers.IO) {
+        when (val outcome = engine.resume(polls)) {
             is MigrationOutcome.Settled -> MigrationResultUi.Settled(outcome.`cashuConfirmedSats`)
             is MigrationOutcome.Pending -> MigrationResultUi.Pending(outcome.`cashuConfirmedSats`)
         }
     }
 
-    override fun close() {
+    override suspend fun status(): MigrationAttemptStatusUi? = withContext(Dispatchers.IO) {
+        engine.status()?.let {
+            MigrationAttemptStatusUi(
+                settlementId = it.`settlementId`,
+                amountSats = it.`amountSats`,
+                feeSats = it.`feeSats`,
+                state = when (it.state) {
+                    MigrationAttemptState.AWAITING_CONSENT -> MigrationAttemptStateUi.AwaitingConsent
+                    MigrationAttemptState.SENDING -> MigrationAttemptStateUi.Sending
+                    MigrationAttemptState.PAYMENT_UNKNOWN -> MigrationAttemptStateUi.PaymentUnknown
+                    MigrationAttemptState.SOURCE_PENDING -> MigrationAttemptStateUi.SourcePending
+                    MigrationAttemptState.SOURCE_PAID -> MigrationAttemptStateUi.SourcePaid
+                    MigrationAttemptState.MINT_PAID -> MigrationAttemptStateUi.MintPaid
+                    MigrationAttemptState.SETTLED -> MigrationAttemptStateUi.Settled
+                    MigrationAttemptState.SOURCE_FAILED -> MigrationAttemptStateUi.SourceFailed
+                    MigrationAttemptState.EXPIRED_UNSENT -> MigrationAttemptStateUi.ExpiredUnsent
+                },
+                paymentHash = it.`paymentHash`,
+            )
+        }
+    }
+
+    override suspend fun cancelUnspent() = withContext(Dispatchers.IO) {
+        engine.cancelUnspent()
+    }
+
+    override suspend fun close() = withContext(Dispatchers.IO) {
         runCatching { destination.disconnect() }
         runCatching { destination.close() }
         runCatching { engine.close() }
+        Unit
     }
 }
 
-private fun desktopCashuDir(): File {
+private fun desktopCashuDir(accountId: String): File {
     val home = System.getProperty("user.home") ?: "."
-    return File(home, ".sonar/sonar-cashu/mainnet")
+    return File(home, ".sonar/sonar-cashu/$accountId/mainnet")
 }
 
 actual suspend fun createWalletMigrationController(
@@ -72,7 +96,11 @@ actual suspend fun createWalletMigrationController(
     if (!WalletBridge.isAvailable()) return@withContext null
     val nsec = SonarCore.identityNsec()
 
-    val dir = desktopCashuDir().apply { mkdirs() }
+    val accountId = java.security.MessageDigest.getInstance("SHA-256")
+        .digest(nsec.toByteArray(Charsets.UTF_8))
+        .take(16)
+        .joinToString("") { "%02x".format(it) }
+    val dir = desktopCashuDir(accountId).apply { mkdirs() }
     val destination = SonarCashuWallet.open(nsec, mintUrl, dir.absolutePath)
 
     val engine = try {
@@ -83,4 +111,12 @@ actual suspend fun createWalletMigrationController(
         throw t
     }
     JvmWalletMigrationController(destination, engine)
+}
+
+actual suspend fun wipeCashuMigrationStorage(): Unit = withContext(Dispatchers.IO) {
+    val home = System.getProperty("user.home") ?: "."
+    val root = File(home, ".sonar/sonar-cashu")
+    if (root.exists() && !root.deleteRecursively()) {
+        error("Cashu wallet storage could not be cleared")
+    }
 }

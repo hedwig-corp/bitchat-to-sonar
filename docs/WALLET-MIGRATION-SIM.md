@@ -41,9 +41,36 @@ ARGS=(--source-mint http://localhost:3338 --mint http://localhost:3339
 "$BIN" "${ARGS[@]}" status
 "$BIN" "${ARGS[@]}" quote --amount-sats 2000        # prices it, spends nothing
 "$BIN" "${ARGS[@]}" migrate --amount-sats 2000 --max-fee-sats 50 --accept-custody-change
+"$BIN" "${ARGS[@]}" settle --settle-polls 24         # resume only; never spends
 ```
 
 Tear down with `docker rm -f sim-mint-src sim-mint-dst`.
+
+## Durable journal and exact resume
+
+The destination working directory contains `cashu.migration.v1.json`. It is an
+account-and-mint-bound, atomically replaced journal; corrupt, unsupported, or
+misbound bytes fail closed instead of looking like "no migration". The state
+machine is:
+
+`AwaitingConsent` → `Sending` → `PaymentUnknown` / `SourcePending` /
+`SourcePaid` → `MintPaid` → `Settled`.
+
+`SourceFailed` and `ExpiredUnsent` are terminal no-spend states. Before calling
+the source wallet, the engine writes `Sending`, fsyncs the file, renames it, and
+fsyncs the parent directory. A restart therefore cannot call `send` again: it
+must first look up the journaled `payment_hash`. Once `execute_once` returns
+from the source call, the CLI prints the journal's `settlement_id`,
+`payment_hash`, state, and resume command before it starts the settlement watch.
+That resume record is also printed when the source returned an ambiguous error.
+
+`status` reads the journal. `settle` takes only `--settle-polls`; it resumes the
+journaled attempt and does not accept a baseline-balance argument. Source
+reconciliation uses `HostMigrationSource.lookup_payment(payment_hash)`.
+Destination reconciliation uses
+`reconcile_tracked_receive(settlement_id, timeout)`, which checks the exact
+mint quote created for the migration. A balance increase, including an
+unrelated incoming payment for the same amount, cannot settle the attempt.
 
 ## What it does and does not prove
 
@@ -56,7 +83,10 @@ Tear down with `docker rm -f sim-mint-src sim-mint-dst`.
 | Fee cap (fail-closed) | `--max-fee-sats 0` refuses: quoted fee 20 exceeds cap |
 | Destination max | `--amount-sats 2000 --dest-max-sats 100` refuses |
 | melt→mint hand-off | payment reports `Complete`, settlement watch reports `settled` |
-| `settle` resume | re-running `settle` after a migration re-reports the right balance |
+| `settle` resume | re-running `settle` resumes the journaled settlement/payment identities; no baseline is supplied |
+| Exact quote settlement | unrelated destination credits remain pending until the migration's own quote settles |
+| No duplicate send | a durable `Sending` journal refuses a second `execute_once` |
+| Corrupt-journal safety | malformed journal bytes fail construction closed |
 | Crash resume, for real | destination mint frozen (`docker pause`) after the melt, process killed mid-watch, then `settle` recovered the funds — source down exactly 1003, destination up exactly 1000 |
 | NUT-13 restore | deleting the whole destination wallet directory and reopening with only the account key recovers the full balance |
 
@@ -136,57 +166,17 @@ reads like a fee-reserve problem and sends you chasing the wrong bug. **Budget
 ≥ ~1,050 sats for any live test**, and check the limits endpoint before
 assuming a payment failure is ours.
 
-## Known gap: the settlement watch has no timeout
+## Pending settlement and drain safeguards
 
-Freeze the destination mint after the melt (`docker pause sim-mint-dst` two
-seconds into a `migrate`) and the command prints
+Each destination reconciliation call has a request timeout. A timeout leaves
+the journal in `MintPaid` and returns `Pending`; it never turns a post-payment
+network failure into a fresh send. Re-run `settle` after the mint is reachable.
+The application presents the same condition as "Paid — waiting on the mint"
+with a non-spending "Check again" action.
 
-```
-{"plan":{"amount_sats":1000,"destination_baseline_sats":0,"source_fee_sats":10}}
-{"paid":{"amount_sats":1000,"fees_sats":2,"id":"01a005c8-…","status":"Complete"}}
-```
-
-and then **hangs indefinitely** — observed past ten minutes with
-`--settle-polls 4`. The poll count cannot bound it: one poll blocks forever on a
-mint that accepts the connection and never answers, which is what a hung server
-looks like (a *refused* connection fails fast instead).
-
-The state is recoverable — unfreezing and running `settle` found the funds, with
-the balances conserved exactly — but the hang lands at the worst moment in the
-whole flow: after the money has left the source, and on a branch that never
-prints the resume instruction, because that text only exists on the `Pending`
-path. An operator who did not already know to interrupt and run `settle` would
-be staring at a dead terminal holding a paid migration. In the app the same
-shape is a spinner that never resolves.
-
-Fixes worth considering: a per-request timeout on the destination sync so a
-poll can fail into `Pending` instead of blocking, and printing the resume
-instruction as soon as the payment succeeds rather than only when settlement
-gives up.
-
-## Known gap this harness found: `prepare_send` does not check affordability
-
-`migrate` **without** `--amount-sats` (drain the whole balance) fails on a Cashu
-source:
-
-```
-{"plan":{"amount_sats":4949,"destination_baseline_sats":0,"source_fee_sats":50}}
-Error: Backend("source wallet: backend error: Insufficient funds")
-```
-
-`plan_drain` reserves `amount + quoted fee` and leaves 1 sat of slack, which the
-mint's input fee then eats. The deeper cause is in the backend, not the engine:
-`CdkWallet::prepare_send` asks the mint for a melt quote but never checks that
-local proofs cover `amount + fee_reserve + input fees`, so it can return a
-`PreparedSend` the wallet cannot pay. `InsufficientFunds` surfaces later, inside
-`send`.
-
-It **fails safe** — the source balance is untouched — but it fails at the wrong
-moment: in the app this is a user who reads a fee, consents, and only then gets
-an error. It also leaves the abandoned destination quotes behind (the retry loop
-can mint up to three).
-
-This does not affect the Breez→Cashu direction that ships first: Breez is the
-source there and does its own affordability check, while Cashu is only the
-destination and does no melting. It does affect any future "send max" from a
-Cashu wallet.
+Whole-balance drain planning is fail-closed. It refuses a destination maximum
+or fee-cap violation before consent. When a host reports typed
+`InsufficientFunds`, or an older host returns an opaque insufficient-funds
+message, the planner steps down through bounded smaller candidates. If none is
+affordable it stops without paying; it never silently exceeds the displayed
+fee or destination limit.

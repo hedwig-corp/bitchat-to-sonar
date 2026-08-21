@@ -76,6 +76,32 @@ pub enum PaymentStatus {
     Refundable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentLookupStatus {
+    Pending,
+    Complete,
+    Failed,
+    Refundable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentLookup {
+    pub status: PaymentLookupStatus,
+    pub id: Option<String>,
+    pub fees_sats: Option<u64>,
+}
+
+impl PaymentLookup {
+    pub fn unknown() -> Self {
+        Self {
+            status: PaymentLookupStatus::Unknown,
+            id: None,
+            fees_sats: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Payment {
     /// Stable identifier for this payment, unique within the wallet and
@@ -187,6 +213,20 @@ pub struct ReceiveRequest {
     /// supports (a BOLT11 invoice generally needs an amount).
     pub amount_sats: Option<u64>,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedReceive {
+    pub id: String,
+    pub request: String,
+    pub amount_sats: u64,
+    pub expires_at_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackedReceiveState {
+    Pending,
+    Settled { amount_sats: u64 },
 }
 
 impl ReceiveRequest {

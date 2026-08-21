@@ -35,11 +35,14 @@ pub use seed::{
     cashu_wallet_seed, entropy_hex, nsec_to_secret, wallet_entropy, CASHU_SEED_INFO, SEED_INFO,
     SEED_SALT,
 };
-pub use traits::{prepare_and_send, supports_receive, WalletBackend, WalletEventListener};
+pub use traits::{
+    prepare_and_send, supports_receive, TrackedReceiveBackend, WalletBackend, WalletEventListener,
+};
 pub use types::{
-    Balance, Destination, DestinationKind, ExchangeRate, Network, Payment, PaymentStatus,
-    PreparedSend, PreparedSendToken, ReceiveMethod, ReceiveRequest, WalletCapabilities,
-    WalletConfig, WalletEvent,
+    Balance, Destination, DestinationKind, ExchangeRate, Network, Payment, PaymentLookup,
+    PaymentLookupStatus, PaymentStatus, PreparedSend, PreparedSendToken, ReceiveMethod,
+    ReceiveRequest, TrackedReceive, TrackedReceiveState, WalletCapabilities, WalletConfig,
+    WalletEvent,
 };
 pub use wipe::guard_wipe_path;
 /// Re-exported so backends can build a [`WalletConfig`] without taking their

@@ -36,8 +36,9 @@ use cdk::Amount;
 use sonar_wallet::{
     classify_destination, guard_wipe_path, resolve_send_amount, Balance, Destination,
     DestinationKind, ExchangeRate, ListenerRegistry, Payment, PaymentStatus, PreparedSend,
-    PreparedSendToken, ReceiveMethod, ReceiveRequest, Result, WalletBackend, WalletCapabilities,
-    WalletConfig, WalletError, WalletEvent, WalletEventListener,
+    PreparedSendToken, ReceiveMethod, ReceiveRequest, Result, TrackedReceive,
+    TrackedReceiveBackend, TrackedReceiveState, WalletBackend, WalletCapabilities, WalletConfig,
+    WalletError, WalletEvent, WalletEventListener,
 };
 
 /// File name of the redb store inside the working dir — also the wipe guard's
@@ -70,8 +71,24 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 /// and a loose `starts_with` would have handed them to `remove_dir_all` —
 /// defeating the foreign-content protection the wipe guard exists for.
 fn is_our_artifact(name: &str) -> bool {
-    if name == DB_FILE || name == ACCOUNT_MARKER {
+    if matches!(
+        name,
+        DB_FILE
+            | ACCOUNT_MARKER
+            | "cashu.migration.v1.json"
+            | "cashu.migration.v1.json.tmp"
+            | "cashu.migration.v1.lock"
+    ) {
         return true;
+    }
+    if let Some(suffix) = name
+        .strip_prefix("cashu.migration.v1.json.")
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    {
+        return !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
     }
     name.strip_prefix(RESTORED_MARKER_PREFIX)
         .and_then(|rest| rest.strip_prefix('.'))
@@ -203,14 +220,28 @@ impl CdkWallet {
     fn check_account_binding(&self) -> Result<()> {
         use std::io::Write;
         let path = self.config.working_dir.join(ACCOUNT_MARKER);
+        let db_path = self.config.working_dir.join(DB_FILE);
         let ours = self.account_fingerprint();
+
+        // A crash while claiming a genuinely new directory can leave an
+        // empty/partial marker but no proof database. There are no bearer
+        // funds to misattribute yet, so remove only malformed claims and let
+        // create_new retry. A complete different fingerprint still refuses.
+        if path.exists() && !db_path.exists() {
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            if existing.trim().len() != ours.len() {
+                std::fs::remove_file(&path).map_err(|e| {
+                    WalletError::Backend(format!("remove partial {}: {e}", path.display()))
+                })?;
+            }
+        }
 
         // An existing proof database with no marker is NOT ours to claim: a
         // database-only backup restore (or a lost sidecar) would otherwise be
         // adopted by whichever seed opened it first, handing one account's
         // bearer proofs to another. Only a genuinely new store self-claims;
         // adopting an existing one is an explicit, deliberate act.
-        if !path.exists() && self.config.working_dir.join(DB_FILE).exists() {
+        if !path.exists() && db_path.exists() {
             if std::env::var("SONAR_CASHU_ADOPT_UNBOUND_STORE").as_deref() != Ok("1") {
                 return Err(WalletError::InvalidInput(format!(
                     "{} holds a wallet database with no account marker; refusing to adopt \
@@ -314,11 +345,12 @@ impl CdkWallet {
         // Before touching the store: never open another account's proofs.
         self.check_account_binding()?;
         let db_path = self.config.working_dir.join(DB_FILE);
-        let fresh = !self
+        let needs_restore = !self
             .config
             .working_dir
             .join(self.restore_marker_name())
-            .exists();
+            .exists()
+            || !db_path.exists();
         let localstore = cdk_redb::WalletRedbDatabase::new(&db_path)
             .map_err(|e| WalletError::Backend(format!("open {}: {e}", db_path.display())))?;
         let wallet = WalletBuilder::new()
@@ -328,7 +360,7 @@ impl CdkWallet {
             .seed(self.seed64())
             .build()
             .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))?;
-        Ok((wallet, fresh))
+        Ok((wallet, needs_restore))
     }
 
     /// One pass of the pending-mint-quote watcher (best-effort: errors are
@@ -558,6 +590,84 @@ impl Drop for CdkWallet {
     }
 }
 
+impl TrackedReceiveBackend for CdkWallet {
+    fn create_tracked_receive(&self, request: &ReceiveRequest) -> Result<TrackedReceive> {
+        let wallet = self.wallet()?;
+        let method = match request.method {
+            ReceiveMethod::Bolt11Invoice => PaymentMethod::Known(KnownMethod::Bolt11),
+            ReceiveMethod::Bolt12Offer => PaymentMethod::Known(KnownMethod::Bolt12),
+            other => {
+                return Err(WalletError::Unsupported(format!("receiving via {other:?}")));
+            }
+        };
+        if request.method == ReceiveMethod::Bolt11Invoice && request.amount_sats.is_none() {
+            return Err(WalletError::InvalidInput(
+                "a BOLT11 invoice needs an amount".into(),
+            ));
+        }
+        let quote = self
+            .rt()
+            .block_on(wallet.mint_quote(
+                method,
+                request.amount_sats.map(Amount::from),
+                request.description.clone(),
+                None,
+            ))
+            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let amount_sats = quote
+            .amount
+            .map(u64::from)
+            .or(request.amount_sats)
+            .ok_or_else(|| WalletError::InvalidInput("mint quote has no fixed amount".into()))?;
+        Ok(TrackedReceive {
+            id: quote.id,
+            request: quote.request,
+            amount_sats,
+            expires_at_secs: (quote.expiry != 0).then_some(quote.expiry),
+        })
+    }
+
+    fn reconcile_tracked_receive(
+        &self,
+        id: &str,
+        request_timeout: Duration,
+    ) -> Result<TrackedReceiveState> {
+        let wallet = self.wallet()?;
+        // `timeout` must be constructed inside `block_on`: creating the Sleep
+        // outside this wallet's runtime panics with "no reactor running".
+        self.rt()
+            .block_on(async {
+                tokio::time::timeout(request_timeout, async {
+                    let quote = wallet
+                        .check_mint_quote_status(id)
+                        .await
+                        .map_err(|e| WalletError::Network(format!("check mint quote {id}: {e}")))?;
+                    match quote.state {
+                        MintQuoteState::Unpaid => Ok(TrackedReceiveState::Pending),
+                        MintQuoteState::Paid => {
+                            let proofs = wallet
+                                .mint(id, SplitTarget::default(), None)
+                                .await
+                                .map_err(|e| {
+                                    WalletError::Network(format!("mint paid quote {id}: {e}"))
+                                })?;
+                            let amount_sats = proofs
+                                .iter()
+                                .map(|proof| u64::from(proof.amount))
+                                .fold(0u64, u64::saturating_add);
+                            Ok(TrackedReceiveState::Settled { amount_sats })
+                        }
+                        MintQuoteState::Issued => Ok(TrackedReceiveState::Settled {
+                            amount_sats: u64::from(quote.amount_issued),
+                        }),
+                    }
+                })
+                .await
+            })
+            .map_err(|_| WalletError::Timeout)?
+    }
+}
+
 impl WalletBackend for CdkWallet {
     fn capabilities(&self) -> WalletCapabilities {
         Self::CAPABILITIES
@@ -729,17 +839,18 @@ impl WalletBackend for CdkWallet {
             // The Balance contract names Cashu unminted quotes as pending
             // receives; CDK's pending-proof balance does not see a quote that
             // has no proofs yet, so sum active quote amounts in as well.
-            let quoted: u64 = wallet
+            let quoted = wallet
                 .get_active_mint_quotes()
                 .await
                 .map_err(|e| WalletError::Backend(e.to_string()))?
                 .iter()
+                .filter(|q| q.state == MintQuoteState::Paid)
                 .filter_map(|q| q.amount)
                 .map(u64::from)
-                .sum();
+                .fold(0u64, u64::saturating_add);
             Ok(Balance {
                 confirmed_sats: u64::from(confirmed),
-                pending_receive_sats: u64::from(pending) + quoted,
+                pending_receive_sats: u64::from(pending).saturating_add(quoted),
                 pending_send_sats: u64::from(reserved),
             })
         })
@@ -754,28 +865,7 @@ impl WalletBackend for CdkWallet {
     }
 
     fn receive(&self, request: &ReceiveRequest) -> Result<String> {
-        let wallet = self.wallet()?;
-        let method = match request.method {
-            ReceiveMethod::Bolt11Invoice => PaymentMethod::Known(KnownMethod::Bolt11),
-            ReceiveMethod::Bolt12Offer => PaymentMethod::Known(KnownMethod::Bolt12),
-            other => {
-                return Err(WalletError::Unsupported(format!("receiving via {other:?}")));
-            }
-        };
-        if request.method == ReceiveMethod::Bolt11Invoice && request.amount_sats.is_none() {
-            return Err(WalletError::InvalidInput(
-                "a BOLT11 invoice needs an amount".into(),
-            ));
-        }
-        let amount = request.amount_sats.map(Amount::from);
-        let description = request.description.clone();
-        self.rt().block_on(async {
-            let quote = wallet
-                .mint_quote(method, amount, description, None)
-                .await
-                .map_err(|e| WalletError::Backend(e.to_string()))?;
-            Ok(quote.request)
-        })
+        Ok(self.create_tracked_receive(request)?.request)
     }
 
     fn parse_destination(&self, input: &str) -> Result<Destination> {
@@ -824,7 +914,11 @@ impl WalletBackend for CdkWallet {
                 DestinationKind::Bolt11 => {
                     // An amount-carrying invoice needs no options; an
                     // amountless one carries the caller's amount as msat.
-                    let options = requested.map(|sats| MeltOptions::new_amountless(sats * 1_000));
+                    let options = if destination.amount_sats.is_none() {
+                        requested.map(|sats| MeltOptions::new_amountless(sats * 1_000))
+                    } else {
+                        None
+                    };
                     wallet
                         .melt_quote(KnownMethod::Bolt11, destination.raw.clone(), options, None)
                         .await
@@ -1201,16 +1295,42 @@ mod tests {
     }
 
     #[test]
+    fn partial_account_marker_without_database_is_recovered() {
+        let dir = std::env::temp_dir().join("sonar-cdk-partial-account-marker-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ACCOUNT_MARKER), b"partial").unwrap();
+        let mut cfg = config();
+        cfg.working_dir = dir.clone();
+        let wallet = CdkWallet::new(cfg, "https://mint.example.com").unwrap();
+        wallet.check_account_binding().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(ACCOUNT_MARKER))
+                .unwrap()
+                .trim(),
+            wallet.account_fingerprint()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn wipe_predicate_matches_exact_artifacts_only() {
         assert!(is_our_artifact("cashu.redb"));
         assert!(is_our_artifact("cashu.account"));
         assert!(is_our_artifact("cashu.restored.00c0ffee"));
+        assert!(is_our_artifact("cashu.migration.v1.json"));
+        assert!(is_our_artifact("cashu.migration.v1.json.tmp"));
+        assert!(is_our_artifact("cashu.migration.v1.json.123.tmp"));
+        assert!(is_our_artifact("cashu.migration.v1.lock"));
         for foreign in [
             "cashu.redb-backup",
             "cashu.restored-notes",
             "cashu.restored.",
             "cashu.restored.xyz",
             "cashu.restored.00c0ffee.old",
+            "cashu.migration.v1.json.backup",
+            "cashu.migration.v1.json..tmp",
+            "cashu.migration.v1.lock.old",
             "notes.txt",
         ] {
             assert!(!is_our_artifact(foreign), "must reject {foreign}");

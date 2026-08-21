@@ -110,6 +110,7 @@ final class WalletBridgeService: ObservableObject {
     }
 
     private let wallet: SonarWallet
+    var migrationWallet: SonarWallet { wallet }
     private let mainnet: Bool
     private let receiveOfferCache = SonarReceiveOfferCache()
     private var balanceTask: Task<Void, Never>?

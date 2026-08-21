@@ -9,7 +9,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import java.util.concurrent.atomic.AtomicBoolean
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.could_not_open_the_migration
+import chat.bitchat.sonar.resources.could_not_price_the_migration_2
+import chat.bitchat.sonar.resources.could_not_read_the_cashu_balance
+import chat.bitchat.sonar.resources.the_lightning_payment_failed_without
+import chat.bitchat.sonar.resources.the_lightning_wallet_is_not_available
+import chat.bitchat.sonar.resources.the_payment_did_not_go_through_2
+import org.jetbrains.compose.resources.stringResource
 
 /** Where migrated funds land. */
 const val SONAR_DEFAULT_MINT_URL: String = "https://mint.hedwig.sh"
@@ -43,19 +56,35 @@ private const val SETTLE_POLLS: UInt = 24u
  */
 @Composable
 fun WalletMigrationRoute(state: SonarAppState) {
+    val errorMarker = "{sonar-migration-error}"
+    val couldNotOpenTemplate =
+        stringResource(Res.string.could_not_open_the_migration, errorMarker)
+    val couldNotReadBalanceTemplate =
+        stringResource(Res.string.could_not_read_the_cashu_balance, errorMarker)
+    val couldNotPriceTemplate =
+        stringResource(Res.string.could_not_price_the_migration_2, errorMarker)
+    val paymentFailedTemplate =
+        stringResource(Res.string.the_payment_did_not_go_through_2, errorMarker)
+    val lightningUnavailable =
+        stringResource(Res.string.the_lightning_wallet_is_not_available)
+    val lightningPaymentFailed =
+        stringResource(Res.string.the_lightning_payment_failed_without)
     val scope = rememberCoroutineScope()
     var phase by remember { mutableStateOf<MigrationPhase>(MigrationPhase.Idle) }
     var cashuBalance by remember { mutableStateOf(0uL) }
     var quote by remember { mutableStateOf<MigrationQuoteUi?>(null) }
+    var openGeneration by remember { mutableStateOf(0) }
 
     var controller by remember { mutableStateOf<WalletMigrationController?>(null) }
+    val abandoned = remember { AtomicBoolean(false) }
 
     // `createWalletMigrationController` opens the Cashu store, connects to the
     // mint, and on a fresh store runs a NUT-13 restore scan — a network round
     // trip. It must never run during composition or on the main dispatcher:
     // that blocks first paint on the mint and can ANR. Build it on IO and let
     // the screen paint "opening" state meanwhile.
-    LaunchedEffect(Unit) {
+    LaunchedEffect(openGeneration) {
+        abandoned.set(false)
         phase = MigrationPhase.Quoting
         runCatching {
             createWalletMigrationController(
@@ -69,22 +98,55 @@ fun WalletMigrationRoute(state: SonarAppState) {
                 // "unavailable" is what made the first device run
                 // undiagnosable.
                 phase = MigrationPhase.Failed(
-                    "Could not open the migration: ${cause.message ?: cause.toString()}"
+                    couldNotOpenTemplate.replace(
+                        errorMarker,
+                        cause.message ?: cause.toString(),
+                    )
                 )
             }
             .onSuccess { built ->
                 if (built == null) {
-                    phase = MigrationPhase.Failed(
-                        "The Lightning wallet is not available on this device."
-                    )
+                    phase = MigrationPhase.Failed(lightningUnavailable)
+                    return@onSuccess
+                }
+                if (abandoned.get()) {
+                    built.close()
                     return@onSuccess
                 }
                 controller = built
-                runCatching { built.destinationBalanceSats() }
-                    .onSuccess { cashuBalance = it; phase = MigrationPhase.Idle }
+                if (abandoned.get()) {
+                    controller = null
+                    built.close()
+                    return@onSuccess
+                }
+                runCatching {
+                    cashuBalance = built.destinationBalanceSats()
+                    built.status()
+                }
+                    .onSuccess { status ->
+                        phase = when (status?.state) {
+                            null -> MigrationPhase.Idle
+                            MigrationAttemptStateUi.AwaitingConsent,
+                            MigrationAttemptStateUi.ExpiredUnsent -> {
+                                // Prepared source quotes cannot survive a
+                                // process restart. Clear only this proven-
+                                // unspent state and ask for a fresh quote.
+                                built.cancelUnspent()
+                                MigrationPhase.Idle
+                            }
+                            MigrationAttemptStateUi.Settled ->
+                                MigrationPhase.Settled(status.amountSats)
+                            MigrationAttemptStateUi.SourceFailed ->
+                                MigrationPhase.Failed(lightningPaymentFailed)
+                            else -> MigrationPhase.PendingSettlement(cashuBalance)
+                        }
+                    }
                     .onFailure {
                         phase = MigrationPhase.Failed(
-                            "Could not read the Cashu balance: ${it.message}"
+                            couldNotReadBalanceTemplate.replace(
+                                errorMarker,
+                                it.message ?: it.toString(),
+                            )
                         )
                     }
             }
@@ -100,7 +162,20 @@ fun WalletMigrationRoute(state: SonarAppState) {
     // has already been destroyed" on the first real device run. With Unit,
     // dispose happens only when the screen goes away, which is the intent.
     DisposableEffect(Unit) {
-        onDispose { controller?.close() }
+        onDispose {
+            abandoned.set(true)
+            val owned = controller
+            controller = null
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch(NonCancellable) {
+                val state = runCatching { owned?.status()?.state }.getOrNull()
+                if (state == MigrationAttemptStateUi.AwaitingConsent ||
+                    state == MigrationAttemptStateUi.ExpiredUnsent
+                ) {
+                    runCatching { owned?.cancelUnspent() }
+                }
+                owned?.close()
+            }
+        }
     }
 
     WalletMigrationScreen(
@@ -109,16 +184,48 @@ fun WalletMigrationRoute(state: SonarAppState) {
         breezBalanceSats = state.walletBalanceSats().coerceAtLeast(0L).toULong(),
         cashuBalanceSats = cashuBalance,
         onQuote = {
-            val c = controller ?: return@WalletMigrationScreen
+            val c = controller
+            if (c == null) {
+                openGeneration += 1
+                return@WalletMigrationScreen
+            }
             phase = MigrationPhase.Quoting
             scope.launch {
+                when (val status = runCatching { c.status() }.getOrNull()) {
+                    null -> Unit
+                    else -> when (status.state) {
+                        MigrationAttemptStateUi.Sending,
+                        MigrationAttemptStateUi.PaymentUnknown,
+                        MigrationAttemptStateUi.SourcePending,
+                        MigrationAttemptStateUi.SourcePaid,
+                        MigrationAttemptStateUi.MintPaid -> {
+                            phase = MigrationPhase.PendingSettlement(cashuBalance)
+                            return@launch
+                        }
+                        MigrationAttemptStateUi.Settled -> {
+                            phase = MigrationPhase.Settled(status.amountSats)
+                            return@launch
+                        }
+                        MigrationAttemptStateUi.SourceFailed,
+                        MigrationAttemptStateUi.AwaitingConsent,
+                        MigrationAttemptStateUi.ExpiredUnsent ->
+                            runCatching { c.cancelUnspent() }
+                    }
+                }
                 // amountSats = null: whole-balance drain, minus the quoted fee.
                 runCatching { c.quote(null) }
                     .onSuccess {
                         quote = it
                         phase = MigrationPhase.AwaitingConsent(it.amountSats, it.feeSats)
                     }
-                    .onFailure { phase = MigrationPhase.Failed(it.message ?: "Could not price the migration.") }
+                    .onFailure {
+                        phase = MigrationPhase.Failed(
+                            couldNotPriceTemplate.replace(
+                                errorMarker,
+                                it.message ?: it.toString(),
+                            )
+                        )
+                    }
             }
         },
         onConfirm = {
@@ -126,15 +233,28 @@ fun WalletMigrationRoute(state: SonarAppState) {
             val q = quote ?: return@WalletMigrationScreen
             phase = MigrationPhase.Paying
             scope.launch {
-                val paid = runCatching { c.execute(q.planId) }
+                runCatching { c.execute(q.planId) }
                     .getOrElse {
-                        phase = MigrationPhase.Failed(it.message ?: "The payment did not go through.")
+                        phase = when (runCatching { c.status() }.getOrNull()?.state) {
+                            MigrationAttemptStateUi.Sending,
+                            MigrationAttemptStateUi.PaymentUnknown,
+                            MigrationAttemptStateUi.SourcePending,
+                            MigrationAttemptStateUi.SourcePaid,
+                            MigrationAttemptStateUi.MintPaid ->
+                                MigrationPhase.PendingSettlement(cashuBalance)
+                            else -> MigrationPhase.Failed(
+                                paymentFailedTemplate.replace(
+                                    errorMarker,
+                                    it.message ?: it.toString(),
+                                )
+                            )
+                        }
                         return@launch
                     }
                 // Past this point the money has LEFT the Lightning wallet.
                 // Every branch below must leave the user a way forward.
                 phase = MigrationPhase.Watching
-                runCatching { c.settle(q.baselineSats, paid, SETTLE_POLLS) }
+                runCatching { c.resume(SETTLE_POLLS) }
                     .onSuccess { result ->
                         phase = when (result) {
                             is MigrationResultUi.Settled -> {
@@ -157,12 +277,9 @@ fun WalletMigrationRoute(state: SonarAppState) {
         },
         onResume = {
             val c = controller ?: return@WalletMigrationScreen
-            val q = quote
             phase = MigrationPhase.Watching
             scope.launch {
-                runCatching {
-                    c.settle(q?.baselineSats ?: 0uL, q?.amountSats ?: 0uL, SETTLE_POLLS)
-                }
+                runCatching { c.resume(SETTLE_POLLS) }
                     .onSuccess { result ->
                         phase = when (result) {
                             is MigrationResultUi.Settled -> {

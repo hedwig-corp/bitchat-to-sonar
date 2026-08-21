@@ -1,15 +1,18 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::destination::{classify_destination, resolve_send_amount};
 use crate::error::{Result, WalletError};
 use crate::listeners::ListenerRegistry;
 #[cfg(test)]
 use crate::traits::prepare_and_send;
-use crate::traits::{WalletBackend, WalletEventListener};
+use crate::traits::{TrackedReceiveBackend, WalletBackend, WalletEventListener};
 use crate::types::{
     Balance, Destination, ExchangeRate, Payment, PaymentStatus, PreparedSend, PreparedSendToken,
-    ReceiveMethod, ReceiveRequest, WalletCapabilities, WalletEvent,
+    ReceiveMethod, ReceiveRequest, TrackedReceive, TrackedReceiveState, WalletCapabilities,
+    WalletEvent,
 };
 
 /// Flat fee the mock charges, so tests exercise the fee path rather than
@@ -26,6 +29,7 @@ pub struct MockWallet {
     listeners: ListenerRegistry,
     /// Monotonic fake clock so tests are order-stable without real time.
     clock_secs: AtomicU64,
+    tracked_receives: Mutex<HashMap<String, (TrackedReceive, bool)>>,
 }
 
 impl Default for MockWallet {
@@ -45,6 +49,7 @@ impl MockWallet {
             payments: Mutex::new(Vec::new()),
             listeners: ListenerRegistry::new(),
             clock_secs: AtomicU64::new(1_700_000_000),
+            tracked_receives: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,6 +89,24 @@ impl MockWallet {
             payment: payment.clone(),
         });
         payment
+    }
+
+    /// Test helper: settle the exact tracked quote and credit its amount.
+    pub fn settle_tracked(&self, id: &str) -> Result<Payment> {
+        let amount = {
+            let mut receives = self.tracked_receives.lock().expect("tracked receive lock");
+            let (receive, settled) = receives
+                .get_mut(id)
+                .ok_or_else(|| WalletError::UnknownReceive(id.to_string()))?;
+            if *settled {
+                return Err(WalletError::InvalidInput(format!(
+                    "tracked receive {id} is already settled"
+                )));
+            }
+            *settled = true;
+            receive.amount_sats
+        };
+        Ok(self.simulate_receive(amount))
     }
 }
 
@@ -131,16 +154,7 @@ impl WalletBackend for MockWallet {
     }
 
     fn receive(&self, request: &ReceiveRequest) -> Result<String> {
-        self.ensure_connected()?;
-        match request.method {
-            ReceiveMethod::Bolt12Offer => Ok("lno1mockoffermockoffermockoffer".to_string()),
-            ReceiveMethod::Bolt11Invoice => {
-                let amount = request.amount_sats.ok_or_else(|| {
-                    WalletError::InvalidInput("a BOLT11 invoice needs an amount".into())
-                })?;
-                Ok(format!("lnbc{amount}n1mockinvoice"))
-            }
-        }
+        Ok(self.create_tracked_receive(request)?.request)
     }
 
     fn parse_destination(&self, input: &str) -> Result<Destination> {
@@ -249,6 +263,54 @@ impl WalletBackend for MockWallet {
         // and the seed survive a wipe by design.
         self.payments.lock().expect("payments lock").clear();
         Ok(())
+    }
+}
+
+impl TrackedReceiveBackend for MockWallet {
+    fn create_tracked_receive(&self, request: &ReceiveRequest) -> Result<TrackedReceive> {
+        self.ensure_connected()?;
+        let amount_sats = match request.method {
+            ReceiveMethod::Bolt11Invoice => request.amount_sats.ok_or_else(|| {
+                WalletError::InvalidInput("a BOLT11 invoice needs an amount".into())
+            })?,
+            ReceiveMethod::Bolt12Offer => request.amount_sats.unwrap_or(0),
+        };
+        let sequence = self.now();
+        let id = format!("mock-quote-{sequence}");
+        let request = match request.method {
+            ReceiveMethod::Bolt12Offer => "lno1mockoffermockoffermockoffer".to_string(),
+            ReceiveMethod::Bolt11Invoice => format!("lnbc{amount_sats}n1mockinvoice{sequence}"),
+        };
+        let tracked = TrackedReceive {
+            id: id.clone(),
+            request,
+            amount_sats,
+            expires_at_secs: None,
+        };
+        self.tracked_receives
+            .lock()
+            .expect("tracked receive lock")
+            .insert(id, (tracked.clone(), false));
+        Ok(tracked)
+    }
+
+    fn reconcile_tracked_receive(
+        &self,
+        id: &str,
+        _request_timeout: Duration,
+    ) -> Result<TrackedReceiveState> {
+        self.ensure_connected()?;
+        let receives = self.tracked_receives.lock().expect("tracked receive lock");
+        let (receive, settled) = receives
+            .get(id)
+            .ok_or_else(|| WalletError::UnknownReceive(id.to_string()))?;
+        Ok(if *settled {
+            TrackedReceiveState::Settled {
+                amount_sats: receive.amount_sats,
+            }
+        } else {
+            TrackedReceiveState::Pending
+        })
     }
 }
 
@@ -369,6 +431,30 @@ mod tests {
             }),
             Err(WalletError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn tracked_receive_requires_its_exact_quote() {
+        let w = wallet();
+        let quote = w
+            .create_tracked_receive(&ReceiveRequest {
+                method: ReceiveMethod::Bolt11Invoice,
+                amount_sats: Some(1_000),
+                description: None,
+            })
+            .unwrap();
+        w.simulate_receive(1_000);
+        assert_eq!(
+            w.reconcile_tracked_receive(&quote.id, Duration::from_secs(1))
+                .unwrap(),
+            TrackedReceiveState::Pending
+        );
+        w.settle_tracked(&quote.id).unwrap();
+        assert_eq!(
+            w.reconcile_tracked_receive(&quote.id, Duration::from_secs(1))
+                .unwrap(),
+            TrackedReceiveState::Settled { amount_sats: 1_000 }
+        );
     }
 
     #[test]

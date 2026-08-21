@@ -41,6 +41,20 @@ data class SendResult(
     val error: String? = null,
 )
 
+enum class WalletPaymentLookupStatus {
+    Pending,
+    Complete,
+    Failed,
+    Refundable,
+    Unknown,
+}
+
+data class WalletPaymentLookup(
+    val status: WalletPaymentLookupStatus,
+    val id: String? = null,
+    val feesSats: Long? = null,
+)
+
 /**
  * One settled payment surfaced by the Breez SDK event listener — the Compose
  * twin of iOS `SonarWallet.incomingPaymentsStream()`'s `Payment` element. Used
@@ -135,6 +149,9 @@ expect object WalletBridge {
 
     /** Pay a quote from [prepareSend]. Single-use — the quote is consumed. */
     suspend fun sendPrepared(id: String, note: String): SendResult
+
+    /** Reconcile an outgoing Lightning payment by its durable payment hash. */
+    suspend fun lookupPayment(paymentHash: String): WalletPaymentLookup
 
     /** Fetch + cache live BTC→fiat rates. */
     suspend fun fetchRates(): List<ExchangeRate>

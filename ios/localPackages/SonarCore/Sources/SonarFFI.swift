@@ -591,14 +591,13 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 /**
  * The migration SOURCE, implemented by the host over its existing native
  * Breez integration. Deliberately minimal — the engine needs exactly these
- * three operations, so hosts do not have to mirror the whole `WalletBackend`
+ * four operations, so hosts do not have to mirror the whole `WalletBackend`
  * trait over the FFI boundary.
  *
  * Implementations are called from a Rust thread and MUST block until done.
- * Failures are reported by throwing [`SonarFfiError`] — the same error type
- * the rest of this FFI surface uses, so hosts have one error to handle.
- * (A bare `String` error is NOT exportable by UniFFI for callback
- * interfaces; the binding generator rejects it outright.)
+ * Failures are reported by throwing [`HostWalletError`]; see the note there
+ * on why this deliberately is not the flat `SonarFfiError` used elsewhere in
+ * this FFI surface.
  */
 public protocol HostMigrationSource: AnyObject, Sendable {
 
@@ -617,18 +616,22 @@ public protocol HostMigrationSource: AnyObject, Sendable {
      */
     func send(token: String, note: String) throws  -> HostPayment
 
+    /**
+     * Reconcile an ambiguous or pending send by its BOLT11 payment hash.
+     */
+    func lookupPayment(paymentHash: String) throws  -> HostPaymentLookup
+
 }
 /**
  * The migration SOURCE, implemented by the host over its existing native
  * Breez integration. Deliberately minimal — the engine needs exactly these
- * three operations, so hosts do not have to mirror the whole `WalletBackend`
+ * four operations, so hosts do not have to mirror the whole `WalletBackend`
  * trait over the FFI boundary.
  *
  * Implementations are called from a Rust thread and MUST block until done.
- * Failures are reported by throwing [`SonarFfiError`] — the same error type
- * the rest of this FFI surface uses, so hosts have one error to handle.
- * (A bare `String` error is NOT exportable by UniFFI for callback
- * interfaces; the binding generator rejects it outright.)
+ * Failures are reported by throwing [`HostWalletError`]; see the note there
+ * on why this deliberately is not the flat `SonarFfiError` used elsewhere in
+ * this FFI surface.
  */
 open class HostMigrationSourceImpl: HostMigrationSource, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -687,7 +690,7 @@ open class HostMigrationSourceImpl: HostMigrationSource, @unchecked Sendable {
      * Confirmed spendable balance, sats.
      */
 open func balanceSats()throws  -> UInt64  {
-    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeHostWalletError_lift) {
     uniffi_sonar_ffi_fn_method_hostmigrationsource_balance_sats(
             self.uniffiCloneHandle(),$0
     )
@@ -698,7 +701,7 @@ open func balanceSats()throws  -> UInt64  {
      * Price paying `invoice` for `amount_sats` WITHOUT paying it.
      */
 open func prepare(invoice: String, amountSats: UInt64)throws  -> HostSendQuote  {
-    return try  FfiConverterTypeHostSendQuote_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    return try  FfiConverterTypeHostSendQuote_lift(try rustCallWithError(FfiConverterTypeHostWalletError_lift) {
     uniffi_sonar_ffi_fn_method_hostmigrationsource_prepare(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(invoice),
@@ -711,11 +714,23 @@ open func prepare(invoice: String, amountSats: UInt64)throws  -> HostSendQuote  
      * Pay a previously prepared quote. Called at most once per token.
      */
 open func send(token: String, note: String)throws  -> HostPayment  {
-    return try  FfiConverterTypeHostPayment_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    return try  FfiConverterTypeHostPayment_lift(try rustCallWithError(FfiConverterTypeHostWalletError_lift) {
     uniffi_sonar_ffi_fn_method_hostmigrationsource_send(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(token),
         FfiConverterString.lower(note),$0
+    )
+})
+}
+
+    /**
+     * Reconcile an ambiguous or pending send by its BOLT11 payment hash.
+     */
+open func lookupPayment(paymentHash: String)throws  -> HostPaymentLookup  {
+    return try  FfiConverterTypeHostPaymentLookup_lift(try rustCallWithError(FfiConverterTypeHostWalletError_lift) {
+    uniffi_sonar_ffi_fn_method_hostmigrationsource_lookup_payment(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(paymentHash),$0
     )
 })
 }
@@ -768,7 +783,7 @@ fileprivate struct UniffiCallbackInterfaceHostMigrationSource {
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
                 writeReturn: writeReturn,
-                lowerError: FfiConverterTypeSonarFfiError_lower
+                lowerError: FfiConverterTypeHostWalletError_lower
             )
         },
         prepare: { (
@@ -795,7 +810,7 @@ fileprivate struct UniffiCallbackInterfaceHostMigrationSource {
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
                 writeReturn: writeReturn,
-                lowerError: FfiConverterTypeSonarFfiError_lower
+                lowerError: FfiConverterTypeHostWalletError_lower
             )
         },
         send: { (
@@ -822,7 +837,32 @@ fileprivate struct UniffiCallbackInterfaceHostMigrationSource {
                 callStatus: uniffiCallStatus,
                 makeCall: makeCall,
                 writeReturn: writeReturn,
-                lowerError: FfiConverterTypeSonarFfiError_lower
+                lowerError: FfiConverterTypeHostWalletError_lower
+            )
+        },
+        lookupPayment: { (
+            uniffiHandle: UInt64,
+            paymentHash: RustBuffer,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> HostPaymentLookup in
+                guard let uniffiObj = try? FfiConverterTypeHostMigrationSource.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.lookupPayment(
+                     paymentHash: try FfiConverterString.lift(paymentHash)
+                )
+            }
+
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterTypeHostPaymentLookup_lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeHostWalletError_lower
             )
         }
     )
@@ -1936,9 +1976,14 @@ public func FfiConverterTypeSonarIdentity_lower(_ value: SonarIdentity) -> UInt6
 
 /**
  * Drives one migration. Held by the host across the consent step: `plan` →
- * (consent UI) → `execute` → `settle`.
+ * (consent UI) → `execute` → `resume`.
  */
 public protocol SonarMigrationProtocol: AnyObject, Sendable {
+
+    /**
+     * Remove a consent/expired attempt only while no payment can have left.
+     */
+    func cancelUnspent() throws
 
     /**
      * Pay the planned migration. THE spending call — hosts must not reach it
@@ -1954,17 +1999,20 @@ public protocol SonarMigrationProtocol: AnyObject, Sendable {
     func plan(amountSats: UInt64?) throws  -> MigrationQuote
 
     /**
-     * Watch the Cashu wallet until the funds land. Blocking; each poll is a
-     * mint sync. Safe to call any number of times, including after a crash
-     * between `execute` and settlement — the wallet's own reconciliation is
-     * what finishes the job, this only observes it.
+     * Reconcile the journaled source payment and exact destination quote.
+     * Safe to call any number of times, including after a crash.
      */
-    func settle(baselineSats: UInt64, expectedSats: UInt64, polls: UInt32) throws  -> MigrationOutcome
+    func resume(polls: UInt32) throws  -> MigrationOutcome
+
+    /**
+     * Return the durable attempt, including one created before this process.
+     */
+    func status() throws  -> MigrationAttemptStatus?
 
 }
 /**
  * Drives one migration. Held by the host across the consent step: `plan` →
- * (consent UI) → `execute` → `settle`.
+ * (consent UI) → `execute` → `resume`.
  */
 open class SonarMigration: SonarMigrationProtocol, @unchecked Sendable {
     fileprivate let handle: UInt64
@@ -2036,6 +2084,16 @@ public convenience init(source: HostMigrationSource, destination: SonarCashuWall
 
 
     /**
+     * Remove a consent/expired attempt only while no payment can have left.
+     */
+open func cancelUnspent()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarmigration_cancel_unspent(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
      * Pay the planned migration. THE spending call — hosts must not reach it
      * without explicit user consent to the custody change. Single-use: the
      * plan is consumed, so a double-tap cannot pay twice.
@@ -2063,18 +2121,25 @@ open func plan(amountSats: UInt64?)throws  -> MigrationQuote  {
 }
 
     /**
-     * Watch the Cashu wallet until the funds land. Blocking; each poll is a
-     * mint sync. Safe to call any number of times, including after a crash
-     * between `execute` and settlement — the wallet's own reconciliation is
-     * what finishes the job, this only observes it.
+     * Reconcile the journaled source payment and exact destination quote.
+     * Safe to call any number of times, including after a crash.
      */
-open func settle(baselineSats: UInt64, expectedSats: UInt64, polls: UInt32)throws  -> MigrationOutcome  {
+open func resume(polls: UInt32)throws  -> MigrationOutcome  {
     return try  FfiConverterTypeMigrationOutcome_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarmigration_settle(
+    uniffi_sonar_ffi_fn_method_sonarmigration_resume(
             self.uniffiCloneHandle(),
-        FfiConverterUInt64.lower(baselineSats),
-        FfiConverterUInt64.lower(expectedSats),
         FfiConverterUInt32.lower(polls),$0
+    )
+})
+}
+
+    /**
+     * Return the durable attempt, including one created before this process.
+     */
+open func status()throws  -> MigrationAttemptStatus?  {
+    return try  FfiConverterOptionTypeMigrationAttemptStatus.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarmigration_status(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -5212,6 +5277,64 @@ public func FfiConverterTypeHostPayment_lower(_ value: HostPayment) -> RustBuffe
 }
 
 
+public struct HostPaymentLookup: Equatable, Hashable {
+    public var status: HostPaymentLookupStatus
+    public var id: String?
+    public var feesSats: UInt64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: HostPaymentLookupStatus, id: String?, feesSats: UInt64?) {
+        self.status = status
+        self.id = id
+        self.feesSats = feesSats
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension HostPaymentLookup: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHostPaymentLookup: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HostPaymentLookup {
+        return
+            try HostPaymentLookup(
+                status: FfiConverterTypeHostPaymentLookupStatus.read(from: &buf),
+                id: FfiConverterOptionString.read(from: &buf),
+                feesSats: FfiConverterOptionUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HostPaymentLookup, into buf: inout [UInt8]) {
+        FfiConverterTypeHostPaymentLookupStatus.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.id, into: &buf)
+        FfiConverterOptionUInt64.write(value.feesSats, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostPaymentLookup_lift(_ buf: RustBuffer) throws -> HostPaymentLookup {
+    return try FfiConverterTypeHostPaymentLookup.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostPaymentLookup_lower(_ value: HostPaymentLookup) -> RustBuffer {
+    return FfiConverterTypeHostPaymentLookup.lower(value)
+}
+
+
 /**
  * A priced send from the host's wallet: what the engine asked for, and what
  * the host's backend quoted. `token` is opaque — the host hands it back to
@@ -5988,6 +6111,72 @@ public func FfiConverterTypeMessageInfo_lower(_ value: MessageInfo) -> RustBuffe
 }
 
 
+public struct MigrationAttemptStatus: Equatable, Hashable {
+    public var settlementId: String
+    public var amountSats: UInt64
+    public var feeSats: UInt64?
+    public var state: MigrationAttemptState
+    public var paymentHash: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(settlementId: String, amountSats: UInt64, feeSats: UInt64?, state: MigrationAttemptState, paymentHash: String) {
+        self.settlementId = settlementId
+        self.amountSats = amountSats
+        self.feeSats = feeSats
+        self.state = state
+        self.paymentHash = paymentHash
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MigrationAttemptStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMigrationAttemptStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MigrationAttemptStatus {
+        return
+            try MigrationAttemptStatus(
+                settlementId: FfiConverterString.read(from: &buf),
+                amountSats: FfiConverterUInt64.read(from: &buf),
+                feeSats: FfiConverterOptionUInt64.read(from: &buf),
+                state: FfiConverterTypeMigrationAttemptState.read(from: &buf),
+                paymentHash: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MigrationAttemptStatus, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.settlementId, into: &buf)
+        FfiConverterUInt64.write(value.amountSats, into: &buf)
+        FfiConverterOptionUInt64.write(value.feeSats, into: &buf)
+        FfiConverterTypeMigrationAttemptState.write(value.state, into: &buf)
+        FfiConverterString.write(value.paymentHash, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationAttemptStatus_lift(_ buf: RustBuffer) throws -> MigrationAttemptStatus {
+    return try FfiConverterTypeMigrationAttemptStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationAttemptStatus_lower(_ value: MigrationAttemptStatus) -> RustBuffer {
+    return FfiConverterTypeMigrationAttemptStatus.lower(value)
+}
+
+
 /**
  * What the user must see before consenting. Amounts in sats.
  */
@@ -6001,8 +6190,8 @@ public struct MigrationQuote: Equatable, Hashable {
      */
     public var sourceFeeSats: UInt64?
     /**
-     * Destination balance before the migration — hand this back to `settle`
-     * so a resumed watch knows what "arrived" means.
+     * Destination balance before the migration, retained for display only.
+     * Settlement uses the journaled exact quote id, never this aggregate.
      */
     public var destinationBaselineSats: UInt64
     /**
@@ -6020,8 +6209,8 @@ public struct MigrationQuote: Equatable, Hashable {
          * Fee the source wallet will pay on top, when it can quote one.
          */sourceFeeSats: UInt64?,
         /**
-         * Destination balance before the migration — hand this back to `settle`
-         * so a resumed watch knows what "arrived" means.
+         * Destination balance before the migration, retained for display only.
+         * Settlement uses the journaled exact quote id, never this aggregate.
          */destinationBaselineSats: UInt64,
         /**
          * Opaque handle for `execute`; single-use.
@@ -7285,6 +7474,204 @@ public func FfiConverterTypeCallStateInfo_lower(_ value: CallStateInfo) -> RustB
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum HostPaymentLookupStatus: Equatable, Hashable {
+
+    case pending
+    case complete
+    case failed
+    case refundable
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension HostPaymentLookupStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHostPaymentLookupStatus: FfiConverterRustBuffer {
+    typealias SwiftType = HostPaymentLookupStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HostPaymentLookupStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .pending
+
+        case 2: return .complete
+
+        case 3: return .failed
+
+        case 4: return .refundable
+
+        case 5: return .unknown
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: HostPaymentLookupStatus, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .pending:
+            writeInt(&buf, Int32(1))
+
+
+        case .complete:
+            writeInt(&buf, Int32(2))
+
+
+        case .failed:
+            writeInt(&buf, Int32(3))
+
+
+        case .refundable:
+            writeInt(&buf, Int32(4))
+
+
+        case .unknown:
+            writeInt(&buf, Int32(5))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostPaymentLookupStatus_lift(_ buf: RustBuffer) throws -> HostPaymentLookupStatus {
+    return try FfiConverterTypeHostPaymentLookupStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostPaymentLookupStatus_lower(_ value: HostPaymentLookupStatus) -> RustBuffer {
+    return FfiConverterTypeHostPaymentLookupStatus.lower(value)
+}
+
+
+
+/**
+ * Why a host-side wallet call failed, in a form UniFFI can carry BACK across
+ * the boundary.
+ *
+ * This must NOT be `#[uniffi(flat_error)]`. A flat error cannot be lifted out
+ * of a foreign trait: when the host throws one, UniFFI aborts the entire
+ * outer call with the opaque message "Can't lift flat errors", and the Rust
+ * side never sees an `Err` at all. That is not merely a bad message — it
+ * makes every host failure unrecoverable, because the engine's own retry
+ * logic never runs. A real Pixel drain failed exactly this way: Breez
+ * refused the whole balance with "Cannot pay: not enough funds",
+ * `plan_drain`'s step-down never fired, and the user saw
+ * "Can't lift flat errors".
+ *
+ * [`InsufficientFunds`](Self::InsufficientFunds) is a distinct variant rather
+ * than a message because the engine branches on it: it is the signal to plan
+ * a smaller amount, and a string could not be matched on safely.
+ */
+public enum HostWalletError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+
+
+    /**
+     * The wallet cannot afford this amount plus its fee. The engine responds
+     * by stepping the amount down, so hosts should prefer this over
+     * `Failed` whenever the backend says so.
+     */
+    case InsufficientFunds
+    /**
+     * Anything else, carrying the host's own message.
+     *
+     * The field is `reason`, not `message`: UniFFI maps this variant to a
+     * Kotlin subclass of `Exception`, and a field called `message` collides
+     * with `Throwable.message` — the generated bindings then fail to compile.
+     */
+    case Failed(reason: String
+    )
+
+
+
+
+
+
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+
+}
+
+#if compiler(>=6)
+extension HostWalletError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHostWalletError: FfiConverterRustBuffer {
+    typealias SwiftType = HostWalletError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HostWalletError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+
+
+
+        case 1: return .InsufficientFunds
+        case 2: return .Failed(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: HostWalletError, into buf: inout [UInt8]) {
+        switch value {
+
+
+
+
+
+        case .InsufficientFunds:
+            writeInt(&buf, Int32(1))
+
+
+        case let .Failed(reason):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(reason, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostWalletError_lift(_ buf: RustBuffer) throws -> HostWalletError {
+    return try FfiConverterTypeHostWalletError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHostWalletError_lower(_ value: HostWalletError) -> RustBuffer {
+    return FfiConverterTypeHostWalletError.lower(value)
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum MeshEngineCommand: Equatable, Hashable {
 
     /**
@@ -7686,6 +8073,122 @@ public func FfiConverterTypeMessageClassInfo_lower(_ value: MessageClassInfo) ->
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum MigrationAttemptState: Equatable, Hashable {
+
+    case awaitingConsent
+    case sending
+    case paymentUnknown
+    case sourcePending
+    case sourcePaid
+    case mintPaid
+    case settled
+    case sourceFailed
+    case expiredUnsent
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MigrationAttemptState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMigrationAttemptState: FfiConverterRustBuffer {
+    typealias SwiftType = MigrationAttemptState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MigrationAttemptState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .awaitingConsent
+
+        case 2: return .sending
+
+        case 3: return .paymentUnknown
+
+        case 4: return .sourcePending
+
+        case 5: return .sourcePaid
+
+        case 6: return .mintPaid
+
+        case 7: return .settled
+
+        case 8: return .sourceFailed
+
+        case 9: return .expiredUnsent
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MigrationAttemptState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .awaitingConsent:
+            writeInt(&buf, Int32(1))
+
+
+        case .sending:
+            writeInt(&buf, Int32(2))
+
+
+        case .paymentUnknown:
+            writeInt(&buf, Int32(3))
+
+
+        case .sourcePending:
+            writeInt(&buf, Int32(4))
+
+
+        case .sourcePaid:
+            writeInt(&buf, Int32(5))
+
+
+        case .mintPaid:
+            writeInt(&buf, Int32(6))
+
+
+        case .settled:
+            writeInt(&buf, Int32(7))
+
+
+        case .sourceFailed:
+            writeInt(&buf, Int32(8))
+
+
+        case .expiredUnsent:
+            writeInt(&buf, Int32(9))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationAttemptState_lift(_ buf: RustBuffer) throws -> MigrationAttemptState {
+    return try FfiConverterTypeMigrationAttemptState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMigrationAttemptState_lower(_ value: MigrationAttemptState) -> RustBuffer {
+    return FfiConverterTypeMigrationAttemptState.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum MigrationOutcome: Equatable, Hashable {
 
     /**
@@ -7767,6 +8270,10 @@ public func FfiConverterTypeMigrationOutcome_lower(_ value: MigrationOutcome) ->
 /**
  * Flat error: only the rendered message crosses the FFI boundary
  * (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
+ *
+ * NOTE: flat is correct for errors travelling Rust → host, which is every use
+ * below. It is NOT usable for an error a host throws back across a
+ * `with_foreign` trait — see `HostWalletError` in `wallet.rs`.
  */
 public enum SonarFfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
@@ -8707,6 +9214,30 @@ fileprivate struct FfiConverterOptionTypeMeshPublicMessage: FfiConverterRustBuff
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeMeshPublicMessage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMigrationAttemptStatus: FfiConverterRustBuffer {
+    typealias SwiftType = MigrationAttemptStatus?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMigrationAttemptStatus.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMigrationAttemptStatus.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -10603,13 +11134,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarsuspendlatch_is_interrupted() != 22902) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_balance_sats() != 64047) {
+    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_balance_sats() != 43155) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_prepare() != 28809) {
+    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_prepare() != 11543) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_send() != 7016) {
+    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_send() != 33503) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_hostmigrationsource_lookup_payment() != 19932) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_balance() != 34400) {
@@ -10627,13 +11161,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_sync() != 8473) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarmigration_cancel_unspent() != 56231) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarmigration_execute() != 1036) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarmigration_plan() != 29160) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarmigration_settle() != 1241) {
+    if (uniffi_sonar_ffi_checksum_method_sonarmigration_resume() != 32838) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarmigration_status() != 49458) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_meshlinkengine_new() != 12347) {

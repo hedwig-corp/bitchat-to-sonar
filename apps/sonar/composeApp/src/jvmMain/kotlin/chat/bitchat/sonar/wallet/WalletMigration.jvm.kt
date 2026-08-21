@@ -4,6 +4,8 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.runBlocking
 import uniffi.sonar_ffi.HostMigrationSource
 import uniffi.sonar_ffi.HostPayment
+import uniffi.sonar_ffi.HostPaymentLookup
+import uniffi.sonar_ffi.HostPaymentLookupStatus
 import uniffi.sonar_ffi.HostSendQuote
 import uniffi.sonar_ffi.HostWalletException
 
@@ -81,5 +83,24 @@ class BreezMigrationSource : HostMigrationSource {
             // The bridge returns ok only once Breez accepted the payment.
             `complete` = true,
         )
+    }
+
+    override fun `lookupPayment`(paymentHash: String): HostPaymentLookup = runBlocking {
+        try {
+            val lookup = WalletBridge.lookupPayment(paymentHash)
+            HostPaymentLookup(
+                status = when (lookup.status) {
+                    WalletPaymentLookupStatus.Pending -> HostPaymentLookupStatus.PENDING
+                    WalletPaymentLookupStatus.Complete -> HostPaymentLookupStatus.COMPLETE
+                    WalletPaymentLookupStatus.Failed -> HostPaymentLookupStatus.FAILED
+                    WalletPaymentLookupStatus.Refundable -> HostPaymentLookupStatus.REFUNDABLE
+                    WalletPaymentLookupStatus.Unknown -> HostPaymentLookupStatus.UNKNOWN
+                },
+                id = lookup.id,
+                feesSats = lookup.feesSats?.coerceAtLeast(0)?.toULong(),
+            )
+        } catch (t: Throwable) {
+            throw HostWalletException.Failed(t.message ?: t.toString())
+        }
     }
 }
