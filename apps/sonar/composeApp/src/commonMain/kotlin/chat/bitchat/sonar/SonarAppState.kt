@@ -862,6 +862,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var localCoreReady = false
     var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
         private set
+    /** Encrypted timezone controls projected from the core's local cache. */
+    private var peerTimezonesByNpub by mutableStateOf<Map<String, SonarPeerTimezone>>(emptyMap())
+    private var lastSharedSystemTimezone: String? = null
     /** Monotonic counter bumped whenever [chatSnapshotMessagesByChat] is
      *  reassigned. Feeds the [visibleChats] memo key so the dedupe ordering
      *  (which depends on per-chat latest ts) re-runs when the snapshot changes. */
@@ -1037,6 +1040,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // sticker bytes painted after credentials have been cleared.
             stack = listOf(Screen.Home)
             chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear()
+            timezoneShareByChat = emptyMap(); lastSharedSystemTimezone = null
             clearChatSnapshot()
             cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
@@ -1101,7 +1105,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             updateBleDiscoveryPolicy()
-            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
+            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); peerTimezonesByNpub = emptyMap(); lastSharedSystemTimezone = null; timezoneShareByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
+            persistTimezoneShareByChat()
             retainedTranscriptByChat.clear()
             transcriptWindows.clear()
             // Leave the old composer before the delivery suspension is lifted.
@@ -1877,6 +1882,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     var sonarPeerProfiles by mutableStateOf<Map<String, SonarAnnounce>>(emptyMap())
         private set
     private val meshPeerRefreshQueue = ConflatedRefreshQueue(scope, ::refreshMeshRadioState)
+    private val timezoneRefreshQueue = ConflatedRefreshQueue(scope) { refreshPeerTimezones(chats) }
     /** Bumped at the start of every mesh snapshot refresh; older concurrent
      *  readers discard their result so a stale Default-dispatcher decode cannot
      *  overwrite a newer publish (queue + housekeeping + settle overlap). */
@@ -2481,6 +2487,18 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun isDirectMarmotChat(chat: SonarChat): Boolean =
         directMarmotPeerKey(chat, npub) != null
+
+    fun peerTimezoneForChat(chatId: String): SonarPeerTimezone? {
+        val peer = if (isMeshChat(chatId)) {
+            npubStringForPeer(meshPeerId(chatId))
+        } else {
+            chats.firstOrNull { it.id == chatId }?.let(::directMarmotPeerKey)
+        }
+        return peer?.let(::peerTimezone)
+    }
+
+    fun peerTimezone(memberNpub: String): SonarPeerTimezone? =
+        peerTimezonesByNpub[canonicalProfileKey(memberNpub)]
 
     private fun directMarmotPeerKey(chat: SonarChat): String? =
         directMarmotPeerKey(chat, npub)
@@ -4412,6 +4430,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
             localCoreReady = true
             started = true
+            scope.launch { reconcileLocalTimezone() }
             refreshChats()
             recomputeConversations()
             poll()
@@ -4640,6 +4659,60 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun togglePref(key: String, default: Boolean = false) = setPref(key, !prefBool(key, default))
 
+    fun toggleShareLocalTime() {
+        val enabled = !prefBool("shareLocalTime")
+        setPref("shareLocalTime", enabled)
+        scope.launch { reconcileLocalTimezone(force = true) }
+    }
+
+    fun sharesLocalTimeWith(chatId: String): Boolean {
+        val override = timezoneShareOverride(chatId)
+        return override ?: prefBool("shareLocalTime")
+    }
+
+    fun canShareLocalTimeInChat(chatId: String): Boolean =
+        if (isMeshChat(chatId)) transcriptGroupIds(chatId).isNotEmpty()
+        else chats.any { it.id == chatId } || transcriptGroupIds(chatId).isNotEmpty()
+
+    fun toggleShareLocalTimeForChat(chatId: String) {
+        val next = !sharesLocalTimeWith(chatId)
+        val keys = timezoneShareKeysFor(chatId)
+        timezoneShareByChat = if (next == prefBool("shareLocalTime")) {
+            timezoneShareByChat - keys
+        } else {
+            timezoneShareByChat + keys.associateWith { next }
+        }
+        persistTimezoneShareByChat()
+        prefsVersion++
+        scope.launch { reconcileLocalTimezone(force = true) }
+    }
+
+    private var timezoneShareByChat by mutableStateOf(
+        decodeTimezoneShareMap(SonarCore.loadBlob(TIMEZONE_SHARE_BLOB_KEY))
+    )
+
+    private fun persistTimezoneShareByChat() {
+        SonarCore.saveBlob(TIMEZONE_SHARE_BLOB_KEY, encodeTimezoneShareMap(timezoneShareByChat))
+    }
+
+    private fun timezoneShareKeysFor(chatId: String): Set<String> = buildSet {
+        add(chatId)
+        addAll(directMarmotChatIds(chatId))
+        addAll(transcriptGroupIds(chatId))
+    }
+
+    private fun timezoneShareOverride(chatId: String): Boolean? {
+        timezoneShareByChat[chatId]?.let { return it }
+        return timezoneShareKeysFor(chatId).firstNotNullOfOrNull { timezoneShareByChat[it] }
+    }
+
+    private fun timezoneShareGroupIds(): List<String> =
+        chats.asSequence()
+            .filter { !isMeshChat(it.id) && sharesLocalTimeWith(it.id) }
+            .map { it.id }
+            .distinct()
+            .toList()
+
     fun prefStr(key: String, default: String): String =
         SonarCore.loadBlob("pref.$key").ifEmpty { default }
 
@@ -4808,6 +4881,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     // Local-first: never gate chat-list / channel paint on relay
                     // reconnect. The relay wait below is bounded and background.
                     repaintFromLocal()
+                    reconcileLocalTimezone()
 
                     activeCatchupSyncs++
                     try {
@@ -4846,6 +4920,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         recomputeConversations()
         (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
         refreshPresenceCounts()
+    }
+
+    fun onSystemTimezoneChanged() {
+        scope.launch { reconcileLocalTimezone(force = true) }
     }
 
     /**
@@ -5712,6 +5790,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Local usability begins here. These services must work through
                 // a relay outage; relay attach/retry runs independently below.
                 started = true
+                launch { reconcileLocalTimezone() }
                 // Adopt a core-claimed handle when the bip353 blob is blank
                 // (fresh install restored from nsec, or lost prefs): the core
                 // sidecar is the durable record, prefs are a mirror.
@@ -11915,6 +11994,42 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
         resolvePendingMarmotChats()
+        if (localCoreReady || started) {
+            scope.launch { reconcileLocalTimezone() }
+            timezoneRefreshQueue.request()
+        }
+    }
+
+    private suspend fun reconcileLocalTimezone(force: Boolean = false) {
+        if (!localCoreReady && !started) return
+        val groupIds = timezoneShareGroupIds()
+        runCatching { SonarCore.setTimezoneShareGroups(groupIds) }
+        if (groupIds.isEmpty()) {
+            lastSharedSystemTimezone = null
+            runCatching { SonarCore.updateLocalTimezone("") }
+            return
+        }
+        val identifier = currentSystemTimeZoneId()
+        if (!force && identifier == lastSharedSystemTimezone) return
+        runCatching { SonarCore.updateLocalTimezone(identifier) }
+            .onSuccess { lastSharedSystemTimezone = identifier }
+    }
+
+    private suspend fun refreshPeerTimezones(currentChats: List<SonarChat>) {
+        val mine = canonicalProfileKey(npub)
+        val members = currentChats.asSequence()
+            .flatMap { it.members.asSequence() }
+            .map(::canonicalProfileKey)
+            .filter { it.isNotBlank() && it != mine }
+            .distinct()
+            .toList()
+        peerTimezonesByNpub = if (members.isEmpty()) {
+            emptyMap()
+        } else {
+            runCatching { SonarCore.peerTimezones(members) }
+                .getOrDefault(emptyList())
+                .associateBy { canonicalProfileKey(it.senderNpub) }
+        }
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)

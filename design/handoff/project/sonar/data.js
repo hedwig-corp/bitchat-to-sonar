@@ -17,15 +17,15 @@ window.BC_DATA = {
   ],
   // inRange = reachable over Bluetooth right now; angle/r place them on the radar
   peers: [
-    { id: 'maya', name: 'Maya', inRange: true, bars: 3, hint: 'Right here', detail: 'Strong signal · a few meters away', angle: 210, r: 66,
+    { id: 'maya', name: 'Maya', inRange: true, bars: 3, hint: 'Right here', detail: 'Strong signal · a few meters away', angle: 210, r: 66, tz: 'Europe/Zurich',
       npub: 'npub1m4yaq7r0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vrtsqp7m2hd', bip353: 'maya@sonar.app', caps: ['marmot-dm', 'calls', 'payments'], media: ['voice', 'video'], met: 'today · in person', supporter: true },
     { id: 'luca', name: 'Luca', inRange: true, bars: 3, hint: 'Very close', detail: 'Same block · direct connection', angle: 335, r: 86,
       npub: 'npub1luc4q9c3uxe650pgh8vrtsw4j8mc7q0e2v9zk5xr3thl6f8s2a7dq8n3jd', caps: ['marmot-dm', 'calls'], media: ['voice', 'video'], met: 'today · in person' },
-    { id: 'nettle', name: 'nettle', inRange: true, bars: 2, hint: 'Nearby', detail: '1 hop away · relayed through Maya', angle: 55, r: 118,
+    { id: 'nettle', name: 'nettle', inRange: true, bars: 2, hint: 'Nearby', detail: '1 hop away · relayed through Maya', angle: 55, r: 118, tz: 'Asia/Tokyo',
       npub: 'npub1nett1e6f8s2a7d4ynq9c3uxe650pgh8vrtsw4j8mc7q0e2v9zk5xrq2k7jd', caps: ['marmot-dm', 'calls'], media: ['voice'], met: '2 weeks ago · on mesh', supporter: true },
     { id: 'koi', name: 'koi_', inRange: true, bars: 1, hint: 'Edge of range', detail: '2 hops away · connection may drop', angle: 140, r: 150,
       npub: 'npub1koi8vrtsw4j8mc7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgq5n8jd', caps: ['marmot-dm'], media: [], met: 'just now · on mesh' },
-    { id: 'sofia', name: 'Sofia', inRange: false, bars: 0, hint: 'Out of range', detail: 'Met Saturday · reachable over internet', angle: 290, r: 168,
+    { id: 'sofia', name: 'Sofia', inRange: false, bars: 0, hint: 'Out of range', detail: 'Met Saturday · reachable over internet', angle: 290, r: 168, tz: 'America/Chicago',
       npub: 'npub1sof1aq0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vrtsw4jq3m9hd', bip353: 'sofia@stacker.news', caps: ['marmot-dm', 'calls', 'payments'], media: ['voice', 'video'], met: 'Saturday · in person' },
     { id: 'tomas', name: 'Tomas', inRange: false, bars: 0, hint: 'Out of range', detail: 'Met last week · reachable over internet', angle: 22, r: 170,
       npub: 'npub1tom4s2a7d4ynq9c3uxe650pgh8vrtsw4j8mc7q0e2v9zk5xr3thl6q9k2jd', caps: ['marmot-dm'], media: [], met: 'last week · on mesh' },

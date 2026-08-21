@@ -10,6 +10,13 @@ data class SonarChat(
     val members: List<String>,
 )
 
+/** A peer's most recent valid timezone share from the encrypted local cache. */
+data class SonarPeerTimezone(
+    val senderNpub: String,
+    val ianaIdentifier: String,
+    val updatedAtSecs: Long,
+)
+
 /** Pending multi-member group invite awaiting explicit accept/decline. */
 data class SonarGroupInvite(
     val id: String,
@@ -1004,6 +1011,15 @@ expect object SonarCore {
     /** Precomputed conversation summaries from the core-owned index, ordered
      *  by latest message timestamp (newest first). */
     suspend fun conversationSummaries(): List<SonarConversationSummary>
+
+    /** Update and privately fan out this device's current OS timezone. */
+    suspend fun updateLocalTimezone(ianaIdentifier: String)
+
+    /** Restrict timezone shares to these MLS group ids. Empty shares with nobody. */
+    suspend fun setTimezoneShareGroups(groupIdHexes: List<String>)
+
+    /** Read cached peer timezones without any relay or history dependency. */
+    suspend fun peerTimezones(memberPubkeys: List<String>): List<SonarPeerTimezone>
 
     /** Reset unread count for a chat to 0. */
     suspend fun markConversationRead(chatId: String)

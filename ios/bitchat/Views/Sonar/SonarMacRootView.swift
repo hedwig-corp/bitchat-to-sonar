@@ -3042,6 +3042,14 @@ private struct MacSettingsModal: View {
         VStack(spacing: 0) {
             SNSectionLabel("Privacy & safety")
             SNSettingsCard {
+                SNSettingsRow(
+                    icon: .globe,
+                    label: "Share local time",
+                    sub: "Default for encrypted chats. You can also turn it on or off in each chat.",
+                    trail: .toggle(store.shareLocalTime)
+                ) {
+                    store.toggleShareLocalTime()
+                }
                 SNSettingsRow(icon: .shieldCheck, tone: .cyan, label: "Verified people", value: String(store.verifiedCount)) {
                     store.push(.nearby)
                     isPresented = false

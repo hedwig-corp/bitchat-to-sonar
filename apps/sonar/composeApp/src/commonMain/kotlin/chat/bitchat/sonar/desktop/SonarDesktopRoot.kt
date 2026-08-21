@@ -93,7 +93,10 @@ fun DesktopApp() {
             SonarLifecycle.clearOpenConversationHandler()
         }
     }
-    LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
+    LaunchedEffect(state) {
+        SonarLifecycle.onForeground = { state.setForeground(it) }
+        SonarLifecycle.onSystemTimezoneChanged = { state.onSystemTimezoneChanged() }
+    }
     // Tray-icon taps (Notifier.jvm) land here once local Home is coherent —
     // same hydrate gate as the phone App composable.
     LaunchedEffect(state, state.onboarded, state.homeMessagesHydrated) {

@@ -337,6 +337,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
         <p className="st-note">Off by default — amounts show in your currency. Turn on to see sats, Lightning and ecash.</p>
         <SectionLabel>Privacy &amp; safety</SectionLabel>
         <div className="st-card">
+          <StRow icon="globe" label="Share local time" sub="Default for encrypted chats. You can also turn it on or off in each chat." onClick={() => onPref('shareLocalTime', !prefs.shareLocalTime)} toggle={!!prefs.shareLocalTime} />
           <StRow icon="faceid" label="App lock" sub="Require Face ID to open Sonar" onClick={() => onPref('appLock', !prefs.appLock)} toggle={!!prefs.appLock} />
           <StRow icon="check" label="Read receipts" onClick={() => onPref('readReceipts', !prefs.readReceipts)} toggle={!!prefs.readReceipts} />
           <StRow icon="key" label="Show public keys" sub={prefs.pubkeyUI ? 'Raw npub shown under every name' : 'Nicknames everywhere — keys on tap'} onClick={() => onPref('pubkeyUI', !prefs.pubkeyUI)} toggle={!!prefs.pubkeyUI} />

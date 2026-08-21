@@ -84,6 +84,12 @@ final class MarmotService: @unchecked Sendable {
         let memberNpubs: [String]
     }
 
+    struct PeerTimezone: Sendable, Equatable {
+        let senderNpub: String
+        let ianaIdentifier: String
+        let updatedAt: Date
+    }
+
     struct GroupInvite: Sendable, Equatable {
         /// Hex kind-444 welcome event id; pass it to accept/decline.
         let id: String
@@ -531,7 +537,9 @@ final class MarmotService: @unchecked Sendable {
             #endif
             throw ServiceError.cancelled
         }
-        try await run { try $0.requireNode().retryOutbox() }
+        try? await run { service in
+            try service.requireNode().retryOutbox()
+        }
         return identity.npub()
     }
 
@@ -1256,6 +1264,45 @@ final class MarmotService: @unchecked Sendable {
                 MarmotGroup(id: $0.idHex, name: $0.name, memberNpubs: $0.memberNpubs)
             }
         }
+    }
+
+    /// Report a host timezone change when Share local time is on. Reads the
+    /// phone's current IANA id. Core publication is encrypted MLS and
+    /// backgrounded; this call runs off the main actor on the service queue.
+    func updateLocalTimezone() async {
+        let identifier = TimeZone.autoupdatingCurrent.identifier
+        _ = try? await run {
+            try $0.requireNode().updateLocalTimezone(ianaTimezone: identifier)
+        }
+    }
+
+    /// Stop publishing the phone timezone after the user disables Share local time.
+    func clearLocalTimezone() async {
+        _ = try? await run {
+            try $0.requireNode().updateLocalTimezone(ianaTimezone: "")
+        }
+    }
+
+    /// Restrict timezone rumors to these MLS group ids (hex). Empty shares with nobody.
+    func setTimezoneShareGroups(_ groupIdHexes: [String]) async {
+        _ = try? await run {
+            try $0.requireNode().setTimezoneShareGroups(groupIdHexes: groupIdHexes)
+        }
+    }
+
+    /// Local-only batch read for visible group members.
+    func peerTimezones(memberNpubs: [String]) async -> [PeerTimezone] {
+        let members = Array(Set(memberNpubs.filter { !$0.isEmpty }))
+        guard !members.isEmpty else { return [] }
+        return await readOnlyNonThrowing({ node in
+            (try? node.peerTimezones(memberPubkeys: members).map {
+                PeerTimezone(
+                    senderNpub: $0.senderNpub,
+                    ianaIdentifier: $0.ianaTimezone,
+                    updatedAt: Date(timeIntervalSince1970: TimeInterval($0.updatedAtSecs))
+                )
+            }) ?? []
+        }, default: [])
     }
 
     /// Decrypted message history for a group, oldest first.

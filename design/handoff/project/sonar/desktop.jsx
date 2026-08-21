@@ -605,6 +605,7 @@ function DkSettingsModal({ app, mode, onToggleMode, toggleNetwork, onPref, onRen
 
         <SectionLabel>Privacy &amp; safety</SectionLabel>
         <div className="st-card">
+          <StRow icon="globe" label="Share local time" sub="Default for encrypted chats. You can also turn it on or off in each chat." onClick={() => onPref('shareLocalTime', !prefs.shareLocalTime)} toggle={!!prefs.shareLocalTime} />
           <StRow icon="faceid" label="App lock" sub="Require Touch ID to open Sonar" onClick={() => onPref('appLock', !prefs.appLock)} toggle={!!prefs.appLock} />
           <StRow icon="check" label="Read receipts" onClick={() => onPref('readReceipts', !prefs.readReceipts)} toggle={!!prefs.readReceipts} />
           <StRow icon="importKey" label="Export private key" sub="Move your account to another wallet" onClick={() => setExportKey(true)} />
