@@ -203,6 +203,9 @@ object SonarLifecycle {
 
     /** Real process background (Android `onStop`), not a transient pause. */
     @Volatile var onProcessBackground: (() -> Unit)? = null
+    /** Host OS timezone changed while the process is alive. iOS uses
+     *  `NSSystemTimeZoneDidChange`; Android uses `ACTION_TIMEZONE_CHANGED`. */
+    @Volatile var onSystemTimezoneChanged: (() -> Unit)? = null
     @Volatile private var onInviteLink: ((String) -> Unit)? = null
     private val pendingInviteLinks = mutableListOf<String>()
 
@@ -298,6 +301,7 @@ fun App(
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
         SonarLifecycle.onProcessBackground = { state.onProcessBackgrounded() }
+        SonarLifecycle.onSystemTimezoneChanged = { state.onSystemTimezoneChanged() }
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
         SonarLifecycle.installSharedContentHandler { state.handleSharedContent(it) }
     }
@@ -487,7 +491,6 @@ private fun HomeScreen(state: SonarAppState) {
                     online = state.relayOnline,
                     connecting = state.connecting || state.relayConnecting,
                     meshCount = meshCount,
-                    syncing = state.syncing,
                 ) { connSheet = true }
             }
 
@@ -688,7 +691,7 @@ private fun channelName(geohash: String): String =
 
 /** bc-chip — centered status pill: dot + "<b>Online</b> · reaches anyone". */
 @Composable
-private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int, syncing: Boolean = false, onClick: () -> Unit) {
+private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int, onClick: () -> Unit) {
     val s = sonar
     Row(
         Modifier.clip(RoundedCornerShape(999.dp)).background(s.surface)
@@ -700,7 +703,6 @@ private fun StatusChipPill(online: Boolean, connecting: Boolean, meshCount: Int,
         Spacer(Modifier.width(8.dp))
         val label = if (online) "Online" else "Offline"
         val desc = when {
-            online && syncing -> "catching up…"
             online -> "reaches anyone"
             connecting -> "connecting…"
             else -> "$meshCount nearby on Bluetooth"
@@ -1738,6 +1740,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
+    val peerTimezone = if (isGroup) null else state.peerTimezoneForChat(screen.id)
+    val peerClockNow = rememberMinuteClock(peerTimezone?.ianaIdentifier)
+    val peerLocalTime = peerTimezone
+        ?.let { peerLocalTimeSnapshot(it.ianaIdentifier, peerClockNow) }
+        ?.let { peerLocalTimeText(it, includeRelative = true) }
     val canManageGroup = state.canManageGroup(screen.id)
     // Hoisted out of the row loop: resolving it costs a bech32 decode per group
     // member, which per-row would repeat for every message on the page.
@@ -2140,7 +2147,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
                             Spacer(Modifier.width(5.dp))
                             Text(
-                                (if (verified) "Verified · " else "") + subTransport,
+                                peerLocalTime ?: ((if (verified) "Verified · " else "") + subTransport),
                                 color = s.text2, fontSize = 12.sp,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis
                             )
