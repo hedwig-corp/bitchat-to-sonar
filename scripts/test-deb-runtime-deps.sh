@@ -55,6 +55,9 @@ check () {
 check "plain Depends"            "$(mkfixture plain    'Depends: libc6\n')"
 check "folded Depends"           "$(mkfixture folded   'Depends: libc6,\n libx11-6,\n zlib1g\n')"
 check "pre-existing Recommends"  "$(mkfixture existing 'Depends: libc6\nRecommends: something-old\n')"
+# A FOLDED existing Recommends. Replacing only its first line orphans the
+# continuation lines and dpkg-deb -b refuses the package.
+check "folded Recommends"        "$(mkfixture foldedrec 'Depends: libc6\nRecommends: aaa,\n bbb,\n ccc\n')"
 check "no Depends field"         "$(mkfixture nodeps   '')"
 # The shape the real jpackage artifact has, and the one a plain `>>` broke: a
 # trailing blank line ends the stanza, so appending after it creates a second

@@ -30,23 +30,27 @@ trap 'rm -rf "$WORK"' EXIT
 dpkg-deb -R "$DEB" "$WORK/pkg"
 CONTROL="$WORK/pkg/DEBIAN/control"
 
-if grep -q '^Recommends:' "$CONTROL"; then
-  sed -i "s/^Recommends:.*/Recommends: $RECOMMENDS/" "$CONTROL"
-else
-  # Appended, never inserted after Depends:. Inserting looked tidier, but Debian
-  # fields can be FOLDED across continuation lines beginning with a space, and
-  # `sed /^Depends:/a` then lands between the field and its own continuation;
-  # dpkg-deb -b rejects that. Field order is not significant to dpkg.
-  #
-  # Appended INSIDE the stanza, though, not merely at the end of the file. A blank
-  # line in a control file separates PARAGRAPHS, and jpackage's control ends with
-  # one, so a plain `>>` started a second stanza and dpkg-deb -b refused the
-  # package with "several package info entries found, only one allowed". Command
-  # substitution strips every trailing newline, which collapses that blank line;
-  # the printf then restores exactly one.
-  CONTENT="$(cat "$CONTROL")"
-  printf '%s\nRecommends: %s\n' "$CONTENT" "$RECOMMENDS" > "$CONTROL"
-fi
+# One path, whether or not a Recommends already exists: drop any existing field
+# INCLUDING its continuation lines, then append a fresh one inside the stanza.
+#
+# Two hazards, both hit for real, both avoided by rewriting rather than editing:
+#
+#   Folded fields. Debian fields may continue across lines beginning with a space.
+#   `sed s/^Recommends:.*/` rewrote only the first line and orphaned the rest,
+#   which dpkg-deb -b rejects ("syntax error after reference to package"), and
+#   `sed /^Depends:/a` inserted between a folded Depends and its own continuation.
+#   Field order is not significant to dpkg, so neither edit-in-place was worth it.
+#
+#   Paragraph separation. A blank line ends the stanza, and jpackage's control
+#   ends with one, so appending with `>>` started a SECOND package entry and
+#   dpkg-deb refused the package. Command substitution strips every trailing
+#   newline, collapsing that blank line; the printf restores exactly one.
+CONTENT="$(awk '
+  /^Recommends:/ { dropping = 1; next }
+  dropping && /^[ \t]/ { next }
+  { dropping = 0; print }
+' "$CONTROL")"
+printf '%s\nRecommends: %s\n' "$CONTENT" "$RECOMMENDS" > "$CONTROL"
 
 # -Zxz matches what jpackage emits; without it dpkg-deb would repack with its
 # current default and silently change the compression of a release artifact.

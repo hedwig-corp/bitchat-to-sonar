@@ -47,13 +47,27 @@ while [[ $# -gt 0 ]]; do
     --no-smoke) SMOKE=0; shift ;;
     --check) MODE=check; shift ;;
     --upload) MODE=upload; TAG="${2:-}"; [[ -n "$TAG" ]] || die "--upload needs a release tag"; shift 2 ;;
-    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Prints the header block by shape, not by line number, so editing the header
+    # cannot silently truncate --help.
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 need dpkg-deb
 need fakeroot
+need java
+
+# Gradle 8.12 rejects newer JDKs, and it says so only as a bare version number:
+# on a machine whose default java had moved to 25 the entire build output was
+# "* What went wrong:" followed by "25.0.2". Name the problem and the fix instead;
+# this is a tool a maintainer runs a few times a year, and that error costs an
+# afternoon.
+JAVA_MAJOR="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/')"
+if [[ ! "$JAVA_MAJOR" =~ ^(17|21)$ ]]; then
+  CANDIDATE="$(ls -d /usr/lib/jvm/*17* 2>/dev/null | head -1 || true)"
+  die "this build needs JDK 17 or 21, found ${JAVA_MAJOR:-unknown}.${CANDIDATE:+ Try: JAVA_HOME=$CANDIDATE $0 $*}"
+fi
 
 # The control-file patch is the fiddliest part of this, so its fixtures run
 # first: a broken patch should stop the build, not surface in a shipped package.
@@ -132,7 +146,9 @@ tar -C "$APP_DIR" -czf "$DIST_DIR/sonar-${VERSION}-linux-amd64.tar.gz" Sonar
 
 echo
 echo "deb Version=$RAW_VERSION → asset version=$VERSION"
-ls -lh "$DIST_DIR"/sonar-"${VERSION}"-linux-amd64.* | awk '{print "  "$9"  "$5}'
+for f in "$DIST_DIR/sonar-${VERSION}-linux-amd64.deb" "$DIST_DIR/sonar-${VERSION}-linux-amd64.tar.gz"; do
+  printf '  %s  %s\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+done
 
 if [[ "$MODE" == upload ]]; then
   need gh

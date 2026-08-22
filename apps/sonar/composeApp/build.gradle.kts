@@ -325,7 +325,8 @@ compose.desktop {
                 //                    will spawn. Without it a received voice note
                 //                    reports itself unplayable.
                 // scripts/deb-add-runtime-deps.sh adds both as Recommends after
-                // packaging, and .github/workflows/desktop-release.yml runs it.
+                // packaging; scripts/package-linux-desktop.sh runs it as part of
+                // building the release artifacts.
                 // Recommends rather than Depends so the package stays installable
                 // where they are unavailable; apt pulls them by default but
                 // `dpkg -i` does not.
