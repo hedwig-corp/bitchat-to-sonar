@@ -53,6 +53,11 @@ function sha256Hex(message) {
 	let h7 = 0x5be0cd19;
 
 	const w = new Uint32Array(64);
+	/**
+	 * @param {number} x
+	 * @param {number} n
+	 * @returns {number}
+	 */
 	const rotr = (x, n) => (x >>> n) | (x << (32 - n));
 
 	for (let i = 0; i < total; i += 64) {
