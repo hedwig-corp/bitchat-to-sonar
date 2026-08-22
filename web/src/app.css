@@ -36,6 +36,11 @@ body {
   font-family: 'Figtree', system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   line-height: 1.5;
+  /* Decorative radar/pulse art is centered and can spill a few px past a
+     narrow viewport, adding a phantom horizontal scroll. Clip the x-axis
+     (not `hidden`, which would create a scroll container and break the
+     position:sticky nav). overflow-y stays visible. */
+  overflow-x: clip;
 }
 .wrap { max-width: 1060px; margin: 0 auto; padding: 0 28px; }
 
