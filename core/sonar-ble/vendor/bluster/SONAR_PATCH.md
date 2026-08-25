@@ -27,7 +27,21 @@ GATT server through this side channel rather than bluster's cross-platform
 wiring `Event::NotifySubscribe` / `Event::Write` through the BlueZ backend's
 event receiver, which is a different mechanism, not a port of this patch.
 
-## 3. Never-type fallback in the BlueZ backend (Linux)
+## 3. Insecure write advertises both write types (Linux)
+
+`src/peripheral/bluez/gatt/flags.rs`: bluster models `Write` as either
+`WithResponse` or `WithoutResponse`, so an insecure write characteristic
+advertised only the `write` flag and a central writing without a response was
+refused with NOTSUPPORTED.
+
+Both phone platforms use both types on the bitchat characteristic (iOS
+`[.notify, .write, .writeWithoutResponse, .read]`, Android `PROPERTY_WRITE |
+PROPERTY_WRITE_NO_RESPONSE | PROPERTY_NOTIFY`), so the Linux GATT server has to
+offer both or half the writes fail. This is the BlueZ mirror of patch 4's
+CoreBluetooth change. BlueZ routes both write types to the same `WriteValue`
+handler, so no extra event handling is needed.
+
+## 4. Never-type fallback in the BlueZ backend (Linux)
 
 `src/peripheral/bluez/adapter.rs` (`powered`, `set_alias`) and
 `src/peripheral/bluez/advertisement.rs` (`register`, `unregister`) call
@@ -41,14 +55,14 @@ Each of the four calls is annotated `method_call::<(), _, _, _>(…)`, which is 
 annotation rustc's own diagnostic suggests. No behavior change: `()` is what the
 fallback resolved to anyway.
 
-## 4. Other CoreBluetooth changes
+## 5. Other CoreBluetooth changes
 
 `src/peripheral/corebluetooth/characteristic_flags.rs` also advertises
 write-WITHOUT-response, and `src/peripheral/corebluetooth/events.rs` fills in
 callbacks that upstream left as stubs. Both are Sonar changes rather than
 upstream code.
 
-Patches 1, 2 and 4 touch only the macOS (CoreBluetooth) path; patch 3 touches only
-the Linux (BlueZ) path. Anything without a `PATCH (Sonar)` marker should be
+Patches 1, 2 and 5 touch only the macOS (CoreBluetooth) path; patches 3 and 4
+touch only the Linux (BlueZ) path. Anything without a `PATCH (Sonar)` marker should be
 upstream `bluster`, but verify with the marker rather than trusting this list to
 be exhaustive when rebasing the vendor drop.
