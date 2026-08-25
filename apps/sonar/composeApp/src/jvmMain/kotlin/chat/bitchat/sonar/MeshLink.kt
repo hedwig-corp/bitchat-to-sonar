@@ -98,6 +98,13 @@ object MeshLink {
                         val previousName = nameByFp.put(fp, ann.nickname)
                         seenByFp[fp] = now
                         if (!wasVisible || previousName != ann.nickname) notifyPeerUpdate()
+                        // Start the Noise handshake. The desktop reaches peers by
+                        // connecting OUT as a GATT central, and the peripheral side
+                        // does not initiate to a central that never advertised, so
+                        // nobody would. Without a session hasLink() stays false,
+                        // which the UI reads as "out of range", which blocks the
+                        // send that would otherwise trigger a handshake.
+                        beginHandshake(fp, sender)
                     }
                 }
                 TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload)
@@ -148,6 +155,8 @@ object MeshLink {
             sonarLog("MeshLink", "re-handshake from ${nameByFp[fp] ?: fp.take(8)} → resetting session")
             sessions.remove(fp)
         }
+        // getOrPut, so an initiator session we started is reused for its m2 rather
+        // than replaced by a responder.
         val s = sessions.getOrPut(fp) { Session(SonarNoise.responder(MeshIdentity.noisePrivHex())) }
         synchronized(s) {
             if (!feedHandshake(fp, senderPeerId, s, m)) {
@@ -160,6 +169,27 @@ object MeshLink {
         touch(fp)
     }
 
+    /**
+     * Noise XX initiator: write m1 → read m2 → write m3 → established.
+     *
+     * No-op when a session already exists, so repeated announces do not restart a
+     * handshake in flight. A collision (both sides initiating) is handled by
+     * [handleHandshake], which tears down and restarts on a message that does not
+     * fit the current state.
+     */
+    private fun beginHandshake(fp: String, peerId: String) {
+        if (sessions.containsKey(fp)) return
+        val s = Session(SonarNoise.initiator(MeshIdentity.noisePrivHex()))
+        if (sessions.putIfAbsent(fp, s) != null) return
+        synchronized(s) {
+            runCatching {
+                val m1 = s.noise.writeMessage()
+                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), peerId, m1))
+                sonarLog("MeshLink", "Noise handshake started with ${nameByFp[fp] ?: fp.take(8)}")
+            }.onFailure { sessions.remove(fp) }
+        }
+    }
+
     /** Returns false if [m] couldn't be processed (caller restarts the handshake). */
     private fun feedHandshake(fp: String, senderPeerId: String, s: Session, m: ByteArray): Boolean =
         runCatching {
@@ -168,8 +198,15 @@ object MeshLink {
                 s.noise.intoSession(); s.established = true
                 sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
             } else {
-                val m2 = s.noise.writeMessage()
-                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2))
+                val next = s.noise.writeMessage()
+                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, next))
+                // The responder finishes after READING m3; the initiator finishes
+                // after WRITING it. Without this check the initiator sends m3 and
+                // then waits forever for a fourth message that never comes.
+                if (s.noise.isFinished()) {
+                    s.noise.intoSession(); s.established = true
+                    sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
+                }
             }
             true
         }.getOrElse { sessions.remove(fp); false }
