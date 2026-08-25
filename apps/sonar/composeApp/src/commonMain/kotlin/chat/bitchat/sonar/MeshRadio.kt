@@ -262,6 +262,23 @@ internal inline fun shouldExpireAnnouncedMeshPeer(
  * `iosMain` (later, at the CMP shift) provides a CoreBluetooth `actual`.
  */
 expect object MeshRadio {
+    /**
+     * Whether this build can exchange mesh messages at all, as opposed to merely
+     * seeing that peers exist.
+     *
+     * False off Apple platforms. `sonar-ble` implements the peripheral/GATT-server
+     * role only for CoreBluetooth, and without it a phone can never subscribe, so
+     * it never writes its announce, so [MeshLink] has nothing to pump and no Noise
+     * session forms. The radio still scans, so peers appear in presence counts —
+     * which is exactly why this needs to be askable: a channel that lists people
+     * and delivers nothing reads as broken sync rather than an unimplemented
+     * transport.
+     *
+     * [available] is a different question: it asks whether the radio hardware and
+     * permissions are there. Both can be true while this is false.
+     */
+    val meshMessagingSupported: Boolean
+
     /** True when BLE hardware + runtime permissions are available. */
     fun available(): Boolean
     /** Restrict open discovery while keeping known chat peers reachable. */
