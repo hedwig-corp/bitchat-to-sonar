@@ -7,6 +7,7 @@ import java.nio.file.Files
 
 /** JNA view of the Rust BLE bridge (`core/sonar-ble`, libsonar_ble). */
 private interface BleLib : Library {
+    fun sonar_ble_mesh_supported(): Boolean
     fun sonar_ble_start()
     fun sonar_ble_stop()
     fun sonar_ble_peers_json(): Pointer?
@@ -39,12 +40,29 @@ object BleBridge {
 
     /**
      * True when this platform can also play the peripheral role (advertise + GATT
-     * server). False on Linux/Windows, where only the scan radar works, so callers
-     * must not treat [available] as "phones can discover this desktop".
+     * server), so callers must not treat [available] as "phones can discover this
+     * desktop".
+     *
+     * Deliberately NOT cached. On BlueZ this is a runtime answer, not a
+     * compile-time one: the bridge reports optimistically until an advertisement
+     * has actually been attempted, then reports what happened. An adapter can be
+     * present, powered and unblocked and still refuse every LE advertisement, and
+     * caching the optimistic first read would leave the app claiming mesh works on
+     * exactly those machines. Each call is one FFI hop reading two atomics.
      */
-    val advertisingSupported: Boolean by lazy {
-        runCatching { lib?.sonar_ble_advertising_supported() == true }.getOrDefault(false)
-    }
+    /**
+     * True when this build can exchange mesh traffic at all.
+     *
+     * Separate from [advertisingSupported]: the desktop takes part as a GATT
+     * central (scan, connect, subscribe, write), which carries both directions,
+     * so mesh works on adapters that refuse to advertise. Advertising only
+     * decides whether a phone can find us first.
+     */
+    val meshSupported: Boolean
+        get() = runCatching { lib?.sonar_ble_mesh_supported() == true }.getOrDefault(false)
+
+    val advertisingSupported: Boolean
+        get() = runCatching { lib?.sonar_ble_advertising_supported() == true }.getOrDefault(false)
 
     private fun load(): BleLib? = runCatching {
         val mapped = System.mapLibraryName("sonar_ble") // libsonar_ble.dylib / .so / sonar_ble.dll
