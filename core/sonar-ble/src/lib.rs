@@ -18,42 +18,50 @@
 //!   sonar_ble_free(ptr)        -> free a string returned above
 //!   sonar_ble_stop()           -> stop scanning + clear state
 
-use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::Manager;
-// The peripheral/advertise role is CoreBluetooth-only; see `run_peripheral`.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+// The peripheral/advertise role runs on CoreBluetooth and BlueZ; see
+// `run_peripheral`. The two drive different mechanisms behind the same API.
 use bluster::gatt::characteristic::{Characteristic, Properties, Read, Secure, Write};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::gatt::event::{Event, Response};
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::gatt::service::Service;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::Peripheral;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::collections::HashSet;
 use std::ffi::{c_char, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
 use uuid08::Uuid as Uuid08; // bluster's UUID version
 
 /// bitchat mesh GATT service + characteristic — must match the iOS/Android apps.
 const BITCHAT_SERVICE_U128: u128 = 0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C;
-// Only the peripheral role serves this characteristic (CoreBluetooth-only today).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+// Served by the peripheral role (CoreBluetooth and BlueZ).
 const BITCHAT_CHAR_U128: u128 = 0xA1B2C3D4_E5F6_4A5B_8C9D_0E1F2A3B4C5D;
 const BITCHAT_SERVICE: Uuid = Uuid::from_u128(BITCHAT_SERVICE_U128);
+const BITCHAT_CHAR: Uuid = Uuid::from_u128(BITCHAT_CHAR_U128);
 
 /// The signed bitchat ANNOUNCE packet (built by the Rust core via the JVM and
 /// pushed down) that the GATT server sends when a central subscribes — that's
 /// what makes a phone show this desktop as a named mesh peer.
 static ANNOUNCE: Lazy<Mutex<Option<Vec<u8>>>> = Lazy::new(|| Mutex::new(None));
 static ADVERTISING: AtomicBool = AtomicBool::new(false);
+/// Whether `start_advertising` has actually succeeded at least once this run.
+///
+/// Compile-time support is not the same question as working hardware. A BlueZ
+/// adapter can be present, powered and unblocked and still refuse to register an
+/// advertisement (an Intel AX201 on this developer's laptop rejects every LE
+/// advertisement, `bluetoothctl advertise on` included, with mgmt
+/// "Invalid Parameters"). Reporting the compile-time answer there would tell the
+/// app mesh works, advertising would fail out of sight, and the user would be
+/// back to a Mesh channel that silently delivers nothing.
+static ADVERTISE_OK: AtomicBool = AtomicBool::new(false);
+/// Set once an attempt has completed, so callers can tell "not tried yet" from
+/// "tried and failed" instead of reading a not-yet-started run as broken.
+static ADVERTISE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 /// Packets centrals wrote to our GATT characteristic (their announce / handshake).
 /// Drained by the JVM, which decodes the announce to name + dedupe a peer — this
@@ -158,6 +166,16 @@ struct Seen {
 const MAX_TRACKED_DEVICES: usize = 256;
 
 static DEVICES: Lazy<Mutex<HashMap<String, Seen>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Peers the central link currently holds a GATT connection to.
+///
+/// The desktop reaches the mesh as a CENTRAL: the phone advertises, we connect,
+/// subscribe to its bitchat characteristic and write ours. That needs only scan
+/// and connect, which every adapter does. Advertising is the fragile half — some
+/// controllers refuse to register an advertisement at all — and it is only needed
+/// so a phone can find US first.
+static LINKED: Lazy<Mutex<HashMap<String, ()>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// True once a central link has delivered or accepted mesh traffic.
+static CENTRAL_LINK_OK: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Begin a continuous background scan (idempotent). Spawns a dedicated thread
@@ -269,7 +287,29 @@ async fn scan_loop() {
     while RUNNING.load(Ordering::SeqCst) {
         // 1s timeout so a stop() is noticed even when no advertisements arrive.
         match tokio::time::timeout(Duration::from_secs(1), events.next()).await {
-            Ok(Some(ev)) => handle_event(&central, ev).await,
+            Ok(Some(ev)) => {
+                handle_event(&central, ev).await;
+                // The desktop takes part as a CENTRAL: link to any bitchat peer
+                // we are not already linked to. One task per peer, ending when
+                // the link drops so the next sighting relinks.
+                if let Ok(peers) = central.peripherals().await {
+                    for p in peers {
+                        let addr = p.address().to_string();
+                        let already = LINKED.lock().map(|l| l.contains_key(&addr)).unwrap_or(true);
+                        if already {
+                            continue;
+                        }
+                        let is_mesh = match p.properties().await {
+                            Ok(Some(props)) => props.services.contains(&BITCHAT_SERVICE),
+                            _ => false,
+                        };
+                        if is_mesh {
+                            LINKED.lock().map(|mut l| l.insert(addr.clone(), ())).ok();
+                            tokio::spawn(run_central_link(p, addr));
+                        }
+                    }
+                }
+            }
             Ok(None) => break, // stream ended
             Err(_) => {}       // tick — re-check RUNNING
         }
@@ -287,6 +327,102 @@ async fn scan_loop() {
         }
     }
     let _ = central.stop_scan().await;
+}
+
+/// Hold a GATT client link to one bitchat peer: subscribe to its notifications
+/// and drain our outbound queue into its characteristic.
+///
+/// This is the half that makes mesh work on a desktop whose adapter will not
+/// advertise. The phone exposes the bitchat characteristic with
+/// WRITE | WRITE_WITHOUT_RESPONSE | NOTIFY, so a central can both send and
+/// receive; being discoverable is not required to take part.
+///
+/// Runs until the link drops, then returns so the scan loop can relink when the
+/// peer is seen again.
+async fn run_central_link(peer: btleplug::platform::Peripheral, addr: String) {
+    use futures::StreamExt as _;
+
+    if peer.connect().await.is_err() {
+        dbg_log(&format!("link {addr}: connect failed"));
+        return;
+    }
+    if peer.discover_services().await.is_err() {
+        dbg_log(&format!("link {addr}: service discovery failed"));
+        let _ = peer.disconnect().await;
+        return;
+    }
+    let Some(ch) = peer.characteristics().into_iter().find(|c| c.uuid == BITCHAT_CHAR) else {
+        // Advertised the service but does not serve the characteristic: not a
+        // mesh peer we can talk to.
+        dbg_log(&format!("link {addr}: no bitchat characteristic"));
+        let _ = peer.disconnect().await;
+        return;
+    };
+    if peer.subscribe(&ch).await.is_err() {
+        dbg_log(&format!("link {addr}: subscribe failed"));
+        let _ = peer.disconnect().await;
+        return;
+    }
+    LINKED.lock().map(|mut l| l.insert(addr.clone(), ())).ok();
+    dbg_log(&format!("link {addr}: up (subscribed)"));
+
+    // Announce ourselves immediately: this write is how the peer learns we
+    // exist, since it never saw us advertise.
+    let ann = ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default();
+    if !ann.is_empty() {
+        let _ = peer.write(&ch, &ann, WriteType::WithoutResponse).await;
+    }
+
+    let Ok(mut notifications) = peer.notifications().await else {
+        let _ = peer.disconnect().await;
+        LINKED.lock().map(|mut l| l.remove(&addr)).ok();
+        return;
+    };
+
+    let mut last_announce = Instant::now();
+    while RUNNING.load(Ordering::SeqCst) {
+        // Drain anything the mesh engine queued for the wire.
+        let queued: Vec<Vec<u8>> = TX_PACKETS
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default();
+        for pkt in queued {
+            if peer.write(&ch, &pkt, WriteType::WithoutResponse).await.is_err() {
+                dbg_log(&format!("link {addr}: write failed, dropping link"));
+                break;
+            }
+            CENTRAL_LINK_OK.store(true, Ordering::SeqCst);
+        }
+        // Re-announce periodically so a peer that restarts its app re-learns us.
+        if last_announce.elapsed() >= Duration::from_secs(10) {
+            let ann = ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default();
+            if !ann.is_empty() {
+                let _ = peer.write(&ch, &ann, WriteType::WithoutResponse).await;
+            }
+            last_announce = Instant::now();
+        }
+
+        match tokio::time::timeout(Duration::from_millis(200), notifications.next()).await {
+            Ok(Some(n)) => {
+                CENTRAL_LINK_OK.store(true, Ordering::SeqCst);
+                if let Ok(mut q) = RX_PACKETS.lock() {
+                    if q.len() < 256 {
+                        q.push(n.value);
+                    }
+                }
+            }
+            Ok(None) => break, // peer went away
+            Err(_) => {
+                if !peer.is_connected().await.unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+    }
+
+    dbg_log(&format!("link {addr}: down"));
+    LINKED.lock().map(|mut l| l.remove(&addr)).ok();
+    let _ = peer.disconnect().await;
 }
 
 async fn init_central() -> Option<btleplug::platform::Adapter> {
@@ -420,7 +556,26 @@ pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
 /// needs exists only in bluster's CoreBluetooth backend.
 #[no_mangle]
 pub extern "C" fn sonar_ble_advertising_supported() -> bool {
-    cfg!(any(target_os = "macos", target_os = "ios"))
+    if !cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux")) {
+        return false;
+    }
+    // Optimistic until proven otherwise: the host calls this before the radio
+    // starts, and answering false there would hide mesh on a machine that can
+    // do it. Once an attempt has completed, the answer is what actually
+    // happened.
+    !ADVERTISE_ATTEMPTED.load(Ordering::SeqCst) || ADVERTISE_OK.load(Ordering::SeqCst)
+}
+
+/// Whether this build can take part in the mesh at all.
+///
+/// Distinct from [sonar_ble_advertising_supported], which asks only whether
+/// phones can discover US. The desktop participates as a GATT central — scan,
+/// connect, subscribe, write — and that carries traffic in both directions, so
+/// mesh works on adapters that refuse to advertise. Advertising is additive: it
+/// lets a phone initiate instead of waiting for us to.
+#[no_mangle]
+pub extern "C" fn sonar_ble_mesh_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux"))
 }
 
 /// Begin advertising the bitchat service (peripheral role) so phones discover
@@ -488,7 +643,182 @@ pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) {
 /// C ABI on every target (the JVM `BleLib` binds all of it via JNA) and failing
 /// here means Linux gets the central/scan radar with advertising reported
 /// unavailable, rather than the whole crate failing to build.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+/// BlueZ (Linux) peripheral role.
+///
+/// Same job as the CoreBluetooth version below, driven through a different
+/// mechanism. CoreBluetooth has no subscribe callback in bluster, so that path
+/// uses a Sonar side channel (`notify()`/`take_writes()`) and polls. BlueZ does
+/// deliver the cross-platform `gatt::event` stream, so this drives everything
+/// from it: `NotifySubscribe` hands us an `mpsc::Sender<Vec<u8>>` per subscribed
+/// central, and `WriteRequest` carries what a central wrote.
+///
+/// Two details are load-bearing:
+///
+/// - **Every `WriteRequest` must be answered.** BlueZ's `WriteValue` blocks on
+///   the oneshot until we reply, so dropping it wedges the writing central.
+/// - **The notification channel has capacity 1** (`mpsc::channel(1)` inside
+///   bluster), so a `try_send` fails whenever the previous notification has not
+///   drained. Subscribers that fail are retried on the next tick rather than
+///   dropped, and a closed channel is what prunes them.
+#[cfg(target_os = "linux")]
+async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
+    use futures::SinkExt;
+
+    let svc = Uuid08::from_u128(BITCHAT_SERVICE_U128);
+    let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
+
+    // Each step logs: when this fails it is almost always one specific BlueZ
+    // call, and a single "advertise: ERR" line cannot tell you which. Diagnosing
+    // it without these took a bisect through D-Bus errors.
+    dbg_log("advertise: creating BlueZ peripheral");
+    let peripheral = Peripheral::new()
+        .await
+        .map_err(|e| { dbg_log(&format!("advertise: Peripheral::new FAILED ({e}); is the adapter blocked or powered off?")); e })?;
+
+    // BlueZ rejects RegisterApplication while the adapter is down, and the app
+    // may start before the user powers Bluetooth on.
+    let mut tries = 0;
+    while !peripheral.is_powered().await? {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tries += 1;
+        if tries > 50 {
+            return Err("bluetooth adapter never powered on".into());
+        }
+    }
+
+    let (tx, mut rx) = futures::channel::mpsc::channel(32);
+    // read + write + notify, matching what the phones advertise: iOS uses
+    // [.notify, .write, .writeWithoutResponse, .read] and Android
+    // PROPERTY_WRITE | PROPERTY_WRITE_NO_RESPONSE | PROPERTY_NOTIFY.
+    let characteristic = Characteristic::new(
+        chr,
+        Properties::new(
+            Some(Read(Secure::Insecure(tx.clone()))),
+            Some(Write::WithResponse(Secure::Insecure(tx.clone()))),
+            Some(tx.clone()),
+            None,
+        ),
+        None,
+        HashSet::new(),
+    );
+    let mut chars = HashSet::new();
+    chars.insert(characteristic);
+    peripheral.add_service(&Service::new(svc, true, chars))?;
+    peripheral
+        .register_gatt()
+        .await
+        .map_err(|e| { dbg_log(&format!("advertise: register_gatt FAILED ({e})")); e })?;
+    dbg_log("advertise: GATT application registered");
+    let started = peripheral.start_advertising("Sonar", &[svc]).await;
+    ADVERTISE_ATTEMPTED.store(true, Ordering::SeqCst);
+    if let Err(e) = started {
+        // Adapter present and powered, controller still refuses. Record it so
+        // the host stops claiming mesh works and shows the scan-only notice.
+        ADVERTISE_OK.store(false, Ordering::SeqCst);
+        dbg_log(&format!(
+            "advertise: start_advertising REFUSED by the adapter ({e}); mesh stays scan-only"
+        ));
+        return Err(e.into());
+    }
+    ADVERTISE_OK.store(true, Ordering::SeqCst);
+    dbg_log("advertise: started on BlueZ (bitchat service)");
+
+    fn announce() -> Vec<u8> {
+        ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
+    }
+
+    // One sender per subscribed central.
+    let mut subs: Vec<futures::channel::mpsc::Sender<Vec<u8>>> = Vec::new();
+
+    // Push to every subscriber, dropping only those whose channel has closed.
+    // A full channel is not a dead one: capacity is 1, so a burst outruns it
+    // routinely and the next tick retries.
+    fn push(subs: &mut Vec<futures::channel::mpsc::Sender<Vec<u8>>>, payload: &[u8]) -> usize {
+        let mut delivered = 0;
+        subs.retain_mut(|s| match s.try_send(payload.to_vec()) {
+            Ok(()) => {
+                delivered += 1;
+                true
+            }
+            Err(e) if e.is_full() => true,
+            Err(_) => false, // disconnected
+        });
+        delivered
+    }
+
+    let mut last_notify = Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .unwrap_or_else(Instant::now);
+    while ADVERTISING.load(Ordering::SeqCst) {
+        // Re-announce on a timer like the CoreBluetooth path: a central that
+        // subscribes between ticks is caught by the next one.
+        if last_notify.elapsed() >= Duration::from_secs(2) && !subs.is_empty() {
+            let ann = announce();
+            if !ann.is_empty() {
+                let n = push(&mut subs, &ann);
+                dbg_log(&format!(
+                    "advertise: notify announce ({} bytes) to {}/{} subscriber(s)",
+                    ann.len(),
+                    n,
+                    subs.len()
+                ));
+            }
+            last_notify = Instant::now();
+        }
+
+        // Packets the JVM mesh engine queued (handshake replies, DMs). Taken
+        // only when someone is subscribed, so they are not dropped on the floor
+        // before a phone connects.
+        if !subs.is_empty() {
+            let queued: Vec<Vec<u8>> = TX_PACKETS
+                .lock()
+                .map(|mut q| std::mem::take(&mut *q))
+                .unwrap_or_default();
+            for pkt in queued {
+                push(&mut subs, &pkt);
+            }
+        }
+
+        match tokio::time::timeout(Duration::from_millis(120), rx.next()).await {
+            Ok(Some(ev)) => match ev {
+                Event::NotifySubscribe(sub) => {
+                    dbg_log("advertise: central subscribed");
+                    let mut s = sub.notification;
+                    // Send our announce immediately: this is the moment the
+                    // phone is waiting for to show this desktop as a peer.
+                    let _ = s.send(announce()).await;
+                    subs.push(s);
+                }
+                Event::NotifyUnsubscribe => {
+                    dbg_log("advertise: central unsubscribed");
+                    subs.retain(|s| !s.is_closed());
+                }
+                Event::ReadRequest(req) => {
+                    let _ = req.response.send(Response::Success(announce()));
+                }
+                Event::WriteRequest(req) => {
+                    // A central's packet: its announce, a handshake step, or a
+                    // DM. Hand it to the JVM mesh engine through RX_PACKETS.
+                    dbg_log(&format!("advertise: rx write {} bytes from central", req.data.len()));
+                    if let Ok(mut q) = RX_PACKETS.lock() {
+                        if q.len() < 256 {
+                            q.push(req.data);
+                        }
+                    }
+                    // Must answer, or BlueZ leaves the central blocked.
+                    let _ = req.response.send(Response::Success(vec![]));
+                }
+            },
+            Ok(None) => break,
+            Err(_) => {} // tick
+        }
+    }
+    let _ = peripheral.stop_advertising().await;
+    let _ = peripheral.unregister_gatt().await;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
 async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     Err("peripheral/advertise role is not implemented for this platform".into())
 }
@@ -636,25 +966,58 @@ mod tests {
         assert!(!advertises_bitchat(&props_with(vec![])));
     }
 
-    /// The advertise capability must match the platform that actually has the
-    /// peripheral implementation, since the host uses this to decide whether to
-    /// promise discoverability.
+    /// The capability must be reported for every platform that has a peripheral
+    /// implementation, since the host uses it to decide whether to promise
+    /// discoverability. BlueZ joined CoreBluetooth here.
     #[test]
-    fn advertising_supported_matches_platform() {
+    fn advertising_supported_covers_every_implemented_platform() {
+        // Reset: another test in this binary may have recorded an attempt.
+        ADVERTISE_ATTEMPTED.store(false, Ordering::SeqCst);
         assert_eq!(
             sonar_ble_advertising_supported(),
-            cfg!(any(target_os = "macos", target_os = "ios"))
+            cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux"))
         );
     }
 
-    /// On a platform without the peripheral role, the stub must report failure
-    /// rather than silently appearing to advertise.
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    /// A platform with no implementation must still say so, rather than letting
+    /// the host promise a discoverability it cannot deliver.
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
     #[test]
-    fn stub_peripheral_reports_unsupported() {
+    fn unimplemented_platform_reports_unsupported() {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         assert!(rt.block_on(run_peripheral()).is_err());
         assert!(!ADVERTISING.load(Ordering::SeqCst));
+    }
+
+    /// Compile-time support is not the same claim as a working radio.
+    ///
+    /// An adapter can be present, powered and unblocked and still refuse every LE
+    /// advertisement — an Intel AX201 does exactly that on the machine this was
+    /// written on, rejecting `bluetoothctl advertise on` too. Reporting the
+    /// compile-time answer there would tell the app mesh works while nothing is
+    /// discoverable, which is the bug the UI notice exists to prevent, one layer
+    /// down.
+    #[test]
+    fn a_refused_advertisement_downgrades_the_capability() {
+        ADVERTISE_ATTEMPTED.store(false, Ordering::SeqCst);
+        ADVERTISE_OK.store(false, Ordering::SeqCst);
+        assert!(
+            sonar_ble_advertising_supported() == cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux")),
+            "before an attempt the answer is the platform's"
+        );
+
+        // The adapter refused.
+        ADVERTISE_ATTEMPTED.store(true, Ordering::SeqCst);
+        ADVERTISE_OK.store(false, Ordering::SeqCst);
+        assert!(!sonar_ble_advertising_supported(), "a refusal must downgrade it");
+
+        // And a later success restores it.
+        ADVERTISE_OK.store(true, Ordering::SeqCst);
+        assert_eq!(
+            sonar_ble_advertising_supported(),
+            cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux"))
+        );
+        ADVERTISE_ATTEMPTED.store(false, Ordering::SeqCst);
     }
 
     /// The debug log must never be a fixed path in a shared directory: it records
