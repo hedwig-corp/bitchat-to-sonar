@@ -542,6 +542,14 @@ pub struct GroupInfo {
     pub member_npubs: Vec<String>,
 }
 
+/// A peer's locally cached, privately shared IANA timezone.
+#[derive(uniffi::Record)]
+pub struct PeerTimezoneInfo {
+    pub sender_npub: String,
+    pub iana_timezone: String,
+    pub updated_at_secs: u64,
+}
+
 /// FFI-friendly pending group invite summary.
 #[derive(uniffi::Record)]
 pub struct GroupInviteInfo {
@@ -1693,6 +1701,45 @@ impl SonarNode {
                     id_hex: hex::encode(g.mls_group_id.as_slice()),
                     name: g.name,
                     member_npubs: members,
+                })
+            })
+            .collect()
+    }
+
+    /// Report this host's current system IANA timezone. The host must only
+    /// call this after the user enables Share local time. Pass an empty
+    /// string to stop sharing. The core validates a non-empty id, remembers
+    /// it for the node lifetime, and encrypts kind-449 rumors into MLS group
+    /// messages (kind 445) without blocking transcript reads.
+    pub fn update_local_timezone(&self, iana_timezone: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.update_local_timezone(&iana_timezone))?;
+        Ok(())
+    }
+
+    /// Restrict timezone shares to these MLS group ids (hex). Empty shares
+    /// with nobody. Call before or after `update_local_timezone`; a live
+    /// zone is republished to newly allowlisted groups without blocking
+    /// transcript reads.
+    pub fn set_timezone_share_groups(&self, group_id_hexes: Vec<String>) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.set_timezone_share_groups(group_id_hexes));
+        Ok(())
+    }
+
+    /// Batch local-only cache lookup for visible DM/group members.
+    pub fn peer_timezones(&self, member_pubkeys: Vec<String>) -> FfiResult<Vec<PeerTimezoneInfo>> {
+        let members = parse_pubkeys(member_pubkeys, "timezone member pubkey")?;
+        self.client
+            .peer_timezones(&members)
+            .into_iter()
+            .map(|(sender, cached)| {
+                Ok(PeerTimezoneInfo {
+                    sender_npub: sender
+                        .to_bech32()
+                        .map_err(|e| SonarFfiError::Core(e.to_string()))?,
+                    iana_timezone: cached.zone,
+                    updated_at_secs: cached.updated_at_secs,
                 })
             })
             .collect()

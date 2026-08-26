@@ -498,6 +498,27 @@ actual object SonarCore {
         }
     }
 
+    actual suspend fun updateLocalTimezone(ianaIdentifier: String): Unit = withContext(Dispatchers.IO) {
+        node?.updateLocalTimezone(ianaIdentifier)
+    }
+
+    actual suspend fun setTimezoneShareGroups(groupIdHexes: List<String>): Unit =
+        withContext(Dispatchers.IO) {
+            node?.setTimezoneShareGroups(groupIdHexes)
+        }
+
+    actual suspend fun peerTimezones(memberPubkeys: List<String>): List<SonarPeerTimezone> =
+        withContext(Dispatchers.IO) {
+            val n = node ?: return@withContext emptyList()
+            n.peerTimezones(memberPubkeys).map {
+                SonarPeerTimezone(
+                    senderNpub = it.senderNpub,
+                    ianaIdentifier = it.ianaTimezone,
+                    updatedAtSecs = it.updatedAtSecs.toLong(),
+                )
+            }
+        }
+
     actual suspend fun markConversationRead(chatId: String) = withContext(Dispatchers.IO) {
         node?.markConversationRead(chatId)
         Unit

@@ -24,13 +24,26 @@ struct SonarGroupInfoScreen: View {
     @State private var pendingJoinRequests: [JoinRequestInfo] = []
     @State private var approvingJoinRequests: Set<String> = []
     @State private var toast: String? = nil
+    @State private var clockNow = Date()
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var members: [SNGroupContact] { store.groupMemberContacts(forConversationId: peerId) }
+    private var hasVisibleTimezone: Bool {
+        members.contains { store.marmot.peerTimezone(for: $0.npub) != nil }
+    }
 
     private var groupTitle: String {
         let row = store.dmRows.first { $0.id == peerId }
         return row?.title ?? peer.name
+    }
+
+    private func localTimeText(zoneIdentifier: String) -> String? {
+        guard let time = SNPeerLocalTimeFormatter.display(
+            zoneIdentifier: zoneIdentifier,
+            at: clockNow,
+            includeRelative: false
+        )?.timeText else { return nil }
+        return String.localizedStringWithFormat(String(localized: "Local time: %@"), time)
     }
 
     var body: some View {
@@ -141,6 +154,23 @@ struct SonarGroupInfoScreen: View {
                         .foregroundColor(SonarTheme.text3)
                         .padding(EdgeInsets(top: 0, leading: 16, bottom: 8, trailing: 16))
 
+                    SNSectionLabel("Privacy")
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon: .globe,
+                            label: "Share local time",
+                            sub: "This group can see your current time. Uses this phone's timezone.",
+                            trail: .toggle(store.sharesLocalTime(withChatId: peerId)),
+                            divider: false
+                        ) {
+                            store.toggleShareLocalTime(forChatId: peerId)
+                        }
+                    }
+                    Text(verbatim: "Only your timezone (\(TimeZone.autoupdatingCurrent.identifier)) travels — inside the group's encryption, never a location. Overrides your Settings default for this group only.")
+                        .font(SonarTheme.uiFont(size: 13))
+                        .foregroundColor(SonarTheme.text3)
+                        .padding(EdgeInsets(top: 8, leading: 16, bottom: 0, trailing: 16))
+
                     // ── Members ──
                     SNSectionLabel("Members")
                     SNSettingsCard {
@@ -163,6 +193,15 @@ struct SonarGroupInfoScreen: View {
                                     .font(SonarTheme.uiFont(size: 12.5))
                                     .foregroundColor(SonarTheme.text2)
                                     .lineLimit(1)
+                                if let localTime = localTimeText(
+                                    zoneIdentifier: TimeZone.autoupdatingCurrent.identifier
+                                ) {
+                                    Text(verbatim: localTime)
+                                        .font(SonarTheme.uiFont(size: 12.5))
+                                        .foregroundColor(SonarTheme.text2)
+                                        .lineLimit(1)
+                                        .padding(.top, 3)
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
@@ -187,6 +226,16 @@ struct SonarGroupInfoScreen: View {
                                             .font(SonarTheme.uiFont(size: 12.5))
                                             .foregroundColor(SonarTheme.text2)
                                             .lineLimit(1)
+                                        if let zone = store.marmot.peerTimezone(for: member.npub),
+                                           let localTime = localTimeText(
+                                               zoneIdentifier: zone.ianaIdentifier
+                                           ) {
+                                            Text(verbatim: localTime)
+                                                .font(SonarTheme.uiFont(size: 12.5))
+                                                .foregroundColor(SonarTheme.text2)
+                                                .lineLimit(1)
+                                                .padding(.top, 3)
+                                        }
                                     }
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     SNIcon(name: .chevron, size: 14, weight: 2.2)
@@ -261,6 +310,15 @@ struct SonarGroupInfoScreen: View {
         .overlay(alignment: .bottom) { toastView }
         .animation(.easeOut(duration: 0.2), value: toast)
         .task(id: peerId) { await loadPendingJoinRequests() }
+        .task(id: hasVisibleTimezone) {
+            guard hasVisibleTimezone else { return }
+            while !Task.isCancelled {
+                clockNow = Date()
+                try? await Task.sleep(
+                    nanoseconds: SNPeerLocalTimeFormatter.nanosecondsUntilNextMinute()
+                )
+            }
+        }
         .snSheet(isPresented: $leaveSheet, title: "Leave group") {
             VStack(spacing: 12) {
                 Text("Are you sure you want to leave this group? You won\u{2019}t be able to read or send messages anymore.")

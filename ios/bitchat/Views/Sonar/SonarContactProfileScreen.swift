@@ -339,6 +339,28 @@ struct SonarContactProfileScreen: View {
                         ) {}
                     }
 
+                    if store.marmotGroupId(effectiveChatId) != nil {
+                        let sharing = store.sharesLocalTime(withChatId: effectiveChatId)
+                        SNSectionLabel("Privacy")
+                        SNSettingsCard {
+                            SNSettingsRow(
+                                icon: .globe,
+                                label: "Share local time",
+                                sub: "This chat can show your current time. Uses this phone's timezone.",
+                                trail: .toggle(sharing),
+                                divider: false
+                            ) {
+                                store.toggleShareLocalTime(forChatId: effectiveChatId)
+                            }
+                        }
+                        Text(verbatim: sharing
+                             ? "Sharing \(TimeZone.autoupdatingCurrent.identifier) with \(peerName) inside this chat’s encryption. Only the timezone travels, never a location."
+                             : "Off for this chat — overrides your Settings default. Only the timezone travels, never a location.")
+                            .font(SonarTheme.uiFont(size: 13))
+                            .foregroundColor(SonarTheme.text3)
+                            .padding(EdgeInsets(top: 8, leading: 16, bottom: 0, trailing: 16))
+                    }
+
                     // ── Shared groups ──
                     SNSectionLabel("Shared groups")
                     if sharedGroups.isEmpty {
