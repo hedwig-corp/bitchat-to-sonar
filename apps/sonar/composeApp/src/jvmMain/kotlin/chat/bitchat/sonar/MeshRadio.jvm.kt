@@ -42,19 +42,49 @@ actual object MeshRadio {
         }
     }
 
+    /**
+     * Forces [meshMessagingSupported] for tests.
+     *
+     * The notice this gates used to be testable simply because Linux could never
+     * do mesh; now that it can, the only way to exercise the unsupported path is
+     * to say so. Testing "the notice appears on Linux" would now pin the platform
+     * rather than the behaviour, and would go green for the wrong reason on any
+     * machine whose adapter happens to refuse advertising.
+     */
+    @Volatile
+    internal var meshMessagingOverrideForTest: Boolean? = null
+
+    // The central link carries messages; advertising only decides whether a phone
+    // can find us first. See the expect declaration.
+    actual val meshMessagingSupported: Boolean
+        get() = meshMessagingOverrideForTest ?: BleBridge.meshSupported
+
     actual fun start() {
         if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) return
         BleBridge.start()            // central: filtered scan
         refreshAnnounce()
+        // The scan loop links to every bitchat peer it finds as a GATT central,
+        // and that carries traffic both ways, so the protocol engine runs
+        // wherever scanning does.
+        MeshLink.start()
+        // Advertising is additive: it lets a phone initiate instead of waiting to
+        // be connected to. An adapter that refuses it does not stop mesh working.
         if (BleBridge.advertisingSupported) {
-            BleBridge.startAdvertising() // peripheral: advertise + GATT server
-            MeshLink.start()             // protocol engine: handshake + DMs
+            BleBridge.startAdvertising()
+            Thread({
+                Thread.sleep(6_000)
+                if (!BleBridge.advertisingSupported) {
+                    sonarLog(
+                        "MeshRadio",
+                        "BLE adapter refused to advertise: this desktop reaches peers by connecting to them, but phones cannot initiate",
+                    )
+                }
+            }, "sonar-mesh-advcheck").apply { isDaemon = true }.start()
         } else {
-            // Linux/Windows: scan-only. Without the peripheral role a phone can
-            // never subscribe, so it never writes its announce, so MeshLink has
-            // nothing to pump and no Noise session can form. Starting it would
-            // just spin a thread that never sees a packet.
-            sonarLog("MeshRadio", "BLE peripheral role unavailable on this platform: scan-only, phones cannot discover this desktop")
+            sonarLog(
+                "MeshRadio",
+                "peripheral role unavailable: this desktop reaches peers by connecting to them, but phones cannot initiate",
+            )
         }
     }
 

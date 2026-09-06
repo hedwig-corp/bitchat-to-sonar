@@ -35,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.MeshRadio
 import chat.bitchat.sonar.MessageComposerTextField
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SlashHints
@@ -68,6 +69,10 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
     // the location channel's name + tier + live "N here now" count (state.presence).
     val gc = state.locationChannels.firstOrNull { it.geohash == screen.geohash }
     val isMesh = screen.geohash == "mesh"
+    // Mesh needs the BLE peripheral role to carry anything, and it is implemented
+    // only on Apple platforms. The radio still scans, so peers appear in the
+    // presence count while nothing can be sent or received.
+    val meshUnavailable = isMesh && !MeshRadio.meshMessagingSupported
     val name = gc?.name ?: if (isMesh) "Mesh" else "#${screen.geohash}"
     val here = state.presence(screen.geohash)
     val tier = gc?.level?.label ?: if (isMesh) "Bluetooth range" else "channel"
@@ -113,7 +118,18 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
 
         if (state.channelMsgs.isEmpty()) {
             Box(Modifier.weight(1f).fillMaxWidth()) {
-                if (isMesh) {
+                if (meshUnavailable) {
+                    // "Say hi" is the wrong thing to tell someone whose messages
+                    // cannot leave the device. Name the limit and point at the
+                    // channels that do work here.
+                    SNEmptyState(
+                        icon = SNIconName.Mesh, iconSize = 26.dp,
+                        title = "Bluetooth mesh isn't available on this device",
+                        desc = "This build can see nearby people but can't send or receive mesh " +
+                            "messages, and phones can't discover it. Use a location channel instead — " +
+                            "those work over the internet and reach the same people."
+                    )
+                } else if (isMesh) {
                     SNEmptyState(
                         icon = SNIconName.Mesh, iconSize = 26.dp,
                         title = "Bluetooth mesh",
@@ -144,6 +160,16 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
 
         if (draft.startsWith("/")) SlashHints(draft) { state.setComposerDraft(draftKey, it) }
 
+        // No composer where the message could not leave the device. A send that
+        // only ever produces a local echo is worse than no send: it looks like it
+        // worked and the silence reads as nobody answering.
+        if (meshUnavailable) {
+            Text(
+                "Sending is unavailable on Bluetooth mesh here.",
+                color = s.text3, fontSize = 13.sp,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            )
+        } else
         // composer
         Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom) {
             Box(
