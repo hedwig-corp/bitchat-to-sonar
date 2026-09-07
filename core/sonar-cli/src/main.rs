@@ -204,6 +204,9 @@ struct PostArgs {
     /// Accept invalid TLS certificates when fetching encrypted Signal CDN blobs.
     #[arg(long)]
     accept_invalid_signal_certs: bool,
+    /// Additional PEM root certificate file. Repeat for multiple certificates.
+    #[arg(long = "root-cert", value_name = "PATH")]
+    root_certs: Vec<PathBuf>,
     /// Continue when a Signal pack references an unavailable sticker asset.
     #[arg(long)]
     skip_missing_signal_stickers: bool,
@@ -593,11 +596,19 @@ async fn run(cli: Cli) -> Result<()> {
 
 async fn post_sticker_pack(loaded: &LoadedConfig, args: PostArgs) -> Result<Output> {
     let identity = loaded.identity()?;
+    let root_certificate_bytes = load_signal_root_certificates(&args.root_certs)?;
+    let root_certificates = root_certificate_bytes
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
     let imported = import_signal_pack_with_options(
         &args.signal_link,
         SignalImportOptions {
             accept_invalid_certs: args.accept_invalid_signal_certs,
+            root_certificates: (!root_certificates.is_empty())
+                .then_some(root_certificates.as_slice()),
             skip_failed_stickers: args.skip_missing_signal_stickers,
+            ..Default::default()
         },
     )
     .await?;
@@ -1264,6 +1275,20 @@ fn init_secret(args: &InitArgs) -> Result<Option<String>> {
     Ok(None)
 }
 
+fn load_signal_root_certificates(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
+    paths
+        .iter()
+        .map(|path| {
+            fs::read(path).map_err(|e| {
+                CliError::Message(format!(
+                    "read Signal root certificate {}: {e}",
+                    path.display()
+                ))
+            })
+        })
+        .collect()
+}
+
 fn next_wait_secs(start: Instant, timeout_secs: Option<u64>, poll_secs: u64) -> u64 {
     let poll_secs = poll_secs.max(1);
     let Some(timeout_secs) = timeout_secs else {
@@ -1486,6 +1511,46 @@ mod tests {
         .expect("env secret");
         env::remove_var("SONAR_CLI_TEST_NSEC");
         assert_eq!(from_env.as_deref(), Some("nsec-env"));
+    }
+
+    #[test]
+    fn load_signal_root_certificates_reads_multiple_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.pem");
+        let second = temp.path().join("second.pem");
+        fs::write(&first, b"first certificate").expect("write first certificate");
+        fs::write(&second, b"second certificate").expect("write second certificate");
+
+        let certificates =
+            load_signal_root_certificates(&[first, second]).expect("load root certificates");
+        assert_eq!(
+            certificates,
+            vec![
+                b"first certificate".to_vec(),
+                b"second certificate".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn post_accepts_multiple_root_cert_paths() {
+        let cli = Cli::try_parse_from([
+            "sonar-cli",
+            "post",
+            "https://signal.art/addstickers/#pack_id=abcdefabcdef1234567890abcdef1234&pack_key=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--root-cert",
+            "first.pem",
+            "--root-cert",
+            "second.pem",
+        ])
+        .expect("parse post arguments");
+        let Command::Post(args) = cli.command else {
+            panic!("expected post command");
+        };
+        assert_eq!(
+            args.root_certs,
+            [PathBuf::from("first.pem"), PathBuf::from("second.pem")]
+        );
     }
 
     #[test]
