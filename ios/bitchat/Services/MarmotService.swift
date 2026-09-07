@@ -936,6 +936,23 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Geohash public channel send via the core geo pool. iOS still receives
+    /// on `NostrRelayManager` until that stack is cut over (needs Arti SOCKS
+    /// on `geo_nostr` so GPS relays do not go clearnet).
+    func sendGeohash(geohash: String, text: String, nickname: String) async throws {
+        try await sendLane { try $0.sendGeohash(geohash: geohash, text: text, nickname: nickname) }
+    }
+
+    func sendGeohashPresence(geohash: String) async throws {
+        try await sendLane { try $0.sendGeohashPresence(geohash: geohash) }
+    }
+
+    func sendGeoDm(geohash: String, recipientHex: String, text: String) async throws {
+        try await sendLane {
+            try $0.sendGeoDm(geohash: geohash, recipientHex: recipientHex, text: text)
+        }
+    }
+
     /// Republish one failed message from the durable local outbox.
     func retryMessage(messageId: String) async throws -> String {
         try await run {

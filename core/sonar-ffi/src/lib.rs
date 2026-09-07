@@ -2027,6 +2027,38 @@ impl SonarNode {
         Ok(msgs.into_iter().map(geo_message_info).collect())
     }
 
+    /// Open the live geohash subscriptions (kind 20000/20001/1 + geo DMs).
+    /// Send/fetch already subscribe as a side effect; hosts call this on
+    /// channel open so the buffer fills before the first send.
+    pub fn subscribe_geohash(&self, geohash: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.subscribe_geohash(&geohash))?;
+        Ok(())
+    }
+
+    /// Publish a persistent location note (kind 1 + `#g`).
+    pub fn send_location_note(
+        &self,
+        geohash: String,
+        text: String,
+        nickname: String,
+    ) -> FfiResult<()> {
+        self.runtime.block_on(self.client.send_location_note(
+            &geohash,
+            &text,
+            &nickname,
+        ))?;
+        Ok(())
+    }
+
+    /// Location notes for a geohash, newest first.
+    pub fn location_notes(&self, geohash: String, limit: u32) -> FfiResult<Vec<GeoMessageInfo>> {
+        let msgs = self
+            .runtime
+            .block_on(self.client.fetch_location_notes(&geohash, limit as usize))?;
+        Ok(msgs.into_iter().map(geo_message_info).collect())
+    }
+
     /// Broadcast a presence heartbeat (kind-20001) for a geohash channel.
     /// Call on channel open and on a ~60s heartbeat while it is active.
     pub fn send_geohash_presence(&self, geohash: String) -> FfiResult<()> {
