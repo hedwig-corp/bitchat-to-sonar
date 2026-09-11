@@ -115,6 +115,20 @@ async fn two_instances_exchange_dms_through_a_relay() {
     assert_eq!(members.mls_group_id, *bob_group);
 }
 
+fn group_hex(id: &sonar_core::GroupId) -> String {
+    id.as_slice().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+async fn wait_conversation_unread(client: &SonarClient, group_id_hex: &str) -> u64 {
+    for _ in 0..50 {
+        if let Some(summary) = client.conversation_summary(group_id_hex) {
+            return summary.unread_count;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("conversation summary never materialized for {group_id_hex}");
+}
+
 #[tokio::test]
 async fn kind7_reaction_tallies_and_is_not_a_transcript_row() {
     let relay = MockRelay::run().await.expect("mock relay starts");
@@ -183,6 +197,92 @@ async fn kind7_reaction_tallies_and_is_not_a_transcript_row() {
     let multi = alice.messages(&alice_group).expect("alice messages");
     assert_eq!(multi.len(), 1);
     assert_eq!(multi[0].reactions.len(), 2, "multi-emoji per sender");
+}
+
+/// Persistent Alice owns a conversation index. In-memory sessions skip it, so
+/// unread/push (R-017) have to be pinned here — kind-7 is not a ChatMessage and
+/// never reaches `upsert_index_for_message`.
+#[tokio::test]
+async fn kind7_reaction_does_not_notify_or_increment_unread() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    const ALICE_KEY: [u8; 32] = [0x11; 32];
+    let alice = SonarClient::connect(
+        Identity::generate(),
+        vec![relay_url.clone()],
+        dir.path().join("alice.sqlite"),
+        ALICE_KEY,
+    )
+    .await
+    .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    let alice_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    alice
+        .send_text(&alice_group, "react to me")
+        .await
+        .expect("alice sends");
+    let alice_group_hex = group_hex(&alice_group);
+    assert_eq!(
+        wait_conversation_unread(&alice, &alice_group_hex).await,
+        0,
+        "own send is never unread"
+    );
+
+    bob.sync().await.expect("bob syncs");
+    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let parent = bob
+        .messages(&bob_group)
+        .expect("bob messages")
+        .into_iter()
+        .find(|m| m.content == "react to me")
+        .expect("parent");
+    bob.send_reaction(&bob_group, &parent.id, &parent.sender, "👍")
+        .await
+        .expect("bob reacts");
+    // Persistent sessions open a live tail at connect. Watermarked `sync()`
+    // short-circuits and `sync_force` still skips the unbounded kind-445
+    // fetch while the watermark is 0, so the host receive path is drain.
+    let mut notes = Vec::new();
+    let mut saw_tally = false;
+    for _ in 0..50 {
+        notes.extend(
+            alice
+                .drain_pending_marmot()
+                .await
+                .expect("drain live reaction"),
+        );
+        let view = alice.messages(&alice_group).expect("alice messages");
+        if view.first().map(|m| m.reactions.len()).unwrap_or(0) == 1 {
+            saw_tally = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw_tally,
+        "kind-7 must persist locally and hydrate onto the parent"
+    );
+
+    let alice_view = alice.messages(&alice_group).expect("alice messages");
+    assert_eq!(alice_view.len(), 1, "kind-7 is not a transcript row");
+    assert_eq!(alice_view[0].reactions.len(), 1);
+    assert_eq!(
+        wait_conversation_unread(&alice, &alice_group_hex).await,
+        0,
+        "kind-7 must not raise unread (R-017)"
+    );
+    assert!(
+        notes.is_empty(),
+        "kind-7 must not produce a push notification (R-017)"
+    );
 }
 
 #[tokio::test]
@@ -842,10 +942,13 @@ async fn republished_key_package_replaces_the_slot_and_newest_wins() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
     assert_eq!(
         all.len(),
         1,
@@ -891,10 +994,13 @@ async fn in_memory_clients_sharing_an_identity_reuse_one_slot() {
     let observer = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
         .await
         .expect("observer connects");
-    let all = timeout(Duration::from_secs(10), observer.fetch_all_key_packages(pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        observer.fetch_all_key_packages(pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
 
     assert_eq!(
         all.len(),
@@ -952,7 +1058,10 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
     let stale_id = stale.id;
 
     let publisher = nostr_sdk::Client::default();
-    publisher.add_relay(url_old.clone()).await.expect("add relay B");
+    publisher
+        .add_relay(url_old.clone())
+        .await
+        .expect("add relay B");
     publisher.connect().await;
     publisher.send_event(&stale).await.expect("publish stale");
 
@@ -961,10 +1070,13 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all");
     assert_eq!(all.len(), 2, "expected one candidate from each relay");
 
     let picked = timeout(Duration::from_secs(10), bob.fetch_key_package(alice_pubkey))
