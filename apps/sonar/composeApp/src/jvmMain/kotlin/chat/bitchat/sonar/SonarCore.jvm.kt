@@ -270,6 +270,26 @@ actual object SonarCore {
         requireNode().sendTextReply(chatId, text, replyToHex, replyToNpub, preview)
     }
 
+    actual suspend fun sendReaction(
+        chatId: String,
+        targetIdHex: String,
+        targetNpub: String,
+        emoji: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendReaction(chatId, targetIdHex, targetNpub, emoji)
+    }
+
+    actual suspend fun reactionTallies(
+        chatId: String,
+        targetIdHexes: List<String>,
+    ): Map<String, List<SonarReactionTally>> = withContext(Dispatchers.IO) {
+        requireNode().reactionTallies(chatId, targetIdHexes).associate { row ->
+            row.targetIdHex to row.tallies.map { t ->
+                SonarReactionTally(emoji = t.emoji, count = t.count.toInt(), mine = t.mine)
+            }
+        }
+    }
+
     actual suspend fun retryMessage(messageId: String): String = withContext(Dispatchers.IO) {
         requireNode().retryMessage(messageId)
     }
@@ -555,6 +575,9 @@ actual object SonarCore {
                 // Keep blank blank — QuoteChip resolves from the local parent.
                 preview = r.preview.orEmpty(),
             )
+        },
+        reactions = reactions.map { t ->
+            SonarReactionTally(emoji = t.emoji, count = t.count.toInt(), mine = t.mine)
         },
     )
 

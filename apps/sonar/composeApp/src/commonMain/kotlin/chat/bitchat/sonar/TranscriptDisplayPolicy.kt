@@ -77,8 +77,9 @@ internal fun mergeTranscriptRows(
  * rebuilds LazyColumn and looks like the chat was torn down.
  *
  * Compares paint-relevant fields only: id order, content, delivery state,
- * timestamp, and full [SonarMedia] values (URL alone is not enough — MIP-04
- * dims / mime / filename change reserved bubble geometry).
+ * timestamp, quote chrome, kind-7 chips, and full [SonarMedia] values (URL
+ * alone is not enough — MIP-04 dims / mime / filename change reserved bubble
+ * geometry).
  */
 internal fun sameTranscriptPaint(current: List<SonarMsg>, next: List<SonarMsg>): Boolean {
     if (current.size != next.size) return false
@@ -93,6 +94,8 @@ internal fun sameTranscriptPaint(current: List<SonarMsg>, next: List<SonarMsg>):
         if (a.viaInternet != b.viaInternet) return false
         if (a.media != b.media) return false
         if (a.stickerRef != b.stickerRef) return false
+        if (a.reply != b.reply) return false
+        if (a.reactions != b.reactions) return false
     }
     return true
 }
@@ -113,6 +116,17 @@ internal fun refreshTranscriptRows(
     if (!pinnedToOlderEdge) return mergeTranscriptRows(existing, newest, retainedRows)
     val retainedIds = existing.mapTo(hashSetOf()) { it.id }
     return mergeTranscriptRows(existing, newest.filter { it.id in retainedIds }, retainedRows)
+}
+
+/** Overlay target-keyed kind-7 tallies onto already-loaded transcript rows. */
+internal fun overlayReactionTallies(
+    rows: List<SonarMsg>,
+    talliesById: Map<String, List<SonarReactionTally>>,
+): List<SonarMsg> {
+    if (talliesById.isEmpty()) return rows
+    return rows.map { row ->
+        talliesById[row.id]?.let { row.copy(reactions = it) } ?: row
+    }
 }
 
 /** Prepend history while keeping the older edge when the retained window is full. */

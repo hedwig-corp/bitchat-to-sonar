@@ -75,6 +75,43 @@ struct SonarReplyTests {
     }
 
     @Test
+    func reactDisabledOnOptimisticSendingAndMissingNpub() {
+        var live = SNMessage(id: String(repeating: "ab", count: 32), text: "hi", time: "10:00")
+        live.senderNpub = "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+        live.via = .internet
+        #expect(snCanReact(to: live))
+        #expect(!snCanReact(to: SNMessage(id: "optimistic-1", text: "hi", time: "10:00", senderNpub: live.senderNpub, via: .internet)))
+        var mesh = live
+        mesh.via = .mesh
+        #expect(!snCanReact(to: mesh))
+        var sending = live
+        sending.state = "Sending"
+        #expect(!snCanReact(to: sending))
+        var noNpub = live
+        noNpub.senderNpub = nil
+        #expect(!snCanReact(to: noNpub))
+        var action = live
+        action.action = true
+        #expect(!snCanReact(to: action))
+    }
+
+    @Test @MainActor
+    func reactionChipsWrapInsteadOfOverflowing() {
+        #if os(iOS)
+        let reactions = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "💯"].map {
+            SNReactionTally(emoji: $0, count: 1, mine: false)
+        }
+        let host = UIHostingController(
+            rootView: SNReactionRow(reactions: reactions)
+                .frame(width: 140)
+        )
+        let size = host.sizeThatFits(in: CGSize(width: 140, height: 400))
+        #expect(size.width <= 140)
+        #expect(size.height > 36)
+        #endif
+    }
+
+    @Test
     func copyUsesFullSourceAndSkipsNonTextRows() {
         let live = SNMessage(id: String(repeating: "ab", count: 32), text: "  hello  ", time: "10:00")
         #expect(snCopyableText(of: live) == "  hello  ")

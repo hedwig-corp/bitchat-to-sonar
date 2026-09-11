@@ -2358,6 +2358,12 @@ impl SonarClient {
             storage_empty,
         )));
         let outbox_state = Arc::new(Mutex::new(OutboxState::load(outbox_state_path)));
+        engine.suppress_reactions_from_hex_ids(
+            outbox_state
+                .lock()
+                .unwrap()
+                .terminal_failed_message_ids(),
+        );
         let (media_staging_state_path, media_staging_dir_path) = match media_staging_paths {
             Some((state, dir)) => (Some(state), Some(dir)),
             None => (None, None),
@@ -3531,6 +3537,49 @@ impl SonarClient {
         Ok(())
     }
 
+    /// Encrypt a NIP-25 kind-7 reaction, persist it locally, then publish.
+    ///
+    /// Not a transcript row: no index upsert, unread bump, or push wake
+    /// (R-017). Hosts re-page tallies from `notify_conversation_changed`.
+    pub async fn send_reaction(
+        &self,
+        group_id: &GroupId,
+        target_id: &EventId,
+        target_pubkey: &PublicKey,
+        emoji: &str,
+    ) -> Result<()> {
+        let (event, incoming) = {
+            let _epoch = self.membership_gate.read().await;
+            self.engine
+                .create_and_process_reaction(group_id, target_id, target_pubkey, emoji)?
+        };
+        match incoming {
+            Incoming::Reaction { reaction_id, .. } => {
+                let group_id_hex = hex::encode(group_id.as_slice());
+                let rumor_id_hex = reaction_id.to_hex();
+                let wrapper_id_hex = event.id.to_hex();
+                // Same durable-before-publish contract as `send_text`. The outbox
+                // key is the inner rumor id so a terminal publish failure can
+                // suppress that kind-7 from tallies (hosts refuse to resend an
+                // emoji already marked `mine`).
+                self.outbox_state.lock().unwrap().mark_pending(
+                    group_id_hex.clone(),
+                    rumor_id_hex.clone(),
+                    wrapper_id_hex,
+                    event.as_json(),
+                    Timestamp::now().as_secs(),
+                )?;
+                let _publish_ack =
+                    self.spawn_outbox_publish(rumor_id_hex, group_id_hex.clone(), event);
+                self.notify_conversation_changed(&group_id_hex);
+                Ok(())
+            }
+            other => Err(Error::Storage(format!(
+                "created reaction did not persist as a kind-7 rumor: {other:?}"
+            ))),
+        }
+    }
+
     fn spawn_send_bookkeeping(
         &self,
         group_name: Option<String>,
@@ -4486,6 +4535,9 @@ impl SonarClient {
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
+        let suppressed_reactions = self.engine.suppressed_reactions_handle();
+        let reaction_store = self.engine.reaction_store_handle();
+        let reaction_db_path = self.engine.db_path().map(PathBuf::from);
         // Count the send before spawn so hosts that gate catch-up / shutdown on
         // `send_inflight == 0` cannot observe a gap between return and task start.
         send_inflight.fetch_add(1, Ordering::Relaxed);
@@ -4619,6 +4671,24 @@ impl SonarClient {
                     break;
                 };
                 if attempts >= crate::outbox::OUTBOX_RETRY_ATTEMPT_LIMIT {
+                    if let Ok(id) = EventId::from_hex(&message_id_hex) {
+                        suppressed_reactions.lock().unwrap().insert(id);
+                        let removed = {
+                            let mut store = reaction_store.lock().unwrap();
+                            store.remove_id(id)
+                        };
+                        if removed {
+                            if let Some(ref db_path) = reaction_db_path {
+                                let path =
+                                    crate::reaction::reaction_store_path_for_db(db_path);
+                                let store = reaction_store.lock().unwrap();
+                                if let Err(err) = store.save(&path) {
+                                    tracing::warn!(%err, "reaction store persist failed");
+                                }
+                            }
+                        }
+                    }
+                    notify();
                     break;
                 }
                 let delay_secs = crate::outbox::outbox_auto_retry_delay_secs(attempts);
@@ -6803,7 +6873,8 @@ impl SonarClient {
                     // also covers kind-445 commit/proposal merges, whose
                     // member-list change the row should reflect.
                     if let Incoming::GroupUpdated(group_id)
-                    | Incoming::GroupInvitePending(group_id) = &incoming
+                    | Incoming::GroupInvitePending(group_id)
+                    | Incoming::Reaction { group_id, .. } = &incoming
                     {
                         changed_groups.insert(hex::encode(group_id.as_slice()));
                     }
@@ -7119,6 +7190,15 @@ impl SonarClient {
                     .map(|m| self.with_delivery_state(m))
                     .collect()
             })
+    }
+
+    /// Target-keyed kind-7 tallies for already-loaded transcript ids.
+    pub fn reaction_tallies_for(
+        &self,
+        group_id: &GroupId,
+        target_ids: &[nostr::EventId],
+    ) -> Result<Vec<(nostr::EventId, Vec<crate::reaction::ReactionTally>)>> {
+        self.engine.reaction_tallies_for(group_id, target_ids)
     }
 
     fn upsert_index_for_message(&self, message: &ChatMessage, group_name: Option<&str>) {
@@ -8427,6 +8507,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of(content),
             reply: None,
+            reactions: vec![],
         };
 
         client.upsert_index_for_message(&incoming(1, 100, "hey"), Some("Chat"));
@@ -8495,6 +8576,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("hey"),
             reply: None,
+            reactions: vec![],
         };
 
         client.upsert_index_for_message(&msg(1, 100, false), Some("Chat"));
@@ -8524,6 +8606,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
             reply: None,
+            reactions: vec![],
         };
         // Bot/agent JSON payloads preview as a label, never raw JSON.
         assert_eq!(index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")), "JSON payload");
@@ -8556,6 +8639,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
             reply: None,
+            reactions: vec![],
         };
         // Caption/text always wins.
         assert_eq!(

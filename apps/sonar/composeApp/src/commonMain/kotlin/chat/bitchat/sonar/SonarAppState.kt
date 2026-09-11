@@ -2829,6 +2829,35 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatJumpMessageId = openChatJumpMessageId + (chatId to parentId)
     }
 
+    fun sendReaction(chatId: String, message: SonarMsg, emoji: String) {
+        if (!sonarCanReact(message)) return
+        if (message.reactions.any { it.emoji == emoji && it.mine }) return
+        if (pendingMarmotNpub(chatId) != null || isPendingMarmotGroup(chatId)) return
+        val groupId = marmotGroupIdForReaction(chatId, message) ?: return
+        val trimmed = emoji.trim()
+        if (trimmed.isEmpty()) return
+        scope.launch {
+            runCatching {
+                runMarmotAccountOperation {
+                    SonarCore.sendReaction(groupId, message.id, message.senderNpub, trimmed)
+                }
+            }.onFailure { e ->
+                toast = e.message ?: "Couldn't react"
+            }
+            reloadNewestAfterSendIfNeeded(chatId)
+        }
+    }
+
+    /** MLS group that actually holds [message]. Mesh-folded chats are keyed by
+     *  `mesh:<peer>` — passing that to core would fail `parse_group_id`. */
+    private fun marmotGroupIdForReaction(chatId: String, message: SonarMsg): String? {
+        if (isMeshChat(chatId) && !message.viaInternet) return null
+        transcriptWindows.entries.firstOrNull { (_, window) ->
+            window.rows.any { it.id.equals(message.id, ignoreCase = true) }
+        }?.let { return it.key }
+        return resolveMarmotGroupId(chatId)
+    }
+
     private fun consumeComposerReply(chatId: String): SonarReplyRef? =
         composerReplyByChat.remove(chatId)
 
@@ -10670,11 +10699,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         // the render window refuses to admit.
         freshCanonicalByGroup[groupId] = newest
         val unboundedCount = (current?.rows.orEmpty() + newest).distinctBy { it.id }.size
-        val merged = refreshTranscriptRows(
+        var merged = refreshTranscriptRows(
             existing = current?.rows.orEmpty(),
             newest = newest,
             pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
         )
+        val staleIds = merged.map { it.id }.filter { id -> newest.none { it.id == id } }
+        if (staleIds.isNotEmpty()) {
+            val overlay = runCatching { SonarCore.reactionTallies(groupId, staleIds) }
+                .getOrDefault(emptyMap())
+            merged = overlayReactionTallies(merged, overlay)
+        }
         val hasMore = when {
             unboundedCount > TRANSCRIPT_RETAINED_ROWS -> true
             current != null -> current.hasMore || page.size > TRANSCRIPT_PAGE_SIZE

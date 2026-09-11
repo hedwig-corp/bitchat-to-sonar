@@ -604,6 +604,23 @@ pub struct MessageInfo {
     pub classification: MessageClassInfo,
     /// NIP-C7 reply pointer. `content` is the display body (nevent already stripped).
     pub reply: Option<ReplyRefInfo>,
+    /// Aggregated kind-7 chips. Empty when nobody has reacted.
+    pub reactions: Vec<ReactionTallyInfo>,
+}
+
+/// Target-keyed kind-7 tallies for overlaying retained historical rows.
+#[derive(uniffi::Record)]
+pub struct MessageReactionTallies {
+    pub target_id_hex: String,
+    pub tallies: Vec<ReactionTallyInfo>,
+}
+
+/// FFI-friendly aggregated emoji chip.
+#[derive(uniffi::Record)]
+pub struct ReactionTallyInfo {
+    pub emoji: String,
+    pub count: u32,
+    pub mine: bool,
 }
 
 /// FFI-friendly NIP-C7 quote pointer.
@@ -1452,6 +1469,27 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message.
+    pub fn send_reaction(
+        &self,
+        group_id_hex: String,
+        target_id_hex: String,
+        target_npub: String,
+        emoji: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let target_id = nostr::EventId::from_hex(&target_id_hex)
+            .map_err(|e| SonarFfiError::InvalidInput(format!("target_id: {e}")))?;
+        let target_pk = PublicKey::parse(&target_npub).map_err(invalid("target npub"))?;
+        self.runtime.block_on(self.client.send_reaction(
+            &group_id,
+            &target_id,
+            &target_pk,
+            &emoji,
+        ))?;
+        Ok(())
+    }
+
     /// Encrypt + publish a sticker message to the group.
     pub fn send_sticker(
         &self,
@@ -1823,6 +1861,34 @@ impl SonarNode {
             limit as usize,
         )?;
         Ok(msgs.into_iter().map(message_info).collect())
+    }
+
+    /// Target-keyed kind-7 tallies for already-loaded transcript ids.
+    pub fn reaction_tallies(
+        &self,
+        group_id_hex: String,
+        target_id_hexes: Vec<String>,
+    ) -> FfiResult<Vec<MessageReactionTallies>> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mut target_ids = Vec::with_capacity(target_id_hexes.len());
+        for hex in &target_id_hexes {
+            target_ids.push(parse_event_id(hex)?);
+        }
+        let rows = self.client.reaction_tallies_for(&group_id, &target_ids)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, tallies)| MessageReactionTallies {
+                target_id_hex: id.to_hex(),
+                tallies: tallies
+                    .into_iter()
+                    .map(|t| ReactionTallyInfo {
+                        emoji: t.emoji,
+                        count: t.count,
+                        mine: t.mine,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 
     /// Encrypt + upload `data` to a Blossom server, then publish a media message
@@ -3201,6 +3267,15 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             parent_npub: r.parent_pubkey.and_then(|pk| pk.to_bech32().ok()),
             preview: r.preview,
         }),
+        reactions: m
+            .reactions
+            .into_iter()
+            .map(|t| ReactionTallyInfo {
+                emoji: t.emoji,
+                count: t.count,
+                mine: t.mine,
+            })
+            .collect(),
     }
 }
 

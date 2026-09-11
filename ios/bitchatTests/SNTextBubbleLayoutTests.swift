@@ -74,6 +74,9 @@ struct SNTextBubbleLayoutTests {
         var pay = message()
         pay.pay = SNPayInfo(id: "p", sats: 21, state: .claimed)
         #expect(!SNTextBubbleModel.handles(pay))
+        var reacted = message()
+        reacted.reactions = [SNReactionTally(emoji: "👍", count: 1, mine: true)]
+        #expect(!SNTextBubbleModel.handles(reacted))
     }
 
     // MARK: Heights

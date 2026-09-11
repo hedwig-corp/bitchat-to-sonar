@@ -153,7 +153,7 @@ extension SNTextBubbleModel {
     /// lines) keeps the SwiftUI hosting path.
     static func handles(_ m: SNMessage) -> Bool {
         m.call == nil && !m.trill && m.pay == nil && m.media.isEmpty
-            && m.stickerRef == nil && !m.action
+            && m.stickerRef == nil && !m.action && m.reactions.isEmpty
     }
 
     static func make(
