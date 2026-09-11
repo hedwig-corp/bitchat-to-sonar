@@ -125,62 +125,43 @@ fun WalletMigrationRoute(state: SonarAppState) {
             built.close()
             return@LaunchedEffect
         }
-        runCatching {
+        val status = try {
             cashuBalance = built.destinationBalanceSats()
             built.status()
-        }
-            .onSuccess { status ->
-                if (status?.state == MigrationAttemptStateUi.AwaitingConsent ||
-                    status?.state == MigrationAttemptStateUi.ExpiredUnsent
-                ) {
-                    // Prepared source quotes cannot survive a
-                    // process restart. Clear only this proven-
-                    // unspent state and ask for a fresh quote.
-                    runCatching { built.cancelUnspent() }
-                }
-                if (abandoned.get()) return@onSuccess
-                val opened = phaseAfterOpenStatus(
-                    state = status?.state,
-                    attemptAmountSats = status?.amountSats ?: 0uL,
-                    destConfirmedSats = cashuBalance,
-                    lightningFailedMessage = lightningPaymentFailed,
-                )
-                if (opened is MigrationPhase.PendingSettlement) {
-                    // Relaunch after a paid/ambiguous journal must resume
-                    // without a "Check again" tap. Check again remains for
-                    // a later Pending outcome.
-                    phase = MigrationPhase.Watching
-                    runCatching { built.resume(SETTLE_POLLS) }
-                        .onSuccess { result ->
-                            if (abandoned.get()) return@onSuccess
-                            phase = when (result) {
-                                is MigrationResultUi.Settled -> {
-                                    cashuBalance = result.cashuSats
-                                    MigrationPhase.Settled(result.cashuSats)
-                                }
-                                is MigrationResultUi.Pending -> {
-                                    cashuBalance = result.cashuSats
-                                    MigrationPhase.PendingSettlement(result.cashuSats)
-                                }
-                            }
-                        }
-                        .onFailure {
-                            if (!abandoned.get()) {
-                                phase = MigrationPhase.PendingSettlement(cashuBalance)
-                            }
-                        }
-                } else {
-                    phase = opened
-                }
-            }
-            .onFailure {
+        } catch (cause: Throwable) {
+            if (!abandoned.get()) {
                 phase = MigrationPhase.Failed(
                     couldNotReadBalanceTemplate.replace(
                         errorMarker,
-                        it.message ?: it.toString(),
+                        cause.message ?: cause.toString(),
                     )
                 )
             }
+            return@LaunchedEffect
+        }
+        if (abandoned.get()) return@LaunchedEffect
+        if (status?.state?.let { migrationAttemptNeedsRescue(it) } == true) {
+            phase = MigrationPhase.Watching
+        }
+        val restored = restoreOpenedMigration(
+            status = status,
+            destConfirmedSats = cashuBalance,
+            lightningFailedMessage = lightningPaymentFailed,
+            cancelUnspent = { built.cancelUnspent() },
+            resume = { built.resume(SETTLE_POLLS) },
+        )
+        if (abandoned.get()) return@LaunchedEffect
+        when (restored) {
+            is MigrationPhase.Settled -> {
+                cashuBalance = restored.cashuSats
+                phase = restored
+            }
+            is MigrationPhase.PendingSettlement -> {
+                cashuBalance = restored.cashuSats
+                phase = restored
+            }
+            else -> phase = restored
+        }
     }
 
     // The destination wallet holds an open store; leaving the screen must

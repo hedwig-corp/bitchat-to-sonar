@@ -2686,6 +2686,9 @@ LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
 `WalletMigrationContractTest.executeErrorAfterSourceAcceptedIsPendingNotANewQuote`,
 `WalletMigrationContractTest.relaunchAfterPaidJournalIsPendingNotANewQuote`,
 `WalletMigrationContractTest.journalBytesNeedRescueWithoutOpeningTheMint`,
+`WalletMigrationContractTest.openWithPaidJournalResumesAndDoesNotQuote`,
+`WalletMigrationContractTest.openWithUnspentConsentClearsAndDoesNotResume`,
+`WalletMigrationContractTest.openResumeFailureStaysPendingNotANewQuote`,
 `SonarMigrationRescueTests.testExecuteErrorAfterSourceAcceptedIsPendingNotANewQuote`,
 `SonarMigrationRescueTests.testRelaunchAfterPaidJournalIsPendingNotANewQuote`,
 `SonarMigrationRescueTests.testJournalBytesNeedRescueWithoutOpeningTheMint`

@@ -6,6 +6,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
 
 class WalletSeedTest {
     private val secret = "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"
@@ -214,5 +215,77 @@ class WalletMigrationContractTest {
         assertFalse(journalNeedsRescue(null))
         assertFalse(journalNeedsRescue("{}"))
         assertFalse(journalNeedsRescue(journal("NotAState")))
+    }
+
+    @Test fun openWithPaidJournalResumesAndDoesNotQuote() = runBlocking {
+        var cancelled = 0
+        var resumed = 0
+        val quoted = 0
+        val dest = 500uL
+        val status = MigrationAttemptStatusUi(
+            settlementId = "qid",
+            amountSats = 2_000uL,
+            feeSats = 20uL,
+            state = MigrationAttemptStateUi.SourcePaid,
+            paymentHash = "hh",
+        )
+        val phase = restoreOpenedMigration(
+            status = status,
+            destConfirmedSats = dest,
+            lightningFailedMessage = "fail",
+            cancelUnspent = { cancelled += 1 },
+            resume = {
+                resumed += 1
+                MigrationResultUi.Pending(dest)
+            },
+        )
+        assertEquals(0, cancelled)
+        assertEquals(1, resumed)
+        assertEquals(0, quoted)
+        assertEquals(MigrationPhase.PendingSettlement(dest), phase)
+    }
+
+    @Test fun openWithUnspentConsentClearsAndDoesNotResume() = runBlocking {
+        var cancelled = 0
+        var resumed = 0
+        val status = MigrationAttemptStatusUi(
+            settlementId = "qid",
+            amountSats = 2_000uL,
+            feeSats = 20uL,
+            state = MigrationAttemptStateUi.AwaitingConsent,
+            paymentHash = "hh",
+        )
+        val phase = restoreOpenedMigration(
+            status = status,
+            destConfirmedSats = 0uL,
+            lightningFailedMessage = "fail",
+            cancelUnspent = { cancelled += 1 },
+            resume = {
+                resumed += 1
+                MigrationResultUi.Pending(0uL)
+            },
+        )
+        assertEquals(1, cancelled)
+        assertEquals(0, resumed)
+        assertEquals(MigrationPhase.Idle, phase)
+    }
+
+    @Test fun openResumeFailureStaysPendingNotANewQuote() = runBlocking {
+        val dest = 500uL
+        val status = MigrationAttemptStatusUi(
+            settlementId = "qid",
+            amountSats = 2_000uL,
+            feeSats = 20uL,
+            state = MigrationAttemptStateUi.Sending,
+            paymentHash = "hh",
+        )
+        val phase = restoreOpenedMigration(
+            status = status,
+            destConfirmedSats = dest,
+            lightningFailedMessage = "fail",
+            cancelUnspent = {},
+            resume = { error("mint timeout") },
+        )
+        assertEquals(MigrationPhase.PendingSettlement(dest), phase)
     }
 }

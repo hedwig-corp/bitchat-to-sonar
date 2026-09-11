@@ -113,6 +113,36 @@ fun phaseAfterOpenStatus(
         else -> MigrationPhase.PendingSettlement(destConfirmedSats)
     }
 
+suspend fun restoreOpenedMigration(
+    status: MigrationAttemptStatusUi?,
+    destConfirmedSats: ULong,
+    lightningFailedMessage: String,
+    cancelUnspent: suspend () -> Unit,
+    resume: suspend () -> MigrationResultUi,
+): MigrationPhase {
+    when (status?.state) {
+        MigrationAttemptStateUi.AwaitingConsent,
+        MigrationAttemptStateUi.ExpiredUnsent -> runCatching { cancelUnspent() }
+        else -> Unit
+    }
+    val opened = phaseAfterOpenStatus(
+        state = status?.state,
+        attemptAmountSats = status?.amountSats ?: 0uL,
+        destConfirmedSats = destConfirmedSats,
+        lightningFailedMessage = lightningFailedMessage,
+    )
+    if (opened !is MigrationPhase.PendingSettlement) return opened
+    return runCatching { resume() }.fold(
+        onSuccess = { result ->
+            when (result) {
+                is MigrationResultUi.Settled -> MigrationPhase.Settled(result.cashuSats)
+                is MigrationResultUi.Pending -> MigrationPhase.PendingSettlement(result.cashuSats)
+            }
+        },
+        onFailure = { MigrationPhase.PendingSettlement(destConfirmedSats) },
+    )
+}
+
 /**
  * Host-side read of `cashu.migration.v1.json`. The serde wire names are the
  * PascalCase variant names pinned by `journal.rs::state_json_is_the_pascal_case_variant_name`.
