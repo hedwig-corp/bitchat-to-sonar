@@ -3531,6 +3531,48 @@ impl SonarClient {
         Ok(())
     }
 
+    /// Encrypt a NIP-25 kind-7 reaction, persist it locally, then publish.
+    ///
+    /// Not a transcript row: no index upsert, unread bump, or push wake
+    /// (R-017). Hosts re-page tallies from `notify_conversation_changed`.
+    pub async fn send_reaction(
+        &self,
+        group_id: &GroupId,
+        target_id: &EventId,
+        target_pubkey: &PublicKey,
+        emoji: &str,
+    ) -> Result<()> {
+        let (event, incoming) = {
+            let _epoch = self.membership_gate.read().await;
+            self.engine
+                .create_and_process_reaction(group_id, target_id, target_pubkey, emoji)?
+        };
+        match incoming {
+            Incoming::Reaction { .. } => {}
+            other => {
+                return Err(Error::Storage(format!(
+                    "created reaction did not persist as a kind-7 rumor: {other:?}"
+                )));
+            }
+        }
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let event_id_hex = event.id.to_hex();
+        // Same durable-before-publish contract as `send_text`. Without this
+        // entry, `spawn_outbox_publish`'s failure path gets `None` from
+        // `mark_failed_by_message_id` and never auto-retries; restart recovery
+        // also cannot find the reaction.
+        self.outbox_state.lock().unwrap().mark_pending(
+            group_id_hex.clone(),
+            event_id_hex.clone(),
+            event_id_hex.clone(),
+            event.as_json(),
+            Timestamp::now().as_secs(),
+        )?;
+        let _publish_ack = self.spawn_outbox_publish(event_id_hex, group_id_hex.clone(), event);
+        self.notify_conversation_changed(&group_id_hex);
+        Ok(())
+    }
+
     fn spawn_send_bookkeeping(
         &self,
         group_name: Option<String>,
@@ -6803,7 +6845,8 @@ impl SonarClient {
                     // also covers kind-445 commit/proposal merges, whose
                     // member-list change the row should reflect.
                     if let Incoming::GroupUpdated(group_id)
-                    | Incoming::GroupInvitePending(group_id) = &incoming
+                    | Incoming::GroupInvitePending(group_id)
+                    | Incoming::Reaction { group_id } = &incoming
                     {
                         changed_groups.insert(hex::encode(group_id.as_slice()));
                     }
@@ -8427,6 +8470,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of(content),
             reply: None,
+            reactions: vec![],
         };
 
         client.upsert_index_for_message(&incoming(1, 100, "hey"), Some("Chat"));
@@ -8495,6 +8539,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::of("hey"),
             reply: None,
+            reactions: vec![],
         };
 
         client.upsert_index_for_message(&msg(1, 100, false), Some("Chat"));
@@ -8524,6 +8569,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
             reply: None,
+            reactions: vec![],
         };
         // Bot/agent JSON payloads preview as a label, never raw JSON.
         assert_eq!(index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")), "JSON payload");
@@ -8556,6 +8602,7 @@ mod tests {
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
             reply: None,
+            reactions: vec![],
         };
         // Caption/text always wins.
         assert_eq!(

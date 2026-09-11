@@ -181,6 +181,65 @@ async fn local_first_send_persists_pending_message_before_relay_publish() {
     assert_eq!(page[0].delivery_state, DeliveryState::Pending);
 }
 
+fn outbox_entry_count(path: &std::path::Path) -> usize {
+    let bytes = std::fs::read(path).expect("read outbox");
+    let disk: serde_json::Value = serde_json::from_slice(&bytes).expect("outbox json");
+    disk["entries"].as_array().map(|a| a.len()).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn local_first_reaction_persists_pending_outbox_before_relay_publish() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
+
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+
+    let alice_identity = Identity::generate();
+    let client = SonarClient::connect(alice_identity, Vec::new(), &db_path, DB_KEY)
+        .await
+        .expect("connect local-only client");
+    let creation = client
+        .engine()
+        .create_group("alice & bob", vec![bob_kp], Vec::new())
+        .expect("create local group");
+    let group_id = creation.group.mls_group_id.clone();
+    client
+        .engine()
+        .merge_pending_commit(&group_id)
+        .expect("merge local group");
+
+    client
+        .send_text(&group_id, "react to me")
+        .await
+        .expect("local-first send");
+    let after_text = outbox_entry_count(&outbox_path);
+    assert_eq!(after_text, 1, "text send records one outbox row");
+
+    let parent = client
+        .messages_cursor_page(&group_id, None, None, 10)
+        .expect("cursor page")
+        .into_iter()
+        .find(|m| m.content == "react to me")
+        .expect("parent");
+    client
+        .send_reaction(&group_id, &parent.id, &parent.sender, "👍")
+        .await
+        .expect("local-first reaction");
+    assert_eq!(
+        outbox_entry_count(&outbox_path),
+        after_text + 1,
+        "reaction must create a durable outbox entry before publish"
+    );
+    let page = client
+        .messages_cursor_page(&group_id, None, None, 10)
+        .expect("cursor page after react");
+    assert_eq!(page.len(), 1, "kind-7 is not a transcript row");
+    assert_eq!(page[0].reactions.len(), 1);
+    assert_eq!(page[0].reactions[0].emoji, "👍");
+}
+
 #[tokio::test]
 async fn restart_watermark_ignores_later_local_messages() {
     let dir = tempfile::tempdir().expect("tempdir");
