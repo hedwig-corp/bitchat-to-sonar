@@ -6,9 +6,12 @@
 //! same `send_reaction` / tally FFI.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use mdk_storage_traits::messages::types::Message as StoredMessage;
 use nostr::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::marmot::{ChatMessage, CHAT_RUMOR_KIND};
 use crate::{Error, Result};
@@ -164,36 +167,145 @@ pub fn attach_tallies(messages: &mut [ChatMessage], reactions: &[ParsedReaction]
 /// In-process kind-7 index keyed by `(group, target)`.
 ///
 /// MDK only offers newest-first row scans, so a later reaction on an older
-/// parent is invisible to a cursor page and to a newest-N extra pass. This
-/// map is filled on every processed kind-7 and lazily backfilled from storage
-/// the first time an older page (or a host overlay of retained ids) needs it.
-/// Newest-page open does not backfill.
+/// parent is invisible to a cursor page. This map is filled on every processed
+/// kind-7 and persisted beside the DB so restart/backscroll is a HashMap
+/// lookup, not a 10,000-row scan. Newest-page open still uses only the page-local
+/// scan plus this index.
 #[derive(Default)]
 pub struct ReactionStore {
     by_target: HashMap<(Vec<u8>, EventId), Vec<ParsedReaction>>,
-    backfilled: HashSet<Vec<u8>>,
+}
+
+pub(crate) const REACTION_STORE_FILE_SUFFIX: &str = ".sonar-reactions.json";
+const REACTION_STORE_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct ReactionStoreDisk {
+    version: u32,
+    entries: Vec<ReactionStoreDiskEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReactionStoreDiskEntry {
+    group_id_hex: String,
+    target_id_hex: String,
+    id_hex: String,
+    sender: String,
+    emoji: String,
 }
 
 fn group_key(group_id: &mdk_core::GroupId) -> Vec<u8> {
     group_id.as_slice().to_vec()
 }
 
+pub(crate) fn reaction_store_path_for_db(db_path: &Path) -> PathBuf {
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("marmot.sqlite");
+    db_path.with_file_name(format!("{file_name}{REACTION_STORE_FILE_SUFFIX}"))
+}
+
 impl ReactionStore {
-    pub fn record(&mut self, group_id: &mdk_core::GroupId, reaction: ParsedReaction) {
+    pub fn load(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
+            return Self::default();
+        };
+        let Ok(bytes) = fs::read(path) else {
+            return Self::default();
+        };
+        let Ok(disk) = serde_json::from_slice::<ReactionStoreDisk>(&bytes) else {
+            return Self::default();
+        };
+        if disk.version != REACTION_STORE_VERSION {
+            return Self::default();
+        }
+        let mut store = Self::default();
+        for entry in disk.entries {
+            let Ok(group_bytes) = hex::decode(&entry.group_id_hex) else {
+                continue;
+            };
+            if group_bytes.is_empty() {
+                continue;
+            }
+            let Ok(target_id) = EventId::from_hex(&entry.target_id_hex) else {
+                continue;
+            };
+            let Ok(id) = EventId::from_hex(&entry.id_hex) else {
+                continue;
+            };
+            let Ok(sender) = PublicKey::parse(&entry.sender) else {
+                continue;
+            };
+            let group = mdk_core::GroupId::from_slice(&group_bytes);
+            store.record(
+                &group,
+                ParsedReaction {
+                    id,
+                    target_id,
+                    sender,
+                    emoji: entry.emoji,
+                },
+            );
+        }
+        store
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                Error::Storage(format!(
+                    "create reaction-store dir {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let mut entries: Vec<ReactionStoreDiskEntry> = Vec::new();
+        for ((group, target), reactions) in &self.by_target {
+            for r in reactions {
+                entries.push(ReactionStoreDiskEntry {
+                    group_id_hex: hex::encode(group),
+                    target_id_hex: target.to_hex(),
+                    id_hex: r.id.to_hex(),
+                    sender: r.sender.to_hex(),
+                    emoji: r.emoji.clone(),
+                });
+            }
+        }
+        entries.sort_by(|a, b| {
+            a.group_id_hex
+                .cmp(&b.group_id_hex)
+                .then_with(|| a.target_id_hex.cmp(&b.target_id_hex))
+                .then_with(|| a.id_hex.cmp(&b.id_hex))
+        });
+        let disk = ReactionStoreDisk {
+            version: REACTION_STORE_VERSION,
+            entries,
+        };
+        let bytes = serde_json::to_vec(&disk)?;
+        let tmp = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("sonar-reactions.json")
+        ));
+        fs::write(&tmp, bytes)
+            .map_err(|e| Error::Storage(format!("write reaction store {}: {e}", tmp.display())))?;
+        fs::rename(&tmp, path).map_err(|e| {
+            Error::Storage(format!("replace reaction store {}: {e}", path.display()))
+        })?;
+        Ok(())
+    }
+
+    /// Returns true when the reaction was newly inserted.
+    pub fn record(&mut self, group_id: &mdk_core::GroupId, reaction: ParsedReaction) -> bool {
         let key = (group_key(group_id), reaction.target_id);
         let entries = self.by_target.entry(key).or_default();
         if entries.iter().any(|e| e.id == reaction.id) {
-            return;
+            return false;
         }
         entries.push(reaction);
-    }
-
-    pub fn is_backfilled(&self, group_id: &mdk_core::GroupId) -> bool {
-        self.backfilled.contains(&group_key(group_id))
-    }
-
-    pub fn mark_backfilled(&mut self, group_id: &mdk_core::GroupId) {
-        self.backfilled.insert(group_key(group_id));
+        true
     }
 
     pub fn for_targets(
@@ -341,5 +453,25 @@ mod tests {
         let found = store.for_targets(&group, &targets);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].emoji, "👍");
+    }
+
+    #[test]
+    fn store_round_trips_through_sidecar() {
+        let (parent, _, me, _) = ids();
+        // MLS GroupId is 16 bytes. Filtering `len() != 32` on load would pass a
+        // 32-byte fixture here and drop every real group on reopen.
+        let group = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let mut store = ReactionStore::default();
+        store.record(&group, rx(1, parent, me, "👍"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marmot.sqlite.sonar-reactions.json");
+        store.save(&path).expect("save");
+        let loaded = ReactionStore::load(Some(&path));
+        let mut targets = HashSet::new();
+        targets.insert(parent);
+        let found = loaded.for_targets(&group, &targets);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].emoji, "👍");
+        assert_eq!(found[0].sender, me);
     }
 }

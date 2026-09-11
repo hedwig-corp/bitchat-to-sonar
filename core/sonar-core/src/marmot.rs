@@ -683,7 +683,9 @@ impl MarmotEngine {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
-            reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::default()),
+            reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::load(Some(
+                &crate::reaction::reaction_store_path_for_db(path),
+            ))),
             suppressed_reactions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             // Persistent engine ⇒ persisted window. The iOS NSE builds a
             // fresh engine per push wake, so an in-memory budget here would
@@ -2096,8 +2098,7 @@ impl MarmotEngine {
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
         hydrate_page_reply_previews(&mut candidates);
-        let newest_page = before_secs.is_none() && before_id.is_none();
-        self.hydrate_page_reactions(group_id, &mut candidates, page_reactions, newest_page)?;
+        self.hydrate_page_reactions(group_id, &mut candidates, page_reactions)?;
         Ok(candidates)
     }
 
@@ -2342,26 +2343,20 @@ impl MarmotEngine {
     /// Attach kind-7 tallies for the messages in `msgs`.
     ///
     /// `page_reactions` are kind-7 rows already seen in the same bounded cursor
-    /// scan that built the page. Newest-page open uses only that window so
-    /// first paint cannot walk full history. Older pages (and host overlays of
-    /// retained ids) use the target-keyed [`crate::reaction::ReactionStore`] so
-    /// a later reaction beyond the newest 512 raw rows still lands on its
-    /// parent.
+    /// scan that built the page. The target-keyed [`crate::reaction::ReactionStore`]
+    /// (durable beside the DB) supplies later reactions on older parents without
+    /// a 10,000-row scan on backscroll.
     fn hydrate_page_reactions(
         &self,
         group_id: &GroupId,
         msgs: &mut [ChatMessage],
         page_reactions: Vec<crate::reaction::ParsedReaction>,
-        newest_page: bool,
     ) -> Result<()> {
         if msgs.is_empty() {
             return Ok(());
         }
         for r in &page_reactions {
             self.record_reaction(group_id, r.clone());
-        }
-        if !newest_page {
-            self.ensure_reaction_backfill(group_id)?;
         }
         let targets: HashSet<EventId> = msgs.iter().map(|m| m.id).collect();
         let mut reactions = {
@@ -2383,10 +2378,24 @@ impl MarmotEngine {
         if self.reaction_is_suppressed(&reaction.id) {
             return;
         }
-        self.reaction_store
-            .lock()
-            .unwrap()
-            .record(group_id, reaction);
+        let inserted = {
+            let mut store = self.reaction_store.lock().unwrap();
+            store.record(group_id, reaction)
+        };
+        if inserted {
+            self.persist_reaction_store();
+        }
+    }
+
+    fn persist_reaction_store(&self) {
+        let Some(db_path) = self.db_path.as_ref() else {
+            return;
+        };
+        let path = crate::reaction::reaction_store_path_for_db(db_path);
+        let store = self.reaction_store.lock().unwrap();
+        if let Err(err) = store.save(&path) {
+            tracing::warn!(%err, "reaction store persist failed");
+        }
     }
 
     fn reaction_is_suppressed(&self, id: &EventId) -> bool {
@@ -2418,46 +2427,6 @@ impl MarmotEngine {
         }
     }
 
-    fn ensure_reaction_backfill(&self, group_id: &GroupId) -> Result<()> {
-        {
-            let store = self.reaction_store.lock().unwrap();
-            if store.is_backfilled(group_id) {
-                return Ok(());
-            }
-        }
-        let mut raw_offset = 0usize;
-        let mut raw_scanned = 0usize;
-        let batch = 128usize;
-        while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
-            let remaining = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
-            let page = Pagination::with_sort_order(
-                Some(batch.min(remaining)),
-                Some(raw_offset),
-                MessageSortOrder::CreatedAtFirst,
-            );
-            let raw = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page)))?;
-            if raw.is_empty() {
-                break;
-            }
-            let raw_len = raw.len();
-            raw_scanned += raw_len;
-            raw_offset += raw_len;
-            for m in raw {
-                if let Some(r) = crate::reaction::parse_stored(&m) {
-                    self.record_reaction(group_id, r);
-                }
-            }
-            if raw_len < batch {
-                break;
-            }
-        }
-        self.reaction_store
-            .lock()
-            .unwrap()
-            .mark_backfilled(group_id);
-        Ok(())
-    }
-
     /// Target-keyed tallies for already-loaded transcript ids. Hosts overlay
     /// these onto retained historical rows that a newest-page refresh misses.
     pub fn reaction_tallies_for(
@@ -2468,7 +2437,6 @@ impl MarmotEngine {
         if target_ids.is_empty() {
             return Ok(Vec::new());
         }
-        self.ensure_reaction_backfill(group_id)?;
         let targets: HashSet<EventId> = target_ids.iter().copied().collect();
         let mut reactions = self
             .reaction_store
@@ -2574,6 +2542,7 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         "-journal",
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
+        crate::reaction::REACTION_STORE_FILE_SUFFIX,
         DM_AUTOACCEPT_FILE_SUFFIX,
         DM_AUTOACCEPT_TMP_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
@@ -2583,6 +2552,10 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     .collect();
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
+    paths.push(base.with_file_name(format!(
+        "{name}{}.tmp",
+        crate::reaction::REACTION_STORE_FILE_SUFFIX
+    )));
     paths.push(base.with_file_name(format!("{name}{KEY_PACKAGE_SLOT_FILE_SUFFIX}.tmp")));
     paths
 }
