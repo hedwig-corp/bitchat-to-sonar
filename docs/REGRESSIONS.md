@@ -2687,6 +2687,7 @@ rescue: Compose `SonarAppState.setupWallet` /
 `lib.rs::corrupt_journal_fails_closed`,
 `lib.rs::planning_refuses_an_in_flight_send`,
 `lib.rs::source_send_error_journals_unknown_and_refuses_a_new_plan`,
+`lib.rs::accepted_pending_send_journals_source_pending_and_refuses_a_new_plan`,
 `journal.rs::needs_rescue_is_only_ambiguous_or_paid_states`,
 `WalletMigrationContractTest.executeErrorAfterSourceAcceptedIsPendingNotANewQuote`,
 `WalletMigrationContractTest.relaunchAfterPaidJournalIsPendingNotANewQuote`,
@@ -2706,7 +2707,7 @@ rescue: Compose `SonarAppState.setupWallet` /
 
 **Also guarded by:** `WalletMigrationContractTest.backgroundRescueSkipsWhenJournalDoesNotNeedRescue`, `WalletMigrationContractTest.backgroundRescueSkipsWhenStoreAlreadyOwned`, `WalletMigrationContractTest.backgroundRescueResumesPaidJournalAndCloses`, `SonarMigrationRescueTests.testBackgroundRescueSkipsWhenStoreAlreadyOwned`
 
-**Also guarded by:** `WalletMigrationContractTest.acceptedBreezSendWithoutPreimageIsPending`, `BreezMigrationSourceTests.testAcceptedBreezSendWithoutPreimageIsPending`, `SonarMigrationRescueTests.testCancelledAcquireDoesNotKeepTheLock`
+**Also guarded by:** `WalletMigrationContractTest.acceptedBreezSendWithoutPreimageIsPending`, `BreezMigrationSourceTests.testAcceptedBreezSendWithoutPreimageIsPending`, `SonarMigrationRescueTests.testCancelledAcquireDoesNotKeepTheLock`, `lib.rs::accepted_pending_send_journals_source_pending_and_refuses_a_new_plan`
 
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
 journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
