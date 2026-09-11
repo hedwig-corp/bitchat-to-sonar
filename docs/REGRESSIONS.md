@@ -2785,12 +2785,17 @@ Compose Android
 `WalletMigrationController.jvm.kt::wipeCashuMigrationStorage`.
 
 **Guarded by:** `lib.rs::partial_account_marker_without_database_is_recovered`,
-`lib.rs::wipe_predicate_matches_exact_artifacts_only`
+`lib.rs::wipe_predicate_matches_exact_artifacts_only`,
+`SonarWalletDerivationTests.testWalletStorageWipeRemovesSharedAndLegacyState`,
+`DesktopCashuWipeTest.wipeRemovesProofStoreJournalAndRestoreMarker`
 
 **Coverage (honest):** the CDK tests pin marker recovery and the exact artifact
 predicate, including `cashu.migration.v1.json`, its temp forms, and lock file.
-They do not prove either host invokes its wipe root during account replacement;
-that remains the same call-site gap documented for R-023/R-004 below.
+Apple drives `wipeWalletFilesAndDefaults` on injected paths. Compose JVM drives
+`wipeCashuMigrationStorage` against a DesktopEnv test root. Neither proves
+`SonarAppState.wipe()` / `restoreAccount` or Apple `wipe()` invoke those helpers;
+that remains the same call-site gap documented for R-023/R-004 below. Android
+`filesDir` wipe is the same expect/actual with no instrumented pin.
 
 **History:** journal durability added new identity-bearing files to an existing
 Cashu store whose first-open marker can itself be interrupted.

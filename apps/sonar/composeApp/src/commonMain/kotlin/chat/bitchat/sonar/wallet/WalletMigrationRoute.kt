@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.resources.Res
@@ -86,17 +87,19 @@ fun WalletMigrationRoute(state: SonarAppState) {
     LaunchedEffect(openGeneration) {
         abandoned.set(false)
         phase = MigrationPhase.Quoting
-        runCatching {
-            createWalletMigrationController(
-                mintUrl = SONAR_DEFAULT_MINT_URL,
-                destMaxSats = DEST_MAX_SATS,
-                feeCapSats = FEE_CAP_SATS,
-            )
-        }
-            .onFailure { cause ->
-                // A real fault reports itself. Collapsing this into
-                // "unavailable" is what made the first device run
-                // undiagnosable.
+        // Leaving the screen cannot interrupt native open/restore. Without
+        // NonCancellable the result is discarded at the cancellation boundary
+        // and the newly opened store stays locked until process death.
+        val built = try {
+            withContext(NonCancellable) {
+                createWalletMigrationController(
+                    mintUrl = SONAR_DEFAULT_MINT_URL,
+                    destMaxSats = DEST_MAX_SATS,
+                    feeCapSats = FEE_CAP_SATS,
+                )
+            }
+        } catch (cause: Throwable) {
+            if (!abandoned.get()) {
                 phase = MigrationPhase.Failed(
                     couldNotOpenTemplate.replace(
                         errorMarker,
@@ -104,51 +107,53 @@ fun WalletMigrationRoute(state: SonarAppState) {
                     )
                 )
             }
-            .onSuccess { built ->
-                if (built == null) {
-                    phase = MigrationPhase.Failed(lightningUnavailable)
-                    return@onSuccess
-                }
-                if (abandoned.get()) {
-                    built.close()
-                    return@onSuccess
-                }
-                controller = built
-                if (abandoned.get()) {
-                    controller = null
-                    built.close()
-                    return@onSuccess
-                }
-                runCatching {
-                    cashuBalance = built.destinationBalanceSats()
-                    built.status()
-                }
-                    .onSuccess { status ->
-                        phase = when (status?.state) {
-                            null -> MigrationPhase.Idle
-                            MigrationAttemptStateUi.AwaitingConsent,
-                            MigrationAttemptStateUi.ExpiredUnsent -> {
-                                // Prepared source quotes cannot survive a
-                                // process restart. Clear only this proven-
-                                // unspent state and ask for a fresh quote.
-                                built.cancelUnspent()
-                                MigrationPhase.Idle
-                            }
-                            MigrationAttemptStateUi.Settled ->
-                                MigrationPhase.Settled(status.amountSats)
-                            MigrationAttemptStateUi.SourceFailed ->
-                                MigrationPhase.Failed(lightningPaymentFailed)
-                            else -> MigrationPhase.PendingSettlement(cashuBalance)
-                        }
+            return@LaunchedEffect
+        }
+        if (built == null) {
+            if (!abandoned.get()) {
+                phase = MigrationPhase.Failed(lightningUnavailable)
+            }
+            return@LaunchedEffect
+        }
+        if (abandoned.get()) {
+            built.close()
+            return@LaunchedEffect
+        }
+        controller = built
+        if (abandoned.get()) {
+            controller = null
+            built.close()
+            return@LaunchedEffect
+        }
+        runCatching {
+            cashuBalance = built.destinationBalanceSats()
+            built.status()
+        }
+            .onSuccess { status ->
+                phase = when (status?.state) {
+                    null -> MigrationPhase.Idle
+                    MigrationAttemptStateUi.AwaitingConsent,
+                    MigrationAttemptStateUi.ExpiredUnsent -> {
+                        // Prepared source quotes cannot survive a
+                        // process restart. Clear only this proven-
+                        // unspent state and ask for a fresh quote.
+                        built.cancelUnspent()
+                        MigrationPhase.Idle
                     }
-                    .onFailure {
-                        phase = MigrationPhase.Failed(
-                            couldNotReadBalanceTemplate.replace(
-                                errorMarker,
-                                it.message ?: it.toString(),
-                            )
-                        )
-                    }
+                    MigrationAttemptStateUi.Settled ->
+                        MigrationPhase.Settled(status.amountSats)
+                    MigrationAttemptStateUi.SourceFailed ->
+                        MigrationPhase.Failed(lightningPaymentFailed)
+                    else -> MigrationPhase.PendingSettlement(cashuBalance)
+                }
+            }
+            .onFailure {
+                phase = MigrationPhase.Failed(
+                    couldNotReadBalanceTemplate.replace(
+                        errorMarker,
+                        it.message ?: it.toString(),
+                    )
+                )
             }
     }
 

@@ -494,7 +494,7 @@ mod tests {
     use super::*;
     use sonar_wallet::{
         Balance, Destination as WalletDestination, MockWallet, PreparedSend, TrackedReceive,
-        WalletCapabilities, WalletEventListener,
+        WalletCapabilities, WalletError, WalletEventListener,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -614,6 +614,56 @@ mod tests {
         }
         fn wipe_local_storage(&self) -> sonar_wallet::Result<()> {
             self.inner.wipe_local_storage()
+        }
+    }
+
+    struct FailingSendSource(MockWallet);
+
+    impl WalletBackend for FailingSendSource {
+        fn capabilities(&self) -> WalletCapabilities {
+            self.0.capabilities()
+        }
+        fn connect(&self) -> sonar_wallet::Result<()> {
+            self.0.connect()
+        }
+        fn disconnect(&self) -> sonar_wallet::Result<()> {
+            self.0.disconnect()
+        }
+        fn is_connected(&self) -> bool {
+            self.0.is_connected()
+        }
+        fn balance(&self) -> sonar_wallet::Result<Balance> {
+            self.0.balance()
+        }
+        fn receive(&self, request: &ReceiveRequest) -> sonar_wallet::Result<String> {
+            self.0.receive(request)
+        }
+        fn parse_destination(&self, input: &str) -> sonar_wallet::Result<WalletDestination> {
+            self.0.parse_destination(input)
+        }
+        fn prepare_send(
+            &self,
+            destination: &WalletDestination,
+            amount_sats: Option<u64>,
+        ) -> sonar_wallet::Result<PreparedSend> {
+            self.0.prepare_send(destination, amount_sats)
+        }
+        fn send(&self, _prepared: &PreparedSend, _note: &str) -> sonar_wallet::Result<Payment> {
+            Err(WalletError::Backend(
+                "host callback timed out after the source accepted".into(),
+            ))
+        }
+        fn list_recent_payments(&self, limit: u32) -> sonar_wallet::Result<Vec<Payment>> {
+            self.0.list_recent_payments(limit)
+        }
+        fn add_event_listener(&self, listener: Arc<dyn WalletEventListener>) -> u64 {
+            self.0.add_event_listener(listener)
+        }
+        fn remove_event_listener(&self, id: u64) {
+            self.0.remove_event_listener(id)
+        }
+        fn wipe_local_storage(&self) -> sonar_wallet::Result<()> {
+            self.0.wipe_local_storage()
         }
     }
 
@@ -757,6 +807,30 @@ mod tests {
             engine.resume(Duration::from_secs(1)).unwrap(),
             Settlement::Settled { amount_sats: 1_000 }
         );
+    }
+
+    #[test]
+    fn source_send_error_journals_unknown_and_refuses_a_new_plan() {
+        let inner = MockWallet::new(10_000);
+        inner.connect().unwrap();
+        let source = FailingSendSource(inner);
+        let destination = Destination::default();
+        let dir = tempfile::tempdir().unwrap();
+        let journal = MigrationJournal::new(dir.path(), b"account", b"mint").unwrap();
+        let engine = MigrationEngine::new(&source, &destination, limits(None, Some(10)), &journal);
+        let plan = engine.plan_amount(1_000).unwrap();
+        assert!(engine.execute_once(&plan).is_err());
+        assert_eq!(
+            journal.load().unwrap().unwrap().state,
+            MigrationAttemptState::PaymentUnknown
+        );
+        assert!(matches!(
+            engine.plan_amount(1_000),
+            Err(MigrateError::InFlight(
+                MigrationAttemptState::PaymentUnknown
+            ))
+        ));
+        assert_eq!(source.balance().unwrap().confirmed_sats, 10_000);
     }
 
     #[test]

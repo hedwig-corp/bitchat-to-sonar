@@ -523,8 +523,10 @@ impl SonarMigration {
     }
 
     /// Pay the planned migration. THE spending call — hosts must not reach it
-    /// without explicit user consent to the custody change. Single-use: the
-    /// plan is consumed, so a double-tap cannot pay twice.
+    /// without explicit user consent to the custody change. Single-use once
+    /// the journal has left `AwaitingConsent`, so a double-tap cannot pay twice.
+    /// If `execute_once` fails before that durable take, the in-memory plan is
+    /// restored so retry does not mint a second invoice.
     pub fn execute(&self, plan_id: String) -> FfiResult<HostPayment> {
         let taken = {
             let mut slot = self.plan.lock().unwrap_or_else(|e| e.into_inner());
@@ -549,13 +551,25 @@ impl SonarMigration {
             self.limits.clone(),
             &self.dest.migration_journal,
         );
-        let payment = engine.execute_once(&plan)?;
-        Ok(HostPayment {
-            id: payment.id,
-            amount_sats: payment.amount_sats,
-            fees_sats: payment.fees_sats,
-            complete: payment.status == sonar_wallet::PaymentStatus::Complete,
-        })
+        match engine.execute_once(&plan) {
+            Ok(payment) => Ok(HostPayment {
+                id: payment.id,
+                amount_sats: payment.amount_sats,
+                fees_sats: payment.fees_sats,
+                complete: payment.status == sonar_wallet::PaymentStatus::Complete,
+            }),
+            Err(error) => {
+                if unsent_plan_is_reusable(
+                    engine.status().ok().flatten().map(|attempt| attempt.state),
+                ) {
+                    let mut slot = self.plan.lock().unwrap_or_else(|e| e.into_inner());
+                    if slot.is_none() {
+                        *slot = Some((plan.settlement_id.clone(), plan));
+                    }
+                }
+                Err(error.into())
+            }
+        }
     }
 
     /// Return the durable attempt, including one created before this process.
@@ -604,5 +618,40 @@ impl SonarMigration {
 impl SonarCashuWallet {
     fn inner_ref(&self) -> &CdkWallet {
         &self.inner
+    }
+}
+
+/// The in-memory prepared send may be reused only while the journal still
+/// proves no source payment can have left. After `Sending` the resume path
+/// is the journal; putting the plan back would let a second tap pay twice.
+fn unsent_plan_is_reusable(state: Option<CoreMigrationAttemptState>) -> bool {
+    matches!(state, Some(CoreMigrationAttemptState::AwaitingConsent))
+}
+
+#[cfg(test)]
+mod restore_unsent_plan {
+    use super::*;
+
+    #[test]
+    fn unsent_plan_is_reusable_only_while_awaiting_consent() {
+        assert!(unsent_plan_is_reusable(Some(
+            CoreMigrationAttemptState::AwaitingConsent
+        )));
+        for state in [
+            CoreMigrationAttemptState::Sending,
+            CoreMigrationAttemptState::PaymentUnknown,
+            CoreMigrationAttemptState::SourcePending,
+            CoreMigrationAttemptState::SourcePaid,
+            CoreMigrationAttemptState::MintPaid,
+            CoreMigrationAttemptState::Settled,
+            CoreMigrationAttemptState::SourceFailed,
+            CoreMigrationAttemptState::ExpiredUnsent,
+        ] {
+            assert!(
+                !unsent_plan_is_reusable(Some(state)),
+                "{state:?} must resume from the journal, not the in-memory plan"
+            );
+        }
+        assert!(!unsent_plan_is_reusable(None));
     }
 }

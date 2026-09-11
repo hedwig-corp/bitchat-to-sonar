@@ -3,6 +3,7 @@ package chat.bitchat.sonar.wallet
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import chat.bitchat.sonar.DesktopEnv
 import chat.bitchat.sonar.SonarCore
 import uniffi.sonar_ffi.MigrationOutcome
 import uniffi.sonar_ffi.MigrationAttemptState
@@ -80,10 +81,8 @@ private class JvmWalletMigrationController(
     }
 }
 
-private fun desktopCashuDir(accountId: String): File {
-    val home = System.getProperty("user.home") ?: "."
-    return File(home, ".sonar/sonar-cashu/$accountId/mainnet")
-}
+private fun desktopCashuDir(accountId: String): File =
+    DesktopEnv.file("sonar-cashu/$accountId/mainnet")
 
 actual suspend fun createWalletMigrationController(
     mintUrl: String,
@@ -114,9 +113,19 @@ actual suspend fun createWalletMigrationController(
 }
 
 actual suspend fun wipeCashuMigrationStorage(): Unit = withContext(Dispatchers.IO) {
-    val home = System.getProperty("user.home") ?: "."
-    val root = File(home, ".sonar/sonar-cashu")
-    if (root.exists() && !root.deleteRecursively()) {
-        error("Cashu wallet storage could not be cleared")
+    val roots = buildList {
+        add(DesktopEnv.file("sonar-cashu"))
+        // First desktop Cashu builds stored proofs under ~/.sonar/sonar-cashu,
+        // outside DesktopEnv. Wipe that leftover only against the real home —
+        // a redirected test root must not delete the developer's own store.
+        if (DesktopEnv.testRootOverride == null) {
+            val home = System.getProperty("user.home") ?: "."
+            add(File(home, ".sonar/sonar-cashu"))
+        }
+    }
+    for (root in roots) {
+        if (root.exists() && !root.deleteRecursively()) {
+            error("Cashu wallet storage could not be cleared")
+        }
     }
 }
