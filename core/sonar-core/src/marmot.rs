@@ -683,7 +683,7 @@ impl MarmotEngine {
             Err(e) => return Err(Error::Storage(e.to_string())),
         };
         let sidecar_path = crate::reaction::reaction_store_path_for_db(path);
-        let rebuild = crate::reaction::reaction_store_needs_rebuild(&sidecar_path);
+        let rebuild = crate::reaction::reaction_store_needs_rebuild(path);
         let engine = Self {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
@@ -1288,7 +1288,18 @@ impl MarmotEngine {
         emoji: &str,
     ) -> Result<(Event, Incoming)> {
         let _mls = self.mls_write();
-        let event = self.create_reaction_event_inner(group_id, target_id, target_pubkey, emoji)?;
+        let already_dirty = self.reaction_index_is_dirty();
+        self.mark_reaction_index_dirty();
+        let event =
+            match self.create_reaction_event_inner(group_id, target_id, target_pubkey, emoji) {
+                Ok(event) => event,
+                Err(err) => {
+                    if !already_dirty {
+                        self.clear_reaction_index_dirty();
+                    }
+                    return Err(err);
+                }
+            };
         let incoming = self.process_group_message(&event)?;
         Ok((event, incoming))
     }
@@ -1682,7 +1693,16 @@ impl MarmotEngine {
     /// Process a kind-445 group message into the local store. Synchronous MLS
     /// mutation — requires the caller to hold the MLS write guard.
     fn process_group_message(&self, event: &Event) -> Result<Incoming> {
-        match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
+        // Mark before MDK commits so a crash between SQLCipher and the sidecar
+        // replace rebuilds on the next open instead of trusting a valid-but-stale
+        // JSON file. Non-reaction results restore the previous dirty state.
+        let already_dirty = self.reaction_index_is_dirty();
+        self.mark_reaction_index_dirty();
+        let result = match dispatch!(&self.storage, |mdk| mdk.process_message(event)) {
+            Ok(result) => result,
+            Err(err) => return Err(err.into()),
+        };
+        let incoming = match result {
             MessageProcessingResult::ApplicationMessage(msg) => {
                 // Kind-7 reactions stay out of the transcript/unread/notify
                 // path (R-017) but must invalidate the conversation so hosts
@@ -1696,24 +1716,29 @@ impl MarmotEngine {
                     });
                 }
                 if msg.kind.as_u16() != CHAT_RUMOR_KIND {
-                    return Ok(Incoming::None);
+                    Incoming::None
+                } else {
+                    Incoming::Message(self.to_chat_message(msg))
                 }
-                Ok(Incoming::Message(self.to_chat_message(msg)))
             }
             MessageProcessingResult::Commit { mls_group_id }
             | MessageProcessingResult::PendingProposal { mls_group_id } => {
-                Ok(Incoming::GroupUpdated(mls_group_id))
+                Incoming::GroupUpdated(mls_group_id)
             }
-            MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
-                Self::to_membership_update(update, Vec::new(), true),
-            )),
+            MessageProcessingResult::Proposal(update) => {
+                Incoming::GroupProposal(Self::to_membership_update(update, Vec::new(), true))
+            }
             // MDK persists a Failed processing record on the first
             // failure and short-circuits every re-delivery with the
             // same result, so these are terminal for the sync layer.
             MessageProcessingResult::Unprocessable { .. }
-            | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Failed),
-            _ => Ok(Incoming::None),
+            | MessageProcessingResult::PreviouslyFailed => Incoming::Failed,
+            _ => Incoming::None,
+        };
+        if !already_dirty {
+            self.clear_reaction_index_dirty();
         }
+        Ok(incoming)
     }
 
     /// All active groups this identity belongs to. Pending group invites are
@@ -2279,6 +2304,8 @@ impl MarmotEngine {
     /// deleting a conversation in Signal/iMessage). Idempotent.
     pub fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         let _mls = self.mls_write();
+        let already_dirty = self.reaction_index_is_dirty();
+        self.mark_reaction_index_dirty();
         dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?;
         let removed = {
             let mut store = self.reaction_store.lock().unwrap();
@@ -2286,6 +2313,8 @@ impl MarmotEngine {
         };
         if removed {
             self.persist_reaction_store();
+        } else if !already_dirty {
+            self.clear_reaction_index_dirty();
         }
         Ok(())
     }
@@ -2408,10 +2437,30 @@ impl MarmotEngine {
         let Some(db_path) = self.db_path.as_ref() else {
             return;
         };
+        crate::reaction::mark_reaction_store_dirty(db_path);
         let path = crate::reaction::reaction_store_path_for_db(db_path);
         let store = self.reaction_store.lock().unwrap();
-        if let Err(err) = store.save(&path) {
-            tracing::warn!(%err, "reaction store persist failed");
+        match store.save(&path) {
+            Ok(()) => crate::reaction::clear_reaction_store_dirty(db_path),
+            Err(err) => tracing::warn!(%err, "reaction store persist failed"),
+        }
+    }
+
+    fn reaction_index_is_dirty(&self) -> bool {
+        self.db_path
+            .as_ref()
+            .is_some_and(|path| crate::reaction::reaction_store_is_dirty(path))
+    }
+
+    fn mark_reaction_index_dirty(&self) {
+        if let Some(path) = self.db_path.as_ref() {
+            crate::reaction::mark_reaction_store_dirty(path);
+        }
+    }
+
+    fn clear_reaction_index_dirty(&self) {
+        if let Some(path) = self.db_path.as_ref() {
+            crate::reaction::clear_reaction_store_dirty(path);
         }
     }
 
@@ -2604,6 +2653,7 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
         crate::reaction::REACTION_STORE_FILE_SUFFIX,
+        crate::reaction::REACTION_STORE_DIRTY_SUFFIX,
         DM_AUTOACCEPT_FILE_SUFFIX,
         DM_AUTOACCEPT_TMP_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,

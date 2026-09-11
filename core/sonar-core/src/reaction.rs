@@ -177,6 +177,7 @@ pub struct ReactionStore {
 }
 
 pub(crate) const REACTION_STORE_FILE_SUFFIX: &str = ".sonar-reactions.json";
+pub(crate) const REACTION_STORE_DIRTY_SUFFIX: &str = ".sonar-reactions.dirty";
 const REACTION_STORE_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
@@ -215,10 +216,36 @@ pub(crate) fn reaction_store_tmp_path(path: &Path) -> PathBuf {
     ))
 }
 
-/// True when the sidecar is missing or unreadable, so the derived index must
-/// be rebuilt from the encrypted DB (account restore, first open, corrupt file).
-pub(crate) fn reaction_store_needs_rebuild(path: &Path) -> bool {
-    let Ok(bytes) = fs::read(path) else {
+pub(crate) fn reaction_store_dirty_path_for_db(db_path: &Path) -> PathBuf {
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("marmot.sqlite");
+    db_path.with_file_name(format!("{file_name}{REACTION_STORE_DIRTY_SUFFIX}"))
+}
+
+pub(crate) fn mark_reaction_store_dirty(db_path: &Path) {
+    let _ = fs::write(reaction_store_dirty_path_for_db(db_path), b"");
+}
+
+pub(crate) fn clear_reaction_store_dirty(db_path: &Path) {
+    let _ = fs::remove_file(reaction_store_dirty_path_for_db(db_path));
+}
+
+pub(crate) fn reaction_store_is_dirty(db_path: &Path) -> bool {
+    reaction_store_dirty_path_for_db(db_path).exists()
+}
+
+/// True when the sidecar is missing, unreadable, or marked dirty, so the
+/// derived index must be rebuilt from the encrypted DB (account restore,
+/// first open, corrupt file, or a crash/persist failure after MDK committed
+/// a kind-7). Never run this rebuild on the chat-open paging path.
+pub(crate) fn reaction_store_needs_rebuild(db_path: &Path) -> bool {
+    if reaction_store_is_dirty(db_path) {
+        return true;
+    }
+    let path = reaction_store_path_for_db(db_path);
+    let Ok(bytes) = fs::read(&path) else {
         return true;
     };
     let Ok(disk) = serde_json::from_slice::<ReactionStoreDisk>(&bytes) else {
@@ -233,6 +260,7 @@ pub(crate) fn remove_reaction_store_files(db_path: &Path) {
     let tmp = reaction_store_tmp_path(&path);
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&tmp);
+    clear_reaction_store_dirty(db_path);
 }
 
 #[cfg(not(windows))]
@@ -612,5 +640,24 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].emoji, "👍");
         assert_eq!(found[0].sender, me);
+    }
+
+    #[test]
+    fn needs_rebuild_when_sidecar_is_valid_but_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let sidecar = reaction_store_path_for_db(&db_path);
+        fs::write(&sidecar, r#"{"version":1,"entries":[]}"#).expect("valid sidecar");
+        assert!(
+            !reaction_store_needs_rebuild(&db_path),
+            "valid sidecar with no dirty marker must be trusted"
+        );
+        mark_reaction_store_dirty(&db_path);
+        assert!(
+            reaction_store_needs_rebuild(&db_path),
+            "a dirty marker must force rebuild even when the sidecar is valid JSON"
+        );
+        clear_reaction_store_dirty(&db_path);
+        assert!(!reaction_store_needs_rebuild(&db_path));
     }
 }

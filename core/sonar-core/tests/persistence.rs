@@ -565,6 +565,63 @@ async fn restore_rebuilds_reaction_index_and_drops_ghosts() {
 }
 
 #[tokio::test]
+async fn dirty_stale_sidecar_rebuilds_from_db() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let sidecar = db_path.with_file_name("marmot.sqlite.sonar-reactions.json");
+    let dirty = db_path.with_file_name("marmot.sqlite.sonar-reactions.dirty");
+
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let alice_identity = Identity::generate();
+
+    let (group_id, parent_id) = {
+        let alice = MarmotEngine::persistent(alice_identity.clone(), &db_path, DB_KEY)
+            .expect("open persistent engine");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], Vec::new())
+            .expect("create local group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("merge local group");
+        let parent_event = alice
+            .create_text_message(&group_id, "old parent")
+            .expect("parent event");
+        let Incoming::Message(parent) = alice
+            .process_incoming(&parent_event)
+            .await
+            .expect("process parent")
+        else {
+            panic!("parent must persist as a chat row");
+        };
+        alice
+            .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
+            .expect("react");
+        (group_id, parent.id)
+    };
+
+    std::fs::write(&sidecar, r#"{"version":1,"entries":[]}"#).expect("stale valid sidecar");
+    std::fs::write(&dirty, b"").expect("dirty marker");
+
+    let alice = MarmotEngine::persistent(alice_identity, &db_path, DB_KEY)
+        .expect("reopen after crash window");
+    let overlay = alice
+        .reaction_tallies_for(&group_id, &[parent_id])
+        .expect("overlay after dirty rebuild");
+    assert_eq!(
+        overlay[0].1.len(),
+        1,
+        "a valid-but-stale sidecar with a dirty marker must rebuild from SQLCipher"
+    );
+    assert_eq!(overlay[0].1[0].emoji, "👍");
+    assert!(
+        !dirty.exists(),
+        "successful rebuild persist must clear the dirty marker"
+    );
+}
+
+#[tokio::test]
 async fn restart_watermark_ignores_later_local_messages() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("marmot.sqlite");
@@ -779,6 +836,7 @@ async fn wipe_removes_the_database() {
     // sidecar_paths keeps CI green while stranding the coordinate.
     let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
     let slot_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot.tmp");
+    let reaction_dirty_path = db_path.with_file_name("marmot.sqlite.sonar-reactions.dirty");
     std::fs::write(&sync_path, b"{}").expect("fake sync sidecar");
     std::fs::write(&sync_tmp_path, b"{}").expect("fake sync temp sidecar");
     std::fs::write(&outbox_path, b"{}").expect("fake outbox sidecar");
@@ -793,6 +851,7 @@ async fn wipe_removes_the_database() {
         "publishing a key package must create the slot"
     );
     std::fs::write(&slot_tmp_path, "leftover").expect("stage a crashed rename");
+    std::fs::write(&reaction_dirty_path, b"").expect("fake reaction dirty marker");
 
     MarmotEngine::wipe(&db_path).expect("wipe");
     assert!(!db_path.exists(), "db file removed by wipe");
@@ -807,6 +866,10 @@ async fn wipe_removes_the_database() {
     assert!(
         !outbox_tmp_path.exists(),
         "outbox temp sidecar removed by wipe"
+    );
+    assert!(
+        !reaction_dirty_path.exists(),
+        "reaction dirty marker removed by wipe"
     );
 
     // Wipe is idempotent.
