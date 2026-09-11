@@ -70,11 +70,17 @@ final class SonarWalletDerivationTests: XCTestCase {
         let group = root.appendingPathComponent("group", isDirectory: true)
         let support = root.appendingPathComponent("support", isDirectory: true)
         let sharedWallet = group.appendingPathComponent("breez-sdk/mainnet", isDirectory: true)
+        let sharedCashu = group.appendingPathComponent("sonar-cashu", isDirectory: true)
         let legacyWallet = support.appendingPathComponent("sonar-wallet", isDirectory: true)
+        let legacyCashu = support.appendingPathComponent("sonar-cashu", isDirectory: true)
         try fm.createDirectory(at: sharedWallet, withIntermediateDirectories: true)
+        try fm.createDirectory(at: sharedCashu, withIntermediateDirectories: true)
         try fm.createDirectory(at: legacyWallet, withIntermediateDirectories: true)
+        try fm.createDirectory(at: legacyCashu, withIntermediateDirectories: true)
         try Data("old-shared-wallet".utf8).write(to: sharedWallet.appendingPathComponent("wallet.db"))
         try Data("old-legacy-wallet".utf8).write(to: legacyWallet.appendingPathComponent("wallet.db"))
+        try Data("old-cashu-proofs".utf8).write(to: sharedCashu.appendingPathComponent("cashu.redb"))
+        try Data("old-legacy-cashu".utf8).write(to: legacyCashu.appendingPathComponent("cashu.redb"))
 
         let suite = "SonarWalletDerivationTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -94,7 +100,9 @@ final class SonarWalletDerivationTests: XCTestCase {
         )
 
         XCTAssertFalse(fm.fileExists(atPath: group.appendingPathComponent("breez-sdk").path))
+        XCTAssertFalse(fm.fileExists(atPath: group.appendingPathComponent("sonar-cashu").path))
         XCTAssertFalse(fm.fileExists(atPath: legacyWallet.path))
+        XCTAssertFalse(fm.fileExists(atPath: legacyCashu.path))
         XCTAssertNil(defaults.object(forKey: "breez_api_key"))
         XCTAssertNil(defaults.object(forKey: "breez_seed_hex"))
         XCTAssertNil(defaults.object(forKey: "breez_mainnet"))
