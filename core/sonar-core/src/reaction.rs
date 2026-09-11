@@ -298,14 +298,36 @@ impl ReactionStore {
     }
 
     /// Returns true when the reaction was newly inserted.
+    ///
+    /// Tallies are unique `(sender, emoji)` per target, so a flood of distinct
+    /// kind-7 ids for the same chip is stored once. First event wins; a later
+    /// distinct id is ignored unless [`Self::remove_id`] dropped the first.
     pub fn record(&mut self, group_id: &mdk_core::GroupId, reaction: ParsedReaction) -> bool {
         let key = (group_key(group_id), reaction.target_id);
         let entries = self.by_target.entry(key).or_default();
         if entries.iter().any(|e| e.id == reaction.id) {
             return false;
         }
+        if entries
+            .iter()
+            .any(|e| e.sender == reaction.sender && e.emoji == reaction.emoji)
+        {
+            return false;
+        }
         entries.push(reaction);
         true
+    }
+
+    /// Drop a rumor by id so a retry with a new id can occupy the chip slot.
+    pub fn remove_id(&mut self, id: EventId) -> bool {
+        let mut changed = false;
+        self.by_target.retain(|_, entries| {
+            let before = entries.len();
+            entries.retain(|e| e.id != id);
+            changed |= entries.len() != before;
+            !entries.is_empty()
+        });
+        changed
     }
 
     pub fn for_targets(
@@ -453,6 +475,35 @@ mod tests {
         let found = store.for_targets(&group, &targets);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].emoji, "👍");
+    }
+
+    #[test]
+    fn store_compacts_duplicate_sender_emoji() {
+        let (parent, _, me, _) = ids();
+        let group = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let mut store = ReactionStore::default();
+        assert!(store.record(&group, rx(1, parent, me, "👍")));
+        assert!(!store.record(&group, rx(2, parent, me, "👍")));
+        let mut targets = HashSet::new();
+        targets.insert(parent);
+        let found = store.for_targets(&group, &targets);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, rx(1, parent, me, "👍").id);
+    }
+
+    #[test]
+    fn store_remove_id_allows_retry_after_terminal_failure() {
+        let (parent, _, me, _) = ids();
+        let group = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let mut store = ReactionStore::default();
+        store.record(&group, rx(1, parent, me, "👍"));
+        assert!(store.remove_id(rx(1, parent, me, "👍").id));
+        assert!(store.record(&group, rx(2, parent, me, "👍")));
+        let mut targets = HashSet::new();
+        targets.insert(parent);
+        let found = store.for_targets(&group, &targets);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, rx(2, parent, me, "👍").id);
     }
 
     #[test]

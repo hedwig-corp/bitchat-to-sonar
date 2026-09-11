@@ -750,6 +750,7 @@ struct SNReplyChrome<Content: View>: View {
                     SNReactionRow(
                         reactions: m.reactions,
                         viaInternet: m.via == .internet,
+                        alignment: m.mine ? .trailing : .leading,
                         onTap: { emoji in onReact?(m, emoji) }
                     )
                 }
@@ -876,13 +877,76 @@ private struct SNMessageActionMenu: ViewModifier {
     }
 }
 
+struct SNWrappingHStack: Layout {
+    var spacing: CGFloat = 4
+    var lineSpacing: CGFloat = 4
+    var alignment: HorizontalAlignment = .leading
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
+        arrange(maxWidth: proposal.width, subviews: subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {
+        let result = arrange(maxWidth: bounds.width, subviews: subviews)
+        for (subview, origin) in zip(subviews, result.origins) {
+            subview.place(
+                at: CGPoint(x: bounds.minX + origin.x, y: bounds.minY + origin.y),
+                proposal: .unspecified
+            )
+        }
+    }
+
+    private func arrange(maxWidth: CGFloat?, subviews: Subviews) -> (size: CGSize, origins: [CGPoint]) {
+        let cap = maxWidth ?? .infinity
+        var lineXs: [[CGFloat]] = [[]]
+        var lineWidths: [CGFloat] = [0]
+        var lineHeights: [CGFloat] = [0]
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            let line = lineXs.count - 1
+            let x = lineWidths[line]
+            if cap.isFinite, x > 0, x + size.width > cap {
+                lineXs.append([])
+                lineWidths.append(0)
+                lineHeights.append(0)
+            }
+            let current = lineXs.count - 1
+            let placedX = lineWidths[current]
+            lineXs[current].append(placedX)
+            lineWidths[current] = placedX + size.width + spacing
+            lineHeights[current] = max(lineHeights[current], size.height)
+        }
+        var origins = Array(repeating: CGPoint.zero, count: subviews.count)
+        var y: CGFloat = 0
+        var usedWidth: CGFloat = 0
+        var index = 0
+        for (line, xs) in lineXs.enumerated() {
+            let lineWidth = max(0, lineWidths[line] - spacing)
+            usedWidth = max(usedWidth, lineWidth)
+            let shift: CGFloat = {
+                guard alignment == .trailing, cap.isFinite else { return 0 }
+                return max(0, cap - lineWidth)
+            }()
+            for x in xs {
+                origins[index] = CGPoint(x: x + shift, y: y)
+                index += 1
+            }
+            y += lineHeights[line] + lineSpacing
+        }
+        let height = y == 0 ? 0 : y - lineSpacing
+        let width = cap.isFinite ? min(cap, usedWidth) : usedWidth
+        return (CGSize(width: width, height: height), origins)
+    }
+}
+
 struct SNReactionRow: View {
     let reactions: [SNReactionTally]
     var viaInternet: Bool = false
+    var alignment: HorizontalAlignment = .leading
     var onTap: ((String) -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 4) {
+        SNWrappingHStack(spacing: 4, lineSpacing: 4, alignment: alignment) {
             ForEach(reactions, id: \.emoji) { tally in
                 Button {
                     onTap?(tally.emoji)

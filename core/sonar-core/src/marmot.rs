@@ -2408,6 +2408,13 @@ impl MarmotEngine {
             .lock()
             .unwrap()
             .insert(reaction_id);
+        let removed = {
+            let mut store = self.reaction_store.lock().unwrap();
+            store.remove_id(reaction_id)
+        };
+        if removed {
+            self.persist_reaction_store();
+        }
     }
 
     pub(crate) fn suppressed_reactions_handle(&self) -> Arc<std::sync::Mutex<HashSet<EventId>>> {
@@ -2419,11 +2426,19 @@ impl MarmotEngine {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut suppressed = self.suppressed_reactions.lock().unwrap();
-        for hex in ids {
-            if let Ok(id) = EventId::from_hex(&hex) {
-                suppressed.insert(id);
+        let mut removed = false;
+        {
+            let mut suppressed = self.suppressed_reactions.lock().unwrap();
+            let mut store = self.reaction_store.lock().unwrap();
+            for hex in ids {
+                if let Ok(id) = EventId::from_hex(&hex) {
+                    suppressed.insert(id);
+                    removed |= store.remove_id(id);
+                }
             }
+        }
+        if removed {
+            self.persist_reaction_store();
         }
     }
 

@@ -38,6 +38,8 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -3123,6 +3125,7 @@ private fun ReplyDecorated(
                 ReactionRow(
                     reactions = m.reactions,
                     viaInternet = m.viaInternet,
+                    mine = m.mine,
                     onTap = { emoji -> state.sendReaction(chatId, m, emoji) },
                     modifier = Modifier.align(
                         if (m.mine) Alignment.BottomEnd else Alignment.BottomStart,
@@ -3312,20 +3315,26 @@ private fun ReactionPickerRow(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ReactionRow(
     reactions: List<SonarReactionTally>,
     viaInternet: Boolean,
+    mine: Boolean,
     onTap: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val s = sonar
-    Row(
+    FlowRow(
         modifier
+            .fillMaxWidth()
             .padding(horizontal = 6.dp)
             .offset(y = (-7).dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(
+            4.dp,
+            if (mine) Alignment.End else Alignment.Start,
+        ),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         reactions.forEach { tally ->
             val mineStroke = if (viaInternet) s.net else s.accent

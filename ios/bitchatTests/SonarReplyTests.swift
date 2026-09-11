@@ -95,6 +95,22 @@ struct SonarReplyTests {
         #expect(!snCanReact(to: action))
     }
 
+    @Test @MainActor
+    func reactionChipsWrapInsteadOfOverflowing() {
+        #if os(iOS)
+        let reactions = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "💯"].map {
+            SNReactionTally(emoji: $0, count: 1, mine: false)
+        }
+        let host = UIHostingController(
+            rootView: SNReactionRow(reactions: reactions)
+                .frame(width: 140)
+        )
+        let size = host.sizeThatFits(in: CGSize(width: 140, height: 400))
+        #expect(size.width <= 140)
+        #expect(size.height > 36)
+        #endif
+    }
+
     @Test
     func copyUsesFullSourceAndSkipsNonTextRows() {
         let live = SNMessage(id: String(repeating: "ab", count: 32), text: "  hello  ", time: "10:00")
