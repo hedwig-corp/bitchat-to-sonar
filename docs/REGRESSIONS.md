@@ -2792,13 +2792,18 @@ a valid whole-balance migration dies on the first "not enough funds" quote.
 `WalletMigrationContractTest.breezProseInsufficientFundsIsTheDrainSignal`,
 `BreezMigrationSourceTests.testBreezProseInsufficientFundsIsTheDrainSignal`
 
+**Also guarded by:** `HostWalletErrorFfiTest.hostWalletErrorInsufficientFundsLiftsAcrossUniffi`, `HostWalletErrorFfiTest.hostWalletErrorFailedLiftsAcrossUniffi`, `BreezMigrationSourceTests.testHostWalletErrorInsufficientFundsLiftsAcrossUniffi`, `BreezMigrationSourceTests.testHostWalletErrorFailedLiftsAcrossUniffi`
+
 **Coverage (honest):** these tests pin the Rust planner's bounded step-down,
 both hard limits, the FFI adapter's typed `From<HostWalletError>` mapping
 (in-process, no UniFFI), and the three Breez prose phrases the hosts treat as
-`InsufficientFunds`. They still do not cross UniFFI with `HostWalletError`,
-and do not prove Android/JVM throws `HostWalletException.InsufficientFunds` or
-Apple lifts `HostWalletError.InsufficientFunds` back into Rust. The Apple
-message fallback is intentionally weaker than a native typed WalletKit error.
+`InsufficientFunds`. JVM CI crosses the generated `with_foreign` callback:
+`probe_host_migration_prepare` throws `HostWalletException.InsufficientFunds`
+from a Kotlin `HostMigrationSource` and must lift as that subclass, not
+"Can't lift flat errors". The matching Apple XCTest exists at the same
+generated-binding call site; the iOS CI job is xcodebuild, not XCTest, so
+that pin does not run on every PR. The Apple message fallback is still
+weaker than a native typed WalletKit error.
 
 **History:** the first Pixel drain exposed a flat foreign-trait error
 (`Can't lift flat errors`) that prevented the existing planner from seeing the
@@ -2858,15 +2863,12 @@ cross-account resume.
   invoking `send` again. This needs a process-death/device harness with an
   injectable source and a delayed mint; helper tests cannot pin the host
   lifecycle call site.
-- **Apple `HostWalletError` lifting across the foreign-trait boundary.** The
-  non-flat Rust enum and planner branch are covered only on the Rust side.
-  Nothing constructs the generated Swift `HostMigrationSource` callback,
-  throws `HostWalletError.InsufficientFunds`, and proves UniFFI lifts it back as
-  `WalletError::InsufficientFunds`. This is specifically weaker than Compose,
-  where generated `HostWalletException` subclasses compile in Android/JVM
-  sources, though their runtime crossing is also untested. A generated-binding
-  integration test is required; a direct `hostError(_:)` unit test would not
-  guard the boundary that failed on device.
+- **Apple `HostWalletError` lifting in the iOS CI job.** R-047 now pins the
+  generated `with_foreign` callback on JVM CI via `probe_host_migration_prepare`,
+  and an Apple XCTest throws `HostWalletError.InsufficientFunds` at the same
+  seam. The iOS CI job is still xcodebuild, not XCTest, so the Apple pin does
+  not run on every PR. A direct `hostError(_:)` unit test would not guard this
+  boundary.
 - **Live Breez → Cashu value transfer.** Fake-mint simulation and Rust tests
   cannot prove Breez payment lookup, real Lightning routing/fees, mint issuance,
   NUT-13 recovery, or app-kill resume as one production path. Verification must

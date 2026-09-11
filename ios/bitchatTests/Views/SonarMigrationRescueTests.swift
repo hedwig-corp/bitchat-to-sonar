@@ -195,4 +195,54 @@ final class BreezMigrationSourceTests: XCTestCase {
         XCTAssertFalse(BreezMigrationSource.hostSendReportsComplete(preimage: ""))
         XCTAssertTrue(BreezMigrationSource.hostSendReportsComplete(preimage: "00"))
     }
+
+    func testHostWalletErrorInsufficientFundsLiftsAcrossUniffi() {
+        XCTAssertThrowsError(
+            try probeHostMigrationPrepare(
+                source: InsufficientHost(),
+                invoice: "lnbc1test",
+                amountSats: 1_000
+            )
+        ) { error in
+            XCTAssertEqual(error as? HostWalletError, .InsufficientFunds)
+        }
+    }
+
+    func testHostWalletErrorFailedLiftsAcrossUniffi() {
+        XCTAssertThrowsError(
+            try probeHostMigrationPrepare(
+                source: FailedHost(),
+                invoice: "lnbc1test",
+                amountSats: 1_000
+            )
+        ) { error in
+            XCTAssertEqual(error as? HostWalletError, .Failed(reason: "bolt timeout"))
+        }
+    }
+}
+
+private final class InsufficientHost: HostMigrationSource, @unchecked Sendable {
+    func balanceSats() throws -> UInt64 { 10_000 }
+    func prepare(invoice: String, amountSats: UInt64) throws -> HostSendQuote {
+        throw HostWalletError.InsufficientFunds
+    }
+    func send(token: String, note: String) throws -> HostPayment {
+        throw HostWalletError.Failed(reason: "send must not run")
+    }
+    func lookupPayment(paymentHash: String) throws -> HostPaymentLookup {
+        throw HostWalletError.Failed(reason: "lookup must not run")
+    }
+}
+
+private final class FailedHost: HostMigrationSource, @unchecked Sendable {
+    func balanceSats() throws -> UInt64 { 10_000 }
+    func prepare(invoice: String, amountSats: UInt64) throws -> HostSendQuote {
+        throw HostWalletError.Failed(reason: "bolt timeout")
+    }
+    func send(token: String, note: String) throws -> HostPayment {
+        throw HostWalletError.Failed(reason: "send must not run")
+    }
+    func lookupPayment(paymentHash: String) throws -> HostPaymentLookup {
+        throw HostWalletError.Failed(reason: "lookup must not run")
+    }
 }

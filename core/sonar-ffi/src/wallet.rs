@@ -155,6 +155,19 @@ pub trait HostMigrationSource: Send + Sync {
     fn lookup_payment(&self, payment_hash: String) -> Result<HostPaymentLookup, HostWalletError>;
 }
 
+/// Invoke a host `prepare` through the same UniFFI `with_foreign` callback
+/// path `plan` / `plan_drain` uses. Production hosts never call this; it exists
+/// so Swift/Kotlin tests can throw [`HostWalletError`] and prove UniFFI lifts
+/// it instead of aborting with "Can't lift flat errors".
+#[uniffi::export]
+pub fn probe_host_migration_prepare(
+    source: Arc<dyn HostMigrationSource>,
+    invoice: String,
+    amount_sats: u64,
+) -> Result<HostSendQuote, HostWalletError> {
+    source.prepare(invoice, amount_sats)
+}
+
 impl From<HostWalletError> for WalletError {
     fn from(err: HostWalletError) -> Self {
         match err {
