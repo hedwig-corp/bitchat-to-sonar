@@ -2238,6 +2238,7 @@ final class SonarAppStore: ObservableObject {
                 if configured {
                     self.attemptCashuMigrationRescue()
                 }
+            }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
         if case .ready = wallet.state {
