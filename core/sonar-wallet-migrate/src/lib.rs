@@ -18,6 +18,11 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, MigrateError>;
 
+/// Pause between settlement polls after the first. Hosts ask for 24 polls
+/// with a 15s per-request timeout; without this the 24 rounds complete in
+/// milliseconds whenever the mint answers Pending immediately.
+const SETTLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Error)]
 pub enum MigrateError {
     #[error("source wallet: {0}")]
@@ -387,7 +392,13 @@ impl<'a> MigrationEngine<'a> {
         let mut outcome = Settlement::Pending {
             amount_sats: Self::dst(self.dest.confirmed_sats())?,
         };
-        for _ in 0..polls.max(1) {
+        // First poll is immediate. Later rounds wait so a real Lightning
+        // payment has time to reach the mint instead of burning every
+        // poll back-to-back and reporting Pending in milliseconds.
+        for i in 0..polls.max(1) {
+            if i > 0 {
+                std::thread::sleep(SETTLE_POLL_INTERVAL);
+            }
             outcome = self.resume(request_timeout)?;
             if matches!(outcome, Settlement::Settled { .. }) {
                 break;
@@ -691,6 +702,25 @@ mod tests {
                 .settle(&plan.settlement_id, 1, Duration::from_secs(1))
                 .unwrap(),
             Settlement::Settled { amount_sats: 2_000 }
+        );
+    }
+
+    #[test]
+    fn settle_waits_between_unsettled_polls() {
+        let (source, destination, _dir, journal) = setup(10_000);
+        let engine = MigrationEngine::new(&source, &destination, limits(None, Some(10)), &journal);
+        let plan = engine.plan_amount(1_000).unwrap();
+        engine.execute_once(&plan).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            engine
+                .settle(&plan.settlement_id, 2, Duration::from_millis(1))
+                .unwrap(),
+            Settlement::Pending { amount_sats: 0 }
+        );
+        assert!(
+            started.elapsed() >= SETTLE_POLL_INTERVAL,
+            "two unsettled polls must not run back-to-back"
         );
     }
 
