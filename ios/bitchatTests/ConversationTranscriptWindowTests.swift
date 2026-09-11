@@ -391,6 +391,19 @@ struct ConversationTranscriptWindowTests {
         #expect(refreshed.last?.id == "marmot-0060")
     }
 
+    @Test func overlayReactionTalliesPatchesRetainedRows() {
+        let existing = [marmotMessage(0), marmotMessage(1)]
+        let overlaid = MarmotChatModel.overlayReactionTallies(
+            existing,
+            tallies: [
+                "marmot-0000": [MarmotService.MarmotReactionTally(emoji: "🔥", count: 1, mine: true)]
+            ]
+        )
+        #expect(overlaid[0].reactions.first?.emoji == "🔥")
+        #expect(overlaid[0].reactions.first?.mine == true)
+        #expect(overlaid[1].reactions.isEmpty)
+    }
+
     /// Regression: a message sent at the live edge, followed by scrolling deep
     /// into history before the relay ack lands, pins the render window while it
     /// still contains the optimistic echo. Once the Marmot model reconciles the

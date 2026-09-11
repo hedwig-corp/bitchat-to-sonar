@@ -1752,6 +1752,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
 
     /**
+     * Target-keyed kind-7 tallies for already-loaded transcript ids.
+     */
+    func reactionTallies(groupIdHex: String, targetIdHexes: [String]) throws  -> [MessageReactionTallies]
+
+    /**
      * Bounded local transcript windows for the most recent groups, newest
      * conversation first. Used by chat-list hydration so first paint is local
      * DB only and does not wait on relay sync or full-history scans.
@@ -2736,6 +2741,19 @@ open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12
         FfiConverterOptionString.lower(bolt12Offer),$0
     )
 }
+}
+
+    /**
+     * Target-keyed kind-7 tallies for already-loaded transcript ids.
+     */
+open func reactionTallies(groupIdHex: String, targetIdHexes: [String])throws  -> [MessageReactionTallies]  {
+    return try  FfiConverterSequenceTypeMessageReactionTallies.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_reaction_tallies(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterSequenceString.lower(targetIdHexes),$0
+    )
+})
 }
 
     /**
@@ -5171,6 +5189,63 @@ public func FfiConverterTypeMessageInfo_lift(_ buf: RustBuffer) throws -> Messag
 #endif
 public func FfiConverterTypeMessageInfo_lower(_ value: MessageInfo) -> RustBuffer {
     return FfiConverterTypeMessageInfo.lower(value)
+}
+
+
+/**
+ * Target-keyed kind-7 tallies for overlaying retained historical rows.
+ */
+public struct MessageReactionTallies: Equatable, Hashable {
+    public var targetIdHex: String
+    public var tallies: [ReactionTallyInfo]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(targetIdHex: String, tallies: [ReactionTallyInfo]) {
+        self.targetIdHex = targetIdHex
+        self.tallies = tallies
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MessageReactionTallies: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMessageReactionTallies: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MessageReactionTallies {
+        return
+            try MessageReactionTallies(
+                targetIdHex: FfiConverterString.read(from: &buf),
+                tallies: FfiConverterSequenceTypeReactionTallyInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MessageReactionTallies, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.targetIdHex, into: &buf)
+        FfiConverterSequenceTypeReactionTallyInfo.write(value.tallies, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageReactionTallies_lift(_ buf: RustBuffer) throws -> MessageReactionTallies {
+    return try FfiConverterTypeMessageReactionTallies.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMessageReactionTallies_lower(_ value: MessageReactionTallies) -> RustBuffer {
+    return FfiConverterTypeMessageReactionTallies.lower(value)
 }
 
 
@@ -8272,6 +8347,31 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeMessageReactionTallies: FfiConverterRustBuffer {
+    typealias SwiftType = [MessageReactionTallies]
+
+    public static func write(_ value: [MessageReactionTallies], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMessageReactionTallies.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MessageReactionTallies] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MessageReactionTallies]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMessageReactionTallies.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeReactionTallyInfo: FfiConverterRustBuffer {
     typealias SwiftType = [ReactionTallyInfo]
 
@@ -9524,6 +9624,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 27940) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_reaction_tallies() != 31425) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {

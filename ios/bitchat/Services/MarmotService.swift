@@ -154,6 +154,22 @@ final class MarmotService: @unchecked Sendable {
             self.reactions = reactions
         }
 
+        func replacingReactions(_ reactions: [MarmotReactionTally]) -> MarmotMessage {
+            MarmotMessage(
+                id: id,
+                senderNpub: senderNpub,
+                content: content,
+                createdAt: createdAt,
+                isMine: isMine,
+                deliveryState: deliveryState,
+                media: media,
+                stickerRef: stickerRef,
+                classification: classification,
+                reply: reply,
+                reactions: reactions
+            )
+        }
+
         enum CodingKeys: String, CodingKey {
             case id
             case senderNpub
@@ -2241,6 +2257,25 @@ final class MarmotService: @unchecked Sendable {
                     limit: limit
                 )
                 .map(Self.marmotMessage)
+        }
+    }
+
+    func reactionTallies(
+        groupId: String,
+        targetIds: [String]
+    ) async throws -> [String: [MarmotReactionTally]] {
+        try await readOnly {
+            Dictionary(
+                uniqueKeysWithValues: try $0.reactionTallies(
+                    groupIdHex: groupId,
+                    targetIdHexes: targetIds
+                ).map { row in
+                    (
+                        row.targetIdHex,
+                        row.tallies.map { MarmotReactionTally(emoji: $0.emoji, count: $0.count, mine: $0.mine) }
+                    )
+                }
+            )
         }
     }
 

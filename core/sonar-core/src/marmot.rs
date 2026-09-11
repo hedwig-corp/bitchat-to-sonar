@@ -59,13 +59,6 @@ pub(crate) const KEY_PACKAGE_SLOT_FILE_SUFFIX: &str = ".sonar-keypackage-slot";
 /// be empty after filtering even when older chat messages exist.
 const MESSAGE_PAGE_RAW_SCAN_LIMIT: usize = 10_000;
 
-/// Newest-first raw rows scanned when hydrating kind-7 tallies onto a
-/// transcript page. Must stay far below `MESSAGE_PAGE_RAW_SCAN_LIMIT` so chat
-/// open cannot walk full history before first paint. Reactions created in the
-/// same window as the page are collected during that page's own scan; this
-/// extra pass only catches a later reaction on an older parent.
-const REACTION_HYDRATE_RAW_LIMIT: usize = 512;
-
 /// Result of creating a group: the group plus the welcome rumors that must be
 /// gift-wrapped and delivered to each invited member.
 pub struct GroupCreation {
@@ -307,8 +300,13 @@ pub enum Incoming {
     JoinRequest(crate::invite_link::JoinRequest),
     /// A kind-7 reaction was persisted. Not a transcript row — hosts must
     /// invalidate the conversation so tallies refresh, and must not count
-    /// unread or ring a notification (R-017).
-    Reaction { group_id: GroupId },
+    /// unread or ring a notification (R-017). `target_id` is the parent so
+    /// retained historical rows can overlay chips without a newest-page
+    /// membership match.
+    Reaction {
+        group_id: GroupId,
+        target_id: EventId,
+    },
     /// The event was valid but produced nothing actionable (duplicates,
     /// ignored proposals, non-Marmot gift wraps, ...).
     None,
@@ -352,6 +350,8 @@ pub struct MarmotEngine {
     /// is never held across an await, so a concurrent send waits for at most
     /// one in-flight mutation, never for a relay fetch.
     write_lock: std::sync::Mutex<()>,
+    /// Kind-7 index keyed by target. See [`crate::reaction::ReactionStore`].
+    reaction_store: std::sync::Mutex<crate::reaction::ReactionStore>,
     /// Sliding window of recent 2-member-welcome auto-accepts (#419). Anyone
     /// holding our public KeyPackage can gift-wrap us a welcome, so
     /// auto-accepts are rate limited; overflow routes to the pending
@@ -621,6 +621,7 @@ impl MarmotEngine {
             storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::default()),
             dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::in_memory()),
             db_path: None,
             key_package_slot_memo: std::sync::Mutex::new(None),
@@ -676,6 +677,7 @@ impl MarmotEngine {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::default()),
             // Persistent engine ⇒ persisted window. The iOS NSE builds a
             // fresh engine per push wake, so an in-memory budget here would
             // hand every wake a full budget (5 × wake-rate, not 5 per window).
@@ -1667,9 +1669,11 @@ impl MarmotEngine {
                 // Kind-7 reactions stay out of the transcript/unread/notify
                 // path (R-017) but must invalidate the conversation so hosts
                 // re-page and pick up tallies. Other non-chat kinds remain None.
-                if crate::reaction::is_reaction_kind(msg.kind) {
+                if let Some(reaction) = crate::reaction::parse_stored(&msg) {
+                    self.record_reaction(&msg.mls_group_id, reaction.clone());
                     return Ok(Incoming::Reaction {
                         group_id: msg.mls_group_id,
+                        target_id: reaction.target_id,
                     });
                 }
                 if msg.kind.as_u16() != CHAT_RUMOR_KIND {
@@ -1863,6 +1867,9 @@ impl MarmotEngine {
         }
         crate::reaction::attach_tallies(&mut mapped, &reactions, self.identity.public_key());
         hydrate_page_reply_previews(&mut mapped);
+        for r in reactions {
+            self.record_reaction(group_id, r);
+        }
         Ok(mapped)
     }
 
@@ -2077,7 +2084,8 @@ impl MarmotEngine {
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
         hydrate_page_reply_previews(&mut candidates);
-        self.hydrate_page_reactions(group_id, &mut candidates, page_reactions)?;
+        let newest_page = before_secs.is_none() && before_id.is_none();
+        self.hydrate_page_reactions(group_id, &mut candidates, page_reactions, newest_page)?;
         Ok(candidates)
     }
 
@@ -2322,32 +2330,58 @@ impl MarmotEngine {
     /// Attach kind-7 tallies for the messages in `msgs`.
     ///
     /// `page_reactions` are kind-7 rows already seen in the same bounded cursor
-    /// scan that built the page. A second newest-first pass is capped at
-    /// [`REACTION_HYDRATE_RAW_LIMIT`] so a later reaction on an older parent is
-    /// still found without walking up to `MESSAGE_PAGE_RAW_SCAN_LIMIT` on
-    /// every refresh.
+    /// scan that built the page. Newest-page open uses only that window so
+    /// first paint cannot walk full history. Older pages (and host overlays of
+    /// retained ids) use the target-keyed [`crate::reaction::ReactionStore`] so
+    /// a later reaction beyond the newest 512 raw rows still lands on its
+    /// parent.
     fn hydrate_page_reactions(
         &self,
         group_id: &GroupId,
         msgs: &mut [ChatMessage],
-        mut reactions: Vec<crate::reaction::ParsedReaction>,
+        page_reactions: Vec<crate::reaction::ParsedReaction>,
+        newest_page: bool,
     ) -> Result<()> {
         if msgs.is_empty() {
             return Ok(());
         }
+        for r in &page_reactions {
+            self.record_reaction(group_id, r.clone());
+        }
+        if !newest_page {
+            self.ensure_reaction_backfill(group_id)?;
+        }
         let targets: HashSet<EventId> = msgs.iter().map(|m| m.id).collect();
-        let mut seen: HashSet<EventId> = HashSet::new();
-        reactions.retain(|r| {
-            if !targets.contains(&r.target_id) {
-                return false;
+        let mut reactions = {
+            let store = self.reaction_store.lock().unwrap();
+            store.for_targets(group_id, &targets)
+        };
+        if reactions.is_empty() {
+            reactions = page_reactions;
+        }
+        crate::reaction::attach_tallies(msgs, &reactions, self.identity.public_key());
+        Ok(())
+    }
+
+    fn record_reaction(&self, group_id: &GroupId, reaction: crate::reaction::ParsedReaction) {
+        self.reaction_store
+            .lock()
+            .unwrap()
+            .record(group_id, reaction);
+    }
+
+    fn ensure_reaction_backfill(&self, group_id: &GroupId) -> Result<()> {
+        {
+            let store = self.reaction_store.lock().unwrap();
+            if store.is_backfilled(group_id) {
+                return Ok(());
             }
-            seen.insert(r.id)
-        });
+        }
         let mut raw_offset = 0usize;
         let mut raw_scanned = 0usize;
         let batch = 128usize;
-        while raw_scanned < REACTION_HYDRATE_RAW_LIMIT {
-            let remaining = REACTION_HYDRATE_RAW_LIMIT - raw_scanned;
+        while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
+            let remaining = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
             let page = Pagination::with_sort_order(
                 Some(batch.min(remaining)),
                 Some(raw_offset),
@@ -2362,17 +2396,47 @@ impl MarmotEngine {
             raw_offset += raw_len;
             for m in raw {
                 if let Some(r) = crate::reaction::parse_stored(&m) {
-                    if targets.contains(&r.target_id) && seen.insert(r.id) {
-                        reactions.push(r);
-                    }
+                    self.record_reaction(group_id, r);
                 }
             }
             if raw_len < batch {
                 break;
             }
         }
-        crate::reaction::attach_tallies(msgs, &reactions, self.identity.public_key());
+        self.reaction_store
+            .lock()
+            .unwrap()
+            .mark_backfilled(group_id);
         Ok(())
+    }
+
+    /// Target-keyed tallies for already-loaded transcript ids. Hosts overlay
+    /// these onto retained historical rows that a newest-page refresh misses.
+    pub fn reaction_tallies_for(
+        &self,
+        group_id: &GroupId,
+        target_ids: &[EventId],
+    ) -> Result<Vec<(EventId, Vec<ReactionTally>)>> {
+        if target_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_reaction_backfill(group_id)?;
+        let targets: HashSet<EventId> = target_ids.iter().copied().collect();
+        let reactions = self
+            .reaction_store
+            .lock()
+            .unwrap()
+            .for_targets(group_id, &targets);
+        let me = self.identity.public_key();
+        Ok(target_ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    crate::reaction::tallies_for_target(&reactions, id, &me),
+                )
+            })
+            .collect())
     }
 }
 

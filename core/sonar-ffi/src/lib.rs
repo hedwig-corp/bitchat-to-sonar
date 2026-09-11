@@ -608,6 +608,13 @@ pub struct MessageInfo {
     pub reactions: Vec<ReactionTallyInfo>,
 }
 
+/// Target-keyed kind-7 tallies for overlaying retained historical rows.
+#[derive(uniffi::Record)]
+pub struct MessageReactionTallies {
+    pub target_id_hex: String,
+    pub tallies: Vec<ReactionTallyInfo>,
+}
+
 /// FFI-friendly aggregated emoji chip.
 #[derive(uniffi::Record)]
 pub struct ReactionTallyInfo {
@@ -1854,6 +1861,34 @@ impl SonarNode {
             limit as usize,
         )?;
         Ok(msgs.into_iter().map(message_info).collect())
+    }
+
+    /// Target-keyed kind-7 tallies for already-loaded transcript ids.
+    pub fn reaction_tallies(
+        &self,
+        group_id_hex: String,
+        target_id_hexes: Vec<String>,
+    ) -> FfiResult<Vec<MessageReactionTallies>> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let mut target_ids = Vec::with_capacity(target_id_hexes.len());
+        for hex in &target_id_hexes {
+            target_ids.push(parse_event_id(hex)?);
+        }
+        let rows = self.client.reaction_tallies_for(&group_id, &target_ids)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, tallies)| MessageReactionTallies {
+                target_id_hex: id.to_hex(),
+                tallies: tallies
+                    .into_iter()
+                    .map(|t| ReactionTallyInfo {
+                        emoji: t.emoji,
+                        count: t.count,
+                        mine: t.mine,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 
     /// Encrypt + upload `data` to a Blossom server, then publish a media message

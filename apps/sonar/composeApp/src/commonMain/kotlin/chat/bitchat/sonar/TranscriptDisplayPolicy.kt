@@ -118,6 +118,17 @@ internal fun refreshTranscriptRows(
     return mergeTranscriptRows(existing, newest.filter { it.id in retainedIds }, retainedRows)
 }
 
+/** Overlay target-keyed kind-7 tallies onto already-loaded transcript rows. */
+internal fun overlayReactionTallies(
+    rows: List<SonarMsg>,
+    talliesById: Map<String, List<SonarReactionTally>>,
+): List<SonarMsg> {
+    if (talliesById.isEmpty()) return rows
+    return rows.map { row ->
+        talliesById[row.id]?.let { row.copy(reactions = it) } ?: row
+    }
+}
+
 /** Prepend history while keeping the older edge when the retained window is full. */
 internal fun prependTranscriptRows(
     existing: List<SonarMsg>,

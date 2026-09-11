@@ -241,6 +241,82 @@ async fn local_first_reaction_persists_pending_outbox_before_relay_publish() {
 }
 
 #[tokio::test]
+async fn later_reaction_on_older_parent_survives_beyond_newest_512_raw_rows() {
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let creation = alice
+        .create_group("alice & bob", vec![bob_kp], Vec::new())
+        .expect("create local group");
+    let group_id = creation.group.mls_group_id.clone();
+    alice
+        .merge_pending_commit(&group_id)
+        .expect("merge local group");
+
+    let parent_event = alice
+        .create_text_message(&group_id, "old parent")
+        .expect("parent event");
+    let Incoming::Message(parent) = alice
+        .process_incoming(&parent_event)
+        .await
+        .expect("process parent")
+    else {
+        panic!("parent must persist as a chat row");
+    };
+    let parent_id = parent.id;
+    let parent_sender = parent.sender;
+    sleep(Duration::from_secs(1)).await;
+    alice
+        .create_and_process_reaction(&group_id, &parent_id, &parent_sender, "👍")
+        .expect("react to old parent");
+    sleep(Duration::from_secs(1)).await;
+
+    for i in 0..520 {
+        let event = alice
+            .create_text_message(&group_id, &format!("newer {i}"))
+            .expect("newer event");
+        alice.process_incoming(&event).await.expect("process newer");
+    }
+
+    let history = alice.messages(&group_id).expect("full history");
+    let parent_row = history
+        .iter()
+        .find(|m| m.id == parent_id)
+        .unwrap_or_else(|| panic!("parent missing from {} stored chat rows", history.len()));
+    assert_eq!(
+        parent_row.reactions.len(),
+        1,
+        "full-history hydrate must include the later reaction"
+    );
+
+    let overlay = alice
+        .reaction_tallies_for(&group_id, &[parent_id])
+        .expect("overlay lookup");
+    assert_eq!(overlay[0].1.len(), 1);
+    assert_eq!(overlay[0].1[0].emoji, "👍");
+
+    let newest = alice
+        .messages_cursor_page(&group_id, None, None, 10)
+        .expect("newest page");
+    assert!(
+        newest.iter().all(|m| m.id != parent_id),
+        "parent must sit behind the newest page"
+    );
+    let older = alice
+        .messages_cursor_page(&group_id, Some(parent.created_at.as_secs() + 1), None, 10)
+        .expect("older page");
+    let older_parent = older
+        .iter()
+        .find(|m| m.id == parent_id)
+        .expect("older cursor page includes the parent");
+    assert_eq!(
+        older_parent.reactions.len(),
+        1,
+        "older cursor page must overlay a later reaction beyond the newest 512 rows"
+    );
+}
+
+#[tokio::test]
 async fn restart_watermark_ignores_later_local_messages() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("marmot.sqlite");
@@ -464,7 +540,10 @@ async fn wipe_removes_the_database() {
     assert!(sync_tmp_path.exists());
     assert!(outbox_path.exists());
     assert!(outbox_tmp_path.exists());
-    assert!(slot_path.exists(), "publishing a key package must create the slot");
+    assert!(
+        slot_path.exists(),
+        "publishing a key package must create the slot"
+    );
     std::fs::write(&slot_tmp_path, "leftover").expect("stage a crashed rename");
 
     MarmotEngine::wipe(&db_path).expect("wipe");
@@ -521,8 +600,7 @@ async fn key_package_slot_is_stable_across_republish_and_reopen() {
     // Same identity: the addressable coordinate is (kind, pubkey, d), so
     // reopening under a different pubkey would be a different slot regardless of
     // the d tag, and the assertion below would prove nothing.
-    let reopened =
-        MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen engine");
+    let reopened = MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen engine");
     let d_after_restart = d_tag_of(&reopened.key_package_event(relays()).expect("kp 3"));
     assert_eq!(
         d_first, d_after_restart,
@@ -586,7 +664,9 @@ async fn malformed_stored_slot_is_replaced_not_fatal() {
     // And it must be rewritten to disk. Without this, "replaced" could silently
     // mean "re-minted on every launch" while this test stays green.
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot rewritten").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot rewritten")
+            .trim(),
         d,
         "the malformed slot must be replaced on disk, not just bypassed"
     );
@@ -621,8 +701,8 @@ async fn committing_a_staged_restore_drops_the_previous_slot() {
 
     // A live install with a published slot.
     {
-        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
-            .expect("engine");
+        let engine =
+            MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
         engine.key_package_event(relays()).expect("kp");
     }
     assert!(slot_path.exists(), "precondition: live slot exists");
@@ -658,16 +738,14 @@ async fn unreadable_slot_fails_the_publish_instead_of_substituting_one() {
     let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
     let identity = Identity::generate();
 
-    let engine =
-        MarmotEngine::persistent(identity.clone(), &db_path, DB_KEY).expect("engine");
+    let engine = MarmotEngine::persistent(identity.clone(), &db_path, DB_KEY).expect("engine");
     let original = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
 
     // New engine so the in-process memo cannot mask the read, then make the slot
     // unreadable the way a locked container would.
     drop(engine);
     let engine = MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen");
-    std::fs::set_permissions(&slot_path, std::fs::Permissions::from_mode(0o000))
-        .expect("chmod");
+    std::fs::set_permissions(&slot_path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
     let result = engine.key_package_event(relays());
 
@@ -678,7 +756,9 @@ async fn unreadable_slot_fails_the_publish_instead_of_substituting_one() {
         "an unreadable slot must fail the publish, not silently pick another slot"
     );
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot readable again").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot readable again")
+            .trim(),
         original,
         "the stored slot must be untouched by the failed publish"
     );
@@ -704,9 +784,8 @@ async fn a_persistent_install_does_not_use_the_derived_slot() {
     let identity = Identity::generate();
     let pubkey_hex = identity.public_key().to_hex();
 
-    let engine =
-        MarmotEngine::persistent(identity, dir.path().join("marmot.sqlite"), DB_KEY)
-            .expect("engine");
+    let engine = MarmotEngine::persistent(identity, dir.path().join("marmot.sqlite"), DB_KEY)
+        .expect("engine");
     let slot = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
 
     // Recomputed here rather than reaching into the engine, so the test also
@@ -754,7 +833,9 @@ async fn a_failed_restore_rename_keeps_the_live_slot() {
 
     assert!(result.is_err(), "a failed rename must surface as an error");
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot must survive").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot must survive")
+            .trim(),
         original,
         "the still-live install must keep its coordinate when the rename fails"
     );
@@ -776,8 +857,8 @@ async fn a_retried_commit_finishes_dropping_the_outgoing_slot() {
     let intent_path = db_path.with_file_name("marmot.sqlite.sonar-restore-intent");
 
     {
-        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
-            .expect("engine");
+        let engine =
+            MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
         engine.key_package_event(relays()).expect("kp");
     }
     assert!(slot_path.exists(), "precondition: outgoing slot exists");
@@ -806,8 +887,8 @@ async fn a_commit_with_no_restore_in_flight_leaves_the_slot_alone() {
     let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
 
     {
-        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
-            .expect("engine");
+        let engine =
+            MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
         engine.key_package_event(relays()).expect("kp");
     }
     let original = std::fs::read_to_string(&slot_path).expect("slot exists");
@@ -816,7 +897,9 @@ async fn a_commit_with_no_restore_in_flight_leaves_the_slot_alone() {
     sonar_core::account_backup::commit_staged_account_restore(&db_path).expect("no-op commit");
 
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot must survive").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot must survive")
+            .trim(),
         original.trim(),
         "a healthy install must keep its coordinate"
     );

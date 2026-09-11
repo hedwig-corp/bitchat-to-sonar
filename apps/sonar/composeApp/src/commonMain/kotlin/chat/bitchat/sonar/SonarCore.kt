@@ -932,6 +932,12 @@ expect object SonarCore {
         emoji: String,
     )
 
+    /** Target-keyed kind-7 tallies for already-loaded transcript ids. */
+    suspend fun reactionTallies(
+        chatId: String,
+        targetIdHexes: List<String>,
+    ): Map<String, List<SonarReactionTally>>
+
     /** Republish one failed message from the durable local outbox. */
     suspend fun retryMessage(messageId: String): String
 

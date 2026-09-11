@@ -161,6 +161,57 @@ pub fn attach_tallies(messages: &mut [ChatMessage], reactions: &[ParsedReaction]
     }
 }
 
+/// In-process kind-7 index keyed by `(group, target)`.
+///
+/// MDK only offers newest-first row scans, so a later reaction on an older
+/// parent is invisible to a cursor page and to a newest-N extra pass. This
+/// map is filled on every processed kind-7 and lazily backfilled from storage
+/// the first time an older page (or a host overlay of retained ids) needs it.
+/// Newest-page open does not backfill.
+#[derive(Default)]
+pub struct ReactionStore {
+    by_target: HashMap<(Vec<u8>, EventId), Vec<ParsedReaction>>,
+    backfilled: HashSet<Vec<u8>>,
+}
+
+fn group_key(group_id: &mdk_core::GroupId) -> Vec<u8> {
+    group_id.as_slice().to_vec()
+}
+
+impl ReactionStore {
+    pub fn record(&mut self, group_id: &mdk_core::GroupId, reaction: ParsedReaction) {
+        let key = (group_key(group_id), reaction.target_id);
+        let entries = self.by_target.entry(key).or_default();
+        if entries.iter().any(|e| e.id == reaction.id) {
+            return;
+        }
+        entries.push(reaction);
+    }
+
+    pub fn is_backfilled(&self, group_id: &mdk_core::GroupId) -> bool {
+        self.backfilled.contains(&group_key(group_id))
+    }
+
+    pub fn mark_backfilled(&mut self, group_id: &mdk_core::GroupId) {
+        self.backfilled.insert(group_key(group_id));
+    }
+
+    pub fn for_targets(
+        &self,
+        group_id: &mdk_core::GroupId,
+        targets: &HashSet<EventId>,
+    ) -> Vec<ParsedReaction> {
+        let gk = group_key(group_id);
+        let mut out = Vec::new();
+        for target in targets {
+            if let Some(entries) = self.by_target.get(&(gk.clone(), *target)) {
+                out.extend(entries.iter().cloned());
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +327,19 @@ mod tests {
         attach_tallies(&mut messages, &reactions, me);
         assert_eq!(messages[0].reactions.len(), 1);
         assert_eq!(messages[0].reactions[0].emoji, "👍");
+    }
+
+    #[test]
+    fn store_lookup_is_target_keyed() {
+        let (parent, other, me, _) = ids();
+        let group = mdk_core::GroupId::from_slice(&[0u8; 32]);
+        let mut store = ReactionStore::default();
+        store.record(&group, rx(1, parent, me, "👍"));
+        store.record(&group, rx(2, other, me, "🔥"));
+        let mut targets = HashSet::new();
+        targets.insert(parent);
+        let found = store.for_targets(&group, &targets);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].emoji, "👍");
     }
 }

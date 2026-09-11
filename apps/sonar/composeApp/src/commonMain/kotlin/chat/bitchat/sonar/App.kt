@@ -3124,6 +3124,9 @@ private fun ReplyDecorated(
                     reactions = m.reactions,
                     viaInternet = m.viaInternet,
                     onTap = { emoji -> state.sendReaction(chatId, m, emoji) },
+                    modifier = Modifier.align(
+                        if (m.mine) Alignment.BottomEnd else Alignment.BottomStart,
+                    ),
                 )
             }
             SonarMessageActionSheet(
@@ -3314,10 +3317,11 @@ private fun ReactionRow(
     reactions: List<SonarReactionTally>,
     viaInternet: Boolean,
     onTap: (String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val s = sonar
     Row(
-        Modifier
+        modifier
             .padding(horizontal = 6.dp)
             .offset(y = (-7).dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp),

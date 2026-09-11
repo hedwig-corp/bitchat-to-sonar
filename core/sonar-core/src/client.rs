@@ -6846,7 +6846,7 @@ impl SonarClient {
                     // member-list change the row should reflect.
                     if let Incoming::GroupUpdated(group_id)
                     | Incoming::GroupInvitePending(group_id)
-                    | Incoming::Reaction { group_id } = &incoming
+                    | Incoming::Reaction { group_id, .. } = &incoming
                     {
                         changed_groups.insert(hex::encode(group_id.as_slice()));
                     }
@@ -7162,6 +7162,15 @@ impl SonarClient {
                     .map(|m| self.with_delivery_state(m))
                     .collect()
             })
+    }
+
+    /// Target-keyed kind-7 tallies for already-loaded transcript ids.
+    pub fn reaction_tallies_for(
+        &self,
+        group_id: &GroupId,
+        target_ids: &[nostr::EventId],
+    ) -> Result<Vec<(nostr::EventId, Vec<crate::reaction::ReactionTally>)>> {
+        self.engine.reaction_tallies_for(group_id, target_ids)
     }
 
     fn upsert_index_for_message(&self, message: &ChatMessage, group_name: Option<&str>) {

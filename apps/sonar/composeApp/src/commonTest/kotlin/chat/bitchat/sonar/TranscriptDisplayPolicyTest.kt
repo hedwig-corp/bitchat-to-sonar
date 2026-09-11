@@ -142,6 +142,21 @@ class TranscriptDisplayPolicyTest {
     }
 
     @Test
+    fun overlayReactionTalliesPatchesRetainedRows() {
+        val existing = listOf(
+            message("old", 1),
+            message("new", 2).copy(reactions = listOf(SonarReactionTally("👍", 1, mine = false))),
+        )
+        val overlaid = overlayReactionTallies(
+            existing,
+            mapOf("old" to listOf(SonarReactionTally("🔥", 1, mine = true))),
+        )
+        assertEquals("🔥", overlaid[0].reactions.single().emoji)
+        assertTrue(overlaid[0].reactions.single().mine)
+        assertEquals("👍", overlaid[1].reactions.single().emoji)
+    }
+
+    @Test
     fun mergeCapsAtNewest500Rows() {
         val merged = mergeTranscriptRows(
             existing = emptyList(),

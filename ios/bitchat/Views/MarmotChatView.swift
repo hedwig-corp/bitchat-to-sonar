@@ -2530,7 +2530,7 @@ final class MarmotChatModel: ObservableObject {
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
             let shouldPreserveHistoricalWindow = mode == .preserveHistoricalWindow
                 && !existingCanonical.isEmpty
-            let canonical: [MarmotService.MarmotMessage]
+            var canonical: [MarmotService.MarmotMessage]
             if shouldPreserveHistoricalWindow {
                 let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
                 let merged = Self.mergeMessages(existing: existingCanonical, incoming: page)
@@ -2565,6 +2565,11 @@ final class MarmotChatModel: ObservableObject {
                 localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
                 localTranscriptHasOlderByGroup[groupId] = rawPage.count > Self.localTranscriptPageLimit
                 localTranscriptPreservesOlderEdgeGroups.remove(groupId)
+            }
+            let staleIds = canonical.map(\.id).filter { id in !page.contains { $0.id == id } }
+            if !staleIds.isEmpty {
+                let overlay = (try? await service.reactionTallies(groupId: groupId, targetIds: staleIds)) ?? [:]
+                canonical = Self.overlayReactionTallies(canonical, tallies: overlay)
             }
             var byGroup = messagesByGroup
             byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
@@ -2849,6 +2854,17 @@ final class MarmotChatModel: ObservableObject {
         return byID.values.sorted {
             if $0.createdAt == $1.createdAt { return $0.id < $1.id }
             return $0.createdAt < $1.createdAt
+        }
+    }
+
+    static func overlayReactionTallies(
+        _ rows: [MarmotService.MarmotMessage],
+        tallies: [String: [MarmotService.MarmotReactionTally]]
+    ) -> [MarmotService.MarmotMessage] {
+        guard !tallies.isEmpty else { return rows }
+        return rows.map { row in
+            guard let next = tallies[row.id] else { return row }
+            return row.replacingReactions(next)
         }
     }
 

@@ -10699,11 +10699,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         // the render window refuses to admit.
         freshCanonicalByGroup[groupId] = newest
         val unboundedCount = (current?.rows.orEmpty() + newest).distinctBy { it.id }.size
-        val merged = refreshTranscriptRows(
+        var merged = refreshTranscriptRows(
             existing = current?.rows.orEmpty(),
             newest = newest,
             pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
         )
+        val staleIds = merged.map { it.id }.filter { id -> newest.none { it.id == id } }
+        if (staleIds.isNotEmpty()) {
+            val overlay = runCatching { SonarCore.reactionTallies(groupId, staleIds) }
+                .getOrDefault(emptyMap())
+            merged = overlayReactionTallies(merged, overlay)
+        }
         val hasMore = when {
             unboundedCount > TRANSCRIPT_RETAINED_ROWS -> true
             current != null -> current.hasMore || page.size > TRANSCRIPT_PAGE_SIZE
