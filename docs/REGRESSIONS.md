@@ -712,7 +712,7 @@ on both Android and JVM), consumed by the `ChatScreen` feed filter; iOS
 
 **Guarded by:** `client.rs::hidden_control_lines_do_not_count_as_unread_at_the_index_call_site`
 
-**Also guarded by:** `conversation_index.rs::host_hidden_messages_do_not_increment_unread`, `marmot.rs::only_host_rendered_classes_are_transcript_visible`, `conversation_index.rs::mine_messages_do_not_increment_unread`, `TranscriptDisplayPolicyTest.coreClassificationWinsOverTheLocalStringDecode`, `TranscriptDisplayPolicyTest.coreClassificationDecidesVisibilityForCoreRows`, `TranscriptDisplayPolicyTest.rowsWithoutCoreClassificationKeepTheStringDecode`
+**Also guarded by:** `conversation_index.rs::host_hidden_messages_do_not_increment_unread`, `marmot.rs::only_host_rendered_classes_are_transcript_visible`, `conversation_index.rs::mine_messages_do_not_increment_unread`, `client.rs::timezone_share_notifies_conversation_listener_without_unread`, `e2e.rs::timezone_share_does_not_notify_or_increment_unread`, `TranscriptDisplayPolicyTest.coreClassificationWinsOverTheLocalStringDecode`, `TranscriptDisplayPolicyTest.coreClassificationDecidesVisibilityForCoreRows`, `TranscriptDisplayPolicyTest.rowsWithoutCoreClassificationKeepTheStringDecode`
 
 **Enforced by the compiler:** `counts_unread` has **no default** on
 `upsert_summary`; a new call site cannot silently fall back to counting

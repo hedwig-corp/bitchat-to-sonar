@@ -56,4 +56,25 @@ class PrivateTimezoneTest {
         assertEquals(emptyMap(), decodeTimezoneShareMap(""))
         assertEquals(emptyMap(), decodeTimezoneShareMap("bad-line"))
     }
+
+    @Test
+    fun allowlistKeepsMlsHexAndStripsMarmotPrefix() {
+        val hex = "aabbccddeeff00112233445566778899"
+        assertEquals(hex, normalizeMlsGroupIdHex(hex.uppercase()))
+        assertEquals(hex, normalizeMlsGroupIdHex("marmot:$hex"))
+        assertEquals("", normalizeMlsGroupIdHex("mesh:peer"))
+    }
+
+    @Test
+    fun allowlistResolvesMeshChatsToMlsGroupsAndDropsDisabled() {
+        val hex = "aabbccddeeff00112233445566778899"
+        val ids = mlsTimezoneShareGroupIds(
+            chatIds = listOf("mesh:peer", "marmot:$hex", "other"),
+            sharesLocalTime = { it != "other" },
+            resolveGroupIds = { chatId ->
+                if (chatId.startsWith("mesh:")) listOf(hex) else emptyList()
+            },
+        )
+        assertEquals(listOf(hex), ids)
+    }
 }

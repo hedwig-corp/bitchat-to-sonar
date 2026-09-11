@@ -772,10 +772,13 @@ async fn republished_key_package_replaces_the_slot_and_newest_wins() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
     assert_eq!(
         all.len(),
         1,
@@ -821,10 +824,13 @@ async fn in_memory_clients_sharing_an_identity_reuse_one_slot() {
     let observer = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
         .await
         .expect("observer connects");
-    let all = timeout(Duration::from_secs(10), observer.fetch_all_key_packages(pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        observer.fetch_all_key_packages(pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
 
     assert_eq!(
         all.len(),
@@ -882,7 +888,10 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
     let stale_id = stale.id;
 
     let publisher = nostr_sdk::Client::default();
-    publisher.add_relay(url_old.clone()).await.expect("add relay B");
+    publisher
+        .add_relay(url_old.clone())
+        .await
+        .expect("add relay B");
     publisher.connect().await;
     publisher.send_event(&stale).await.expect("publish stale");
 
@@ -891,10 +900,13 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all");
     assert_eq!(all.len(), 2, "expected one candidate from each relay");
 
     let picked = timeout(Duration::from_secs(10), bob.fetch_key_package(alice_pubkey))
@@ -981,5 +993,99 @@ async fn profile_republish_against_empty_relay_keeps_sidecar_fields() {
         profile.picture.as_deref(),
         Some("https://example.com/pic.png"),
         "picture must survive an empty-fetch republish"
+    );
+}
+
+fn group_hex(id: &sonar_core::GroupId) -> String {
+    hex::encode(id.as_slice())
+}
+
+/// Kind-449 is a control rumor (R-017): it must cache the peer zone through
+/// the host allowlist + outbox path without becoming a transcript row, unread
+/// bump, or push.
+#[tokio::test]
+async fn timezone_share_does_not_notify_or_increment_unread() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    let alice_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    alice
+        .send_text(&alice_group, "hello")
+        .await
+        .expect("alice sends");
+
+    bob.sync().await.expect("bob syncs hello");
+    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let bob_hex = group_hex(&bob_group);
+    assert_eq!(bob.messages(&bob_group).expect("bob messages").len(), 1);
+    let _ = bob
+        .drain_pending_marmot()
+        .await
+        .expect("drain hello notifications");
+    let unread_before = bob
+        .conversation_summary(&bob_hex)
+        .map(|s| s.unread_count)
+        .unwrap_or(0);
+    assert!(
+        unread_before >= 1,
+        "hello must count as unread before the timezone share"
+    );
+
+    let alice_hex = group_hex(&alice_group);
+    alice
+        .set_timezone_share_groups(vec![alice_hex.clone()])
+        .await;
+    alice
+        .update_local_timezone("Europe/Zurich")
+        .await
+        .expect("alice shares timezone");
+
+    let mut notes = Vec::new();
+    let mut cached = Vec::new();
+    for _ in 0..50 {
+        notes.extend(
+            bob.drain_pending_marmot()
+                .await
+                .expect("drain timezone share"),
+        );
+        let _ = bob.sync().await;
+        cached = bob.peer_timezones(&[alice.identity().public_key()]);
+        if cached.iter().any(|(_, zone)| zone.zone == "Europe/Zurich") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert_eq!(
+        cached.len(),
+        1,
+        "host allowlist + update_local_timezone must reach the peer"
+    );
+    assert_eq!(cached[0].1.zone, "Europe/Zurich");
+    assert!(
+        notes.is_empty(),
+        "kind-449 must not produce a push notification"
+    );
+    assert_eq!(
+        bob.messages(&bob_group).expect("bob messages").len(),
+        1,
+        "kind-449 is not a transcript row"
+    );
+    assert_eq!(
+        bob.conversation_summary(&bob_hex)
+            .map(|s| s.unread_count)
+            .unwrap_or(0),
+        unread_before,
+        "kind-449 must not increment unread"
     );
 }

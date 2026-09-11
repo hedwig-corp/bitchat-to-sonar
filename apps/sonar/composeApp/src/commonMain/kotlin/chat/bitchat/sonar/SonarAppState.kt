@@ -4707,11 +4707,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun timezoneShareGroupIds(): List<String> =
-        chats.asSequence()
-            .filter { !isMeshChat(it.id) && sharesLocalTimeWith(it.id) }
-            .map { it.id }
-            .distinct()
-            .toList()
+        mlsTimezoneShareGroupIds(
+            chatIds = chats.map { it.id },
+            sharesLocalTime = ::sharesLocalTimeWith,
+            resolveGroupIds = { chatId ->
+                transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }
+            },
+        )
 
     fun prefStr(key: String, default: String): String =
         SonarCore.loadBlob("pref.$key").ifEmpty { default }

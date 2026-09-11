@@ -10579,10 +10579,7 @@ mod tests {
             .unwrap();
         let group_id_hex = hex::encode(creation.group.mls_group_id.as_slice());
 
-        alice
-            .update_local_timezone("Europe/Zurich")
-            .await
-            .unwrap();
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
         assert!(
             alice.timezone_shared_with.lock().unwrap().is_empty(),
             "no allowlist means no MLS timezone fan-out"
@@ -10603,6 +10600,80 @@ mod tests {
 
         alice.set_timezone_share_groups(Vec::new()).await;
         assert!(alice.timezone_shared_with.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timezone_share_allowlist_ignores_marmot_prefixed_chat_ids() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .engine
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id_hex = hex::encode(creation.group.mls_group_id.as_slice());
+
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        alice
+            .set_timezone_share_groups(vec![format!("marmot:{group_id_hex}")])
+            .await;
+        assert!(
+            alice.timezone_shared_with.lock().unwrap().is_empty(),
+            "hosts must pass MLS group hex, not marmot: chat ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_notifies_conversation_listener_without_unread() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        bob.set_conversation_change_listener(Some(listener.clone()));
+        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let (bob_pubkey, welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(member, _)| *member == bob.identity().public_key())
+            .unwrap();
+        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+        bob.process_marmot_events([welcome], "timezone listener welcome")
+            .await;
+        listener.changed.lock().unwrap().clear();
+
+        let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
+        let (event, _) = alice
+            .create_and_process_timezone_share(&group_id, &payload)
+            .unwrap();
+        let (report, notifications) = bob
+            .process_marmot_events([event], "timezone listener")
+            .await;
+
+        assert_eq!(report.processed, 1);
+        assert!(notifications.is_empty());
+        assert_eq!(
+            listener.changed.lock().unwrap().as_slice(),
+            [group_id_hex.as_str()]
+        );
+        assert_eq!(
+            bob.conversation_summary(&group_id_hex)
+                .map(|s| s.unread_count)
+                .unwrap_or(0),
+            0
+        );
+        assert!(bob.messages(&group_id).unwrap().is_empty());
     }
 
     #[tokio::test]

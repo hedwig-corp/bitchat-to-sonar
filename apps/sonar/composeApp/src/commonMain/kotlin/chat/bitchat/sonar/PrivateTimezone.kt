@@ -80,6 +80,34 @@ internal fun timezoneOffsetParts(minutes: Int): Pair<Int, Int> = minutes / 60 to
 
 internal const val TIMEZONE_SHARE_BLOB_KEY = "timezone.shareByChat"
 
+/** Core's allowlist is MLS group-id hex. Chat ids that are mesh routes or
+ *  `marmot:` prefixed must resolve first or fan-out is a silent no-op. */
+internal fun mlsTimezoneShareGroupIds(
+    chatIds: Iterable<String>,
+    sharesLocalTime: (String) -> Boolean,
+    resolveGroupIds: (String) -> List<String>,
+): List<String> =
+    chatIds.asSequence()
+        .filter(sharesLocalTime)
+        .flatMap { chatId ->
+            val resolved = resolveGroupIds(chatId)
+            (if (resolved.isEmpty()) listOf(chatId) else resolved).asSequence()
+        }
+        .map(::normalizeMlsGroupIdHex)
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .toList()
+
+internal fun normalizeMlsGroupIdHex(raw: String): String {
+    val trimmed = raw.trim()
+    val stripped = when {
+        trimmed.startsWith("marmot:", ignoreCase = true) -> trimmed.substring("marmot:".length)
+        trimmed.startsWith("mesh:", ignoreCase = true) -> ""
+        else -> trimmed
+    }
+    return stripped.lowercase()
+}
+
 internal fun encodeTimezoneShareMap(map: Map<String, Boolean>): String =
     map.entries.joinToString("\n") { "${it.key}|${if (it.value) "1" else "0"}" }
 
