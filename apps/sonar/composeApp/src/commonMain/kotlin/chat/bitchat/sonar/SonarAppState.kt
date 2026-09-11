@@ -2876,6 +2876,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Spendable balance in sats (0 unless the wallet is Ready). */
     fun walletBalanceSats(): Long = (walletState as? WalletState.Ready)?.balanceSats ?: 0L
 
+    /** Re-read Breez after a migration send so the Lightning row is not stale. */
+    suspend fun refreshWalletBalance() {
+        if (!walletAvailable) return
+        runCatching {
+            WalletBridge.refreshBalance()
+            walletState = WalletBridge.state()
+        }
+    }
+
     /** Live-rate fiat string for [sats], or null when no rate is available. */
     fun fiatOrNull(sats: Long): String? = Money.formatFiat(sats, currency, rate)
 

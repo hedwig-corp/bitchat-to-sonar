@@ -249,11 +249,13 @@ fun WalletMigrationRoute(state: SonarAppState) {
                                 )
                             )
                         }
+                        runCatching { state.refreshWalletBalance() }
                         return@launch
                     }
                 // Past this point the money has LEFT the Lightning wallet.
                 // Every branch below must leave the user a way forward.
                 phase = MigrationPhase.Watching
+                runCatching { state.refreshWalletBalance() }
                 runCatching { c.resume(SETTLE_POLLS) }
                     .onSuccess { result ->
                         phase = when (result) {
@@ -281,6 +283,7 @@ fun WalletMigrationRoute(state: SonarAppState) {
             scope.launch {
                 runCatching { c.resume(SETTLE_POLLS) }
                     .onSuccess { result ->
+                        runCatching { state.refreshWalletBalance() }
                         phase = when (result) {
                             is MigrationResultUi.Settled -> {
                                 cashuBalance = result.cashuSats

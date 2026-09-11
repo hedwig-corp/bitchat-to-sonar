@@ -97,15 +97,11 @@ impl MigrationJournal {
             .write(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|e| {
-                MigrateError::Journal(format!("open {}: {e}", lock_path.display()))
-            })?;
+            .map_err(|e| MigrateError::Journal(format!("open {}: {e}", lock_path.display())))?;
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            let rc = unsafe {
-                libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-            };
+            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {
                 return Err(MigrateError::Journal(
                     "another migration holds the journal lock".into(),
@@ -198,11 +194,63 @@ fn atomic_write(parent: &Path, path: &Path, tmp: &Path, bytes: &[u8]) -> Result<
     file.write_all(bytes)
         .and_then(|_| file.sync_all())
         .map_err(|e| MigrateError::Journal(format!("write {}: {e}", tmp.display())))?;
-    fs::rename(tmp, path)
-        .map_err(|e| MigrateError::Journal(format!("rename {}: {e}", path.display())))?;
+    atomic_replace_file(tmp, path)
+        .map_err(|e| MigrateError::Journal(format!("replace {}: {e}", path.display())))?;
+    sync_parent_dir(parent)
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// `fs::rename` cannot replace an existing destination on Windows. The
+/// sticker cache and reaction sidecar use the same `MoveFileExW` replace.
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Directory `sync_all` is Unix-only: a standard `OpenOptions` handle cannot
+/// open a directory on Windows, and failing here after a successful replace
+/// would report "journal write failed" while the attempt is already durable.
+#[cfg(not(windows))]
+fn sync_parent_dir(parent: &Path) -> Result<()> {
     OpenOptions::new()
         .read(true)
         .open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|e| MigrateError::Journal(format!("sync {}: {e}", parent.display())))
+}
+
+#[cfg(windows)]
+fn sync_parent_dir(_parent: &Path) -> Result<()> {
+    Ok(())
 }

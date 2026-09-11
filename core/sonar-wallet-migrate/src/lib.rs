@@ -64,7 +64,9 @@ pub enum MigrateError {
     NoAttempt,
     #[error("migration attempt cannot be cancelled in state {0:?}")]
     CannotCancel(MigrationAttemptState),
-    #[error("a migration is already in flight ({0:?}); resume or settle it instead of planning another")]
+    #[error(
+        "a migration is already in flight ({0:?}); resume or settle it instead of planning another"
+    )]
     InFlight(MigrationAttemptState),
 }
 
@@ -700,6 +702,32 @@ mod tests {
             MigrationJournal::new(dir.path(), b"account", b"mint"),
             Err(MigrateError::Journal(_))
         ));
+    }
+
+    #[test]
+    fn journal_store_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = MigrationJournal::new(dir.path(), b"account", b"mint").unwrap();
+        let first = MigrationAttempt {
+            settlement_id: "quote-1".into(),
+            invoice: "lnbc1".into(),
+            payment_hash: "aa".into(),
+            amount_sats: 1_000,
+            source_fee_sats: Some(10),
+            expires_at_secs: None,
+            source_payment_id: None,
+            state: MigrationAttemptState::AwaitingConsent,
+        };
+        journal.store(Some(&first)).unwrap();
+        let mut second = first.clone();
+        second.settlement_id = "quote-2".into();
+        second.state = MigrationAttemptState::Sending;
+        journal.store(Some(&second)).unwrap();
+        let loaded = journal.load().unwrap().unwrap();
+        assert_eq!(loaded.settlement_id, "quote-2");
+        assert_eq!(loaded.state, MigrationAttemptState::Sending);
+        journal.store(None).unwrap();
+        assert!(journal.load().unwrap().is_none());
     }
 
     #[test]

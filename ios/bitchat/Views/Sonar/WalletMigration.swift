@@ -277,7 +277,7 @@ final class SonarMigrationModel: ObservableObject {
     }
 
     /// Pay. Only reachable from the consent screen's explicit confirm.
-    func confirmAndMigrate() async {
+    func confirmAndMigrate(source: BreezMigrationSource) async {
         guard let engine, let planId else {
             phase = .failed(String(localized: "No migration plan; check the amount and fee again."))
             return
@@ -291,6 +291,7 @@ final class SonarMigrationModel: ObservableObject {
                 try engine.resume(polls: 24)
             }.value
             apply(outcome)
+            await refreshBalances(source: source)
         } catch {
             let status = try? await Task.detached { try engine.status() }.value
             if let status, status.state != .awaitingConsent, status.state != .expiredUnsent,
@@ -304,13 +305,14 @@ final class SonarMigrationModel: ObservableObject {
                     )
                 )
             }
+            await refreshBalances(source: source)
         }
     }
 
     /// Resume watching — after a Pending outcome, or after the app was killed
     /// between paying and settlement. The Cashu wallet's own reconciliation is
     /// what completes the migration; this only observes it.
-    func resumeSettlement() async {
+    func resumeSettlement(source: BreezMigrationSource) async {
         guard let engine else { return }
         phase = .watching
         do {
@@ -321,6 +323,7 @@ final class SonarMigrationModel: ObservableObject {
         } catch {
             phase = .pendingSettlement(cashuSats: cashuBalanceSats)
         }
+        await refreshBalances(source: source)
     }
 
     func refreshBalances(source: BreezMigrationSource) async {
@@ -399,7 +402,7 @@ struct SonarWalletMigrationScreen: View {
                             mintHost
                         )
                     ) {
-                        Task { await model.confirmAndMigrate() }
+                        Task { await model.confirmAndMigrate(source: source) }
                     }
                     Text("This pays now. It cannot be undone from then.")
                         .font(.footnote)
@@ -429,7 +432,7 @@ struct SonarWalletMigrationScreen: View {
                         systemImage: "clock"
                     )
                     actionButton(String(localized: "Check again")) {
-                        Task { await model.resumeSettlement() }
+                        Task { await model.resumeSettlement(source: source) }
                     }
                 case .failed(let message):
                     resultRow(
