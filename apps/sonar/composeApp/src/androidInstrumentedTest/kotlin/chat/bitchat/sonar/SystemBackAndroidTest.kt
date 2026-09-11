@@ -7,7 +7,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.junit4.createComposeRule
-import androidx.test.espresso.Espresso.pressBack
+import androidx.test.espresso.Espresso.pressBackUnconditionally
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.GrantPermissionRule
 import chat.bitchat.sonar.screens.SonarScanQrSheet
@@ -45,7 +45,7 @@ class SystemBackAndroidTest {
                 )
             }
 
-            pressBack()
+            pressSystemBack()
 
             composeRule.runOnIdle { assertTrue(state.isHome) }
         } finally {
@@ -69,7 +69,7 @@ class SystemBackAndroidTest {
             )
         }
 
-        pressBack()
+        pressSystemBack()
 
         composeRule.runOnIdle {
             assertEquals(1, systemBacks)
@@ -92,7 +92,7 @@ class SystemBackAndroidTest {
                 )
             }
 
-            pressBack()
+            pressSystemBack()
 
             composeRule.runOnIdle { assertSame(call, state.screen) }
         } finally {
@@ -116,7 +116,7 @@ class SystemBackAndroidTest {
             }
         }
 
-        pressBack()
+        pressSystemBack()
 
         composeRule.runOnIdle {
             assertFalse(trayVisible)
@@ -169,11 +169,19 @@ class SystemBackAndroidTest {
             content { closed = true }
         }
 
-        pressBack()
+        pressSystemBack()
 
         composeRule.runOnIdle {
             assertTrue(closed)
             assertEquals(0, fallthroughs)
         }
+    }
+
+    /// Espresso's `pressBack()` waits for a focused root and flakes on CI
+    /// emulators (`RootViewWithoutFocusException`) after earlier tests. These
+    /// cases only need KEYCODE_BACK to reach Compose `BackHandler`s.
+    private fun pressSystemBack() {
+        composeRule.waitForIdle()
+        pressBackUnconditionally()
     }
 }
