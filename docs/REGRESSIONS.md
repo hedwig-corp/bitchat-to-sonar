@@ -2679,12 +2679,17 @@ offers a second payment.
 
 **Guarded by:** `lib.rs::durable_sending_state_prevents_resend`,
 `lib.rs::corrupt_journal_fails_closed`,
-`lib.rs::planning_refuses_an_in_flight_send`
+`lib.rs::planning_refuses_an_in_flight_send`,
+`lib.rs::source_send_error_journals_unknown_and_refuses_a_new_plan`,
+`WalletMigrationContractTest.executeErrorAfterSourceAcceptedIsPendingNotANewQuote`,
+`SonarMigrationRescueTests.testExecuteErrorAfterSourceAcceptedIsPendingNotANewQuote`
 
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
-journal and fail-closed parsing. They do not kill either app between fsync and
-the source return, do not prove the host calls `resume` after relaunch, and do
-not inject filesystem or parent-directory-fsync failures on a device.
+journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
+so a second `plan` is refused. The host tests pin the UI mapping that turns those
+states into "Paid — waiting on the mint" instead of a new quote. They do not
+kill either app between fsync and the source return, and do not inject
+filesystem or parent-directory-fsync failures on a device.
 
 **History:** the production migration replaced process-local plan ownership
 with `cashu.migration.v1.json` and a take-before-send barrier.
@@ -2743,18 +2748,19 @@ a valid whole-balance migration dies on the first "not enough funds" quote.
 `check_fee_and_capacity` and
 `sonar-ffi::wallet::HostWalletError` / `HostSourceBackend`; iOS
 `WalletMigration.swift::BreezMigrationSource.hostError`; Compose
-`WalletMigration.android.kt::BreezMigrationSource.looksInsufficient` and
-`WalletMigration.jvm.kt::BreezMigrationSource.looksInsufficient`.
+`breezMessageLooksInsufficient` via Android and JVM `BreezMigrationSource`.
 
 **Guarded by:** `lib.rs::drain_steps_down_for_opaque_insufficient_funds`,
-`lib.rs::drain_refuses_destination_max_and_fee_cap`
+`lib.rs::drain_refuses_destination_max_and_fee_cap`,
+`WalletMigrationContractTest.breezProseInsufficientFundsIsTheDrainSignal`,
+`BreezMigrationSourceTests.testBreezProseInsufficientFundsIsTheDrainSignal`
 
-**Coverage (honest):** these tests pin the Rust planner's bounded step-down and
-both hard limits. They only partly guard the host-error work: no test crosses
-UniFFI with `HostWalletError`, and no app test proves Android/JVM throws
-`HostWalletException.InsufficientFunds` or Apple lifts its Swift
-`HostWalletError.InsufficientFunds` back into Rust. The Apple message fallback
-is intentionally weaker than a native typed WalletKit error.
+**Coverage (honest):** these tests pin the Rust planner's bounded step-down,
+both hard limits, and the three Breez prose phrases the hosts treat as
+`InsufficientFunds`. They still do not cross UniFFI with `HostWalletError`,
+and do not prove Android/JVM throws `HostWalletException.InsufficientFunds` or
+Apple lifts `HostWalletError.InsufficientFunds` back into Rust. The Apple
+message fallback is intentionally weaker than a native typed WalletKit error.
 
 **History:** the first Pixel drain exposed a flat foreign-trait error
 (`Can't lift flat errors`) that prevented the existing planner from seeing the

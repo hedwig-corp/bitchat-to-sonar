@@ -139,4 +139,12 @@ class WalletMigrationContractTest {
             phaseAfterExecuteError(null, dest, failed),
         )
     }
+
+    @Test fun breezProseInsufficientFundsIsTheDrainSignal() {
+        assertTrue(breezMessageLooksInsufficient("Cannot pay: not enough funds"))
+        assertTrue(breezMessageLooksInsufficient("InsufficientFunds"))
+        assertTrue(breezMessageLooksInsufficient("balance too low for this swap"))
+        assertFalse(breezMessageLooksInsufficient("Boltz is unavailable"))
+        assertFalse(breezMessageLooksInsufficient("timeout"))
+    }
 }

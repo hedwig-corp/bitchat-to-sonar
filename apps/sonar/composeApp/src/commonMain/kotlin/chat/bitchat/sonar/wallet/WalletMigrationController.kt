@@ -103,6 +103,18 @@ fun phaseAfterExecuteError(
     }
 
 /**
+ * Breez reports "cannot afford it" only as prose. Matching too broadly is the
+ * safer failure: a false positive costs one extra smaller quote; a false
+ * negative aborts the whole drain. Keep this list identical on Apple.
+ */
+fun breezMessageLooksInsufficient(message: String): Boolean {
+    val lower = message.lowercase()
+    return "not enough funds" in lower ||
+        "insufficient" in lower ||
+        "balance too low" in lower
+}
+
+/**
  * Build a controller, or `null` where no Breez wallet is configured — the one
  * case that means "migration not offered" rather than "something broke".
  * Anything else throws, carrying its own reason.

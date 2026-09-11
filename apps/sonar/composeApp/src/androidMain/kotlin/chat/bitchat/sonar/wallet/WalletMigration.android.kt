@@ -10,17 +10,6 @@ import uniffi.sonar_ffi.HostSendQuote
 import uniffi.sonar_ffi.HostWalletException
 
 /**
- * Breez reports "cannot afford it" only as prose, with no code to switch on,
- * so the classification has to be textual. Matching too broadly is the safer
- * failure here: a false positive costs one extra, smaller quote attempt; a
- * false negative aborts the whole migration.
- */
-private fun looksInsufficient(message: String): Boolean =
-    message.contains("not enough funds", ignoreCase = true) ||
-        message.contains("insufficient", ignoreCase = true) ||
-        message.contains("balance too low", ignoreCase = true)
-
-/**
  * Breez→Cashu migration source on Android.
  *
  * The engine is Rust (`sonar-wallet-migrate`, exposed as `SonarMigration`).
@@ -73,7 +62,7 @@ class BreezMigrationSource : HostMigrationSource {
                 // cannot afford this one, and gives up on anything else — so
                 // this distinction decides whether a whole-balance drain can
                 // succeed at all.
-                throw if (reason != null && looksInsufficient(reason)) {
+                throw if (reason != null && breezMessageLooksInsufficient(reason)) {
                     HostWalletException.InsufficientFunds()
                 } else {
                     HostWalletException.Failed(
@@ -96,7 +85,7 @@ class BreezMigrationSource : HostMigrationSource {
         if (!result.ok) {
             val reason = result.error ?: "the Lightning payment failed"
             android.util.Log.w("SonarWallet", "migration send failed: $reason")
-            throw if (looksInsufficient(reason)) {
+            throw if (breezMessageLooksInsufficient(reason)) {
                 HostWalletException.InsufficientFunds()
             } else {
                 HostWalletException.Failed(reason)

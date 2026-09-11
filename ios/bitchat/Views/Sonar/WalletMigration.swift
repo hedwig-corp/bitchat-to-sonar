@@ -51,13 +51,20 @@ final class BreezMigrationSource: HostMigrationSource, @unchecked Sendable {
            case .insufficientAfterFee = walletError {
             return .InsufficientFunds
         }
-        let message = "\(error)"
-        if message.localizedCaseInsensitiveContains("insufficient")
-            || message.localizedCaseInsensitiveContains("not enough funds")
-            || message.localizedCaseInsensitiveContains("balance too low") {
+        if Self.looksInsufficient("\(error)") {
             return .InsufficientFunds
         }
-        return .Failed(reason: message)
+        return .Failed(reason: "\(error)")
+    }
+
+    /// Keep the three Breez phrases identical to Compose
+    /// `breezMessageLooksInsufficient`.
+    static func looksInsufficient(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        return lower.contains("not enough funds")
+            || lower.contains("insufficient")
+            || lower.contains("balance too low")
+    }
     }
 
     func balanceSats() throws -> UInt64 {

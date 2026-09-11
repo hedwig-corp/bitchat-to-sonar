@@ -54,3 +54,14 @@ final class SonarMigrationRescueTests: XCTestCase {
         )
     }
 }
+
+@MainActor
+final class BreezMigrationSourceTests: XCTestCase {
+    func testBreezProseInsufficientFundsIsTheDrainSignal() {
+        XCTAssertTrue(BreezMigrationSource.looksInsufficient("Cannot pay: not enough funds"))
+        XCTAssertTrue(BreezMigrationSource.looksInsufficient("InsufficientFunds"))
+        XCTAssertTrue(BreezMigrationSource.looksInsufficient("balance too low for this swap"))
+        XCTAssertFalse(BreezMigrationSource.looksInsufficient("Boltz is unavailable"))
+        XCTAssertFalse(BreezMigrationSource.looksInsufficient("timeout"))
+    }
+}

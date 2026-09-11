@@ -22,12 +22,6 @@ import uniffi.sonar_ffi.HostWalletException
  * must therefore invoke the engine from `Dispatchers.IO`, never the main
  * dispatcher.
  */
-/** Mirror of the Android classifier; see that file for why it is textual. */
-private fun looksInsufficient(message: String): Boolean =
-    message.contains("not enough funds", ignoreCase = true) ||
-        message.contains("insufficient", ignoreCase = true) ||
-        message.contains("balance too low", ignoreCase = true)
-
 class BreezMigrationSource : HostMigrationSource {
 
     /**
@@ -48,7 +42,7 @@ class BreezMigrationSource : HostMigrationSource {
                 val reason = WalletBridge.lastPrepareFailure()
                 // InsufficientFunds is the engine's signal to plan a smaller
                 // amount; anything else aborts the migration.
-                throw if (reason != null && looksInsufficient(reason)) {
+                throw if (reason != null && breezMessageLooksInsufficient(reason)) {
                     HostWalletException.InsufficientFunds()
                 } else {
                     HostWalletException.Failed(
@@ -70,7 +64,7 @@ class BreezMigrationSource : HostMigrationSource {
         val result = WalletBridge.sendPrepared(token, note)
         if (!result.ok) {
             val reason = result.error ?: "the Lightning payment failed"
-            throw if (looksInsufficient(reason)) {
+            throw if (breezMessageLooksInsufficient(reason)) {
                 HostWalletException.InsufficientFunds()
             } else {
                 HostWalletException.Failed(reason)
