@@ -174,6 +174,8 @@ network failure into a fresh send. Re-run `settle` after the mint is reachable.
 The application presents the same condition as "Paid — waiting on the mint"
 with a non-spending "Check again" action on the chat list, Settings, and
 Wallet activity. Opening that surface auto-resumes the journaled attempt.
+A process relaunch also resumes in the background after local Home paint,
+without minting a second invoice.
 
 Whole-balance drain planning is fail-closed. It refuses a destination maximum
 or fee-cap violation before consent. When a host reports typed

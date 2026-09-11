@@ -1402,6 +1402,8 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var coreClaimedHandle: String?
     /// Mirrors wallet.state for the UI (balance row and PaySheet).
     @Published private(set) var walletState: SonarWalletState
+    /// One launch-time Cashu rescue attempt per process.
+    private var didAttemptCashuRescue = false
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
     private var pendingPayPeer: String?
     /// Local call records, keyed by DM peer id (the same id the call route +
@@ -2233,11 +2235,14 @@ final class SonarAppStore: ObservableObject {
                     SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: bridged.walletService)
                 }
                 #endif
-            }
+                if configured {
+                    self.attemptCashuMigrationRescue()
+                }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
         if case .ready = wallet.state {
             UserDefaults.standard.set(true, forKey: Keys.walletConfigured)
+            attemptCashuMigrationRescue()
         } else {
             UserDefaults.standard.set(false, forKey: Keys.walletConfigured)
         }
@@ -4596,6 +4601,19 @@ final class SonarAppStore: ObservableObject {
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
             }
+        }
+    }
+
+    /// File-only peek, then resume on a background task. Must not run on the
+    /// local-first paint path; wallet Ready is already after Home hydrated.
+    private func attemptCashuMigrationRescue() {
+        guard !didAttemptCashuRescue else { return }
+        didAttemptCashuRescue = true
+        Task {
+            guard let nsec = await exportNsec(),
+                  let bridged = wallet as? BridgedWallet else { return }
+            let source = BreezMigrationSource(wallet: bridged.walletService.migrationWallet)
+            await CashuMigrationStorage.resumeInBackgroundIfNeeded(nsec: nsec, source: source)
         }
     }
 

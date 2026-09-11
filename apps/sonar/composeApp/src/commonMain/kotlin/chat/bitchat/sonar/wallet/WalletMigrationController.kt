@@ -1,5 +1,7 @@
 package chat.bitchat.sonar.wallet
 
+import kotlinx.coroutines.sync.Mutex
+
 /**
  * Host-side driver for the Rust migration engine.
  *
@@ -181,6 +183,62 @@ fun showsMigrationRescueOnHomeStrip(
     walletAvailable: Boolean,
     journalNeedsRescue: Boolean,
 ): Boolean = walletAvailable && journalNeedsRescue
+
+/**
+ * One owner of `cashu.redb` at a time. The migration screen holds this for its
+ * whole lifetime; a launch-time rescue uses [tryLock] so a consent screen
+ * already in use is not interrupted.
+ */
+internal val cashuMigrationStoreMutex = Mutex()
+
+/**
+ * After local paint, resume a paid/ambiguous journal without minting a second
+ * invoice. Peek is file-only; [open] is the only call that may touch the mint.
+ * Returns null when there is nothing to rescue or the store is already owned.
+ */
+suspend fun resumePaidCashuMigrationIfNeeded(
+    peekNeedsRescue: Boolean,
+    acquireExclusive: () -> Boolean,
+    releaseExclusive: () -> Unit,
+    open: suspend () -> WalletMigrationController?,
+    lightningFailedMessage: String,
+    polls: UInt,
+): MigrationPhase? {
+    if (!peekNeedsRescue) return null
+    if (!acquireExclusive()) return null
+    try {
+        val controller = open() ?: return null
+        try {
+            return restoreOpenedMigration(
+                status = controller.status(),
+                destConfirmedSats = controller.destinationBalanceSats(),
+                lightningFailedMessage = lightningFailedMessage,
+                cancelUnspent = { controller.cancelUnspent() },
+                resume = { controller.resume(polls) },
+            )
+        } finally {
+            controller.close()
+        }
+    } finally {
+        releaseExclusive()
+    }
+}
+
+suspend fun resumePaidCashuMigrationInBackground(): MigrationPhase? =
+    resumePaidCashuMigrationIfNeeded(
+        peekNeedsRescue = peekCashuMigrationNeedsRescue(),
+        acquireExclusive = { cashuMigrationStoreMutex.tryLock() },
+        releaseExclusive = { cashuMigrationStoreMutex.unlock() },
+        open = {
+            createWalletMigrationController(
+                mintUrl = SONAR_DEFAULT_MINT_URL,
+                destMaxSats = 500_000uL,
+                feeCapSats = 5_000uL,
+            )
+        },
+        lightningFailedMessage = "The Lightning payment failed without moving funds.",
+        polls = 24u,
+    )
 
 private val JOURNAL_STATE_FIELD = Regex(""""state"\s*:\s*"([A-Za-z]+)"""")
 

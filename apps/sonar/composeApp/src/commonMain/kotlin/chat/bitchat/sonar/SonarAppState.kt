@@ -26,6 +26,7 @@ import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.resumePaidCashuMigrationInBackground
 import chat.bitchat.sonar.wallet.wipeCashuMigrationStorage
 import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.wallet.paymentDestinationHash
@@ -2942,7 +2943,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             WalletBridge.fetchRates()
             rate = WalletBridge.cachedRate(currency)
             publishSonarDescriptorIfNeeded(force = true)
-            if (walletState is WalletState.Ready) Notifier.onWalletReady()
+            if (walletState is WalletState.Ready) {
+                Notifier.onWalletReady()
+                // File peek + resume on IO. Must not sit on the local-first
+                // paint path; this launch is already after Home hydrated.
+                launch(Dispatchers.IO) {
+                    runCatching { resumePaidCashuMigrationInBackground() }
+                }
+            }
         }
     }
 

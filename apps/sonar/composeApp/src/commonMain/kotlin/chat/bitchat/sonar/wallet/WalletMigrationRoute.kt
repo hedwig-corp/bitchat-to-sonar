@@ -1,7 +1,6 @@
 package chat.bitchat.sonar.wallet
 
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -9,10 +8,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import chat.bitchat.sonar.SonarAppState
@@ -84,108 +83,97 @@ fun WalletMigrationRoute(state: SonarAppState) {
     // trip. It must never run during composition or on the main dispatcher:
     // that blocks first paint on the mint and can ANR. Build it on IO and let
     // the screen paint "opening" state meanwhile.
-    LaunchedEffect(openGeneration) {
-        abandoned.set(false)
-        phase = MigrationPhase.Quoting
-        // Leaving the screen cannot interrupt native open/restore. Without
-        // NonCancellable the result is discarded at the cancellation boundary
-        // and the newly opened store stays locked until process death.
-        val built = try {
-            withContext(NonCancellable) {
-                createWalletMigrationController(
-                    mintUrl = SONAR_DEFAULT_MINT_URL,
-                    destMaxSats = DEST_MAX_SATS,
-                    feeCapSats = FEE_CAP_SATS,
-                )
-            }
-        } catch (cause: Throwable) {
-            if (!abandoned.get()) {
-                phase = MigrationPhase.Failed(
-                    couldNotOpenTemplate.replace(
-                        errorMarker,
-                        cause.message ?: cause.toString(),
-                    )
-                )
-            }
-            return@LaunchedEffect
-        }
-        if (built == null) {
-            if (!abandoned.get()) {
-                phase = MigrationPhase.Failed(lightningUnavailable)
-            }
-            return@LaunchedEffect
-        }
-        if (abandoned.get()) {
-            built.close()
-            return@LaunchedEffect
-        }
-        controller = built
-        if (abandoned.get()) {
-            controller = null
-            built.close()
-            return@LaunchedEffect
-        }
-        val status = try {
-            cashuBalance = built.destinationBalanceSats()
-            built.status()
-        } catch (cause: Throwable) {
-            if (!abandoned.get()) {
-                phase = MigrationPhase.Failed(
-                    couldNotReadBalanceTemplate.replace(
-                        errorMarker,
-                        cause.message ?: cause.toString(),
-                    )
-                )
-            }
-            return@LaunchedEffect
-        }
-        if (abandoned.get()) return@LaunchedEffect
-        if (status?.state?.let { migrationAttemptNeedsRescue(it) } == true) {
-            phase = MigrationPhase.Watching
-        }
-        val restored = restoreOpenedMigration(
-            status = status,
-            destConfirmedSats = cashuBalance,
-            lightningFailedMessage = lightningPaymentFailed,
-            cancelUnspent = { built.cancelUnspent() },
-            resume = { built.resume(SETTLE_POLLS) },
-        )
-        if (abandoned.get()) return@LaunchedEffect
-        when (restored) {
-            is MigrationPhase.Settled -> {
-                cashuBalance = restored.cashuSats
-                phase = restored
-            }
-            is MigrationPhase.PendingSettlement -> {
-                cashuBalance = restored.cashuSats
-                phase = restored
-            }
-            else -> phase = restored
-        }
-    }
-
-    // The destination wallet holds an open store; leaving the screen must
-    // release it, or a later migration reopens a locked database.
     //
-    // Keyed on Unit, NOT on `controller`: keying on the controller makes the
-    // effect re-run the moment it is assigned, and the disposal of the old
-    // effect reads `controller` at dispose time — by then the NEW instance,
-    // which it would close immediately. That produced "SonarMigration object
-    // has already been destroyed" on the first real device run. With Unit,
-    // dispose happens only when the screen goes away, which is the intent.
-    DisposableEffect(Unit) {
-        onDispose {
-            abandoned.set(true)
-            val owned = controller
-            controller = null
-            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch(NonCancellable) {
-                val state = runCatching { owned?.status()?.state }.getOrNull()
-                if (state == MigrationAttemptStateUi.AwaitingConsent ||
-                    state == MigrationAttemptStateUi.ExpiredUnsent
-                ) {
-                    runCatching { owned?.cancelUnspent() }
+    // Hold [cashuMigrationStoreMutex] until this effect is cancelled so a
+    // launch-time rescue cannot open the same store while the screen owns it.
+    LaunchedEffect(openGeneration) {
+        cashuMigrationStoreMutex.withLock {
+            abandoned.set(false)
+            phase = MigrationPhase.Quoting
+            var owned: WalletMigrationController? = null
+            try {
+                // Leaving the screen cannot interrupt native open/restore. Without
+                // NonCancellable the result is discarded at the cancellation boundary
+                // and the newly opened store stays locked until process death.
+                val built = try {
+                    withContext(NonCancellable) {
+                        createWalletMigrationController(
+                            mintUrl = SONAR_DEFAULT_MINT_URL,
+                            destMaxSats = DEST_MAX_SATS,
+                            feeCapSats = FEE_CAP_SATS,
+                        )
+                    }
+                } catch (cause: Throwable) {
+                    if (!abandoned.get()) {
+                        phase = MigrationPhase.Failed(
+                            couldNotOpenTemplate.replace(
+                                errorMarker,
+                                cause.message ?: cause.toString(),
+                            )
+                        )
+                    }
+                    return@withLock
                 }
-                owned?.close()
+                if (built == null) {
+                    if (!abandoned.get()) {
+                        phase = MigrationPhase.Failed(lightningUnavailable)
+                    }
+                    return@withLock
+                }
+                owned = built
+                if (abandoned.get()) return@withLock
+                controller = built
+                val status = try {
+                    cashuBalance = built.destinationBalanceSats()
+                    built.status()
+                } catch (cause: Throwable) {
+                    if (!abandoned.get()) {
+                        phase = MigrationPhase.Failed(
+                            couldNotReadBalanceTemplate.replace(
+                                errorMarker,
+                                cause.message ?: cause.toString(),
+                            )
+                        )
+                    }
+                    return@withLock
+                }
+                if (abandoned.get()) return@withLock
+                if (status?.state?.let { migrationAttemptNeedsRescue(it) } == true) {
+                    phase = MigrationPhase.Watching
+                }
+                val restored = restoreOpenedMigration(
+                    status = status,
+                    destConfirmedSats = cashuBalance,
+                    lightningFailedMessage = lightningPaymentFailed,
+                    cancelUnspent = { built.cancelUnspent() },
+                    resume = { built.resume(SETTLE_POLLS) },
+                )
+                if (abandoned.get()) return@withLock
+                when (restored) {
+                    is MigrationPhase.Settled -> {
+                        cashuBalance = restored.cashuSats
+                        phase = restored
+                    }
+                    is MigrationPhase.PendingSettlement -> {
+                        cashuBalance = restored.cashuSats
+                        phase = restored
+                    }
+                    else -> phase = restored
+                }
+                awaitCancellation()
+            } finally {
+                abandoned.set(true)
+                controller = null
+                val toClose = owned
+                withContext(NonCancellable + Dispatchers.IO) {
+                    val state = runCatching { toClose?.status()?.state }.getOrNull()
+                    if (state == MigrationAttemptStateUi.AwaitingConsent ||
+                        state == MigrationAttemptStateUi.ExpiredUnsent
+                    ) {
+                        runCatching { toClose?.cancelUnspent() }
+                    }
+                    toClose?.close()
+                }
             }
         }
     }

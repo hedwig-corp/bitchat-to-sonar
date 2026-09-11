@@ -297,4 +297,85 @@ class WalletMigrationContractTest {
         )
         assertEquals(MigrationPhase.PendingSettlement(dest), phase)
     }
+
+    @Test
+    fun backgroundRescueSkipsWhenJournalDoesNotNeedRescue() = runBlocking {
+        var opened = 0
+        var acquired = 0
+        val phase = resumePaidCashuMigrationIfNeeded(
+            peekNeedsRescue = false,
+            acquireExclusive = { acquired += 1; true },
+            releaseExclusive = {},
+            open = {
+                opened += 1
+                error("must not open the mint")
+            },
+            lightningFailedMessage = "fail",
+            polls = 24u,
+        )
+        assertNull(phase)
+        assertEquals(0, acquired)
+        assertEquals(0, opened)
+    }
+
+    @Test
+    fun backgroundRescueSkipsWhenStoreAlreadyOwned() = runBlocking {
+        var opened = 0
+        val phase = resumePaidCashuMigrationIfNeeded(
+            peekNeedsRescue = true,
+            acquireExclusive = { false },
+            releaseExclusive = { error("must not release a lock we never took") },
+            open = {
+                opened += 1
+                error("must not open the mint")
+            },
+            lightningFailedMessage = "fail",
+            polls = 24u,
+        )
+        assertNull(phase)
+        assertEquals(0, opened)
+    }
+
+    @Test
+    fun backgroundRescueResumesPaidJournalAndCloses() = runBlocking {
+        var closed = 0
+        var resumed = 0
+        var quoted = 0
+        var released = 0
+        val dest = 500uL
+        val controller = object : WalletMigrationController {
+            override suspend fun destinationBalanceSats() = dest
+            override suspend fun quote(amountSats: ULong?): MigrationQuoteUi {
+                quoted += 1
+                error("quote must not run during rescue")
+            }
+            override suspend fun execute(planId: String) = error("execute must not run")
+            override suspend fun resume(polls: UInt): MigrationResultUi {
+                resumed += 1
+                return MigrationResultUi.Pending(dest)
+            }
+            override suspend fun status() = MigrationAttemptStatusUi(
+                settlementId = "qid",
+                amountSats = 2_000uL,
+                feeSats = 20uL,
+                state = MigrationAttemptStateUi.SourcePaid,
+                paymentHash = "hh",
+            )
+            override suspend fun cancelUnspent() {}
+            override suspend fun close() { closed += 1 }
+        }
+        val phase = resumePaidCashuMigrationIfNeeded(
+            peekNeedsRescue = true,
+            acquireExclusive = { true },
+            releaseExclusive = { released += 1 },
+            open = { controller },
+            lightningFailedMessage = "fail",
+            polls = 24u,
+        )
+        assertEquals(MigrationPhase.PendingSettlement(dest), phase)
+        assertEquals(1, resumed)
+        assertEquals(0, quoted)
+        assertEquals(1, closed)
+        assertEquals(1, released)
+    }
 }

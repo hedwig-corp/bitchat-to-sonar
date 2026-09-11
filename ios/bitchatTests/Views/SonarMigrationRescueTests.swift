@@ -154,6 +154,17 @@ final class SonarMigrationRescueTests: XCTestCase {
         XCTAssertFalse(CashuMigrationStorage.showsOnHomeStrip(walletReady: true, journalNeedsRescue: false))
         XCTAssertFalse(CashuMigrationStorage.showsOnHomeStrip(walletReady: false, journalNeedsRescue: false))
     }
+
+    func testBackgroundRescueSkipsWhenStoreAlreadyOwned() async {
+        let gate = CashuMigrationStoreGate()
+        let acquired = await gate.tryAcquire()
+        XCTAssertTrue(acquired)
+        let second = await gate.tryAcquire()
+        XCTAssertFalse(second, "a launch-time rescue must not open the store the screen owns")
+        await gate.release()
+        XCTAssertTrue(await gate.tryAcquire())
+        await gate.release()
+    }
 }
 
 @MainActor

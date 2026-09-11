@@ -450,6 +450,16 @@ final class SonarMigrationModel: ObservableObject {
         }
     }
 
+    func close() async {
+        let cashu = self.cashu
+        self.cashu = nil
+        engine = nil
+        didRestoreOnOpen = false
+        if let cashu {
+            _ = try? await Task.detached { try cashu.disconnect() }.value
+        }
+    }
+
     /// A new quote is unsafe once a source payment may exist. Matches Compose
     /// `migrationAttemptBlocksNewQuote` so a host timeout after Breez accepted
     /// cannot look like a failed tap that should try another invoice.
@@ -578,10 +588,14 @@ struct SonarWalletMigrationScreen: View {
         }
         .navigationTitle(String(localized: "Move to Cashu"))
         .task {
+            await CashuMigrationStoreGate.shared.acquire()
             await model.restoreOnOpen(nsec: nsec, source: source)
-        }
-        .onDisappear {
-            Task { await model.cancelUnspentOnLeave() }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+            }
+            await model.cancelUnspentOnLeave()
+            await model.close()
+            await CashuMigrationStoreGate.shared.release()
         }
     }
 
@@ -673,6 +687,37 @@ struct SonarWalletMigrationScreen: View {
     }
 }
 
+/// One owner of the Cashu store at a time. The migration screen waits; a
+/// launch-time rescue uses `tryAcquire` so an open consent screen is left alone.
+actor CashuMigrationStoreGate {
+    static let shared = CashuMigrationStoreGate()
+    private var locked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func tryAcquire() -> Bool {
+        if locked { return false }
+        locked = true
+        return true
+    }
+
+    func acquire() async {
+        if !locked {
+            locked = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+        locked = true
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            locked = false
+            return
+        }
+        waiters.removeFirst().resume()
+    }
+}
+
 enum CashuMigrationStorage {
     static let journalFileName = "cashu.migration.v1.json"
 
@@ -725,6 +770,25 @@ enum CashuMigrationStorage {
             return false
         }
         return journalNeedsRescue(json)
+    }
+
+    static func resumeInBackgroundIfNeeded(nsec: String, source: BreezMigrationSource) async {
+        guard peekNeedsRescue(nsec: nsec) else { return }
+        guard await CashuMigrationStoreGate.shared.tryAcquire() else { return }
+        let model: SonarMigrationModel? = await MainActor.run {
+            guard let dir = workingDir(nsec: nsec) else { return nil }
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            return SonarMigrationModel(
+                mintUrl: "https://mint.hedwig.sh",
+                walletDir: dir.path,
+                feeCapSats: 5_000
+            )
+        }
+        if let model {
+            await model.restoreOnOpen(nsec: nsec, source: source)
+            await model.close()
+        }
+        await CashuMigrationStoreGate.shared.release()
     }
 }
 

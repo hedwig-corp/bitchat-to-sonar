@@ -2677,7 +2677,11 @@ offers a second payment.
 `restoreOnOpen`, and `resumeSettlement`; Compose `WalletMigrationRoute.kt`
 LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
 `WalletMigrationController`. Home-strip call sites:
-`HomeMigrationRescueStrip` and `SNHomeMigrationRescueStrip`.
+`HomeMigrationRescueStrip` and `SNHomeMigrationRescueStrip`. Launch-time
+rescue: Compose `SonarAppState.setupWallet` /
+`resumePaidCashuMigrationInBackground`; iOS
+`SonarAppStore.attemptCashuMigrationRescue` /
+`CashuMigrationStorage.resumeInBackgroundIfNeeded`.
 
 **Guarded by:** `lib.rs::durable_sending_state_prevents_resend`,
 `lib.rs::corrupt_journal_fails_closed`,
@@ -2691,10 +2695,16 @@ LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
 `WalletMigrationContractTest.openWithUnspentConsentClearsAndDoesNotResume`,
 `WalletMigrationContractTest.openResumeFailureStaysPendingNotANewQuote`,
 `WalletMigrationContractTest.paidJournalShowsOnHomeStripAfterRelaunch`,
+`WalletMigrationContractTest.backgroundRescueSkipsWhenJournalDoesNotNeedRescue`,
+`WalletMigrationContractTest.backgroundRescueSkipsWhenStoreAlreadyOwned`,
+`WalletMigrationContractTest.backgroundRescueResumesPaidJournalAndCloses`,
 `SonarMigrationRescueTests.testExecuteErrorAfterSourceAcceptedIsPendingNotANewQuote`,
 `SonarMigrationRescueTests.testRelaunchAfterPaidJournalIsPendingNotANewQuote`,
 `SonarMigrationRescueTests.testJournalBytesNeedRescueWithoutOpeningTheMint`,
-`SonarMigrationRescueTests.testPaidJournalShowsOnHomeStripAfterRelaunch`
+`SonarMigrationRescueTests.testPaidJournalShowsOnHomeStripAfterRelaunch`,
+`SonarMigrationRescueTests.testBackgroundRescueSkipsWhenStoreAlreadyOwned`
+
+**Also guarded by:** `WalletMigrationContractTest.backgroundRescueSkipsWhenJournalDoesNotNeedRescue`, `WalletMigrationContractTest.backgroundRescueSkipsWhenStoreAlreadyOwned`, `WalletMigrationContractTest.backgroundRescueResumesPaidJournalAndCloses`, `SonarMigrationRescueTests.testBackgroundRescueSkipsWhenStoreAlreadyOwned`
 
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
 journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
@@ -2704,9 +2714,12 @@ relaunch-open mapping (`restoreOpenedMigration` / `phaseAfterOpenStatus`) and
 a file-only journal peek so the home strip, Settings, and Wallet can offer
 rescue without opening the mint. The home-strip tests pin the named gate
 (`showsMigrationRescueOnHomeStrip` / `CashuMigrationStorage.showsOnHomeStrip`)
-used at the chat-list call site; they do not compose the strip. They do not
-kill either app between fsync and the source return, and do not inject
-filesystem or parent-directory-fsync failures on a device.
+used at the chat-list call site; they do not compose the strip. Launch-time
+rescue is pinned at `resumePaidCashuMigrationIfNeeded` (skip when the journal
+is clean, skip when the store is already owned, resume+close a paid journal)
+and Apple `CashuMigrationStoreGate.tryAcquire`. They do not kill either app
+between fsync and the source return, and do not inject filesystem or
+parent-directory-fsync failures on a device.
 
 **History:** the production migration replaced process-local plan ownership
 with `cashu.migration.v1.json` and a take-before-send barrier.
