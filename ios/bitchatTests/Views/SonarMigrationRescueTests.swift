@@ -145,6 +145,15 @@ final class SonarMigrationRescueTests: XCTestCase {
         XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue("{}"))
         XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue(journal("NotAState")))
     }
+
+    func testPaidJournalShowsOnHomeStripAfterRelaunch() {
+        // Opposite of the live-payment H1 rule: a killed process with a
+        // paid journal is exactly when the chat list has to offer rescue.
+        XCTAssertTrue(CashuMigrationStorage.showsOnHomeStrip(walletReady: true, journalNeedsRescue: true))
+        XCTAssertFalse(CashuMigrationStorage.showsOnHomeStrip(walletReady: false, journalNeedsRescue: true))
+        XCTAssertFalse(CashuMigrationStorage.showsOnHomeStrip(walletReady: true, journalNeedsRescue: false))
+        XCTAssertFalse(CashuMigrationStorage.showsOnHomeStrip(walletReady: false, journalNeedsRescue: false))
+    }
 }
 
 @MainActor

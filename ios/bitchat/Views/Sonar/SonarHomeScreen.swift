@@ -77,6 +77,7 @@ struct SonarHomeScreen: View {
                         // is in flight it sits above the list; it clears itself
                         // the moment it settles or fails.
                         SNHomePaymentStrip()
+                        SNHomeMigrationRescueStrip()
                         SNSectionLabel("Around you")
                         channelList
                         let saved = store.savedChannels

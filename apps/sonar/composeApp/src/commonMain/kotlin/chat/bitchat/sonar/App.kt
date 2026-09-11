@@ -498,6 +498,7 @@ private fun HomeScreen(state: SonarAppState) {
                 // sits above the list; it clears itself the moment it settles
                 // or fails.
                 item { chat.bitchat.sonar.screens.HomePaymentStrip(state) }
+                item { chat.bitchat.sonar.screens.HomeMigrationRescueStrip(state) }
                 item { SNSectionLabel("Around you") }
                 // "Around you" collapses the geohash precision ladder (+ Mesh) into one
                 // card with a tier picker (design: HereCard) instead of a flat list.

@@ -217,6 +217,15 @@ class WalletMigrationContractTest {
         assertFalse(journalNeedsRescue(journal("NotAState")))
     }
 
+    @Test fun paidJournalShowsOnHomeStripAfterRelaunch() {
+        // Opposite of the live-payment H1 rule: a killed process with a
+        // paid journal is exactly when the chat list has to offer rescue.
+        assertTrue(showsMigrationRescueOnHomeStrip(true, true))
+        assertFalse(showsMigrationRescueOnHomeStrip(false, true))
+        assertFalse(showsMigrationRescueOnHomeStrip(true, false))
+        assertFalse(showsMigrationRescueOnHomeStrip(false, false))
+    }
+
     @Test fun openWithPaidJournalResumesAndDoesNotQuote() = runBlocking {
         var cancelled = 0
         var resumed = 0

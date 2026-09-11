@@ -2676,7 +2676,8 @@ offers a second payment.
 `WalletMigration.swift::SonarMigrationModel.confirmAndMigrate`,
 `restoreOnOpen`, and `resumeSettlement`; Compose `WalletMigrationRoute.kt`
 LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
-`WalletMigrationController`.
+`WalletMigrationController`. Home-strip call sites:
+`HomeMigrationRescueStrip` and `SNHomeMigrationRescueStrip`.
 
 **Guarded by:** `lib.rs::durable_sending_state_prevents_resend`,
 `lib.rs::corrupt_journal_fails_closed`,
@@ -2689,18 +2690,23 @@ LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
 `WalletMigrationContractTest.openWithPaidJournalResumesAndDoesNotQuote`,
 `WalletMigrationContractTest.openWithUnspentConsentClearsAndDoesNotResume`,
 `WalletMigrationContractTest.openResumeFailureStaysPendingNotANewQuote`,
+`WalletMigrationContractTest.paidJournalShowsOnHomeStripAfterRelaunch`,
 `SonarMigrationRescueTests.testExecuteErrorAfterSourceAcceptedIsPendingNotANewQuote`,
 `SonarMigrationRescueTests.testRelaunchAfterPaidJournalIsPendingNotANewQuote`,
-`SonarMigrationRescueTests.testJournalBytesNeedRescueWithoutOpeningTheMint`
+`SonarMigrationRescueTests.testJournalBytesNeedRescueWithoutOpeningTheMint`,
+`SonarMigrationRescueTests.testPaidJournalShowsOnHomeStripAfterRelaunch`
 
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
 journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
 so a second `plan` is refused. The host tests pin the UI mapping that turns those
 states into "Paid — waiting on the mint" instead of a new quote, including the
 relaunch-open mapping (`restoreOpenedMigration` / `phaseAfterOpenStatus`) and
-a file-only journal peek so Settings/Wallet can offer rescue without opening the
-mint. They do not kill either app between fsync and the source return, and do
-not inject filesystem or parent-directory-fsync failures on a device.
+a file-only journal peek so the home strip, Settings, and Wallet can offer
+rescue without opening the mint. The home-strip tests pin the named gate
+(`showsMigrationRescueOnHomeStrip` / `CashuMigrationStorage.showsOnHomeStrip`)
+used at the chat-list call site; they do not compose the strip. They do not
+kill either app between fsync and the source return, and do not inject
+filesystem or parent-directory-fsync failures on a device.
 
 **History:** the production migration replaced process-local plan ownership
 with `cashu.migration.v1.json` and a take-before-send barrier.
@@ -2827,11 +2833,12 @@ cross-account resume.
 ## Unguarded
 
 - **Post-payment pending migration after an app kill.** R-045 now pins the
-  relaunch-open mapping and journal-peek banner copy, but no Apple or Compose
-  test kills the process after Breez accepts the payment, relaunches, opens
-  `WalletMigrationRoute`, and proves `resume` runs without invoking `send`
-  again. This needs a process-death/device harness with an injectable source
-  and a delayed mint; helper tests cannot pin the host lifecycle call site.
+  relaunch-open mapping, journal-peek banner copy, and the home-strip gate, but
+  no Apple or Compose test kills the process after Breez accepts the payment,
+  relaunches, opens `WalletMigrationRoute`, and proves `resume` runs without
+  invoking `send` again. This needs a process-death/device harness with an
+  injectable source and a delayed mint; helper tests cannot pin the host
+  lifecycle call site.
 - **Apple `HostWalletError` lifting across the foreign-trait boundary.** The
   non-flat Rust enum and planner branch are covered only on the Rust side.
   Nothing constructs the generated Swift `HostMigrationSource` callback,

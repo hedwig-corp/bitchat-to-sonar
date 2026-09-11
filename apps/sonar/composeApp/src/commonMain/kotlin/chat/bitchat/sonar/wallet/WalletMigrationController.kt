@@ -170,6 +170,18 @@ fun journalNeedsRescue(json: String?): Boolean {
 
 fun peekCashuMigrationNeedsRescue(): Boolean = journalNeedsRescue(readCashuMigrationJournalJson())
 
+/**
+ * Unlike the live-payment H1 strip, a paid Cashu migration MUST survive
+ * process death. The journal is the live state; a relaunch without an
+ * in-process send is exactly when this banner has to appear.
+ *
+ * Named rather than inlined so the home call site cannot drift from Settings.
+ */
+fun showsMigrationRescueOnHomeStrip(
+    walletAvailable: Boolean,
+    journalNeedsRescue: Boolean,
+): Boolean = walletAvailable && journalNeedsRescue
+
 private val JOURNAL_STATE_FIELD = Regex(""""state"\s*:\s*"([A-Za-z]+)"""")
 
 fun phaseAfterExecuteError(
@@ -217,6 +229,7 @@ expect suspend fun wipeCashuMigrationStorage()
 
 /**
  * Local journal bytes only. Must never open the Cashu store or talk to the
- * mint — Settings and the wallet log use this for a rescue banner.
+ * mint — the home strip, Settings, and the wallet log use this for a
+ * rescue banner.
  */
 expect fun readCashuMigrationJournalJson(): String?

@@ -712,6 +712,13 @@ enum CashuMigrationStorage {
         }
     }
 
+    /// Unlike the live-payment H1 strip, a paid Cashu migration MUST survive
+    /// process death. The journal is the live state; a relaunch without an
+    /// in-process send is exactly when this banner has to appear.
+    static func showsOnHomeStrip(walletReady: Bool, journalNeedsRescue: Bool) -> Bool {
+        walletReady && journalNeedsRescue
+    }
+
     static func peekNeedsRescue(nsec: String) -> Bool {
         guard let url = workingDir(nsec: nsec)?.appendingPathComponent(journalFileName),
               let json = try? String(contentsOf: url, encoding: .utf8) else {
