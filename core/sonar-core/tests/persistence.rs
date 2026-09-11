@@ -241,6 +241,81 @@ async fn local_first_reaction_persists_pending_outbox_before_relay_publish() {
 }
 
 #[tokio::test]
+async fn terminal_failed_reaction_is_dropped_from_tallies() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
+
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+
+    let alice_identity = Identity::generate();
+    let client = SonarClient::connect(alice_identity, Vec::new(), &db_path, DB_KEY)
+        .await
+        .expect("connect local-only client");
+    let creation = client
+        .engine()
+        .create_group("alice & bob", vec![bob_kp], Vec::new())
+        .expect("create local group");
+    let group_id = creation.group.mls_group_id.clone();
+    client
+        .engine()
+        .merge_pending_commit(&group_id)
+        .expect("merge local group");
+
+    client
+        .send_text(&group_id, "react to me")
+        .await
+        .expect("local-first send");
+    let parent = client
+        .messages_cursor_page(&group_id, None, None, 10)
+        .expect("cursor page")
+        .into_iter()
+        .find(|m| m.content == "react to me")
+        .expect("parent");
+    client
+        .send_reaction(&group_id, &parent.id, &parent.sender, "👍")
+        .await
+        .expect("local-first reaction");
+    assert_eq!(
+        client
+            .messages_cursor_page(&group_id, None, None, 10)
+            .expect("page")[0]
+            .reactions
+            .len(),
+        1,
+        "chip is local-first until publish is exhausted"
+    );
+
+    let rumor_id = {
+        let bytes = std::fs::read(&outbox_path).expect("read outbox");
+        let disk: serde_json::Value = serde_json::from_slice(&bytes).expect("outbox json");
+        disk["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .find(|e| e["message_id_hex"].as_str().unwrap_or_default() != parent.id.to_hex())
+            .and_then(|e| e["message_id_hex"].as_str())
+            .expect("reaction outbox row")
+            .to_string()
+    };
+    let rumor = nostr::EventId::from_hex(&rumor_id).expect("rumor id");
+    client.engine().suppress_reaction(rumor);
+
+    let page = client
+        .messages_cursor_page(&group_id, None, None, 10)
+        .expect("page after suppress");
+    assert!(
+        page[0].reactions.is_empty(),
+        "terminal publish failure must drop the mine chip so the host can resend"
+    );
+    let overlay = client
+        .reaction_tallies_for(&group_id, &[parent.id])
+        .expect("overlay");
+    assert!(overlay[0].1.is_empty());
+}
+
+#[tokio::test]
 async fn later_reaction_on_older_parent_survives_beyond_newest_512_raw_rows() {
     let bob = MarmotEngine::in_memory(Identity::generate());
     let bob_kp = bob.key_package_event(relays()).expect("bob key package");

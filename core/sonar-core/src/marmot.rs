@@ -16,6 +16,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
 use mdk_core::key_packages::{validate_existing_d_tag, KeyPackageOptions};
@@ -302,10 +303,11 @@ pub enum Incoming {
     /// invalidate the conversation so tallies refresh, and must not count
     /// unread or ring a notification (R-017). `target_id` is the parent so
     /// retained historical rows can overlay chips without a newest-page
-    /// membership match.
+    /// membership match. `reaction_id` is the inner rumor id (outbox key).
     Reaction {
         group_id: GroupId,
         target_id: EventId,
+        reaction_id: EventId,
     },
     /// The event was valid but produced nothing actionable (duplicates,
     /// ignored proposals, non-Marmot gift wraps, ...).
@@ -352,6 +354,9 @@ pub struct MarmotEngine {
     write_lock: std::sync::Mutex<()>,
     /// Kind-7 index keyed by target. See [`crate::reaction::ReactionStore`].
     reaction_store: std::sync::Mutex<crate::reaction::ReactionStore>,
+    /// Inner rumor ids whose outbox publish exhausted auto-retries. Hydrate
+    /// skips these so a locally echoed `mine` chip cannot look sent forever.
+    suppressed_reactions: Arc<std::sync::Mutex<HashSet<EventId>>>,
     /// Sliding window of recent 2-member-welcome auto-accepts (#419). Anyone
     /// holding our public KeyPackage can gift-wrap us a welcome, so
     /// auto-accepts are rate limited; overflow routes to the pending
@@ -622,6 +627,7 @@ impl MarmotEngine {
             identity,
             write_lock: std::sync::Mutex::new(()),
             reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::default()),
+            suppressed_reactions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::in_memory()),
             db_path: None,
             key_package_slot_memo: std::sync::Mutex::new(None),
@@ -678,6 +684,7 @@ impl MarmotEngine {
             identity,
             write_lock: std::sync::Mutex::new(()),
             reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::default()),
+            suppressed_reactions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             // Persistent engine ⇒ persisted window. The iOS NSE builds a
             // fresh engine per push wake, so an in-memory budget here would
             // hand every wake a full budget (5 × wake-rate, not 5 per window).
@@ -1674,6 +1681,7 @@ impl MarmotEngine {
                     return Ok(Incoming::Reaction {
                         group_id: msg.mls_group_id,
                         target_id: reaction.target_id,
+                        reaction_id: reaction.id,
                     });
                 }
                 if msg.kind.as_u16() != CHAT_RUMOR_KIND {
@@ -1857,7 +1865,9 @@ impl MarmotEngine {
         let mut mapped: Vec<ChatMessage> = Vec::new();
         for m in msgs {
             if let Some(reaction) = crate::reaction::parse_stored(&m) {
-                reactions.push(reaction);
+                if !self.reaction_is_suppressed(&reaction.id) {
+                    reactions.push(reaction);
+                }
                 continue;
             }
             if m.kind.as_u16() != CHAT_RUMOR_KIND {
@@ -2050,7 +2060,9 @@ impl MarmotEngine {
                     break 'scan;
                 }
                 if let Some(reaction) = crate::reaction::parse_stored(&msg) {
-                    page_reactions.push(reaction);
+                    if !self.reaction_is_suppressed(&reaction.id) {
+                        page_reactions.push(reaction);
+                    }
                     continue;
                 }
                 if msg.kind.as_u16() != CHAT_RUMOR_KIND
@@ -2356,18 +2368,54 @@ impl MarmotEngine {
             let store = self.reaction_store.lock().unwrap();
             store.for_targets(group_id, &targets)
         };
+        reactions.retain(|r| !self.reaction_is_suppressed(&r.id));
         if reactions.is_empty() {
-            reactions = page_reactions;
+            reactions = page_reactions
+                .into_iter()
+                .filter(|r| !self.reaction_is_suppressed(&r.id))
+                .collect();
         }
         crate::reaction::attach_tallies(msgs, &reactions, self.identity.public_key());
         Ok(())
     }
 
     fn record_reaction(&self, group_id: &GroupId, reaction: crate::reaction::ParsedReaction) {
+        if self.reaction_is_suppressed(&reaction.id) {
+            return;
+        }
         self.reaction_store
             .lock()
             .unwrap()
             .record(group_id, reaction);
+    }
+
+    fn reaction_is_suppressed(&self, id: &EventId) -> bool {
+        self.suppressed_reactions.lock().unwrap().contains(id)
+    }
+
+    /// Roll back a locally echoed kind-7 whose publish exhausted auto-retries.
+    pub fn suppress_reaction(&self, reaction_id: EventId) {
+        self.suppressed_reactions
+            .lock()
+            .unwrap()
+            .insert(reaction_id);
+    }
+
+    pub(crate) fn suppressed_reactions_handle(&self) -> Arc<std::sync::Mutex<HashSet<EventId>>> {
+        Arc::clone(&self.suppressed_reactions)
+    }
+
+    /// Seed suppressions from durable outbox rows that have hit the attempt cap.
+    pub fn suppress_reactions_from_hex_ids<I>(&self, ids: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut suppressed = self.suppressed_reactions.lock().unwrap();
+        for hex in ids {
+            if let Ok(id) = EventId::from_hex(&hex) {
+                suppressed.insert(id);
+            }
+        }
     }
 
     fn ensure_reaction_backfill(&self, group_id: &GroupId) -> Result<()> {
@@ -2422,11 +2470,12 @@ impl MarmotEngine {
         }
         self.ensure_reaction_backfill(group_id)?;
         let targets: HashSet<EventId> = target_ids.iter().copied().collect();
-        let reactions = self
+        let mut reactions = self
             .reaction_store
             .lock()
             .unwrap()
             .for_targets(group_id, &targets);
+        reactions.retain(|r| !self.reaction_is_suppressed(&r.id));
         let me = self.identity.public_key();
         Ok(target_ids
             .iter()

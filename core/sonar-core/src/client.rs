@@ -2358,6 +2358,12 @@ impl SonarClient {
             storage_empty,
         )));
         let outbox_state = Arc::new(Mutex::new(OutboxState::load(outbox_state_path)));
+        engine.suppress_reactions_from_hex_ids(
+            outbox_state
+                .lock()
+                .unwrap()
+                .terminal_failed_message_ids(),
+        );
         let (media_staging_state_path, media_staging_dir_path) = match media_staging_paths {
             Some((state, dir)) => (Some(state), Some(dir)),
             None => (None, None),
@@ -3548,29 +3554,30 @@ impl SonarClient {
                 .create_and_process_reaction(group_id, target_id, target_pubkey, emoji)?
         };
         match incoming {
-            Incoming::Reaction { .. } => {}
-            other => {
-                return Err(Error::Storage(format!(
-                    "created reaction did not persist as a kind-7 rumor: {other:?}"
-                )));
+            Incoming::Reaction { reaction_id, .. } => {
+                let group_id_hex = hex::encode(group_id.as_slice());
+                let rumor_id_hex = reaction_id.to_hex();
+                let wrapper_id_hex = event.id.to_hex();
+                // Same durable-before-publish contract as `send_text`. The outbox
+                // key is the inner rumor id so a terminal publish failure can
+                // suppress that kind-7 from tallies (hosts refuse to resend an
+                // emoji already marked `mine`).
+                self.outbox_state.lock().unwrap().mark_pending(
+                    group_id_hex.clone(),
+                    rumor_id_hex.clone(),
+                    wrapper_id_hex,
+                    event.as_json(),
+                    Timestamp::now().as_secs(),
+                )?;
+                let _publish_ack =
+                    self.spawn_outbox_publish(rumor_id_hex, group_id_hex.clone(), event);
+                self.notify_conversation_changed(&group_id_hex);
+                Ok(())
             }
+            other => Err(Error::Storage(format!(
+                "created reaction did not persist as a kind-7 rumor: {other:?}"
+            ))),
         }
-        let group_id_hex = hex::encode(group_id.as_slice());
-        let event_id_hex = event.id.to_hex();
-        // Same durable-before-publish contract as `send_text`. Without this
-        // entry, `spawn_outbox_publish`'s failure path gets `None` from
-        // `mark_failed_by_message_id` and never auto-retries; restart recovery
-        // also cannot find the reaction.
-        self.outbox_state.lock().unwrap().mark_pending(
-            group_id_hex.clone(),
-            event_id_hex.clone(),
-            event_id_hex.clone(),
-            event.as_json(),
-            Timestamp::now().as_secs(),
-        )?;
-        let _publish_ack = self.spawn_outbox_publish(event_id_hex, group_id_hex.clone(), event);
-        self.notify_conversation_changed(&group_id_hex);
-        Ok(())
     }
 
     fn spawn_send_bookkeeping(
@@ -4528,6 +4535,7 @@ impl SonarClient {
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
+        let suppressed_reactions = self.engine.suppressed_reactions_handle();
         // Count the send before spawn so hosts that gate catch-up / shutdown on
         // `send_inflight == 0` cannot observe a gap between return and task start.
         send_inflight.fetch_add(1, Ordering::Relaxed);
@@ -4661,6 +4669,10 @@ impl SonarClient {
                     break;
                 };
                 if attempts >= crate::outbox::OUTBOX_RETRY_ATTEMPT_LIMIT {
+                    if let Ok(id) = EventId::from_hex(&message_id_hex) {
+                        suppressed_reactions.lock().unwrap().insert(id);
+                    }
+                    notify();
                     break;
                 }
                 let delay_secs = crate::outbox::outbox_auto_retry_delay_secs(attempts);
