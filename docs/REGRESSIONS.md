@@ -2760,11 +2760,13 @@ a valid whole-balance migration dies on the first "not enough funds" quote.
 
 **Guarded by:** `lib.rs::drain_steps_down_for_opaque_insufficient_funds`,
 `lib.rs::drain_refuses_destination_max_and_fee_cap`,
+`wallet.rs::host_source_backend_preserves_typed_insufficient_funds`,
 `WalletMigrationContractTest.breezProseInsufficientFundsIsTheDrainSignal`,
 `BreezMigrationSourceTests.testBreezProseInsufficientFundsIsTheDrainSignal`
 
 **Coverage (honest):** these tests pin the Rust planner's bounded step-down,
-both hard limits, and the three Breez prose phrases the hosts treat as
+both hard limits, the FFI adapter's typed `From<HostWalletError>` mapping
+(in-process, no UniFFI), and the three Breez prose phrases the hosts treat as
 `InsufficientFunds`. They still do not cross UniFFI with `HostWalletError`,
 and do not prove Android/JVM throws `HostWalletException.InsufficientFunds` or
 Apple lifts `HostWalletError.InsufficientFunds` back into Rust. The Apple

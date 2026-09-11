@@ -655,3 +655,66 @@ mod restore_unsent_plan {
         assert!(!unsent_plan_is_reusable(None));
     }
 }
+
+#[cfg(test)]
+mod host_wallet_error {
+    use super::*;
+
+    struct InsufficientHost;
+
+    impl HostMigrationSource for InsufficientHost {
+        fn balance_sats(&self) -> std::result::Result<u64, HostWalletError> {
+            Ok(10_000)
+        }
+        fn prepare(
+            &self,
+            _invoice: String,
+            _amount_sats: u64,
+        ) -> std::result::Result<HostSendQuote, HostWalletError> {
+            Err(HostWalletError::InsufficientFunds)
+        }
+        fn send(
+            &self,
+            _token: String,
+            _note: String,
+        ) -> std::result::Result<HostPayment, HostWalletError> {
+            Err(HostWalletError::Failed {
+                reason: "send must not run".into(),
+            })
+        }
+        fn lookup_payment(
+            &self,
+            _payment_hash: String,
+        ) -> std::result::Result<HostPaymentLookup, HostWalletError> {
+            Err(HostWalletError::Failed {
+                reason: "lookup must not run".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn host_source_backend_preserves_typed_insufficient_funds() {
+        assert!(matches!(
+            WalletError::from(HostWalletError::InsufficientFunds),
+            WalletError::InsufficientFunds
+        ));
+        match WalletError::from(HostWalletError::Failed {
+            reason: "timeout".into(),
+        }) {
+            WalletError::Backend(reason) => assert_eq!(reason, "timeout"),
+            other => panic!("failed host error must not become {other:?}"),
+        }
+
+        let backend = HostSourceBackend {
+            host: Arc::new(InsufficientHost),
+        };
+        let destination = sonar_wallet::classify_destination("lnbc1test");
+        let err = backend
+            .prepare_send(&destination, Some(1_000))
+            .expect_err("prepare must surface the host refusal");
+        assert!(
+            matches!(err, WalletError::InsufficientFunds),
+            "HostWalletError::InsufficientFunds must reach the planner as WalletError::InsufficientFunds, not a string, got {err:?}"
+        );
+    }
+}
