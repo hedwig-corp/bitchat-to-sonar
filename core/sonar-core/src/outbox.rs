@@ -87,6 +87,11 @@ impl OutboxState {
         self.entries.get(message_id_hex).map(|entry| entry.state)
     }
 
+    #[cfg(test)]
+    pub(crate) fn recorded_count(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn mark_pending(
         &mut self,
         group_id_hex: String,

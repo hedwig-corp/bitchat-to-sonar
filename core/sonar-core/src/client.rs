@@ -1766,6 +1766,12 @@ impl Drop for FrozenWakeGuard<'_> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimezoneShareDedupe {
+    zone: String,
+    member_count: usize,
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
@@ -1865,8 +1871,10 @@ pub struct SonarClient {
     /// cannot keep publishing.
     local_timezone: Arc<Mutex<Option<String>>>,
     /// Per-group dedupe for this process. Entries are installed before an
-    /// MLS share and removed on failure so the next trigger retries.
-    timezone_shared_with: Arc<Mutex<HashMap<String, String>>>,
+    /// MLS share and removed on failure so the next trigger retries. The
+    /// member count is part of the key so adding someone forces a resend
+    /// (MLS FS means they cannot decrypt the earlier epoch's rumor).
+    timezone_shared_with: Arc<Mutex<HashMap<String, TimezoneShareDedupe>>>,
     /// MLS group ids the host currently wants to receive our timezone.
     /// Empty means share with nobody, even if `local_timezone` is set.
     timezone_share_group_ids: Arc<Mutex<HashSet<String>>>,
@@ -7288,12 +7296,28 @@ impl SonarClient {
         for group in groups {
             let group_id = group.mls_group_id;
             let group_id_hex = hex::encode(group_id.as_slice());
+            let member_count = self
+                .engine
+                .members(&group_id)
+                .map(|members| members.len())
+                .unwrap_or(0);
             {
                 let mut shared = self.timezone_shared_with.lock().unwrap();
-                if shared.get(&group_id_hex) == Some(&zone) {
+                if shared.get(&group_id_hex)
+                    == Some(&TimezoneShareDedupe {
+                        zone: zone.clone(),
+                        member_count,
+                    })
+                {
                     continue;
                 }
-                shared.insert(group_id_hex.clone(), zone.clone());
+                shared.insert(
+                    group_id_hex.clone(),
+                    TimezoneShareDedupe {
+                        zone: zone.clone(),
+                        member_count,
+                    },
+                );
             }
             let (event, incoming) = {
                 let _epoch = self.membership_gate.read().await;
@@ -7320,13 +7344,28 @@ impl SonarClient {
                     continue;
                 }
             }
+            // Durable before publish: if every relay is down, reconnect
+            // retry_outbox can still send this control event. Skipping this
+            // leaves timezone_shared_with claiming success and suppresses
+            // later attempts until the zone or membership changes.
+            if let Err(err) = self.outbox_state.lock().unwrap().mark_pending(
+                group_id_hex.clone(),
+                event.id.to_hex(),
+                event.id.to_hex(),
+                event.as_json(),
+                Timestamp::now().as_secs(),
+            ) {
+                self.remove_failed_timezone_share(&group_id_hex, &zone);
+                tracing::debug!(%err, "timezone share outbox persist failed");
+                continue;
+            }
             let _publish_ack = self.spawn_outbox_publish(event.id.to_hex(), group_id_hex, event);
         }
     }
 
     fn remove_failed_timezone_share(&self, group_id_hex: &str, zone: &str) {
         let mut shared = self.timezone_shared_with.lock().unwrap();
-        if shared.get(group_id_hex).map(String::as_str) == Some(zone) {
+        if shared.get(group_id_hex).map(|r| r.zone.as_str()) == Some(zone) {
             shared.remove(group_id_hex);
         }
     }
@@ -10594,8 +10633,38 @@ mod tests {
                 .lock()
                 .unwrap()
                 .get(&group_id_hex)
-                .map(String::as_str),
+                .map(|r| r.zone.as_str()),
             Some("Europe/Zurich")
+        );
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            1,
+            "kind-449 must be in the durable outbox before publish so offline retries can find it"
+        );
+
+        alice
+            .set_timezone_share_groups(vec![group_id_hex.clone()])
+            .await;
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            1,
+            "same zone and membership must not encrypt a second rumor"
+        );
+
+        alice
+            .timezone_shared_with
+            .lock()
+            .unwrap()
+            .get_mut(&group_id_hex)
+            .unwrap()
+            .member_count = 0;
+        alice
+            .set_timezone_share_groups(vec![group_id_hex.clone()])
+            .await;
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            2,
+            "a membership-count change must resend so the new member can decrypt"
         );
 
         alice.set_timezone_share_groups(Vec::new()).await;
