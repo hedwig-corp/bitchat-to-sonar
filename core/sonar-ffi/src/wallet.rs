@@ -398,6 +398,8 @@ pub enum MigrationOutcome {
     Settled { cashu_confirmed_sats: u64 },
     /// Paid, not yet visible. NOT a failure — the wallet keeps reconciling;
     /// call `settle` again (the same call is the crash-resume path).
+    /// `cashu_confirmed_sats` is the destination wallet's confirmed balance,
+    /// never the invoice amount.
     Pending { cashu_confirmed_sats: u64 },
 }
 

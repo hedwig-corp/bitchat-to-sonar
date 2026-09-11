@@ -267,6 +267,10 @@ impl WalletBackend for MockWallet {
 }
 
 impl TrackedReceiveBackend for MockWallet {
+    fn confirmed_sats(&self) -> Result<u64> {
+        WalletBackend::balance(self).map(|b| b.confirmed_sats)
+    }
+
     fn create_tracked_receive(&self, request: &ReceiveRequest) -> Result<TrackedReceive> {
         self.ensure_connected()?;
         let amount_sats = match request.method {

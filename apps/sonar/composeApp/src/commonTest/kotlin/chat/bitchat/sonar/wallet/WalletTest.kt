@@ -90,3 +90,16 @@ class MoneyTest {
         }
     }
 }
+
+class WalletMigrationContractTest {
+    @Test fun pendingPhaseCarriesDestConfirmedSatsNotInvoice() {
+        val invoiceSats = 2_000uL
+        val destConfirmedSats = 500uL
+        val pending = MigrationPhase.PendingSettlement(destConfirmedSats)
+        val result = MigrationResultUi.Pending(destConfirmedSats)
+        assertEquals(destConfirmedSats, pending.cashuSats)
+        assertEquals(destConfirmedSats, result.cashuSats)
+        assertNotEquals(invoiceSats, pending.cashuSats)
+        assertNotEquals(invoiceSats, result.cashuSats)
+    }
+}

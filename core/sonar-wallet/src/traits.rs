@@ -144,6 +144,10 @@ pub trait WalletBackend: Send + Sync {
 /// specific quote created during planning is issued; aggregate balance changes
 /// are deliberately not evidence for this contract.
 pub trait TrackedReceiveBackend: Send + Sync {
+    /// Confirmed destination funds. Pending migration outcomes report this
+    /// figure, never the invoice amount — hosts map it to `cashu_confirmed_sats`.
+    fn confirmed_sats(&self) -> Result<u64>;
+
     fn create_tracked_receive(&self, request: &ReceiveRequest) -> Result<TrackedReceive>;
 
     fn reconcile_tracked_receive(

@@ -89,8 +89,14 @@ pub struct MigrationPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
-    Settled { amount_sats: u64 },
-    Pending { amount_sats: u64 },
+    Settled {
+        amount_sats: u64,
+    },
+    /// Still waiting on the mint quote. `amount_sats` is the destination's
+    /// confirmed balance, never the invoice amount.
+    Pending {
+        amount_sats: u64,
+    },
 }
 
 pub struct MigrationEngine<'a> {
@@ -338,7 +344,7 @@ impl<'a> MigrationEngine<'a> {
                 MigrationAttemptState::SourcePaid | MigrationAttemptState::MintPaid
             ) {
                 return Ok(Settlement::Pending {
-                    amount_sats: attempt.amount_sats,
+                    amount_sats: Self::dst(self.dest.confirmed_sats())?,
                 });
             }
             match self
@@ -349,7 +355,7 @@ impl<'a> MigrationEngine<'a> {
                     attempt.state = MigrationAttemptState::MintPaid;
                     journal.store_unlocked(Some(&attempt))?;
                     Ok(Settlement::Pending {
-                        amount_sats: attempt.amount_sats,
+                        amount_sats: Self::dst(self.dest.confirmed_sats())?,
                     })
                 }
                 Ok(TrackedReceiveState::Settled { amount_sats }) => {
@@ -379,7 +385,7 @@ impl<'a> MigrationEngine<'a> {
             return Err(MigrateError::AttemptMismatch);
         }
         let mut outcome = Settlement::Pending {
-            amount_sats: attempt.amount_sats,
+            amount_sats: Self::dst(self.dest.confirmed_sats())?,
         };
         for _ in 0..polls.max(1) {
             outcome = self.resume(request_timeout)?;
@@ -488,15 +494,24 @@ mod tests {
     struct Destination {
         next: Mutex<u64>,
         quotes: Mutex<HashMap<String, (u64, bool)>>,
+        confirmed_sats: Mutex<u64>,
     }
 
     impl Destination {
         fn settle(&self, id: &str) {
             self.quotes.lock().unwrap().get_mut(id).unwrap().1 = true;
         }
+
+        fn credit(&self, sats: u64) {
+            *self.confirmed_sats.lock().unwrap() += sats;
+        }
     }
 
     impl TrackedReceiveBackend for Destination {
+        fn confirmed_sats(&self) -> sonar_wallet::Result<u64> {
+            Ok(*self.confirmed_sats.lock().unwrap())
+        }
+
         fn create_tracked_receive(
             &self,
             request: &ReceiveRequest,
@@ -591,6 +606,56 @@ mod tests {
         }
     }
 
+    struct MismatchingPrepareSource(MockWallet);
+
+    impl WalletBackend for MismatchingPrepareSource {
+        fn capabilities(&self) -> WalletCapabilities {
+            self.0.capabilities()
+        }
+        fn connect(&self) -> sonar_wallet::Result<()> {
+            self.0.connect()
+        }
+        fn disconnect(&self) -> sonar_wallet::Result<()> {
+            self.0.disconnect()
+        }
+        fn is_connected(&self) -> bool {
+            self.0.is_connected()
+        }
+        fn balance(&self) -> sonar_wallet::Result<Balance> {
+            self.0.balance()
+        }
+        fn receive(&self, request: &ReceiveRequest) -> sonar_wallet::Result<String> {
+            self.0.receive(request)
+        }
+        fn parse_destination(&self, input: &str) -> sonar_wallet::Result<WalletDestination> {
+            self.0.parse_destination(input)
+        }
+        fn prepare_send(
+            &self,
+            destination: &WalletDestination,
+            amount_sats: Option<u64>,
+        ) -> sonar_wallet::Result<PreparedSend> {
+            let mut prepared = self.0.prepare_send(destination, amount_sats)?;
+            prepared.amount_sats = prepared.amount_sats.saturating_add(1);
+            Ok(prepared)
+        }
+        fn send(&self, prepared: &PreparedSend, note: &str) -> sonar_wallet::Result<Payment> {
+            self.0.send(prepared, note)
+        }
+        fn list_recent_payments(&self, limit: u32) -> sonar_wallet::Result<Vec<Payment>> {
+            self.0.list_recent_payments(limit)
+        }
+        fn add_event_listener(&self, listener: Arc<dyn WalletEventListener>) -> u64 {
+            self.0.add_event_listener(listener)
+        }
+        fn remove_event_listener(&self, id: u64) {
+            self.0.remove_event_listener(id)
+        }
+        fn wipe_local_storage(&self) -> sonar_wallet::Result<()> {
+            self.0.wipe_local_storage()
+        }
+    }
+
     fn setup(balance: u64) -> (MockWallet, Destination, tempfile::TempDir, MigrationJournal) {
         let source = MockWallet::new(balance);
         source.connect().unwrap();
@@ -614,9 +679,11 @@ mod tests {
         let plan = engine.plan_amount(2_000).unwrap();
         engine.execute_once(&plan).unwrap();
         source.simulate_receive(2_000);
+        destination.credit(500);
         assert_eq!(
             engine.resume(Duration::from_secs(1)).unwrap(),
-            Settlement::Pending { amount_sats: 2_000 }
+            Settlement::Pending { amount_sats: 500 },
+            "pending must report dest confirmed sats, not the invoice or an unrelated source credit"
         );
         destination.settle(&plan.settlement_id);
         assert_eq!(
@@ -625,6 +692,24 @@ mod tests {
                 .unwrap(),
             Settlement::Settled { amount_sats: 2_000 }
         );
+    }
+
+    #[test]
+    fn planning_rejects_a_prepared_amount_that_does_not_match_the_quote() {
+        let source = MockWallet::new(10_000);
+        source.connect().unwrap();
+        let source = MismatchingPrepareSource(source);
+        let destination = Destination::default();
+        let dir = tempfile::tempdir().unwrap();
+        let journal = MigrationJournal::new(dir.path(), b"account", b"mint").unwrap();
+        let engine = MigrationEngine::new(&source, &destination, limits(None, Some(10)), &journal);
+        assert!(matches!(
+            engine.plan_amount(1_000),
+            Err(MigrateError::PreparedAmountMismatch {
+                prepared_sats: 1_001,
+                requested_sats: 1_000
+            })
+        ));
     }
 
     #[test]

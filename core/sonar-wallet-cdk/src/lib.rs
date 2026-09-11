@@ -25,6 +25,7 @@
 //! and `connect` never reports someone else's in-flight attempt as success.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -93,6 +94,15 @@ fn is_our_artifact(name: &str) -> bool {
     name.strip_prefix(RESTORED_MARKER_PREFIX)
         .and_then(|rest| rest.strip_prefix('.'))
         .is_some_and(|suffix| suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Whether a NUT-13 restore scan is still owed.
+///
+/// A surviving `cashu.restored.<mint>` marker is not enough: if `cashu.redb`
+/// is gone, CDK creates an empty store and the marker would otherwise skip
+/// restore forever, presenting a zero balance over recoverable funds.
+fn needs_nut13_restore(working_dir: &Path, restore_marker_name: &str) -> bool {
+    !working_dir.join(restore_marker_name).exists() || !working_dir.join(DB_FILE).exists()
 }
 
 /// Connection state; one mutex, same discipline as the Breez backend.
@@ -345,12 +355,6 @@ impl CdkWallet {
         // Before touching the store: never open another account's proofs.
         self.check_account_binding()?;
         let db_path = self.config.working_dir.join(DB_FILE);
-        let needs_restore = !self
-            .config
-            .working_dir
-            .join(self.restore_marker_name())
-            .exists()
-            || !db_path.exists();
         let localstore = cdk_redb::WalletRedbDatabase::new(&db_path)
             .map_err(|e| WalletError::Backend(format!("open {}: {e}", db_path.display())))?;
         let wallet = WalletBuilder::new()
@@ -360,7 +364,10 @@ impl CdkWallet {
             .seed(self.seed64())
             .build()
             .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))?;
-        Ok((wallet, needs_restore))
+        Ok((
+            wallet,
+            needs_nut13_restore(&self.config.working_dir, &self.restore_marker_name()),
+        ))
     }
 
     /// One pass of the pending-mint-quote watcher (best-effort: errors are
@@ -591,6 +598,10 @@ impl Drop for CdkWallet {
 }
 
 impl TrackedReceiveBackend for CdkWallet {
+    fn confirmed_sats(&self) -> Result<u64> {
+        WalletBackend::balance(self).map(|b| b.confirmed_sats)
+    }
+
     fn create_tracked_receive(&self, request: &ReceiveRequest) -> Result<TrackedReceive> {
         let wallet = self.wallet()?;
         let method = match request.method {
@@ -1309,6 +1320,30 @@ mod tests {
                 .unwrap()
                 .trim(),
             wallet.account_fingerprint()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn surviving_restore_marker_does_not_skip_nut13_when_proof_db_is_gone() {
+        let dir = std::env::temp_dir().join("sonar-cdk-nut13-restore-gate-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = "cashu.restored.00c0ffee";
+        std::fs::write(dir.join(marker), b"done").unwrap();
+        assert!(
+            needs_nut13_restore(&dir, marker),
+            "missing cashu.redb must restore even if the mint marker survived"
+        );
+        std::fs::write(dir.join(DB_FILE), b"proofs").unwrap();
+        assert!(
+            !needs_nut13_restore(&dir, marker),
+            "marker + proof db present ⇒ skip"
+        );
+        std::fs::remove_file(dir.join(marker)).unwrap();
+        assert!(
+            needs_nut13_restore(&dir, marker),
+            "missing marker still restores even with a proof db"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

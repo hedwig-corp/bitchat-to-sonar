@@ -71,7 +71,8 @@ sealed interface MigrationResultUi {
     /** Funds are in the Cashu wallet. */
     data class Settled(val cashuSats: ULong) : MigrationResultUi
 
-    /** Paid, not yet visible. Recoverable, not a failure — settle again. */
+    /** Paid, not yet visible. Recoverable, not a failure — settle again.
+     *  `cashuSats` is dest confirmed balance, never the invoice amount. */
     data class Pending(val cashuSats: ULong) : MigrationResultUi
 }
 
