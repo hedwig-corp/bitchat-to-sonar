@@ -102,4 +102,41 @@ class WalletMigrationContractTest {
         assertNotEquals(invoiceSats, pending.cashuSats)
         assertNotEquals(invoiceSats, result.cashuSats)
     }
+
+    @Test fun executeErrorAfterSourceAcceptedIsPendingNotANewQuote() {
+        val dest = 500uL
+        val failed = "payment failed"
+        for (state in listOf(
+            MigrationAttemptStateUi.Sending,
+            MigrationAttemptStateUi.PaymentUnknown,
+            MigrationAttemptStateUi.SourcePending,
+            MigrationAttemptStateUi.SourcePaid,
+            MigrationAttemptStateUi.MintPaid,
+        )) {
+            assertTrue(migrationAttemptBlocksNewQuote(state), "$state must not mint a second invoice")
+            assertEquals(
+                MigrationPhase.PendingSettlement(dest),
+                phaseAfterExecuteError(state, dest, failed),
+            )
+        }
+        assertEquals(
+            MigrationPhase.Settled(dest),
+            phaseAfterExecuteError(MigrationAttemptStateUi.Settled, dest, failed),
+        )
+        for (state in listOf(
+            MigrationAttemptStateUi.AwaitingConsent,
+            MigrationAttemptStateUi.ExpiredUnsent,
+            MigrationAttemptStateUi.SourceFailed,
+        )) {
+            assertFalse(migrationAttemptBlocksNewQuote(state))
+            assertEquals(
+                MigrationPhase.Failed(failed),
+                phaseAfterExecuteError(state, dest, failed),
+            )
+        }
+        assertEquals(
+            MigrationPhase.Failed(failed),
+            phaseAfterExecuteError(null, dest, failed),
+        )
+    }
 }

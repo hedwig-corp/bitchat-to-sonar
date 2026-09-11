@@ -294,17 +294,14 @@ final class SonarMigrationModel: ObservableObject {
             await refreshBalances(source: source)
         } catch {
             let status = try? await Task.detached { try engine.status() }.value
-            if let status, status.state != .awaitingConsent, status.state != .expiredUnsent,
-               status.state != .sourceFailed {
-                phase = .pendingSettlement(cashuSats: cashuBalanceSats)
-            } else {
-                phase = .failed(
-                    String(
-                        format: String(localized: "The payment did not go through: %@"),
-                        String(describing: error)
-                    )
+            phase = Self.phaseAfterExecuteError(
+                state: status?.state,
+                destConfirmedSats: cashuBalanceSats,
+                failedMessage: String(
+                    format: String(localized: "The payment did not go through: %@"),
+                    String(describing: error)
                 )
-            }
+            )
             await refreshBalances(source: source)
         }
     }
@@ -367,6 +364,30 @@ final class SonarMigrationModel: ObservableObject {
         default:
             phase = .pendingSettlement(cashuSats: cashuBalanceSats)
         }
+    }
+
+    /// A new quote is unsafe once a source payment may exist. Matches Compose
+    /// `migrationAttemptBlocksNewQuote` so a host timeout after Breez accepted
+    /// cannot look like a failed tap that should try another invoice.
+    static func attemptBlocksNewQuote(_ state: MigrationAttemptState) -> Bool {
+        switch state {
+        case .awaitingConsent, .expiredUnsent, .sourceFailed: return false
+        default: return true
+        }
+    }
+
+    static func phaseAfterExecuteError(
+        state: MigrationAttemptState?,
+        destConfirmedSats: UInt64,
+        failedMessage: String
+    ) -> Phase {
+        guard let state, attemptBlocksNewQuote(state) else {
+            return .failed(failedMessage)
+        }
+        if state == .settled {
+            return .settled(cashuSats: destConfirmedSats)
+        }
+        return .pendingSettlement(cashuSats: destConfirmedSats)
     }
 }
 

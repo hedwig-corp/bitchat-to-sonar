@@ -240,20 +240,14 @@ fun WalletMigrationRoute(state: SonarAppState) {
             scope.launch {
                 runCatching { c.execute(q.planId) }
                     .getOrElse {
-                        phase = when (runCatching { c.status() }.getOrNull()?.state) {
-                            MigrationAttemptStateUi.Sending,
-                            MigrationAttemptStateUi.PaymentUnknown,
-                            MigrationAttemptStateUi.SourcePending,
-                            MigrationAttemptStateUi.SourcePaid,
-                            MigrationAttemptStateUi.MintPaid ->
-                                MigrationPhase.PendingSettlement(cashuBalance)
-                            else -> MigrationPhase.Failed(
-                                paymentFailedTemplate.replace(
-                                    errorMarker,
-                                    it.message ?: it.toString(),
-                                )
-                            )
-                        }
+                        phase = phaseAfterExecuteError(
+                            state = runCatching { c.status() }.getOrNull()?.state,
+                            destConfirmedSats = cashuBalance,
+                            failedMessage = paymentFailedTemplate.replace(
+                                errorMarker,
+                                it.message ?: it.toString(),
+                            ),
+                        )
                         runCatching { state.refreshWalletBalance() }
                         return@launch
                     }

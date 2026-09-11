@@ -77,6 +77,32 @@ sealed interface MigrationResultUi {
 }
 
 /**
+ * A new quote is unsafe once a source payment may exist. Matches Apple
+ * `SonarMigrationModel.confirmAndMigrate` so a host timeout after Breez
+ * accepted cannot look like a failed tap that should try another invoice.
+ */
+fun migrationAttemptBlocksNewQuote(state: MigrationAttemptStateUi): Boolean =
+    when (state) {
+        MigrationAttemptStateUi.AwaitingConsent,
+        MigrationAttemptStateUi.ExpiredUnsent,
+        MigrationAttemptStateUi.SourceFailed -> false
+        else -> true
+    }
+
+fun phaseAfterExecuteError(
+    state: MigrationAttemptStateUi?,
+    destConfirmedSats: ULong,
+    failedMessage: String,
+): MigrationPhase =
+    when {
+        state == null || !migrationAttemptBlocksNewQuote(state) ->
+            MigrationPhase.Failed(failedMessage)
+        state == MigrationAttemptStateUi.Settled ->
+            MigrationPhase.Settled(destConfirmedSats)
+        else -> MigrationPhase.PendingSettlement(destConfirmedSats)
+    }
+
+/**
  * Build a controller, or `null` where no Breez wallet is configured — the one
  * case that means "migration not offered" rather than "something broke".
  * Anything else throws, carrying its own reason.
