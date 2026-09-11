@@ -679,12 +679,14 @@ impl MarmotEngine {
             }
             Err(e) => return Err(Error::Storage(e.to_string())),
         };
-        Ok(Self {
+        let sidecar_path = crate::reaction::reaction_store_path_for_db(path);
+        let rebuild = crate::reaction::reaction_store_needs_rebuild(&sidecar_path);
+        let engine = Self {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
             reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::load(Some(
-                &crate::reaction::reaction_store_path_for_db(path),
+                &sidecar_path,
             ))),
             suppressed_reactions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             // Persistent engine ⇒ persisted window. The iOS NSE builds a
@@ -693,7 +695,11 @@ impl MarmotEngine {
             dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::load(path)),
             db_path: Some(path.to_path_buf()),
             key_package_slot_memo: std::sync::Mutex::new(None),
-        })
+        };
+        if rebuild {
+            engine.rebuild_reaction_store_from_storage()?;
+        }
+        Ok(engine)
     }
 
     pub fn identity(&self) -> &Identity {
@@ -2396,6 +2402,25 @@ impl MarmotEngine {
         if let Err(err) = store.save(&path) {
             tracing::warn!(%err, "reaction store persist failed");
         }
+    }
+
+    /// One-shot derived-index rebuild from MDK rows. Used after account restore
+    /// (sidecar wiped) and when the sidecar is missing/unreadable — never on
+    /// the chat-open paging path.
+    fn rebuild_reaction_store_from_storage(&self) -> Result<()> {
+        let groups = dispatch!(&self.storage, |mdk| mdk.get_groups())?;
+        let mut rebuilt = crate::reaction::ReactionStore::default();
+        for g in groups {
+            let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(&g.mls_group_id, None))?;
+            for m in msgs {
+                if let Some(r) = crate::reaction::parse_stored(&m) {
+                    rebuilt.record(&g.mls_group_id, r);
+                }
+            }
+        }
+        *self.reaction_store.lock().unwrap() = rebuilt;
+        self.persist_reaction_store();
+        Ok(())
     }
 
     fn reaction_is_suppressed(&self, id: &EventId) -> bool {

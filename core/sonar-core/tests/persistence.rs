@@ -450,6 +450,75 @@ async fn reaction_index_survives_engine_reopen() {
 }
 
 #[tokio::test]
+async fn restore_rebuilds_reaction_index_and_drops_ghosts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let sidecar = db_path.with_file_name("marmot.sqlite.sonar-reactions.json");
+
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let alice_identity = Identity::generate();
+
+    let (group_id, parent_id) = {
+        let alice = MarmotEngine::persistent(alice_identity.clone(), &db_path, DB_KEY)
+            .expect("open persistent engine");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], Vec::new())
+            .expect("create local group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("merge local group");
+        let parent_event = alice
+            .create_text_message(&group_id, "old parent")
+            .expect("parent event");
+        let Incoming::Message(parent) = alice
+            .process_incoming(&parent_event)
+            .await
+            .expect("process parent")
+        else {
+            panic!("parent must persist as a chat row");
+        };
+        alice
+            .create_and_process_reaction(&group_id, &parent.id, &parent.sender, "👍")
+            .expect("react");
+        (group_id, parent.id)
+    };
+
+    let db_key_hex = "42".repeat(32);
+    let package = sonar_core::account_backup::read_account_backup_package(&db_path, &db_key_hex)
+        .expect("read backup");
+    std::fs::write(
+        &sidecar,
+        r#"{"version":1,"entries":[{"group_id_hex":"ab","target_id_hex":"11","id_hex":"22","sender":"npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq","emoji":"🔥"}]}"#,
+    )
+    .expect("plant ghost sidecar");
+
+    sonar_core::account_backup::write_account_backup_package(&db_path, &package)
+        .expect("restore package");
+    assert!(
+        !sidecar.exists(),
+        "restore must drop the derived sidecar so ghosts cannot survive"
+    );
+
+    let alice =
+        MarmotEngine::persistent(alice_identity, &db_path, DB_KEY).expect("reopen after restore");
+    let overlay = alice
+        .reaction_tallies_for(&group_id, &[parent_id])
+        .expect("overlay after restore");
+    assert_eq!(
+        overlay[0].1.len(),
+        1,
+        "restored DB reactions must be rebuilt"
+    );
+    assert_eq!(overlay[0].1[0].emoji, "👍");
+    assert!(
+        overlay[0].1.iter().all(|t| t.emoji != "🔥"),
+        "post-backup ghost chips must not survive restore"
+    );
+}
+
+#[tokio::test]
 async fn restart_watermark_ignores_later_local_messages() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("marmot.sqlite");

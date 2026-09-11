@@ -206,6 +206,35 @@ pub(crate) fn reaction_store_path_for_db(db_path: &Path) -> PathBuf {
     db_path.with_file_name(format!("{file_name}{REACTION_STORE_FILE_SUFFIX}"))
 }
 
+pub(crate) fn reaction_store_tmp_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sonar-reactions.json")
+    ))
+}
+
+/// True when the sidecar is missing or unreadable, so the derived index must
+/// be rebuilt from the encrypted DB (account restore, first open, corrupt file).
+pub(crate) fn reaction_store_needs_rebuild(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return true;
+    };
+    let Ok(disk) = serde_json::from_slice::<ReactionStoreDisk>(&bytes) else {
+        return true;
+    };
+    disk.version != REACTION_STORE_VERSION
+}
+
+/// Drop the derived sidecar so a restore cannot keep post-backup ghost chips.
+pub(crate) fn remove_reaction_store_files(db_path: &Path) {
+    let path = reaction_store_path_for_db(db_path);
+    let tmp = reaction_store_tmp_path(&path);
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&tmp);
+}
+
 impl ReactionStore {
     pub fn load(path: Option<&Path>) -> Self {
         let Some(path) = path else {
@@ -283,12 +312,7 @@ impl ReactionStore {
             entries,
         };
         let bytes = serde_json::to_vec(&disk)?;
-        let tmp = path.with_file_name(format!(
-            "{}.tmp",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("sonar-reactions.json")
-        ));
+        let tmp = reaction_store_tmp_path(path);
         fs::write(&tmp, bytes)
             .map_err(|e| Error::Storage(format!("write reaction store {}: {e}", tmp.display())))?;
         fs::rename(&tmp, path).map_err(|e| {
