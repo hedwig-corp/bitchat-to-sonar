@@ -4536,6 +4536,8 @@ impl SonarClient {
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
         let suppressed_reactions = self.engine.suppressed_reactions_handle();
+        let reaction_store = self.engine.reaction_store_handle();
+        let reaction_db_path = self.engine.db_path().map(PathBuf::from);
         // Count the send before spawn so hosts that gate catch-up / shutdown on
         // `send_inflight == 0` cannot observe a gap between return and task start.
         send_inflight.fetch_add(1, Ordering::Relaxed);
@@ -4671,6 +4673,20 @@ impl SonarClient {
                 if attempts >= crate::outbox::OUTBOX_RETRY_ATTEMPT_LIMIT {
                     if let Ok(id) = EventId::from_hex(&message_id_hex) {
                         suppressed_reactions.lock().unwrap().insert(id);
+                        let removed = {
+                            let mut store = reaction_store.lock().unwrap();
+                            store.remove_id(id)
+                        };
+                        if removed {
+                            if let Some(ref db_path) = reaction_db_path {
+                                let path =
+                                    crate::reaction::reaction_store_path_for_db(db_path);
+                                let store = reaction_store.lock().unwrap();
+                                if let Err(err) = store.save(&path) {
+                                    tracing::warn!(%err, "reaction store persist failed");
+                                }
+                            }
+                        }
                     }
                     notify();
                     break;

@@ -353,7 +353,8 @@ pub struct MarmotEngine {
     /// one in-flight mutation, never for a relay fetch.
     write_lock: std::sync::Mutex<()>,
     /// Kind-7 index keyed by target. See [`crate::reaction::ReactionStore`].
-    reaction_store: std::sync::Mutex<crate::reaction::ReactionStore>,
+    /// `Arc` so the outbox publish task can `remove_id` on terminal failure.
+    reaction_store: Arc<std::sync::Mutex<crate::reaction::ReactionStore>>,
     /// Inner rumor ids whose outbox publish exhausted auto-retries. Hydrate
     /// skips these so a locally echoed `mine` chip cannot look sent forever.
     suppressed_reactions: Arc<std::sync::Mutex<HashSet<EventId>>>,
@@ -626,7 +627,9 @@ impl MarmotEngine {
             storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
             identity,
             write_lock: std::sync::Mutex::new(()),
-            reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::default()),
+            reaction_store: Arc::new(std::sync::Mutex::new(
+                crate::reaction::ReactionStore::default(),
+            )),
             suppressed_reactions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::in_memory()),
             db_path: None,
@@ -685,8 +688,8 @@ impl MarmotEngine {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
-            reaction_store: std::sync::Mutex::new(crate::reaction::ReactionStore::load(Some(
-                &sidecar_path,
+            reaction_store: Arc::new(std::sync::Mutex::new(crate::reaction::ReactionStore::load(
+                Some(&sidecar_path),
             ))),
             suppressed_reactions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             // Persistent engine ⇒ persisted window. The iOS NSE builds a
@@ -2276,7 +2279,15 @@ impl MarmotEngine {
     /// deleting a conversation in Signal/iMessage). Idempotent.
     pub fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         let _mls = self.mls_write();
-        Ok(dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?)
+        dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?;
+        let removed = {
+            let mut store = self.reaction_store.lock().unwrap();
+            store.remove_group(group_id)
+        };
+        if removed {
+            self.persist_reaction_store();
+        }
+        Ok(())
     }
 
     fn to_membership_update(
@@ -2444,6 +2455,16 @@ impl MarmotEngine {
 
     pub(crate) fn suppressed_reactions_handle(&self) -> Arc<std::sync::Mutex<HashSet<EventId>>> {
         Arc::clone(&self.suppressed_reactions)
+    }
+
+    pub(crate) fn reaction_store_handle(
+        &self,
+    ) -> Arc<std::sync::Mutex<crate::reaction::ReactionStore>> {
+        Arc::clone(&self.reaction_store)
+    }
+
+    pub(crate) fn db_path(&self) -> Option<&Path> {
+        self.db_path.as_deref()
     }
 
     /// Seed suppressions from durable outbox rows that have hit the attempt cap.

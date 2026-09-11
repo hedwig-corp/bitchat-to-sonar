@@ -235,6 +235,43 @@ pub(crate) fn remove_reaction_store_files(db_path: &Path) {
     let _ = fs::remove_file(&tmp);
 }
 
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl ReactionStore {
     pub fn load(path: Option<&Path>) -> Self {
         let Some(path) = path else {
@@ -315,7 +352,8 @@ impl ReactionStore {
         let tmp = reaction_store_tmp_path(path);
         fs::write(&tmp, bytes)
             .map_err(|e| Error::Storage(format!("write reaction store {}: {e}", tmp.display())))?;
-        fs::rename(&tmp, path).map_err(|e| {
+        atomic_replace_file(&tmp, path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
             Error::Storage(format!("replace reaction store {}: {e}", path.display()))
         })?;
         Ok(())
@@ -352,6 +390,14 @@ impl ReactionStore {
             !entries.is_empty()
         });
         changed
+    }
+
+    /// Drop every reaction belonging to a locally deleted group.
+    pub fn remove_group(&mut self, group_id: &mdk_core::GroupId) -> bool {
+        let gk = group_key(group_id);
+        let before = self.by_target.len();
+        self.by_target.retain(|(g, _), _| g != &gk);
+        self.by_target.len() != before
     }
 
     pub fn for_targets(
@@ -531,6 +577,22 @@ mod tests {
     }
 
     #[test]
+    fn store_remove_group_drops_that_group_only() {
+        let (parent, other, me, _) = ids();
+        let group_a = mdk_core::GroupId::from_slice(&[0xABu8; 16]);
+        let group_b = mdk_core::GroupId::from_slice(&[0xCDu8; 16]);
+        let mut store = ReactionStore::default();
+        store.record(&group_a, rx(1, parent, me, "👍"));
+        store.record(&group_b, rx(2, other, me, "🔥"));
+        assert!(store.remove_group(&group_a));
+        let mut targets = HashSet::new();
+        targets.insert(parent);
+        assert!(store.for_targets(&group_a, &targets).is_empty());
+        targets.insert(other);
+        assert_eq!(store.for_targets(&group_b, &targets).len(), 1);
+    }
+
+    #[test]
     fn store_round_trips_through_sidecar() {
         let (parent, _, me, _) = ids();
         // MLS GroupId is 16 bytes. Filtering `len() != 32` on load would pass a
@@ -541,11 +603,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("marmot.sqlite.sonar-reactions.json");
         store.save(&path).expect("save");
+        store.record(&group, rx(2, parent, me, "🔥"));
+        store.save(&path).expect("replace existing sidecar");
         let loaded = ReactionStore::load(Some(&path));
         let mut targets = HashSet::new();
         targets.insert(parent);
         let found = loaded.for_targets(&group, &targets);
-        assert_eq!(found.len(), 1);
+        assert_eq!(found.len(), 2);
         assert_eq!(found[0].emoji, "👍");
         assert_eq!(found[0].sender, me);
     }
