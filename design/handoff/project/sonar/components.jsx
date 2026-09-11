@@ -219,6 +219,52 @@ function bcRenderText(text) {
 }
 const bcMentionsMe = (text, me) => !!text && new RegExp('@(' + (me || 'you') + '|you|everyone)\\b', 'i').test(text);
 
+/* ── Local time sharing — IANA zone only, inside encrypted chats ── */
+function bcMyZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Europe/Zurich'; } catch (e) { return 'Europe/Zurich'; }
+}
+function bcZoneClock(tz, at) {
+  const d = at || new Date();
+  try { return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', timeZone: tz }).format(d); } catch (e) { return ''; }
+}
+function bcZoneOffsetMin(tz, at) {
+  const d = at || new Date();
+  try {
+    const p = {};
+    new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      .formatToParts(d).forEach((x) => { p[x.type] = x.value; });
+    const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute);
+    return Math.round((asUTC - Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes())) / 60000);
+  } catch (e) { return 0; }
+}
+/* words for how far a zone is from the viewer's own — '' when identical */
+function bcZoneDelta(tz, at) {
+  const d = at || new Date();
+  const diff = bcZoneOffsetMin(tz, d) - bcZoneOffsetMin(bcMyZone(), d);
+  if (!diff) return '';
+  const abs = Math.abs(diff), h = Math.floor(abs / 60), m = abs % 60;
+  const amount = m === 0 ? h + (h === 1 ? ' hour' : ' hours') : h + 'h ' + m + 'm';
+  return amount + (diff > 0 ? ' ahead' : ' behind');
+}
+/* repaint the visible clock on the minute — no network traffic */
+function useBcMinute() {
+  const [, tick] = React.useState(0);
+  React.useEffect(() => {
+    let id;
+    const schedule = () => {
+      const now = new Date();
+      id = setTimeout(() => { tick((n) => n + 1); schedule(); }, (60 - now.getSeconds()) * 1000 + 50);
+    };
+    schedule();
+    return () => clearTimeout(id);
+  }, []);
+}
+/* per-conversation override, falling back to the Settings default */
+function bcSharesTime(app, convId) {
+  const o = (app.tzShare || {})[convId];
+  return o === undefined ? !!(app.prefs && app.prefs.shareLocalTime) : !!o;
+}
+
 function bcReplyFrom(m, peerName) {
   return { author: m.mine ? 'You' : m.author || peerName || 'Them', text: m.text || bcMediaWord(m.media) };
 }
@@ -925,5 +971,6 @@ Object.assign(window, {
   bcHash, Avatar, PlaceTile, GroupAvatar, SupporterBadge, StatusChip, ConvRow, MuteSheet, MUTE_DURATIONS, SectionLabel,
   NavHeader, Banner, MsgBubble, MediaBubble, NudgeMsg, MsgList, Composer, Sheet, ActionRow, AttachActions, Bars,
   BC_REACTIONS, bcReplyFrom, ReplyQuote, ReactionRow, useBcPress, bcRenderText, bcMentionsMe,
+  bcMyZone, bcZoneClock, bcZoneOffsetMin, bcZoneDelta, useBcMinute, bcSharesTime,
   SettingsCard, SettingsRow, bcSampleMedia, bcVoiceMedia, bcMediaWord, fmtDur
 });

@@ -70,6 +70,13 @@ class MainActivity : ComponentActivity() {
             startMeshRadio()
         }
 
+    private val timezoneChangedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != Intent.ACTION_TIMEZONE_CHANGED) return
+            SonarLifecycle.onSystemTimezoneChanged?.invoke()
+        }
+    }
+
     /**
      * Airplane mode (and any manual Bluetooth toggle) powers the adapter down
      * without telling the app: the scan and advertiser die, `scanning` stays
@@ -162,6 +169,10 @@ class MainActivity : ComponentActivity() {
         registerReceiver(
             adapterStateReceiver,
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+        )
+        registerReceiver(
+            timezoneChangedReceiver,
+            IntentFilter(Intent.ACTION_TIMEZONE_CHANGED),
         )
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         setContent {
@@ -629,6 +640,7 @@ class MainActivity : ComponentActivity() {
         debugMeshGeneration++
         debugHandler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(adapterStateReceiver) }
+        runCatching { unregisterReceiver(timezoneChangedReceiver) }
         MeshRadio.stop()
         super.onDestroy()
     }

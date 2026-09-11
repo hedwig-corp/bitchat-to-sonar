@@ -208,6 +208,12 @@ fun SonarSettingsScreen(state: SonarAppState) {
 
             SNSectionLabel("Privacy & safety")
             SNSettingsCard {
+                SNSettingsRow(
+                    icon = SNIconName.Globe,
+                    label = "Share local time",
+                    sub = "Default for encrypted chats. You can also turn it on or off in each chat.",
+                    toggle = state.prefBool("shareLocalTime"),
+                ) { state.toggleShareLocalTime() }
                 SNXSettingsRow(
                     label = "App lock",
                     sub = "Require your device unlock to open Sonar",

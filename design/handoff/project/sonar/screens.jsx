@@ -666,9 +666,11 @@ function JoinViaLinkSheet({ onClose, onJoin }) {
   );
 }
 
-function GroupInfoScreen({ app, nav, pop, push, groupId, onLeave }) {
+function GroupInfoScreen({ app, nav, pop, push, groupId, onLeave, onTzShare }) {
   const group = (BC_DATA.groups || []).find((g) => g.id === groupId) || BC_DATA.groups[0];
   const { mem, label } = groupReach(group);
+  useBcMinute();
+  const sharing = bcSharesTime(app, group.id);
   const [inviteSheet, setInviteSheet] = React.useState(false);
   const [reqSheet, setReqSheet] = React.useState(false);
   const pendingCount = SAMPLE_REQUESTS.length;
@@ -721,12 +723,18 @@ function GroupInfoScreen({ app, nav, pop, push, groupId, onLeave }) {
         </div>
         <div className="bc-note" style={{ padding: '8px 16px 0' }}>Tagged members are notified even if they muted the group. Mentions are part of the encrypted message — relays never see who you tagged, and someone out of Bluetooth range still gets it over the internet.</div>
 
+        <SectionLabel>Privacy</SectionLabel>
+        <div className="st-card">
+          <StRow icon="globe" label="Share local time" sub="This group can see your current time. Uses this phone's timezone." onClick={() => onTzShare(group.id, !sharing)} toggle={sharing} />
+        </div>
+        <div className="bc-note" style={{ padding: '8px 16px 0' }}>Only your timezone ({bcMyZone()}) travels — inside the group's encryption, never a location. Overrides your Settings default for this group only.</div>
+
         <SectionLabel>{mem.length + 1} members</SectionLabel>
         <div className="bc-list">
           <ConvRow
             av={<Avatar name={app.nick || 'you'} size={44} />}
             title={<span>You</span>}
-            sub={<span>Admin</span>}
+            sub={<span>Admin<span className="bc-localtime">Local time: {bcZoneClock(bcMyZone())}</span></span>}
             onClick={() => {}}
           />
           {mem.map((p) => (
@@ -737,7 +745,7 @@ function GroupInfoScreen({ app, nav, pop, push, groupId, onLeave }) {
               extra={<>{p.supporter ? <SupporterBadge size={14} /> : null}{app.verified[p.id]
                 ? <BCIcon name="shieldCheck" size={14} weight={2.1} style={{ color: 'var(--green)', flex: 'none' }} />
                 : null}</>}
-              sub={<span className="bc-signal">{p.inRange ? <><Bars n={p.bars} />{p.hint}</> : <><BCIcon name="globe" size={12} weight={2.2} style={{ color: 'var(--net)', flex: 'none' }} />Out of range · internet</>}</span>}
+              sub={<span className="bc-signal">{p.inRange ? <><Bars n={p.bars} />{p.hint}</> : <><BCIcon name="globe" size={12} weight={2.2} style={{ color: 'var(--net)', flex: 'none' }} />Out of range · internet</>}{p.tz ? <span className="bc-localtime">Local time: {bcZoneClock(p.tz)}</span> : null}</span>}
               onClick={() => push('dm', { id: p.id })}
             />
           ))}
@@ -833,7 +841,7 @@ const CAP_INFO = {
   'payments': { icon: 'coin', label: 'Bitcoin payments', desc: 'Accepts bitcoin' },
 };
 
-function PeerProfileScreen({ app, nav, pop, push, peerId, onVerify }) {
+function PeerProfileScreen({ app, nav, pop, push, peerId, onVerify, onTzShare }) {
   const peer = BC_DATA.peers.find((p) => p.id === peerId) || BC_DATA.peers[0];
   const [verify, setVerify] = React.useState(false);
   const [showKey, setShowKey] = React.useState(false);
@@ -844,6 +852,9 @@ function PeerProfileScreen({ app, nav, pop, push, peerId, onVerify }) {
   const canCall = caps.includes('calls');
   const canPay = caps.includes('payments');
   const npub = peer.npub || BC_DATA.pubkey;
+  useBcMinute();
+  const encrypted = caps.includes('marmot-dm');
+  const sharing = bcSharesTime(app, peer.id);
   const pubkeyUI = !!(app.prefs && app.prefs.pubkeyUI);
   const shortNpub = npub.slice(0, 16) + '…' + npub.slice(-8);
   const copy = (text, tag) => {
@@ -895,6 +906,16 @@ function PeerProfileScreen({ app, nav, pop, push, peerId, onVerify }) {
               : <span><b>Encrypted</b> — verify {peer.name}’s safety number in person</span>}
           </Banner>
         )}
+
+        {encrypted ? (
+          <React.Fragment>
+            <SectionLabel>Privacy</SectionLabel>
+            <div className="st-card">
+              <StRow icon="globe" label="Share local time" sub="This chat can show your current time. Uses this phone's timezone." onClick={() => onTzShare(peer.id, !sharing)} toggle={sharing} />
+            </div>
+            <div className="bc-note" style={{ padding: '8px 16px 0' }}>{sharing ? 'Sharing ' + bcMyZone() + ' with ' + peer.name + ' inside this chat’s encryption.' : 'Off for this chat — overrides your Settings default.'} Only the timezone travels, never a location.</div>
+          </React.Fragment>
+        ) : null}
 
         <SectionLabel>What you can do together</SectionLabel>
         <div className="bc-list">
@@ -1015,6 +1036,10 @@ function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, on
   const subTransport = peer.inRange
     ? 'Nearby · Bluetooth'
     : (offlineFar ? 'Offline — will send later' : 'Via internet');
+  useBcMinute();
+  // peer shared an IANA zone inside this chat — their clock replaces the transport subtitle
+  const peerDelta = peer.tz ? bcZoneDelta(peer.tz) : '';
+  const peerClock = peer.tz ? bcZoneClock(peer.tz) + (peerDelta ? ' · ' + peerDelta : '') : null;
   return (
     <div className="bc-screen" data-nav={nav} data-screen-label={'DM: ' + peer.name}>
       <NavHeader
@@ -1045,7 +1070,7 @@ function DMScreen({ app, nav, pop, push, peerId, onSend, onCommand, onVerify, on
             </div>
             <div className="bc-hsub">
               <BCIcon name="lock" size={11} weight={2.4} />
-              {sub}{subTransport}
+              {peerClock || (sub + subTransport)}
             </div>
           </div>
         </button>

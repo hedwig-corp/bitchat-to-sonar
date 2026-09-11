@@ -14,7 +14,14 @@ members = ["sonar-core", "sonar-ffi", "sonar-cli", "sonar-stickers", "sonar-stat
 #    libsqlite3-sys 0.35 (via mdk-sqlite-storage) — and linking both into one
 #    binary would recreate the SQLCipher symbol-shadowing bug that once broke
 #    iOS Marmot encryption.
-exclude = ["vendor/iroh-roq", "sonar-ble", "sonar-wallet-breez"]
+#  - vendor/breez-sdk: sdk-common/sdk-macros, vendored because upstream deleted
+#    github.com/breez/breez-sdk (see vendor/breez-sdk/VENDORED.md). Belongs to
+#    the Breez island for the same reason as above — sdk-common's workspace
+#    pins rusqlite with `bundled` (plain SQLite), so letting this workspace
+#    absorb it would reintroduce the SQLCipher shadowing risk. It has its own
+#    [workspace] root; without this exclude, cargo resolves these crates
+#    against THIS manifest and fails to inherit their workspace deps.
+exclude = ["vendor/iroh-roq", "sonar-ble", "sonar-wallet-breez", "vendor/breez-sdk"]
 
 [workspace.package]
 version = "0.1.0"

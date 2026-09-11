@@ -1,6 +1,27 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%@ ahead" : {
+
+    },
+    "%@ behind" : {
+
+    },
+    "%@ hours" : {
+
+    },
+    "%@ minutes" : {
+
+    },
+    "1 hour" : {
+
+    },
+    "1 minute" : {
+
+    },
+    "Local time: %@" : {
+
+    },
     "Restoring..." : {
 
     },
