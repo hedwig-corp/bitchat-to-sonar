@@ -268,6 +268,15 @@ fun breezMessageLooksInsufficient(message: String): Boolean {
 }
 
 /**
+ * Breez `sendPayment` can return once the SDK has accepted the swap, before
+ * Lightning settles. Only a preimage is settlement evidence; anything else
+ * must journal as pending so resume looks up the real source outcome.
+ * `complete = true` would skip that lookup and wait on a mint that never
+ * issues if the swap later fails.
+ */
+fun hostSendReportsComplete(preimage: String?): Boolean = !preimage.isNullOrEmpty()
+
+/**
  * Build a controller, or `null` where no Breez wallet is configured — the one
  * case that means "migration not offered" rather than "something broke".
  * Anything else throws, carrying its own reason.

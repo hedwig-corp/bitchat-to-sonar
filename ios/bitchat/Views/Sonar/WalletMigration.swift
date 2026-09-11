@@ -57,6 +57,14 @@ final class BreezMigrationSource: HostMigrationSource, @unchecked Sendable {
         return .Failed(reason: "\(error)")
     }
 
+    /// Breez `sendPayment` can return once the SDK has accepted the swap,
+    /// before Lightning settles. Only a preimage is settlement evidence.
+    /// Matches Compose `hostSendReportsComplete`.
+    static func hostSendReportsComplete(preimage: String?) -> Bool {
+        guard let preimage, !preimage.isEmpty else { return false }
+        return true
+    }
+
     /// Keep the three Breez phrases identical to Compose
     /// `breezMessageLooksInsufficient`.
     static func looksInsufficient(_ message: String) -> Bool {
@@ -90,10 +98,7 @@ final class BreezMigrationSource: HostMigrationSource, @unchecked Sendable {
             id: payment.id,
             amountSats: UInt64(max(0, payment.amountSats)),
             feesSats: payment.feesSats.map { UInt64(max(0, $0)) },
-            // WalletKit returns a Payment only once Breez accepted it; the
-            // engine treats "not complete" as pending, which is the safe
-            // direction for an outgoing payment.
-            complete: true
+            complete: Self.hostSendReportsComplete(preimage: payment.preimage)
         )
     }
 
@@ -278,6 +283,7 @@ final class SonarMigrationModel: ObservableObject {
                 phase = opened
             }
         } catch {
+            if Task.isCancelled { return }
             phase = .failed(
                 String(
                     format: String(localized: "Could not open the migration: %@"),
@@ -588,7 +594,8 @@ struct SonarWalletMigrationScreen: View {
         }
         .navigationTitle(String(localized: "Move to Cashu"))
         .task {
-            await CashuMigrationStoreGate.shared.acquire()
+            let held = await CashuMigrationStoreGate.shared.acquire()
+            guard held else { return }
             await model.restoreOnOpen(nsec: nsec, source: source)
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 60_000_000_000)
@@ -700,13 +707,25 @@ actor CashuMigrationStoreGate {
         return true
     }
 
-    func acquire() async {
+    /// Returns false if the caller was cancelled. A cancelled waiter that was
+    /// handed the lock passes it on instead of opening `cashu.redb`.
+    func acquire() async -> Bool {
+        if Task.isCancelled { return false }
         if !locked {
             locked = true
-            return
+            if Task.isCancelled {
+                locked = false
+                return false
+            }
+            return true
         }
         await withCheckedContinuation { waiters.append($0) }
+        if Task.isCancelled {
+            release()
+            return false
+        }
         locked = true
+        return true
     }
 
     func release() {

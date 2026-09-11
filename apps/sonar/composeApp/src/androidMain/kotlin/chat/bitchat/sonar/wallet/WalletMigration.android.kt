@@ -95,8 +95,7 @@ class BreezMigrationSource : HostMigrationSource {
             `id` = result.paymentId ?: token,
             `amountSats` = amount,
             `feesSats` = result.feesSats?.coerceAtLeast(0)?.toULong(),
-            // The bridge returns ok only once Breez accepted the payment.
-            `complete` = true,
+            `complete` = hostSendReportsComplete(result.preimage),
         )
     }
 

@@ -165,6 +165,19 @@ final class SonarMigrationRescueTests: XCTestCase {
         XCTAssertTrue(await gate.tryAcquire())
         await gate.release()
     }
+
+    func testCancelledAcquireDoesNotKeepTheLock() async {
+        let gate = CashuMigrationStoreGate()
+        XCTAssertTrue(await gate.tryAcquire())
+        let waiter = Task { await gate.acquire() }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        waiter.cancel()
+        await gate.release()
+        let got = await waiter.value
+        XCTAssertFalse(got, "a cancelled migration screen must not keep cashu.redb")
+        XCTAssertTrue(await gate.tryAcquire(), "rescue must be able to take the lock after a cancelled waiter")
+        await gate.release()
+    }
 }
 
 @MainActor
@@ -175,5 +188,11 @@ final class BreezMigrationSourceTests: XCTestCase {
         XCTAssertTrue(BreezMigrationSource.looksInsufficient("balance too low for this swap"))
         XCTAssertFalse(BreezMigrationSource.looksInsufficient("Boltz is unavailable"))
         XCTAssertFalse(BreezMigrationSource.looksInsufficient("timeout"))
+    }
+
+    func testAcceptedBreezSendWithoutPreimageIsPending() {
+        XCTAssertFalse(BreezMigrationSource.hostSendReportsComplete(preimage: nil))
+        XCTAssertFalse(BreezMigrationSource.hostSendReportsComplete(preimage: ""))
+        XCTAssertTrue(BreezMigrationSource.hostSendReportsComplete(preimage: "00"))
     }
 }

@@ -378,4 +378,11 @@ class WalletMigrationContractTest {
         assertEquals(1, closed)
         assertEquals(1, released)
     }
+
+    @Test
+    fun acceptedBreezSendWithoutPreimageIsPending() {
+        assertFalse(hostSendReportsComplete(null))
+        assertFalse(hostSendReportsComplete(""))
+        assertTrue(hostSendReportsComplete("00"))
+    }
 }

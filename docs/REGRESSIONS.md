@@ -2706,6 +2706,8 @@ rescue: Compose `SonarAppState.setupWallet` /
 
 **Also guarded by:** `WalletMigrationContractTest.backgroundRescueSkipsWhenJournalDoesNotNeedRescue`, `WalletMigrationContractTest.backgroundRescueSkipsWhenStoreAlreadyOwned`, `WalletMigrationContractTest.backgroundRescueResumesPaidJournalAndCloses`, `SonarMigrationRescueTests.testBackgroundRescueSkipsWhenStoreAlreadyOwned`
 
+**Also guarded by:** `WalletMigrationContractTest.acceptedBreezSendWithoutPreimageIsPending`, `BreezMigrationSourceTests.testAcceptedBreezSendWithoutPreimageIsPending`, `SonarMigrationRescueTests.testCancelledAcquireDoesNotKeepTheLock`
+
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
 journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
 so a second `plan` is refused. The host tests pin the UI mapping that turns those
@@ -2717,9 +2719,12 @@ rescue without opening the mint. The home-strip tests pin the named gate
 used at the chat-list call site; they do not compose the strip. Launch-time
 rescue is pinned at `resumePaidCashuMigrationIfNeeded` (skip when the journal
 is clean, skip when the store is already owned, resume+close a paid journal)
-and Apple `CashuMigrationStoreGate.tryAcquire`. They do not kill either app
-between fsync and the source return, and do not inject filesystem or
-parent-directory-fsync failures on a device.
+and Apple `CashuMigrationStoreGate.tryAcquire`. Host send reports `complete`
+only when Breez returned a preimage (`hostSendReportsComplete`); an accept
+without a preimage journals pending so resume looks up Lightning. Apple
+`acquire()` returns false on cancellation so a dismissed screen cannot keep
+`cashu.redb`. They do not kill either app between fsync and the source return,
+and do not inject filesystem or parent-directory-fsync failures on a device.
 
 **History:** the production migration replaced process-local plan ownership
 with `cashu.migration.v1.json` and a take-before-send barrier.
