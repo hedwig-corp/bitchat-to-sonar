@@ -186,7 +186,7 @@
     <string name="get_started">Get started</string>
     <string name="group_name">Group name</string>
     <string name="here_now">%1$s · %2$s here now</string>
-    <string name="hours">%1$d hours</string>
+    <string name="hours">%1$s hours</string>
     <string name="i_already_have_a_key">I already have a key</string>
     <string name="i_understand_chats_on_this_phone_will">I understand chats on this phone will be erased</string>
     <string name="identity_key_sharing_payments_and_safety">Identity, key sharing, payments, and safety</string>
@@ -241,7 +241,7 @@
     <string name="logs_stay_on_this_device_until_you">Logs stay on this device until you share them. They contain relay and sync events — no message text and no keys.</string>
     <string name="mesh_peers_tooltip_new_messages">new messages</string>
     <string name="messages_travel_encrypted_over_the_open">Messages travel encrypted over the open internet instead.</string>
-    <string name="minutes">%1$d minutes</string>
+    <string name="minutes">%1$s minutes</string>
     <string name="more_places_nearby">More places nearby</string>
     <string name="nearby">Nearby</string>
     <string name="nearby_bluetooth">nearby · Bluetooth</string>

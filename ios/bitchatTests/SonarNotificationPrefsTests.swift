@@ -214,6 +214,29 @@ struct SonarNotificationPrefsTests {
     }
 
     #if os(iOS)
+    @Test("app-generated Marmot notifications retain forced catch-up identity")
+    func localMarmotWakeMarkerSurvivesRouting() {
+        let routed = SonarLocalNotificationRouter.make(
+            idKey: "msg-1",
+            kind: .message,
+            conversationTitle: "Alice",
+            preview: "hello",
+            prefs: SonarLocalNotificationPrefs(),
+            userInfo: [SonarNotificationKeys.marmotWake: true]
+        )
+        #expect(SonarNotificationHandoff.isMarmotWake(from: routed!.userInfo))
+        #expect(
+            SonarNotificationHandoff.isMarmotWake(
+                from: [SonarNotificationKeys.marmotWake: NSNumber(value: true)]
+            )
+        )
+        #expect(
+            SonarNotificationHandoff.isMarmotWake(
+                from: [SonarNotificationKeys.marmotWake: false]
+            ) == false
+        )
+    }
+
     @Test("NSE placeholder wipe keeps ids that arrived after wake start")
     func nsePlaceholderWipeRespectsWakeSnapshot() {
         let toRemove = SonarPushProcessor.nsePlaceholderIdsToRemove(

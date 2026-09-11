@@ -937,7 +937,7 @@ final class MarmotChatModel: ObservableObject {
     /// re-kick only when the app is foreground AND still disconnected.
     func reconnectIfForegroundAfterWakeClose() async {
         #if os(iOS)
-        if let existing = refreshTask {
+        if let existing = foregroundRefreshTask {
             _ = await existing.value
         }
         guard UIApplication.shared.applicationState != .background else { return }
