@@ -2673,21 +2673,29 @@ offers a second payment.
 **Call sites:** core
 `sonar-wallet-migrate::MigrationEngine.execute_once` /
 `MigrationJournal.store_unlocked`; iOS
-`WalletMigration.swift::SonarMigrationModel.confirmAndMigrate` and
-`resumeSettlement`; Compose `WalletMigrationRoute.kt::onConfirm` /
-`onResume` through the Android and JVM `WalletMigrationController`.
+`WalletMigration.swift::SonarMigrationModel.confirmAndMigrate`,
+`restoreOnOpen`, and `resumeSettlement`; Compose `WalletMigrationRoute.kt`
+LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
+`WalletMigrationController`.
 
 **Guarded by:** `lib.rs::durable_sending_state_prevents_resend`,
 `lib.rs::corrupt_journal_fails_closed`,
 `lib.rs::planning_refuses_an_in_flight_send`,
 `lib.rs::source_send_error_journals_unknown_and_refuses_a_new_plan`,
+`journal.rs::needs_rescue_is_only_ambiguous_or_paid_states`,
 `WalletMigrationContractTest.executeErrorAfterSourceAcceptedIsPendingNotANewQuote`,
-`SonarMigrationRescueTests.testExecuteErrorAfterSourceAcceptedIsPendingNotANewQuote`
+`WalletMigrationContractTest.relaunchAfterPaidJournalIsPendingNotANewQuote`,
+`WalletMigrationContractTest.journalBytesNeedRescueWithoutOpeningTheMint`,
+`SonarMigrationRescueTests.testExecuteErrorAfterSourceAcceptedIsPendingNotANewQuote`,
+`SonarMigrationRescueTests.testRelaunchAfterPaidJournalIsPendingNotANewQuote`,
+`SonarMigrationRescueTests.testJournalBytesNeedRescueWithoutOpeningTheMint`
 
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
 journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
 so a second `plan` is refused. The host tests pin the UI mapping that turns those
-states into "Paid — waiting on the mint" instead of a new quote. They do not
+states into "Paid — waiting on the mint" instead of a new quote, including the
+relaunch-open mapping (`phaseAfterOpenStatus`) and a file-only journal peek so
+Settings/Wallet can offer rescue without opening the mint. They do not
 kill either app between fsync and the source return, and do not inject
 filesystem or parent-directory-fsync failures on a device.
 
@@ -2813,12 +2821,12 @@ cross-account resume.
 
 ## Unguarded
 
-- **Post-payment pending migration after an app kill.** R-045 pins the durable
-  engine state, but no Apple or Compose test kills the process after Breez
-  accepts the payment, relaunches, opens `WalletMigrationRoute`, and proves the
-  UI enters "Paid — waiting on the mint" without invoking `send` again. This
-  needs a process-death/device harness with an injectable source and a delayed
-  mint; helper tests cannot pin the host lifecycle call site.
+- **Post-payment pending migration after an app kill.** R-045 now pins the
+  relaunch-open mapping and journal-peek banner copy, but no Apple or Compose
+  test kills the process after Breez accepts the payment, relaunches, opens
+  `WalletMigrationRoute`, and proves `resume` runs without invoking `send`
+  again. This needs a process-death/device harness with an injectable source
+  and a delayed mint; helper tests cannot pin the host lifecycle call site.
 - **Apple `HostWalletError` lifting across the foreign-trait boundary.** The
   non-flat Rust enum and planner branch are covered only on the Rust side.
   Nothing constructs the generated Swift `HostMigrationSource` callback,

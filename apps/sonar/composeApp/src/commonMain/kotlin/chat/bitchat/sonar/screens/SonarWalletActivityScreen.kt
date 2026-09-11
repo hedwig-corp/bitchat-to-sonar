@@ -1,6 +1,7 @@
 package chat.bitchat.sonar.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -15,11 +16,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -29,6 +34,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.rowTimeLabel
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
@@ -38,6 +44,13 @@ import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.sonar
+import chat.bitchat.sonar.wallet.peekCashuMigrationNeedsRescue
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.check_again
+import chat.bitchat.sonar.resources.paid_waiting_on_the_mint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.jetbrains.compose.resources.stringResource
 
 /**
  * Wallet — 1:1 with the design's `WalletScreen` + `WalletActivity`
@@ -61,6 +74,10 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
     // path via derivedStateOf: it recomputes only when the ledgers it reads
     // actually change, instead of on every recomposition of this screen.
     val entries by remember(state) { derivedStateOf { state.walletActivity() } }
+    var migrationNeedsRescue by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        migrationNeedsRescue = withContext(Dispatchers.IO) { peekCashuMigrationNeedsRescue() }
+    }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Wallet", hairline = false, onBack = { state.back() })
@@ -94,6 +111,28 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
                         color = s.text3,
                         fontSize = 12.5.sp,
                     )
+                }
+                if (migrationNeedsRescue) {
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(s.surface)
+                            .clickable { state.push(Screen.WalletMigration) }
+                            .padding(14.dp),
+                    ) {
+                        Text(
+                            stringResource(Res.string.paid_waiting_on_the_mint),
+                            color = s.text,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            stringResource(Res.string.check_again),
+                            color = s.text3,
+                            fontSize = 12.5.sp,
+                        )
+                    }
                 }
                 SNSectionLabel("Activity")
             }

@@ -94,12 +94,7 @@ actual suspend fun createWalletMigrationController(
     // as "wallet unavailable".
     if (!WalletBridge.isAvailable()) return@withContext null
     val nsec = SonarCore.identityNsec()
-
-    val accountId = java.security.MessageDigest.getInstance("SHA-256")
-        .digest(nsec.toByteArray(Charsets.UTF_8))
-        .take(16)
-        .joinToString("") { "%02x".format(it) }
-    val dir = desktopCashuDir(accountId).apply { mkdirs() }
+    val dir = desktopCashuDir(cashuAccountId(nsec)).apply { mkdirs() }
     val destination = SonarCashuWallet.open(nsec, mintUrl, dir.absolutePath)
 
     val engine = try {
@@ -129,3 +124,16 @@ actual suspend fun wipeCashuMigrationStorage(): Unit = withContext(Dispatchers.I
         }
     }
 }
+
+actual fun readCashuMigrationJournalJson(): String? {
+    val nsec = runCatching { SonarCore.identityNsec() }.getOrNull()?.takeIf { it.isNotEmpty() }
+        ?: return null
+    val file = File(desktopCashuDir(cashuAccountId(nsec)), "cashu.migration.v1.json")
+    return if (file.isFile) runCatching { file.readText() }.getOrNull() else null
+}
+
+private fun cashuAccountId(nsec: String): String =
+    java.security.MessageDigest.getInstance("SHA-256")
+        .digest(nsec.toByteArray(Charsets.UTF_8))
+        .take(16)
+        .joinToString("") { "%02x".format(it) }

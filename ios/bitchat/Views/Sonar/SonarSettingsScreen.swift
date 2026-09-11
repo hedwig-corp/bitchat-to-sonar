@@ -33,6 +33,7 @@ struct SonarSettingsScreen: View {
     @State private var dataUsageSheet = false
     @State private var transcriptSpikeB = false
     @State private var collectionHostEnabled = SNTranscriptCollectionHostFlag.isEnabled
+    @State private var migrationNeedsRescue = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -137,8 +138,12 @@ struct SonarSettingsScreen: View {
                             SNSettingsRow(
                                 icon: .coin,
                                 tone: .gold,
-                                label: String(localized: "Move to Cashu"),
-                                sub: String(localized: "Move your Lightning balance into ecash"),
+                                label: migrationNeedsRescue
+                                    ? String(localized: "Paid — waiting on the mint")
+                                    : String(localized: "Move to Cashu"),
+                                sub: migrationNeedsRescue
+                                    ? String(localized: "Check again")
+                                    : String(localized: "Move your Lightning balance into ecash"),
                                 divider: false
                             ) {
                                 if case .ready = store.walletState {
@@ -269,6 +274,11 @@ struct SonarSettingsScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .task {
+            if let nsec = await store.exportNsec() {
+                migrationNeedsRescue = CashuMigrationStorage.peekNeedsRescue(nsec: nsec)
+            }
+        }
         .onAppear {
             // Hydrate the Data & storage rows: the policy feeds the Chat backup
             // sub line, and the storage walk feeds the Storage value. Without

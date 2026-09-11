@@ -147,4 +147,72 @@ class WalletMigrationContractTest {
         assertFalse(breezMessageLooksInsufficient("Boltz is unavailable"))
         assertFalse(breezMessageLooksInsufficient("timeout"))
     }
+
+    @Test fun relaunchAfterPaidJournalIsPendingNotANewQuote() {
+        val dest = 500uL
+        val failed = "Lightning payment failed"
+        for (state in listOf(
+            MigrationAttemptStateUi.Sending,
+            MigrationAttemptStateUi.PaymentUnknown,
+            MigrationAttemptStateUi.SourcePending,
+            MigrationAttemptStateUi.SourcePaid,
+            MigrationAttemptStateUi.MintPaid,
+        )) {
+            assertTrue(migrationAttemptNeedsRescue(state), "$state must resume, not re-quote")
+            assertEquals(
+                MigrationPhase.PendingSettlement(dest),
+                phaseAfterOpenStatus(state, 2_000uL, dest, failed),
+            )
+        }
+        assertEquals(
+            MigrationPhase.Idle,
+            phaseAfterOpenStatus(null, 0uL, dest, failed),
+        )
+        assertEquals(
+            MigrationPhase.Idle,
+            phaseAfterOpenStatus(MigrationAttemptStateUi.AwaitingConsent, 2_000uL, dest, failed),
+        )
+        assertEquals(
+            MigrationPhase.Settled(2_000uL),
+            phaseAfterOpenStatus(MigrationAttemptStateUi.Settled, 2_000uL, dest, failed),
+        )
+        assertEquals(
+            MigrationPhase.Failed(failed),
+            phaseAfterOpenStatus(MigrationAttemptStateUi.SourceFailed, 2_000uL, dest, failed),
+        )
+        assertFalse(migrationAttemptNeedsRescue(MigrationAttemptStateUi.Settled))
+    }
+
+    @Test fun journalBytesNeedRescueWithoutOpeningTheMint() {
+        fun journal(state: String) = """
+            {
+              "version": 1,
+              "account_fingerprint": "aa",
+              "mint_fingerprint": "bb",
+              "attempt": {
+                "settlement_id": "qid",
+                "invoice": "lnbc1",
+                "payment_hash": "hh",
+                "amount_sats": 2000,
+                "source_fee_sats": 20,
+                "expires_at_secs": null,
+                "source_payment_id": null,
+                "state": "$state"
+              }
+            }
+        """.trimIndent()
+        assertEquals(
+            MigrationAttemptStateUi.SourcePaid,
+            parseJournalAttemptState(journal("SourcePaid")),
+        )
+        assertTrue(journalNeedsRescue(journal("Sending")))
+        assertTrue(journalNeedsRescue(journal("PaymentUnknown")))
+        assertTrue(journalNeedsRescue(journal("SourcePaid")))
+        assertFalse(journalNeedsRescue(journal("AwaitingConsent")))
+        assertFalse(journalNeedsRescue(journal("Settled")))
+        assertFalse(journalNeedsRescue(journal("SourceFailed")))
+        assertFalse(journalNeedsRescue(null))
+        assertFalse(journalNeedsRescue("{}"))
+        assertFalse(journalNeedsRescue(journal("NotAState")))
+    }
 }

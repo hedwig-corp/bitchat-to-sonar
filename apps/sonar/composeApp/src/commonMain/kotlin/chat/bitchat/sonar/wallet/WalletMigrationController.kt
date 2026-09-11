@@ -89,6 +89,59 @@ fun migrationAttemptBlocksNewQuote(state: MigrationAttemptStateUi): Boolean =
         else -> true
     }
 
+/** Paid or ambiguous: resume the journal, never mint a second invoice. */
+fun migrationAttemptNeedsRescue(state: MigrationAttemptStateUi): Boolean =
+    migrationAttemptBlocksNewQuote(state) && state != MigrationAttemptStateUi.Settled
+
+/**
+ * Mapping used when the migration screen opens against an existing journal.
+ * Matches Apple `SonarMigrationModel.phaseAfterOpenStatus` so a relaunch
+ * after Breez accepted cannot look like a fresh "Check amount and fee".
+ */
+fun phaseAfterOpenStatus(
+    state: MigrationAttemptStateUi?,
+    attemptAmountSats: ULong,
+    destConfirmedSats: ULong,
+    lightningFailedMessage: String,
+): MigrationPhase =
+    when (state) {
+        null,
+        MigrationAttemptStateUi.AwaitingConsent,
+        MigrationAttemptStateUi.ExpiredUnsent -> MigrationPhase.Idle
+        MigrationAttemptStateUi.Settled -> MigrationPhase.Settled(attemptAmountSats)
+        MigrationAttemptStateUi.SourceFailed -> MigrationPhase.Failed(lightningFailedMessage)
+        else -> MigrationPhase.PendingSettlement(destConfirmedSats)
+    }
+
+/**
+ * Host-side read of `cashu.migration.v1.json`. The serde wire names are the
+ * PascalCase variant names pinned by `journal.rs::state_json_is_the_pascal_case_variant_name`.
+ */
+fun parseJournalAttemptState(json: String): MigrationAttemptStateUi? {
+    val name = JOURNAL_STATE_FIELD.find(json)?.groupValues?.getOrNull(1) ?: return null
+    return when (name) {
+        "AwaitingConsent" -> MigrationAttemptStateUi.AwaitingConsent
+        "Sending" -> MigrationAttemptStateUi.Sending
+        "PaymentUnknown" -> MigrationAttemptStateUi.PaymentUnknown
+        "SourcePending" -> MigrationAttemptStateUi.SourcePending
+        "SourcePaid" -> MigrationAttemptStateUi.SourcePaid
+        "MintPaid" -> MigrationAttemptStateUi.MintPaid
+        "Settled" -> MigrationAttemptStateUi.Settled
+        "SourceFailed" -> MigrationAttemptStateUi.SourceFailed
+        "ExpiredUnsent" -> MigrationAttemptStateUi.ExpiredUnsent
+        else -> null
+    }
+}
+
+fun journalNeedsRescue(json: String?): Boolean {
+    val state = parseJournalAttemptState(json ?: return false) ?: return false
+    return migrationAttemptNeedsRescue(state)
+}
+
+fun peekCashuMigrationNeedsRescue(): Boolean = journalNeedsRescue(readCashuMigrationJournalJson())
+
+private val JOURNAL_STATE_FIELD = Regex(""""state"\s*:\s*"([A-Za-z]+)"""")
+
 fun phaseAfterExecuteError(
     state: MigrationAttemptStateUi?,
     destConfirmedSats: ULong,
@@ -131,3 +184,9 @@ expect suspend fun createWalletMigrationController(
 
 /** Remove only Cashu-derived state and migration journals, never the account key. */
 expect suspend fun wipeCashuMigrationStorage()
+
+/**
+ * Local journal bytes only. Must never open the Cashu store or talk to the
+ * mint — Settings and the wallet log use this for a rescue banner.
+ */
+expect fun readCashuMigrationJournalJson(): String?

@@ -65,7 +65,6 @@ final class BreezMigrationSource: HostMigrationSource, @unchecked Sendable {
             || lower.contains("insufficient")
             || lower.contains("balance too low")
     }
-    }
 
     func balanceSats() throws -> UInt64 {
         let sats = try blocking { [wallet] in try await wallet.balanceSnapshot() }
@@ -214,6 +213,7 @@ final class SonarMigrationModel: ObservableObject {
     private var engine: SonarMigration?
     private var cashu: SonarCashuWallet?
     private var planId: String?
+    private var didRestoreOnOpen = false
 
     /// The mint's per-quote ceiling and the fail-closed fee cap. A quote above
     /// the cap — or a source that cannot quote a fee at all — refuses to plan.
@@ -227,8 +227,77 @@ final class SonarMigrationModel: ObservableObject {
         self.feeCapSats = feeCapSats
     }
 
+    /// Open the Cashu wallet and restore a journaled attempt, if any. Nothing
+    /// is paid. A paid/ambiguous journal auto-resumes so a relaunch does not
+    /// wait on "Check amount and fee" then "Check again".
+    func restoreOnOpen(nsec: String, source: BreezMigrationSource) async {
+        guard !didRestoreOnOpen else { return }
+        didRestoreOnOpen = true
+        phase = .quoting
+        let mintUrl = self.mintUrl
+        let walletDir = self.walletDir
+        let destMax = self.destMaxSats
+        let feeCap = self.feeCapSats
+        do {
+            let (engine, cashu, status) = try await Task.detached {
+                () -> (SonarMigration, SonarCashuWallet, MigrationAttemptStatus?) in
+                let cashu = try SonarCashuWallet.open(
+                    nsec: nsec, mintUrl: mintUrl, workingDir: walletDir
+                )
+                let engine = SonarMigration(
+                    source: source,
+                    destination: cashu,
+                    destMaxSats: destMax,
+                    feeCapSats: feeCap
+                )
+                let status = try engine.status()
+                if let status {
+                    switch status.state {
+                    case .awaitingConsent, .expiredUnsent:
+                        try engine.cancelUnspent()
+                    default:
+                        break
+                    }
+                }
+                return (engine, cashu, status)
+            }.value
+            self.engine = engine
+            self.cashu = cashu
+            await refreshBalances(source: source)
+            let opened = Self.phaseAfterOpenStatus(
+                state: status?.state,
+                attemptAmountSats: status?.amountSats ?? 0,
+                destConfirmedSats: cashuBalanceSats,
+                lightningFailedMessage: String(
+                    localized: "The Lightning payment failed without moving funds."
+                )
+            )
+            if case .pendingSettlement = opened {
+                await resumeSettlement(source: source)
+            } else {
+                phase = opened
+            }
+        } catch {
+            phase = .failed(
+                String(
+                    format: String(localized: "Could not open the migration: %@"),
+                    String(describing: error)
+                )
+            )
+        }
+    }
+
     /// Open the Cashu wallet and price a whole-balance drain. Nothing is paid.
     func quote(nsec: String, source: BreezMigrationSource) async {
+        if engine == nil {
+            await restoreOnOpen(nsec: nsec, source: source)
+        }
+        switch phase {
+        case .pendingSettlement, .watching, .paying, .settled:
+            return
+        default:
+            break
+        }
         phase = .quoting
         let mintUrl = self.mintUrl
         let walletDir = self.walletDir
@@ -237,6 +306,14 @@ final class SonarMigrationModel: ObservableObject {
         do {
             // Detached: the engine calls back into `source` synchronously, so
             // this must not run on the main actor.
+            if let engine, cashu != nil {
+                let quote = try await Task.detached {
+                    try engine.plan(amountSats: nil)
+                }.value
+                self.planId = quote.planId
+                phase = .awaitingConsent(amountSats: quote.amountSats, feeSats: quote.sourceFeeSats)
+                return
+            }
             let (engine, cashu, quote, status) = try await Task.detached {
                 () -> (SonarMigration, SonarCashuWallet, MigrationQuote?, MigrationAttemptStatus?) in
                 let cashu = try SonarCashuWallet.open(
@@ -396,6 +473,29 @@ final class SonarMigrationModel: ObservableObject {
         }
         return .pendingSettlement(cashuSats: destConfirmedSats)
     }
+
+    static func needsRescue(_ state: MigrationAttemptState) -> Bool {
+        attemptBlocksNewQuote(state) && state != .settled
+    }
+
+    static func phaseAfterOpenStatus(
+        state: MigrationAttemptState?,
+        attemptAmountSats: UInt64,
+        destConfirmedSats: UInt64,
+        lightningFailedMessage: String
+    ) -> Phase {
+        guard let state else { return .idle }
+        switch state {
+        case .awaitingConsent, .expiredUnsent:
+            return .idle
+        case .settled:
+            return .settled(cashuSats: attemptAmountSats)
+        case .sourceFailed:
+            return .failed(lightningFailedMessage)
+        default:
+            return .pendingSettlement(cashuSats: destConfirmedSats)
+        }
+    }
 }
 
 // MARK: - Screen
@@ -477,7 +577,9 @@ struct SonarWalletMigrationScreen: View {
             .padding(20)
         }
         .navigationTitle(String(localized: "Move to Cashu"))
-        .task { await model.refreshBalances(source: source) }
+        .task {
+            await model.restoreOnOpen(nsec: nsec, source: source)
+        }
         .onDisappear {
             Task { await model.cancelUnspentOnLeave() }
         }
@@ -568,6 +670,54 @@ struct SonarWalletMigrationScreen: View {
             Text(title).frame(maxWidth: .infinity)
         }
         .buttonStyle(.borderedProminent)
+    }
+}
+
+enum CashuMigrationStorage {
+    static let journalFileName = "cashu.migration.v1.json"
+
+    static func workingDir(nsec: String) -> URL? {
+        let digest = SHA256.hash(data: Data(nsec.utf8))
+        let accountId = digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+        guard let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { return nil }
+        return support
+            .appendingPathComponent("sonar-cashu", isDirectory: true)
+            .appendingPathComponent(accountId, isDirectory: true)
+            .appendingPathComponent("mainnet", isDirectory: true)
+    }
+
+    static func journalAttemptStateName(_ json: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: "\"state\"\\s*:\\s*\"([A-Za-z]+)\"") else {
+            return nil
+        }
+        let range = NSRange(json.startIndex..<json.endIndex, in: json)
+        guard let match = regex.firstMatch(in: json, range: range),
+              let captured = Range(match.range(at: 1), in: json) else {
+            return nil
+        }
+        return String(json[captured])
+    }
+
+    static func journalNeedsRescue(_ json: String?) -> Bool {
+        guard let json,
+              let name = journalAttemptStateName(json) else { return false }
+        switch name {
+        case "Sending", "PaymentUnknown", "SourcePending", "SourcePaid", "MintPaid":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func peekNeedsRescue(nsec: String) -> Bool {
+        guard let url = workingDir(nsec: nsec)?.appendingPathComponent(journalFileName),
+              let json = try? String(contentsOf: url, encoding: .utf8) else {
+            return false
+        }
+        return journalNeedsRescue(json)
     }
 }
 

@@ -53,6 +53,98 @@ final class SonarMigrationRescueTests: XCTestCase {
             .failed(failed)
         )
     }
+
+    func testRelaunchAfterPaidJournalIsPendingNotANewQuote() {
+        let dest: UInt64 = 500
+        let failed = "Lightning payment failed"
+        let pendingStates: [MigrationAttemptState] = [
+            .sending, .paymentUnknown, .sourcePending, .sourcePaid, .mintPaid,
+        ]
+        for state in pendingStates {
+            XCTAssertTrue(
+                SonarMigrationModel.needsRescue(state),
+                "\(state) must resume, not re-quote"
+            )
+            XCTAssertEqual(
+                SonarMigrationModel.phaseAfterOpenStatus(
+                    state: state,
+                    attemptAmountSats: 2_000,
+                    destConfirmedSats: dest,
+                    lightningFailedMessage: failed
+                ),
+                .pendingSettlement(cashuSats: dest)
+            )
+        }
+        XCTAssertEqual(
+            SonarMigrationModel.phaseAfterOpenStatus(
+                state: nil,
+                attemptAmountSats: 0,
+                destConfirmedSats: dest,
+                lightningFailedMessage: failed
+            ),
+            .idle
+        )
+        XCTAssertEqual(
+            SonarMigrationModel.phaseAfterOpenStatus(
+                state: .awaitingConsent,
+                attemptAmountSats: 2_000,
+                destConfirmedSats: dest,
+                lightningFailedMessage: failed
+            ),
+            .idle
+        )
+        XCTAssertEqual(
+            SonarMigrationModel.phaseAfterOpenStatus(
+                state: .settled,
+                attemptAmountSats: 2_000,
+                destConfirmedSats: dest,
+                lightningFailedMessage: failed
+            ),
+            .settled(cashuSats: 2_000)
+        )
+        XCTAssertEqual(
+            SonarMigrationModel.phaseAfterOpenStatus(
+                state: .sourceFailed,
+                attemptAmountSats: 2_000,
+                destConfirmedSats: dest,
+                lightningFailedMessage: failed
+            ),
+            .failed(failed)
+        )
+        XCTAssertFalse(SonarMigrationModel.needsRescue(.settled))
+    }
+
+    func testJournalBytesNeedRescueWithoutOpeningTheMint() {
+        func journal(_ state: String) -> String {
+            """
+            {
+              "version": 1,
+              "account_fingerprint": "aa",
+              "mint_fingerprint": "bb",
+              "attempt": {
+                "settlement_id": "qid",
+                "invoice": "lnbc1",
+                "payment_hash": "hh",
+                "amount_sats": 2000,
+                "source_fee_sats": 20,
+                "expires_at_secs": null,
+                "source_payment_id": null,
+                "state": "\(state)"
+              }
+            }
+            """
+        }
+        XCTAssertEqual(CashuMigrationStorage.journalAttemptStateName(journal("SourcePaid")), "SourcePaid")
+        XCTAssertTrue(CashuMigrationStorage.journalNeedsRescue(journal("Sending")))
+        XCTAssertTrue(CashuMigrationStorage.journalNeedsRescue(journal("PaymentUnknown")))
+        XCTAssertTrue(CashuMigrationStorage.journalNeedsRescue(journal("SourcePaid")))
+        XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue(journal("AwaitingConsent")))
+        XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue(journal("Settled")))
+        XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue(journal("SourceFailed")))
+        XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue(nil))
+        XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue("{}"))
+        XCTAssertFalse(CashuMigrationStorage.journalNeedsRescue(journal("NotAState")))
+    }
 }
 
 @MainActor

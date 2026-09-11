@@ -130,21 +130,47 @@ fun WalletMigrationRoute(state: SonarAppState) {
             built.status()
         }
             .onSuccess { status ->
-                phase = when (status?.state) {
-                    null -> MigrationPhase.Idle
-                    MigrationAttemptStateUi.AwaitingConsent,
-                    MigrationAttemptStateUi.ExpiredUnsent -> {
-                        // Prepared source quotes cannot survive a
-                        // process restart. Clear only this proven-
-                        // unspent state and ask for a fresh quote.
-                        built.cancelUnspent()
-                        MigrationPhase.Idle
-                    }
-                    MigrationAttemptStateUi.Settled ->
-                        MigrationPhase.Settled(status.amountSats)
-                    MigrationAttemptStateUi.SourceFailed ->
-                        MigrationPhase.Failed(lightningPaymentFailed)
-                    else -> MigrationPhase.PendingSettlement(cashuBalance)
+                if (status?.state == MigrationAttemptStateUi.AwaitingConsent ||
+                    status?.state == MigrationAttemptStateUi.ExpiredUnsent
+                ) {
+                    // Prepared source quotes cannot survive a
+                    // process restart. Clear only this proven-
+                    // unspent state and ask for a fresh quote.
+                    runCatching { built.cancelUnspent() }
+                }
+                if (abandoned.get()) return@onSuccess
+                val opened = phaseAfterOpenStatus(
+                    state = status?.state,
+                    attemptAmountSats = status?.amountSats ?: 0uL,
+                    destConfirmedSats = cashuBalance,
+                    lightningFailedMessage = lightningPaymentFailed,
+                )
+                if (opened is MigrationPhase.PendingSettlement) {
+                    // Relaunch after a paid/ambiguous journal must resume
+                    // without a "Check again" tap. Check again remains for
+                    // a later Pending outcome.
+                    phase = MigrationPhase.Watching
+                    runCatching { built.resume(SETTLE_POLLS) }
+                        .onSuccess { result ->
+                            if (abandoned.get()) return@onSuccess
+                            phase = when (result) {
+                                is MigrationResultUi.Settled -> {
+                                    cashuBalance = result.cashuSats
+                                    MigrationPhase.Settled(result.cashuSats)
+                                }
+                                is MigrationResultUi.Pending -> {
+                                    cashuBalance = result.cashuSats
+                                    MigrationPhase.PendingSettlement(result.cashuSats)
+                                }
+                            }
+                        }
+                        .onFailure {
+                            if (!abandoned.get()) {
+                                phase = MigrationPhase.PendingSettlement(cashuBalance)
+                            }
+                        }
+                } else {
+                    phase = opened
                 }
             }
             .onFailure {

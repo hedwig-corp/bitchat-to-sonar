@@ -26,6 +26,20 @@ pub enum MigrationAttemptState {
     ExpiredUnsent,
 }
 
+impl MigrationAttemptState {
+    /// Paid or ambiguous source states the UI must resume, not re-quote.
+    pub fn needs_rescue(self) -> bool {
+        matches!(
+            self,
+            Self::Sending
+                | Self::PaymentUnknown
+                | Self::SourcePending
+                | Self::SourcePaid
+                | Self::MintPaid
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationAttempt {
     pub settlement_id: String,
@@ -253,4 +267,36 @@ fn sync_parent_dir(parent: &Path) -> Result<()> {
 #[cfg(windows)]
 fn sync_parent_dir(_parent: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_rescue_is_only_ambiguous_or_paid_states() {
+        assert!(!MigrationAttemptState::AwaitingConsent.needs_rescue());
+        assert!(!MigrationAttemptState::ExpiredUnsent.needs_rescue());
+        assert!(!MigrationAttemptState::SourceFailed.needs_rescue());
+        assert!(!MigrationAttemptState::Settled.needs_rescue());
+        assert!(MigrationAttemptState::Sending.needs_rescue());
+        assert!(MigrationAttemptState::PaymentUnknown.needs_rescue());
+        assert!(MigrationAttemptState::SourcePending.needs_rescue());
+        assert!(MigrationAttemptState::SourcePaid.needs_rescue());
+        assert!(MigrationAttemptState::MintPaid.needs_rescue());
+    }
+
+    #[test]
+    fn state_json_is_the_pascal_case_variant_name() {
+        for (state, name) in [
+            (MigrationAttemptState::Sending, "Sending"),
+            (MigrationAttemptState::PaymentUnknown, "PaymentUnknown"),
+            (MigrationAttemptState::SourcePaid, "SourcePaid"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{name}\"")
+            );
+        }
+    }
 }
