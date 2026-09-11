@@ -2697,10 +2697,10 @@ LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
 journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
 so a second `plan` is refused. The host tests pin the UI mapping that turns those
 states into "Paid — waiting on the mint" instead of a new quote, including the
-relaunch-open mapping (`phaseAfterOpenStatus`) and a file-only journal peek so
-Settings/Wallet can offer rescue without opening the mint. They do not
-kill either app between fsync and the source return, and do not inject
-filesystem or parent-directory-fsync failures on a device.
+relaunch-open mapping (`restoreOpenedMigration` / `phaseAfterOpenStatus`) and
+a file-only journal peek so Settings/Wallet can offer rescue without opening the
+mint. They do not kill either app between fsync and the source return, and do
+not inject filesystem or parent-directory-fsync failures on a device.
 
 **History:** the production migration replaced process-local plan ownership
 with `cashu.migration.v1.json` and a take-before-send barrier.
