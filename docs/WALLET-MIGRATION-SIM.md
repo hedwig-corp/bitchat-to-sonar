@@ -79,7 +79,7 @@ unrelated incoming payment for the same amount, cannot settle the attempt.
 | Property | Evidence |
 | --- | --- |
 | Value conservation | fund 5000 → migrate 2000 → destination holds exactly 2000 |
-| Custody-consent gate | `migrate` without `--accept-custody-change` refuses |
+| Custody-consent gate | `migrate` without `--accept-custody-change` refuses before `$SONAR_NSEC` is read (`refuse_before_wallets` + `tests/migrate_cli_preflight.rs`) |
 | Fee cap (fail-closed) | `--max-fee-sats 0` refuses: quoted fee 20 exceeds cap |
 | Destination max | `--amount-sats 2000 --dest-max-sats 100` refuses |
 | melt→mint hand-off | payment reports `Complete`, settlement watch reports `settled` |
@@ -195,7 +195,9 @@ ARGS=(--mint https://mint.hedwig.sh
 "$BIN" "${ARGS[@]}" settle --settle-polls 24
 ```
 
-A migrate without `--accept-custody-change` must refuse. If `migrate` returns
+A migrate without `--accept-custody-change` must refuse before any wallet
+opens — the CLI does not read `$SONAR_NSEC` or connect Breez in that case.
+If `migrate` returns
 Pending, only `settle` (or the app's "Check again") may continue — never a
 second `migrate`. The journal is `$cashu_dir/cashu.migration.v1.json`.
 

@@ -2899,6 +2899,10 @@ cross-account resume.
   use a deliberately budgeted device run with a real Breez wallet and target
   mint; it must record the journal identities and balances before/after. It
   must never run as an unattended unit or CI test because it spends real funds.
+  The CLI spend gates themselves are pinned: `migrate` without
+  `--accept-custody-change` and `sim-fund` without `--source-mint` refuse in
+  `refuse_before_wallets` before `$SONAR_NSEC` is read (`sonar-migrate-cli`
+  bin tests and `tests/migrate_cli_preflight.rs`). That is not a live payment.
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
   #498 made core stop filtering `member_count <= 2` out of

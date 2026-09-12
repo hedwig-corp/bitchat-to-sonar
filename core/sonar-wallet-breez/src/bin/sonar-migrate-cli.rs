@@ -130,11 +130,32 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// Spend and source-selection gates that must fire before any wallet is
+/// constructed or `$SONAR_NSEC` is read. `migrate` without custody consent,
+/// and `sim-fund` without `--source-mint`, must never open the Breez store.
+fn refuse_before_wallets(cli: &Cli) -> Result<(), WalletError> {
+    match &cli.command {
+        Command::Migrate(args) if !args.accept_custody_change => Err(WalletError::InvalidInput(
+            "migration changes the custody model: Breez is self-custodial, Cashu proofs \
+                 are bearer instruments and the mint holds the Lightning side. Re-run with \
+                 --accept-custody-change to proceed"
+                .into(),
+        )),
+        Command::SimFund(_) if cli.source_mint.is_none() => Err(WalletError::InvalidInput(
+            "sim-fund requires --source-mint: it exists to fund a simulated source \
+                 wallet, and must never be pointed at the real Breez wallet"
+                .into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn main() -> Result<(), WalletError> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    refuse_before_wallets(&cli)?;
 
     // Secrets from the environment only (argv is world-readable via ps).
     let nsec = Zeroizing::new(std::env::var("SONAR_NSEC").map_err(|_| {
@@ -281,14 +302,10 @@ fn run(
             engine.cancel_unspent().map_err(to_wallet_err)?;
         }
         Command::Migrate(args) => {
-            if !args.accept_custody_change {
-                return Err(WalletError::InvalidInput(
-                    "migration changes the custody model: Breez is self-custodial, Cashu proofs \
-                     are bearer instruments and the mint holds the Lightning side. Re-run with \
-                     --accept-custody-change to proceed"
-                        .into(),
-                ));
-            }
+            // Belt-and-suspenders: `refuse_before_wallets` already gated this
+            // before any store was opened. Keep the same check here so a
+            // future `run` caller cannot skip consent.
+            refuse_before_wallets(cli)?;
             let engine = MigrationEngine::new(
                 source,
                 dest,
@@ -346,13 +363,7 @@ fn run(
             print_settlement(&outcome);
         }
         Command::SimFund(args) => {
-            if cli.source_mint.is_none() {
-                return Err(WalletError::InvalidInput(
-                    "sim-fund requires --source-mint: it exists to fund a simulated source \
-                     wallet, and must never be pointed at the real Breez wallet"
-                        .into(),
-                ));
-            }
+            refuse_before_wallets(cli)?;
             let before = source.balance()?.confirmed_sats;
             let invoice = source.receive(&ReceiveRequest {
                 method: ReceiveMethod::Bolt11Invoice,
@@ -409,6 +420,95 @@ fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("cli should parse")
+    }
+
+    fn parse_err(args: &[&str]) -> clap::Error {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("cli should refuse to parse"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
+    fn migrate_without_custody_consent_refuses_before_wallets() {
+        let cli = parse(&["sonar-migrate-cli", "migrate", "--max-fee-sats", "50"]);
+        let err = refuse_before_wallets(&cli).expect_err("consent is required");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("accept-custody-change"),
+            "unexpected refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn migrate_with_custody_consent_is_allowed_to_open_wallets() {
+        let cli = parse(&[
+            "sonar-migrate-cli",
+            "migrate",
+            "--max-fee-sats",
+            "50",
+            "--accept-custody-change",
+        ]);
+        refuse_before_wallets(&cli).expect("consent was given");
+    }
+
+    #[test]
+    fn quote_status_and_settle_do_not_require_custody_consent() {
+        for args in [
+            &["sonar-migrate-cli", "quote"][..],
+            &["sonar-migrate-cli", "status"],
+            &["sonar-migrate-cli", "settle"],
+        ] {
+            let cli = parse(args);
+            refuse_before_wallets(&cli)
+                .unwrap_or_else(|_| panic!("{} must not require custody consent", args[1]));
+        }
+    }
+
+    #[test]
+    fn sim_fund_without_source_mint_refuses_before_wallets() {
+        let cli = parse(&["sonar-migrate-cli", "sim-fund", "--amount-sats", "1000"]);
+        let err = refuse_before_wallets(&cli).expect_err("source-mint is required");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sim-fund requires --source-mint"),
+            "unexpected refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn sim_fund_with_source_mint_is_allowed_to_open_wallets() {
+        let cli = parse(&[
+            "sonar-migrate-cli",
+            "--source-mint",
+            "https://source.example",
+            "--mint",
+            "https://mint.hedwig.sh",
+            "sim-fund",
+            "--amount-sats",
+            "1000",
+        ]);
+        refuse_before_wallets(&cli).expect("simulated source was selected");
+    }
+
+    #[test]
+    fn migrate_without_max_fee_fails_to_parse() {
+        let err = parse_err(&["sonar-migrate-cli", "migrate", "--accept-custody-change"]);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max-fee-sats"),
+            "fee cap must be clap-required: {msg}"
+        );
+    }
 }
 
 fn print_settlement(outcome: &Settlement) {
