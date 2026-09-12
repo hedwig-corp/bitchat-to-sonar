@@ -192,6 +192,14 @@ final class SonarMigrationRescueTests: XCTestCase {
         XCTAssertTrue(await gate.tryAcquire(), "rescue must be able to take the lock after a cancelled waiter")
         await gate.release()
     }
+
+    func testFailedOpenTryAgainRetriesControllerCreation() {
+        // Failed-screen "Try again" is quote(). A missing engine must reopen,
+        // not no-op restoreOnOpen: otherwise a transient mint failure makes
+        // the button inert (Compose `quoteTapRetriesOpen`).
+        XCTAssertTrue(SonarMigrationModel.quoteTapRetriesOpen(enginePresent: false))
+        XCTAssertFalse(SonarMigrationModel.quoteTapRetriesOpen(enginePresent: true))
+    }
 }
 
 @MainActor

@@ -401,4 +401,12 @@ class WalletMigrationContractTest {
         assertFalse(hostSendReportsComplete(""))
         assertTrue(hostSendReportsComplete("00"))
     }
+
+    @Test
+    fun failedOpenTryAgainRetriesControllerCreation() {
+        // Failed-screen "Try again" is onQuote. A null controller must reopen,
+        // not return: otherwise a transient mint failure makes the button inert.
+        assertTrue(quoteTapRetriesOpen(controllerPresent = false))
+        assertFalse(quoteTapRetriesOpen(controllerPresent = true))
+    }
 }

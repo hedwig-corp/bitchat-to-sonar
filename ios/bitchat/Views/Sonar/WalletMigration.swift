@@ -284,6 +284,11 @@ final class SonarMigrationModel: ObservableObject {
             }
         } catch {
             if Task.isCancelled { return }
+            // A failed open must not keep the restore latch: Try again calls
+            // `quote`, which retries through `quoteTapRetriesOpen`.
+            didRestoreOnOpen = false
+            engine = nil
+            cashu = nil
             phase = .failed(
                 String(
                     format: String(localized: "Could not open the migration: %@"),
@@ -293,10 +298,19 @@ final class SonarMigrationModel: ObservableObject {
         }
     }
 
+    /// Failed-open "Try again" must reopen the Cashu store. Matches Compose
+    /// `quoteTapRetriesOpen` so a transient mint/restore failure cannot leave
+    /// the button permanently inert.
+    static func quoteTapRetriesOpen(enginePresent: Bool) -> Bool {
+        !enginePresent
+    }
+
     /// Open the Cashu wallet and price a whole-balance drain. Nothing is paid.
     func quote(nsec: String, source: BreezMigrationSource) async {
-        if engine == nil {
+        if Self.quoteTapRetriesOpen(enginePresent: engine != nil) {
+            didRestoreOnOpen = false
             await restoreOnOpen(nsec: nsec, source: source)
+            if engine == nil { return }
         }
         switch phase {
         case .pendingSettlement, .watching, .paying, .settled:

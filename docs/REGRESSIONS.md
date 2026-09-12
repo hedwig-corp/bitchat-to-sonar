@@ -2711,6 +2711,8 @@ rescue: Compose `SonarAppState.setupWallet` /
 
 **Also guarded by:** `lib.rs::crash_after_sending_resumes_via_lookup_without_resend`, `lib.rs::timeout_after_source_accept_resumes_via_lookup_without_resend`
 
+**Also guarded by:** `WalletMigrationContractTest.failedOpenTryAgainRetriesControllerCreation`, `SonarMigrationRescueTests.testFailedOpenTryAgainRetriesControllerCreation`
+
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
 journal, fail-closed parsing, a source-send error leaving `PaymentUnknown`
 so a second `plan` is refused, resume-from-`Sending` via payment-hash
@@ -2729,7 +2731,10 @@ and Apple `CashuMigrationStoreGate.tryAcquire`. Host send reports `complete`
 only when Breez returned a preimage (`hostSendReportsComplete`); an accept
 without a preimage journals pending so resume looks up Lightning. Apple
 `acquire()` returns false on cancellation so a dismissed screen cannot keep
-`cashu.redb`. They do not kill either app between fsync and the source return,
+`cashu.redb`. Failed-open "Try again" is pinned at `quoteTapRetriesOpen` on
+both hosts, used by Compose `onQuote` and Apple `quote` so a null
+controller/engine recreates the store instead of leaving the button inert.
+They do not kill either app between fsync and the source return,
 and do not inject filesystem or parent-directory-fsync failures on a device.
 
 **History:** the production migration replaced process-local plan ownership

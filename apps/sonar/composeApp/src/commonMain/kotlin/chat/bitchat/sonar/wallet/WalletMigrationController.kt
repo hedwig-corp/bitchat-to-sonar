@@ -279,6 +279,15 @@ fun breezMessageLooksInsufficient(message: String): Boolean {
 fun hostSendReportsComplete(preimage: String?): Boolean = !preimage.isNullOrEmpty()
 
 /**
+ * Failed-open "Try again" must recreate the Cashu controller. The Failed
+ * screen's button is [WalletMigrationRoute]'s `onQuote`; a null-controller
+ * early-return without this retry leaves that button permanently inert after a
+ * transient mint/restore failure. Matches Apple
+ * `SonarMigrationModel.quoteTapRetriesOpen`.
+ */
+fun quoteTapRetriesOpen(controllerPresent: Boolean): Boolean = !controllerPresent
+
+/**
  * Build a controller, or `null` where no Breez wallet is configured — the one
  * case that means "migration not offered" rather than "something broke".
  * Anything else throws, carrying its own reason.

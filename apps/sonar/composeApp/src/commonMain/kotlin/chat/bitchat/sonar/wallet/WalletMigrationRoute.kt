@@ -186,6 +186,7 @@ fun WalletMigrationRoute(state: SonarAppState) {
         onQuote = {
             val c = controller
             if (c == null) {
+                check(quoteTapRetriesOpen(controllerPresent = false))
                 openGeneration += 1
                 return@WalletMigrationScreen
             }
