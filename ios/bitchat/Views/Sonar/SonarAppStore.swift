@@ -189,6 +189,7 @@ enum SonarRoute: Hashable {
     case contactProfile(String, String)
     case groupInfo(String)
     case walletActivity
+    case walletMigration
     /// Standalone send-payment picker (new-chat sheet → "Send a payment").
     case sendPayment
     /// Status of one external payment, by activity id (design: paystatus.jsx
@@ -1401,6 +1402,8 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var coreClaimedHandle: String?
     /// Mirrors wallet.state for the UI (balance row and PaySheet).
     @Published private(set) var walletState: SonarWalletState
+    /// One launch-time Cashu rescue attempt per process.
+    private var didAttemptCashuRescue = false
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
     private var pendingPayPeer: String?
     /// Local call records, keyed by DM peer id (the same id the call route +
@@ -2232,11 +2235,15 @@ final class SonarAppStore: ObservableObject {
                     SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: bridged.walletService)
                 }
                 #endif
+                if configured {
+                    self.attemptCashuMigrationRescue()
+                }
             }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
         if case .ready = wallet.state {
             UserDefaults.standard.set(true, forKey: Keys.walletConfigured)
+            attemptCashuMigrationRescue()
         } else {
             UserDefaults.standard.set(false, forKey: Keys.walletConfigured)
         }
@@ -4594,6 +4601,22 @@ final class SonarAppStore: ObservableObject {
                 self.publishedBolt12Offer = offer
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+            }
+        }
+    }
+
+    /// File-only peek, then resume on a background task. Must not run on the
+    /// local-first paint path; wallet Ready is already after Home hydrated.
+    private func attemptCashuMigrationRescue() {
+        guard !didAttemptCashuRescue else { return }
+        didAttemptCashuRescue = true
+        Task {
+            guard let nsec = await exportNsec(),
+                  let bridged = wallet as? BridgedWallet else { return }
+            let source = BreezMigrationSource(wallet: bridged.walletService.migrationWallet)
+            await CashuMigrationStorage.resumeInBackgroundIfNeeded(nsec: nsec, source: source)
+            if SonarMigrationModel.refreshHostLightningAfterSourceMove() {
+                await refreshWalletBalance()
             }
         }
     }
@@ -8636,6 +8659,12 @@ final class SonarAppStore: ObservableObject {
     var balanceSats: Int64? {
         if case .ready(let balance) = walletState { return balance }
         return nil
+    }
+
+    /// Re-read Breez after a migration send so Wallet/Settings are not stale.
+    /// Matches Compose `SonarAppState.refreshWalletBalance`.
+    func refreshWalletBalance() async {
+        await wallet.refreshBalance()
     }
 
     /// Wallet payment activity, newest first. Includes direct Sonar BOLT12

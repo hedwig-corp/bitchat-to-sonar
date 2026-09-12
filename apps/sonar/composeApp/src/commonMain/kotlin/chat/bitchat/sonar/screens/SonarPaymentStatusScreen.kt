@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,6 +50,9 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.payFmt
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.check_again
+import chat.bitchat.sonar.resources.paid_waiting_on_the_mint
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -60,6 +64,11 @@ import chat.bitchat.sonar.wallet.PayMoneyTone
 import chat.bitchat.sonar.wallet.PayPhase
 import chat.bitchat.sonar.wallet.PayStatusCopy
 import chat.bitchat.sonar.wallet.PaymentStatus
+import chat.bitchat.sonar.wallet.peekCashuMigrationNeedsRescue
+import chat.bitchat.sonar.wallet.showsMigrationRescueOnHomeStrip
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.jetbrains.compose.resources.stringResource
 
 /**
  * Payment status — 1:1 with Direction D ("resumable status") of the design's
@@ -388,6 +397,54 @@ fun HomePaymentStrip(state: SonarAppState) {
         Column(Modifier.weight(1f)) {
             Text(title, color = s.text, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, maxLines = 1)
             Text(sub, color = s.text2, fontSize = 12.5.sp, maxLines = 1)
+        }
+        SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
+    }
+}
+
+/**
+ * A paid or ambiguous Cashu migration has no conversation to live in, so it
+ * sits on the same H1 slot as an in-flight Lightning send. Unlike that
+ * strip, this one MUST appear after process death — the journal is the live
+ * state. Peek is file-only; opening the mint stays on the migration screen.
+ */
+@Composable
+fun HomeMigrationRescueStrip(state: SonarAppState) {
+    val s = sonar
+    var journalNeedsRescue by remember { mutableStateOf(false) }
+    LaunchedEffect(state.walletAvailable) {
+        journalNeedsRescue = if (state.walletAvailable) {
+            withContext(Dispatchers.IO) { peekCashuMigrationNeedsRescue() }
+        } else {
+            false
+        }
+    }
+    if (!showsMigrationRescueOnHomeStrip(state.walletAvailable, journalNeedsRescue)) return
+    Row(
+        Modifier.fillMaxWidth().padding(start = 14.dp, end = 14.dp, top = 2.dp, bottom = 8.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(s.goldSoft)
+            .border(1.dp, s.goldFill.copy(alpha = 0.28f), RoundedCornerShape(16.dp))
+            .clickable { state.push(Screen.WalletMigration) }
+            .padding(horizontal = 14.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SpinningArc(size = 34.dp, stroke = 3.5.dp, track = s.surface2, color = s.goldFill)
+        Spacer(Modifier.width(11.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                stringResource(Res.string.paid_waiting_on_the_mint),
+                color = s.text,
+                fontSize = 14.5.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+            )
+            Text(
+                stringResource(Res.string.check_again),
+                color = s.text2,
+                fontSize = 12.5.sp,
+                maxLines = 1,
+            )
         }
         SNIcon(SNIconName.Chevron, 14.dp, s.text3, weight = 2.2f)
     }

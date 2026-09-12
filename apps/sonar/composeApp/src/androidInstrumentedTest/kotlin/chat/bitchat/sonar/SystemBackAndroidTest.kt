@@ -1,13 +1,13 @@
 package chat.bitchat.sonar
 
 import android.Manifest
+import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.test.junit4.createComposeRule
-import androidx.test.espresso.Espresso.pressBack
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.GrantPermissionRule
 import chat.bitchat.sonar.screens.SonarScanQrSheet
@@ -29,7 +29,7 @@ class SystemBackAndroidTest {
     val cameraPermissionRule: GrantPermissionRule = GrantPermissionRule.grant(Manifest.permission.CAMERA)
 
     @get:Rule(order = 1)
-    val composeRule = createComposeRule()
+    val composeRule = createAndroidComposeRule<ComponentActivity>()
 
     @Test
     fun systemBackPopsTheRealSonarAppStateStack() {
@@ -45,7 +45,7 @@ class SystemBackAndroidTest {
                 )
             }
 
-            pressBack()
+            pressSystemBack()
 
             composeRule.runOnIdle { assertTrue(state.isHome) }
         } finally {
@@ -69,7 +69,7 @@ class SystemBackAndroidTest {
             )
         }
 
-        pressBack()
+        pressSystemBack()
 
         composeRule.runOnIdle {
             assertEquals(1, systemBacks)
@@ -92,7 +92,7 @@ class SystemBackAndroidTest {
                 )
             }
 
-            pressBack()
+            pressSystemBack()
 
             composeRule.runOnIdle { assertSame(call, state.screen) }
         } finally {
@@ -116,7 +116,7 @@ class SystemBackAndroidTest {
             }
         }
 
-        pressBack()
+        pressSystemBack()
 
         composeRule.runOnIdle {
             assertFalse(trayVisible)
@@ -169,11 +169,24 @@ class SystemBackAndroidTest {
             content { closed = true }
         }
 
-        pressBack()
+        pressSystemBack()
 
         composeRule.runOnIdle {
             assertTrue(closed)
             assertEquals(0, fallthroughs)
         }
+    }
+
+    /// Compose `BackHandler` registers on the Activity `OnBackPressedDispatcher`.
+    /// Espresso's `pressBack()` and `pressBackUnconditionally()` both wait for a
+    /// focused root and flake on CI emulators (`RootViewWithoutFocusException`)
+    /// after earlier instrumented tests. Invoking the dispatcher is the same
+    /// path system Back uses once the key event reaches the Activity.
+    private fun pressSystemBack() {
+        composeRule.waitForIdle()
+        composeRule.runOnIdle {
+            composeRule.activity.onBackPressedDispatcher.onBackPressed()
+        }
+        composeRule.waitForIdle()
     }
 }

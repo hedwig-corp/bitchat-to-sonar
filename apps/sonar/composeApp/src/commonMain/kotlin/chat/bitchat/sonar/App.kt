@@ -419,6 +419,7 @@ internal fun SonarScreenHost(state: SonarAppState) {
             is Screen.ContactProfile -> chat.bitchat.sonar.screens.SonarContactProfileScreen(state, sc)
             is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
             is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
+            is Screen.WalletMigration -> chat.bitchat.sonar.wallet.WalletMigrationRoute(state)
             is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
             is Screen.PaymentStatus ->
                 chat.bitchat.sonar.screens.SonarPaymentStatusScreen(state, sc.activityId)
@@ -497,6 +498,7 @@ private fun HomeScreen(state: SonarAppState) {
                 // sits above the list; it clears itself the moment it settles
                 // or fails.
                 item { chat.bitchat.sonar.screens.HomePaymentStrip(state) }
+                item { chat.bitchat.sonar.screens.HomeMigrationRescueStrip(state) }
                 item { SNSectionLabel("Around you") }
                 // "Around you" collapses the geohash precision ladder (+ Mesh) into one
                 // card with a tier picker (design: HereCard) instead of a flat list.

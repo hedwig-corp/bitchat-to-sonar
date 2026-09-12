@@ -418,6 +418,87 @@ struct SNHomePaymentStrip: View {
     }
 }
 
+/// A paid or ambiguous Cashu migration has no conversation to live in, so it
+/// sits on the same H1 slot as an in-flight Lightning send. Unlike that strip,
+/// this one MUST appear after process death — the journal is the live
+/// state. Peek is file-only; opening the mint stays on the migration screen.
+struct SNHomeMigrationRescueStrip: View {
+    @EnvironmentObject private var store: SonarAppStore
+    @State private var journalNeedsRescue = false
+
+    private var walletReady: Bool {
+        if case .ready = store.walletState { return true }
+        return false
+    }
+
+    var body: some View {
+        Group {
+            if CashuMigrationStorage.showsOnHomeStrip(
+                walletReady: walletReady,
+                journalNeedsRescue: journalNeedsRescue
+            ) {
+                Button {
+                    store.push(.walletMigration)
+                } label: {
+                    HStack(spacing: 11) {
+                        Circle()
+                            .stroke(SonarTheme.surface2, lineWidth: 3.5)
+                            .overlay(
+                                Circle()
+                                    .trim(from: 0, to: 0.32)
+                                    .stroke(
+                                        SonarTheme.goldFill,
+                                        style: StrokeStyle(lineWidth: 3.5, lineCap: .round)
+                                    )
+                                    .modifier(SNSpinForever())
+                            )
+                            .padding(2)
+                            .frame(width: 34, height: 34)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(String(localized: "Paid — waiting on the mint"))
+                                .font(SonarTheme.uiFont(size: 14.5, weight: .bold))
+                                .foregroundColor(SonarTheme.text)
+                                .lineLimit(1)
+                            Text(String(localized: "Check again"))
+                                .font(SonarTheme.uiFont(size: 12.5))
+                                .foregroundColor(SonarTheme.text2)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        SNIcon(name: .chevron, size: 14, weight: 2.2)
+                            .foregroundColor(SonarTheme.text3)
+                    }
+                    .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(SonarTheme.goldSoft)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .stroke(SonarTheme.goldFill.opacity(0.28), lineWidth: 1)
+                            )
+                    )
+                    .padding(EdgeInsets(top: 2, leading: 14, bottom: 8, trailing: 14))
+                }
+                .buttonStyle(SNScaleStyle(scale: 0.99))
+            }
+        }
+        .task(id: "\(store.path.isEmpty)-\(walletReady)") {
+            // File-only peek after local paint. exportNsec is keychain, never
+            // mint/NUT-13 — those stay on the migration screen.
+            guard store.path.isEmpty else { return }
+            guard walletReady else {
+                journalNeedsRescue = false
+                return
+            }
+            if let nsec = await store.exportNsec() {
+                journalNeedsRescue = CashuMigrationStorage.peekNeedsRescue(nsec: nsec)
+            } else {
+                journalNeedsRescue = false
+            }
+        }
+    }
+}
+
 /// Continuous rotation that starts as soon as the view exists.
 private struct SNSpinForever: ViewModifier {
     @State private var on = false

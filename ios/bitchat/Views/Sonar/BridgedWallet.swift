@@ -155,6 +155,10 @@ final class BridgedWallet: SonarWalletProviding {
             .eraseToAnyPublisher()
     }
 
+    func refreshBalance() async {
+        await bridge.refreshBalance()
+    }
+
     func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
         let payment = try await bridge.send(destination: destination, amountSats: amountSats, note: note ?? "")
         return SonarWalletPayment(
@@ -272,7 +276,9 @@ final class BridgedWallet: SonarWalletProviding {
     ) throws {
         let roots = [
             appGroupContainer?.appendingPathComponent("breez-sdk", isDirectory: true),
+            appGroupContainer?.appendingPathComponent("sonar-cashu", isDirectory: true),
             applicationSupportDirectory?.appendingPathComponent("sonar-wallet", isDirectory: true),
+            applicationSupportDirectory?.appendingPathComponent("sonar-cashu", isDirectory: true),
         ].compactMap { $0 }
         for root in roots where fileManager.fileExists(atPath: root.path) {
             do {

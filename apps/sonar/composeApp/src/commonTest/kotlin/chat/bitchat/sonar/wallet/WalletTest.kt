@@ -6,6 +6,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.runBlocking
 
 class WalletSeedTest {
     private val secret = "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"
@@ -88,5 +89,333 @@ class MoneyTest {
                 Money.formatFiat(100_000, FiatCurrency.EUR, rate) != null,
             )
         }
+    }
+}
+
+class WalletMigrationContractTest {
+    @Test
+    fun pendingPhaseCarriesDestConfirmedSatsNotInvoice() {
+        val invoiceSats = 2_000uL
+        val destConfirmedSats = 500uL
+        val pending = MigrationPhase.PendingSettlement(destConfirmedSats)
+        val result = MigrationResultUi.Pending(destConfirmedSats)
+        assertEquals(destConfirmedSats, pending.cashuSats)
+        assertEquals(destConfirmedSats, result.cashuSats)
+        assertNotEquals(invoiceSats, pending.cashuSats)
+        assertNotEquals(invoiceSats, result.cashuSats)
+    }
+
+    @Test
+    fun settledPhaseCarriesDestConfirmedSatsNotInvoice() {
+        val invoiceSats = 2_000uL
+        val destConfirmedSats = 500uL
+        val settled = phaseAfterOpenStatus(
+            MigrationAttemptStateUi.Settled,
+            invoiceSats,
+            destConfirmedSats,
+            "failed",
+        )
+        assertEquals(MigrationPhase.Settled(destConfirmedSats), settled)
+        assertEquals(destConfirmedSats, MigrationResultUi.Settled(destConfirmedSats).cashuSats)
+        assertNotEquals(invoiceSats, (settled as MigrationPhase.Settled).cashuSats)
+    }
+
+    @Test fun executeErrorAfterSourceAcceptedIsPendingNotANewQuote() {
+        val dest = 500uL
+        val failed = "payment failed"
+        for (state in listOf(
+            MigrationAttemptStateUi.Sending,
+            MigrationAttemptStateUi.PaymentUnknown,
+            MigrationAttemptStateUi.SourcePending,
+            MigrationAttemptStateUi.SourcePaid,
+            MigrationAttemptStateUi.MintPaid,
+        )) {
+            assertTrue(migrationAttemptBlocksNewQuote(state), "$state must not mint a second invoice")
+            assertEquals(
+                MigrationPhase.PendingSettlement(dest),
+                phaseAfterExecuteError(state, dest, failed),
+            )
+        }
+        assertEquals(
+            MigrationPhase.Settled(dest),
+            phaseAfterExecuteError(MigrationAttemptStateUi.Settled, dest, failed),
+        )
+        for (state in listOf(
+            MigrationAttemptStateUi.AwaitingConsent,
+            MigrationAttemptStateUi.ExpiredUnsent,
+            MigrationAttemptStateUi.SourceFailed,
+        )) {
+            assertFalse(migrationAttemptBlocksNewQuote(state))
+            assertEquals(
+                MigrationPhase.Failed(failed),
+                phaseAfterExecuteError(state, dest, failed),
+            )
+        }
+        assertEquals(
+            MigrationPhase.Failed(failed),
+            phaseAfterExecuteError(null, dest, failed),
+        )
+    }
+
+    @Test fun breezProseInsufficientFundsIsTheDrainSignal() {
+        assertTrue(breezMessageLooksInsufficient("Cannot pay: not enough funds"))
+        assertTrue(breezMessageLooksInsufficient("InsufficientFunds"))
+        assertTrue(breezMessageLooksInsufficient("balance too low for this swap"))
+        assertFalse(breezMessageLooksInsufficient("Boltz is unavailable"))
+        assertFalse(breezMessageLooksInsufficient("timeout"))
+    }
+
+    @Test fun relaunchAfterPaidJournalIsPendingNotANewQuote() {
+        val dest = 500uL
+        val failed = "Lightning payment failed"
+        for (state in listOf(
+            MigrationAttemptStateUi.Sending,
+            MigrationAttemptStateUi.PaymentUnknown,
+            MigrationAttemptStateUi.SourcePending,
+            MigrationAttemptStateUi.SourcePaid,
+            MigrationAttemptStateUi.MintPaid,
+        )) {
+            assertTrue(migrationAttemptNeedsRescue(state), "$state must resume, not re-quote")
+            assertEquals(
+                MigrationPhase.PendingSettlement(dest),
+                phaseAfterOpenStatus(state, 2_000uL, dest, failed),
+            )
+        }
+        assertEquals(
+            MigrationPhase.Idle,
+            phaseAfterOpenStatus(null, 0uL, dest, failed),
+        )
+        assertEquals(
+            MigrationPhase.Idle,
+            phaseAfterOpenStatus(MigrationAttemptStateUi.AwaitingConsent, 2_000uL, dest, failed),
+        )
+        assertEquals(
+            MigrationPhase.Settled(dest),
+            phaseAfterOpenStatus(MigrationAttemptStateUi.Settled, 2_000uL, dest, failed),
+        )
+        assertEquals(
+            MigrationPhase.Failed(failed),
+            phaseAfterOpenStatus(MigrationAttemptStateUi.SourceFailed, 2_000uL, dest, failed),
+        )
+        assertFalse(migrationAttemptNeedsRescue(MigrationAttemptStateUi.Settled))
+    }
+
+    @Test fun journalBytesNeedRescueWithoutOpeningTheMint() {
+        fun journal(state: String) = """
+            {
+              "version": 1,
+              "account_fingerprint": "aa",
+              "mint_fingerprint": "bb",
+              "attempt": {
+                "settlement_id": "qid",
+                "invoice": "lnbc1",
+                "payment_hash": "hh",
+                "amount_sats": 2000,
+                "source_fee_sats": 20,
+                "expires_at_secs": null,
+                "source_payment_id": null,
+                "state": "$state"
+              }
+            }
+        """.trimIndent()
+        assertEquals(
+            MigrationAttemptStateUi.SourcePaid,
+            parseJournalAttemptState(journal("SourcePaid")),
+        )
+        assertTrue(journalNeedsRescue(journal("Sending")))
+        assertTrue(journalNeedsRescue(journal("PaymentUnknown")))
+        assertTrue(journalNeedsRescue(journal("SourcePaid")))
+        assertFalse(journalNeedsRescue(journal("AwaitingConsent")))
+        assertFalse(journalNeedsRescue(journal("Settled")))
+        assertFalse(journalNeedsRescue(journal("SourceFailed")))
+        assertFalse(journalNeedsRescue(null))
+        assertFalse(journalNeedsRescue("{}"))
+        assertFalse(journalNeedsRescue(journal("NotAState")))
+    }
+
+    @Test fun paidJournalShowsOnHomeStripAfterRelaunch() {
+        // Opposite of the live-payment H1 rule: a killed process with a
+        // paid journal is exactly when the chat list has to offer rescue.
+        assertTrue(showsMigrationRescueOnHomeStrip(true, true))
+        assertFalse(showsMigrationRescueOnHomeStrip(false, true))
+        assertFalse(showsMigrationRescueOnHomeStrip(true, false))
+        assertFalse(showsMigrationRescueOnHomeStrip(false, false))
+    }
+
+    @Test fun openWithPaidJournalResumesAndDoesNotQuote() = runBlocking {
+        var cancelled = 0
+        var resumed = 0
+        val quoted = 0
+        val dest = 500uL
+        val status = MigrationAttemptStatusUi(
+            settlementId = "qid",
+            amountSats = 2_000uL,
+            feeSats = 20uL,
+            state = MigrationAttemptStateUi.SourcePaid,
+            paymentHash = "hh",
+        )
+        val phase = restoreOpenedMigration(
+            status = status,
+            destConfirmedSats = dest,
+            lightningFailedMessage = "fail",
+            cancelUnspent = { cancelled += 1 },
+            resume = {
+                resumed += 1
+                MigrationResultUi.Pending(dest)
+            },
+        )
+        assertEquals(0, cancelled)
+        assertEquals(1, resumed)
+        assertEquals(0, quoted)
+        assertEquals(MigrationPhase.PendingSettlement(dest), phase)
+    }
+
+    @Test fun openWithUnspentConsentClearsAndDoesNotResume() = runBlocking {
+        var cancelled = 0
+        var resumed = 0
+        val status = MigrationAttemptStatusUi(
+            settlementId = "qid",
+            amountSats = 2_000uL,
+            feeSats = 20uL,
+            state = MigrationAttemptStateUi.AwaitingConsent,
+            paymentHash = "hh",
+        )
+        val phase = restoreOpenedMigration(
+            status = status,
+            destConfirmedSats = 0uL,
+            lightningFailedMessage = "fail",
+            cancelUnspent = { cancelled += 1 },
+            resume = {
+                resumed += 1
+                MigrationResultUi.Pending(0uL)
+            },
+        )
+        assertEquals(1, cancelled)
+        assertEquals(0, resumed)
+        assertEquals(MigrationPhase.Idle, phase)
+    }
+
+    @Test fun openResumeFailureStaysPendingNotANewQuote() = runBlocking {
+        val dest = 500uL
+        val status = MigrationAttemptStatusUi(
+            settlementId = "qid",
+            amountSats = 2_000uL,
+            feeSats = 20uL,
+            state = MigrationAttemptStateUi.Sending,
+            paymentHash = "hh",
+        )
+        val phase = restoreOpenedMigration(
+            status = status,
+            destConfirmedSats = dest,
+            lightningFailedMessage = "fail",
+            cancelUnspent = {},
+            resume = { error("mint timeout") },
+        )
+        assertEquals(MigrationPhase.PendingSettlement(dest), phase)
+    }
+
+    @Test
+    fun backgroundRescueSkipsWhenJournalDoesNotNeedRescue() = runBlocking {
+        var opened = 0
+        var acquired = 0
+        val phase = resumePaidCashuMigrationIfNeeded(
+            peekNeedsRescue = false,
+            acquireExclusive = { acquired += 1; true },
+            releaseExclusive = {},
+            open = {
+                opened += 1
+                error("must not open the mint")
+            },
+            lightningFailedMessage = "fail",
+            polls = 24u,
+        )
+        assertNull(phase)
+        assertEquals(0, acquired)
+        assertEquals(0, opened)
+    }
+
+    @Test
+    fun backgroundRescueSkipsWhenStoreAlreadyOwned() = runBlocking {
+        var opened = 0
+        val phase = resumePaidCashuMigrationIfNeeded(
+            peekNeedsRescue = true,
+            acquireExclusive = { false },
+            releaseExclusive = { error("must not release a lock we never took") },
+            open = {
+                opened += 1
+                error("must not open the mint")
+            },
+            lightningFailedMessage = "fail",
+            polls = 24u,
+        )
+        assertNull(phase)
+        assertEquals(0, opened)
+    }
+
+    @Test
+    fun backgroundRescueResumesPaidJournalAndCloses() = runBlocking {
+        var closed = 0
+        var resumed = 0
+        var quoted = 0
+        var released = 0
+        val dest = 500uL
+        val controller = object : WalletMigrationController {
+            override suspend fun destinationBalanceSats() = dest
+            override suspend fun quote(amountSats: ULong?): MigrationQuoteUi {
+                quoted += 1
+                error("quote must not run during rescue")
+            }
+            override suspend fun execute(planId: String) = error("execute must not run")
+            override suspend fun resume(polls: UInt): MigrationResultUi {
+                resumed += 1
+                return MigrationResultUi.Pending(dest)
+            }
+            override suspend fun status() = MigrationAttemptStatusUi(
+                settlementId = "qid",
+                amountSats = 2_000uL,
+                feeSats = 20uL,
+                state = MigrationAttemptStateUi.SourcePaid,
+                paymentHash = "hh",
+            )
+            override suspend fun cancelUnspent() {}
+            override suspend fun close() { closed += 1 }
+        }
+        val phase = resumePaidCashuMigrationIfNeeded(
+            peekNeedsRescue = true,
+            acquireExclusive = { true },
+            releaseExclusive = { released += 1 },
+            open = { controller },
+            lightningFailedMessage = "fail",
+            polls = 24u,
+        )
+        assertEquals(MigrationPhase.PendingSettlement(dest), phase)
+        assertEquals(1, resumed)
+        assertEquals(0, quoted)
+        assertEquals(1, closed)
+        assertEquals(1, released)
+    }
+
+    @Test
+    fun acceptedBreezSendWithoutPreimageIsPending() {
+        assertFalse(hostSendReportsComplete(null))
+        assertFalse(hostSendReportsComplete(""))
+        assertTrue(hostSendReportsComplete("00"))
+    }
+
+    @Test
+    fun failedOpenTryAgainRetriesControllerCreation() {
+        // Failed-screen "Try again" is onQuote. A null controller must reopen,
+        // not return: otherwise a transient mint failure makes the button inert.
+        assertTrue(quoteTapRetriesOpen(controllerPresent = false))
+        assertFalse(quoteTapRetriesOpen(controllerPresent = true))
+    }
+
+    @Test
+    fun lightningRefreshAfterSourceMoveIsRequired() {
+        // WalletMigrationRoute onConfirm, onResume (success and throw),
+        // restoreOpenedMigration, and setupWallet background rescue wrap
+        // refreshWalletBalance with this gate so Apple's store-level
+        // refresh stays in lockstep.
+        assertTrue(refreshHostLightningAfterSourceMove())
     }
 }

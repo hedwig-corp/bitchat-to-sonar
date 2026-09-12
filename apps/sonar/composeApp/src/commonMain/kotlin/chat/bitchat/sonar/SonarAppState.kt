@@ -26,6 +26,9 @@ import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.refreshHostLightningAfterSourceMove
+import chat.bitchat.sonar.wallet.resumePaidCashuMigrationInBackground
+import chat.bitchat.sonar.wallet.wipeCashuMigrationStorage
 import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.wallet.paymentDestinationHash
 import kotlinx.coroutines.CompletableDeferred
@@ -364,6 +367,8 @@ sealed interface Screen {
     data class ContactProfile(val chatId: String, val name: String) : Screen
     data class GroupInfo(val chatId: String) : Screen
     data object WalletActivity : Screen
+    /** Move the Lightning balance into ecash held on this device. */
+    data object WalletMigration : Screen
     /** Standalone send-payment picker (new-chat sheet → "Send a payment"). */
     data object SendPayment : Screen
     /**
@@ -990,6 +995,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             cancelPendingMarmotGroupSetups()
             val walletShutdownFailure = runCatching { WalletBridge.shutdown() }.exceptionOrNull()
             val walletWipeFailure = runCatching { WalletBridge.wipeLocalStorage() }.exceptionOrNull()
+            val cashuWipeFailure = runCatching { wipeCashuMigrationStorage() }.exceptionOrNull()
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
@@ -1055,7 +1061,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             pollJob?.cancel(); pollJob = null
             housekeepingJob?.cancel(); housekeepingJob = null
             stopMarmotWakeLoop()
-            if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
+            if (coreWipeFailure != null || walletShutdownFailure != null ||
+                walletWipeFailure != null || cashuWipeFailure != null
+            ) {
                 toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
             }
             } finally {
@@ -2870,6 +2878,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Spendable balance in sats (0 unless the wallet is Ready). */
     fun walletBalanceSats(): Long = (walletState as? WalletState.Ready)?.balanceSats ?: 0L
 
+    /** Re-read Breez after a migration send so the Lightning row is not stale. */
+    suspend fun refreshWalletBalance() {
+        if (!walletAvailable) return
+        runCatching {
+            WalletBridge.refreshBalance()
+            walletState = WalletBridge.state()
+        }
+    }
+
     /** Live-rate fiat string for [sats], or null when no rate is available. */
     fun fiatOrNull(sats: Long): String? = Money.formatFiat(sats, currency, rate)
 
@@ -2927,7 +2944,19 @@ class SonarAppState(private val scope: CoroutineScope) {
             WalletBridge.fetchRates()
             rate = WalletBridge.cachedRate(currency)
             publishSonarDescriptorIfNeeded(force = true)
-            if (walletState is WalletState.Ready) Notifier.onWalletReady()
+            if (walletState is WalletState.Ready) {
+                Notifier.onWalletReady()
+                // File peek + resume on IO. Must not sit on the local-first
+                // paint path; this launch is already after Home hydrated.
+                launch(Dispatchers.IO) {
+                    runCatching { resumePaidCashuMigrationInBackground() }
+                    if (refreshHostLightningAfterSourceMove()) {
+                        withContext(Dispatchers.Main) {
+                            runCatching { refreshWalletBalance() }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3944,6 +3973,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 try {
                     WalletBridge.shutdown()
                     WalletBridge.wipeLocalStorage()
+                    wipeCashuMigrationStorage()
                 } catch (error: Throwable) {
                     throw SonarAccountRestoreException(
                         "Wallet storage couldn't be cleared. Restart Sonar and try again.",

@@ -2659,7 +2659,254 @@ keep it until the UIKit path has device mileage.
 - *Port every row kind to UIKit.* Media/sticker/pay/call chrome is rare on the
   scroll path and would double a large amount of layout for no measured win.
 
+## R-045 — An ambiguous migration send must never be sent twice
+
+**Invariant:** the migration journal reaches durable `Sending` before the
+source wallet is called, and no state other than `AwaitingConsent` may enter
+`execute_once`. Corrupt, unsupported, account-mismatched, or mint-mismatched
+journal bytes fail closed.
+
+**Breaks as:** after an app kill or ambiguous Breez error, retry pays the same
+Cashu invoice twice; alternatively a damaged journal is treated as empty and
+offers a second payment.
+
+**Call sites:** core
+`sonar-wallet-migrate::MigrationEngine.execute_once` /
+`MigrationJournal.store_unlocked`; iOS
+`WalletMigration.swift::SonarMigrationModel.confirmAndMigrate`,
+`restoreOnOpen`, and `resumeSettlement`; Compose `WalletMigrationRoute.kt`
+LaunchedEffect / `onConfirm` / `onResume` through the Android and JVM
+`WalletMigrationController`. Home-strip call sites:
+`HomeMigrationRescueStrip` and `SNHomeMigrationRescueStrip`. Launch-time
+rescue: Compose `SonarAppState.setupWallet` /
+`resumePaidCashuMigrationInBackground`; iOS
+`SonarAppStore.attemptCashuMigrationRescue` /
+`CashuMigrationStorage.resumeInBackgroundIfNeeded`.
+
+**Guarded by:** `lib.rs::durable_sending_state_prevents_resend`,
+`lib.rs::corrupt_journal_fails_closed`,
+`lib.rs::planning_refuses_an_in_flight_send`,
+`lib.rs::source_send_error_journals_unknown_and_refuses_a_new_plan`,
+`lib.rs::accepted_pending_send_journals_source_pending_and_refuses_a_new_plan`,
+`journal.rs::needs_rescue_is_only_ambiguous_or_paid_states`,
+`WalletMigrationContractTest.executeErrorAfterSourceAcceptedIsPendingNotANewQuote`,
+`WalletMigrationContractTest.relaunchAfterPaidJournalIsPendingNotANewQuote`,
+`WalletMigrationContractTest.journalBytesNeedRescueWithoutOpeningTheMint`,
+`WalletMigrationContractTest.openWithPaidJournalResumesAndDoesNotQuote`,
+`WalletMigrationContractTest.openWithUnspentConsentClearsAndDoesNotResume`,
+`WalletMigrationContractTest.openResumeFailureStaysPendingNotANewQuote`,
+`WalletMigrationContractTest.paidJournalShowsOnHomeStripAfterRelaunch`,
+`WalletMigrationContractTest.backgroundRescueSkipsWhenJournalDoesNotNeedRescue`,
+`WalletMigrationContractTest.backgroundRescueSkipsWhenStoreAlreadyOwned`,
+`WalletMigrationContractTest.backgroundRescueResumesPaidJournalAndCloses`,
+`SonarMigrationRescueTests.testExecuteErrorAfterSourceAcceptedIsPendingNotANewQuote`,
+`SonarMigrationRescueTests.testRelaunchAfterPaidJournalIsPendingNotANewQuote`,
+`SonarMigrationRescueTests.testJournalBytesNeedRescueWithoutOpeningTheMint`,
+`SonarMigrationRescueTests.testPaidJournalShowsOnHomeStripAfterRelaunch`,
+`SonarMigrationRescueTests.testBackgroundRescueSkipsWhenStoreAlreadyOwned`
+
+**Also guarded by:** `WalletMigrationContractTest.backgroundRescueSkipsWhenJournalDoesNotNeedRescue`, `WalletMigrationContractTest.backgroundRescueSkipsWhenStoreAlreadyOwned`, `WalletMigrationContractTest.backgroundRescueResumesPaidJournalAndCloses`, `SonarMigrationRescueTests.testBackgroundRescueSkipsWhenStoreAlreadyOwned`
+
+**Also guarded by:** `WalletMigrationContractTest.acceptedBreezSendWithoutPreimageIsPending`, `BreezMigrationSourceTests.testAcceptedBreezSendWithoutPreimageIsPending`, `SonarMigrationRescueTests.testCancelledAcquireDoesNotKeepTheLock`, `lib.rs::accepted_pending_send_journals_source_pending_and_refuses_a_new_plan`
+
+**Also guarded by:** `lib.rs::crash_after_sending_resumes_via_lookup_without_resend`, `lib.rs::timeout_after_source_accept_resumes_via_lookup_without_resend`, `lib.rs::execute_once_journals_sending_before_source_send`
+
+**Also guarded by:** `WalletMigrationContractTest.failedOpenTryAgainRetriesControllerCreation`, `SonarMigrationRescueTests.testFailedOpenTryAgainRetriesControllerCreation`
+
+**Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
+journal, fail-closed parsing, a source-send error leaving `PaymentUnknown`
+so a second `plan` is refused, resume-from-`Sending` via payment-hash
+lookup without a second `send`, a host timeout after the source already
+debited (Breez-accepted-then-threw) settling the exact quote on `resume`
+without a second send, and that `execute_once` has already fsynced
+`Sending` onto the journal file before `source.send` runs. The host tests pin the UI mapping that turns those
+states into "Paid — waiting on the mint" instead of a new quote, including the
+relaunch-open mapping (`restoreOpenedMigration` / `phaseAfterOpenStatus`) and
+a file-only journal peek so the home strip, Settings, and Wallet can offer
+rescue without opening the mint. The home-strip tests pin the named gate
+(`showsMigrationRescueOnHomeStrip` / `CashuMigrationStorage.showsOnHomeStrip`)
+used at the chat-list call site; they do not compose the strip. Launch-time
+rescue is pinned at `resumePaidCashuMigrationIfNeeded` (skip when the journal
+is clean, skip when the store is already owned, resume+close a paid journal)
+and Apple `CashuMigrationStoreGate.tryAcquire`. Host send reports `complete`
+only when Breez returned a preimage (`hostSendReportsComplete`); an accept
+without a preimage journals pending so resume looks up Lightning. Apple
+`acquire()` returns false on cancellation so a dismissed screen cannot keep
+`cashu.redb`. Failed-open "Try again" is pinned at `quoteTapRetriesOpen` on
+both hosts, used by Compose `onQuote` and Apple `quote` so a null
+controller/engine recreates the store instead of leaving the button inert.
+They do not kill either app between fsync and the source return,
+and do not inject filesystem or parent-directory-fsync failures on a device.
+
+**History:** the production migration replaced process-local plan ownership
+with `cashu.migration.v1.json` and a take-before-send barrier.
+
+**Rejected:** using an in-memory "already sent" flag, deleting the journal on
+parse failure, or resetting `Sending` to `AwaitingConsent`; all three convert
+uncertainty into permission to spend again.
+
+---
+
+## R-046 — Only the migration's exact Cashu quote may settle it
+
+**Invariant:** source resume is keyed by the journaled BOLT11 `payment_hash`,
+and destination resume is keyed by the journaled `settlement_id`. Aggregate
+Cashu balance growth is never settlement evidence. Pending and Settled
+outcomes still report the destination's confirmed balance (never the invoice
+amount) so the host copy cannot show a 1,000-sat attempt as a 1,000-sat
+Cashu wallet.
+
+**Breaks as:** an unrelated incoming payment makes the UI report "Migration
+complete" while the paid migration quote is still pending or lost; or the
+settled/pending screen overwrites the Cashu balance with the invoice amount.
+
+**Call sites:** core
+`sonar-wallet-migrate::MigrationEngine.resume` /
+`WalletBackend.reconcile_tracked_receive`; iOS
+`WalletMigration.swift::BreezMigrationSource.lookupPayment` and
+`SonarMigrationModel.resumeSettlement`; Compose
+`WalletMigration.android.kt::BreezMigrationSource.lookupPayment`,
+`WalletMigration.jvm.kt::BreezMigrationSource.lookupPayment`, and
+`WalletMigrationRoute.kt::onResume`.
+
+**Guarded by:** `lib.rs::exact_quote_not_unrelated_credit_settles`,
+`lib.rs::resume_reports_settled_idempotently`,
+`lib.rs::settled_outcome_reports_dest_confirmed_not_invoice`,
+`mock.rs::tracked_receive_requires_its_exact_quote`
+
+**Also guarded by:** `WalletMigrationContractTest.pendingPhaseCarriesDestConfirmedSatsNotInvoice`, `WalletMigrationContractTest.settledPhaseCarriesDestConfirmedSatsNotInvoice`, `SonarMigrationRescueTests.testSettledPhaseCarriesDestConfirmedSatsNotInvoice`, `lib.rs::unpaid_mint_quotes_are_excluded_from_pending_receive`
+
+**Coverage (honest):** the tests pin the engine and wallet contracts with exact
+quote identities, and that Settled/Pending outcomes carry dest confirmed
+sats (including after an unrelated dest credit). They do not exercise a live
+CDK mint, Breez payment lookup, UniFFI lifting, or either app's
+pending/settled rendering. Unpaid mint-quote exclusion is pinned on the
+sum helper, not a live CDK `balance()` call.
+
+**History:** baseline-balance settlement was removed in favor of tracked
+receive identity plus source payment-hash reconciliation.
+
+**Rejected:** `cashu_balance >= baseline + amount`. It confuses unrelated
+credits with the paid quote and cannot prove which invoice issued tokens.
+
+---
+
+## R-047 — Migration limits and typed insufficiency must fail before consent
+
+**Invariant:** destination maximum and fee cap are hard pre-spend gates.
+Whole-balance planning may step down only through bounded candidates when the
+source reports typed `InsufficientFunds` or a recognized legacy opaque
+insufficiency; every other host failure aborts.
+
+**Breaks as:** the app pays more fee or moves more principal than displayed, or
+a valid whole-balance migration dies on the first "not enough funds" quote.
+
+**Call sites:** core `sonar-wallet-migrate::MigrationEngine.plan_drain` /
+`check_fee_and_capacity` and
+`sonar-ffi::wallet::HostWalletError` / `HostSourceBackend`; iOS
+`WalletMigration.swift::BreezMigrationSource.hostError`; Compose
+`breezMessageLooksInsufficient` via Android and JVM `BreezMigrationSource`.
+
+**Guarded by:** `lib.rs::drain_steps_down_for_opaque_insufficient_funds`,
+`lib.rs::drain_refuses_destination_max_and_fee_cap`,
+`wallet.rs::host_source_backend_preserves_typed_insufficient_funds`,
+`WalletMigrationContractTest.breezProseInsufficientFundsIsTheDrainSignal`,
+`BreezMigrationSourceTests.testBreezProseInsufficientFundsIsTheDrainSignal`
+
+**Also guarded by:** `HostWalletErrorFfiTest.hostWalletErrorInsufficientFundsLiftsAcrossUniffi`, `HostWalletErrorFfiTest.hostWalletErrorFailedLiftsAcrossUniffi`, `BreezMigrationSourceTests.testHostWalletErrorInsufficientFundsLiftsAcrossUniffi`, `BreezMigrationSourceTests.testHostWalletErrorFailedLiftsAcrossUniffi`
+
+**Coverage (honest):** these tests pin the Rust planner's bounded step-down,
+both hard limits, the FFI adapter's typed `From<HostWalletError>` mapping
+(in-process, no UniFFI), and the three Breez prose phrases the hosts treat as
+`InsufficientFunds`. JVM CI crosses the generated `with_foreign` callback:
+`probe_host_migration_prepare` throws `HostWalletException.InsufficientFunds`
+from a Kotlin `HostMigrationSource` and must lift as that subclass, not
+"Can't lift flat errors". The matching Apple XCTest exists at the same
+generated-binding call site, and `ios-build.yml` now runs
+`BreezMigrationSourceTests` plus `SonarMigrationRescueTests` after the
+compile. The rest of `ios/bitchatTests` still does not run on every PR. The
+Apple message fallback is still weaker than a native typed WalletKit error.
+
+**History:** the first Pixel drain exposed a flat foreign-trait error
+(`Can't lift flat errors`) that prevented the existing planner from seeing the
+insufficiency branch.
+
+**Rejected:** flattening host errors to strings at the FFI adapter, retrying
+all errors as insufficient funds, or accepting an unknown/over-cap fee. The
+first disables typed control flow; the latter two can repeat unrelated faults
+or violate consent.
+
+---
+
+## R-048 — Partial Cashu identity and migration artifacts must be recoverable
+
+**Invariant:** a partial account marker without a Cashu database is repaired
+from the current account, while destructive wallet replacement removes the
+database, account marker, restore markers, and exact migration journal/temp/lock
+artifacts without matching unrelated files.
+
+**Breaks as:** an interrupted first open permanently bricks Cashu restore, or
+an account wipe leaves a migration journal that is later resumed under the
+wrong identity.
+
+**Call sites:** core `sonar-wallet-cdk::CdkWallet.check_account_binding` /
+`is_our_artifact`; iOS `BridgedWallet.swift::wipeWalletFilesAndDefaults`;
+Compose Android
+`WalletMigrationController.android.kt::wipeCashuMigrationStorage` and Desktop
+`WalletMigrationController.jvm.kt::wipeCashuMigrationStorage`.
+
+**Guarded by:** `lib.rs::partial_account_marker_without_database_is_recovered`,
+`lib.rs::wipe_predicate_matches_exact_artifacts_only`,
+`SonarWalletDerivationTests.testWalletStorageWipeRemovesSharedAndLegacyState`,
+`DesktopCashuWipeTest.wipeRemovesProofStoreJournalAndRestoreMarker`
+
+**Coverage (honest):** the CDK tests pin marker recovery and the exact artifact
+predicate, including `cashu.migration.v1.json`, its temp forms, and lock file.
+Apple drives `wipeWalletFilesAndDefaults` on injected paths. Compose JVM drives
+`wipeCashuMigrationStorage` against a DesktopEnv test root. Neither proves
+`SonarAppState.wipe()` / `restoreAccount` or Apple `wipe()` invoke those helpers;
+that remains the same call-site gap documented for R-023/R-004 below. Android
+`filesDir` wipe is the same expect/actual with no instrumented pin.
+
+**History:** journal durability added new identity-bearing files to an existing
+Cashu store whose first-open marker can itself be interrupted.
+
+**Rejected:** treating any marker as authoritative without a database, matching
+all `cashu.*` files, or preserving the migration journal across account wipe.
+Those choices respectively brick recovery, delete foreign files, or permit a
+cross-account resume.
+
 ## Unguarded
+
+- **Post-payment pending migration after an app kill.** R-045 now pins the
+  relaunch-open mapping, journal-peek banner copy, and the home-strip gate, but
+  no Apple or Compose test kills the process after Breez accepts the payment,
+  relaunches, opens `WalletMigrationRoute`, and proves `resume` runs without
+  invoking `send` again. This needs a process-death/device harness with an
+  injectable source and a delayed mint; helper tests cannot pin the host
+  lifecycle call site.
+- **Apple `HostWalletError` lifting beyond the wallet XCTest slice.** R-047 now
+  pins the generated `with_foreign` callback on JVM CI via
+  `probe_host_migration_prepare`, and `ios-build.yml` runs
+  `BreezMigrationSourceTests` (the same UniFFI seam) plus
+  `SonarMigrationRescueTests`. The rest of `ios/bitchatTests` still does not
+  run on every PR. A direct `hostError(_:)` unit test would not guard this
+  boundary, and the Apple message fallback is still weaker than a native typed
+  WalletKit error.
+- **Live Breez → Cashu value transfer.** Fake-mint simulation and Rust tests
+  cannot prove Breez payment lookup, real Lightning routing/fees, mint issuance,
+  NUT-13 recovery, or app-kill resume as one production path. Verification must
+  use a deliberately budgeted device run with a real Breez wallet and target
+  mint; it must record the journal identities and balances before/after. It
+  must never run as an unattended unit or CI test because it spends real funds.
+  The CLI spend gates themselves are pinned: `migrate` without
+  `--accept-custody-change` and `sim-fund` without `--source-mint` refuse in
+  `refuse_before_wallets` before `$SONAR_NSEC` is read (`sonar-migrate-cli`
+  bin tests and `tests/migrate_cli_preflight.rs`).   Host Lightning refresh after
+  a source send, resume (including a thrown watch), relaunch restore, and
+  background rescue is a named gate on both hosts
+  (`refreshHostLightningAfterSourceMove`); that still does not prove a live
+  Breez `getInfo`. That is not a live payment.
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
   #498 made core stop filtering `member_count <= 2` out of
@@ -2687,7 +2934,7 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.
 - **Out-of-range mesh DM echo dedup + Marmot reconcile (R-011 outbox half).** The outbox-flush path (`flushOutboxNow` -> `sendMesh(messageId)` + durable `removeMeshEcho` after Marmot) extends R-011's echo lifecycle to a second entry point. The O(1) dedup in `sendMesh` (`messageId == null || messageId !in meshEchoIds`) and the bounded reconcile (`removeMeshEcho` polls `marmotMessagesForPeer` up to 10x100ms before clearing the echo; on outbox eviction `failMeshEcho` marks the echo "Couldn't send") are both untested -- `SonarAppState` cannot be constructed in a test. Same root cause as the entry above. (Compose media retry is now covered by #397's `SonarMediaOutbox`/`queueMeshMediaForRetry`, so the earlier display-only media-echo gap no longer applies on Android.)
 - **A running iOS process is not a rendered UI.** `BitchatApp.init()` read `_sonarStore.wrappedValue` before SwiftUI installed the `@StateObject`, so each access built a throwaway store: the throwaway connected and opened the account while the view's store never left its launch state, and the app sat on the splash forever. It shipped because the simulator check verified the process stayed alive and read `t1_local_paint groups=137` from the log — both true, both from the wrong instance. The **mechanism** is now pinned: `scripts/check-stateobject-init.sh` (CI: `.github/workflows/swiftui-lifecycle.yml`) fails on any `_x.wrappedValue` read inside an `init()` in a file declaring a `@StateObject` — verified by reintroducing the exact line and re-running, and by confirming the clean tree passes. Like the share-extension check below it is deliberately not cited as `Guarded by:`: it is a shell check, not a test in this ledger's citation grammar. **What it does not pin** is the entry's actual claim — that the app renders. Any other route to a split instance (a helper taking the projected value, the same mistake via `@ObservedObject`) still passes, and no iOS test builds an app scene. Until a UI test target exists (#520) treat "the process is alive" and "the log looks healthy" as insufficient evidence for any launch-path change, and screenshot the screen. Found on an iPhone 14 Pro Max in #368.
-- **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
+- **Most iOS tests do not run in CI.** `ios-build.yml` now runs a bounded wallet slice (`BreezMigrationSourceTests` + `SonarMigrationRescueTests`). `MarmotOptimisticEchoTests` and the rest of `ios/bitchatTests` still only guard locally. `scripts/check-regression-ledger.sh` verifies those tests *exist*; nothing verifies they still *pass*. Treat non-wallet Swift citations as weaker than Kotlin/Rust ones.
 - **Mesh-DM peer-ID rotation orphaning (PR #397 Compose + PR #405 iOS).** Messages keyed by short BLE ID (16-hex) are orphaned when the peer reconnects with a rotated RP address. Compose side fixed in #397 (`echoMeshMessage` + `enqueueOutbox`); iOS side fixed in #405 (`didDisconnectFromPeer` always migrates to stable Noise key). **Residual gap:** when `derivedStableKeyHex` is nil (Noise session never established or already torn down), messages stay under the dead short BLE ID — `consolidateMessages` does not scan for orphaned 16-hex keys. Needs orphan-recovery scan in `PrivateChatManager.consolidateMessages` or deferred migration on reconnect. **Second residual gap:** when a peer has both an outbound peripheral connection and an inbound central subscription (dual BLE leg), losing either leg triggers `didDisconnectFromPeer` unconditionally (`BLEService.swift:1573` / `:4823` / `:5032`). The migration removes the short-key transcript, but messages arriving over the surviving leg continue to be stored under that short peer ID, splitting the conversation again. `notifyPeerDisconnectedDebounced` (debounce window at `:4823`) mitigates rapid double-disconnects but does not check if the other leg is still live. Fix requires per-leg connection-count tracking in `BLEService` so `didDisconnectFromPeer` only fires when all legs are gone. Neither platform has a test for this path; iOS tests don't run in CI.
 - **Android offline BOLT12 wake: settle path and service lifecycle (PR #295).** The `invoice_request` answer path is now pinned end to end at the boundary that matters — `NdsReplyUrlTest` (androidUnitTest, 12 cases) covers the reply-URL pin, the single control between a forged NDS push and a redirected payment invoice, including the two bypasses that survived review: `java.net.URL` does **not** normalize dot-segments (only `URI.normalize()` does), and percent-encoded traversal re-appears once the far side decodes. What is **not** pinned is everything downstream of it. (1) `handleSettledReceive`'s exit signal is now pinned: the decision moved to a pure `settleWakeOutcome(settled, liveEvent, firstThisWake, alreadyNotified)` in commonMain with `SettleWakeOutcomeTest` (9 cases) naming the actual failures rather than covering a truth table — the historical-receive regression, the foreground-claimed trap, and two invariants (`PENDING` never notifies under any combination; notifying implies ending the wake). Mutation-checked: reintroducing the exact `289dda986` regression fails two of them. The **call site** is still unpinned — nothing proves the service passes the right `liveEvent` at each of its two call sites, which is precisely how R-001 escaped, so prefer extending this seam over re-inlining the logic. (2) `paymentEventOf`'s `paymentHash`-before-`txId` id stability, whose whole purpose is that a Lightning receive keeps one id across `PENDING` → `COMPLETE`; keying `txId` first double-ledgers and double-notifies. (3) The service lifecycle: `inFlightWakes` stopping the service only at zero, and the per-delivery `enterForeground()` re-arm of the shortService window. All three need either an Android `Service` driver (Robolectric) or an injectable `SonarCore`; none is reachable from `commonTest` today. The settle path has also never run on device — every captured receive settled inside a single wake, so cross-wake dedup and the `PENDING` branch are reasoning-only. This is simultaneously the most-churned and least-verified code in that PR.
 - **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.

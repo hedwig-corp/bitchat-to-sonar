@@ -6,7 +6,22 @@
 > `core/sonar-wallet-breez`. The per-platform Breez integrations described
 > below are what ships today; they are scheduled for replacement by that
 > interface over a staged PR train (desktop → Android → iOS app → iOS
-> notification extension). Background and the decisions behind it:
+> **Migration surface (PR3).** `SonarCashuWallet` and `SonarMigration` are
+> exported from sonar-ffi; the Breez side of a migration is the foreign trait
+> `HostMigrationSource`, implemented per app over the EXISTING native Breez
+> integrations (`SonarWallet` on Apple, `WalletBridge` on Compose) — Breez-rust
+> can never enter sonar-ffi because its forked libsqlite3-sys links plain
+> sqlite3 and would collide with sonar-core's SQLCipher. The source ships on
+> all three surfaces: Apple, Compose Android, and Compose Desktop (jvmMain
+> gets its own UniFFI bindings from `build-desktop.sh`, so it hosts the engine
+> too).
+>
+> notification extension). The Cashu backend (`core/sonar-wallet-cdk`, PR
+> #582) is core-only for now on BOTH app surfaces — an explicit tracked gap
+> per the Cross-Platform Feature Rule: apps reach wallet backends through the
+> sonar-ffi surface, which lands with the platform cutovers; the follow-up
+> path is the guided Breez→Cashu migration flow (PR3 of the train) plus the
+> per-platform cutover PRs. Background and the decisions behind it:
 > [`docs/brainstorms/2026-07-26-wallet-interface-bolt12.md`](brainstorms/2026-07-26-wallet-interface-bolt12.md).
 >
 > Two constraints that will not go away, and that any wallet work must respect:
@@ -26,6 +41,51 @@
 >    32 bytes) handed to Breez as the *raw* seed — never via a BIP39 mnemonic,
 >    which derives a different wallet. Pinned by a golden vector shared with
 >    `ios/bitchatTests/Services/SonarWalletDerivationTests.swift`.
+
+## Breez → Cashu migration
+
+`core/sonar-wallet-migrate` owns the funds-safety state machine. The apps host
+the existing Breez wallet behind sonar-ffi's `HostMigrationSource`; Cashu is
+the Rust `SonarCashuWallet` destination. Apple implements the host in
+`ios/bitchat/Views/Sonar/WalletMigration.swift`, while Compose Android and
+Desktop implement it through `WalletMigrationController` and the platform
+`WalletBridge`.
+
+The Cashu working directory contains the durable, account-and-mint-bound
+`cashu.migration.v1.json` journal. Its normal progression is
+`AwaitingConsent` → `Sending` → `PaymentUnknown` / `SourcePending` /
+`SourcePaid` → `MintPaid` → `Settled`. `Sending` is atomically persisted and
+fsynced before the source `send`, so an app restart cannot resend an ambiguous
+payment. Corrupt or misbound journal data fails closed. Wallet replacement and
+emergency wipe remove the Cashu root, including the journal, temp, and lock
+artifacts.
+
+Every plan records two independent identities:
+
+- `payment_hash` identifies the outgoing Lightning payment.
+  `HostMigrationSource.lookup_payment(payment_hash)` returns a typed
+  `HostPaymentLookupStatus`, allowing resume to distinguish pending, complete,
+  failed/refundable, and unknown outcomes.
+- `settlement_id` identifies the exact Cashu mint quote.
+  `reconcile_tracked_receive(settlement_id, timeout)` settles only that quote;
+  unrelated Cashu credits and aggregate balance deltas do not count.
+
+`SonarMigration.status()` exposes the journaled state without spending.
+`resume(polls:)` first reconciles the source payment when its outcome is
+ambiguous, then reconciles the exact destination quote. A post-payment timeout
+or app restart remains a pending migration with a safe "check again" path; only
+an `AwaitingConsent`/`ExpiredUnsent` attempt may be cancelled and replanned.
+The headless `sonar-migrate-cli status`/`settle --settle-polls N` commands use
+the same journal. `settle` has no baseline-balance argument, and `migrate`
+prints the settlement id, payment hash, current state, and resume command after
+the source attempt returns and before settlement polling begins.
+
+Host errors are non-flat `HostWalletError` values. `InsufficientFunds` must
+remain a distinct variant across UniFFI so bounded whole-balance drain
+step-down can run; all other failures retain diagnostic text. The Compose host
+maps the typed variant directly. Apple currently maps its native
+`insufficientAfterFee` case directly and retains a message fallback for native
+errors that WalletKit has not typed yet.
 
 ## Current iOS integration (Breez SDK Liquid via unify-wallet)
 

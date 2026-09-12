@@ -183,7 +183,8 @@ struct SonarMacRootView: View {
         case .profile:
             selection = .profile
             store.path.removeAll()
-        case .contactProfile, .groupInfo, .walletActivity, .sendPayment, .paymentStatus, .backup:
+        case .contactProfile, .groupInfo, .walletActivity, .walletMigration,
+             .sendPayment, .paymentStatus, .backup:
             // Pushed detail screens: they live on store.path, so the sidebar
             // selection stays where it is.
             break
@@ -265,6 +266,7 @@ private struct SonarMacSidebar: View {
 
             ScrollView {
                 VStack(spacing: 0) {
+                    SNHomeMigrationRescueStrip()
                     MacSidebarDiscoverRow(
                         selected: selection == .radar,
                         meshCount: store.meshCount
@@ -506,6 +508,8 @@ private struct SonarMacMainPane: View {
             SonarGroupInfoScreen(peerId: id)
         case .walletActivity:
             SonarWalletActivityScreen()
+        case .walletMigration:
+            SonarWalletMigrationRoute()
         case .sendPayment:
             SonarSendPaymentScreen()
         case .paymentStatus(let activityId):

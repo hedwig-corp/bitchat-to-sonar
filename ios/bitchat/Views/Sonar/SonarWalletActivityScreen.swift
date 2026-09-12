@@ -16,6 +16,7 @@ import SwiftUI
 
 struct SonarWalletActivityScreen: View {
     @EnvironmentObject private var store: SonarAppStore
+    @State private var migrationNeedsRescue = false
 
     private var balanceSats: Int64 { store.balanceSats ?? 0 }
     private var entries: [SonarPaymentActivity] { store.paymentActivities }
@@ -51,6 +52,27 @@ struct SonarWalletActivityScreen: View {
                     .padding(.top, 14)
                     .padding(.bottom, 6)
 
+                    if migrationNeedsRescue {
+                        Button {
+                            store.push(.walletMigration)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(String(localized: "Paid — waiting on the mint"))
+                                    .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                                    .foregroundColor(SonarTheme.text)
+                                Text(String(localized: "Check again"))
+                                    .font(SonarTheme.uiFont(size: 12.5))
+                                    .foregroundColor(SonarTheme.text3)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                            .background(SonarTheme.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 8)
+                    }
+
                     SNSectionLabel("Activity")
 
                     if rows.isEmpty {
@@ -79,6 +101,11 @@ struct SonarWalletActivityScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .task {
+            if let nsec = await store.exportNsec() {
+                migrationNeedsRescue = CashuMigrationStorage.peekNeedsRescue(nsec: nsec)
+            }
+        }
     }
 
     /// .wallet-txrow — icon bubble, "To/From <who>", "<status> · <rail> · <time>",

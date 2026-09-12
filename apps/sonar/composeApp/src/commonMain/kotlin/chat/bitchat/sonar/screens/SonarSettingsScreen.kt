@@ -56,9 +56,12 @@ import chat.bitchat.sonar.TranscriptSpikeBDemo
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.sonarTranscriptPolicyHostEntryVisible
 import chat.bitchat.sonar.sonarTranscriptSpikeBEntryVisible
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.peekCashuMigrationNeedsRescue
 import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -80,6 +83,9 @@ import chat.bitchat.sonar.resources.chat_backup
 import chat.bitchat.sonar.resources.encrypted_cloud_backup_recover_chats
 import chat.bitchat.sonar.resources.encrypted_cloud_backup_when_chats_change
 import chat.bitchat.sonar.resources.i_understand_chats_on_this_phone_will
+import chat.bitchat.sonar.resources.move_to_ecash
+import chat.bitchat.sonar.resources.paid_waiting_on_the_mint
+import chat.bitchat.sonar.resources.check_again
 import chat.bitchat.sonar.resources.paste_from_clipboard
 import chat.bitchat.sonar.resources.replace_this_account_with_an_nsec_from
 import chat.bitchat.sonar.resources.restore_account
@@ -111,10 +117,18 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var dataUsage by remember { mutableStateOf(false) }
     var transcriptSpikeB by remember { mutableStateOf(false) }
     var transcriptPolicyHost by remember { mutableStateOf(false) }
+    var migrationNeedsRescue by remember { mutableStateOf(false) }
     state.prefsVersion // subscribe so toggles recompose
     LaunchedEffect(Unit) {
         state.refreshBackupPolicy()
         state.refreshStorageBytes()
+    }
+    LaunchedEffect(state.walletAvailable) {
+        migrationNeedsRescue = if (state.walletAvailable) {
+            withContext(Dispatchers.IO) { peekCashuMigrationNeedsRescue() }
+        } else {
+            false
+        }
     }
 
     val balance = (state.walletState as? WalletState.Ready)?.balanceSats ?: 0L
@@ -190,6 +204,20 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     divider = state.walletAvailable,
                 ) { if (state.walletAvailable) state.push(Screen.WalletActivity) }
                 if (state.walletAvailable) {
+                    SNSettingsRow(
+                        icon = SNIconName.Coin,
+                        tone = SNTone.Gold,
+                        label = if (migrationNeedsRescue) {
+                            stringResource(Res.string.paid_waiting_on_the_mint)
+                        } else {
+                            stringResource(Res.string.move_to_ecash)
+                        },
+                        sub = if (migrationNeedsRescue) {
+                            stringResource(Res.string.check_again)
+                        } else {
+                            null
+                        },
+                    ) { state.push(Screen.WalletMigration) }
                     SNSettingsRow(
                         icon = SNIconName.Globe, label = "Currency", value = state.currency.code,
                     ) { currencyPick = true }

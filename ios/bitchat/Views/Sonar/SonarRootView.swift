@@ -178,6 +178,8 @@ struct SonarRootView: View {
             SonarGroupInfoScreen(peerId: id)
         case .walletActivity:
             SonarWalletActivityScreen()
+        case .walletMigration:
+            SonarWalletMigrationRoute()
         case .sendPayment:
             SonarSendPaymentScreen()
         case .paymentStatus(let activityId):

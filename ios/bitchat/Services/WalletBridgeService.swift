@@ -110,6 +110,7 @@ final class WalletBridgeService: ObservableObject {
     }
 
     private let wallet: SonarWallet
+    var migrationWallet: SonarWallet { wallet }
     private let mainnet: Bool
     private let receiveOfferCache = SonarReceiveOfferCache()
     private var balanceTask: Task<Void, Never>?
@@ -429,6 +430,20 @@ final class WalletBridgeService: ObservableObject {
             try await wallet.unregisterWebhook()
         } catch let error as SonarWallet.WalletError {
             throw Self.map(error)
+        }
+    }
+
+    /// Force a Breez `getInfo` so the published `.ready` balance is not the
+    /// pre-drain snapshot. Matches Compose `WalletBridge.refreshBalance`.
+    @discardableResult
+    func refreshBalance() async -> Int64? {
+        guard case .ready = state else { return nil }
+        do {
+            let sats = try await wallet.balanceSnapshot()
+            state = .ready(balanceSats: sats)
+            return sats
+        } catch {
+            return nil
         }
     }
 

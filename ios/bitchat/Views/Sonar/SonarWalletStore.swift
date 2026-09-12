@@ -133,6 +133,10 @@ protocol SonarWalletProviding: AnyObject {
     /// backends may return an idle stream until they expose settlement events.
     func incomingPayments() -> AsyncStream<SonarWalletPayment>
 
+    /// Re-read the Lightning balance after a migration send so Settings and
+    /// Wallet do not keep the pre-drain figure until the next poll.
+    func refreshBalance() async
+
     // MARK: Money display
 
     /// Persisted display mode: "bitcoin" or "fiat".
@@ -178,6 +182,8 @@ extension SonarWalletProviding {
     func incomingPayments() -> AsyncStream<SonarWalletPayment> {
         AsyncStream { continuation in continuation.finish() }
     }
+
+    func refreshBalance() async {}
 }
 
 /// Coalesces receive-offer creation so repeated descriptor refreshes keep
