@@ -288,6 +288,13 @@ fun hostSendReportsComplete(preimage: String?): Boolean = !preimage.isNullOrEmpt
 fun quoteTapRetriesOpen(controllerPresent: Boolean): Boolean = !controllerPresent
 
 /**
+ * After a source send, send-error, or resume, re-read the Lightning balance
+ * so Wallet/Settings do not keep the pre-drain figure. Matches Apple
+ * `SonarMigrationModel.refreshHostLightningAfterSourceMove`.
+ */
+fun refreshHostLightningAfterSourceMove(): Boolean = true
+
+/**
  * Build a controller, or `null` where no Breez wallet is configured — the one
  * case that means "migration not offered" rather than "something broke".
  * Anything else throws, carrying its own reason.

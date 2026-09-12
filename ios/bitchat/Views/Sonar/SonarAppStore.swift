@@ -4615,6 +4615,9 @@ final class SonarAppStore: ObservableObject {
                   let bridged = wallet as? BridgedWallet else { return }
             let source = BreezMigrationSource(wallet: bridged.walletService.migrationWallet)
             await CashuMigrationStorage.resumeInBackgroundIfNeeded(nsec: nsec, source: source)
+            if SonarMigrationModel.refreshHostLightningAfterSourceMove() {
+                await refreshWalletBalance()
+            }
         }
     }
 
@@ -8656,6 +8659,12 @@ final class SonarAppStore: ObservableObject {
     var balanceSats: Int64? {
         if case .ready(let balance) = walletState { return balance }
         return nil
+    }
+
+    /// Re-read Breez after a migration send so Wallet/Settings are not stale.
+    /// Matches Compose `SonarAppState.refreshWalletBalance`.
+    func refreshWalletBalance() async {
+        await wallet.refreshBalance()
     }
 
     /// Wallet payment activity, newest first. Includes direct Sonar BOLT12

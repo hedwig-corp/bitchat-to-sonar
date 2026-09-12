@@ -2902,7 +2902,10 @@ cross-account resume.
   The CLI spend gates themselves are pinned: `migrate` without
   `--accept-custody-change` and `sim-fund` without `--source-mint` refuse in
   `refuse_before_wallets` before `$SONAR_NSEC` is read (`sonar-migrate-cli`
-  bin tests and `tests/migrate_cli_preflight.rs`). That is not a live payment.
+  bin tests and `tests/migrate_cli_preflight.rs`). Host Lightning refresh after
+  a source send is a named gate on both hosts
+  (`refreshHostLightningAfterSourceMove`); that still does not prove a live
+  Breez `getInfo`. That is not a live payment.
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
   #498 made core stop filtering `member_count <= 2` out of

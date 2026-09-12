@@ -155,6 +155,10 @@ final class BridgedWallet: SonarWalletProviding {
             .eraseToAnyPublisher()
     }
 
+    func refreshBalance() async {
+        await bridge.refreshBalance()
+    }
+
     func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
         let payment = try await bridge.send(destination: destination, amountSats: amountSats, note: note ?? "")
         return SonarWalletPayment(

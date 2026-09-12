@@ -184,11 +184,15 @@ struct SonarWalletMigrationRoute: View {
         }
         self.nsec = nsec
         source = BreezMigrationSource(wallet: bridged.walletService.migrationWallet)
-        model = SonarMigrationModel(
+        let created = SonarMigrationModel(
             mintUrl: mintUrl,
             walletDir: directory.path,
             feeCapSats: 5_000
         )
+        created.onHostLightningMoved = {
+            await store.refreshWalletBalance()
+        }
+        model = created
     }
 }
 
@@ -224,6 +228,14 @@ final class SonarMigrationModel: ObservableObject {
     /// the cap — or a source that cannot quote a fee at all — refuses to plan.
     private let destMaxSats: UInt64
     private let feeCapSats: UInt64
+
+    /// Compose `refreshWalletBalance` after execute / execute-error / resume.
+    var onHostLightningMoved: (() async -> Void)?
+
+    /// After a source send the Lightning figure on this screen and in the
+    /// app wallet state must both be re-read. Matches Compose
+    /// `refreshHostLightningAfterSourceMove`.
+    static func refreshHostLightningAfterSourceMove() -> Bool { true }
 
     init(mintUrl: String, walletDir: String, destMaxSats: UInt64 = 500_000, feeCapSats: UInt64) {
         self.mintUrl = mintUrl
@@ -396,7 +408,7 @@ final class SonarMigrationModel: ObservableObject {
                 try engine.resume(polls: 24)
             }.value
             apply(outcome)
-            await refreshBalances(source: source)
+            await refreshLightningAfterSourceMove(source: source)
         } catch {
             let status = try? await Task.detached { try engine.status() }.value
             phase = Self.phaseAfterExecuteError(
@@ -407,7 +419,7 @@ final class SonarMigrationModel: ObservableObject {
                     String(describing: error)
                 )
             )
-            await refreshBalances(source: source)
+            await refreshLightningAfterSourceMove(source: source)
         }
     }
 
@@ -425,7 +437,13 @@ final class SonarMigrationModel: ObservableObject {
         } catch {
             phase = .pendingSettlement(cashuSats: cashuBalanceSats)
         }
+        await refreshLightningAfterSourceMove(source: source)
+    }
+
+    func refreshLightningAfterSourceMove(source: BreezMigrationSource) async {
+        guard Self.refreshHostLightningAfterSourceMove() else { return }
         await refreshBalances(source: source)
+        await onHostLightningMoved?()
     }
 
     func refreshBalances(source: BreezMigrationSource) async {

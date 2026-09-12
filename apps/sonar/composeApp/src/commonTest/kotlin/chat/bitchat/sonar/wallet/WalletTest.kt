@@ -409,4 +409,11 @@ class WalletMigrationContractTest {
         assertTrue(quoteTapRetriesOpen(controllerPresent = false))
         assertFalse(quoteTapRetriesOpen(controllerPresent = true))
     }
+
+    @Test
+    fun lightningRefreshAfterSourceMoveIsRequired() {
+        // WalletMigrationRoute onConfirm/onResume wrap refreshWalletBalance
+        // with this gate so Apple's store-level refresh stays in lockstep.
+        assertTrue(refreshHostLightningAfterSourceMove())
+    }
 }

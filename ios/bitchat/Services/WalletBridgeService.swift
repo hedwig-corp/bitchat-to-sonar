@@ -433,6 +433,20 @@ final class WalletBridgeService: ObservableObject {
         }
     }
 
+    /// Force a Breez `getInfo` so the published `.ready` balance is not the
+    /// pre-drain snapshot. Matches Compose `WalletBridge.refreshBalance`.
+    @discardableResult
+    func refreshBalance() async -> Int64? {
+        guard case .ready = state else { return nil }
+        do {
+            let sats = try await wallet.balanceSnapshot()
+            state = .ready(balanceSats: sats)
+            return sats
+        } catch {
+            return nil
+        }
+    }
+
     // MARK: - Payments
 
     /// Send to any Lightning destination: BOLT11 invoice, BOLT12 offer,

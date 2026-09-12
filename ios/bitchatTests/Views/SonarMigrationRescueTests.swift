@@ -203,6 +203,10 @@ final class SonarMigrationRescueTests: XCTestCase {
         XCTAssertTrue(SonarMigrationModel.quoteTapRetriesOpen(enginePresent: false))
         XCTAssertFalse(SonarMigrationModel.quoteTapRetriesOpen(enginePresent: true))
     }
+
+    func testRefreshHostLightningAfterSourceMoveIsRequired() {
+        XCTAssertTrue(SonarMigrationModel.refreshHostLightningAfterSourceMove())
+    }
 }
 
 @MainActor
