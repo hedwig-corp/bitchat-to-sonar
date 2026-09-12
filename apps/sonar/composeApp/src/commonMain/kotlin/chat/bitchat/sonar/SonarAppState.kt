@@ -26,6 +26,7 @@ import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.wallet.refreshHostLightningAfterSourceMove
 import chat.bitchat.sonar.wallet.resumePaidCashuMigrationInBackground
 import chat.bitchat.sonar.wallet.wipeCashuMigrationStorage
 import chat.bitchat.sonar.wallet.mergeWalletActivity
@@ -2949,6 +2950,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // paint path; this launch is already after Home hydrated.
                 launch(Dispatchers.IO) {
                     runCatching { resumePaidCashuMigrationInBackground() }
+                    if (refreshHostLightningAfterSourceMove()) {
+                        withContext(Dispatchers.Main) {
+                            runCatching { refreshWalletBalance() }
+                        }
+                    }
                 }
             }
         }

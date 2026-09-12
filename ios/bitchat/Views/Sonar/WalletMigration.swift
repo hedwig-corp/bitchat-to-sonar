@@ -229,7 +229,8 @@ final class SonarMigrationModel: ObservableObject {
     private let destMaxSats: UInt64
     private let feeCapSats: UInt64
 
-    /// Compose `refreshWalletBalance` after execute / execute-error / resume.
+    /// Compose `refreshWalletBalance` after execute / execute-error / resume
+    /// (including a thrown watch), relaunch restore, and background rescue.
     var onHostLightningMoved: (() async -> Void)?
 
     /// After a source send the Lightning figure on this screen and in the

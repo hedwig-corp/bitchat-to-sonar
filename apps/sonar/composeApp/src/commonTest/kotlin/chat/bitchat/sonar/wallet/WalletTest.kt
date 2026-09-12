@@ -412,8 +412,10 @@ class WalletMigrationContractTest {
 
     @Test
     fun lightningRefreshAfterSourceMoveIsRequired() {
-        // WalletMigrationRoute onConfirm/onResume wrap refreshWalletBalance
-        // with this gate so Apple's store-level refresh stays in lockstep.
+        // WalletMigrationRoute onConfirm, onResume (success and throw),
+        // restoreOpenedMigration, and setupWallet background rescue wrap
+        // refreshWalletBalance with this gate so Apple's store-level
+        // refresh stays in lockstep.
         assertTrue(refreshHostLightningAfterSourceMove())
     }
 }

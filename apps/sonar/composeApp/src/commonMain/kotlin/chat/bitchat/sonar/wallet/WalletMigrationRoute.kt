@@ -160,6 +160,13 @@ fun WalletMigrationRoute(state: SonarAppState) {
                     }
                     else -> phase = restored
                 }
+                // Matches Apple restoreOnOpen → resumeSettlement, which
+                // always re-reads Lightning after a journaled resume.
+                if (status?.state?.let { migrationAttemptNeedsRescue(it) } == true &&
+                    refreshHostLightningAfterSourceMove()
+                ) {
+                    runCatching { state.refreshWalletBalance() }
+                }
                 awaitCancellation()
             } finally {
                 abandoned.set(true)
@@ -286,11 +293,6 @@ fun WalletMigrationRoute(state: SonarAppState) {
             scope.launch {
                 runCatching { c.resume(SETTLE_POLLS) }
                     .onSuccess { result ->
-                        runCatching {
-                            if (refreshHostLightningAfterSourceMove()) {
-                                state.refreshWalletBalance()
-                            }
-                        }
                         phase = when (result) {
                             is MigrationResultUi.Settled -> {
                                 cashuBalance = result.cashuSats
@@ -303,6 +305,13 @@ fun WalletMigrationRoute(state: SonarAppState) {
                         }
                     }
                     .onFailure { phase = MigrationPhase.PendingSettlement(cashuBalance) }
+                // Matches Apple resumeSettlement: refresh after the attempt,
+                // including when the watch throws.
+                runCatching {
+                    if (refreshHostLightningAfterSourceMove()) {
+                        state.refreshWalletBalance()
+                    }
+                }
             }
         },
     )

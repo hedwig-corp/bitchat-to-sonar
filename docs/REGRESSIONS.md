@@ -2902,8 +2902,9 @@ cross-account resume.
   The CLI spend gates themselves are pinned: `migrate` without
   `--accept-custody-change` and `sim-fund` without `--source-mint` refuse in
   `refuse_before_wallets` before `$SONAR_NSEC` is read (`sonar-migrate-cli`
-  bin tests and `tests/migrate_cli_preflight.rs`). Host Lightning refresh after
-  a source send is a named gate on both hosts
+  bin tests and `tests/migrate_cli_preflight.rs`).   Host Lightning refresh after
+  a source send, resume (including a thrown watch), relaunch restore, and
+  background rescue is a named gate on both hosts
   (`refreshHostLightningAfterSourceMove`); that still does not prove a live
   Breez `getInfo`. That is not a live payment.
 

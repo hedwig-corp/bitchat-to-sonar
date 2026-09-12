@@ -288,8 +288,9 @@ fun hostSendReportsComplete(preimage: String?): Boolean = !preimage.isNullOrEmpt
 fun quoteTapRetriesOpen(controllerPresent: Boolean): Boolean = !controllerPresent
 
 /**
- * After a source send, send-error, or resume, re-read the Lightning balance
- * so Wallet/Settings do not keep the pre-drain figure. Matches Apple
+ * After a source send, send-error, resume (success or throw), relaunch
+ * restore, or background rescue, re-read the Lightning balance so
+ * Wallet/Settings do not keep the pre-drain figure. Matches Apple
  * `SonarMigrationModel.refreshHostLightningAfterSourceMove`.
  */
 fun refreshHostLightningAfterSourceMove(): Boolean = true
