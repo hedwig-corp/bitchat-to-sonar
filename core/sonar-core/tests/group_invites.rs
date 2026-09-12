@@ -171,11 +171,18 @@ async fn staged_add_member_commit_can_be_rolled_back() {
         .expect("stage add charlie");
     assert_eq!(update.welcomes.len(), 1);
     assert!(
-        !alice
+        update.requires_commit_merge,
+        "invite is GroupEvolution: host must confirm_published or publish_failed"
+    );
+    // MDK 0.9 projects the invitee into members() during PendingPublish
+    // (cgka-engine publish_lifecycle). Rollback, not "absent until merge",
+    // is the host invariant.
+    assert!(
+        alice
             .members(&group_id)
-            .expect("members before merge")
+            .expect("members while pending")
             .contains(&charlie_pubkey),
-        "staged add-member state stays pending until commit merge"
+        "0.9 projects staged invitees into members() before confirm"
     );
 
     alice
@@ -257,11 +264,15 @@ async fn published_add_member_commit_remains_mergeable_after_welcome_failure() {
         .expect("stage add charlie");
     assert_eq!(update.welcomes.len(), 1);
     assert!(
-        !alice
+        update.requires_commit_merge,
+        "invite is GroupEvolution: host must confirm_published or publish_failed"
+    );
+    assert!(
+        alice
             .members(&group_id)
-            .expect("members before merge")
+            .expect("members while pending")
             .contains(&charlie_pubkey),
-        "staged add-member state stays pending until commit merge"
+        "0.9 projects staged invitees into members() before confirm"
     );
 
     alice

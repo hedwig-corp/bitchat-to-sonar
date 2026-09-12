@@ -34,9 +34,11 @@ let package = Package(
                 // NSE note: BreezFFI also ships plain sqlite3_* symbols. With
                 // -dead_strip, those can satisfy SonarCore's sqlite imports and
                 // strip SQLCipher from libsonar_ffi — hydrate then fails with
-                // "SQLCipher support is not active". The NSE target forces
-                // `_sqlcipher_cc_setup` / `_sqlite3_key` via OTHER_LDFLAGS
-                // (see bitchat.xcodeproj SonarNotificationService).
+                // "SQLCipher support is not active". MDK 0.9 vendors OpenSSL
+                // SQLCipher, so the NSE target forces `_sqlcipher_openssl_setup`
+                // / `_sqlite3_key` via OTHER_LDFLAGS (see bitchat.xcodeproj
+                // SonarNotificationService). `_sqlcipher_cc_setup` is the
+                // CommonCrypto backend and is not compiled on this pin.
                 .linkedFramework("Security"),
                 .linkedFramework("CoreFoundation"),
                 // cpal's CoreAudio backend (P2P call mic/speaker, behind the Rust

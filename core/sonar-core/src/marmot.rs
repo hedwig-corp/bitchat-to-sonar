@@ -27,8 +27,8 @@ use cgka_engine::account_identity_proof::{
 use cgka_engine::KeyPackageMetadata;
 use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig, SessionEffects};
 use cgka_traits::app_components::{
-    default_group_components, encode_nostr_routing_v1, AppComponentData, NostrRoutingV1,
-    NOSTR_ROUTING_COMPONENT_ID,
+    decode_nostr_routing_v1, default_group_components, encode_nostr_routing_v1, AppComponentData,
+    NostrRoutingV1, NOSTR_ROUTING_COMPONENT_ID,
 };
 use cgka_traits::app_event::{MarmotAppEvent, MARMOT_APP_EVENT_KIND_CHAT};
 use cgka_traits::engine::{
@@ -312,8 +312,10 @@ pub enum Incoming {
     /// Processing a proposal produced an auto-commit that the caller must
     /// publish and merge before the group converges.
     GroupProposal(GroupMembershipUpdate),
-    /// Processing recorded a terminal failure. The relay sync layer must mark
-    /// it processed and move on.
+    /// Processing recorded a terminal failure, or a Duplicate redelivery of a
+    /// Failed ciphertext with no local chat row. Relay sync counts the delivery
+    /// handled for the batch watermark but must not durable-dedup it: MLS
+    /// rollback can later make the same event Retryable.
     Failed,
     /// A join request was received for a group we administer.
     JoinRequest(crate::invite_link::JoinRequest),
@@ -1133,7 +1135,21 @@ impl MarmotEngine {
         member_key_packages: Vec<Event>,
         relays: Vec<RelayUrl>,
     ) -> Result<GroupCreation> {
-        self.create_group_with_description(name, "", member_key_packages, relays)
+        self.create_group_with_admins(name, member_key_packages, relays, Vec::new())
+            .await
+    }
+
+    /// Like [`Self::create_group`], with extra founding admins besides the
+    /// creator. Production groups keep this empty so invitees can Leave;
+    /// competing-commit tests pass a co-admin because Invite is admin-only.
+    pub async fn create_group_with_admins(
+        &self,
+        name: &str,
+        member_key_packages: Vec<Event>,
+        relays: Vec<RelayUrl>,
+        extra_admins: Vec<PublicKey>,
+    ) -> Result<GroupCreation> {
+        self.create_group_with_description(name, "", member_key_packages, relays, extra_admins)
             .await
     }
 
@@ -1143,6 +1159,7 @@ impl MarmotEngine {
         description: &str,
         member_key_packages: Vec<Event>,
         relays: Vec<RelayUrl>,
+        extra_admins: Vec<PublicKey>,
     ) -> Result<GroupCreation> {
         let relay_urls: Vec<String> = if relays.is_empty() {
             // Local-only / no-relay clients still need a wrap-valid relay list
@@ -1160,9 +1177,11 @@ impl MarmotEngine {
         let routing =
             NostrRoutingV1::new(nostr_group_id, relay_urls).map_err(Error::InvalidInput)?;
         let routing_bytes = encode_nostr_routing_v1(&routing).map_err(Error::InvalidInput)?;
-        let initial_admins = member_key_packages
-            .iter()
-            .map(|ev| MemberId::new(ev.pubkey.to_bytes().to_vec()))
+        // Founder is always an admin. Extra ids bootstrap co-admins
+        // (MIP-03 competing commits). Default empty: invitees can Leave.
+        let initial_admins = extra_admins
+            .into_iter()
+            .map(|pk| MemberId::new(pk.to_bytes().to_vec()))
             .collect();
         let req = CreateGroupRequest {
             name: name.to_owned(),
@@ -1236,9 +1255,15 @@ impl MarmotEngine {
     }
 
     pub async fn self_demote(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
-        // MDK 0.9 has no self-demote commit. Leave (MIP-03 SelfRemove) is the
-        // membership-exit path; keep this method so hosts still compile.
-        self.leave_group(group_id).await
+        // MDK 0.9 has no demote SendIntent. MIP-03 Leave refuses admins
+        // (`EngineError::AdminCannotSelfRemove`). Calling Leave here would
+        // recurse from `SonarClient::leave_group`'s recovery arm. Invitees
+        // are created with empty `initial_admins` so they can Leave; the
+        // founding admin cannot until MDK grows a demote commit.
+        Err(Error::InvalidInput(format!(
+            "MDK 0.9 has no self-demote commit for {}; leave the admin set first",
+            hex::encode(group_id.as_slice())
+        )))
     }
 
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
@@ -1375,6 +1400,30 @@ impl MarmotEngine {
         };
         let mut lease = self.lease_session().await;
         lease.get_mut().confirm_published(pending).await?;
+        Ok(())
+    }
+
+    /// Apply buffered MIP-03 commits after the convergence quiescence
+    /// window. Ingest leaves competing commits `Buffered`; the host must
+    /// call this after the cutoff (tests sleep ~1.1s; the live client
+    /// should schedule the same).
+    ///
+    /// MDK may replay PeelDeferred application messages in this same drain.
+    /// Those `MessageReceived` events must land in the local transcript here:
+    /// a later relay redelivery of the same ciphertext is a durable
+    /// Duplicate keyed by content-id, which `lookup_chat` cannot find from
+    /// the Nostr event id.
+    pub async fn advance_group_convergence(&self, group_id: &GroupId) -> Result<()> {
+        let mut lease = self.lease_session().await;
+        let _ = lease.get_mut().ensure_group_hydrated(group_id);
+        let _ = lease
+            .get_mut()
+            .prepare_convergence_cutoff_delay_ms(group_id);
+        let mut effects = lease.get_mut().advance_convergence(group_id).await?;
+        let drained = lease.get_mut().drain();
+        merge_session_effects(&mut effects, drained);
+        drop(lease);
+        let _ = self.persist_session_effects(effects)?;
         Ok(())
     }
 
@@ -1817,21 +1866,41 @@ impl MarmotEngine {
         let outcome = ingested.outcome;
         let mut effects = ingested.effects;
         let drained = lease.get_mut().drain();
-        effects.events.extend(drained.events);
-        effects.publish.extend(drained.publish);
+        merge_session_effects(&mut effects, drained);
         drop(lease);
 
+        tracing::debug!(
+            ?outcome,
+            effect_events = effects.events.len(),
+            "ingest_event"
+        );
         match outcome {
-            IngestOutcome::Ignored {
-                category: InputRejectionCategory::OwnEcho | InputRejectionCategory::Duplicate,
-            } => {
-                if let Some(msg) = self.lookup_chat(&event.id) {
-                    return Ok(Incoming::Message(msg));
+            IngestOutcome::Ignored { category } => {
+                match category {
+                    InputRejectionCategory::OwnEcho | InputRejectionCategory::Duplicate => {
+                        if let Some(msg) = self.lookup_chat(&event.id) {
+                            return Ok(Incoming::Message(msg));
+                        }
+                        // MDK 0.9 collapsed 0.8 PreviouslyFailed into Duplicate
+                        // (Failed/Processed/EpochInvalidated share this category).
+                        // A Duplicate with no transcript row must not become
+                        // Incoming::None — that path durable-dedups the event
+                        // and hides a ciphertext MLS rollback can make Retryable.
+                        if category == InputRejectionCategory::Duplicate {
+                            return Ok(Incoming::Failed);
+                        }
+                        return Ok(Incoming::None);
+                    }
+                    _ => return Ok(Incoming::None),
                 }
-                return Ok(Incoming::None);
             }
-            IngestOutcome::Ignored { .. } => return Ok(Incoming::None),
             IngestOutcome::Rejected { .. } | IngestOutcome::Stale { .. } => {
+                return Ok(Incoming::Failed)
+            }
+            IngestOutcome::Buffered { .. } if effects.events.is_empty() => {
+                return Ok(Incoming::Failed)
+            }
+            IngestOutcome::TransportDeferred { .. } | IngestOutcome::ResourceRefused { .. } => {
                 return Ok(Incoming::Failed)
             }
             IngestOutcome::LocalState { .. } => return Ok(Incoming::None),
@@ -1842,6 +1911,10 @@ impl MarmotEngine {
             return Ok(Incoming::GroupProposal(update));
         }
 
+        self.persist_session_effects(effects)
+    }
+
+    fn persist_session_effects(&self, effects: SessionEffects) -> Result<Incoming> {
         let mut last = Incoming::None;
         for ev in effects.events {
             match ev {
@@ -1951,6 +2024,30 @@ impl MarmotEngine {
                 }
             }
             Ok(groups)
+        })
+    }
+
+    /// Kind-445 `#h` tag: the 32-byte Nostr routing id, not the MLS [`GroupId`].
+    ///
+    /// MDK 0.9 puts a random 32-byte `nostr_group_id` in the founding
+    /// `NostrRoutingV1` component. Relays and White Noise index kind-445 on
+    /// that value. The host-facing MLS group id stays 16 bytes.
+    pub fn nostr_h_tag_hex(&self, mls_group_id: &GroupId) -> Result<Option<String>> {
+        self.with_session_mut(|session| {
+            if !session.ensure_group_hydrated(mls_group_id)? {
+                return Ok(None);
+            }
+            let Some(bytes) = session.app_component(mls_group_id, NOSTR_ROUTING_COMPONENT_ID)?
+            else {
+                return Ok(None);
+            };
+            match decode_nostr_routing_v1(&bytes) {
+                Ok(routing) => Ok(Some(hex::encode(routing.nostr_group_id))),
+                Err(e) => {
+                    tracing::debug!(error = %e, "nostr routing component unreadable");
+                    Ok(None)
+                }
+            }
         })
     }
 
@@ -2554,6 +2651,13 @@ fn marmot_app_event_from_rumor(rumor: &UnsignedEvent) -> Result<Vec<u8>> {
     )
     .encode()
     .map_err(|e| Error::Mdk(e.to_string()))
+}
+
+fn merge_session_effects(into: &mut SessionEffects, from: SessionEffects) {
+    into.events.extend(from.events);
+    into.publish.extend(from.publish);
+    into.queued.extend(from.queued);
+    into.pending_convergence.extend(from.pending_convergence);
 }
 
 fn event_from_app_publish(effects: &SessionEffects) -> Result<Event> {

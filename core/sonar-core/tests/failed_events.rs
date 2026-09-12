@@ -34,9 +34,12 @@ async fn undecryptable_group_message_surfaces_as_failed_until_rollback() {
         .await
         .expect("merge pending commit");
 
-    let group_hex = hex::encode(creation.group.id.as_slice());
+    let h_tag = alice
+        .nostr_h_tag_hex(&creation.group.id)
+        .expect("routing lookup")
+        .expect("founding group has nostr routing");
     let garbage = EventBuilder::new(Kind::MlsGroupMessage, "bm90LWFuLW1scy1jaXBoZXJ0ZXh0")
-        .tags([Tag::parse(["h", &group_hex]).expect("h tag")])
+        .tags([Tag::parse(["h", &h_tag]).expect("h tag")])
         .sign_with_keys(&Keys::generate())
         .expect("sign garbage 445");
 

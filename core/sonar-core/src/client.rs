@@ -2527,6 +2527,7 @@ impl SonarClient {
                 SONAR_DIRECT_DM_DESCRIPTION,
                 vec![key_package],
                 self.relays.clone(),
+                Vec::new(),
             )
             .await?;
         self.publish_group_creation(creation).await
@@ -3059,6 +3060,7 @@ impl SonarClient {
                 SONAR_DIRECT_DM_DESCRIPTION,
                 key_packages,
                 self.relays.clone(),
+                Vec::new(),
             )
             .await?;
         self.publish_group_creation(creation).await
@@ -3233,7 +3235,7 @@ impl SonarClient {
         let _epoch = self.membership_gate.write().await;
         let leave_update = match self.engine.leave_group(group_id).await {
             Ok(update) => update,
-            Err(err) if err.to_string().contains("self-demote") => {
+            Err(err) if is_admin_self_remove_blocked(&err) => {
                 let demote = self.engine.self_demote(group_id).await?;
                 self.best_effort_membership_publish(demote, "self-demote before leave")
                     .await;
@@ -3437,7 +3439,10 @@ impl SonarClient {
         let group_id = self.engine.accept_group_invite(welcome_id).await?;
         if let Some(group) = self.engine.groups()?.into_iter().find(|g| g.id == group_id) {
             self.ensure_index_for_group(&group_id, &group.name);
-            let nostr_group_id = hex::encode(group.id.as_slice());
+            let nostr_group_id = self
+                .engine
+                .nostr_h_tag_hex(&group_id)?
+                .unwrap_or_else(|| hex::encode(group.id.as_slice()));
             if let Err(err) = self.backfill_group(&nostr_group_id).await {
                 tracing::debug!(
                     %err,
@@ -5864,13 +5869,16 @@ impl SonarClient {
         Ok(())
     }
 
+    /// Kind-445 `#h` tags for every live group (32-byte Nostr routing ids).
+    /// Host conversation ids stay MLS [`GroupId`] hex; do not mix the two.
     fn current_group_ids(&self) -> Result<HashSet<String>> {
-        Ok(self
-            .engine
-            .groups()?
-            .into_iter()
-            .map(|g| hex::encode(g.id.as_slice()))
-            .collect())
+        let mut tags = HashSet::new();
+        for group in self.engine.groups()? {
+            if let Some(h) = self.engine.nostr_h_tag_hex(&group.id)? {
+                tags.insert(h);
+            }
+        }
+        Ok(tags)
     }
 
     fn empty_transcript_group_ids(engine: &MarmotEngine) -> HashSet<String> {
@@ -5880,7 +5888,7 @@ impl SonarClient {
         groups
             .into_iter()
             .filter_map(|group| match engine.messages_page(&group.id, 1, 0) {
-                Ok(page) if page.is_empty() => Some(hex::encode(group.id.as_slice())),
+                Ok(page) if page.is_empty() => engine.nostr_h_tag_hex(&group.id).ok().flatten(),
                 _ => None,
             })
             .collect()
@@ -5926,7 +5934,8 @@ impl SonarClient {
                 let floor = engine
                     .latest_remote_chat_message_secs(&group.id)
                     .unwrap_or(0);
-                Some((hex::encode(group.id.as_slice()), floor))
+                let h = engine.nostr_h_tag_hex(&group.id).ok().flatten()?;
+                Some((h, floor))
             })
             .collect()
     }
@@ -6161,8 +6170,11 @@ impl SonarClient {
                 } else if let Ok(groups) = self.engine.groups() {
                     groups.into_iter().find_map(|g| {
                         let mls = hex::encode(g.id.as_slice());
+                        let h = self.engine.nostr_h_tag_hex(&g.id).ok().flatten();
                         if mls == clean {
-                            Some(hex::encode(g.id.as_slice()))
+                            h
+                        } else if h.as_deref() == Some(clean.as_str()) {
+                            Some(clean.clone())
                         } else {
                             None
                         }
@@ -7795,6 +7807,11 @@ fn is_terminal_marmot_processing_error(err: &Error) -> bool {
     )
 }
 
+fn is_admin_self_remove_blocked(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("admin cannot self-remove") || s.contains("self-demote")
+}
+
 /// Deadline for one Blossom upload, scaled to the payload so a large video on
 /// a slow uplink is not killed while still progressing (the fixed 60s cap
 /// predates video attachments). Floor keeps small blobs snappy to fail; the
@@ -9068,6 +9085,16 @@ mod tests {
             .process_incoming(&removal.evolution_event)
             .await
             .expect("carol processes removal commit");
+        // MIP-03 collects commits for ~1s before applying. Ingest must not
+        // wait that window (a rival commit can still arrive).
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        bob.advance_group_convergence(&bob_group_id)
+            .await
+            .expect("bob applies removal after cutoff");
+        carol
+            .advance_group_convergence(&carol_group_id)
+            .await
+            .expect("carol applies removal after cutoff");
         assert!(
             !alice
                 .members(&group_id)
@@ -9080,12 +9107,14 @@ mod tests {
             .create_and_process_text_message(&group_id, "after carol removal")
             .await
             .expect("alice sends post-removal");
-        assert!(matches!(
-            bob.process_incoming(&post_removal_event)
-                .await
-                .expect("bob still reads post-removal message"),
-            Incoming::Message(_)
-        ));
+        let bob_post = bob
+            .process_incoming(&post_removal_event)
+            .await
+            .expect("bob still reads post-removal message");
+        assert!(
+            matches!(bob_post, Incoming::Message(_)),
+            "bob must decrypt the post-removal message, got {bob_post:?}"
+        );
         let carol_result = carol.process_incoming(&post_removal_event).await;
         let carol_readable = matches!(carol_result, Ok(Incoming::Message(_)));
         assert!(
@@ -9206,7 +9235,10 @@ mod tests {
             .await
             .expect("alice creates group");
         let group_id = creation.group.id.clone();
-        let nostr_group_id_hex = hex::encode(creation.group.id.as_slice());
+        let nostr_group_id_hex = alice
+            .nostr_h_tag_hex(&group_id)
+            .expect("routing")
+            .expect("founding group has nostr routing");
         let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
@@ -9253,9 +9285,33 @@ mod tests {
         ));
 
         let floors = SonarClient::group_message_catchup_floors(&alice);
+        assert_eq!(nostr_group_id_hex.len(), 64);
+        assert_ne!(nostr_group_id_hex, hex::encode(group_id.as_slice()));
         assert_eq!(
             floors.get(&nostr_group_id_hex).copied(),
             Some(bob_message_secs)
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_445_h_tag_is_nostr_routing_id_not_mls_group_id() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let mls_hex = hex::encode(creation.group.id.as_slice());
+        let h = alice
+            .nostr_h_tag_hex(&creation.group.id)
+            .expect("routing lookup")
+            .expect("founding group has nostr routing");
+        assert_eq!(h.len(), 64, "kind-445 #h is 32 bytes of lowercase hex");
+        assert_ne!(
+            h, mls_hex,
+            "MLS GroupId must not be used as the Nostr #h filter"
         );
     }
 
@@ -9981,10 +10037,14 @@ mod tests {
             .await
             .expect("charlie key package");
         let creation = alice
-            .create_group("rollback retry", vec![bob_kp, charlie_kp], relays.clone())
+            .create_group_with_admins(
+                "rollback retry",
+                vec![bob_kp, charlie_kp],
+                relays.clone(),
+                vec![bob.identity().public_key()],
+            )
             .await
             .expect("alice creates group");
-        let alice_group_id = creation.group.id.clone();
 
         for (member, welcome) in creation.welcomes {
             let wrapped = welcome;
@@ -10026,53 +10086,43 @@ mod tests {
             .id
             .clone();
         let dave = MarmotEngine::in_memory(Identity::generate());
-        let erin = MarmotEngine::in_memory(Identity::generate());
 
-        // Bob's earlier commit is the MIP-03 winner, but Charlie sees Alice's
-        // competing commit first and therefore cannot initially decrypt Bob's
-        // message from the winning epoch.
+        // MDK 0.9 does not apply kind-445 commits on ingest (they stay
+        // Buffered until `advance_group_convergence`). A message from the
+        // next epoch therefore arrives PeelDeferred/Failed until Charlie
+        // applies Bob's add-Dave commit. 0.8 used a competing-commit
+        // rollback here; 0.9 selects forks by committer/digest, not
+        // Nostr `created_at`, so a rival Alice commit is not a reliable
+        // way to force the initial decrypt miss.
         let bob_update = bob
             .add_members(
                 &bob_group_id,
                 vec![dave
-                    .key_package_event(relays.clone())
+                    .key_package_event(relays)
                     .await
                     .expect("dave key package")],
             )
             .await
-            .expect("bob creates earlier commit");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let alice_update = alice
-            .add_members(
-                &alice_group_id,
-                vec![erin
-                    .key_package_event(relays)
-                    .await
-                    .expect("erin key package")],
-            )
-            .await
-            .expect("alice creates later commit");
-        assert!(
-            bob_update.evolution_event.created_at < alice_update.evolution_event.created_at,
-            "competing commits need deterministic MIP-03 order"
-        );
+            .expect("bob adds dave");
         bob.merge_pending_commit(&bob_group_id)
             .await
-            .expect("bob merges winning commit");
+            .expect("bob merges add-dave commit");
         let bob_message = bob
             .create_text_message(&bob_group_id, "message recovered after rollback")
             .await
-            .expect("bob creates message in winning epoch");
+            .expect("bob creates message in the new epoch");
 
-        let (wrong_commit, _) = charlie
-            .process_marmot_events([alice_update.evolution_event], "test losing commit first")
-            .await;
-        assert_eq!(wrong_commit.processed, 1);
-
+        // 0.9 records a durable PeelDeferred/Failed row on first decrypt miss
+        // (0.8 returned Err / retryable). Count it handled, do not durable-dedup.
         let (first_failure, _) = charlie
             .process_marmot_events([bob_message.clone()], "test initial message failure")
             .await;
-        assert_eq!(first_failure.retryable_failures, 1);
+        assert_eq!(first_failure.retryable_failures, 0);
+        assert_eq!(first_failure.processed, 1);
+        assert!(
+            !charlie.is_sync_event_processed(&bob_message.id),
+            "first Failed delivery must stay eligible for rollback retry"
+        );
 
         // A duplicate relay delivery reaches MDK's Incoming::Failed branch.
         // Sonar used to add the event to its own durable processed-ID set here.
@@ -10082,26 +10132,46 @@ mod tests {
         assert_eq!(failed_redelivery.processed, 1);
         assert!(
             !charlie.is_sync_event_processed(&bob_message.id),
-            "Sonar dedup must not hide an MDK Failed event that a later MLS rollback can make Retryable"
+            "Sonar dedup must not hide an MDK Failed event that a later MLS commit can make decryptable"
         );
 
-        let (winning_commit, _) = charlie
-            .process_marmot_events([bob_update.evolution_event], "test winning commit rollback")
+        let (epoch_commit, _) = charlie
+            .process_marmot_events([bob_update.evolution_event], "test epoch commit")
             .await;
-        assert_eq!(winning_commit.processed, 1);
+        assert_eq!(epoch_commit.processed, 1);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        charlie
+            .engine
+            .advance_group_convergence(&charlie_group_id)
+            .await
+            .expect("charlie applies buffered add-dave commit");
 
         let (recovered, _) = charlie
-            .process_marmot_events([bob_message], "test retry after rollback")
+            .process_marmot_events([bob_message], "test retry after commit apply")
             .await;
         assert_eq!(recovered.processed, 1);
+        let members = charlie
+            .engine
+            .members(&charlie_group_id)
+            .expect("charlie members after commit");
         assert!(
-            charlie
-                .engine
-                .messages(&charlie_group_id)
-                .expect("charlie transcript")
+            members.contains(&dave.identity().public_key()),
+            "buffered add-dave commit must apply before the message can decrypt"
+        );
+        let transcript = charlie
+            .engine
+            .messages(&charlie_group_id)
+            .expect("charlie transcript");
+        assert!(
+            transcript
                 .iter()
                 .any(|message| message.content == "message recovered after rollback"),
-            "relay redelivery after rollback must restore the missing peer message"
+            "relay redelivery after the matching commit applies must restore the missing peer message; \
+             contents={:?}",
+            transcript
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
         );
     }
 

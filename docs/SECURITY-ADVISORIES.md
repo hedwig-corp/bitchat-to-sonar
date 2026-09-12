@@ -117,6 +117,8 @@ a lockfile bump:
 
 - **Wire format** `0xf2ee` → `0xf2f1`. New installs speak White Noise's current
   profile. A 0.8 peer and a 0.9.14 peer cannot decrypt each other's MLS traffic.
+  Kind-445 `#h` is the 32-byte `nostr_group_id` from the founding routing
+  component, not the 16-byte MLS group id hosts use as a conversation id.
 - **Existing 0.8 SQLCipher stores cannot be opened in place.** MDK 0.9 applies
   the key as a passphrase (`PRAGMA key = '<hex>'`), not the 0.8 raw-key form
   `PRAGMA key = "x'HEX'"`. An on-disk 0.8 DB therefore looks like "file is not
@@ -127,6 +129,20 @@ a lockfile bump:
 - **Stage 1 of this port** keeps the host-facing `MarmotEngine` / `SonarClient`
   API (hex group ids, publish-then-`confirm_published`). Multi-device (Stage 2)
   is not in this change.
+- **Founding admin Leave.** `create_group` / `add_members` pass empty
+  `initial_admins`, so invitees are regular members and MIP-03 Leave works.
+  The founding admin still cannot self-remove (`EngineError::AdminCannotSelfRemove`).
+  `self_demote` returns `InvalidInput` rather than looping Leave; a real demote
+  commit is a follow-up. Do not wipe the store to work around this.
+- **MIP-03 commit ingest is buffered.** Kind-445 commits return `Buffered`
+  until the host calls `advance_group_convergence` after the ~1s quiescence
+  window. Ingest must not wait that window on the receive path (a rival
+  commit can still arrive). Tests sleep 1.1s then advance; the live client
+  still needs a scheduled drain (same shape as marmot-app's worker).
+  `advance_group_convergence` must persist `MessageReceived` events from that
+  drain: MDK may decrypt PeelDeferred application messages there, and a later
+  relay redelivery of the same ciphertext is a content-id Duplicate.
+  Same-epoch fork selection uses committer/digest, not Nostr `created_at`.
 - **Group-scale baseline is pending.** Re-run `sonar-sim group-scale` and
   replace the 0.8 table in [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md); do not
   invent numbers. Until that lands, the 0.8 ceiling/welcome-size columns are
