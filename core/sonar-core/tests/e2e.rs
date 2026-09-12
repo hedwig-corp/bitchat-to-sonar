@@ -77,7 +77,7 @@ async fn two_instances_exchange_dms_through_a_relay() {
     bob.sync().await.expect("bob syncs");
     let bob_groups = bob.groups().expect("bob groups");
     assert_eq!(bob_groups.len(), 1, "bob joined exactly one group");
-    let bob_group = &bob_groups[0].mls_group_id;
+    let bob_group = &bob_groups[0].id;
 
     let bob_view = bob.messages(bob_group).expect("bob messages");
     assert_eq!(bob_view.len(), 1);
@@ -112,7 +112,7 @@ async fn two_instances_exchange_dms_through_a_relay() {
 
     // Both sides agree on membership.
     let members = bob.groups().unwrap()[0].clone();
-    assert_eq!(members.mls_group_id, *bob_group);
+    assert_eq!(members.id, *bob_group);
 }
 
 #[tokio::test]
@@ -408,7 +408,7 @@ async fn delete_group_removes_a_single_chat_locally() {
 
     assert_eq!(alice.groups().unwrap().len(), 1);
     assert_eq!(bob.groups().unwrap().len(), 1);
-    let bob_group = bob.groups().unwrap()[0].mls_group_id.clone();
+    let bob_group = bob.groups().unwrap()[0].id.clone();
 
     // Alice deletes the chat from HER device only.
     alice
@@ -772,10 +772,13 @@ async fn republished_key_package_replaces_the_slot_and_newest_wins() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
     assert_eq!(
         all.len(),
         1,
@@ -821,10 +824,13 @@ async fn in_memory_clients_sharing_an_identity_reuse_one_slot() {
     let observer = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
         .await
         .expect("observer connects");
-    let all = timeout(Duration::from_secs(10), observer.fetch_all_key_packages(pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        observer.fetch_all_key_packages(pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
 
     assert_eq!(
         all.len(),
@@ -882,7 +888,10 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
     let stale_id = stale.id;
 
     let publisher = nostr_sdk::Client::default();
-    publisher.add_relay(url_old.clone()).await.expect("add relay B");
+    publisher
+        .add_relay(url_old.clone())
+        .await
+        .expect("add relay B");
     publisher.connect().await;
     publisher.send_event(&stale).await.expect("publish stale");
 
@@ -891,10 +900,13 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all");
     assert_eq!(all.len(), 2, "expected one candidate from each relay");
 
     let picked = timeout(Duration::from_secs(10), bob.fetch_key_package(alice_pubkey))

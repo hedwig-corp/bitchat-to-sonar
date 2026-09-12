@@ -109,7 +109,7 @@ impl InviteLinkState {
         let mut requests: HashMap<Vec<u8>, Vec<JoinRequest>> = HashMap::new();
         for request in disk.requests {
             let group_id_bytes = hex_vec("join request group id", &request.group_id_hex)?;
-            let group_id = GroupId::from_slice(&group_id_bytes);
+            let group_id = GroupId::new(group_id_bytes.clone());
             let key_package_event_id = request
                 .key_package_event_id_hex
                 .as_deref()
@@ -326,9 +326,9 @@ impl InviteLinkStore {
         // than evict a genuine requester the admin has not seen yet — and refuse
         // without touching disk, so a flood cannot force a rewrite per attempt.
         while group_requests.len() >= MAX_PENDING_JOIN_REQUESTS_PER_GROUP {
-            let evictable = group_requests
-                .iter()
-                .position(|r| request.received_at.saturating_sub(r.received_at) >= JOIN_REQUEST_PROTECT_SECS);
+            let evictable = group_requests.iter().position(|r| {
+                request.received_at.saturating_sub(r.received_at) >= JOIN_REQUEST_PROTECT_SECS
+            });
             match evictable {
                 Some(pos) => {
                     group_requests.remove(pos);
@@ -542,7 +542,7 @@ mod tests {
     fn invite_links_and_requests_survive_reload() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("invites.json");
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let admin = Identity::generate();
         let requester = Identity::generate().public_key();
 
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn pending_join_requests_are_capped_against_a_sybil_flood() {
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let store = InviteLinkStore::new();
         let secret_hash = [9u8; 32];
 
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn pending_join_requests_recycle_once_the_protection_window_passes() {
-        let group_id = GroupId::from_slice(&[8u8; 32]);
+        let group_id = GroupId::new([8u8; 32]);
         let store = InviteLinkStore::new();
         let secret_hash = [9u8; 32];
 
@@ -678,7 +678,10 @@ mod tests {
         assert_eq!(normalize_invite_token(&scheme).unwrap(), token);
         assert_eq!(normalize_invite_token(&universal).unwrap(), token);
         // And each still decodes to the original token contents.
-        assert_eq!(decode_invite_token(&universal).unwrap().group_name, "field team");
+        assert_eq!(
+            decode_invite_token(&universal).unwrap().group_name,
+            "field team"
+        );
     }
 
     #[test]
@@ -740,7 +743,11 @@ mod tests {
         }
 
         // No duplicates (case-insensitive)
-        let lowercased: Vec<String> = decoded.relays.iter().map(|r| r.to_ascii_lowercase()).collect();
+        let lowercased: Vec<String> = decoded
+            .relays
+            .iter()
+            .map(|r| r.to_ascii_lowercase())
+            .collect();
         let unique: std::collections::HashSet<_> = lowercased.iter().collect();
         assert_eq!(unique.len(), 8);
 

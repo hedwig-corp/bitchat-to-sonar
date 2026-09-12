@@ -216,7 +216,8 @@ impl ConversationIndex {
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(|e| crate::Error::Storage(format!("index table_info query: {e}")))?;
         for name in names {
-            let name = name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
+            let name =
+                name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
             if name == column {
                 return Ok(true);
             }
@@ -382,8 +383,8 @@ impl ConversationIndex {
     pub fn materialize_from(&self, engine: &MarmotEngine) -> Result<()> {
         let groups = engine.groups()?;
         for group in &groups {
-            let group_id_hex = hex::encode(group.mls_group_id.as_slice());
-            let page = engine.messages_page(&group.mls_group_id, 1, 0)?;
+            let group_id_hex = hex::encode(group.id.as_slice());
+            let page = engine.messages_page(&group.id, 1, 0)?;
             if let Some(msg) = page.first() {
                 let sender = msg.sender.to_string();
                 self.upsert_summary(
@@ -421,8 +422,26 @@ mod tests {
     fn repair_json_previews_rewrites_legacy_rows_once() {
         let idx = ConversationIndex::open_in_memory().unwrap();
         // Simulate a row written before the guard landed.
-        idx.upsert_summary("g1", "agent", "{\"alert\":\"cpu\",\"host\":\"ocean\"}", "npub1x", 10, false, true).unwrap();
-        idx.upsert_summary("g2", "human", "{ not json, just a brace", "npub1y", 20, false, true).unwrap();
+        idx.upsert_summary(
+            "g1",
+            "agent",
+            "{\"alert\":\"cpu\",\"host\":\"ocean\"}",
+            "npub1x",
+            10,
+            false,
+            true,
+        )
+        .unwrap();
+        idx.upsert_summary(
+            "g2",
+            "human",
+            "{ not json, just a brace",
+            "npub1y",
+            20,
+            false,
+            true,
+        )
+        .unwrap();
         idx.repair_json_previews().unwrap();
         let summaries = idx.summaries_ordered().unwrap();
         let g1 = summaries.iter().find(|s| s.group_id_hex == "g1").unwrap();
@@ -431,7 +450,15 @@ mod tests {
         assert_eq!(g2.latest_content, "{ not json, just a brace");
         // Second repair is a no-op (row no longer brace-prefixed JSON).
         idx.repair_json_previews().unwrap();
-        assert_eq!(idx.summaries_ordered().unwrap().iter().find(|s| s.group_id_hex == "g1").unwrap().latest_content, crate::client::JSON_PAYLOAD_PREVIEW_LABEL);
+        assert_eq!(
+            idx.summaries_ordered()
+                .unwrap()
+                .iter()
+                .find(|s| s.group_id_hex == "g1")
+                .unwrap()
+                .latest_content,
+            crate::client::JSON_PAYLOAD_PREVIEW_LABEL
+        );
     }
 
     #[test]

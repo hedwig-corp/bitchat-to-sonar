@@ -81,7 +81,7 @@ fn invalid<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> SonarFfiError 
 
 fn parse_group_id(hex_id: &str) -> FfiResult<GroupId> {
     let bytes = hex::decode(hex_id).map_err(invalid("group id"))?;
-    Ok(GroupId::from_slice(&bytes))
+    Ok(GroupId::new(bytes))
 }
 
 fn parse_event_id(hex_id: &str) -> FfiResult<EventId> {
@@ -442,10 +442,12 @@ pub fn abort_account_restore(db_path: String) -> FfiResult<()> {
 /// leftover staging was committed under `db_key_hex`.
 #[uniffi::export]
 pub fn reconcile_account_restore(db_path: String, db_key_hex: String) -> FfiResult<bool> {
-    Ok(sonar_core::account_backup::reconcile_staged_account_restore(
-        Path::new(&db_path),
-        &db_key_hex,
-    )?)
+    Ok(
+        sonar_core::account_backup::reconcile_staged_account_restore(
+            Path::new(&db_path),
+            &db_key_hex,
+        )?,
+    )
 }
 
 /// True when `*.sonar-restore-staging` still exists (DB not yet promoted).
@@ -1363,7 +1365,8 @@ impl SonarNode {
     /// Decline a pending group invite by welcome event id.
     pub fn decline_group_invite(&self, invite_id_hex: String) -> FfiResult<()> {
         let invite_id = parse_event_id(&invite_id_hex)?;
-        self.client.decline_group_invite(&invite_id)?;
+        self.runtime
+            .block_on(self.client.decline_group_invite(&invite_id))?;
         Ok(())
     }
 
@@ -1441,14 +1444,12 @@ impl SonarNode {
         let group_id = parse_group_id(&group_id_hex)?;
         let parent_id = nostr::EventId::from_hex(&reply_to_hex)
             .map_err(|e| SonarFfiError::InvalidInput(format!("reply_to: {e}")))?;
-        let parent_pk = PublicKey::parse(&reply_to_npub)
-            .map_err(invalid("reply_to npub"))?;
+        let parent_pk = PublicKey::parse(&reply_to_npub).map_err(invalid("reply_to npub"))?;
         let reply = sonar_core::reply::ReplyTo::new(parent_id, parent_pk, preview);
-        self.runtime.block_on(self.client.send_text_with_reply(
-            &group_id,
-            &text,
-            Some(&reply),
-        ))?;
+        self.runtime.block_on(
+            self.client
+                .send_text_with_reply(&group_id, &text, Some(&reply)),
+        )?;
         Ok(())
     }
 
@@ -1685,12 +1686,12 @@ impl SonarNode {
             .map(|g| {
                 let members = self
                     .client
-                    .members(&g.mls_group_id)?
+                    .members(&g.id)?
                     .into_iter()
                     .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
                     .collect();
                 Ok(GroupInfo {
-                    id_hex: hex::encode(g.mls_group_id.as_slice()),
+                    id_hex: hex::encode(g.id.as_slice()),
                     name: g.name,
                     member_npubs: members,
                 })
@@ -2084,10 +2085,7 @@ impl SonarNode {
             &recipient_peer_id_hex,
             &message_id,
             &text,
-            reply_to
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
+            reply_to.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         ))?;
         Ok(())
     }
@@ -3375,9 +3373,7 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
             .into_iter()
             .map(|c| match c {
                 mesh_engine::Command::Dial { conn } => MeshEngineCommand::Dial { conn },
-                mesh_engine::Command::Disconnect { conn } => {
-                    MeshEngineCommand::Disconnect { conn }
-                }
+                mesh_engine::Command::Disconnect { conn } => MeshEngineCommand::Disconnect { conn },
                 mesh_engine::Command::CancelServer { conn } => {
                     MeshEngineCommand::CancelServer { conn }
                 }
@@ -3513,9 +3509,9 @@ impl MeshLinkEngine {
     ) -> FfiResult<Arc<Self>> {
         let sk = hex::decode(&noise_private_hex).map_err(invalid("noise private key"))?;
         let seed = hex::decode(&ed25519_seed_hex).map_err(invalid("mesh seed"))?;
-        let sk: [u8; 32] = sk
-            .try_into()
-            .map_err(|_| SonarFfiError::InvalidInput("noise private key must be 32 bytes".into()))?;
+        let sk: [u8; 32] = sk.try_into().map_err(|_| {
+            SonarFfiError::InvalidInput("noise private key must be 32 bytes".into())
+        })?;
         let seed: [u8; 32] = seed
             .try_into()
             .map_err(|_| SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()))?;
@@ -3572,7 +3568,10 @@ impl MeshLinkEngine {
         instances: Vec<i32>,
         now_ms: i64,
     ) -> MeshEngineOutput {
-        engine_output(self.lock().on_instances_discovered(&conn, &instances, ms(now_ms)))
+        engine_output(
+            self.lock()
+                .on_instances_discovered(&conn, &instances, ms(now_ms)),
+        )
     }
 
     pub fn on_subscribe_result(
@@ -3595,7 +3594,10 @@ impl MeshLinkEngine {
         bytes: Vec<u8>,
         now_ms: i64,
     ) -> MeshEngineOutput {
-        engine_output(self.lock().on_client_rx(&conn, instance, &bytes, ms(now_ms)))
+        engine_output(
+            self.lock()
+                .on_client_rx(&conn, instance, &bytes, ms(now_ms)),
+        )
     }
 
     pub fn on_server_connected(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
@@ -3647,10 +3649,7 @@ impl MeshLinkEngine {
         reply_to: Option<String>,
         now_ms: i64,
     ) -> Option<MeshEngineOutput> {
-        let reply = reply_to
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let reply = reply_to.as_deref().map(str::trim).filter(|s| !s.is_empty());
         self.lock()
             .send_text_with_reply(&fingerprint, &message_id, &text, reply, ms(now_ms))
             .map(engine_output)
@@ -3711,11 +3710,7 @@ impl MeshLinkEngine {
         engine_output(self.lock().set_nickname(&nickname, ms(now_ms)))
     }
 
-    pub fn set_sonar_payload(
-        &self,
-        payload: Option<Vec<u8>>,
-        now_ms: i64,
-    ) -> MeshEngineOutput {
+    pub fn set_sonar_payload(&self, payload: Option<Vec<u8>>, now_ms: i64) -> MeshEngineOutput {
         engine_output(self.lock().set_sonar_payload(payload, ms(now_ms)))
     }
 
@@ -4020,7 +4015,7 @@ mod tests {
 
     #[test]
     fn group_id_hex_roundtrips() {
-        let gid = GroupId::from_slice(&[7u8; 32]);
+        let gid = GroupId::new([7u8; 32]);
         let hex_id = hex::encode(gid.as_slice());
         assert_eq!(parse_group_id(&hex_id).unwrap(), gid);
         assert!(parse_group_id("zz").is_err());
@@ -4057,7 +4052,13 @@ mod tests {
         ));
         // empty db path
         assert!(matches!(
-            SonarNode::connect(id, vec!["wss://relay.example".into()], String::new(), key, None),
+            SonarNode::connect(
+                id,
+                vec!["wss://relay.example".into()],
+                String::new(),
+                key,
+                None
+            ),
             Err(SonarFfiError::InvalidInput(_))
         ));
     }

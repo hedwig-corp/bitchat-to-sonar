@@ -1,35 +1,57 @@
-//! Marmot protocol engine: MLS-over-Nostr via MDK.
+//! Marmot protocol engine: MLS-over-Nostr via MDK 0.9 (`AccountDeviceSession`).
 //!
-//! This module is the synchronous, transport-free protocol layer. It produces
-//! and consumes Nostr [`Event`]s but never talks to a relay — publishing and
-//! subscribing belong to [`crate::client`]. Keeping this layer pure makes it
-//! testable without any network and directly bindable over FFI later.
+//! This module is the transport-free protocol layer. It produces and consumes
+//! Nostr [`Event`]s but never talks to a relay — publishing and subscribing belong
+//! to [`crate::client`]. MDK 0.9 session methods are async; mutating engine
+//! methods are therefore async. The session lock is recovered on poison.
 //!
 //! Protocol facts (Marmot MIPs, see CLAUDE.md):
 //! - KeyPackage = kind 30443 (addressable, `d` tag), signed by the user key.
 //! - Welcome   = kind 444 rumor, delivered inside a NIP-59 gift wrap (1059).
-//! - Group msg = kind 445, MLS ciphertext, signed by MDK with a fresh
-//!   ephemeral key per event (the user key never signs a 445).
-//! - Committers must call `merge_pending_commit` only after the commit/welcome
-//!   has been published; see MDK docs.
+//! - Group msg = kind 445, MLS ciphertext, signed with a fresh ephemeral key.
+//! - Current-profile group creation is already canonical (`FoundingGroupCreated`);
+//!   `merge_pending_commit` is a no-op there. Legacy/evolution commits still
+//!   require publish-then-`confirm_published`.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
-use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
-use mdk_core::key_packages::{validate_existing_d_tag, KeyPackageOptions};
-use mdk_core::prelude::*;
-use mdk_memory_storage::MdkMemoryStorage;
-use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
-use mdk_storage_traits::groups::{MessageSortOrder, Pagination};
+use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use cgka_engine::account_identity_proof::{
+    AccountIdentityProofRequest, AccountIdentityProofSigner,
+};
+use cgka_engine::KeyPackageMetadata;
+use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig, SessionEffects};
+use cgka_traits::app_components::{
+    default_group_components, encode_nostr_routing_v1, AppComponentData, NostrRoutingV1,
+    NOSTR_ROUTING_COMPONENT_ID,
+};
+use cgka_traits::app_event::{MarmotAppEvent, MARMOT_APP_EVENT_KIND_CHAT};
+use cgka_traits::engine::{
+    CreateGroupRequest, GroupEvent, KeyPackage, KeyPackageSource, SendIntent,
+};
+use cgka_traits::engine_state::PendingStateRef;
+use cgka_traits::error::PeelerError;
+use cgka_traits::group::Group;
+use cgka_traits::group_context::GroupContextSnapshot;
+use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, PeeledMessage};
+use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
+use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
+use cgka_traits::types::{GroupId, MemberId, MessageId};
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
+use storage_sqlite::SqlCipherKey;
+use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, KIND_MARMOT_WELCOME_RUMOR};
 
 use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
+use crate::media_crypto::{self, EncryptedMediaUpload, MediaReference};
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
 use crate::reply::{ReplyRef, ReplyTo};
 use crate::{Error, Result};
@@ -50,17 +72,25 @@ pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
 /// wipe drops the slot along with the MLS key material it addresses.
 pub(crate) const KEY_PACKAGE_SLOT_FILE_SUFFIX: &str = ".sonar-keypackage-slot";
 
-/// Maximum raw MDK rows to scan while building a chat-only page. MDK stores
-/// commits/proposals alongside application chat rows, so a single raw page can
-/// be empty after filtering even when older chat messages exist.
-const MESSAGE_PAGE_RAW_SCAN_LIMIT: usize = 10_000;
+/// Host-owned chat transcript (MDK 0.9 no longer stores plaintext app events).
+const TRANSCRIPT_FILE_SUFFIX: &str = ".sonar-transcript.json";
+const PARKED_INVITES_FILE_SUFFIX: &str = ".sonar-parked-invites.json";
+const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json";
 
-/// Result of creating a group: the group plus the welcome rumors that must be
-/// gift-wrapped and delivered to each invited member.
+/// Documented encoding of the host's 32-byte SQLCipher key for MDK 0.9.
+/// MDK 0.9 applies the string via `PRAGMA key = '<passphrase>'`, not the 0.8
+/// raw-key form `PRAGMA key = "x'HEX'"`.
+fn sqlcipher_passphrase(key: &[u8; 32]) -> String {
+    hex::encode(key)
+}
+
+/// Result of creating a group: the group plus already-wrapped welcomes that
+/// the caller must publish. MDK 0.9's peeler gift-wraps welcomes; Sonar's
+/// peeler uses a current-timestamp outer wrap (White Noise `since=` window).
 pub struct GroupCreation {
-    pub group: group_types::Group,
-    /// `(member pubkey, kind-444 rumor)` pairs, one per invited member.
-    pub welcomes: Vec<(PublicKey, UnsignedEvent)>,
+    pub group: Group,
+    /// `(member pubkey, kind-1059 gift wrap)` pairs, one per invited member.
+    pub welcomes: Vec<(PublicKey, Event)>,
 }
 
 /// Result of a group membership update that must be published by the caller.
@@ -69,16 +99,18 @@ pub struct GroupMembershipUpdate {
     pub group_id: GroupId,
     /// Kind-445 commit/proposal event to publish to the group's relays.
     pub evolution_event: Event,
-    /// `(member pubkey, kind-444 rumor)` pairs for newly invited members.
-    pub welcomes: Vec<(PublicKey, UnsignedEvent)>,
-    /// True when MDK staged a local commit that must be merged after publish.
+    /// `(member pubkey, kind-1059 gift wrap)` pairs for newly invited members.
+    pub welcomes: Vec<(PublicKey, Event)>,
+    /// True when MDK staged a local commit that must be confirmed after publish.
     pub requires_commit_merge: bool,
 }
 
 /// Pending group invite surfaced to the native shells for accept/decline UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupInvite {
-    /// Kind-444 welcome event id. Use this as the stable accept/decline handle.
+    /// Welcome event id. Use this as the stable accept/decline handle.
+    /// For MDK 0.9 parked (not-yet-ingested) welcomes this is the kind-1059
+    /// wrapper id; `accept_group_invite` ingests that wrapper.
     pub id: EventId,
     pub wrapper_id: EventId,
     pub group_id: GroupId,
@@ -87,13 +119,15 @@ pub struct GroupInvite {
     pub welcomer: PublicKey,
     pub member_count: u32,
     pub relays: Vec<RelayUrl>,
+    /// Original kind-1059 gift wrap JSON. Required to ingest on accept.
+    /// Empty on older sidecars that only stored ids.
+    #[serde(default)]
+    pub wrapper_json: String,
 }
 
 /// A reference to an encrypted media blob (Marmot MIP-04) attached to a chat
 /// message — enough for the UI to render a placeholder and trigger a download.
-/// The decryption material (nonce, hashes, scheme) stays inside MDK;
-/// `decrypt_media_by_url` re-derives it from the message's `imeta` tag by URL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaRef {
     /// Blossom URL of the ENCRYPTED blob.
     pub url: String,
@@ -102,6 +136,12 @@ pub struct MediaRef {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub duration_ms: Option<u64>,
+    /// SHA-256 of the plaintext. Needed to decrypt; `None` on pre-0.9 rows.
+    #[serde(default)]
+    pub original_hash: Option<[u8; 32]>,
+    /// ChaCha20-Poly1305 nonce. Needed to decrypt; `None` on pre-0.9 rows.
+    #[serde(default)]
+    pub nonce: Option<[u8; 12]>,
 }
 
 /// Local delivery state for a transcript row. Network/relay work updates this
@@ -140,6 +180,8 @@ impl From<&MediaReference> for MediaRef {
             width,
             height,
             duration_ms: r.duration_ms,
+            original_hash: Some(r.original_hash),
+            nonce: Some(r.nonce),
         }
     }
 }
@@ -150,7 +192,7 @@ impl From<&MediaReference> for MediaRef {
 ///
 /// Malformed or unknown-version control lines classify as `Text` — a parse
 /// failure must never hide a message from the transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageClassification {
     /// Plain chat text (also the fallback for malformed control lines).
     Text,
@@ -196,20 +238,13 @@ impl MessageClassification {
     }
 
     /// True when every host renders this message as a transcript row.
-    ///
-    /// `PayDone` / `CallControl` are protocol control lines that both apps hide
-    /// (iOS `SonarAppStore.payMapping` → `.hidden`, Compose `ChatScreen`'s feed
-    /// filter). They must therefore not count toward `unread_count`: the
-    /// unread divider is placed by counting `unread_count` **visible** incoming
-    /// rows back from the tail, so each invisible unread event pushes the open
-    /// position one real message further into history.
     pub fn is_transcript_visible(&self) -> bool {
         !matches!(self, Self::PayDone { .. } | Self::CallControl)
     }
 }
 
 /// A decrypted application message, mapped to a small FFI-friendly shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: EventId,
     pub group_id: GroupId,
@@ -231,10 +266,6 @@ pub struct ChatMessage {
     pub reply: Option<ReplyRef>,
 }
 
-/// Compare render messages in the stable newest-first order used by transcript
-/// cursors. Deliberately excludes MDK's local `processed_at` value: two devices
-/// must page the same event set even when they received same-second events in a
-/// different order.
 fn compare_message_cursor_desc(a: &ChatMessage, b: &ChatMessage) -> Ordering {
     compare_message_cursor_keys_desc(a.created_at, &a.id, b.created_at, &b.id)
 }
@@ -248,9 +279,6 @@ fn compare_message_cursor_keys_desc(
     b_created_at.cmp(&a_created_at).then_with(|| b_id.cmp(a_id))
 }
 
-/// True when a message belongs strictly after the supplied newest-first page
-/// cursor. With no event id, the whole cursor second is excluded, preserving the
-/// previous timestamp-only API behavior.
 fn is_before_message_cursor(
     created_at_secs: u64,
     id: &EventId,
@@ -275,7 +303,7 @@ pub struct RecentMessagePage {
 /// What came out of processing an incoming event.
 #[derive(Debug)]
 pub enum Incoming {
-    /// A decrypted chat message (already persisted in MDK storage).
+    /// A decrypted chat message (already persisted in the local transcript).
     Message(ChatMessage),
     /// A group-membership/welcome change was applied; no chat content.
     GroupUpdated(GroupId),
@@ -284,74 +312,14 @@ pub enum Incoming {
     /// Processing a proposal produced an auto-commit that the caller must
     /// publish and merge before the group converges.
     GroupProposal(GroupMembershipUpdate),
-    /// MDK recorded this event as failed and blocks reprocessing: re-delivery
-    /// returns this same result forever (only MDK's internal epoch-rollback
-    /// machinery can revive one). The relay sync layer must mark it processed
-    /// and move on — holding the sync cursor behind it refetches the same
-    /// history on every sync without ever succeeding.
+    /// Processing recorded a terminal failure. The relay sync layer must mark
+    /// it processed and move on.
     Failed,
     /// A join request was received for a group we administer.
     JoinRequest(crate::invite_link::JoinRequest),
     /// The event was valid but produced nothing actionable (duplicates,
     /// ignored proposals, non-Marmot gift wraps, ...).
     None,
-}
-
-/// Storage backend for the MLS state.
-///
-/// MDK is generic over `Storage: MdkStorageProvider`, and the two concrete
-/// providers (`MdkMemoryStorage`, `MdkSqliteStorage`) are distinct types. Rather
-/// than thread that generic through `client`/`ffi`, we keep `MarmotEngine` a
-/// single concrete type and dispatch over this enum (see the `dispatch!` macro).
-enum Storage {
-    /// Volatile, used by tests and the (historical) in-memory path. Boxed so the
-    /// enum stays small despite the two providers' differing sizes.
-    Memory(Box<MDK<MdkMemoryStorage>>),
-    /// Encrypted SQLCipher database on disk (production persistence).
-    Sqlite(Box<MDK<MdkSqliteStorage>>),
-}
-
-/// Call the same MDK method on whichever storage variant is active.
-///
-/// Usage: `dispatch!(self.storage, |mdk| mdk.get_groups())` — both arms must
-/// type-check, which they do because the MDK API is identical across providers.
-macro_rules! dispatch {
-    ($storage:expr, |$mdk:ident| $body:expr) => {
-        match $storage {
-            Storage::Memory($mdk) => $body,
-            Storage::Sqlite($mdk) => $body,
-        }
-    };
-}
-
-/// The Marmot engine: one per identity, owns MLS group state via MDK.
-pub struct MarmotEngine {
-    storage: Storage,
-    identity: Identity,
-    /// Serializes MLS-mutating storage operations (message/commit creation,
-    /// incoming processing, group membership changes) so hosts may run sends
-    /// concurrently with sync/drain instead of funneling every engine call
-    /// through one serial queue. Guarded sections are synchronous — the lock
-    /// is never held across an await, so a concurrent send waits for at most
-    /// one in-flight mutation, never for a relay fetch.
-    write_lock: std::sync::Mutex<()>,
-    /// Sliding window of recent 2-member-welcome auto-accepts (#419). Anyone
-    /// holding our public KeyPackage can gift-wrap us a welcome, so
-    /// auto-accepts are rate limited; overflow routes to the pending
-    /// accept/decline UI (or is dropped past [`PENDING_INVITE_CAP`])
-    /// instead of silently writing MLS groups and chat rows without bound.
-    ///
-    /// Persisted to a sidecar next to the DB: the iOS NSE builds a fresh
-    /// engine per push wake, so an in-memory-only window would hand every
-    /// wake a fresh budget (5 × wake-rate, not 5 per window).
-    dm_autoaccept_budget: std::sync::Mutex<DmAutoacceptBudget>,
-    /// Where to persist this install's KeyPackage slot id (the kind-30443 `d`
-    /// tag). `None` for in-memory engines, which keep the slot in
-    /// [`Self::key_package_slot_memo`] for the life of the process instead.
-    db_path: Option<std::path::PathBuf>,
-    /// In-process cache of the slot id. Also the only storage for an in-memory
-    /// engine, so tests that publish twice see one stable slot.
-    key_package_slot_memo: std::sync::Mutex<Option<String>>,
 }
 
 /// Max 2-member welcomes auto-accepted per window before the known-sender
@@ -361,43 +329,22 @@ pub const UNKNOWN_DM_AUTOACCEPT_MAX: usize = 5;
 /// Window for [`UNKNOWN_DM_AUTOACCEPT_MAX`], in seconds.
 pub const UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS: u64 = 10 * 60;
 /// Max ACTIVE groups shared with the SAME welcomer whose further welcomes may
-/// bypass the budget. One admitted welcome must not buy an attacker unlimited
-/// silent groups: the bypass is self-bootstrapping, since landing a single
-/// welcome inside the window makes every later one from that key "known".
-/// Each extra group also adds an `#h` entry to every batched kind-445 fetch.
+/// bypass the budget.
 pub const KNOWN_SENDER_GROUP_CAP: usize = 3;
-/// Hard ceiling on PARKED pending invites of ANY size. Past it, a new
-/// welcome is declined outright rather than parked: without this the flood
-/// just moves from silent groups into an unbounded invite list pinned above
-/// every real conversation on both hosts. Counting only 2-member invites
-/// would leave a 3-member-group spammer an open door.
+/// Hard ceiling on PARKED pending invites of ANY size.
 pub const PENDING_INVITE_CAP: usize = 25;
 /// Ceiling on parked invites for a welcomer we already share an active group
-/// with. Higher than [`PENDING_INVITE_CAP`] so a stranger flood cannot lock a
-/// real contact out of inviting us, but STILL A CEILING: an attacker whose
-/// first welcome was auto-accepted is "known" from then on, so an unbounded
-/// exemption just moves the flood from silent groups into an unbounded invite
-/// list — the exact failure [`PENDING_INVITE_CAP`] exists to prevent.
+/// with.
 pub const KNOWN_SENDER_PENDING_INVITE_CAP: usize = 50;
-/// Ceiling on groups INSPECTED by [`MarmotEngine::shared_active_groups_with`]
-/// (as opposed to matched — the `limit` parameter). The attacker/unknown case
-/// shares no group, so without this the scan pays one membership lookup per
-/// active group under `mls_write` on every flood welcome. A contact whose only
-/// shared group sits past the cap parks for manual accept instead — see the
-/// method doc for the trade.
+/// Ceiling on groups INSPECTED by [`MarmotEngine::shared_active_groups_with`].
 pub const SHARED_GROUP_SCAN_CAP: usize = 128;
 
-/// Sidecar suffix for the persisted auto-accept window (JSON `[u64]` of unix
-/// seconds). Shares fate with the DB in [`MarmotEngine::wipe`].
 const DM_AUTOACCEPT_FILE_SUFFIX: &str = ".dm-autoaccepts.json";
-/// The tmp file of the atomic write above — wiped with everything else.
 const DM_AUTOACCEPT_TMP_FILE_SUFFIX: &str = ".dm-autoaccepts.json.tmp";
 
-/// The sliding auto-accept window, shared by every process that opens the
-/// same DB path (app, NSE) via a best-effort JSON sidecar.
 struct DmAutoacceptBudget {
     admits: std::collections::VecDeque<u64>,
-    sidecar: Option<std::path::PathBuf>,
+    sidecar: Option<PathBuf>,
 }
 
 impl DmAutoacceptBudget {
@@ -408,15 +355,6 @@ impl DmAutoacceptBudget {
         }
     }
 
-    /// A missing sidecar is a fresh install: empty window. Any OTHER read or
-    /// parse failure fails CLOSED — an exhausted window — matching `reserve`'s
-    /// treatment of a failed persist (#498 review round 2). `unwrap_or_default`
-    /// here handed a truncated/unreadable sidecar a fresh set of silent
-    /// auto-accepts, the opposite of what the limiter exists for. The window
-    /// self-heals: the next successful persist rewrites the sidecar, and
-    /// `prune` ages the synthetic admits out after
-    /// [`UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS`] — meanwhile welcomes park for
-    /// manual accept rather than being dropped.
     fn load(db_path: &Path) -> Self {
         let sidecar = dm_autoaccept_sidecar(db_path);
         let admits = match std::fs::read(&sidecar) {
@@ -430,9 +368,7 @@ impl DmAutoacceptBudget {
                     Self::exhausted_window()
                 }
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::collections::VecDeque::new()
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::collections::VecDeque::new(),
             Err(e) => {
                 tracing::warn!(
                     error = %e,
@@ -447,41 +383,22 @@ impl DmAutoacceptBudget {
         }
     }
 
-    /// A full window stamped `now`, so `prune` retires it naturally.
     fn exhausted_window() -> std::collections::VecDeque<u64> {
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now_secs = unix_now_secs();
         std::collections::VecDeque::from(vec![now_secs; UNKNOWN_DM_AUTOACCEPT_MAX])
     }
 
     fn prune(&mut self, now_secs: u64) {
-        // Future-dated admits are dropped too: `saturating_sub` returns 0 for
-        // them, so a device whose clock was ahead (dead battery, bad NTP)
-        // would otherwise pin the window exhausted until wall-clock caught up
-        // — and the persisted sidecar makes that survive reboots.
         self.admits
             .retain(|t| *t <= now_secs && now_secs - *t < UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS);
     }
 
-    /// Whether the window has room, WITHOUT consuming a slot — the slot is
-    /// recorded only after `accept_welcome` succeeds, so a welcome that fails
-    /// MLS processing cannot eat the budget for real first contacts.
     fn has_room(&mut self, now_secs: u64) -> bool {
         self.refresh_from_disk();
         self.prune(now_secs);
         self.admits.len() < UNKNOWN_DM_AUTOACCEPT_MAX
     }
 
-    /// Union the on-disk window into ours before every read or write.
-    ///
-    /// The app and the iOS NSE each hold their own engine, and a
-    /// whole-file write from a stale in-memory snapshot silently drops the
-    /// other process's admits — last-writer-wins only ever WIDENS the
-    /// budget, which is the defect persisting it was meant to close.
-    /// Caveat: two admits in the same wall-clock second across processes
-    /// dedup to one, a 1-slot loss versus today's whole-set loss.
     fn refresh_from_disk(&mut self) {
         let Some(sidecar) = &self.sidecar else { return };
         let Some(disk) = std::fs::read(sidecar)
@@ -493,20 +410,11 @@ impl DmAutoacceptBudget {
         if disk.is_empty() {
             return;
         }
-        // Disk is the AUTHORITY, not a set to union with. Every writer
-        // persists its whole window immediately after recording, so the file
-        // is a superset of what this process last wrote; adopting it wholesale
-        // picks up the other process's admits without the multiplicity problem
-        // a value-dedup creates — two admits in the same wall-clock second are
-        // distinct budget slots, and deduping collapses a burst into one.
         let mut merged = disk;
         merged.sort_unstable();
         self.admits = merged.into();
     }
 
-    /// Write the whole window through tmp+rename, like the sync/outbox
-    /// sidecars. A budget with no sidecar (memory storage, tests) persists
-    /// trivially.
     fn persist(&self) -> std::io::Result<()> {
         let Some(sidecar) = &self.sidecar else {
             return Ok(());
@@ -518,30 +426,6 @@ impl DmAutoacceptBudget {
         std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, sidecar))
     }
 
-    /// Consume a slot and make it DURABLE before the caller acts on it.
-    ///
-    /// Ordering matters and used to be the other way round: recording after
-    /// `accept_welcome` meant a failed sidecar write returned success with the
-    /// budget unconsumed, so the next engine (the NSE opens its own) loaded a
-    /// stale window and granted another five automatic accepts. The limiter
-    /// disappeared exactly when the filesystem was under contention or the NSE
-    /// was killed mid-write. Reserving first fails CLOSED instead.
-    ///
-    /// The property the old ordering protected — a welcome that fails MLS
-    /// processing must not eat a real first contact's slot — is preserved by
-    /// [`Self::release`] rather than by ordering.
-    /// The cap is re-checked HERE, not only in [`Self::has_room`]. Those are
-    /// two separate steps of `process_incoming`, and this one used to
-    /// `push_back` unconditionally — so anything `refresh_from_disk` unioned in
-    /// between (the iOS NSE runs its own engine against the same sidecar) was
-    /// added on top of a decision taken against a smaller window, and the
-    /// window could grow past the maximum. Failing here parks the welcome,
-    /// which is the same fail-closed path a failed persist already takes.
-    ///
-    /// Residual: two processes that both refresh before either persists can
-    /// still each admit one, so this bounds the overrun rather than making the
-    /// window strictly atomic. Closing that needs a lock around the sidecar
-    /// read-modify-write, the way `MarmotStoreLock` guards the store.
     fn reserve(&mut self, now_secs: u64) -> std::io::Result<()> {
         self.refresh_from_disk();
         self.prune(now_secs);
@@ -561,10 +445,6 @@ impl DmAutoacceptBudget {
         }
     }
 
-    /// Give a reserved slot back after the action it was reserved for failed.
-    /// Best-effort by nature: if this write fails the window stays consumed,
-    /// which errs toward rate-limiting a real contact rather than toward
-    /// handing an attacker a free accept.
     fn release(&mut self, now_secs: u64) {
         self.drop_one(now_secs);
         if let Err(e) = self.persist() {
@@ -575,7 +455,6 @@ impl DmAutoacceptBudget {
         }
     }
 
-    /// Remove one admit stamped `now_secs` (the most recent such entry).
     fn drop_one(&mut self, now_secs: u64) {
         if let Some(pos) = self.admits.iter().rposition(|&t| t == now_secs) {
             self.admits.remove(pos);
@@ -583,7 +462,7 @@ impl DmAutoacceptBudget {
     }
 }
 
-fn dm_autoaccept_sidecar(db_path: &Path) -> std::path::PathBuf {
+fn dm_autoaccept_sidecar(db_path: &Path) -> PathBuf {
     let name = db_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -591,82 +470,415 @@ fn dm_autoaccept_sidecar(db_path: &Path) -> std::path::PathBuf {
     db_path.with_file_name(format!("{name}{DM_AUTOACCEPT_FILE_SUFFIX}"))
 }
 
-/// Outcome of the 2-member-welcome gate (#419).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 enum DmWelcomeDecision {
     AutoAccept { consume_budget: bool },
     Park,
     Drop,
 }
 
-impl MarmotEngine {
-    /// In-memory engine. Volatile — state is lost on drop. Used by tests and any
-    /// caller that does not need persistence.
-    pub fn in_memory(identity: Identity) -> Self {
-        Self {
-            storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
-            identity,
-            write_lock: std::sync::Mutex::new(()),
-            dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::in_memory()),
-            db_path: None,
-            key_package_slot_memo: std::sync::Mutex::new(None),
+/// Optional rumor tags our peeler adds so the receiver can park vs auto-accept
+/// without ingesting. White Noise welcomes omit them; unknown size is treated
+/// as a 2-member DM. Extra tags are ignored by MDK's peeler (it only requires
+/// unique `e` and `relays`).
+#[derive(Clone, Debug)]
+struct WelcomeRumorHint {
+    name: String,
+    description: String,
+    member_count: u32,
+}
+
+tokio::task_local! {
+    static WELCOME_RUMOR_HINT: WelcomeRumorHint;
+}
+
+struct WelcomeRumorMeta {
+    name: String,
+    description: String,
+    member_count: Option<u32>,
+    group_id: Option<GroupId>,
+    relays: Vec<RelayUrl>,
+}
+
+fn welcome_rumor_meta(rumor: &UnsignedEvent) -> WelcomeRumorMeta {
+    let mut meta = WelcomeRumorMeta {
+        name: String::new(),
+        description: String::new(),
+        member_count: None,
+        group_id: None,
+        relays: Vec::new(),
+    };
+    for tag in rumor.tags.iter() {
+        let slice = tag.as_slice();
+        let Some(name) = slice.first().map(String::as_str) else {
+            continue;
+        };
+        match name {
+            "name" => {
+                if let Some(value) = slice.get(1) {
+                    meta.name = value.clone();
+                }
+            }
+            "description" => {
+                if let Some(value) = slice.get(1) {
+                    meta.description = value.clone();
+                }
+            }
+            "members" | "member_count" => {
+                meta.member_count = slice.get(1).and_then(|v| v.parse().ok());
+            }
+            "h" | "group" => {
+                if let Some(hex_id) = slice.get(1) {
+                    if let Ok(bytes) = hex::decode(hex_id) {
+                        if !bytes.is_empty() {
+                            meta.group_id = Some(GroupId::new(bytes));
+                        }
+                    }
+                }
+            }
+            "relays" => {
+                meta.relays = slice
+                    .iter()
+                    .skip(1)
+                    .filter_map(|url| RelayUrl::parse(url).ok())
+                    .collect();
+            }
+            _ => {}
         }
+    }
+    meta
+}
+
+fn parked_group_id_for_wrapper(wrapper: &Event, meta: &WelcomeRumorMeta) -> GroupId {
+    meta.group_id
+        .clone()
+        .unwrap_or_else(|| GroupId::new(wrapper.id.as_bytes().to_vec()))
+}
+
+struct NostrProofSigner {
+    keys: Keys,
+}
+
+impl AccountIdentityProofSigner for NostrProofSigner {
+    fn sign_account_identity_proof(
+        &self,
+        request: &AccountIdentityProofRequest,
+    ) -> std::result::Result<[u8; 64], String> {
+        if self.keys.public_key().to_bytes().as_slice() != request.account_identity.as_slice() {
+            return Err("request account identity does not match session key".into());
+        }
+        let event = request.proof_event().and_then(|event| {
+            event
+                .sign_with_keys(&self.keys)
+                .map_err(|err| err.to_string())
+        })?;
+        request.signature_from_signed_event(event)
+    }
+}
+
+/// Peeler that delegates MLS wrap/peel to MDK's Nostr peeler but stamps
+/// welcome gift wraps with `Timestamp::now()` so White Noise `since=` fetches
+/// see them. `EventBuilder::gift_wrap` randomizes `created_at` into the past.
+struct SonarWelcomePeeler {
+    inner: NostrMlsPeeler,
+    keys: Keys,
+}
+
+impl SonarWelcomePeeler {
+    fn new(keys: Keys) -> Self {
+        let inner = NostrMlsPeeler::new().with_welcome_signer(keys.clone());
+        Self { inner, keys }
+    }
+
+    async fn wrap_welcome_now(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+        metadata: &cgka_traits::engine::WelcomeMetadata,
+    ) -> Result<TransportMessage> {
+        if !payload.aad.is_empty() {
+            return Err(Error::Mdk(
+                "Nostr welcome wrap does not currently encode payload AAD".into(),
+            ));
+        }
+        if payload.ciphertext.is_empty() {
+            return Err(Error::Mdk("welcome payload cannot be empty".into()));
+        }
+        if metadata.relays.is_empty() {
+            return Err(Error::Mdk(
+                "welcome relays tag must contain at least one relay".into(),
+            ));
+        }
+        let recipient_pk = PublicKey::from_slice(recipient.as_slice())
+            .map_err(|e| Error::Mdk(format!("recipient MemberId is not a Nostr pubkey: {e}")))?;
+        let mut tags = vec![
+            Tag::custom(
+                TagKind::custom("e"),
+                [hex::encode(metadata.key_package_event_id.as_slice())],
+            ),
+            Tag::custom(
+                TagKind::custom("relays"),
+                metadata.relays.iter().map(|relay| relay.as_str()),
+            ),
+        ];
+        if let Ok(hint) = WELCOME_RUMOR_HINT.try_with(|hint| hint.clone()) {
+            if !hint.name.is_empty() {
+                tags.push(Tag::custom(TagKind::custom("name"), [hint.name]));
+            }
+            if !hint.description.is_empty() {
+                tags.push(Tag::custom(
+                    TagKind::custom("description"),
+                    [hint.description],
+                ));
+            }
+            if hint.member_count > 0 {
+                tags.push(Tag::custom(
+                    TagKind::custom("members"),
+                    [hint.member_count.to_string()],
+                ));
+            }
+        }
+        let rumor = EventBuilder::new(
+            Kind::Custom(KIND_MARMOT_WELCOME_RUMOR),
+            BASE64.encode(&payload.ciphertext),
+        )
+        .tags(tags)
+        .build(self.keys.public_key());
+        let wrapped =
+            gift_wrap_with_current_timestamp_async(&self.keys, &recipient_pk, rumor).await?;
+        nostr_event_to_transport(&wrapped)
+    }
+}
+
+#[async_trait]
+impl TransportPeeler for SonarWelcomePeeler {
+    async fn peel_group_message(
+        &self,
+        msg: &TransportMessage,
+        ctx: &GroupContextSnapshot,
+    ) -> std::result::Result<PeeledMessage, PeelerError> {
+        self.inner.peel_group_message(msg, ctx).await
+    }
+
+    async fn peel_welcome(
+        &self,
+        msg: &TransportMessage,
+    ) -> std::result::Result<PeeledMessage, PeelerError> {
+        self.inner.peel_welcome(msg).await
+    }
+
+    async fn wrap_group_message(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+    ) -> std::result::Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_message(payload, ctx).await
+    }
+
+    async fn wrap_group_message_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        ctx: &GroupContextSnapshot,
+        metadata: &GroupMessageMetadata,
+    ) -> std::result::Result<TransportMessage, PeelerError> {
+        self.inner
+            .wrap_group_message_with_metadata(payload, ctx, metadata)
+            .await
+    }
+
+    async fn wrap_welcome(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+    ) -> std::result::Result<TransportMessage, PeelerError> {
+        let _ = (payload, recipient);
+        Err(PeelerError::MissingContext {
+            label: "welcome_metadata".into(),
+        })
+    }
+
+    async fn wrap_welcome_with_metadata(
+        &self,
+        payload: &EncryptedPayload,
+        recipient: &MemberId,
+        metadata: &cgka_traits::engine::WelcomeMetadata,
+    ) -> std::result::Result<TransportMessage, PeelerError> {
+        self.wrap_welcome_now(payload, recipient, metadata)
+            .await
+            .map_err(|e| PeelerError::WrapFailed(e.to_string()))
+    }
+}
+
+async fn gift_wrap_with_current_timestamp_async(
+    keys: &Keys,
+    receiver: &PublicKey,
+    rumor: UnsignedEvent,
+) -> Result<Event> {
+    let seal: Event = EventBuilder::seal(keys, receiver, rumor)
+        .await?
+        .sign(keys)
+        .await?;
+    let ephemeral = Keys::generate();
+    let content = nip44::encrypt(
+        ephemeral.secret_key(),
+        receiver,
+        seal.as_json(),
+        nip44::Version::default(),
+    )?;
+    let wrapped = EventBuilder::new(Kind::GiftWrap, content)
+        .tags([Tag::public_key(*receiver)])
+        .custom_created_at(Timestamp::now())
+        .sign_with_keys(&ephemeral)?;
+    Ok(wrapped)
+}
+
+/// The Marmot engine: one per identity, owns MLS group state via MDK 0.9.
+pub struct MarmotEngine {
+    /// `None` while an async method owns the session across `.await`
+    /// (so we never hold `std::sync::MutexGuard` across an await point).
+    session: Mutex<Option<AccountDeviceSession>>,
+    identity: Identity,
+    dm_autoaccept_budget: Mutex<DmAutoacceptBudget>,
+    db_path: Option<PathBuf>,
+    key_package_slot_memo: Mutex<Option<String>>,
+    pending_refs: Mutex<HashMap<GroupId, PendingStateRef>>,
+    parked_invites: Mutex<HashMap<EventId, GroupInvite>>,
+    dropped_groups: Mutex<HashSet<GroupId>>,
+    transcript: Mutex<HashMap<GroupId, Vec<ChatMessage>>>,
+    /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
+    _tempdir: Option<tempfile::TempDir>,
+}
+
+/// Owns `AccountDeviceSession` across `.await` without holding a std mutex
+/// guard, so engine futures stay `Send`.
+struct SessionLease<'a> {
+    engine: &'a MarmotEngine,
+    session: Option<AccountDeviceSession>,
+}
+
+impl SessionLease<'_> {
+    fn get_mut(&mut self) -> &mut AccountDeviceSession {
+        self.session.as_mut().expect("session lease still held")
+    }
+}
+
+impl Drop for SessionLease<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            self.engine.replace_session(session);
+        }
+    }
+}
+
+impl MarmotEngine {
+    /// In-memory engine. Volatile — state is lost on drop. MDK 0.9 has no
+    /// memory storage, so this is a SQLCipher file in a [`tempfile::TempDir`].
+    pub fn in_memory(identity: Identity) -> Self {
+        Self::open_in_memory(identity).expect("OS RNG and temp SQLCipher available")
+    }
+
+    fn in_memory_inner(identity: Identity) -> Result<Self> {
+        Self::open_in_memory(identity)
+    }
+
+    fn open_in_memory(identity: Identity) -> Result<Self> {
+        let tempdir = tempfile::TempDir::new()
+            .map_err(|e| Error::Storage(format!("in-memory tempdir: {e}")))?;
+        let db_path = tempdir.path().join("marmot.sqlite");
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key)?;
+        let mut engine = Self::open_session(identity, &db_path, key, false)?;
+        engine._tempdir = Some(tempdir);
+        engine.db_path = None;
+        engine.dm_autoaccept_budget = Mutex::new(DmAutoacceptBudget::in_memory());
+        Ok(engine)
     }
 
     /// Persistent engine backed by an encrypted SQLCipher database at `db_path`.
     ///
-    /// `key` is the 32-byte SQLCipher key. The HOST owns this key (on iOS the
-    /// Swift side stores it in the Keychain and passes it down) — MDK's keyring
-    /// path is bypassed because OS keyrings are unreliable from a Rust static lib
-    /// on iOS. The parent directory of `db_path` must already exist; the host is
-    /// expected to place it in a Data-Protection-Complete directory.
+    /// `key` is the 32-byte host key. It is encoded as lowercase hex and passed
+    /// to MDK 0.9 as a SQLCipher passphrase (`PRAGMA key = '<hex>'`), not the
+    /// 0.8 raw-key form `x'<hex>'`. Existing 0.8 databases therefore cannot be
+    /// opened in place.
+    ///
+    /// Group hydration is deferred so chat-list first paint does not wait on
+    /// every MLS group. Sends/ingest hydrate on demand.
     pub fn persistent(
         identity: Identity,
         db_path: impl AsRef<Path>,
         key: [u8; 32],
     ) -> Result<Self> {
-        // Before MDK's Connection::open: skip WAL checkpoint on sqlite3_close so
-        // a suspend drop cannot hold file locks past iOS's ~30s grace
-        // (0xdead10cc round 10). See sqlcipher_runtime.
         crate::sqlcipher_runtime::ensure_no_checkpoint_on_close()?;
         let path = db_path.as_ref();
-        let storage = match MdkSqliteStorage::new_with_key(path, EncryptionConfig::new(key)) {
-            Ok(storage) => storage,
-            Err(e) if is_unusable_db_error(&e.to_string()) => {
-                // The file on disk cannot be opened as our encrypted store: it is
-                // either plaintext (created by an older build that didn't encrypt),
-                // encrypted under a different/lost key, or corrupt. In every case
-                // the contents are UNRECOVERABLE with the current key, and the file
-                // blocks the app on every launch ("database was created without
-                // encryption" / "file is not a database"). Self-heal by erasing it
-                // and recreating a fresh encrypted database, so the app stays usable
-                // (the keychain key is now stable, so the new DB persists). This is
-                // destructive but only ever discards already-inaccessible data.
+        match Self::open_session(identity.clone(), path, key, true) {
+            Ok(engine) => Ok(engine),
+            Err(e) if path.exists() && is_unencrypted_sqlite(path) => {
                 let detail = e.to_string();
                 Self::wipe(path)?;
-                let storage = MdkSqliteStorage::new_with_key(path, EncryptionConfig::new(key))
-                    .map_err(|e2| {
-                        Error::Storage(format!(
-                            "recreate after unusable DB failed: {e2} (original: {detail})"
-                        ))
-                    })?;
+                let engine = Self::open_session(identity, path, key, true).map_err(|e2| {
+                    Error::Storage(format!(
+                        "recreate after unusable DB failed: {e2} (original: {detail})"
+                    ))
+                })?;
                 tracing::warn!(
-                    "marmot: discarded an unusable on-disk database and recreated it \
+                    "marmot: discarded an unencrypted on-disk database and recreated it \
                      encrypted (original open error: {detail})"
                 );
-                storage
+                Ok(engine)
             }
-            Err(e) => return Err(Error::Storage(e.to_string())),
-        };
+            Err(e) if path.exists() => Err(Error::Storage(format!(
+                "MDK 0.9 cannot open this store (protocol migration required): {e}"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_session(
+        identity: Identity,
+        db_path: &Path,
+        key: [u8; 32],
+        defer_hydration: bool,
+    ) -> Result<Self> {
+        let keys = identity.keys().clone();
+        let peeler = Box::new(SonarWelcomePeeler::new(keys.clone()));
+        let sqlcipher_key = SqlCipherKey::new(sqlcipher_passphrase(&key))
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut config = SessionConfig::new(
+            db_path.to_path_buf(),
+            sqlcipher_key,
+            identity.public_key().to_bytes().to_vec(),
+            peeler,
+        )
+        .account_identity_proof_signer(Arc::new(NostrProofSigner { keys }))
+        .supported_app_components(
+            default_group_components()
+                .into_iter()
+                .chain(std::iter::once(NOSTR_ROUTING_COMPONENT_ID)),
+        );
+        if defer_hydration {
+            config = config.defer_group_hydration();
+        }
+        let session = AccountDeviceSession::open(config)?;
+        let parked = load_parked(db_path);
+        let dropped = load_dropped(db_path);
+        let transcript = load_transcript(db_path);
         Ok(Self {
-            storage: Storage::Sqlite(Box::new(MDK::new(storage))),
+            session: Mutex::new(Some(session)),
             identity,
-            write_lock: std::sync::Mutex::new(()),
-            // Persistent engine ⇒ persisted window. The iOS NSE builds a
-            // fresh engine per push wake, so an in-memory budget here would
-            // hand every wake a full budget (5 × wake-rate, not 5 per window).
-            dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::load(path)),
-            db_path: Some(path.to_path_buf()),
-            key_package_slot_memo: std::sync::Mutex::new(None),
+            dm_autoaccept_budget: Mutex::new(DmAutoacceptBudget::load(db_path)),
+            db_path: Some(db_path.to_path_buf()),
+            key_package_slot_memo: Mutex::new(None),
+            pending_refs: Mutex::new(HashMap::new()),
+            parked_invites: Mutex::new(parked),
+            dropped_groups: Mutex::new(dropped),
+            transcript: Mutex::new(transcript),
+            _tempdir: None,
         })
     }
 
@@ -674,52 +886,83 @@ impl MarmotEngine {
         &self.identity
     }
 
-    /// Take the MLS write lock. A poisoned lock only means another thread
-    /// panicked mid-call; MDK/SQLite transactions keep the store consistent,
-    /// so recover the guard instead of propagating the poison.
-    fn mls_write(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.write_lock
+    fn take_session(&self) -> Option<AccountDeviceSession> {
+        self.session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
-    /// Decide what to do with a 2-member welcome (#419).
-    ///
-    /// Auto-accept is a spam/storage-DoS surface: our KeyPackage (kind 30443)
-    /// is public, so anyone can mint a 2-member MLS group and gift-wrap us a
-    /// welcome. Order of checks, cheapest first:
-    ///
-    /// 1. The authenticated seal author must BE the welcomer. NIP-59 already
-    ///    rejects a third-party seal (`SenderMismatch`) before we get here and
-    ///    MDK derives `welcomer` from the rumor author, so today this cannot
-    ///    fire — it is a cheap, MDK-version-independent backstop, not a live
-    ///    defense, and no test can reach it from the wire.
-    /// 2. The sliding budget window (persisted sidecar). Checked FIRST so the
-    ///    common under-budget path does zero storage IO — the known-sender
-    ///    scan below deserializes full MLS group state per group while the
-    ///    engine write lock is held, which is exactly the
-    ///    long-work-under-a-lock shape the 0xdead10cc history warns about.
-    ///    The slot is consumed only after `accept_welcome` succeeds.
-    /// 3. Budget exhausted: a welcomer we already share an active group with
-    ///    is vouched for (re-invites, key rotation, second device) — accept
-    ///    without consuming budget.
-    /// 4. Otherwise park as a pending invite — but only up to
-    ///    [`PENDING_INVITE_CAP`] parked invites; past the cap the
-    ///    welcome is declined outright, or the flood just moves into an
-    ///    unbounded invite list on both hosts.
+    fn replace_session(&self, session: AccountDeviceSession) {
+        let mut slot = self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(slot.is_none(), "session replaced while still borrowed");
+        *slot = Some(session);
+    }
+
+    /// Wait until the session is free, then lease it for the duration of an
+    /// async MDK call. The session is returned on drop even if the caller
+    /// panics after the lease is taken.
+    async fn lease_session(&self) -> SessionLease<'_> {
+        loop {
+            if let Some(session) = self.take_session() {
+                return SessionLease {
+                    engine: self,
+                    session: Some(session),
+                };
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn with_session<R>(&self, f: impl FnOnce(&AccountDeviceSession) -> Result<R>) -> Result<R> {
+        loop {
+            {
+                let slot = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(session) = slot.as_ref() {
+                    return f(session);
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn with_session_mut<R>(
+        &self,
+        f: impl FnOnce(&mut AccountDeviceSession) -> Result<R>,
+    ) -> Result<R> {
+        loop {
+            {
+                let mut slot = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(session) = slot.as_mut() {
+                    return f(session);
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+
     fn dm_welcome_decision(
         &self,
         seal_sender: &PublicKey,
-        welcome: &welcome_types::Welcome,
+        welcomer: &PublicKey,
         now_secs: u64,
     ) -> DmWelcomeDecision {
-        if *seal_sender != welcome.welcomer {
+        if *seal_sender != *welcomer {
             tracing::warn!(
                 "welcome seal author {} != welcomer {}; parking instead of auto-accepting",
                 seal_sender,
-                welcome.welcomer
+                welcomer
             );
-            return self.park_or_drop_welcome(welcome);
+            return self.park_or_drop_welcome(welcomer);
         }
         let has_room = self
             .dm_autoaccept_budget
@@ -731,7 +974,7 @@ impl MarmotEngine {
                 consume_budget: true,
             };
         }
-        let shared = self.shared_active_groups_with(&welcome.welcomer, KNOWN_SENDER_GROUP_CAP);
+        let shared = self.shared_active_groups_with(welcomer, KNOWN_SENDER_GROUP_CAP);
         if shared > 0 && shared < KNOWN_SENDER_GROUP_CAP {
             return DmWelcomeDecision::AutoAccept {
                 consume_budget: false,
@@ -739,30 +982,11 @@ impl MarmotEngine {
         }
         tracing::info!(
             "unknown-sender DM welcome from {} not auto-accepted (budget exhausted)",
-            welcome.welcomer
+            welcomer
         );
-        self.park_or_drop_welcome(welcome)
+        self.park_or_drop_welcome(welcomer)
     }
 
-    /// How many ACTIVE groups we already share with `welcomer`, counting no
-    /// further than `limit`. Bounds the known-sender bypass (see
-    /// [`KNOWN_SENDER_GROUP_CAP`]) and the parked-invite exemption.
-    ///
-    /// `limit` is not a nicety. This runs inside `process_incoming`, which
-    /// holds the `mls_write` mutex that outgoing message creation also needs,
-    /// and every group costs a membership storage lookup — so an unbounded
-    /// scan lets relay welcome traffic block SENDING on an account with many
-    /// conversations, against the Signal-comparable performance rule. Every
-    /// caller compares against a small ceiling, so stopping there is exact,
-    /// not approximate: the count is only ever used as `> 0` or `< CAP`.
-    ///
-    /// The match cap alone is not enough (#498 review round 2): the normal
-    /// attacker case shares NO group, so `shared` never reaches `limit` and
-    /// the loop would still pay one `members()` lookup per active group under
-    /// `mls_write`. [`SHARED_GROUP_SCAN_CAP`] bounds the groups INSPECTED. The
-    /// trade is explicit: a genuine contact whose only shared group sits past
-    /// the cap reads as unknown and the welcome parks for manual accept —
-    /// fail-toward-parking, never toward auto-accepting or dropping.
     fn shared_active_groups_with(&self, welcomer: &PublicKey, limit: usize) -> usize {
         let Ok(groups) = self.groups() else { return 0 };
         let mut shared = 0usize;
@@ -771,7 +995,7 @@ impl MarmotEngine {
                 break;
             }
             if self
-                .members(&group.mls_group_id)
+                .members(&group.id)
                 .ok()
                 .is_some_and(|members| members.contains(welcomer))
             {
@@ -781,48 +1005,21 @@ impl MarmotEngine {
         shared
     }
 
-    /// Park as pending unless the parked-invite ceiling is already hit.
-    /// `process_welcome` has already stored the CURRENT welcome as pending,
-    /// so it is excluded from the count — the cap bounds the OTHERS.
-    ///
-    /// Counts EVERY pending welcome, not just 2-member ones: a spammer who
-    /// mints 3-member groups instead would otherwise walk straight around a
-    /// DM-only ceiling, and the invite list is a single list to the user
-    /// either way.
-    fn park_or_drop_welcome(&self, current: &welcome_types::Welcome) -> DmWelcomeDecision {
-        // Someone we already share an active group with gets a HIGHER ceiling,
-        // never an unbounded one. The exemption is real — without it 25 parked
-        // spam invites become a permanent invite outage for real contacts —
-        // but returning Park unconditionally handed the attacker the flood back
-        // through the other door: their first welcome is auto-accepted, which
-        // makes them "known", and every later welcome then parked forever. The
-        // group cap stopped the silent groups while the invite list grew without
-        // limit, so the fix bounded one half and left the other open.
-        let known_sender = self.shared_active_groups_with(&current.welcomer, 1) > 0;
+    fn park_or_drop_welcome(&self, welcomer: &PublicKey) -> DmWelcomeDecision {
+        let known_sender = self.shared_active_groups_with(welcomer, 1) > 0;
         let cap = if known_sender {
             KNOWN_SENDER_PENDING_INVITE_CAP
         } else {
             PENDING_INVITE_CAP
         };
-        // A failed pending-list read parks (fails open on the ceiling) rather
-        // than declining: Drop destroys a possibly-real invite unrecoverably,
-        // while Park keeps it user-visible and costs one row — the wrong
-        // direction only if the storage error persists across a whole flood,
-        // by which point welcome processing itself is failing. Logged so a
-        // recurring read failure is visible (#498 review round 2).
-        let parked = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))
-            .map(|ws| ws.iter().filter(|w| w.id != current.id).count())
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "pending-welcome count unavailable; parking without the ceiling"
-                );
-                0
-            });
+        let parked = self
+            .parked_invites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         if parked >= cap {
             tracing::warn!(
-                welcomer = %current.welcomer,
-                member_count = current.member_count,
+                welcomer = %welcomer,
                 cap,
                 known_sender,
                 "pending-invite ceiling hit; declining a welcome without surfacing it"
@@ -847,60 +1044,7 @@ impl MarmotEngine {
             .release(now_secs);
     }
 
-    /// Decline a flood welcome AND reclaim the rows it created.
-    ///
-    /// `process_welcome` has already persisted the welcome and a group row by
-    /// the time we decide to drop it, and `decline_welcome` only marks them
-    /// Declined/Inactive — so a ceiling that stops at declining still lets an
-    /// attacker grow the database ~5KB per event, which is the storage DoS
-    /// #419 is about. `delete_group` removes the group, its `welcomes` rows and
-    /// its `processed_welcomes` rows (mdk-sqlite-storage does this explicitly,
-    /// marmot-protocol/mdk#293), so the flood costs the victim nothing durable.
-    ///
-    /// Guarded, because deleting the wrong group destroys a real conversation:
-    /// only a group that is NOT Active is ever deleted. A replayed wrapper for
-    /// a live chat therefore cannot be turned into a deletion — the failure
-    /// mode this PR already had to fix once (`stop replay deleting a live DM`).
-    ///
-    /// Dropping `processed_welcomes` does mean an identical replayed wrapper is
-    /// processed again rather than deduped. That is the right trade: each replay
-    /// is re-declined and re-deleted, so it costs CPU, not unbounded storage.
-    fn decline_and_purge_welcome(&self, welcome: &welcome_types::Welcome) -> Result<()> {
-        dispatch!(&self.storage, |mdk| mdk.decline_welcome(welcome))?;
-        self.purge_declined_welcome_group(welcome)
-    }
-
-    /// The purge half of [`Self::decline_and_purge_welcome`], callable on its
-    /// own for a RE-DELIVERED already-Declined welcome: a kill between
-    /// `decline_welcome` and `delete_group` (or a transient delete error)
-    /// leaves the decline committed with the flood group's rows still on disk,
-    /// and the sync cursor advances past the wrapper — so re-delivery is the
-    /// only retry that ever comes (#498 review round 2). Same Active guard:
-    /// a manually declined welcome whose group is somehow live is never
-    /// deleted.
-    fn purge_declined_welcome_group(&self, welcome: &welcome_types::Welcome) -> Result<()> {
-        let group_id = &welcome.mls_group_id;
-        let state = dispatch!(&self.storage, |mdk| mdk.get_group(group_id))?.map(|g| g.state);
-        match state {
-            Some(group_types::GroupState::Active) => {
-                tracing::warn!(
-                    welcomer = %welcome.welcomer,
-                    "declined welcome maps to an ACTIVE group; not deleting it"
-                );
-            }
-            Some(_) => {
-                dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?;
-            }
-            None => {}
-        }
-        Ok(())
-    }
-
     /// Erase the on-disk SQLCipher database at `db_path` and its sidecar files.
-    ///
-    /// Used by panic-wipe. No engine must hold the file open when this is called.
-    /// Removes `db_path`, SQLite sidecars, and Sonar sync/outbox sidecars;
-    /// missing files are not an error (idempotent).
     pub fn wipe(db_path: impl AsRef<Path>) -> Result<()> {
         let base = db_path.as_ref();
         for path in sidecar_paths(base) {
@@ -913,29 +1057,10 @@ impl MarmotEngine {
         Ok(())
     }
 
-    /// Path of the file holding this install's KeyPackage slot id.
-    fn key_package_slot_path(&self) -> Option<std::path::PathBuf> {
+    fn key_package_slot_path(&self) -> Option<PathBuf> {
         Some(key_package_slot_path_for(self.db_path.as_ref()?))
     }
 
-    /// This install's stable KeyPackage slot id, or `None` if we have never
-    /// published one. Memo first, then disk. A stored value that does not satisfy
-    /// MIP-00's `d` tag rules is discarded rather than fed back to MDK, which
-    /// would reject it and leave us unable to publish at all.
-    /// `Ok(Some(d))` reuse that slot, `Ok(None)` mint a fresh one, `Err` do not
-    /// publish at all this cycle.
-    ///
-    /// The error case matters: `key_package_event` persists whatever slot it
-    /// ends up using, so silently substituting a value here would write that
-    /// substitute to disk permanently. In particular it must never fall back to
-    /// the identity-derived slot, which is a pure function of the npub: two
-    /// installs of one identity that each hit a transient read error would then
-    /// share one `(kind, pubkey, d)` coordinate and start replacing each other's
-    /// KeyPackage. That is the exact failure this change exists to remove, and
-    /// the iOS "container locked" case that triggers it would hit both of a
-    /// user's devices. Failing the publish is safe instead: hosts republish on
-    /// every relay connect and `publish_key_package_background` logs and
-    /// continues, so it self-heals on the next connect.
     fn load_key_package_slot(&self) -> Result<Option<String>> {
         if let Ok(memo) = self.key_package_slot_memo.lock() {
             if let Some(d) = memo.as_ref() {
@@ -943,13 +1068,6 @@ impl MarmotEngine {
             }
         }
         let Some(path) = self.key_package_slot_path() else {
-            // No database to persist beside (in-memory engine). Derive the slot
-            // from the identity: with no disk, a random slot would mean a NEW
-            // permanent addressable event on every process start. The headless
-            // status probe runs one-shot per poll under a fixed nsec and would
-            // otherwise accumulate a slot per poll forever. Safe here precisely
-            // because an in-memory engine has no persistent install to collide
-            // with.
             return Ok(Some(self.derived_key_package_slot()));
         };
         let raw = match std::fs::read_to_string(&path) {
@@ -971,17 +1089,6 @@ impl MarmotEngine {
         Ok(Some(d))
     }
 
-    /// Deterministic per-identity slot id, for engines with nowhere durable to
-    /// remember a random one. Stable across process restarts by construction.
-    ///
-    /// Only ever used when there is no database, so it cannot collide with a
-    /// persistent install: it is a pure function of the npub, so two callers
-    /// that used it would share one addressable coordinate.
-    ///
-    /// This is an addressing label, not key material: it is published in clear
-    /// in the `d` tag and only ever appears alongside the npub that already
-    /// identifies the event, so deriving it from the public key leaks nothing
-    /// the event does not already carry.
     fn derived_key_package_slot(&self) -> String {
         use nostr::hashes::{sha256::Hash as Sha256Hash, Hash as _};
         let mut input = b"sonar-keypackage-slot-v1:".to_vec();
@@ -989,9 +1096,6 @@ impl MarmotEngine {
         Sha256Hash::hash(&input).to_string()
     }
 
-    /// Persist the slot id so the NEXT publish replaces this addressable event
-    /// instead of creating another one. Best effort: a write failure costs us a
-    /// duplicate slot on the relays, never a failed publish.
     fn store_key_package_slot(&self, d: &str) {
         if let Ok(mut memo) = self.key_package_slot_memo.lock() {
             *memo = Some(d.to_string());
@@ -999,12 +1103,6 @@ impl MarmotEngine {
         let Some(path) = self.key_package_slot_path() else {
             return;
         };
-        // with_file_name, NOT with_extension: the slot file already contains
-        // dots, so with_extension would REPLACE the last component and yield
-        // `marmot.sqlite.tmp`. That name is absent from `sidecar_paths` (so a
-        // crashed rename would survive a wipe) and, for a db path ending in
-        // `.tmp`, would alias the database itself and truncate it. Matches the
-        // `{file_name}.tmp` form every other sidecar in this crate uses.
         let tmp = key_package_slot_tmp_path(&path);
         if std::fs::write(&tmp, d).is_ok() {
             if std::fs::rename(&tmp, &path).is_err() {
@@ -1013,305 +1111,417 @@ impl MarmotEngine {
         }
     }
 
-    /// Build a signed kind-30443 KeyPackage event, ready to publish to
-    /// `relays` (which are also advertised inside the event tags).
-    ///
-    /// The `d` tag is this install's STABLE slot id, reused across publishes.
-    /// MDK mints a fresh random `d` whenever `existing_d_tag` is `None`, and
-    /// hosts republish on every relay connect, so without this each launch left
-    /// another addressable KeyPackage on the relays forever. That is not just
-    /// litter: a peer starting a DM fetches one of them, and with several live
-    /// slots (worse, several DEVICES sharing one npub) the welcome can be
-    /// addressed to key material that lives in a different install's database,
-    /// where it can never be decrypted. One slot per install keeps "which device
-    /// gets invited" answerable.
-    pub fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
-        let _mls = self.mls_write();
-        let options = KeyPackageOptions {
-            existing_d_tag: self.load_key_package_slot()?,
-            ..Default::default()
+    /// Build a signed kind-30443 KeyPackage event, ready to publish to `relays`.
+    pub async fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
+        let _ = relays;
+        let mut lease = self.lease_session().await;
+        let kp = lease.get_mut().fresh_key_package().await?;
+        let meta = lease.get_mut().key_package_metadata(&kp)?;
+        drop(lease);
+        let d_tag = match self.load_key_package_slot()? {
+            Some(d) => d,
+            None => meta.key_package_ref_hex.clone(),
         };
-        let kp = dispatch!(&self.storage, |mdk| mdk
-            .create_key_package_for_event_with_options(
-                &self.identity.public_key(),
-                relays.clone(),
-                options.clone()
-            ))?;
-        self.store_key_package_slot(&kp.d_tag);
-        let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), kp.content)
-            .tags(kp.tags_30443)
-            .build(self.identity.public_key())
-            .sign_with_keys(self.identity.keys())?;
+        self.store_key_package_slot(&d_tag);
+        let event = key_package_to_event(&self.identity, &kp, &meta, &d_tag)?;
         Ok(event)
     }
 
-    /// Create a group with the given members (their signed kind-30443 events).
-    /// All members are admins for now (the 1:1 DM shape used by White Noise).
-    ///
-    /// Per MDK rules the creator's pending commit must be merged only after
-    /// the caller has successfully delivered every Welcome. The caller may
-    /// clear and discard the staged group only if delivery fails before any
-    /// Welcome is published; after partial delivery, the pending state must be
-    /// preserved so the creator does not orphan already-delivered invites.
-    pub fn create_group(
+    pub async fn create_group(
         &self,
         name: &str,
         member_key_packages: Vec<Event>,
         relays: Vec<RelayUrl>,
     ) -> Result<GroupCreation> {
         self.create_group_with_description(name, "", member_key_packages, relays)
+            .await
     }
 
-    pub(crate) fn create_group_with_description(
+    pub(crate) async fn create_group_with_description(
         &self,
         name: &str,
         description: &str,
         member_key_packages: Vec<Event>,
         relays: Vec<RelayUrl>,
     ) -> Result<GroupCreation> {
-        let _mls = self.mls_write();
-        let mut admins: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
-        admins.push(self.identity.public_key());
-        let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
-
-        let config = NostrGroupConfigData::new(
-            name.to_owned(),
-            description.to_owned(),
-            None, // image_hash
-            None, // image_key
-            None, // image_nonce
-            relays,
-            admins,
-            None, // disappearing_message_secs (no ephemeral messages in v1 DMs)
-        );
-        let result = dispatch!(&self.storage, |mdk| mdk.create_group(
-            &self.identity.public_key(),
-            member_key_packages,
-            config,
-        ))?;
-        let welcomes = member_pubkeys
-            .into_iter()
-            .zip(result.welcome_rumors)
+        let relay_urls: Vec<String> = if relays.is_empty() {
+            // Local-only / no-relay clients still need a wrap-valid relay list
+            // in the founding Nostr routing component (0.9 peeler requires it).
+            vec!["wss://relay.example.com".to_owned()]
+        } else {
+            relays.iter().map(|r| r.to_string()).collect()
+        };
+        let members = member_key_packages
+            .iter()
+            .map(key_package_from_event)
+            .collect::<Result<Vec<_>>>()?;
+        let mut nostr_group_id = [0u8; 32];
+        getrandom::getrandom(&mut nostr_group_id)?;
+        let routing =
+            NostrRoutingV1::new(nostr_group_id, relay_urls).map_err(Error::InvalidInput)?;
+        let routing_bytes = encode_nostr_routing_v1(&routing).map_err(Error::InvalidInput)?;
+        let initial_admins = member_key_packages
+            .iter()
+            .map(|ev| MemberId::new(ev.pubkey.to_bytes().to_vec()))
             .collect();
-        Ok(GroupCreation {
-            group: result.group,
-            welcomes,
-        })
+        let req = CreateGroupRequest {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            members,
+            required_features: Vec::new(),
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: routing_bytes,
+            }],
+            initial_admins,
+        };
+        let hint = WelcomeRumorHint {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            member_count: (member_key_packages.len() + 1) as u32,
+        };
+        let mut lease = self.lease_session().await;
+        let created = WELCOME_RUMOR_HINT
+            .scope(hint, lease.get_mut().create_group(req))
+            .await?;
+        let group = lease.get_mut().group_record(&created.group_id)?;
+        let (welcomes, pending) = publish_work_welcomes(&created.effects)?;
+        drop(lease);
+        if let Some(pending) = pending {
+            self.pending_refs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(created.group_id.clone(), pending);
+        }
+        Ok(GroupCreation { group, welcomes })
     }
 
-    /// Create an add-members commit for an existing group. The caller must
-    /// publish `evolution_event`, deliver any welcomes, then merge the pending
-    /// commit with [`Self::merge_pending_commit`]. If welcome delivery fails
-    /// after the commit event may have reached relays, preserve the pending
-    /// commit rather than rolling back local state.
-    pub fn add_members(
+    pub async fn add_members(
         &self,
         group_id: &GroupId,
         member_key_packages: Vec<Event>,
     ) -> Result<GroupMembershipUpdate> {
-        let _mls = self.mls_write();
-        let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
-        let result = dispatch!(&self.storage, |mdk| mdk
-            .add_members(group_id, &member_key_packages))?;
-        Ok(Self::to_membership_update(result, member_pubkeys, true))
+        let key_packages = member_key_packages
+            .iter()
+            .map(key_package_from_event)
+            .collect::<Result<Vec<_>>>()?;
+        self.send_intent(
+            SendIntent::Invite {
+                group_id: group_id.clone(),
+                key_packages,
+                initial_admins: Vec::new(),
+            },
+            true,
+        )
+        .await
     }
 
-    /// Create a remove-members commit for an existing group.
-    pub fn remove_members(
+    pub async fn remove_members(
         &self,
         group_id: &GroupId,
         members: &[PublicKey],
     ) -> Result<GroupMembershipUpdate> {
-        let _mls = self.mls_write();
-        let result = dispatch!(&self.storage, |mdk| mdk.remove_members(group_id, members))?;
-        Ok(Self::to_membership_update(result, Vec::new(), true))
+        let members = members
+            .iter()
+            .map(|pk| MemberId::new(pk.to_bytes().to_vec()))
+            .collect();
+        self.send_intent(
+            SendIntent::RemoveMembers {
+                group_id: group_id.clone(),
+                members,
+            },
+            true,
+        )
+        .await
     }
 
-    /// Create a self-demotion commit. Required before an admin leaves.
-    pub fn self_demote(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
-        let _mls = self.mls_write();
-        let result = dispatch!(&self.storage, |mdk| mdk.self_demote(group_id))?;
-        Ok(Self::to_membership_update(result, Vec::new(), true))
+    pub async fn self_demote(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
+        // MDK 0.9 has no self-demote commit. Leave (MIP-03 SelfRemove) is the
+        // membership-exit path; keep this method so hosts still compile.
+        self.leave_group(group_id).await
     }
 
-    /// Create a leave proposal for the current member.
-    pub fn leave_group(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
-        let _mls = self.mls_write();
-        let result = dispatch!(&self.storage, |mdk| mdk.leave_group(group_id))?;
-        Ok(Self::to_membership_update(result, Vec::new(), false))
+    pub async fn leave_group(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
+        self.send_intent(
+            SendIntent::Leave {
+                group_id: group_id.clone(),
+            },
+            false,
+        )
+        .await
     }
 
-    /// Merge a pending local commit after the caller has published it.
-    pub fn merge_pending_commit(&self, group_id: &GroupId) -> Result<()> {
-        let _mls = self.mls_write();
-        Ok(dispatch!(&self.storage, |mdk| mdk.merge_pending_commit(group_id))?)
+    async fn send_intent(
+        &self,
+        intent: SendIntent,
+        default_requires_merge: bool,
+    ) -> Result<GroupMembershipUpdate> {
+        let group_id = match &intent {
+            SendIntent::Invite { group_id, .. }
+            | SendIntent::RemoveMembers { group_id, .. }
+            | SendIntent::Leave { group_id, .. }
+            | SendIntent::AppMessage { group_id, .. } => group_id.clone(),
+            _ => {
+                return Err(Error::InvalidInput(
+                    "unsupported membership send intent".into(),
+                ))
+            }
+        };
+        let invite_hint = match &intent {
+            SendIntent::Invite {
+                group_id,
+                key_packages,
+                ..
+            } => {
+                let extra = key_packages.len() as u32;
+                let existing = self.members(group_id).map(|m| m.len() as u32).unwrap_or(0);
+                let (name, description) = self
+                    .with_session(|session| Ok(session.group_record(group_id).ok()))
+                    .ok()
+                    .flatten()
+                    .map(|g| (g.name, g.description))
+                    .unwrap_or_default();
+                Some(WelcomeRumorHint {
+                    name,
+                    description,
+                    member_count: existing.saturating_add(extra),
+                })
+            }
+            _ => None,
+        };
+        let mut lease = self.lease_session().await;
+        let _ = lease.get_mut().ensure_group_hydrated(&group_id);
+        let effects = if let Some(hint) = invite_hint {
+            WELCOME_RUMOR_HINT
+                .scope(hint, lease.get_mut().send(intent))
+                .await?
+        } else {
+            lease.get_mut().send(intent).await?
+        };
+        drop(lease);
+        self.effects_to_membership_update(&group_id, effects, default_requires_merge)
     }
 
-    /// Roll back a pending local commit when publish fails before it reaches the
-    /// relays. This keeps the group usable for a later retry.
-    pub fn clear_pending_commit(&self, group_id: &GroupId) -> Result<()> {
-        let _mls = self.mls_write();
-        Ok(dispatch!(&self.storage, |mdk| mdk.clear_pending_commit(group_id))?)
+    fn effects_to_membership_update(
+        &self,
+        group_id: &GroupId,
+        effects: SessionEffects,
+        default_requires_merge: bool,
+    ) -> Result<GroupMembershipUpdate> {
+        let mut evolution_event = None;
+        let mut welcomes = Vec::new();
+        let mut requires_commit_merge = false;
+        for work in &effects.publish {
+            match work {
+                PublishWork::GroupEvolution {
+                    msg,
+                    welcomes: w,
+                    pending,
+                } => {
+                    evolution_event = Some(transport_to_event(msg)?);
+                    welcomes = wrapped_welcomes(w)?;
+                    self.store_pending(group_id.clone(), *pending);
+                    requires_commit_merge = true;
+                }
+                PublishWork::GroupCreated {
+                    welcomes: w,
+                    pending,
+                } => {
+                    welcomes = wrapped_welcomes(w)?;
+                    self.store_pending(group_id.clone(), *pending);
+                    requires_commit_merge = true;
+                }
+                PublishWork::FoundingGroupCreated { welcomes: w } => {
+                    welcomes = wrapped_welcomes(w)?;
+                    requires_commit_merge = false;
+                }
+                PublishWork::Proposal { msg, .. } | PublishWork::AutoPublish { msg, .. } => {
+                    evolution_event = Some(transport_to_event(msg)?);
+                    if let PublishWork::AutoPublish { pending, .. } = work {
+                        self.store_pending(group_id.clone(), *pending);
+                        requires_commit_merge = true;
+                    }
+                }
+                PublishWork::ApplicationMessage { msg, .. } => {
+                    evolution_event = Some(transport_to_event(msg)?);
+                }
+            }
+        }
+        let evolution_event = evolution_event
+            .ok_or_else(|| Error::Mdk("membership update produced no publishable event".into()))?;
+        Ok(GroupMembershipUpdate {
+            group_id: group_id.clone(),
+            evolution_event,
+            welcomes,
+            requires_commit_merge: requires_commit_merge || default_requires_merge && false,
+        })
     }
 
-    /// Gift-wrap a kind-444 welcome rumor for `receiver` (NIP-59, kind 1059).
+    fn store_pending(&self, group_id: GroupId, pending: PendingStateRef) {
+        self.pending_refs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id, pending);
+    }
+
+    pub async fn merge_pending_commit(&self, group_id: &GroupId) -> Result<()> {
+        let pending = self
+            .pending_refs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(group_id);
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let mut lease = self.lease_session().await;
+        lease.get_mut().confirm_published(pending).await?;
+        Ok(())
+    }
+
+    pub async fn clear_pending_commit(&self, group_id: &GroupId) -> Result<()> {
+        let pending = self
+            .pending_refs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(group_id);
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let mut lease = self.lease_session().await;
+        lease.get_mut().publish_failed(pending).await?;
+        Ok(())
+    }
+
     pub async fn gift_wrap_welcome(
         &self,
         receiver: &PublicKey,
         rumor: UnsignedEvent,
     ) -> Result<Event> {
-        // Build the NIP-59 gift wrap manually so the OUTER (kind-1059) event uses a
-        // CURRENT timestamp instead of NIP-59's randomized up-to-2-days-in-the-past
-        // tweak. White Noise subscribes for incoming welcomes with
-        // `since = last_synced_at - 10s`, so a far-past gift-wrap timestamp falls
-        // outside its window and the welcome is NEVER fetched — Sonar->White Noise
-        // group invites silently failed. A recent timestamp keeps them in the window.
-        // (We don't filter by `since`, which is why White Noise->Sonar worked.)
-        let keys = self.identity.keys();
-        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
-            .await?
-            .sign(keys)
-            .await?;
-        let ephemeral = Keys::generate();
-        let content = nip44::encrypt(
-            ephemeral.secret_key(),
-            receiver,
-            seal.as_json(),
-            nip44::Version::default(),
-        )?;
-        let wrapped = EventBuilder::new(Kind::GiftWrap, content)
-            .tags([Tag::public_key(*receiver)])
-            .custom_created_at(Timestamp::now())
-            .sign_with_keys(&ephemeral)?;
-        Ok(wrapped)
+        gift_wrap_with_current_timestamp_async(self.identity.keys(), receiver, rumor).await
     }
 
-    /// Encrypt a text message into a signed kind-445 event for `group_id`.
-    /// The returned event is signed by an MDK-generated ephemeral key and is
-    /// already recorded as "ours" in storage once processed back.
-    pub fn create_text_message(&self, group_id: &GroupId, text: &str) -> Result<Event> {
+    pub async fn create_text_message(&self, group_id: &GroupId, text: &str) -> Result<Event> {
         self.create_text_message_with_reply(group_id, text, None)
+            .await
     }
 
-    pub fn create_text_message_with_reply(
+    pub async fn create_text_message_with_reply(
         &self,
         group_id: &GroupId,
         text: &str,
         reply: Option<&ReplyTo>,
     ) -> Result<Event> {
-        let _mls = self.mls_write();
-        self.create_text_event_inner(group_id, text, reply)
+        self.create_app_event(group_id, text, Vec::new(), reply)
+            .await
     }
 
-    /// Requires the caller to hold the MLS write guard.
-    fn create_text_event_inner(
+    async fn create_app_event(
         &self,
         group_id: &GroupId,
         text: &str,
+        extra_tags: Vec<Tag>,
         reply: Option<&ReplyTo>,
     ) -> Result<Event> {
-        let rumor = self.kind9_rumor(text, Vec::new(), reply)?;
-        let event = dispatch!(&self.storage, |mdk| mdk
-            .create_message(group_id, rumor, None))?;
+        let rumor = self.kind9_rumor(text, extra_tags, reply)?;
+        let payload = marmot_app_event_from_rumor(&rumor)?;
+        let mut lease = self.lease_session().await;
+        let _ = lease.get_mut().ensure_group_hydrated(group_id);
+        let effects = lease
+            .get_mut()
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload,
+            })
+            .await?;
+        drop(lease);
+        let event = event_from_app_publish(&effects)?;
+        if let Some(msg) = self.chat_from_app_rumor(group_id, &rumor, &event, true) {
+            self.store_chat(msg);
+        }
         Ok(event)
     }
 
-    /// Create an outgoing text message AND write its local transcript row under
-    /// ONE MLS write guard. Without the shared guard, a concurrently drained
-    /// commit could advance the group epoch between encryption and local
-    /// processing and strand the just-sent row.
-    pub fn create_and_process_text_message(
+    pub async fn create_and_process_text_message(
         &self,
         group_id: &GroupId,
         text: &str,
     ) -> Result<(Event, Incoming)> {
-        let _mls = self.mls_write();
-        let event = self.create_text_event_inner(group_id, text, None)?;
-        let incoming = self.process_group_message(&event)?;
+        let event = self.create_text_message(group_id, text).await?;
+        let incoming = self
+            .lookup_chat(&event.id)
+            .map(Incoming::Message)
+            .unwrap_or(Incoming::None);
         Ok((event, incoming))
     }
 
-    pub fn create_and_process_text_message_with_reply(
+    pub async fn create_and_process_text_message_with_reply(
         &self,
         group_id: &GroupId,
         text: &str,
         reply: Option<&ReplyTo>,
     ) -> Result<(Event, Incoming)> {
-        let _mls = self.mls_write();
-        let event = self.create_text_event_inner(group_id, text, reply)?;
-        let incoming = overlay_reply_preview(self.process_group_message(&event)?, reply);
+        let event = self
+            .create_text_message_with_reply(group_id, text, reply)
+            .await?;
+        let incoming = overlay_reply_preview(
+            self.lookup_chat(&event.id)
+                .map(Incoming::Message)
+                .unwrap_or(Incoming::None),
+            reply,
+        );
         Ok((event, incoming))
     }
 
-    /// Encrypt a sticker message into a signed kind-445 event for `group_id`.
-    /// The rumor carries the sticker ref tag so the receiver can resolve the
-    /// sticker image from the pack's Blossom URL.
-    pub fn create_sticker_message(
+    pub async fn create_sticker_message(
         &self,
         group_id: &GroupId,
         sticker_ref: &StickerRef,
     ) -> Result<Event> {
-        let _mls = self.mls_write();
-        self.create_sticker_event_inner(group_id, sticker_ref, None)
+        self.create_sticker_message_with_reply(group_id, sticker_ref, None)
+            .await
     }
 
-    pub fn create_sticker_message_with_reply(
-        &self,
-        group_id: &GroupId,
-        sticker_ref: &StickerRef,
-        reply: Option<&ReplyTo>,
-    ) -> Result<Event> {
-        let _mls = self.mls_write();
-        self.create_sticker_event_inner(group_id, sticker_ref, reply)
-    }
-
-    /// Requires the caller to hold the MLS write guard.
-    fn create_sticker_event_inner(
+    pub async fn create_sticker_message_with_reply(
         &self,
         group_id: &GroupId,
         sticker_ref: &StickerRef,
         reply: Option<&ReplyTo>,
     ) -> Result<Event> {
         let tag = build_sticker_ref_tag(sticker_ref);
-        let rumor = self.kind9_rumor("", vec![tag], reply)?;
-        let event = dispatch!(&self.storage, |mdk| mdk
-            .create_message(group_id, rumor, None))?;
-        Ok(event)
+        self.create_app_event(group_id, "", vec![tag], reply).await
     }
 
-    /// Sticker variant of [`Self::create_and_process_text_message`]: create and
-    /// locally process under one MLS write guard.
-    pub fn create_and_process_sticker_message(
+    pub async fn create_and_process_sticker_message(
         &self,
         group_id: &GroupId,
         sticker_ref: &StickerRef,
     ) -> Result<(Event, Incoming)> {
-        let _mls = self.mls_write();
-        let event = self.create_sticker_event_inner(group_id, sticker_ref, None)?;
-        let incoming = self.process_group_message(&event)?;
+        let event = self.create_sticker_message(group_id, sticker_ref).await?;
+        let incoming = self
+            .lookup_chat(&event.id)
+            .map(Incoming::Message)
+            .unwrap_or(Incoming::None);
         Ok((event, incoming))
     }
 
-    pub fn create_and_process_sticker_message_with_reply(
+    pub async fn create_and_process_sticker_message_with_reply(
         &self,
         group_id: &GroupId,
         sticker_ref: &StickerRef,
         reply: Option<&ReplyTo>,
     ) -> Result<(Event, Incoming)> {
-        let _mls = self.mls_write();
-        let event = self.create_sticker_event_inner(group_id, sticker_ref, reply)?;
-        let incoming = overlay_reply_preview(self.process_group_message(&event)?, reply);
+        let event = self
+            .create_sticker_message_with_reply(group_id, sticker_ref, reply)
+            .await?;
+        let incoming = overlay_reply_preview(
+            self.lookup_chat(&event.id)
+                .map(Incoming::Message)
+                .unwrap_or(Incoming::None),
+            reply,
+        );
         Ok((event, incoming))
     }
 
-    // ── Encrypted media (Marmot MIP-04) ───────────────────────────────────
-    //
-    // MDK does the crypto (key from the group exporter secret) and the `imeta`
-    // tag; the caller ([`crate::client`]) does the Blossom upload/download. This
-    // engine layer stays transport-free.
-
-    /// Encrypt `data` for `group_id` into a ciphertext + metadata blob ready to
-    /// upload to a Blossom server. Pure crypto, no I/O. `mime` like `image/jpeg`.
     pub fn encrypt_media(
         &self,
         group_id: &GroupId,
@@ -1319,16 +1529,22 @@ impl MarmotEngine {
         mime: &str,
         filename: &str,
     ) -> Result<EncryptedMediaUpload> {
-        dispatch!(&self.storage, |mdk| mdk
-            .media_manager(group_id.clone())
-            .encrypt_for_upload(data, mime, filename)
-            .map_err(|e| Error::Media(e.to_string())))
+        let secret = self.media_exporter_secret(group_id)?;
+        media_crypto::encrypt_for_upload(&secret, data, mime, filename)
     }
 
-    /// Build a signed kind-445 media message: a kind-9 rumor carrying `caption`
-    /// (may be empty) plus the `imeta` tag pointing at the uploaded ciphertext
-    /// `url`. The imeta rides INSIDE the encrypted rumor, so it is E2E-protected.
-    pub fn create_media_event(
+    fn media_exporter_secret(&self, group_id: &GroupId) -> Result<Vec<u8>> {
+        self.with_session(|session| {
+            let secret = session.exporter_secret(
+                group_id,
+                media_crypto::ENCRYPTED_MEDIA_EXPORTER_LABEL,
+                32,
+            )?;
+            Ok((*secret).clone())
+        })
+    }
+
+    pub async fn create_media_event(
         &self,
         group_id: &GroupId,
         upload: &EncryptedMediaUpload,
@@ -1336,27 +1552,20 @@ impl MarmotEngine {
         caption: &str,
     ) -> Result<Event> {
         self.create_media_event_multi(group_id, &[(upload, url)], caption)
+            .await
     }
 
-    /// Build a signed kind-445 media message carrying MULTIPLE attachments: one
-    /// kind-9 rumor with `caption` (may be empty) plus one `imeta` tag per
-    /// `(upload, url)` pair, in order. All imeta ride INSIDE the encrypted rumor,
-    /// so they are E2E-protected. This is the album path — a single message that
-    /// renders as N images. `uploads` must be non-empty.
-    pub fn create_media_event_multi(
+    pub async fn create_media_event_multi(
         &self,
         group_id: &GroupId,
         uploads: &[(&EncryptedMediaUpload, &str)],
         caption: &str,
     ) -> Result<Event> {
-        if uploads.is_empty() {
-            return Err(Error::Media("no media uploads for message".into()));
-        }
-        let _mls = self.mls_write();
-        self.create_media_event_multi_inner(group_id, uploads, caption, None)
+        self.create_media_event_multi_with_reply(group_id, uploads, caption, None)
+            .await
     }
 
-    pub fn create_media_event_multi_with_reply(
+    pub async fn create_media_event_multi_with_reply(
         &self,
         group_id: &GroupId,
         uploads: &[(&EncryptedMediaUpload, &str)],
@@ -1366,65 +1575,47 @@ impl MarmotEngine {
         if uploads.is_empty() {
             return Err(Error::Media("no media uploads for message".into()));
         }
-        let _mls = self.mls_write();
-        self.create_media_event_multi_inner(group_id, uploads, caption, reply)
+        let imetas: Vec<Tag> = uploads
+            .iter()
+            .map(|&(upload, url)| media_crypto::create_imeta_tag(upload, url))
+            .collect();
+        self.create_app_event(group_id, caption, imetas, reply)
+            .await
     }
 
-    /// Media variant of [`Self::create_and_process_text_message`]: create and
-    /// locally process under one MLS write guard.
-    pub fn create_and_process_media_event_multi(
+    pub async fn create_and_process_media_event_multi(
         &self,
         group_id: &GroupId,
         uploads: &[(&EncryptedMediaUpload, &str)],
         caption: &str,
     ) -> Result<(Event, Incoming)> {
-        if uploads.is_empty() {
-            return Err(Error::Media("no media uploads for message".into()));
-        }
-        let _mls = self.mls_write();
-        let event = self.create_media_event_multi_inner(group_id, uploads, caption, None)?;
-        let incoming = self.process_group_message(&event)?;
+        let event = self
+            .create_media_event_multi(group_id, uploads, caption)
+            .await?;
+        let incoming = self
+            .lookup_chat(&event.id)
+            .map(Incoming::Message)
+            .unwrap_or(Incoming::None);
         Ok((event, incoming))
     }
 
-    pub fn create_and_process_media_event_multi_with_reply(
+    pub async fn create_and_process_media_event_multi_with_reply(
         &self,
         group_id: &GroupId,
         uploads: &[(&EncryptedMediaUpload, &str)],
         caption: &str,
         reply: Option<&ReplyTo>,
     ) -> Result<(Event, Incoming)> {
-        if uploads.is_empty() {
-            return Err(Error::Media("no media uploads for message".into()));
-        }
-        let _mls = self.mls_write();
-        let event = self.create_media_event_multi_inner(group_id, uploads, caption, reply)?;
-        let incoming = overlay_reply_preview(self.process_group_message(&event)?, reply);
+        let event = self
+            .create_media_event_multi_with_reply(group_id, uploads, caption, reply)
+            .await?;
+        let incoming = overlay_reply_preview(
+            self.lookup_chat(&event.id)
+                .map(Incoming::Message)
+                .unwrap_or(Incoming::None),
+            reply,
+        );
         Ok((event, incoming))
-    }
-
-    /// Requires the caller to hold the MLS write guard.
-    fn create_media_event_multi_inner(
-        &self,
-        group_id: &GroupId,
-        uploads: &[(&EncryptedMediaUpload, &str)],
-        caption: &str,
-        reply: Option<&ReplyTo>,
-    ) -> Result<Event> {
-        let event = dispatch!(&self.storage, |mdk| {
-            // One imeta tag per attachment, in send order. A fresh media_manager
-            // per item mirrors the single-item path exactly.
-            let mut imetas = Vec::with_capacity(uploads.len());
-            for &(upload, url) in uploads {
-                let tag = mdk
-                    .media_manager(group_id.clone())
-                    .create_imeta_tag(upload, url);
-                imetas.push(tag);
-            }
-            let rumor = self.kind9_rumor(caption, imetas, reply)?;
-            mdk.create_message(group_id, rumor, None)
-        })?;
-        Ok(event)
     }
 
     fn kind9_rumor(
@@ -1444,50 +1635,56 @@ impl MarmotEngine {
             .build(self.identity.public_key()))
     }
 
-    /// Find the `MediaReference` for `url` among `group_id`'s stored messages and
-    /// decrypt the downloaded `ciphertext` with it. Verifies the original hash.
     pub fn decrypt_media_by_url(
         &self,
         group_id: &GroupId,
         url: &str,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        dispatch!(&self.storage, |mdk| {
-            let mgr = mdk.media_manager(group_id.clone());
-            for m in mdk.get_messages(group_id, None)? {
-                for tag in m.tags.iter() {
-                    if tag.kind() == TagKind::Custom("imeta".into()) {
-                        if let Ok(r) = mgr.parse_imeta_tag(tag) {
-                            if r.url == url {
-                                return mgr
-                                    .decrypt_from_download(ciphertext, &r)
-                                    .map_err(|e| Error::Media(e.to_string()));
-                            }
-                        }
+        let secret = self.media_exporter_secret(group_id)?;
+        let msgs = self.messages(group_id)?;
+        for m in msgs {
+            for media in &m.media {
+                if media.url != url {
+                    continue;
+                }
+                if let (Some(original_hash), Some(nonce)) = (media.original_hash, media.nonce) {
+                    let reference = MediaReference {
+                        url: media.url.clone(),
+                        original_hash,
+                        mime_type: media.mime_type.clone(),
+                        filename: media.filename.clone(),
+                        dimensions: match (media.width, media.height) {
+                            (Some(w), Some(h)) => Some((w, h)),
+                            _ => None,
+                        },
+                        duration_ms: media.duration_ms,
+                        waveform: None,
+                        scheme_version: media_crypto::DEFAULT_SCHEME_VERSION.to_owned(),
+                        nonce,
+                    };
+                    return media_crypto::decrypt_from_download(&secret, ciphertext, &reference);
+                }
+            }
+            for tag in rumor_imeta_from_media(&m) {
+                if let Ok(r) = media_crypto::parse_imeta_tag(&tag) {
+                    if r.url == url {
+                        return media_crypto::decrypt_from_download(&secret, ciphertext, &r);
                     }
                 }
             }
-            Err(Error::Media(format!("no media reference for url {url}")))
-        })
+        }
+        Err(Error::Media(format!("no media reference for url {url}")))
     }
 
-    /// Parse the `imeta` tags on a message into display-ready [`MediaRef`]s.
-    fn parse_media_refs(&self, group_id: &GroupId, tags: &Tags) -> Vec<MediaRef> {
-        dispatch!(&self.storage, |mdk| {
-            let mgr = mdk.media_manager(group_id.clone());
-            tags.iter()
-                .filter(|t| t.kind() == TagKind::Custom("imeta".into()))
-                .filter_map(|t| mgr.parse_imeta_tag(t).ok())
-                .map(|r| MediaRef::from(&r))
-                .collect()
-        })
+    fn parse_media_refs(&self, tags: &Tags) -> Vec<MediaRef> {
+        tags.iter()
+            .filter(|t| t.kind() == TagKind::Custom("imeta".into()))
+            .filter_map(|t| media_crypto::parse_imeta_tag(t).ok())
+            .map(|r| MediaRef::from(&r))
+            .collect()
     }
 
-    /// Process any incoming Marmot-relevant event:
-    /// - kind 1059 gift wrap → unwrap; if it holds a kind-444 welcome, direct
-    ///   1:1 welcomes are auto-accepted for compatibility and group welcomes are
-    ///   stored pending for explicit accept/decline UI.
-    /// - kind 445 group message → decrypt/apply.
     pub async fn process_incoming(&self, event: &Event) -> Result<Incoming> {
         match event.kind {
             Kind::GiftWrap => {
@@ -1496,236 +1693,348 @@ impl MarmotEngine {
                 {
                     return self.handle_join_request_rumor(&unwrapped.sender, &unwrapped.rumor);
                 }
-                if unwrapped.rumor.kind != Kind::MlsWelcome {
+                if unwrapped.rumor.kind != Kind::MlsWelcome
+                    && unwrapped.rumor.kind != Kind::Custom(KIND_MARMOT_WELCOME_RUMOR)
+                {
                     return Ok(Incoming::None);
                 }
-                // Taken after the gift-wrap unwrap await: the lock must never
-                // span an await, only the synchronous MLS mutation below.
-                let _mls = self.mls_write();
-                let welcome = dispatch!(&self.storage, |mdk| mdk
-                    .process_welcome(&event.id, &unwrapped.rumor))?;
-                // A re-delivered wrapper returns the STORED welcome, which may
-                // already be Accepted or Declined — `process_welcome` is
-                // idempotent. Gating one of those can `decline_welcome` an
-                // ACCEPTED welcome, which flips its group Inactive and makes a
-                // live conversation vanish. Only a genuinely pending welcome
-                // may be gated.
-                if welcome.state != welcome_types::WelcomeState::Pending {
-                    return match welcome.state {
-                        welcome_types::WelcomeState::Accepted => {
-                            Ok(Incoming::GroupUpdated(welcome.mls_group_id))
+                self.handle_welcome_gift_wrap(event, &unwrapped).await
+            }
+            Kind::MlsGroupMessage => self.ingest_event(event, None).await,
+            _ => Ok(Incoming::None),
+        }
+    }
+
+    /// Decide park/drop/auto-accept from the unwrapped rumor *before* MDK
+    /// `ingest()`, which auto-joins. Parked invites keep the original wrapper
+    /// so [`Self::accept_group_invite`] can ingest it later.
+    async fn handle_welcome_gift_wrap(
+        &self,
+        wrapper: &Event,
+        unwrapped: &UnwrappedGift,
+    ) -> Result<Incoming> {
+        if let Some(existing) = self.parked_for_wrapper(&wrapper.id) {
+            return Ok(Incoming::GroupInvitePending(existing.group_id));
+        }
+        let welcomer = unwrapped.sender;
+        let meta = welcome_rumor_meta(&unwrapped.rumor);
+        // Unknown size (White Noise / no `members` tag) is treated as a
+        // 2-member DM so the auto-accept budget and flood caps still apply.
+        let member_count = meta.member_count.unwrap_or(2);
+        let now_secs = unix_now_secs();
+        let decision = if member_count <= 2 {
+            self.dm_welcome_decision(&unwrapped.sender, &welcomer, now_secs)
+        } else {
+            self.park_or_drop_welcome(&welcomer)
+        };
+        match decision {
+            DmWelcomeDecision::Drop => Ok(Incoming::None),
+            DmWelcomeDecision::Park => {
+                let invite = self.parked_invite_from_wrapper(wrapper, unwrapped, &meta);
+                let group_id = invite.group_id.clone();
+                self.park_invite(invite);
+                Ok(Incoming::GroupInvitePending(group_id))
+            }
+            DmWelcomeDecision::AutoAccept { consume_budget } => {
+                let reserved = !consume_budget
+                    || match self.reserve_dm_autoaccept(now_secs) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                welcomer = %welcomer,
+                                "cannot persist the DM auto-accept budget; parking this welcome"
+                            );
+                            false
                         }
-                        welcome_types::WelcomeState::Declined => {
-                            // Re-delivery is the only retry a half-finished
-                            // `decline_and_purge_welcome` ever gets: the
-                            // decline committed, the kill (or a transient
-                            // delete error) left the flood group's rows on
-                            // disk, and the sync cursor advanced past the
-                            // wrapper. Best-effort — the Active guard inside
-                            // keeps a live group undeletable.
-                            if let Err(e) = self.purge_declined_welcome_group(&welcome) {
-                                tracing::warn!(
-                                    error = %e,
-                                    welcomer = %welcome.welcomer,
-                                    "retry purge of a declined welcome's group failed"
-                                );
-                            }
-                            Ok(Incoming::None)
+                    };
+                if !reserved {
+                    let invite = self.parked_invite_from_wrapper(wrapper, unwrapped, &meta);
+                    let group_id = invite.group_id.clone();
+                    self.park_invite(invite);
+                    return Ok(Incoming::GroupInvitePending(group_id));
+                }
+                match self.ingest_event(wrapper, Some(unwrapped.sender)).await {
+                    Ok(Incoming::GroupUpdated(id)) => Ok(Incoming::GroupUpdated(id)),
+                    Ok(incoming) => {
+                        // Duplicate re-delivery of an already-joined welcome
+                        // must not refund the slot.
+                        if consume_budget && matches!(incoming, Incoming::Failed) {
+                            self.release_dm_autoaccept(now_secs);
                         }
-                        _ => Ok(Incoming::None),
+                        Ok(incoming)
+                    }
+                    Err(e) => {
+                        if consume_budget {
+                            self.release_dm_autoaccept(now_secs);
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    fn parked_invite_from_wrapper(
+        &self,
+        wrapper: &Event,
+        unwrapped: &UnwrappedGift,
+        meta: &WelcomeRumorMeta,
+    ) -> GroupInvite {
+        let group_id = parked_group_id_for_wrapper(wrapper, meta);
+        GroupInvite {
+            id: wrapper.id,
+            wrapper_id: wrapper.id,
+            group_id,
+            group_name: meta.name.clone(),
+            group_description: meta.description.clone(),
+            welcomer: unwrapped.sender,
+            member_count: meta.member_count.unwrap_or(2),
+            relays: meta.relays.clone(),
+            wrapper_json: wrapper.as_json(),
+        }
+    }
+
+    fn parked_for_wrapper(&self, wrapper_id: &EventId) -> Option<GroupInvite> {
+        self.parked_invites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(wrapper_id)
+            .cloned()
+    }
+
+    async fn ingest_event(
+        &self,
+        event: &Event,
+        _seal_sender: Option<PublicKey>,
+    ) -> Result<Incoming> {
+        let msg = match nostr_event_to_transport(event) {
+            Ok(msg) => msg,
+            Err(_) => return Ok(Incoming::None),
+        };
+        let mut lease = self.lease_session().await;
+        let ingested = lease.get_mut().ingest(msg).await?;
+        let outcome = ingested.outcome;
+        let mut effects = ingested.effects;
+        let drained = lease.get_mut().drain();
+        effects.events.extend(drained.events);
+        effects.publish.extend(drained.publish);
+        drop(lease);
+
+        match outcome {
+            IngestOutcome::Ignored {
+                category: InputRejectionCategory::OwnEcho | InputRejectionCategory::Duplicate,
+            } => {
+                if let Some(msg) = self.lookup_chat(&event.id) {
+                    return Ok(Incoming::Message(msg));
+                }
+                return Ok(Incoming::None);
+            }
+            IngestOutcome::Ignored { .. } => return Ok(Incoming::None),
+            IngestOutcome::Rejected { .. } | IngestOutcome::Stale { .. } => {
+                return Ok(Incoming::Failed)
+            }
+            IngestOutcome::LocalState { .. } => return Ok(Incoming::None),
+            _ => {}
+        }
+
+        if let Some(update) = self.try_membership_from_effects(&effects)? {
+            return Ok(Incoming::GroupProposal(update));
+        }
+
+        let mut last = Incoming::None;
+        for ev in effects.events {
+            match ev {
+                GroupEvent::MessageReceived {
+                    group_id,
+                    message_id,
+                    sender,
+                    payload,
+                    ..
+                } => {
+                    // Persist kind-9 chat rows only. `chat_from_payload` already
+                    // returns None for other Marmot app-event kinds.
+                    if let Some(msg) =
+                        self.chat_from_payload(&group_id, &message_id, &sender, &payload)
+                    {
+                        self.store_chat(msg.clone());
+                        last = Incoming::Message(msg);
+                    }
+                }
+                GroupEvent::GroupJoined { group_id, .. } => {
+                    last = if self.is_dropped(&group_id) {
+                        Incoming::None
+                    } else {
+                        Incoming::GroupUpdated(group_id)
                     };
                 }
-                if welcome.member_count <= 2 {
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    match self.dm_welcome_decision(&unwrapped.sender, &welcome, now_secs) {
-                        DmWelcomeDecision::AutoAccept { consume_budget } => {
-                            // Reserve the slot durably BEFORE accepting. If we
-                            // cannot, fail closed: fall through to the parked
-                            // path so the user still sees the invite, rather
-                            // than granting an accept we cannot account for.
-                            let reserved = !consume_budget
-                                || match self.reserve_dm_autoaccept(now_secs) {
-                                    Ok(()) => true,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            welcomer = %welcome.welcomer,
-                                            "cannot persist the DM auto-accept budget; \
-                                             parking this welcome instead of auto-accepting"
-                                        );
-                                        false
-                                    }
-                                };
-                            if reserved {
-                                match dispatch!(&self.storage, |mdk| mdk
-                                    .accept_welcome(&welcome))
-                                {
-                                    Ok(()) => {
-                                        return Ok(Incoming::GroupUpdated(welcome.mls_group_id))
-                                    }
-                                    Err(e) => {
-                                        // Give the slot back: a welcome that
-                                        // fails MLS processing must not eat a
-                                        // real first contact's budget.
-                                        if consume_budget {
-                                            self.release_dm_autoaccept(now_secs);
-                                        }
-                                        return Err(e.into());
-                                    }
-                                }
-                            }
-                        }
-                        DmWelcomeDecision::Park => {}
-                        DmWelcomeDecision::Drop => {
-                            // Flood ceiling: decline locally so it neither
-                            // surfaces nor stays pending, then reclaim the rows
-                            // it created so the flood costs no durable storage.
-                            // The sender learns nothing (no network here).
-                            self.decline_and_purge_welcome(&welcome)?;
-                            return Ok(Incoming::None);
-                        }
-                    }
+                GroupEvent::GroupCreated { group_id }
+                | GroupEvent::EpochChanged { group_id, .. }
+                | GroupEvent::GroupStateChanged { group_id, .. } => {
+                    last = Incoming::GroupUpdated(group_id);
                 }
-                match welcome.state {
-                    welcome_types::WelcomeState::Pending => {
-                        // The parked-invite ceiling applies to every size, or
-                        // a spammer just mints 3-member groups instead (#419
-                        // review round 2).
-                        if matches!(self.park_or_drop_welcome(&welcome), DmWelcomeDecision::Drop) {
-                            self.decline_and_purge_welcome(&welcome)?;
-                            return Ok(Incoming::None);
-                        }
-                        Ok(Incoming::GroupInvitePending(welcome.mls_group_id))
-                    }
-                    welcome_types::WelcomeState::Accepted => {
-                        Ok(Incoming::GroupUpdated(welcome.mls_group_id))
-                    }
-                    welcome_types::WelcomeState::Declined
-                    | welcome_types::WelcomeState::Ignored => Ok(Incoming::None),
-                }
+                _ => {}
             }
-            Kind::MlsGroupMessage => {
-                let _mls = self.mls_write();
-                self.process_group_message(event)
-            }
-            _ => Ok(Incoming::None),
+        }
+        Ok(last)
+    }
+
+    fn try_membership_from_effects(
+        &self,
+        effects: &SessionEffects,
+    ) -> Result<Option<GroupMembershipUpdate>> {
+        let Some(work) = effects.publish.first() else {
+            return Ok(None);
+        };
+        let group_id = match work {
+            PublishWork::GroupEvolution { msg, .. }
+            | PublishWork::Proposal { msg, .. }
+            | PublishWork::AutoPublish { msg, .. } => transport_group_id(msg),
+            _ => None,
+        };
+        let Some(group_id) = group_id else {
+            return Ok(None);
+        };
+        match self.effects_to_membership_update(&group_id, effects.clone(), false) {
+            Ok(update) => Ok(Some(update)),
+            Err(_) => Ok(None),
         }
     }
 
-    /// Process a kind-445 group message into the local store. Synchronous MLS
-    /// mutation — requires the caller to hold the MLS write guard.
-    fn process_group_message(&self, event: &Event) -> Result<Incoming> {
-        match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
-            MessageProcessingResult::ApplicationMessage(msg) => {
-                // Only kind-9 chat rumors are chat messages. MDK also delivers
-                // other application kinds (reactions/deletes from White Noise
-                // peers) which `messages()` / `messages_page()` filter out of
-                // the transcript — surfacing them as `Incoming::Message` would
-                // index them, count them as unread and ring a notification for
-                // a row no host can ever render. MDK has already persisted the
-                // rumor, so future features can still read it from storage.
-                if msg.kind.as_u16() != CHAT_RUMOR_KIND {
-                    return Ok(Incoming::None);
-                }
-                Ok(Incoming::Message(self.to_chat_message(msg)))
-            }
-            MessageProcessingResult::Commit { mls_group_id }
-            | MessageProcessingResult::PendingProposal { mls_group_id } => {
-                Ok(Incoming::GroupUpdated(mls_group_id))
-            }
-            MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
-                Self::to_membership_update(update, Vec::new(), true),
-            )),
-            // MDK persists a Failed processing record on the first
-            // failure and short-circuits every re-delivery with the
-            // same result, so these are terminal for the sync layer.
-            MessageProcessingResult::Unprocessable { .. }
-            | MessageProcessingResult::PreviouslyFailed => Ok(Incoming::Failed),
-            _ => Ok(Incoming::None),
-        }
-    }
-
-    /// All active groups this identity belongs to. Pending group invites are
-    /// surfaced separately via [`Self::pending_group_invites`].
-    /// Count of stored group rows in EVERY state, not just Active.
-    ///
-    /// Diagnostics and the #419 storage-DoS tests: `groups()` filters to
-    /// Active, so it cannot see the Declined/Inactive rows a welcome flood
-    /// leaves behind — which is exactly the growth that has to be bounded.
     pub fn stored_group_count(&self) -> Result<usize> {
-        Ok(dispatch!(&self.storage, |mdk| mdk.get_groups())?.len())
+        self.with_session_mut(|session| {
+            let mut ids = session.live_group_ids()?;
+            ids.extend(session.unhydrated_group_ids());
+            ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            ids.dedup();
+            for id in &ids {
+                let _ = session.ensure_group_hydrated(id);
+            }
+            let dropped = self
+                .dropped_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(ids.iter().filter(|id| !dropped.contains(*id)).count())
+        })
     }
 
-    pub fn groups(&self) -> Result<Vec<group_types::Group>> {
-        Ok(dispatch!(&self.storage, |mdk| mdk.get_groups())?
-            .into_iter()
-            .filter(|g| g.state == group_types::GroupState::Active)
-            .collect())
+    pub fn groups(&self) -> Result<Vec<Group>> {
+        self.with_session_mut(|session| {
+            let mut ids = session.live_group_ids()?;
+            ids.extend(session.unhydrated_group_ids());
+            ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+            ids.dedup();
+            let parked: HashSet<GroupId> = self
+                .parked_invites
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .map(|i| i.group_id.clone())
+                .collect();
+            let dropped = self
+                .dropped_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut groups = Vec::new();
+            for id in ids {
+                if parked.contains(&id) || dropped.contains(&id) {
+                    continue;
+                }
+                if session.ensure_group_hydrated(&id)? {
+                    let Ok(g) = session.group_record(&id) else {
+                        continue;
+                    };
+                    if g.removed || g.disbanded.is_some() || g.unrecoverable {
+                        continue;
+                    }
+                    groups.push(g);
+                }
+            }
+            Ok(groups)
+        })
     }
 
-    /// Pending multi-member welcomes waiting for user acceptance.
     pub fn pending_group_invites(&self) -> Result<Vec<GroupInvite>> {
-        let welcomes = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))?;
-        // No member-count filter: 2-member welcomes normally auto-accept, but
-        // an unknown-sender welcome past the rate limit (#419) parks here and
-        // must stay visible for explicit accept/decline.
-        //
-        // INVARIANT (do not widen the kind-445 fetch to pending groups): the
-        // 445 subscription/fetch filters are built from ACTIVE groups only, so
-        // a pending group's messages are never handed to MDK — which is what
-        // keeps them retrievable. MDK records a terminal Failed for a message
-        // it cannot process; if pending groups' 445s were fetched before
-        // accept, the opening message of every parked first contact would be
-        // permanently undecryptable. Accept runs a full backfill instead.
-        Ok(welcomes.into_iter().map(Self::to_group_invite).collect())
+        let parked = self
+            .parked_invites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(parked.values().cloned().collect())
     }
 
-    /// Accept a pending group invite by its kind-444 welcome event id.
-    pub fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
-        let _mls = self.mls_write();
-        let welcome = dispatch!(&self.storage, |mdk| mdk.get_welcome(welcome_id))?
-            .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
-        let group_id = welcome.mls_group_id.clone();
-        dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
-        Ok(group_id)
+    pub async fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
+        let invite = self
+            .parked_invites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(welcome_id);
+        let Some(invite) = invite else {
+            return Err(Error::InvalidInput(format!(
+                "unknown group invite {welcome_id}"
+            )));
+        };
+        self.persist_parked();
+        if invite.wrapper_json.is_empty() {
+            self.park_invite(invite);
+            return Err(Error::InvalidInput(format!(
+                "parked group invite {welcome_id} is missing wrapper event"
+            )));
+        }
+        let wrapper = match Event::from_json(&invite.wrapper_json) {
+            Ok(event) => event,
+            Err(e) => {
+                self.park_invite(invite);
+                return Err(Error::InvalidInput(format!(
+                    "parked group invite {welcome_id} wrapper is not a nostr event: {e}"
+                )));
+            }
+        };
+        match self.ingest_event(&wrapper, Some(invite.welcomer)).await {
+            Ok(Incoming::GroupUpdated(group_id)) => Ok(group_id),
+            Ok(other) => {
+                self.park_invite(invite);
+                Err(Error::Mdk(format!(
+                    "accepting parked welcome did not join a group: {other:?}"
+                )))
+            }
+            Err(e) => {
+                self.park_invite(invite);
+                Err(e)
+            }
+        }
     }
 
-    /// Decline a pending group invite by its kind-444 welcome event id.
-    pub fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
-        let _mls = self.mls_write();
-        let welcome = dispatch!(&self.storage, |mdk| mdk.get_welcome(welcome_id))?
-            .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
-        dispatch!(&self.storage, |mdk| mdk.decline_welcome(&welcome))?;
+    pub async fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
+        let invite = self
+            .parked_invites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(welcome_id);
+        let Some(invite) = invite else {
+            return Err(Error::InvalidInput(format!(
+                "unknown group invite {welcome_id}"
+            )));
+        };
+        self.persist_parked();
+        // Parked welcomes are not ingested, so there is no MDK group to leave.
+        // Keep the overlay drop so a later auto-accept of the same MLS id
+        // (if we ever learn it) cannot silently surface.
+        self.drop_group(&invite.group_id);
         Ok(())
     }
 
-    // ── Invite link join requests ──────────────────────────────────────
-
-    /// `sender` is the seal pubkey from the gift wrap, the only authenticated
-    /// identity in a NIP-59 envelope. The rumor body is written by whoever holds
-    /// the invite link, so `requester_npub` inside it is not evidence of who is
-    /// asking. An admin approving a join request must be shown the seal author.
     fn handle_join_request_rumor(
         &self,
         sender: &PublicKey,
         rumor: &UnsignedEvent,
     ) -> Result<Incoming> {
-        // Every malformed-body exit returns Ok(Incoming::None), never Err.
-        // Neither Error::Json nor Error::InvalidInput is terminal per
-        // `is_terminal_marmot_processing_error`, so an Err here would skip
-        // `mark_sync_event_processed` and leave the event to be refetched and
-        // re-fail on every sync forever. One junk rumor from a stranger is
-        // enough to pin the cursor, so unparseable input must be discarded.
         let Ok(payload) = crate::invite_link::parse_join_request_rumor(rumor) else {
             return Ok(Incoming::None);
         };
         let Ok(group_id_bytes) = hex::decode(&payload.group_id) else {
             return Ok(Incoming::None);
         };
-        let group_id = GroupId::from_slice(&group_id_bytes);
+        let group_id = GroupId::new(group_id_bytes);
 
         let Ok(secret_hash_bytes) = hex::decode(&payload.invite_secret_hash) else {
             return Ok(Incoming::None);
@@ -1737,12 +2046,6 @@ impl MarmotEngine {
             return Ok(Incoming::None);
         }
 
-        // Drop the request outright when the body disagrees with the seal
-        // author rather than silently rewriting it: an honest client always
-        // sets its own npub, so a mismatch is a spoofing attempt, not drift.
-        // `parse` (not `from_bech32`) matches how invite_link.rs decodes this
-        // same field, so a hex-encoded key from a non-Sonar client compares
-        // rather than erroring out.
         let Ok(claimed) = PublicKey::parse(&payload.requester_npub) else {
             return Ok(Incoming::None);
         };
@@ -1775,52 +2078,25 @@ impl MarmotEngine {
         Ok(Incoming::JoinRequest(request))
     }
 
-    /// Gift-wrap an arbitrary rumor for a receiver (NIP-59, kind 1059).
-    /// Uses `Timestamp::now()` to avoid relay `since` filter issues.
     pub async fn gift_wrap_rumor(
         &self,
         receiver: &PublicKey,
         rumor: UnsignedEvent,
     ) -> Result<Event> {
-        let keys = self.identity.keys();
-        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
-            .await?
-            .sign(keys)
-            .await?;
-        let ephemeral = Keys::generate();
-        let content = nip44::encrypt(
-            ephemeral.secret_key(),
-            receiver,
-            seal.as_json(),
-            nip44::Version::default(),
-        )?;
-        let wrapped = EventBuilder::new(Kind::GiftWrap, content)
-            .tags([Tag::public_key(*receiver)])
-            .custom_created_at(Timestamp::now())
-            .sign_with_keys(&ephemeral)?;
-        Ok(wrapped)
+        gift_wrap_with_current_timestamp_async(self.identity.keys(), receiver, rumor).await
     }
 
-    /// Decrypted message history for a group (storage-backed).
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
-        let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, None))?;
-        let mut mapped: Vec<ChatMessage> = msgs
-            .into_iter()
-            // Only surface real chat messages (kind-9). MDK's store ALSO keeps
-            // non-chat entries (group-membership / commit / proposal / reaction
-            // kinds) which carry no chat text — without this filter they render
-            // as empty message bubbles in the UI.
-            .filter(|m| m.kind.as_u16() == CHAT_RUMOR_KIND)
-            .map(|m| self.to_chat_message(m))
-            .collect();
+        let mut mapped = self.transcript_for(group_id);
+        mapped.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         hydrate_page_reply_previews(&mut mapped);
         Ok(mapped)
     }
 
-    /// Bounded decrypted chat-message window for a group, newest window first
-    /// before caller-side display sorting. Offset counts chat messages, not raw
-    /// MDK storage rows, because MDK stores commits/proposals beside kind-9
-    /// application messages.
     pub fn messages_page(
         &self,
         group_id: &GroupId,
@@ -1830,62 +2106,12 @@ impl MarmotEngine {
         if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let raw_batch = limit.saturating_mul(4).clamp(32, 500);
-        let mut raw_offset = 0usize;
-        let mut raw_scanned = 0usize;
-        let mut chat_skipped = 0usize;
-        let mut page_messages = Vec::with_capacity(limit);
-
-        while page_messages.len() < limit && raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
-            let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
-            let batch_limit = raw_batch.min(remaining_scan);
-            let page = Pagination::with_sort_order(
-                Some(batch_limit),
-                Some(raw_offset),
-                MessageSortOrder::CreatedAtFirst,
-            );
-            let raw_msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page)))?;
-            if raw_msgs.is_empty() {
-                break;
-            }
-
-            let raw_len = raw_msgs.len();
-            raw_scanned += raw_len;
-            raw_offset += raw_len;
-            for msg in raw_msgs {
-                if msg.kind.as_u16() != CHAT_RUMOR_KIND {
-                    continue;
-                }
-                if chat_skipped < offset {
-                    chat_skipped += 1;
-                    continue;
-                }
-                page_messages.push(self.to_chat_message(msg));
-                if page_messages.len() >= limit {
-                    break;
-                }
-            }
-
-            if raw_len < batch_limit {
-                break;
-            }
-        }
-
-        hydrate_page_reply_previews(&mut page_messages);
-        Ok(page_messages)
+        let mut msgs = self.messages(group_id)?;
+        msgs.sort_by(compare_message_cursor_desc);
+        let page: Vec<ChatMessage> = msgs.into_iter().skip(offset).take(limit).collect();
+        Ok(page)
     }
 
-    /// Cursor-based transcript page: return up to `limit` chat messages strictly
-    /// before `(before_secs, before_id)` in the canonical
-    /// `(created_at DESC, event_id DESC)` transcript order. When the cursor is
-    /// `None`, returns the newest messages (first page).
-    ///
-    /// MDK's created-at-first storage order uses `processed_at` as its secondary
-    /// key. We therefore scan through the complete created-at second containing
-    /// the page boundary and re-sort that bounded candidate set by event id. This
-    /// prevents messages created in the same second from moving between pages
-    /// according to local receive order.
     pub fn messages_cursor_page(
         &self,
         group_id: &GroupId,
@@ -1896,137 +2122,19 @@ impl MarmotEngine {
         if limit == 0 {
             return Ok(Vec::new());
         }
-
-        let raw_batch = limit.saturating_mul(4).clamp(32, 500);
-        // Deep-history cursor pages must not walk every raw row from the
-        // newest one: created_at is monotonic non-increasing in this order,
-        // so binary-search the first row at/below the cursor second and scan
-        // forward from there. Without this, paging near the origin of a
-        // conversation with more than MESSAGE_PAGE_RAW_SCAN_LIMIT raw rows
-        // between the live edge and the cursor failed outright (and every
-        // top-edge attempt re-scanned thousands of rows), which surfaced as
-        // stuck/laggy backscroll with no network (e.g. airplane mode).
-        let mut raw_offset = match before_secs {
-            Some(cursor_secs) => {
-                let first = Pagination::with_sort_order(
-                    Some(1),
-                    Some(0),
-                    MessageSortOrder::CreatedAtFirst,
-                );
-                let newest = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(first)))?;
-                match newest.first() {
-                    None => 0,
-                    // Everything retained is already at/below the cursor.
-                    Some(m) if m.created_at.as_secs() <= cursor_secs => 0,
-                    Some(_) => {
-                        // lo (=0) is known to be newer than the cursor. Double
-                        // hi until it reaches a row at/below the cursor second
-                        // or runs past the end of storage.
-                        let mut lo = 0usize;
-                        let mut hi = raw_batch;
-                        loop {
-                            let probe = Pagination::with_sort_order(
-                                Some(1),
-                                Some(hi),
-                                MessageSortOrder::CreatedAtFirst,
-                            );
-                            let row = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(probe)))?;
-                            match row.first() {
-                                Some(m) if m.created_at.as_secs() > cursor_secs => {
-                                    lo = hi;
-                                    hi = hi.saturating_mul(2);
-                                }
-                                _ => break,
-                            }
-                        }
-                        while lo + 1 < hi {
-                            let mid = lo + (hi - lo) / 2;
-                            let probe = Pagination::with_sort_order(
-                                Some(1),
-                                Some(mid),
-                                MessageSortOrder::CreatedAtFirst,
-                            );
-                            let row = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(probe)))?;
-                            match row.first() {
-                                Some(m) if m.created_at.as_secs() > cursor_secs => lo = mid,
-                                _ => hi = mid,
-                            }
-                        }
-                        hi
-                    }
-                }
-            }
-            None => 0,
-        };
-        let mut raw_scanned = 0usize;
-        let mut candidates = Vec::with_capacity(limit);
-        // Once `limit` eligible chat rows have been seen, keep scanning until
-        // storage advances to an older second. That captures every possible ID
-        // which can sort into the page at the boundary timestamp.
-        let mut boundary_secs = None;
-        let mut scan_complete = false;
-
-        'scan: while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
-            let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
-            let batch_limit = raw_batch.min(remaining_scan);
-            let page = Pagination::with_sort_order(
-                Some(batch_limit),
-                Some(raw_offset),
-                MessageSortOrder::CreatedAtFirst,
-            );
-            let raw_msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page)))?;
-            if raw_msgs.is_empty() {
-                scan_complete = true;
-                break;
-            }
-
-            let raw_len = raw_msgs.len();
-            raw_scanned += raw_len;
-            raw_offset += raw_len;
-            for msg in raw_msgs {
-                let msg_secs = msg.created_at.as_secs();
-                if boundary_secs.is_some_and(|boundary| msg_secs < boundary) {
-                    scan_complete = true;
-                    break 'scan;
-                }
-                if msg.kind.as_u16() != CHAT_RUMOR_KIND
-                    || !is_before_message_cursor(msg_secs, &msg.id, before_secs, before_id)
-                {
-                    continue;
-                }
-                candidates.push(self.to_chat_message(msg));
-                if candidates.len() == limit {
-                    boundary_secs = Some(msg_secs);
-                }
-            }
-
-            if raw_len < batch_limit {
-                scan_complete = true;
-                break;
-            }
-        }
-
-        // A page cannot be deterministic if the safety cap stops before the
-        // requested window is complete: an unscanned event ID could sort ahead
-        // of a selected one. Fail explicitly instead of returning a page whose
-        // membership depends on MDK's processed-at tie ordering. This requires
-        // at least 10,000 raw rows in the relevant window and is pathological.
-        if !scan_complete {
-            return Err(Error::Storage(format!(
-                "cursor page exceeds bounded scan of {MESSAGE_PAGE_RAW_SCAN_LIMIT} rows"
-            )));
-        }
-
+        let mut candidates: Vec<ChatMessage> = self
+            .transcript_for(group_id)
+            .into_iter()
+            .filter(|m| {
+                is_before_message_cursor(m.created_at.as_secs(), &m.id, before_secs, before_id)
+            })
+            .collect();
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
         hydrate_page_reply_previews(&mut candidates);
         Ok(candidates)
     }
 
-    /// Latest local transcript windows for the most recent groups. This is the
-    /// Signal-style chat-list hydration path: rank conversations by local DB
-    /// recency, return only a small window for the newest groups, and leave
-    /// relay sync completely out of first paint.
     pub fn recent_message_pages(
         &self,
         group_limit: usize,
@@ -2035,20 +2143,18 @@ impl MarmotEngine {
         if group_limit == 0 || page_limit == 0 {
             return Ok(Vec::new());
         }
-
         let mut pages = Vec::new();
         for group in self.groups()? {
-            let messages = self.messages_page(&group.mls_group_id, page_limit, 0)?;
+            let messages = self.messages_page(&group.id, page_limit, 0)?;
             let Some(latest_created_at) = messages.iter().map(|m| m.created_at).max() else {
                 continue;
             };
             pages.push(RecentMessagePage {
-                group_id: group.mls_group_id,
+                group_id: group.id,
                 latest_created_at,
                 messages,
             });
         }
-
         pages.sort_by(|a, b| {
             b.latest_created_at
                 .cmp(&a.latest_created_at)
@@ -2058,198 +2164,181 @@ impl MarmotEngine {
         Ok(pages)
     }
 
-    /// Members of a group.
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
-        Ok(dispatch!(&self.storage, |mdk| mdk.get_members(group_id))?
-            .into_iter()
-            .collect())
+        self.with_session(|session| {
+            let members = session.members(group_id)?;
+            Ok(members
+                .into_iter()
+                .filter_map(|m| PublicKey::from_slice(m.id.as_slice()).ok())
+                .collect())
+        })
     }
 
-    /// Unix-seconds timestamp of the NEWEST event stored across all groups (any
-    /// kind — membership/commit/chat). Used to detect whether the local store is
-    /// empty; restart relay catch-up uses [`Self::latest_remote_event_secs`] so
-    /// later local-only rows do not hide missed peer messages. 0 if empty/on
-    /// error.
     pub fn latest_message_secs(&self) -> u64 {
-        let groups = match self.groups() {
-            Ok(g) => g,
-            Err(_) => return 0,
-        };
-        let mut newest = 0u64;
-        for g in groups {
-            let msgs = match dispatch!(&self.storage, |mdk| mdk.get_messages(&g.mls_group_id, None))
-            {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            for m in msgs {
-                let t = m.created_at.as_secs();
-                if t > newest {
-                    newest = t;
-                }
-            }
-        }
-        newest
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .map(|m| m.created_at.as_secs())
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Unix-seconds timestamp of the newest recently stored event authored by
-    /// another participant. Relay catch-up uses this conservative local floor
-    /// so later local-only sends or status/bookkeeping rows cannot hide peer
-    /// messages that arrived while this device was offline. The scan is bounded
-    /// per group; if the only remote event is older than the bounded window,
-    /// this returns 0 and the background sync safely widens instead of blocking
-    /// startup on a full-history scan.
     pub fn latest_remote_event_secs(&self) -> u64 {
-        let groups = match self.groups() {
-            Ok(g) => g,
-            Err(_) => return 0,
-        };
-        let mut newest = 0u64;
         let me = self.identity.public_key();
-        for g in groups {
-            let mut raw_offset = 0usize;
-            let mut raw_scanned = 0usize;
-            while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
-                let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
-                let batch_limit = 500.min(remaining_scan);
-                let page = Pagination::with_sort_order(
-                    Some(batch_limit),
-                    Some(raw_offset),
-                    MessageSortOrder::CreatedAtFirst,
-                );
-                let msgs = match dispatch!(&self.storage, |mdk| {
-                    mdk.get_messages(&g.mls_group_id, Some(page))
-                }) {
-                    Ok(m) => m,
-                    Err(_) => break,
-                };
-                if msgs.is_empty() {
-                    break;
-                }
-
-                let raw_len = msgs.len();
-                raw_scanned += raw_len;
-                raw_offset += raw_len;
-                for m in msgs {
-                    if m.pubkey == me {
-                        continue;
-                    }
-                    let t = m.created_at.as_secs();
-                    if t > newest {
-                        newest = t;
-                    }
-                }
-                if raw_len < batch_limit {
-                    break;
-                }
-            }
-        }
-        newest
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .filter(|m| m.sender != me)
+            .map(|m| m.created_at.as_secs())
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Unix-seconds timestamp of the newest recently stored chat message in
-    /// `group_id` authored by another participant. Returns `None` when the
-    /// bounded scan finds no local remote chat rows; callers should treat that
-    /// as a conservative full-group repair floor.
     pub fn latest_remote_chat_message_secs(&self, group_id: &GroupId) -> Option<u64> {
         let me = self.identity.public_key();
-        let mut raw_offset = 0usize;
-        let mut raw_scanned = 0usize;
-        while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
-            let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
-            let batch_limit = 500.min(remaining_scan);
-            let page = Pagination::with_sort_order(
-                Some(batch_limit),
-                Some(raw_offset),
-                MessageSortOrder::CreatedAtFirst,
-            );
-            let msgs =
-                dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page))).ok()?;
-            if msgs.is_empty() {
-                return None;
-            }
-
-            let raw_len = msgs.len();
-            raw_scanned += raw_len;
-            raw_offset += raw_len;
-            for m in msgs {
-                if m.kind.as_u16() == CHAT_RUMOR_KIND && m.pubkey != me {
-                    return Some(m.created_at.as_secs());
-                }
-            }
-            if raw_len < batch_limit {
-                return None;
-            }
-        }
-        None
-    }
-
-    /// Delete ALL local state for a group: messages, processed-message records,
-    /// MLS tree state, epoch secrets, key material, relay links, proposals, and
-    /// snapshots. Local-only — no MLS proposal or Nostr event is published, so
-    /// the peer is NOT notified (this is "delete this chat from my device", like
-    /// deleting a conversation in Signal/iMessage). Idempotent.
-    pub fn delete_group(&self, group_id: &GroupId) -> Result<()> {
-        let _mls = self.mls_write();
-        Ok(dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?)
-    }
-
-    fn to_membership_update(
-        result: UpdateGroupResult,
-        member_pubkeys: Vec<PublicKey>,
-        requires_commit_merge: bool,
-    ) -> GroupMembershipUpdate {
-        let welcomes = result
-            .welcome_rumors
-            .unwrap_or_default()
+        self.transcript_for(group_id)
             .into_iter()
-            .zip(member_pubkeys)
-            .map(|(rumor, member)| (member, rumor))
+            .filter(|m| m.sender != me)
+            .map(|m| m.created_at.as_secs())
+            .max()
+    }
+
+    pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
+        self.drop_group(group_id);
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(group_id);
+        self.persist_transcript();
+        let _ = self.leave_group(group_id).await;
+        Ok(())
+    }
+
+    fn store_chat(&self, msg: ChatMessage) {
+        let mut transcript = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rows = transcript.entry(msg.group_id.clone()).or_default();
+        if rows.iter().any(|m| m.id == msg.id) {
+            return;
+        }
+        rows.push(msg);
+        drop(transcript);
+        self.persist_transcript();
+    }
+
+    fn lookup_chat(&self, id: &EventId) -> Option<ChatMessage> {
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .find(|m| m.id == *id)
+            .cloned()
+    }
+
+    fn transcript_for(&self, group_id: &GroupId) -> Vec<ChatMessage> {
+        self.transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(group_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn park_invite(&self, invite: GroupInvite) {
+        self.parked_invites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(invite.id, invite);
+        self.persist_parked();
+    }
+
+    fn drop_group(&self, group_id: &GroupId) {
+        self.dropped_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id.clone());
+        self.persist_dropped();
+    }
+
+    fn is_dropped(&self, group_id: &GroupId) -> bool {
+        self.dropped_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(group_id)
+    }
+
+    fn persist_parked(&self) {
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        let parked = self
+            .parked_invites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let values: Vec<&GroupInvite> = parked.values().collect();
+        let _ = atomic_write_json(&sidecar_named(path, PARKED_INVITES_FILE_SUFFIX), &values);
+    }
+
+    fn persist_dropped(&self) {
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        let dropped = self
+            .dropped_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids: Vec<String> = dropped.iter().map(|g| hex::encode(g.as_slice())).collect();
+        let _ = atomic_write_json(&sidecar_named(path, DROPPED_GROUPS_FILE_SUFFIX), &ids);
+    }
+
+    fn persist_transcript(&self) {
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        let transcript = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keyed: HashMap<String, Vec<ChatMessage>> = transcript
+            .iter()
+            .map(|(id, msgs)| (hex::encode(id.as_slice()), msgs.clone()))
             .collect();
-        GroupMembershipUpdate {
-            group_id: result.mls_group_id,
-            evolution_event: result.evolution_event,
-            welcomes,
-            requires_commit_merge,
-        }
+        let _ = atomic_write_json(&sidecar_named(path, TRANSCRIPT_FILE_SUFFIX), &keyed);
     }
 
-    fn to_group_invite(welcome: welcome_types::Welcome) -> GroupInvite {
-        GroupInvite {
-            id: welcome.id,
-            wrapper_id: welcome.wrapper_event_id,
-            group_id: welcome.mls_group_id,
-            group_name: welcome.group_name,
-            group_description: welcome.group_description,
-            welcomer: welcome.welcomer,
-            member_count: welcome.member_count,
-            relays: welcome.group_relays.into_iter().collect(),
+    fn chat_from_app_rumor(
+        &self,
+        group_id: &GroupId,
+        rumor: &UnsignedEvent,
+        event: &Event,
+        mine: bool,
+    ) -> Option<ChatMessage> {
+        if rumor.kind.as_u16() != CHAT_RUMOR_KIND {
+            return None;
         }
-    }
-
-    fn to_chat_message(&self, m: message_types::Message) -> ChatMessage {
-        let media = self.parse_media_refs(&m.mls_group_id, &m.tags);
-        let sticker_ref = m
+        let media = self.parse_media_refs(&rumor.tags);
+        let sticker_ref = rumor
             .tags
             .iter()
-            .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("sticker"))
-            .and_then(|t| match parse_sticker_ref_tag(t) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::debug!("invalid sticker ref tag: {e}");
-                    None
-                }
-            });
-        let (content, reply) = crate::reply::project_application_content(&m.content, m.tags.iter());
-        ChatMessage {
-            id: m.id,
-            group_id: m.mls_group_id.clone(),
-            sender: m.pubkey,
+            .find_map(|t| parse_sticker_ref_tag(t).ok());
+        let (content, reply) =
+            crate::reply::project_application_content(&rumor.content, rumor.tags.iter());
+        Some(ChatMessage {
+            id: event.id,
+            group_id: group_id.clone(),
+            sender: rumor.pubkey,
             classification: MessageClassification::of(&content),
             content,
-            created_at: m.created_at,
-            mine: m.pubkey == self.identity.public_key(),
-            delivery_state: if m.pubkey == self.identity.public_key() {
+            created_at: rumor.created_at,
+            mine,
+            delivery_state: if mine {
                 DeliveryState::Sent
             } else {
                 DeliveryState::Received
@@ -2257,7 +2346,47 @@ impl MarmotEngine {
             media,
             sticker_ref,
             reply,
+        })
+    }
+
+    fn chat_from_payload(
+        &self,
+        group_id: &GroupId,
+        message_id: &MessageId,
+        sender: &MemberId,
+        payload: &[u8],
+    ) -> Option<ChatMessage> {
+        let app = MarmotAppEvent::decode(payload).ok()?;
+        if app.kind != MARMOT_APP_EVENT_KIND_CHAT {
+            return None;
         }
+        let sender_pk = PublicKey::from_slice(sender.as_slice()).ok()?;
+        let id = message_id_to_event(message_id).ok()?;
+        let tags: Tags = app
+            .tags
+            .iter()
+            .filter_map(|t| Tag::parse(t.clone()).ok())
+            .collect();
+        let media = self.parse_media_refs(&tags);
+        let sticker_ref = tags.iter().find_map(|t| parse_sticker_ref_tag(t).ok());
+        let (content, reply) = crate::reply::project_application_content(&app.content, tags.iter());
+        Some(ChatMessage {
+            id,
+            group_id: group_id.clone(),
+            sender: sender_pk,
+            classification: MessageClassification::of(&content),
+            content,
+            created_at: Timestamp::from_secs(app.created_at),
+            mine: sender_pk == self.identity.public_key(),
+            delivery_state: if sender_pk == self.identity.public_key() {
+                DeliveryState::Sent
+            } else {
+                DeliveryState::Received
+            },
+            media,
+            sticker_ref,
+            reply,
+        })
     }
 }
 
@@ -2273,8 +2402,6 @@ fn overlay_reply_preview(incoming: Incoming, reply: Option<&ReplyTo>) -> Incomin
     Incoming::Message(message)
 }
 
-/// Denormalize quote chip text from other rows in the same bounded local page.
-/// NIP-C7 does not carry a preview; never full-scan the group to fill one.
 fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
     let by_id: HashMap<EventId, String> = msgs
         .iter()
@@ -2289,52 +2416,53 @@ fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
         })
         .collect();
     for m in msgs.iter_mut() {
-        let Some(reply) = m.reply.as_mut() else { continue };
+        let Some(reply) = m.reply.as_mut() else {
+            continue;
+        };
         crate::reply::hydrate_reply_preview(reply, by_id.get(&reply.parent_id).map(String::as_str));
     }
 }
 
-/// The database file plus the SQLite sidecar files that may exist alongside it.
-/// True only when an open error means the on-disk file is a PLAINTEXT SQLite
-/// database being opened with an encryption key — an unambiguous, permanent
-/// mismatch (an older build created the store unencrypted; the file can never
-/// be opened with a key). Recreating it is the only way forward and discards
-/// only already-inaccessible data.
-///
-/// Deliberately conservative: a WRONG/lost key on a genuinely-encrypted file
-/// surfaces as "file is not a database", which is indistinguishable from a
-/// transient host key-plumbing bug — we do NOT self-heal on that, so a correct
-/// encrypted database is never erased because the host momentarily passed a bad
-/// key. Likewise disk-full / permission / locked errors are not matched.
-fn is_unusable_db_error(message: &str) -> bool {
-    let m = message.to_lowercase();
-    // SQLCipher when a key is set but the file has no encryption header:
-    // "Cannot open unencrypted database with encryption: database was created
-    //  without encryption".
-    m.contains("without encryption") || m.contains("unencrypted database")
+fn is_unencrypted_sqlite(path: &Path) -> bool {
+    // SQLCipher files (0.8 raw-key or 0.9 passphrase) do not start with the
+    // sqlite magic. Only a proven plaintext sqlite file is safe to wipe.
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hdr = [0u8; 16];
+    matches!(
+        std::io::Read::read(&mut file, &mut hdr),
+        Ok(n) if n >= 16 && hdr.starts_with(b"SQLite format 3")
+    )
 }
 
-/// The KeyPackage slot file beside the database at `db`. Single source of truth
-/// so callers outside this module cannot re-derive it slightly differently.
-pub(crate) fn key_package_slot_path_for(db: &Path) -> std::path::PathBuf {
+pub(crate) fn key_package_slot_path_for(db: &Path) -> PathBuf {
     let name = db.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     db.with_file_name(format!("{name}{KEY_PACKAGE_SLOT_FILE_SUFFIX}"))
 }
 
-/// `<file>.tmp` beside `path`, the atomic-write staging name every sidecar in
-/// this crate uses. Kept as a function so the writer and `sidecar_paths` cannot
-/// disagree about what a wipe has to remove.
-pub(crate) fn key_package_slot_tmp_path(path: &Path) -> std::path::PathBuf {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+pub(crate) fn key_package_slot_tmp_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     path.with_file_name(format!("{name}.tmp"))
 }
 
-fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
+fn sidecar_named(base: &Path, suffix: &str) -> PathBuf {
     let name = base
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let mut paths: Vec<std::path::PathBuf> = [
+    base.with_file_name(format!("{name}{suffix}"))
+}
+
+fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
+    let name = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let mut paths: Vec<PathBuf> = [
         "",
         "-wal",
         "-shm",
@@ -2344,6 +2472,9 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         DM_AUTOACCEPT_FILE_SUFFIX,
         DM_AUTOACCEPT_TMP_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
+        TRANSCRIPT_FILE_SUFFIX,
+        PARKED_INVITES_FILE_SUFFIX,
+        DROPPED_GROUPS_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
@@ -2354,6 +2485,214 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
+fn validate_existing_d_tag(d: &str) -> Result<()> {
+    if d.len() == 64 && d.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(
+            "KeyPackage d tag must be 64 ASCII hex characters".into(),
+        ))
+    }
+}
+
+fn key_package_from_event(event: &Event) -> Result<KeyPackage> {
+    let bytes = BASE64
+        .decode(event.content.as_bytes())
+        .map_err(|e| Error::InvalidInput(format!("key package content is not base64: {e}")))?;
+    Ok(KeyPackage {
+        bytes,
+        source: Some(KeyPackageSource {
+            event_id: MessageId::new(event.id.as_bytes().to_vec()),
+        }),
+        protocol_profile: cgka_traits::group::ProtocolProfile::Current,
+    })
+}
+
+fn key_package_to_event(
+    identity: &Identity,
+    kp: &KeyPackage,
+    meta: &KeyPackageMetadata,
+    d_tag: &str,
+) -> Result<Event> {
+    let hex_u16 = |v: u16| format!("0x{v:04x}");
+    let tags = [
+        Tag::identifier(d_tag),
+        Tag::custom(TagKind::custom("mls_protocol_version"), ["1.0"]),
+        Tag::custom(TagKind::custom("i"), [meta.key_package_ref_hex.clone()]),
+        Tag::custom(
+            TagKind::custom("mls_ciphersuite"),
+            [hex_u16(meta.ciphersuite)],
+        ),
+        Tag::custom(
+            TagKind::custom("mls_extensions"),
+            meta.mls_extensions.iter().copied().map(hex_u16),
+        ),
+        Tag::custom(
+            TagKind::custom("mls_proposals"),
+            meta.mls_proposals.iter().copied().map(hex_u16),
+        ),
+        Tag::custom(
+            TagKind::custom("app_components"),
+            meta.app_components.iter().copied().map(hex_u16),
+        ),
+    ];
+    let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), BASE64.encode(&kp.bytes))
+        .tags(tags)
+        .build(identity.public_key())
+        .sign_with_keys(identity.keys())?;
+    Ok(event)
+}
+
+fn marmot_app_event_from_rumor(rumor: &UnsignedEvent) -> Result<Vec<u8>> {
+    let tags = rumor.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+    MarmotAppEvent::new(
+        rumor.pubkey.to_hex(),
+        rumor.created_at.as_secs(),
+        u64::from(rumor.kind.as_u16()),
+        tags,
+        rumor.content.clone(),
+    )
+    .encode()
+    .map_err(|e| Error::Mdk(e.to_string()))
+}
+
+fn event_from_app_publish(effects: &SessionEffects) -> Result<Event> {
+    for work in &effects.publish {
+        if let PublishWork::ApplicationMessage { msg, .. } = work {
+            return transport_to_event(msg);
+        }
+    }
+    Err(Error::Mdk("send produced no application message".into()))
+}
+
+fn publish_work_welcomes(
+    effects: &SessionEffects,
+) -> Result<(Vec<(PublicKey, Event)>, Option<PendingStateRef>)> {
+    for work in &effects.publish {
+        match work {
+            PublishWork::FoundingGroupCreated { welcomes } => {
+                return Ok((wrapped_welcomes(welcomes)?, None));
+            }
+            PublishWork::GroupCreated { welcomes, pending } => {
+                return Ok((wrapped_welcomes(welcomes)?, Some(*pending)));
+            }
+            PublishWork::GroupEvolution {
+                welcomes, pending, ..
+            } => {
+                return Ok((wrapped_welcomes(welcomes)?, Some(*pending)));
+            }
+            _ => {}
+        }
+    }
+    Ok((Vec::new(), None))
+}
+
+fn wrapped_welcomes(welcomes: &[TransportMessage]) -> Result<Vec<(PublicKey, Event)>> {
+    welcomes
+        .iter()
+        .map(|msg| {
+            let pk = match &msg.envelope {
+                TransportEnvelope::Welcome { recipient } => {
+                    PublicKey::from_slice(recipient.as_slice())
+                        .map_err(|e| Error::Mdk(format!("welcome recipient: {e}")))?
+                }
+                _ => {
+                    return Err(Error::Mdk(
+                        "welcome transport message is not a Welcome envelope".into(),
+                    ))
+                }
+            };
+            Ok((pk, transport_to_event(msg)?))
+        })
+        .collect()
+}
+
+fn nostr_event_to_transport(event: &Event) -> Result<TransportMessage> {
+    NostrTransportEvent::from_nostr_event(event)
+        .and_then(|e| e.to_transport_message())
+        .map_err(|e| Error::Mdk(e.to_string()))
+}
+
+fn transport_to_event(msg: &TransportMessage) -> Result<Event> {
+    NostrTransportEvent::from_transport_message(msg)
+        .and_then(|e| e.to_verified_nostr_event())
+        .map_err(|e| Error::Mdk(e.to_string()))
+}
+
+fn transport_group_id(msg: &TransportMessage) -> Option<GroupId> {
+    match &msg.envelope {
+        TransportEnvelope::GroupMessage { transport_group_id } => {
+            Some(GroupId::new(transport_group_id.clone()))
+        }
+        TransportEnvelope::Welcome { .. } => None,
+    }
+}
+
+fn message_id_to_event(id: &MessageId) -> Result<EventId> {
+    EventId::from_slice(id.as_slice()).map_err(|e| Error::Mdk(format!("message id: {e}")))
+}
+
+fn rumor_imeta_from_media(msg: &ChatMessage) -> Vec<Tag> {
+    // Best-effort: MediaRef is display-only. Decrypt still needs a stored imeta;
+    // create_media_event persists the rumor tags via MarmotAppEvent tags which
+    // chat_from_payload re-parses on receive. Outgoing rows keep media refs only.
+    let _ = msg;
+    Vec::new()
+}
+
+fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sidecar")
+    ));
+    std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path))
+}
+
+fn load_parked(db_path: &Path) -> HashMap<EventId, GroupInvite> {
+    let path = sidecar_named(db_path, PARKED_INVITES_FILE_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<Vec<GroupInvite>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| (i.id, i))
+        .collect()
+}
+
+fn load_dropped(db_path: &Path) -> HashSet<GroupId> {
+    let path = sidecar_named(db_path, DROPPED_GROUPS_FILE_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashSet::new();
+    };
+    serde_json::from_slice::<Vec<String>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|h| hex::decode(h).ok().map(GroupId::new))
+        .collect()
+}
+
+fn load_transcript(db_path: &Path) -> HashMap<GroupId, Vec<ChatMessage>> {
+    let path = sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<HashMap<String, Vec<ChatMessage>>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(hex_id, msgs)| hex::decode(hex_id).ok().map(|b| (GroupId::new(b), msgs)))
+        .collect()
+}
+
+// Silence unused helper on the in-memory Result path used by tests.
+#[allow(dead_code)]
+fn _in_memory_result(identity: Identity) -> Result<MarmotEngine> {
+    MarmotEngine::in_memory_inner(identity)
+}
 #[cfg(test)]
 mod dm_autoaccept_budget_tests {
     use super::{

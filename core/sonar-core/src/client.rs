@@ -13,10 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::media_crypto::EncryptedMediaUpload;
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
-use mdk_core::encrypted_media::EncryptedMediaUpload;
-use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification, RelayStatus};
@@ -52,7 +51,7 @@ use crate::sticker_cache::{
     wipe_sticker_cache_for_db, StickerCache, MAX_STICKER_CACHE_BYTES,
     STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
 };
-use crate::{Error, Result};
+use crate::{Error, GroupId, Result};
 
 /// Blossom user-server-list event kind (BUD-03): the user's preferred blob
 /// servers, newest first.
@@ -2461,7 +2460,7 @@ impl SonarClient {
     /// Waits for the relay OK acks — callers that need durability (a peer is
     /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = self.engine.key_package_event(self.relays.clone()).await?;
         self.nostr.send_event(&event).await?;
         Ok(())
     }
@@ -2476,7 +2475,7 @@ impl SonarClient {
     /// logged, not returned. Event creation (MLS key material persistence) still
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = self.engine.key_package_event(self.relays.clone()).await?;
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
             if let Err(err) = nostr.send_event(&event).await {
@@ -2521,12 +2520,15 @@ impl SonarClient {
         key_package: Event,
         name: &str,
     ) -> Result<GroupId> {
-        let creation = self.engine.create_group_with_description(
-            name,
-            SONAR_DIRECT_DM_DESCRIPTION,
-            vec![key_package],
-            self.relays.clone(),
-        )?;
+        let creation = self
+            .engine
+            .create_group_with_description(
+                name,
+                SONAR_DIRECT_DM_DESCRIPTION,
+                vec![key_package],
+                self.relays.clone(),
+            )
+            .await?;
         self.publish_group_creation(creation).await
     }
 
@@ -3030,7 +3032,8 @@ impl SonarClient {
         let key_packages = self.fetch_key_packages_for_members(members).await?;
         let creation = self
             .engine
-            .create_group(name, key_packages, self.relays.clone())?;
+            .create_group(name, key_packages, self.relays.clone())
+            .await?;
         self.publish_group_creation(creation).await
     }
 
@@ -3049,12 +3052,15 @@ impl SonarClient {
             return Ok(existing);
         }
         let key_packages = self.fetch_key_packages_for_members(vec![peer]).await?;
-        let creation = self.engine.create_group_with_description(
-            name,
-            SONAR_DIRECT_DM_DESCRIPTION,
-            key_packages,
-            self.relays.clone(),
-        )?;
+        let creation = self
+            .engine
+            .create_group_with_description(
+                name,
+                SONAR_DIRECT_DM_DESCRIPTION,
+                key_packages,
+                self.relays.clone(),
+            )
+            .await?;
         self.publish_group_creation(creation).await
     }
 
@@ -3063,16 +3069,16 @@ impl SonarClient {
         let groups = self.engine.groups()?;
         let me = self.identity().public_key();
         for group in groups {
-            let members = self.engine.members(&group.mls_group_id)?;
+            let members = self.engine.members(&group.id)?;
             if Self::is_reusable_dm_group(&group, &members, &me, peer) {
-                return Ok(Some(group.mls_group_id));
+                return Ok(Some(group.id));
             }
         }
         Ok(None)
     }
 
     fn is_reusable_dm_group(
-        group: &group_types::Group,
+        group: &cgka_traits::group::Group,
         members: &[PublicKey],
         me: &PublicKey,
         peer: &PublicKey,
@@ -3086,24 +3092,12 @@ impl SonarClient {
     }
 
     async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
-        let group_id = creation.group.mls_group_id;
-        let mut wrapped_welcomes = Vec::with_capacity(creation.welcomes.len());
-
-        for (member, rumor) in creation.welcomes {
-            match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
-                Err(err) => {
-                    self.discard_unpublished_group_creation(&group_id);
-                    return Err(err);
-                }
-            }
-        }
-
+        let group_id = creation.group.id;
         let mut published_welcomes = 0usize;
-        for wrapped in wrapped_welcomes {
+        for (_member, wrapped) in creation.welcomes {
             if let Err(err) = self.publish_marmot_event(&wrapped, "group welcome").await {
                 if published_welcomes == 0 {
-                    self.discard_unpublished_group_creation(&group_id);
+                    self.discard_unpublished_group_creation(&group_id).await;
                 } else {
                     tracing::debug!(
                         %err,
@@ -3117,16 +3111,12 @@ impl SonarClient {
             published_welcomes += 1;
         }
 
-        self.engine.merge_pending_commit(&group_id)?;
+        self.engine.merge_pending_commit(&group_id).await?;
         let name = self
             .engine
             .groups()
             .ok()
-            .and_then(|gs| {
-                gs.into_iter()
-                    .find(|g| g.mls_group_id == group_id)
-                    .map(|g| g.name)
-            })
+            .and_then(|gs| gs.into_iter().find(|g| g.id == group_id).map(|g| g.name))
             .unwrap_or_default();
         self.ensure_index_for_group(&group_id, &name);
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -3137,39 +3127,25 @@ impl SonarClient {
         Ok(group_id)
     }
 
-    fn discard_unpublished_group_creation(&self, group_id: &GroupId) {
-        let _ = self.engine.clear_pending_commit(group_id);
-        let _ = self.engine.delete_group(group_id);
+    async fn discard_unpublished_group_creation(&self, group_id: &GroupId) {
+        let _ = self.engine.clear_pending_commit(group_id).await;
+        let _ = self.engine.delete_group(group_id).await;
     }
 
     async fn publish_membership_update(&self, update: GroupMembershipUpdate) -> Result<()> {
         let group_id = update.group_id.clone();
         let requires_commit_merge = update.requires_commit_merge;
-        let mut wrapped_welcomes = Vec::with_capacity(update.welcomes.len());
-
-        for (member, rumor) in update.welcomes {
-            match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
-                Err(err) => {
-                    if requires_commit_merge {
-                        let _ = self.engine.clear_pending_commit(&group_id);
-                    }
-                    return Err(err);
-                }
-            }
-        }
-
         if let Err(err) = self
             .publish_marmot_event(&update.evolution_event, "membership update")
             .await
         {
             if requires_commit_merge {
-                let _ = self.engine.clear_pending_commit(&group_id);
+                let _ = self.engine.clear_pending_commit(&group_id).await;
             }
             return Err(err.into());
         }
 
-        for wrapped in wrapped_welcomes {
+        for (_member, wrapped) in update.welcomes {
             if let Err(err) = self
                 .publish_marmot_event(&wrapped, "membership welcome")
                 .await
@@ -3184,7 +3160,7 @@ impl SonarClient {
         }
 
         if requires_commit_merge {
-            self.engine.merge_pending_commit(&group_id)?;
+            self.engine.merge_pending_commit(&group_id).await?;
         }
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after membership update");
@@ -3222,7 +3198,7 @@ impl SonarClient {
     /// [`Self::add_group_members`] on lock discipline.
     async fn commit_add_members(&self, group_id: &GroupId, key_packages: Vec<Event>) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
-        let update = self.engine.add_members(group_id, key_packages)?;
+        let update = self.engine.add_members(group_id, key_packages).await?;
         self.publish_membership_update(update).await
     }
 
@@ -3242,7 +3218,7 @@ impl SonarClient {
         // wire — the removed member must not be able to read anything sent
         // after the removal was initiated.
         let _epoch = self.membership_gate.write().await;
-        let update = self.engine.remove_members(group_id, &members)?;
+        let update = self.engine.remove_members(group_id, &members).await?;
         self.publish_membership_update(update).await
     }
 
@@ -3255,13 +3231,13 @@ impl SonarClient {
     /// create the leave proposal (MIP-03).
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
-        let leave_update = match self.engine.leave_group(group_id) {
+        let leave_update = match self.engine.leave_group(group_id).await {
             Ok(update) => update,
             Err(err) if err.to_string().contains("self-demote") => {
-                let demote = self.engine.self_demote(group_id)?;
+                let demote = self.engine.self_demote(group_id).await?;
                 self.best_effort_membership_publish(demote, "self-demote before leave")
                     .await;
-                self.engine.leave_group(group_id)?
+                self.engine.leave_group(group_id).await?
             }
             Err(err) => return Err(err),
         };
@@ -3269,7 +3245,7 @@ impl SonarClient {
         // Leave updates are proposals (`requires_commit_merge == false`), so the
         // evolution event can be published after MDK group state is gone.
         let group_id_hex = hex::encode(group_id.as_slice());
-        self.engine.delete_group(group_id)?;
+        self.engine.delete_group(group_id).await?;
         self.outbox_state
             .lock()
             .unwrap()
@@ -3289,8 +3265,11 @@ impl SonarClient {
         update: GroupMembershipUpdate,
         context: &'static str,
     ) {
-        match tokio::time::timeout(MEMBERSHIP_PUBLISH_TIMEOUT, self.publish_membership_update(update))
-            .await
+        match tokio::time::timeout(
+            MEMBERSHIP_PUBLISH_TIMEOUT,
+            self.publish_membership_update(update),
+        )
+        .await
         {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -3362,7 +3341,7 @@ impl SonarClient {
         let token = crate::invite_link::decode_invite_token(token_str)?;
         let admin = PublicKey::from_slice(&token.admin_npub)
             .map_err(|e| Error::InvalidInput(e.to_string()))?;
-        let group_id = GroupId::from_slice(&token.group_id);
+        let group_id = GroupId::new(token.group_id.clone());
         let invite_relays: Vec<RelayUrl> = token
             .relays
             .iter()
@@ -3378,7 +3357,10 @@ impl SonarClient {
         };
 
         self.ensure_relays_connected(&publish_relays).await?;
-        let kp_event = self.engine.key_package_event(publish_relays.clone())?;
+        let kp_event = self
+            .engine
+            .key_package_event(publish_relays.clone())
+            .await?;
         let output = self
             .nostr
             .send_event_to(publish_relays.clone(), &kp_event)
@@ -3452,15 +3434,10 @@ impl SonarClient {
     /// Accept a pending group invite by welcome event id, then backfill its
     /// existing group history and widen the live subscription.
     pub async fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
-        let group_id = self.engine.accept_group_invite(welcome_id)?;
-        if let Some(group) = self
-            .engine
-            .groups()?
-            .into_iter()
-            .find(|g| g.mls_group_id == group_id)
-        {
+        let group_id = self.engine.accept_group_invite(welcome_id).await?;
+        if let Some(group) = self.engine.groups()?.into_iter().find(|g| g.id == group_id) {
             self.ensure_index_for_group(&group_id, &group.name);
-            let nostr_group_id = hex::encode(group.nostr_group_id);
+            let nostr_group_id = hex::encode(group.id.as_slice());
             if let Err(err) = self.backfill_group(&nostr_group_id).await {
                 tracing::debug!(
                     %err,
@@ -3476,8 +3453,8 @@ impl SonarClient {
     }
 
     /// Decline a pending group invite by welcome event id.
-    pub fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
-        self.engine.decline_group_invite(welcome_id)
+    pub async fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
+        self.engine.decline_group_invite(welcome_id).await
     }
 
     /// Encrypt and durably record a text message locally before relay publish.
@@ -3503,7 +3480,8 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_text_message_with_reply(group_id, text, reply)?
+                .create_and_process_text_message_with_reply(group_id, text, reply)
+                .await?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -3690,7 +3668,8 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_sticker_message(group_id, sticker_ref)?
+                .create_and_process_sticker_message(group_id, sticker_ref)
+                .await?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -4601,11 +4580,7 @@ impl SonarClient {
                 let attempts = outbox_state
                     .lock()
                     .unwrap()
-                    .mark_failed_by_message_id(
-                        &message_id_hex,
-                        reason,
-                        Timestamp::now().as_secs(),
-                    )
+                    .mark_failed_by_message_id(&message_id_hex, reason, Timestamp::now().as_secs())
                     .ok()
                     .flatten();
                 // Surface the first failure to the host immediately (Failed +
@@ -4637,10 +4612,10 @@ impl SonarClient {
                 if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
                     break;
                 }
-                let prepared = outbox_state.lock().unwrap().prepare_auto_retry(
-                    &message_id_hex,
-                    Timestamp::now().as_secs(),
-                );
+                let prepared = outbox_state
+                    .lock()
+                    .unwrap()
+                    .prepare_auto_retry(&message_id_hex, Timestamp::now().as_secs());
                 match prepared {
                     Ok(Some((next_group_id_hex, next_event))) => {
                         group_id_hex = next_group_id_hex;
@@ -4702,7 +4677,7 @@ impl SonarClient {
         let active_group_ids = match self.engine.groups() {
             Ok(groups) => groups
                 .into_iter()
-                .map(|group| hex::encode(group.mls_group_id.as_slice()))
+                .map(|group| hex::encode(group.id.as_slice()))
                 .collect::<HashSet<_>>(),
             Err(err) => {
                 tracing::debug!(%err, "failed to load active Marmot groups for outbox retry");
@@ -4960,7 +4935,7 @@ impl SonarClient {
                     continue;
                 }
             };
-            // GroupId::from_slice panics on wrong length — refuse corrupt rows.
+            // Staged media rows store a 32-byte MLS group id as hex.
             if group_bytes.len() != 32 {
                 let _ = self.media_staging.lock().unwrap().mark_failed(
                     &id,
@@ -4972,7 +4947,7 @@ impl SonarClient {
                 );
                 continue;
             }
-            let group_id = GroupId::from_slice(&group_bytes);
+            let group_id = GroupId::new(group_bytes);
             let _ = self
                 .media_staging
                 .lock()
@@ -5044,8 +5019,8 @@ impl SonarClient {
             else {
                 let staging = self.media_staging.clone();
                 let id = id.clone();
-                let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&id))
-                    .await;
+                let _ =
+                    tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&id)).await;
                 continue;
             };
             let event = match Event::from_json(&event_json) {
@@ -5081,10 +5056,8 @@ impl SonarClient {
             }
             let staging = self.media_staging.clone();
             let remove_id = id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                staging.lock().unwrap().remove(&remove_id)
-            })
-            .await;
+            let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&remove_id))
+                .await;
             let _ = self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
             self.notify_conversation_changed(&group_id_hex);
         }
@@ -5094,7 +5067,8 @@ impl SonarClient {
     async fn staging_remove(&self, entry_id: &str) {
         let staging = self.media_staging.clone();
         let entry_id = entry_id.to_string();
-        let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&entry_id)).await;
+        let _ =
+            tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&entry_id)).await;
     }
 
     async fn staging_mark_failed(&self, entry_id: &str, error: String) {
@@ -5142,7 +5116,9 @@ impl SonarClient {
             return Ok(false);
         }
         const CRASH_RECOVERY_URL_SCAN: usize = 64;
-        let messages = self.engine.messages_page(group_id, CRASH_RECOVERY_URL_SCAN, 0)?;
+        let messages = self
+            .engine
+            .messages_page(group_id, CRASH_RECOVERY_URL_SCAN, 0)?;
         Ok(messages.iter().any(|message| {
             urls.iter()
                 .all(|url| message.media.iter().any(|m| m.url == *url))
@@ -5207,12 +5183,8 @@ impl SonarClient {
             }
             (encrypted, urls)
         } else {
-            let plaintext_lens: Arc<Vec<u64>> = Arc::new(
-                plaintext_items
-                    .iter()
-                    .map(|d| d.len() as u64)
-                    .collect(),
-            );
+            let plaintext_lens: Arc<Vec<u64>> =
+                Arc::new(plaintext_items.iter().map(|d| d.len() as u64).collect());
             let item_sent: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
                 (0..item_count)
                     .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -5249,20 +5221,12 @@ impl SonarClient {
                         tokio::runtime::RuntimeFlavor::MultiThread
                     ) {
                         tokio::task::block_in_place(|| {
-                            self.engine.encrypt_media(
-                                &group_id,
-                                &data,
-                                &meta.mime,
-                                &meta.filename,
-                            )
+                            self.engine
+                                .encrypt_media(&group_id, &data, &meta.mime, &meta.filename)
                         })?
                     } else {
-                        self.engine.encrypt_media(
-                            &group_id,
-                            &data,
-                            &meta.mime,
-                            &meta.filename,
-                        )?
+                        self.engine
+                            .encrypt_media(&group_id, &data, &meta.mime, &meta.filename)?
                     };
                     let cipher_len = upload.encrypted_data.len() as u64;
                     item_totals[index].store(cipher_len, Ordering::Relaxed);
@@ -5279,7 +5243,8 @@ impl SonarClient {
                                 move |sent: u64, _total: u64| {
                                     item_sent[index].store(sent, Ordering::Relaxed);
                                 }
-                            }) as Box<dyn FnMut(u64, u64) + Send>),
+                            })
+                                as Box<dyn FnMut(u64, u64) + Send>),
                         )
                         .await?;
                     Ok::<_, Error>((index, upload, url))
@@ -5315,11 +5280,7 @@ impl SonarClient {
                         let mut album_total = 0u64;
                         for (i, total) in item_totals.iter().enumerate() {
                             let known = total.load(Ordering::Relaxed);
-                            album_total += if known > 0 {
-                                known
-                            } else {
-                                plaintext_lens[i]
-                            };
+                            album_total += if known > 0 { known } else { plaintext_lens[i] };
                         }
                         let aggregate = aggregate.min(album_total.max(1));
                         let _ = media_staging.lock().unwrap().update_progress(
@@ -5409,7 +5370,8 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_media_event_multi(group_id, &refs, &caption)?
+                .create_and_process_media_event_multi(group_id, &refs, &caption)
+                .await?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -5434,8 +5396,7 @@ impl SonarClient {
         .await?;
         self.mark_outbox_pending(group_id, &message, &event)?;
         self.staging_remove(entry_id).await;
-        let publish_ack =
-            self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
+        let publish_ack = self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);
@@ -5550,8 +5511,7 @@ impl SonarClient {
         }
         // Reuse the process-wide upload client so sequential/concurrent PUTs
         // share keep-alive + TLS session cache (same shape as download HTTP_CLIENT).
-        let client =
-            BlossomClient::with_client(base, BLOSSOM_UPLOAD_HTTP_CLIENT.clone());
+        let client = BlossomClient::with_client(base, BLOSSOM_UPLOAD_HTTP_CLIENT.clone());
         let keys = self.identity().keys();
         let mime = Some(ENCRYPTED_BLOB_MIME_TYPE.to_string());
         let upload = async {
@@ -5909,7 +5869,7 @@ impl SonarClient {
             .engine
             .groups()?
             .into_iter()
-            .map(|g| hex::encode(g.nostr_group_id))
+            .map(|g| hex::encode(g.id.as_slice()))
             .collect())
     }
 
@@ -5919,12 +5879,10 @@ impl SonarClient {
         };
         groups
             .into_iter()
-            .filter_map(
-                |group| match engine.messages_page(&group.mls_group_id, 1, 0) {
-                    Ok(page) if page.is_empty() => Some(hex::encode(group.nostr_group_id)),
-                    _ => None,
-                },
-            )
+            .filter_map(|group| match engine.messages_page(&group.id, 1, 0) {
+                Ok(page) if page.is_empty() => Some(hex::encode(group.id.as_slice())),
+                _ => None,
+            })
             .collect()
     }
 
@@ -5959,16 +5917,16 @@ impl SonarClient {
             .into_iter()
             .filter_map(|group| {
                 let has_local_chat = engine
-                    .messages_page(&group.mls_group_id, 1, 0)
+                    .messages_page(&group.id, 1, 0)
                     .map(|page| !page.is_empty())
                     .unwrap_or(false);
                 if !has_local_chat {
                     return None;
                 }
                 let floor = engine
-                    .latest_remote_chat_message_secs(&group.mls_group_id)
+                    .latest_remote_chat_message_secs(&group.id)
                     .unwrap_or(0);
-                Some((hex::encode(group.nostr_group_id), floor))
+                Some((hex::encode(group.id.as_slice()), floor))
             })
             .collect()
     }
@@ -6202,9 +6160,9 @@ impl SonarClient {
                     None
                 } else if let Ok(groups) = self.engine.groups() {
                     groups.into_iter().find_map(|g| {
-                        let mls = hex::encode(g.mls_group_id.as_slice());
+                        let mls = hex::encode(g.id.as_slice());
                         if mls == clean {
-                            Some(hex::encode(g.nostr_group_id))
+                            Some(hex::encode(g.id.as_slice()))
                         } else {
                             None
                         }
@@ -6467,7 +6425,11 @@ impl SonarClient {
         // actually reconnect. Reconnection itself is owned by the pool and the
         // host attach paths, never by hammering fetches.
         if self.connected_relay_count().await == 0 {
-            tracing::debug!(context, total_relays, "relay fetch skipped: no relay connected");
+            tracing::debug!(
+                context,
+                total_relays,
+                "relay fetch skipped: no relay connected"
+            );
             return Ok(RelayFetchOutcome {
                 events: Vec::new(),
                 completed_relays: 0,
@@ -6644,7 +6606,7 @@ impl SonarClient {
             .groups()
             .unwrap_or_default()
             .into_iter()
-            .map(|g| (g.mls_group_id.as_slice().to_vec(), g.name))
+            .map(|g| (g.id.as_slice().to_vec(), g.name))
             .collect();
         for event in sort_marmot_events(events) {
             if self.is_sync_event_processed(&event.id) {
@@ -6984,7 +6946,7 @@ impl SonarClient {
         Ok(notifications)
     }
 
-    pub fn groups(&self) -> Result<Vec<group_types::Group>> {
+    pub fn groups(&self) -> Result<Vec<cgka_traits::group::Group>> {
         self.engine.groups()
     }
 
@@ -7061,7 +7023,7 @@ impl SonarClient {
     /// the background so delete never waits on relay round-trips.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        self.engine.delete_group(group_id)?;
+        self.engine.delete_group(group_id).await?;
         self.outbox_state
             .lock()
             .unwrap()
@@ -7173,11 +7135,10 @@ impl SonarClient {
     }
 
     fn resolve_group_name(&self, group_id: &GroupId) -> Option<String> {
-        self.engine.groups().ok().and_then(|gs| {
-            gs.into_iter()
-                .find(|g| g.mls_group_id == *group_id)
-                .map(|g| g.name)
-        })
+        self.engine
+            .groups()
+            .ok()
+            .and_then(|gs| gs.into_iter().find(|g| g.id == *group_id).map(|g| g.name))
     }
 
     fn remove_index_for_group(&self, group_id: &GroupId) {
@@ -7693,7 +7654,7 @@ impl SonarClient {
         };
 
         for group in &groups {
-            let members = match self.engine.members(&group.mls_group_id) {
+            let members = match self.engine.members(&group.id) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -7794,7 +7755,7 @@ impl SonarClient {
             Err(_) => return false,
         };
         for group in &groups {
-            if let Ok(members) = self.engine.members(&group.mls_group_id) {
+            if let Ok(members) = self.engine.members(&group.id) {
                 if members.contains(sender) {
                     return true;
                 }
@@ -7830,10 +7791,7 @@ fn sync_state_tmp_path(path: &Path) -> PathBuf {
 fn is_terminal_marmot_processing_error(err: &Error) -> bool {
     matches!(
         err,
-        Error::Nip59(_)
-            | Error::Nip44(_)
-            | Error::NostrEvent(_)
-            | Error::Mdk(mdk_core::Error::WelcomePreviouslyFailed(_))
+        Error::Nip59(_) | Error::Nip44(_) | Error::NostrEvent(_)
     )
 }
 
@@ -8027,12 +7985,10 @@ mod tests {
             .await
             .expect("mock relay starts");
         let url = relay.url().await;
-        let client = SonarClient::connect_in_memory(
-            crate::identity::Identity::generate(),
-            vec![url],
-        )
-        .await
-        .expect("client connects");
+        let client =
+            SonarClient::connect_in_memory(crate::identity::Identity::generate(), vec![url])
+                .await
+                .expect("client connects");
 
         // Disconnect from the CLIENT side, not by killing the relay: a dead
         // socket is only noticed on the next read/ping, so `relay.shutdown()`
@@ -8412,7 +8368,7 @@ mod tests {
             ConversationIndex::open_in_memory().expect("index opens"),
         )));
 
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let group_hex = hex::encode(group_id.as_slice());
         let peer = Keys::generate().public_key();
         let incoming = |seed: u8, secs: u64, content: &str| ChatMessage {
@@ -8430,7 +8386,8 @@ mod tests {
         };
 
         client.upsert_index_for_message(&incoming(1, 100, "hey"), Some("Chat"));
-        client.upsert_index_for_message(&incoming(2, 200, "☎CALL|1|END|c3a1|declined"), Some("Chat"));
+        client
+            .upsert_index_for_message(&incoming(2, 200, "☎CALL|1|END|c3a1|declined"), Some("Chat"));
         client.upsert_index_for_message(&incoming(3, 300, "⚡PAYDONE|1|abc-123"), Some("Chat"));
 
         let summary = client
@@ -8481,7 +8438,7 @@ mod tests {
         )
         .expect("seed policy");
 
-        let group_id = GroupId::from_slice(&[9u8; 32]);
+        let group_id = GroupId::new([9u8; 32]);
         let peer = Keys::generate().public_key();
         let msg = |seed: u8, secs: u64, mine: bool| ChatMessage {
             id: test_event_id(seed),
@@ -8514,7 +8471,7 @@ mod tests {
     fn index_preview_labels_json_payloads_without_leaking_raw_json() {
         let msg = |content: &str| ChatMessage {
             id: test_event_id(9),
-            group_id: GroupId::from_slice(&[1u8; 32]),
+            group_id: GroupId::new([1u8; 32]),
             sender: Keys::generate().public_key(),
             content: content.to_owned(),
             created_at: Timestamp::from_secs(1),
@@ -8526,11 +8483,17 @@ mod tests {
             reply: None,
         };
         // Bot/agent JSON payloads preview as a label, never raw JSON.
-        assert_eq!(index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")), "JSON payload");
+        assert_eq!(
+            index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")),
+            "JSON payload"
+        );
         assert_eq!(index_preview(&msg("  {\"ok\":true}")), "JSON payload");
         assert_eq!(index_preview(&msg("[1,2,3]")), "JSON payload");
         // Brace-prefixed human text that is NOT valid JSON stays verbatim.
-        assert_eq!(index_preview(&msg("{ not json, just a brace")), "{ not json, just a brace");
+        assert_eq!(
+            index_preview(&msg("{ not json, just a brace")),
+            "{ not json, just a brace"
+        );
         assert_eq!(index_preview(&msg("hello {}")), "hello {}");
     }
 
@@ -8543,10 +8506,12 @@ mod tests {
             width: None,
             height: None,
             duration_ms: None,
+            original_hash: None,
+            nonce: None,
         };
         let msg = |content: &str, media: Vec<crate::marmot::MediaRef>| ChatMessage {
             id: test_event_id(9),
-            group_id: GroupId::from_slice(&[1u8; 32]),
+            group_id: GroupId::new([1u8; 32]),
             sender: Keys::generate().public_key(),
             content: content.to_owned(),
             created_at: Timestamp::from_secs(1),
@@ -8751,7 +8716,7 @@ mod tests {
         let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await
             .expect("client without relays");
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let oversized = vec![0u8; MAX_MEDIA_PLAINTEXT_BYTES + 1];
         let err = client
             .send_media(&group_id, oversized, "big.mp4", "video/mp4", "", "")
@@ -8772,7 +8737,7 @@ mod tests {
         let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await
             .expect("client without relays");
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let per_item = MAX_MEDIA_PLAINTEXT_BYTES;
         let count = MAX_MEDIA_TOTAL_PLAINTEXT_BYTES / per_item + 1;
         let items: Vec<_> = (0..count)
@@ -8983,13 +8948,17 @@ mod tests {
         let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
         let bob = MarmotEngine::in_memory(Identity::generate());
         let carol = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
-        let carol_kp = carol.key_package_event(relays.clone()).expect("carol kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol kp");
 
         let creation = alice
             .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
+        let group_id = creation.group.id.clone();
         for (member, engine) in [
             (bob.identity().public_key(), &bob),
             (carol.identity().public_key(), &carol),
@@ -9000,10 +8969,7 @@ mod tests {
                 .find(|(pubkey, _)| *pubkey == member)
                 .cloned()
                 .expect("welcome");
-            let wrapped = alice
-                .gift_wrap_welcome(&member, welcome)
-                .await
-                .expect("wrap welcome");
+            let wrapped = welcome;
             // A >2-member group welcome lands as a pending invite that the
             // member must accept explicitly (White Noise semantics).
             match engine
@@ -9016,6 +8982,7 @@ mod tests {
                     let invite = engine.pending_group_invites().expect("pending invites")[0].id;
                     engine
                         .accept_group_invite(&invite)
+                        .await
                         .expect("member accepts invite");
                 }
                 other => panic!("unexpected welcome result: {other:?}"),
@@ -9023,24 +8990,28 @@ mod tests {
         }
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges creation commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
-        let incoming_events: Vec<Event> = (0..10)
-            .map(|i| {
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
+        let mut incoming_events = Vec::new();
+        for i in 0..10 {
+            incoming_events.push(
                 bob.create_text_message(&bob_group_id, &format!("bob under load {i}"))
-                    .expect("bob creates message")
-            })
-            .collect();
+                    .await
+                    .expect("bob creates message"),
+            );
+        }
 
         // Phase 1: sends + incoming + reads all concurrent.
         let sender = {
             let alice = alice.clone();
             let group_id = group_id.clone();
-            tokio::task::spawn_blocking(move || {
+            tokio::spawn(async move {
                 for i in 0..20 {
                     alice
                         .create_and_process_text_message(&group_id, &format!("alice load {i}"))
+                        .await
                         .expect("alice sends under load");
                 }
             })
@@ -9082,11 +9053,14 @@ mod tests {
         // the post-removal message, carol must not.
         let removal = alice
             .remove_members(&group_id, &[carol.identity().public_key()])
+            .await
             .expect("alice removes carol");
         assert!(removal.requires_commit_merge);
-        let carol_group_id = carol.groups().expect("carol groups")[0]
-            .mls_group_id
-            .clone();
+        let carol_group_id = carol.groups().expect("carol groups")[0].id.clone();
+        alice
+            .merge_pending_commit(&group_id)
+            .await
+            .expect("alice merges removal");
         bob.process_incoming(&removal.evolution_event)
             .await
             .expect("bob processes removal commit");
@@ -9094,9 +9068,6 @@ mod tests {
             .process_incoming(&removal.evolution_event)
             .await
             .expect("carol processes removal commit");
-        alice
-            .merge_pending_commit(&group_id)
-            .expect("alice merges removal");
         assert!(
             !alice
                 .members(&group_id)
@@ -9107,6 +9078,7 @@ mod tests {
 
         let (post_removal_event, _) = alice
             .create_and_process_text_message(&group_id, "after carol removal")
+            .await
             .expect("alice sends post-removal");
         assert!(matches!(
             bob.process_incoming(&post_removal_event)
@@ -9139,21 +9111,19 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
 
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
-        let (bob_pubkey, bob_welcome) = creation
+        let group_id = creation.group.id.clone();
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
             .expect("bob welcome");
-        let bob_wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let bob_wrapped = bob_welcome;
         assert!(matches!(
             bob.process_incoming(&bob_wrapped)
                 .await
@@ -9162,23 +9132,27 @@ mod tests {
         ));
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges pending commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
-        let incoming_events: Vec<Event> = (0..10)
-            .map(|i| {
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
+        let mut incoming_events = Vec::new();
+        for i in 0..10 {
+            incoming_events.push(
                 bob.create_text_message(&bob_group_id, &format!("from bob {i}"))
-                    .expect("bob creates message")
-            })
-            .collect();
+                    .await
+                    .expect("bob creates message"),
+            );
+        }
 
         let sender = {
             let alice = alice.clone();
             let group_id = group_id.clone();
-            tokio::task::spawn_blocking(move || {
+            tokio::spawn(async move {
                 for i in 0..10 {
                     alice
                         .create_and_process_text_message(&group_id, &format!("from alice {i}"))
+                        .await
                         .expect("alice sends");
                 }
             })
@@ -9225,22 +9199,20 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = MarmotEngine::in_memory(Identity::generate());
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
 
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
-        let nostr_group_id_hex = hex::encode(creation.group.nostr_group_id);
-        let (bob_pubkey, bob_welcome) = creation
+        let group_id = creation.group.id.clone();
+        let nostr_group_id_hex = hex::encode(creation.group.id.as_slice());
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
             .expect("bob welcome");
-        let bob_wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let bob_wrapped = bob_welcome;
         assert!(matches!(
             bob.process_incoming(&bob_wrapped)
                 .await
@@ -9249,11 +9221,13 @@ mod tests {
         ));
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges pending commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
         let bob_event = bob
             .create_text_message(&bob_group_id, "remote first")
+            .await
             .expect("bob creates message");
         let bob_message_secs = bob_event.created_at.as_secs();
         assert!(matches!(
@@ -9267,6 +9241,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let alice_event = alice
             .create_text_message(&group_id, "local later")
+            .await
             .expect("alice creates local message");
         assert!(alice_event.created_at.as_secs() > bob_message_secs);
         assert!(matches!(
@@ -9294,20 +9269,18 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = MarmotEngine::in_memory(Identity::generate());
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
-        let (bob_pubkey, bob_welcome) = creation
+        let group_id = creation.group.id.clone();
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pk, _)| *pk == bob.identity().public_key())
             .expect("bob welcome");
-        let bob_wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let bob_wrapped = bob_welcome;
         assert!(matches!(
             bob.process_incoming(&bob_wrapped)
                 .await
@@ -9316,8 +9289,9 @@ mod tests {
         ));
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges pending commit");
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
 
         // Alice sends a "voice note" -- arbitrary bytes stand in for AAC audio.
         let original = b"fake-aac-audio-bytes".to_vec();
@@ -9327,6 +9301,7 @@ mod tests {
             .expect("alice encrypts media");
         let event = alice
             .create_media_event(&group_id, &upload, url, "listen to this")
+            .await
             .expect("alice creates media event");
 
         // Both sides store the message; the imeta rides inside the encrypted rumor.
@@ -9954,13 +9929,11 @@ mod tests {
             client.sync_watermark_secs() < before_wm,
             "in-memory rewind still applies during the wake"
         );
-        assert!(
-            client
-                .sync_state
-                .lock()
-                .unwrap()
-                .has_processed(&event_id.to_hex())
-        );
+        assert!(client
+            .sync_state
+            .lock()
+            .unwrap()
+            .has_processed(&event_id.to_hex()));
         assert_eq!(
             fs::read(&sync_path).expect("read sync state while frozen"),
             before_bytes,
@@ -10000,21 +9973,21 @@ mod tests {
             .expect("charlie starts without relays");
         let bob_kp = bob
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let charlie_kp = charlie
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("charlie key package");
         let creation = alice
             .create_group("rollback retry", vec![bob_kp, charlie_kp], relays.clone())
+            .await
             .expect("alice creates group");
-        let alice_group_id = creation.group.mls_group_id.clone();
+        let alice_group_id = creation.group.id.clone();
 
         for (member, welcome) in creation.welcomes {
-            let wrapped = alice
-                .gift_wrap_welcome(&member, welcome)
-                .await
-                .expect("wrap welcome");
+            let wrapped = welcome;
             if member == bob.identity().public_key() {
                 assert!(matches!(
                     bob.process_incoming(&wrapped)
@@ -10024,6 +9997,7 @@ mod tests {
                 ));
                 let invite = bob.pending_group_invites().expect("bob invites").remove(0);
                 bob.accept_group_invite(&invite.id)
+                    .await
                     .expect("bob accepts invite");
             } else {
                 let (report, _) = charlie
@@ -10038,16 +10012,18 @@ mod tests {
                 charlie
                     .engine
                     .accept_group_invite(&invite.id)
+                    .await
                     .expect("charlie accepts invite");
             }
         }
         alice
-            .merge_pending_commit(&creation.group.mls_group_id)
+            .merge_pending_commit(&creation.group.id)
+            .await
             .expect("merge pending commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
         let charlie_group_id = charlie.engine.groups().expect("charlie groups")[0]
-            .mls_group_id
+            .id
             .clone();
         let dave = MarmotEngine::in_memory(Identity::generate());
         let erin = MarmotEngine::in_memory(Identity::generate());
@@ -10060,24 +10036,32 @@ mod tests {
                 &bob_group_id,
                 vec![dave
                     .key_package_event(relays.clone())
+                    .await
                     .expect("dave key package")],
             )
+            .await
             .expect("bob creates earlier commit");
         tokio::time::sleep(Duration::from_secs(1)).await;
         let alice_update = alice
             .add_members(
                 &alice_group_id,
-                vec![erin.key_package_event(relays).expect("erin key package")],
+                vec![erin
+                    .key_package_event(relays)
+                    .await
+                    .expect("erin key package")],
             )
+            .await
             .expect("alice creates later commit");
         assert!(
             bob_update.evolution_event.created_at < alice_update.evolution_event.created_at,
             "competing commits need deterministic MIP-03 order"
         );
         bob.merge_pending_commit(&bob_group_id)
+            .await
             .expect("bob merges winning commit");
         let bob_message = bob
             .create_text_message(&bob_group_id, "message recovered after rollback")
+            .await
             .expect("bob creates message in winning epoch");
 
         let (wrong_commit, _) = charlie
@@ -10194,26 +10178,25 @@ mod tests {
         let bob_kp = bob
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let (bob_pubkey, bob_welcome) = creation
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pk, _)| *pk == bob.identity().public_key())
             .expect("bob welcome");
-        let wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let wrapped = bob_welcome;
 
         let (report, _) = bob.process_marmot_events([wrapped], "test welcome").await;
         assert_eq!(report.processed, 1);
 
         let bob_groups = bob.engine.groups().expect("bob groups");
         assert_eq!(bob_groups.len(), 1);
-        let expected = hex::encode(bob_groups[0].mls_group_id.as_slice());
+        let expected = hex::encode(bob_groups[0].id.as_slice());
         let changed = listener.changed.lock().unwrap().clone();
         assert_eq!(
             changed,
@@ -10243,22 +10226,22 @@ mod tests {
         let bob_kp = bob
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let carol_kp = carol
             .key_package_event(relays.clone())
+            .await
             .expect("carol key package");
         let creation = alice
             .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)
+            .await
             .expect("alice creates 3-member group");
-        let (bob_pubkey, bob_welcome) = creation
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pk, _)| *pk == bob.identity().public_key())
             .expect("bob welcome");
-        let wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let wrapped = bob_welcome;
 
         let (report, _) = bob
             .process_marmot_events([wrapped], "test pending invite")
@@ -10297,7 +10280,13 @@ mod profile_merge_tests {
 
     #[test]
     fn fresh_key_publishes_supplied_fields() {
-        let m = SonarClient::merge_profile_metadata(None, "alice", Some("hi"), Some("https://x/p.png"), None);
+        let m = SonarClient::merge_profile_metadata(
+            None,
+            "alice",
+            Some("hi"),
+            Some("https://x/p.png"),
+            None,
+        );
         assert_eq!(m.name.as_deref(), Some("alice"));
         assert_eq!(m.display_name.as_deref(), Some("alice"));
         assert_eq!(m.about.as_deref(), Some("hi"));
@@ -10321,14 +10310,26 @@ mod profile_merge_tests {
     #[test]
     fn claimed_handle_replaces_nip05() {
         let r = rich_remote();
-        let m = SonarClient::merge_profile_metadata(Some(&r), "n", None, None, Some("n@sonarprivacy.xyz".into()));
+        let m = SonarClient::merge_profile_metadata(
+            Some(&r),
+            "n",
+            None,
+            None,
+            Some("n@sonarprivacy.xyz".into()),
+        );
         assert_eq!(m.nip05.as_deref(), Some("n@sonarprivacy.xyz"));
     }
 
     #[test]
     fn explicit_about_and_picture_override_remote() {
         let r = rich_remote();
-        let m = SonarClient::merge_profile_metadata(Some(&r), "n", Some("new bio"), Some("https://x/new.png"), None);
+        let m = SonarClient::merge_profile_metadata(
+            Some(&r),
+            "n",
+            Some("new bio"),
+            Some("https://x/new.png"),
+            None,
+        );
         assert_eq!(m.about.as_deref(), Some("new bio"));
         assert_eq!(m.picture.unwrap().as_str(), "https://x/new.png");
         assert_eq!(m.website, r.website);
@@ -10337,7 +10338,8 @@ mod profile_merge_tests {
     #[test]
     fn empty_args_never_wipe_remote_fields() {
         let r = rich_remote();
-        let m = SonarClient::merge_profile_metadata(Some(&r), "n", Some(""), Some("not a url"), None);
+        let m =
+            SonarClient::merge_profile_metadata(Some(&r), "n", Some(""), Some("not a url"), None);
         assert_eq!(m.about.as_deref(), Some("bitcoin dev"));
         assert_eq!(m.picture, r.picture);
     }

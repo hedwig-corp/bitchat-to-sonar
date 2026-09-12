@@ -5,11 +5,11 @@
 //! Alice runs on the persistent engine; Bob is a throwaway in-memory engine that
 //! only exists to mint a KeyPackage so Alice can form a real MLS group.
 
-use mdk_core::prelude::GroupId;
 use nostr::RelayUrl;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 use sonar_core::marmot::{DeliveryState, Incoming, MarmotEngine};
+use sonar_core::GroupId;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Duration};
 
@@ -27,7 +27,10 @@ async fn group_and_message_survive_reopen() {
 
     // Bob: throwaway engine, only used to produce a KeyPackage.
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob
+        .key_package_event(relays())
+        .await
+        .expect("bob key package");
 
     let alice_identity = Identity::generate();
     let alice_pubkey = alice_identity.public_key();
@@ -39,16 +42,19 @@ async fn group_and_message_survive_reopen() {
 
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays())
+            .await
             .expect("create group");
-        let group_id = creation.group.mls_group_id.clone();
+        let group_id = creation.group.id.clone();
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("merge after simulated welcome delivery");
 
         // Send messages and process them back so they land in storage as "ours"
         // (mirrors what SonarClient::send_text does after publishing).
         let event = alice
             .create_text_message(&group_id, "persisted hello 1")
+            .await
             .expect("create message");
         let processed = alice
             .process_incoming(&event)
@@ -58,6 +64,7 @@ async fn group_and_message_survive_reopen() {
         sleep(Duration::from_secs(1)).await;
         let event = alice
             .create_text_message(&group_id, "persisted hello 2")
+            .await
             .expect("create message");
         let processed = alice
             .process_incoming(&event)
@@ -72,13 +79,16 @@ async fn group_and_message_survive_reopen() {
         let charlie = MarmotEngine::in_memory(Identity::generate());
         let charlie_kp = charlie
             .key_package_event(relays())
+            .await
             .expect("charlie key package");
         let update = alice
             .add_members(&group_id, vec![charlie_kp])
+            .await
             .expect("add charlie");
         assert!(update.requires_commit_merge);
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("merge after simulated membership delivery");
 
         // Sanity check within the live session.
@@ -99,7 +109,7 @@ async fn group_and_message_survive_reopen() {
     // The group is still there.
     let groups = alice2.groups().expect("groups after reopen");
     assert_eq!(groups.len(), 1, "group survived reopen");
-    let reopened_id: GroupId = groups[0].mls_group_id.clone();
+    let reopened_id: GroupId = groups[0].id.clone();
     assert_eq!(reopened_id, group_id);
     assert_eq!(groups[0].name, "alice & bob");
 
@@ -139,7 +149,10 @@ async fn local_first_send_persists_pending_message_before_relay_publish() {
     let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob
+        .key_package_event(relays())
+        .await
+        .expect("bob key package");
 
     let alice_identity = Identity::generate();
     let group_id = {
@@ -149,11 +162,13 @@ async fn local_first_send_persists_pending_message_before_relay_publish() {
         let creation = client
             .engine()
             .create_group("alice & bob", vec![bob_kp], Vec::new())
+            .await
             .expect("create local group");
-        let group_id = creation.group.mls_group_id.clone();
+        let group_id = creation.group.id.clone();
         client
             .engine()
             .merge_pending_commit(&group_id)
+            .await
             .expect("merge local group");
 
         client
@@ -187,7 +202,10 @@ async fn restart_watermark_ignores_later_local_messages() {
     let db_path = dir.path().join("marmot.sqlite");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob
+        .key_package_event(relays())
+        .await
+        .expect("bob key package");
 
     let alice_identity = Identity::generate();
     let (bob_message_secs, alice_later_secs) = {
@@ -195,18 +213,16 @@ async fn restart_watermark_ignores_later_local_messages() {
             .expect("open persistent engine");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays())
+            .await
             .expect("create group");
-        let group_id = creation.group.mls_group_id.clone();
+        let group_id = creation.group.id.clone();
 
-        let (bob_pubkey, bob_welcome) = creation
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
             .expect("bob welcome");
-        let bob_wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let bob_wrapped = bob_welcome;
         assert!(matches!(
             bob.process_incoming(&bob_wrapped)
                 .await
@@ -215,11 +231,13 @@ async fn restart_watermark_ignores_later_local_messages() {
         ));
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("merge after simulated welcome delivery");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
         let bob_event = bob
             .create_text_message(&bob_group_id, "peer message while alice was offline")
+            .await
             .expect("bob creates message");
         let bob_message_secs = bob_event.created_at.as_secs();
         assert!(matches!(
@@ -246,6 +264,7 @@ async fn restart_watermark_ignores_later_local_messages() {
         // race where a separately-processed message could strand.
         let (alice_event, alice_incoming) = alice
             .create_and_process_text_message(&group_id, "later local message")
+            .await
             .expect("alice creates and processes later local message");
         let alice_later_secs = alice_event.created_at.as_secs();
         assert!(alice_later_secs > bob_message_secs);
@@ -280,18 +299,24 @@ async fn recent_message_pages_returns_newest_groups_with_bounded_windows() {
 
     for idx in 0..6 {
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+        let bob_kp = bob
+            .key_package_event(relays())
+            .await
+            .expect("bob key package");
         let creation = alice
             .create_group(&format!("chat {idx}"), vec![bob_kp], relays())
+            .await
             .expect("create group");
-        let group_id = creation.group.mls_group_id.clone();
+        let group_id = creation.group.id.clone();
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("merge after simulated welcome delivery");
 
         for msg_idx in 0..3 {
             let event = alice
                 .create_text_message(&group_id, &format!("chat {idx} message {msg_idx}"))
+                .await
                 .expect("create message");
             assert!(matches!(
                 alice
@@ -328,13 +353,20 @@ async fn wrong_key_cannot_open_existing_db() {
         let alice = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
             .expect("open persistent engine");
         // Force the DB to materialize.
-        let _ = alice.key_package_event(relays()).expect("key package");
+        let _ = alice
+            .key_package_event(relays())
+            .await
+            .expect("key package");
     }
 
     // A different key must fail to open the encrypted database.
     let wrong_key = [0x13; 32];
     let result = MarmotEngine::persistent(Identity::generate(), &db_path, wrong_key);
     assert!(result.is_err(), "wrong SQLCipher key must be rejected");
+    assert!(
+        db_path.exists(),
+        "a failed open must not wipe an existing encrypted store"
+    );
 }
 
 #[tokio::test]
@@ -363,6 +395,7 @@ async fn self_heals_an_unencrypted_legacy_database() {
     // The recreated database is a working encrypted store.
     let _ = alice
         .key_package_event(relays())
+        .await
         .expect("usable after self-heal");
     assert_eq!(
         alice.groups().expect("groups").len(),
@@ -385,7 +418,10 @@ async fn wipe_removes_the_database() {
     {
         let alice = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
             .expect("open persistent engine");
-        let _ = alice.key_package_event(relays()).expect("key package");
+        let _ = alice
+            .key_package_event(relays())
+            .await
+            .expect("key package");
     }
     let sync_path = db_path.with_file_name("marmot.sqlite.sonar-sync.json");
     let sync_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-sync.json.tmp");
@@ -405,7 +441,10 @@ async fn wipe_removes_the_database() {
     assert!(sync_tmp_path.exists());
     assert!(outbox_path.exists());
     assert!(outbox_tmp_path.exists());
-    assert!(slot_path.exists(), "publishing a key package must create the slot");
+    assert!(
+        slot_path.exists(),
+        "publishing a key package must create the slot"
+    );
     std::fs::write(&slot_tmp_path, "leftover").expect("stage a crashed rename");
 
     MarmotEngine::wipe(&db_path).expect("wipe");
@@ -449,8 +488,8 @@ async fn key_package_slot_is_stable_across_republish_and_reopen() {
         let engine = MarmotEngine::persistent(identity.clone(), &db_path, DB_KEY)
             .expect("persistent engine");
         // Two publishes in one session, as a relay reconnect would do.
-        d_first = d_tag_of(&engine.key_package_event(relays()).expect("kp 1"));
-        d_second = d_tag_of(&engine.key_package_event(relays()).expect("kp 2"));
+        d_first = d_tag_of(&engine.key_package_event(relays()).await.expect("kp 1"));
+        d_second = d_tag_of(&engine.key_package_event(relays()).await.expect("kp 2"));
     } // engine dropped: the process is "restarted" below.
 
     assert_eq!(
@@ -462,9 +501,8 @@ async fn key_package_slot_is_stable_across_republish_and_reopen() {
     // Same identity: the addressable coordinate is (kind, pubkey, d), so
     // reopening under a different pubkey would be a different slot regardless of
     // the d tag, and the assertion below would prove nothing.
-    let reopened =
-        MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen engine");
-    let d_after_restart = d_tag_of(&reopened.key_package_event(relays()).expect("kp 3"));
+    let reopened = MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen engine");
+    let d_after_restart = d_tag_of(&reopened.key_package_event(relays()).await.expect("kp 3"));
     assert_eq!(
         d_first, d_after_restart,
         "a relaunch must republish into the same slot, not add a new one"
@@ -485,8 +523,8 @@ async fn separate_installs_get_separate_slots() {
     let b = MarmotEngine::persistent(identity, dir_b.path().join("marmot.sqlite"), DB_KEY)
         .expect("engine b");
 
-    let d_a = d_tag_of(&a.key_package_event(relays()).expect("kp a"));
-    let d_b = d_tag_of(&b.key_package_event(relays()).expect("kp b"));
+    let d_a = d_tag_of(&a.key_package_event(relays()).await.expect("kp a"));
+    let d_b = d_tag_of(&b.key_package_event(relays()).await.expect("kp b"));
     assert_ne!(
         d_a, d_b,
         "two installs of the same identity must occupy distinct slots"
@@ -505,7 +543,7 @@ async fn malformed_stored_slot_is_replaced_not_fatal() {
     let identity = Identity::generate();
     let pubkey_hex = identity.public_key().to_hex();
     let engine = MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("engine");
-    let d = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
+    let d = d_tag_of(&engine.key_package_event(relays()).await.expect("kp"));
     assert_eq!(d.len(), 64, "expected a freshly minted 32-byte hex slot");
     assert!(d.chars().all(|c| c.is_ascii_hexdigit()));
 
@@ -527,7 +565,9 @@ async fn malformed_stored_slot_is_replaced_not_fatal() {
     // And it must be rewritten to disk. Without this, "replaced" could silently
     // mean "re-minted on every launch" while this test stays green.
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot rewritten").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot rewritten")
+            .trim(),
         d,
         "the malformed slot must be replaced on disk, not just bypassed"
     );
@@ -562,9 +602,9 @@ async fn committing_a_staged_restore_drops_the_previous_slot() {
 
     // A live install with a published slot.
     {
-        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
-            .expect("engine");
-        engine.key_package_event(relays()).expect("kp");
+        let engine =
+            MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
+        engine.key_package_event(relays()).await.expect("kp");
     }
     assert!(slot_path.exists(), "precondition: live slot exists");
     std::fs::write(&slot_tmp, "leftover").expect("stage a crashed rename");
@@ -599,18 +639,16 @@ async fn unreadable_slot_fails_the_publish_instead_of_substituting_one() {
     let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
     let identity = Identity::generate();
 
-    let engine =
-        MarmotEngine::persistent(identity.clone(), &db_path, DB_KEY).expect("engine");
-    let original = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
+    let engine = MarmotEngine::persistent(identity.clone(), &db_path, DB_KEY).expect("engine");
+    let original = d_tag_of(&engine.key_package_event(relays()).await.expect("kp"));
 
     // New engine so the in-process memo cannot mask the read, then make the slot
     // unreadable the way a locked container would.
     drop(engine);
     let engine = MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen");
-    std::fs::set_permissions(&slot_path, std::fs::Permissions::from_mode(0o000))
-        .expect("chmod");
+    std::fs::set_permissions(&slot_path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
 
-    let result = engine.key_package_event(relays());
+    let result = engine.key_package_event(relays()).await;
 
     std::fs::set_permissions(&slot_path, std::fs::Permissions::from_mode(0o600))
         .expect("restore perms");
@@ -619,7 +657,9 @@ async fn unreadable_slot_fails_the_publish_instead_of_substituting_one() {
         "an unreadable slot must fail the publish, not silently pick another slot"
     );
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot readable again").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot readable again")
+            .trim(),
         original,
         "the stored slot must be untouched by the failed publish"
     );
@@ -645,10 +685,9 @@ async fn a_persistent_install_does_not_use_the_derived_slot() {
     let identity = Identity::generate();
     let pubkey_hex = identity.public_key().to_hex();
 
-    let engine =
-        MarmotEngine::persistent(identity, dir.path().join("marmot.sqlite"), DB_KEY)
-            .expect("engine");
-    let slot = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
+    let engine = MarmotEngine::persistent(identity, dir.path().join("marmot.sqlite"), DB_KEY)
+        .expect("engine");
+    let slot = d_tag_of(&engine.key_package_event(relays()).await.expect("kp"));
 
     // Recomputed here rather than reaching into the engine, so the test also
     // pins the derivation itself.
@@ -695,7 +734,9 @@ async fn a_failed_restore_rename_keeps_the_live_slot() {
 
     assert!(result.is_err(), "a failed rename must surface as an error");
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot must survive").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot must survive")
+            .trim(),
         original,
         "the still-live install must keep its coordinate when the rename fails"
     );
@@ -717,9 +758,9 @@ async fn a_retried_commit_finishes_dropping_the_outgoing_slot() {
     let intent_path = db_path.with_file_name("marmot.sqlite.sonar-restore-intent");
 
     {
-        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
-            .expect("engine");
-        engine.key_package_event(relays()).expect("kp");
+        let engine =
+            MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
+        engine.key_package_event(relays()).await.expect("kp");
     }
     assert!(slot_path.exists(), "precondition: outgoing slot exists");
 
@@ -747,9 +788,9 @@ async fn a_commit_with_no_restore_in_flight_leaves_the_slot_alone() {
     let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
 
     {
-        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
-            .expect("engine");
-        engine.key_package_event(relays()).expect("kp");
+        let engine =
+            MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
+        engine.key_package_event(relays()).await.expect("kp");
     }
     let original = std::fs::read_to_string(&slot_path).expect("slot exists");
 
@@ -757,7 +798,9 @@ async fn a_commit_with_no_restore_in_flight_leaves_the_slot_alone() {
     sonar_core::account_backup::commit_staged_account_restore(&db_path).expect("no-op commit");
 
     assert_eq!(
-        std::fs::read_to_string(&slot_path).expect("slot must survive").trim(),
+        std::fs::read_to_string(&slot_path)
+            .expect("slot must survive")
+            .trim(),
         original.trim(),
         "a healthy install must keep its coordinate"
     );

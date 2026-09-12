@@ -83,9 +83,23 @@ Interpreting a run against a previous one (the "numbers when updating" case):
 - A moved ceiling after an **MDK rev bump** is the signal to watch: it means the
   wire format changed, which is exactly what can break White Noise interop.
 
-Baseline for comparison: the table under [Findings](#findings-2026-07-mdk-rev-e8cd584)
-below is the reference for MDK rev `e8cd584`. When you bump the rev, re-run
-command (1) and diff the ceiling and the welcome-size column against it.
+**Current pin: MDK v0.9.14 (`235c8ade`).** The table under
+[Findings](#findings-2026-07-mdk-rev-e8cd584) is the **0.8 baseline** (rev
+`e8cd584`, wire `0xf2ee`). It is **not** a valid comparison target for 0.9.14
+(`0xf2f1`) until the sim is re-run on this rev.
+
+> **TODO (pending `sonar-sim group-scale` rerun on v0.9.14):** replace the
+> 0.8 table below with a new baseline for `--batch 25` / `--mode incremental`
+> on `235c8ade`. Do **not** invent numbers. Until that run lands, treat the
+> 0.8 ceiling/welcome-size columns as historical only.
+>
+> Reproduce:
+> ```sh
+> cargo run -p sonar-sim --release -- group-scale \
+>   --ramp 2,5,10,25 --mode incremental --batch 25 --no-nip11 \
+>   --out /tmp/scale-mdk09.json
+> ```
+> Full ramp `2,5,10,25,50,100,110,120,130` can follow once the smoke sizes pass.
 
 ## Reproduce with an agent (prompt)
 
@@ -101,13 +115,17 @@ re-measure and report:
 > 3. Report: the group-size ceiling (largest N with `ok=true`) and the reason
 >    the first failing N failed; the `--chaos` `converged`/`post_race_fanout_ok`
 >    values and branch populations; and the welcome-bytes column.
-> 4. Compare against the baseline table in `docs/GROUP-SCALE-SIM.md` (MDK rev
->    `e8cd584`). Flag any *structural* regression — ceiling dropped, a size that
->    used to pass now fails, `converged` flipped, or welcome bytes/member grew.
->    Ignore `build`/`fanout` timing differences (machine-bound). Note the current
->    MDK rev from the workspace `core/Cargo.toml` in your report.
+> 4. Compare against the **current-rev** baseline table in
+>    `docs/GROUP-SCALE-SIM.md`. Until the v0.9.14 table exists, report the raw
+>    JSON and do not treat the 0.8 (`e8cd584`) numbers as a pass/fail gate —
+>    the wire format moved (`0xf2ee` → `0xf2f1`). Flag structural outcomes
+>    (ceiling N, `ok`, `converged`, welcome bytes). Ignore `build`/`fanout`
+>    timings (machine-bound). Note the current MDK rev from `core/Cargo.toml`.
 
-## Findings (2026-07, MDK rev `e8cd584`)
+## Findings (2026-07, MDK rev `e8cd584` — 0.8 historical baseline)
+
+> Historical only. **Do not treat this table as the v0.9.14 baseline.** The
+> protocol profile and welcome/commit encoding changed with the MDK 0.9 port.
 
 ### 1. Hard ceiling ≈ 120 members, gated by the welcome — not the relay
 
