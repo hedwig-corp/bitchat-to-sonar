@@ -299,4 +299,24 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn journal_round_trip_survives_atomic_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = MigrationJournal::new(dir.path(), b"account", b"mint").unwrap();
+        let attempt = MigrationAttempt {
+            settlement_id: "qid".into(),
+            invoice: "lnbc1".into(),
+            payment_hash: "hh".into(),
+            amount_sats: 2_000,
+            source_fee_sats: Some(20),
+            expires_at_secs: None,
+            source_payment_id: None,
+            state: MigrationAttemptState::SourcePaid,
+        };
+        journal.store(Some(&attempt)).unwrap();
+        assert_eq!(journal.load().unwrap().as_ref(), Some(&attempt));
+        journal.store(Some(&attempt)).unwrap();
+        assert_eq!(journal.load().unwrap().as_ref(), Some(&attempt));
+    }
 }

@@ -203,7 +203,7 @@ fun WalletMigrationRoute(state: SonarAppState) {
                             return@launch
                         }
                         MigrationAttemptStateUi.Settled -> {
-                            phase = MigrationPhase.Settled(status.amountSats)
+                            phase = MigrationPhase.Settled(cashuBalance)
                             return@launch
                         }
                         MigrationAttemptStateUi.SourceFailed,

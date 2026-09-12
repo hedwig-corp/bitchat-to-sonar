@@ -70,7 +70,8 @@ data class MigrationAttemptStatusUi(
 )
 
 sealed interface MigrationResultUi {
-    /** Funds are in the Cashu wallet. */
+    /** Funds are in the Cashu wallet.
+     *  `cashuSats` is dest confirmed balance, never the invoice amount. */
     data class Settled(val cashuSats: ULong) : MigrationResultUi
 
     /** Paid, not yet visible. Recoverable, not a failure — settle again.
@@ -100,6 +101,7 @@ fun migrationAttemptNeedsRescue(state: MigrationAttemptStateUi): Boolean =
  * Matches Apple `SonarMigrationModel.phaseAfterOpenStatus` so a relaunch
  * after Breez accepted cannot look like a fresh "Check amount and fee".
  */
+@Suppress("UNUSED_PARAMETER")
 fun phaseAfterOpenStatus(
     state: MigrationAttemptStateUi?,
     attemptAmountSats: ULong,
@@ -110,7 +112,7 @@ fun phaseAfterOpenStatus(
         null,
         MigrationAttemptStateUi.AwaitingConsent,
         MigrationAttemptStateUi.ExpiredUnsent -> MigrationPhase.Idle
-        MigrationAttemptStateUi.Settled -> MigrationPhase.Settled(attemptAmountSats)
+        MigrationAttemptStateUi.Settled -> MigrationPhase.Settled(destConfirmedSats)
         MigrationAttemptStateUi.SourceFailed -> MigrationPhase.Failed(lightningFailedMessage)
         else -> MigrationPhase.PendingSettlement(destConfirmedSats)
     }

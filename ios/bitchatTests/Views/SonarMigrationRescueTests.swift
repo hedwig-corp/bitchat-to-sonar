@@ -100,7 +100,7 @@ final class SonarMigrationRescueTests: XCTestCase {
                 destConfirmedSats: dest,
                 lightningFailedMessage: failed
             ),
-            .settled(cashuSats: 2_000)
+            .settled(cashuSats: dest)
         )
         XCTAssertEqual(
             SonarMigrationModel.phaseAfterOpenStatus(
@@ -112,6 +112,20 @@ final class SonarMigrationRescueTests: XCTestCase {
             .failed(failed)
         )
         XCTAssertFalse(SonarMigrationModel.needsRescue(.settled))
+    }
+
+    func testSettledPhaseCarriesDestConfirmedSatsNotInvoice() {
+        let invoice: UInt64 = 2_000
+        let dest: UInt64 = 500
+        XCTAssertEqual(
+            SonarMigrationModel.phaseAfterOpenStatus(
+                state: .settled,
+                attemptAmountSats: invoice,
+                destConfirmedSats: dest,
+                lightningFailedMessage: "failed"
+            ),
+            .settled(cashuSats: dest)
+        )
     }
 
     func testJournalBytesNeedRescueWithoutOpeningTheMint() {

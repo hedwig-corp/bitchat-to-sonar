@@ -408,6 +408,8 @@ pub struct MigrationQuote {
 #[derive(uniffi::Enum)]
 pub enum MigrationOutcome {
     /// Funds are in the Cashu wallet.
+    /// `cashu_confirmed_sats` is the destination wallet's confirmed balance,
+    /// never the invoice amount.
     Settled { cashu_confirmed_sats: u64 },
     /// Paid, not yet visible. NOT a failure — the wallet keeps reconciling;
     /// call `settle` again (the same call is the crash-resume path).
@@ -666,6 +668,25 @@ mod restore_unsent_plan {
             );
         }
         assert!(!unsent_plan_is_reusable(None));
+    }
+
+    #[test]
+    fn migration_outcome_maps_dest_confirmed_not_invoice_label() {
+        match MigrationOutcome::from(sonar_wallet_migrate::Settlement::Pending { amount_sats: 500 })
+        {
+            MigrationOutcome::Pending {
+                cashu_confirmed_sats,
+            } => assert_eq!(cashu_confirmed_sats, 500),
+            _ => panic!("pending mapped to Settled"),
+        }
+        match MigrationOutcome::from(sonar_wallet_migrate::Settlement::Settled {
+            amount_sats: 2_500,
+        }) {
+            MigrationOutcome::Settled {
+                cashu_confirmed_sats,
+            } => assert_eq!(cashu_confirmed_sats, 2_500),
+            _ => panic!("settled mapped to Pending"),
+        }
     }
 }
 

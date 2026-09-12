@@ -2740,10 +2740,14 @@ uncertainty into permission to spend again.
 
 **Invariant:** source resume is keyed by the journaled BOLT11 `payment_hash`,
 and destination resume is keyed by the journaled `settlement_id`. Aggregate
-Cashu balance growth is never settlement evidence.
+Cashu balance growth is never settlement evidence. Pending and Settled
+outcomes still report the destination's confirmed balance (never the invoice
+amount) so the host copy cannot show a 1,000-sat attempt as a 1,000-sat
+Cashu wallet.
 
 **Breaks as:** an unrelated incoming payment makes the UI report "Migration
-complete" while the paid migration quote is still pending or lost.
+complete" while the paid migration quote is still pending or lost; or the
+settled/pending screen overwrites the Cashu balance with the invoice amount.
 
 **Call sites:** core
 `sonar-wallet-migrate::MigrationEngine.resume` /
@@ -2756,11 +2760,17 @@ complete" while the paid migration quote is still pending or lost.
 
 **Guarded by:** `lib.rs::exact_quote_not_unrelated_credit_settles`,
 `lib.rs::resume_reports_settled_idempotently`,
+`lib.rs::settled_outcome_reports_dest_confirmed_not_invoice`,
 `mock.rs::tracked_receive_requires_its_exact_quote`
 
+**Also guarded by:** `WalletMigrationContractTest.pendingPhaseCarriesDestConfirmedSatsNotInvoice`, `WalletMigrationContractTest.settledPhaseCarriesDestConfirmedSatsNotInvoice`, `SonarMigrationRescueTests.testSettledPhaseCarriesDestConfirmedSatsNotInvoice`, `lib.rs::unpaid_mint_quotes_are_excluded_from_pending_receive`
+
 **Coverage (honest):** the tests pin the engine and wallet contracts with exact
-quote identities. They do not exercise a live CDK mint, Breez payment lookup,
-UniFFI lifting, or either app's pending/settled rendering.
+quote identities, and that Settled/Pending outcomes carry dest confirmed
+sats (including after an unrelated dest credit). They do not exercise a live
+CDK mint, Breez payment lookup, UniFFI lifting, or either app's
+pending/settled rendering. Unpaid mint-quote exclusion is pinned on the
+sum helper, not a live CDK `balance()` call.
 
 **History:** baseline-balance settlement was removed in favor of tracked
 receive identity plus source payment-hash reconciliation.

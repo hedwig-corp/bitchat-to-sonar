@@ -93,7 +93,8 @@ class MoneyTest {
 }
 
 class WalletMigrationContractTest {
-    @Test fun pendingPhaseCarriesDestConfirmedSatsNotInvoice() {
+    @Test
+    fun pendingPhaseCarriesDestConfirmedSatsNotInvoice() {
         val invoiceSats = 2_000uL
         val destConfirmedSats = 500uL
         val pending = MigrationPhase.PendingSettlement(destConfirmedSats)
@@ -102,6 +103,21 @@ class WalletMigrationContractTest {
         assertEquals(destConfirmedSats, result.cashuSats)
         assertNotEquals(invoiceSats, pending.cashuSats)
         assertNotEquals(invoiceSats, result.cashuSats)
+    }
+
+    @Test
+    fun settledPhaseCarriesDestConfirmedSatsNotInvoice() {
+        val invoiceSats = 2_000uL
+        val destConfirmedSats = 500uL
+        val settled = phaseAfterOpenStatus(
+            MigrationAttemptStateUi.Settled,
+            invoiceSats,
+            destConfirmedSats,
+            "failed",
+        )
+        assertEquals(MigrationPhase.Settled(destConfirmedSats), settled)
+        assertEquals(destConfirmedSats, MigrationResultUi.Settled(destConfirmedSats).cashuSats)
+        assertNotEquals(invoiceSats, (settled as MigrationPhase.Settled).cashuSats)
     }
 
     @Test fun executeErrorAfterSourceAcceptedIsPendingNotANewQuote() {
@@ -174,7 +190,7 @@ class WalletMigrationContractTest {
             phaseAfterOpenStatus(MigrationAttemptStateUi.AwaitingConsent, 2_000uL, dest, failed),
         )
         assertEquals(
-            MigrationPhase.Settled(2_000uL),
+            MigrationPhase.Settled(dest),
             phaseAfterOpenStatus(MigrationAttemptStateUi.Settled, 2_000uL, dest, failed),
         )
         assertEquals(

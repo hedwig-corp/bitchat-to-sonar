@@ -67,6 +67,18 @@ const ACCOUNT_MARKER: &str = "cashu.account";
 /// expose no push channel over plain HTTP.
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Unpaid mint quotes must not inflate pending receive. Only Paid quotes
+/// (invoice settled at the mint, proofs not yet issued) belong in the figure.
+fn quoted_pending_receive_sats(
+    quotes: impl IntoIterator<Item = (MintQuoteState, Option<u64>)>,
+) -> u64 {
+    quotes
+        .into_iter()
+        .filter(|(state, _)| *state == MintQuoteState::Paid)
+        .filter_map(|(_, amount)| amount)
+        .fold(0u64, u64::saturating_add)
+}
+
 /// Exactly our artifacts, nothing prefix-shaped: `cashu.redb-backup` or
 /// `cashu.restored-notes` in an over-broad `working_dir` are somebody's data,
 /// and a loose `starts_with` would have handed them to `remove_dir_all` —
@@ -849,16 +861,17 @@ impl WalletBackend for CdkWallet {
                 .map_err(|e| WalletError::Backend(e.to_string()))?;
             // The Balance contract names Cashu unminted quotes as pending
             // receives; CDK's pending-proof balance does not see a quote that
-            // has no proofs yet, so sum active quote amounts in as well.
-            let quoted = wallet
-                .get_active_mint_quotes()
-                .await
-                .map_err(|e| WalletError::Backend(e.to_string()))?
-                .iter()
-                .filter(|q| q.state == MintQuoteState::Paid)
-                .filter_map(|q| q.amount)
-                .map(u64::from)
-                .fold(0u64, u64::saturating_add);
+            // has no proofs yet, so sum Paid quote amounts in as well. Unpaid
+            // quotes (just-issued invoices, abandoned fee-adjustment quotes)
+            // must not inflate the figure.
+            let quoted = quoted_pending_receive_sats(
+                wallet
+                    .get_active_mint_quotes()
+                    .await
+                    .map_err(|e| WalletError::Backend(e.to_string()))?
+                    .iter()
+                    .map(|q| (q.state, q.amount.map(u64::from))),
+            );
             Ok(Balance {
                 confirmed_sats: u64::from(confirmed),
                 pending_receive_sats: u64::from(pending).saturating_add(quoted),
@@ -1379,5 +1392,23 @@ mod tests {
             w.fetch_fiat_rates(),
             Err(WalletError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn unpaid_mint_quotes_are_excluded_from_pending_receive() {
+        assert_eq!(
+            quoted_pending_receive_sats([
+                (MintQuoteState::Unpaid, Some(1_000)),
+                (MintQuoteState::Paid, Some(250)),
+                (MintQuoteState::Issued, Some(400)),
+                (MintQuoteState::Paid, None),
+            ]),
+            250,
+            "only Paid quotes with an amount belong in pending receive"
+        );
+        assert_eq!(
+            quoted_pending_receive_sats([(MintQuoteState::Unpaid, Some(5_000))]),
+            0
+        );
     }
 }

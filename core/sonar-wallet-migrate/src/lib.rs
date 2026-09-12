@@ -94,14 +94,12 @@ pub struct MigrationPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
-    Settled {
-        amount_sats: u64,
-    },
+    /// Destination confirmed balance after the quote issued, never the
+    /// invoice amount. Hosts map this to `cashu_confirmed_sats`.
+    Settled { amount_sats: u64 },
     /// Still waiting on the mint quote. `amount_sats` is the destination's
     /// confirmed balance, never the invoice amount.
-    Pending {
-        amount_sats: u64,
-    },
+    Pending { amount_sats: u64 },
 }
 
 pub struct MigrationEngine<'a> {
@@ -322,7 +320,7 @@ impl<'a> MigrationEngine<'a> {
             let mut attempt = journal.load_unlocked()?.ok_or(MigrateError::NoAttempt)?;
             if attempt.state == MigrationAttemptState::Settled {
                 return Ok(Settlement::Settled {
-                    amount_sats: attempt.amount_sats,
+                    amount_sats: Self::dst(self.dest.confirmed_sats())?,
                 });
             }
             if matches!(
@@ -372,7 +370,9 @@ impl<'a> MigrationEngine<'a> {
                     }
                     attempt.state = MigrationAttemptState::Settled;
                     journal.store_unlocked(Some(&attempt))?;
-                    Ok(Settlement::Settled { amount_sats })
+                    Ok(Settlement::Settled {
+                        amount_sats: Self::dst(self.dest.confirmed_sats())?,
+                    })
                 }
                 Err(error) => Err(MigrateError::Destination(error)),
             }
@@ -510,7 +510,12 @@ mod tests {
 
     impl Destination {
         fn settle(&self, id: &str) {
-            self.quotes.lock().unwrap().get_mut(id).unwrap().1 = true;
+            let mut quotes = self.quotes.lock().unwrap();
+            let (amount_sats, settled) = quotes.get_mut(id).unwrap();
+            if !*settled {
+                *self.confirmed_sats.lock().unwrap() += *amount_sats;
+                *settled = true;
+            }
         }
 
         fn credit(&self, sats: u64) {
@@ -803,7 +808,28 @@ mod tests {
             engine
                 .settle(&plan.settlement_id, 1, Duration::from_secs(1))
                 .unwrap(),
-            Settlement::Settled { amount_sats: 2_000 }
+            Settlement::Settled { amount_sats: 2_500 },
+            "settled must report dest confirmed (prior 500 + issued 2000), not the invoice"
+        );
+    }
+
+    #[test]
+    fn settled_outcome_reports_dest_confirmed_not_invoice() {
+        let (source, destination, _dir, journal) = setup(10_000);
+        let engine = MigrationEngine::new(&source, &destination, limits(None, Some(10)), &journal);
+        destination.credit(500);
+        let plan = engine.plan_amount(2_000).unwrap();
+        engine.execute_once(&plan).unwrap();
+        destination.settle(&plan.settlement_id);
+        assert_eq!(
+            engine.resume(Duration::from_secs(1)).unwrap(),
+            Settlement::Settled { amount_sats: 2_500 }
+        );
+        destination.credit(100);
+        assert_eq!(
+            engine.resume(Duration::from_secs(1)).unwrap(),
+            Settlement::Settled { amount_sats: 2_600 },
+            "already-settled resume must keep reporting dest confirmed, not the journaled invoice"
         );
     }
 

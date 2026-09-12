@@ -347,6 +347,7 @@ final class SonarMigrationModel: ObservableObject {
             self.engine = engine
             self.cashu = cashu
             if let status {
+                await refreshBalances(source: source)
                 apply(status)
                 return
             }
@@ -444,7 +445,7 @@ final class SonarMigrationModel: ObservableObject {
     private func apply(_ status: MigrationAttemptStatus) {
         switch status.state {
         case .settled:
-            phase = .settled(cashuSats: status.amountSats)
+            phase = .settled(cashuSats: cashuBalanceSats)
         case .sourceFailed:
             phase = .failed(String(localized: "The Lightning payment failed without moving funds."))
         case .awaitingConsent:
@@ -505,7 +506,7 @@ final class SonarMigrationModel: ObservableObject {
         case .awaitingConsent, .expiredUnsent:
             return .idle
         case .settled:
-            return .settled(cashuSats: attemptAmountSats)
+            return .settled(cashuSats: destConfirmedSats)
         case .sourceFailed:
             return .failed(lightningFailedMessage)
         default:
