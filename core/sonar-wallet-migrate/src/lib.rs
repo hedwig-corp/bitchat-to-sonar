@@ -672,6 +672,148 @@ mod tests {
         }
     }
 
+    /// Breez accepted (source debited) then the host callback threw. Resume
+    /// must look up the journaled hash, never call `send` again.
+    struct TimeoutAfterAcceptSource {
+        inner: MockWallet,
+        sends: std::sync::atomic::AtomicU64,
+    }
+
+    impl TimeoutAfterAcceptSource {
+        fn new(balance: u64) -> Self {
+            let inner = MockWallet::new(balance);
+            inner.connect().unwrap();
+            Self {
+                inner,
+                sends: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        fn sends(&self) -> u64 {
+            self.sends.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl WalletBackend for TimeoutAfterAcceptSource {
+        fn capabilities(&self) -> WalletCapabilities {
+            self.inner.capabilities()
+        }
+        fn connect(&self) -> sonar_wallet::Result<()> {
+            self.inner.connect()
+        }
+        fn disconnect(&self) -> sonar_wallet::Result<()> {
+            self.inner.disconnect()
+        }
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+        fn balance(&self) -> sonar_wallet::Result<Balance> {
+            self.inner.balance()
+        }
+        fn receive(&self, request: &ReceiveRequest) -> sonar_wallet::Result<String> {
+            self.inner.receive(request)
+        }
+        fn parse_destination(&self, input: &str) -> sonar_wallet::Result<WalletDestination> {
+            self.inner.parse_destination(input)
+        }
+        fn prepare_send(
+            &self,
+            destination: &WalletDestination,
+            amount_sats: Option<u64>,
+        ) -> sonar_wallet::Result<PreparedSend> {
+            self.inner.prepare_send(destination, amount_sats)
+        }
+        fn send(&self, prepared: &PreparedSend, note: &str) -> sonar_wallet::Result<Payment> {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.send(prepared, note)?;
+            Err(WalletError::Backend(
+                "host callback timed out after the source accepted".into(),
+            ))
+        }
+        fn lookup_payment(
+            &self,
+            payment_hash: &str,
+        ) -> sonar_wallet::Result<sonar_wallet::PaymentLookup> {
+            Ok(sonar_wallet::PaymentLookup {
+                status: PaymentLookupStatus::Complete,
+                id: Some(format!("breez-{payment_hash}")),
+                fees_sats: Some(1),
+            })
+        }
+        fn list_recent_payments(&self, limit: u32) -> sonar_wallet::Result<Vec<Payment>> {
+            self.inner.list_recent_payments(limit)
+        }
+        fn add_event_listener(&self, listener: Arc<dyn WalletEventListener>) -> u64 {
+            self.inner.add_event_listener(listener)
+        }
+        fn remove_event_listener(&self, id: u64) {
+            self.inner.remove_event_listener(id)
+        }
+        fn wipe_local_storage(&self) -> sonar_wallet::Result<()> {
+            self.inner.wipe_local_storage()
+        }
+    }
+
+    /// Lookup reports Complete, but `send` must never run. Used for the
+    /// crash-after-`Sending` journal case.
+    struct LookupCompleteSource(MockWallet);
+
+    impl WalletBackend for LookupCompleteSource {
+        fn capabilities(&self) -> WalletCapabilities {
+            self.0.capabilities()
+        }
+        fn connect(&self) -> sonar_wallet::Result<()> {
+            self.0.connect()
+        }
+        fn disconnect(&self) -> sonar_wallet::Result<()> {
+            self.0.disconnect()
+        }
+        fn is_connected(&self) -> bool {
+            self.0.is_connected()
+        }
+        fn balance(&self) -> sonar_wallet::Result<Balance> {
+            self.0.balance()
+        }
+        fn receive(&self, request: &ReceiveRequest) -> sonar_wallet::Result<String> {
+            self.0.receive(request)
+        }
+        fn parse_destination(&self, input: &str) -> sonar_wallet::Result<WalletDestination> {
+            self.0.parse_destination(input)
+        }
+        fn prepare_send(
+            &self,
+            destination: &WalletDestination,
+            amount_sats: Option<u64>,
+        ) -> sonar_wallet::Result<PreparedSend> {
+            self.0.prepare_send(destination, amount_sats)
+        }
+        fn send(&self, _prepared: &PreparedSend, _note: &str) -> sonar_wallet::Result<Payment> {
+            panic!("send must not run once the journal has left AwaitingConsent");
+        }
+        fn lookup_payment(
+            &self,
+            payment_hash: &str,
+        ) -> sonar_wallet::Result<sonar_wallet::PaymentLookup> {
+            Ok(sonar_wallet::PaymentLookup {
+                status: PaymentLookupStatus::Complete,
+                id: Some(format!("breez-{payment_hash}")),
+                fees_sats: Some(1),
+            })
+        }
+        fn list_recent_payments(&self, limit: u32) -> sonar_wallet::Result<Vec<Payment>> {
+            self.0.list_recent_payments(limit)
+        }
+        fn add_event_listener(&self, listener: Arc<dyn WalletEventListener>) -> u64 {
+            self.0.add_event_listener(listener)
+        }
+        fn remove_event_listener(&self, id: u64) {
+            self.0.remove_event_listener(id)
+        }
+        fn wipe_local_storage(&self) -> sonar_wallet::Result<()> {
+            self.0.wipe_local_storage()
+        }
+    }
+
     /// Breez `sendPayment` can return after accept, before Lightning settles.
     struct PendingSendSource(MockWallet);
 
@@ -945,6 +1087,69 @@ mod tests {
             Err(MigrateError::UnsafeToResend(MigrationAttemptState::Sending))
         ));
         assert_eq!(source.balance().unwrap().confirmed_sats, 10_000);
+    }
+
+    #[test]
+    fn crash_after_sending_resumes_via_lookup_without_resend() {
+        let inner = MockWallet::new(10_000);
+        inner.connect().unwrap();
+        let source = LookupCompleteSource(inner);
+        let destination = Destination::default();
+        let dir = tempfile::tempdir().unwrap();
+        let journal = MigrationJournal::new(dir.path(), b"account", b"mint").unwrap();
+        let engine = MigrationEngine::new(&source, &destination, limits(None, Some(10)), &journal);
+        let plan = engine.plan_amount(1_000).unwrap();
+        let mut attempt = journal.load().unwrap().unwrap();
+        attempt.state = MigrationAttemptState::Sending;
+        journal.store(Some(&attempt)).unwrap();
+        assert!(matches!(
+            engine.execute_once(&plan),
+            Err(MigrateError::UnsafeToResend(MigrationAttemptState::Sending))
+        ));
+        destination.settle(&plan.settlement_id);
+        assert_eq!(
+            engine.resume(Duration::from_secs(1)).unwrap(),
+            Settlement::Settled { amount_sats: 1_000 },
+            "Sending + lookup Complete must settle the exact quote without calling send"
+        );
+        assert_eq!(
+            journal.load().unwrap().unwrap().state,
+            MigrationAttemptState::Settled
+        );
+    }
+
+    #[test]
+    fn timeout_after_source_accept_resumes_via_lookup_without_resend() {
+        let source = TimeoutAfterAcceptSource::new(10_000);
+        let destination = Destination::default();
+        let dir = tempfile::tempdir().unwrap();
+        let journal = MigrationJournal::new(dir.path(), b"account", b"mint").unwrap();
+        let engine = MigrationEngine::new(&source, &destination, limits(None, Some(10)), &journal);
+        let plan = engine.plan_amount(1_000).unwrap();
+        assert!(engine.execute_once(&plan).is_err());
+        assert_eq!(source.sends(), 1);
+        assert_eq!(
+            journal.load().unwrap().unwrap().state,
+            MigrationAttemptState::PaymentUnknown
+        );
+        assert_eq!(
+            source.balance().unwrap().confirmed_sats,
+            8_999,
+            "Breez already accepted: 1000 + 1 sat mock fee left the source"
+        );
+        assert!(matches!(
+            engine.execute_once(&plan),
+            Err(MigrateError::UnsafeToResend(
+                MigrationAttemptState::PaymentUnknown
+            ))
+        ));
+        assert_eq!(source.sends(), 1, "retry must not pay the invoice twice");
+        destination.settle(&plan.settlement_id);
+        assert_eq!(
+            engine.resume(Duration::from_secs(1)).unwrap(),
+            Settlement::Settled { amount_sats: 1_000 }
+        );
+        assert_eq!(source.sends(), 1);
     }
 
     #[test]

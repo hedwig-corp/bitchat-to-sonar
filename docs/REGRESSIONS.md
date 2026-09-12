@@ -2709,9 +2709,14 @@ rescue: Compose `SonarAppState.setupWallet` /
 
 **Also guarded by:** `WalletMigrationContractTest.acceptedBreezSendWithoutPreimageIsPending`, `BreezMigrationSourceTests.testAcceptedBreezSendWithoutPreimageIsPending`, `SonarMigrationRescueTests.testCancelledAcquireDoesNotKeepTheLock`, `lib.rs::accepted_pending_send_journals_source_pending_and_refuses_a_new_plan`
 
+**Also guarded by:** `lib.rs::crash_after_sending_resumes_via_lookup_without_resend`, `lib.rs::timeout_after_source_accept_resumes_via_lookup_without_resend`
+
 **Coverage (honest):** the Rust tests pin refusal from a durable `Sending`
-journal, fail-closed parsing, and a source-send error leaving `PaymentUnknown`
-so a second `plan` is refused. The host tests pin the UI mapping that turns those
+journal, fail-closed parsing, a source-send error leaving `PaymentUnknown`
+so a second `plan` is refused, resume-from-`Sending` via payment-hash
+lookup without a second `send`, and a host timeout after the source already
+debited (Breez-accepted-then-threw) settling the exact quote on `resume`
+without a second send. The host tests pin the UI mapping that turns those
 states into "Paid — waiting on the mint" instead of a new quote, including the
 relaunch-open mapping (`restoreOpenedMigration` / `phaseAfterOpenStatus`) and
 a file-only journal peek so the home strip, Settings, and Wallet can offer
