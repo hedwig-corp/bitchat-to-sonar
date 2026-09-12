@@ -176,20 +176,23 @@ final class SonarMigrationRescueTests: XCTestCase {
         let second = await gate.tryAcquire()
         XCTAssertFalse(second, "a launch-time rescue must not open the store the screen owns")
         await gate.release()
-        XCTAssertTrue(await gate.tryAcquire())
+        let reacquired = await gate.tryAcquire()
+        XCTAssertTrue(reacquired)
         await gate.release()
     }
 
     func testCancelledAcquireDoesNotKeepTheLock() async {
         let gate = CashuMigrationStoreGate()
-        XCTAssertTrue(await gate.tryAcquire())
+        let acquired = await gate.tryAcquire()
+        XCTAssertTrue(acquired)
         let waiter = Task { await gate.acquire() }
         try? await Task.sleep(nanoseconds: 50_000_000)
         waiter.cancel()
         await gate.release()
         let got = await waiter.value
         XCTAssertFalse(got, "a cancelled migration screen must not keep cashu.redb")
-        XCTAssertTrue(await gate.tryAcquire(), "rescue must be able to take the lock after a cancelled waiter")
+        let afterCancel = await gate.tryAcquire()
+        XCTAssertTrue(afterCancel, "rescue must be able to take the lock after a cancelled waiter")
         await gate.release()
     }
 
