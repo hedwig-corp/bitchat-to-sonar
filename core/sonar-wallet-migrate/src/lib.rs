@@ -814,6 +814,92 @@ mod tests {
         }
     }
 
+    /// Peek the durable journal file from `send` (not `journal.load()` — that
+    /// mutex is held by `execute_once`). Vincenzo's critical: memory no longer
+    /// has the plan, so Sending must already be on disk before the source is
+    /// called.
+    struct JournalPeekOnSendSource {
+        inner: MockWallet,
+        working_dir: std::path::PathBuf,
+        state_at_send: Mutex<Option<String>>,
+    }
+
+    impl JournalPeekOnSendSource {
+        fn new(balance: u64, working_dir: std::path::PathBuf) -> Self {
+            let inner = MockWallet::new(balance);
+            inner.connect().unwrap();
+            Self {
+                inner,
+                working_dir,
+                state_at_send: Mutex::new(None),
+            }
+        }
+
+        fn state_at_send(&self) -> Option<String> {
+            self.state_at_send.lock().unwrap().clone()
+        }
+    }
+
+    impl WalletBackend for JournalPeekOnSendSource {
+        fn capabilities(&self) -> WalletCapabilities {
+            self.inner.capabilities()
+        }
+        fn connect(&self) -> sonar_wallet::Result<()> {
+            self.inner.connect()
+        }
+        fn disconnect(&self) -> sonar_wallet::Result<()> {
+            self.inner.disconnect()
+        }
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+        fn balance(&self) -> sonar_wallet::Result<Balance> {
+            self.inner.balance()
+        }
+        fn receive(&self, request: &ReceiveRequest) -> sonar_wallet::Result<String> {
+            self.inner.receive(request)
+        }
+        fn parse_destination(&self, input: &str) -> sonar_wallet::Result<WalletDestination> {
+            self.inner.parse_destination(input)
+        }
+        fn prepare_send(
+            &self,
+            destination: &WalletDestination,
+            amount_sats: Option<u64>,
+        ) -> sonar_wallet::Result<PreparedSend> {
+            self.inner.prepare_send(destination, amount_sats)
+        }
+        fn send(&self, prepared: &PreparedSend, note: &str) -> sonar_wallet::Result<Payment> {
+            let json = std::fs::read_to_string(self.working_dir.join(JOURNAL_FILE))
+                .expect("Sending journal must exist before source send");
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            *self.state_at_send.lock().unwrap() = value
+                .get("attempt")
+                .and_then(|a| a.get("state"))
+                .and_then(|s| s.as_str())
+                .map(str::to_owned);
+            self.inner.send(prepared, note)
+        }
+        fn lookup_payment(
+            &self,
+            payment_hash: &str,
+        ) -> sonar_wallet::Result<sonar_wallet::PaymentLookup> {
+            self.inner.lookup_payment(payment_hash)
+        }
+        fn list_recent_payments(&self, limit: u32) -> sonar_wallet::Result<Vec<Payment>> {
+            self.inner.list_recent_payments(limit)
+        }
+        fn add_event_listener(&self, listener: Arc<dyn WalletEventListener>) -> u64 {
+            self.inner.add_event_listener(listener)
+        }
+        fn remove_event_listener(&self, id: u64) {
+            self.inner.remove_event_listener(id)
+        }
+        fn wipe_local_storage(&self) -> sonar_wallet::Result<()> {
+            self.inner.wipe_local_storage()
+        }
+    }
+
     /// Breez `sendPayment` can return after accept, before Lightning settles.
     struct PendingSendSource(MockWallet);
 
@@ -1115,6 +1201,22 @@ mod tests {
         assert_eq!(
             journal.load().unwrap().unwrap().state,
             MigrationAttemptState::Settled
+        );
+    }
+
+    #[test]
+    fn execute_once_journals_sending_before_source_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = JournalPeekOnSendSource::new(10_000, dir.path().to_path_buf());
+        let destination = Destination::default();
+        let journal = MigrationJournal::new(dir.path(), b"account", b"mint").unwrap();
+        let engine = MigrationEngine::new(&source, &destination, limits(None, Some(10)), &journal);
+        let plan = engine.plan_amount(1_000).unwrap();
+        engine.execute_once(&plan).unwrap();
+        assert_eq!(
+            source.state_at_send().as_deref(),
+            Some("Sending"),
+            "a crash during send must find Sending on disk, not a reusable plan"
         );
     }
 
