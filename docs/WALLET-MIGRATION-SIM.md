@@ -166,6 +166,39 @@ reads like a fee-reserve problem and sends you chasing the wrong bug. **Budget
 ≥ ~1,050 sats for any live test**, and check the limits endpoint before
 assuming a payment failure is ours.
 
+## Live Breez → Cashu (real sats)
+
+Omit `--source-mint`. The CLI then uses the Breez Liquid wallet as source and
+`https://mint.hedwig.sh` as destination. This spends real Lightning funds and
+is the remaining merge gate for the migration PR: fake-mint simulation cannot
+prove Boltz routing, Breez payment lookup, or mint issuance.
+
+Do not run this unattended. It needs an explicit spend decision, a Breez
+balance ≥ ~1,050 sats, `BREEZ_API_KEY` in the environment (never argv), and
+`SONAR_NSEC` of the account that holds the Lightning funds. Record
+`settlement_id`, `payment_hash`, and both balances before and after; `status`
+and `settle` never spend.
+
+```bash
+# From core/sonar-wallet-breez (own workspace + Cargo.lock).
+test -n "$BREEZ_API_KEY" || { echo "BREEZ_API_KEY unset"; exit 1; }
+test -n "$SONAR_NSEC" || { echo "SONAR_NSEC unset"; exit 1; }
+cargo build --bin sonar-migrate-cli
+BIN=./target/debug/sonar-migrate-cli
+ARGS=(--mint https://mint.hedwig.sh
+      --breez-dir ~/.sonar-wallet --cashu-dir ~/.sonar-cashu-live)
+
+"$BIN" "${ARGS[@]}" status
+"$BIN" "${ARGS[@]}" quote --amount-sats 1000
+# Spends once:
+"$BIN" "${ARGS[@]}" migrate --amount-sats 1000 --max-fee-sats 50 --accept-custody-change
+"$BIN" "${ARGS[@]}" settle --settle-polls 24
+```
+
+A migrate without `--accept-custody-change` must refuse. If `migrate` returns
+Pending, only `settle` (or the app's "Check again") may continue — never a
+second `migrate`. The journal is `$cashu_dir/cashu.migration.v1.json`.
+
 ## Pending settlement and drain safeguards
 
 Each destination reconciliation call has a request timeout. A timeout leaves
