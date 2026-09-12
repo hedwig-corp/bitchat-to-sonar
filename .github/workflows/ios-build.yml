@@ -6,10 +6,11 @@ name: iOS build
 # (missing `import BitLogger`) and another where an FFI signature change broke
 # the Apple build; both were found by hand, days apart.
 #
-# This job only proves the app COMPILES. It cannot catch runtime bugs — the
-# launch-surface hang in #368 compiled perfectly. Catching that class needs a
-# smoke launch (boot a simulator, install, assert the launch surface goes away),
-# which wants a UI test target and is deliberately left as a follow-up.
+# This job proves the app COMPILES, then runs a bounded wallet XCTest slice
+# (BreezMigrationSourceTests + SonarMigrationRescueTests) so Apple
+# HostWalletError lifting and journal-rescue mapping cannot rot behind a
+# compile-only floor. It still cannot catch launch-surface hangs — that needs
+# a UI smoke install and is deliberately left as a follow-up.
 
 on:
   pull_request:
@@ -31,6 +32,7 @@ jobs:
   ios-build:
     name: iOS app builds
     runs-on: macos-15
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -70,6 +72,38 @@ jobs:
             -scheme 'bitchat (iOS)' \
             -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      # R-047: JVM CI already crosses UniFFI; without this the Apple
+      # HostWalletError XCTest is a citation that never runs. Bounded on
+      # purpose — ios/bitchatTests as a whole is still not a CI job.
+      - name: Wallet migration XCTests
+        run: |
+          set -euo pipefail
+          UDID=$(python3 - <<'PY'
+          import re, subprocess
+          out = subprocess.check_output(["xcrun", "simctl", "list", "devices", "available"], text=True)
+          for line in out.splitlines():
+              if "iPhone" not in line:
+                  continue
+              m = re.search(r"\(([0-9A-Fa-f-]{36})\)", line)
+              if m:
+                  print(m.group(1))
+                  break
+          else:
+              raise SystemExit("no available iPhone simulator")
+          PY
+          )
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          xcodebuild test \
+            -project ios/bitchat.xcodeproj \
+            -scheme 'bitchat (iOS)' \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
+            -only-testing:bitchatTests_iOS/BreezMigrationSourceTests \
+            -only-testing:bitchatTests_iOS/SonarMigrationRescueTests \
             CODE_SIGNING_ALLOWED=NO
