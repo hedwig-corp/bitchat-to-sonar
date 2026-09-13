@@ -3759,6 +3759,65 @@ mod historical_fold_tests {
         assert_eq!(pages[0].messages.len(), 2);
     }
 
+    /// A backup taken after resume-chat must keep the fold. Otherwise restore
+    /// splits the person into a recovered row and a live 0.9 row.
+    #[test]
+    fn historical_fold_survives_account_backup_restore() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let key = [0x42u8; 32];
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        {
+            let engine =
+                MarmotEngine::persistent(alice.clone(), &db_path, key).expect("fresh 0.9 store");
+            engine.push_transcript_message(chat(
+                1,
+                historical.as_slice(),
+                bob.public_key(),
+                "old hello",
+                false,
+            ));
+            engine.push_transcript_message(chat(
+                2,
+                live.as_slice(),
+                alice.public_key(),
+                "new hello",
+                true,
+            ));
+            engine.record_historical_fold(&historical, &live);
+            drop(engine);
+        }
+        let key_hex = hex::encode(key);
+        let package = crate::account_backup::read_account_backup_package(&db_path, &key_hex)
+            .expect("seal after resume-chat");
+        assert!(
+            package
+                .sidecar_files
+                .iter()
+                .any(|(name, bytes)| name == HISTORICAL_FOLDS_FILE_SUFFIX && !bytes.is_empty()),
+            "fold mapping must be inside the backup"
+        );
+        let restore_dir = tempfile::tempdir().expect("restore dir");
+        let restore_path = restore_dir.path().join("marmot.sqlite");
+        crate::account_backup::write_account_backup_package(&restore_path, &package)
+            .expect("restore");
+        let restored =
+            MarmotEngine::persistent(alice, &restore_path, key).expect("restored store plus fold");
+        assert_eq!(restored.live_fold_target(&historical).as_ref(), Some(&live));
+        let from_old = restored.messages(&historical).expect("union after restore");
+        assert_eq!(from_old.len(), 2);
+        assert!(from_old.iter().any(|m| m.content == "old hello"));
+        assert!(from_old.iter().any(|m| m.content == "new hello"));
+        let pages = restored
+            .recent_message_pages(8, 8)
+            .expect("home list after restore");
+        assert_eq!(pages.len(), 1, "restore must not split the person");
+        assert_eq!(pages[0].group_id, live);
+    }
+
     fn photo(url: &str, hash: Option<[u8; 32]>, nonce: Option<[u8; 12]>) -> MediaRef {
         MediaRef {
             url: url.to_owned(),

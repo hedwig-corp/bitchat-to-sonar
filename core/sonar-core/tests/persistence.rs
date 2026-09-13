@@ -1018,12 +1018,27 @@ async fn mdk08_account_backup_preserves_recovered_transcript() {
         .expect("restore package");
     let restored = MarmotEngine::persistent(alice, &restore_path, DB_KEY)
         .expect("restored 0.9 store plus sidecars");
-    let recovered = restored
-        .messages(&sonar_core::GroupId::new(group_id))
-        .expect("transcript after restore");
+    let gid = sonar_core::GroupId::new(group_id);
+    let recovered = restored.messages(&gid).expect("transcript after restore");
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].id, event_id);
     assert_eq!(recovered[0].content, "keep this chat");
+    let listed = restored
+        .historical_groups()
+        .expect("restored recovered chats must be listable");
+    assert_eq!(listed.len(), 1);
+    assert!(
+        listed[0].members.contains(&bob.public_key()),
+        "resume peers must survive nsec restore"
+    );
+    let index = sonar_core::conversation_index::ConversationIndex::open_in_memory().expect("index");
+    index
+        .materialize_from(&restored)
+        .expect("chat-list seed after restore");
+    let summaries = index.summaries_ordered().expect("summaries");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].latest_content, "keep this chat");
+    assert_eq!(summaries[0].name, "alice & bob");
 }
 
 /// Leftover bak rows must survive a post-migrate backup. Otherwise nsec

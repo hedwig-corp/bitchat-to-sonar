@@ -151,6 +151,7 @@ Guarded by:
 - `persistence::mdk08_account_backup_preserves_remainder_after_restore`
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
+- `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
 
 ## Account backup after upgrade
 
