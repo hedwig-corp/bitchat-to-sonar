@@ -1382,3 +1382,81 @@ async fn recovered_08_group_resumes_on_a_new_09_group_through_a_relay() {
         1
     );
 }
+
+/// A recovered room must stay usable when only some members have updated.
+/// The send goes to whoever published a 0.9 KeyPackage; it must not fail
+/// the whole room, and it must not fold onto a 1:1 with that one peer.
+#[tokio::test]
+async fn recovered_08_group_resumes_with_whichever_peers_have_updated() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("room resumes with the reachable member");
+
+    let live = alice.groups().expect("live groups");
+    assert_eq!(live.len(), 1);
+    let members = alice.members(&live[0].id).expect("live members");
+    assert_eq!(members.len(), 2, "alice + bob; carol is still on 0.8");
+    assert!(!members.contains(&carol.identity().public_key()));
+    assert_eq!(alice.conversation_summaries().len(), 1);
+
+    carol.sync().await.expect("carol syncs");
+    assert!(
+        carol
+            .pending_group_invites()
+            .expect("carol invites")
+            .is_empty(),
+        "carol must not be invited until they publish a 0.9 key package"
+    );
+    assert!(carol.groups().expect("carol groups").is_empty());
+
+    bob.sync().await.expect("bob syncs welcome");
+    let bob_invite = bob
+        .pending_group_invites()
+        .expect("bob invites")
+        .into_iter()
+        .next()
+        .expect("bob is invited to the resumed room");
+    bob.accept_group_invite(&bob_invite.id)
+        .await
+        .expect("bob accepts");
+    bob.sync().await.expect("bob syncs after accept");
+    assert_eq!(
+        bob.messages(&bob.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "bob already updated")
+            .count(),
+        1
+    );
+}

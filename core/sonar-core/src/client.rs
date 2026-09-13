@@ -2533,6 +2533,30 @@ impl SonarClient {
         self.publish_group_creation(creation).await
     }
 
+    /// Best-effort KeyPackages for a recovered 0.8 resume. Missing packages
+    /// (peer still on 0.8 / unpublished) are skipped. Relay/fetch failures
+    /// still fail the send — a down relay is not "they have not updated".
+    async fn fetch_resume_key_packages(&self, members: &[PublicKey]) -> Result<Vec<Event>> {
+        let mut packages = Vec::new();
+        let mut relay_err = None;
+        for member in members {
+            if *member == self.identity().public_key() {
+                continue;
+            }
+            match self.fetch_key_package(*member).await {
+                Ok(event) => packages.push(event),
+                Err(Error::KeyPackageNotFound(_)) => {}
+                Err(err) => relay_err = Some(err),
+            }
+        }
+        if packages.is_empty() {
+            if let Some(err) = relay_err {
+                return Err(err);
+            }
+        }
+        Ok(packages)
+    }
+
     async fn fetch_key_packages_for_members(&self, members: Vec<PublicKey>) -> Result<Vec<Event>> {
         let mut deduped = Vec::new();
         let mut seen = HashSet::new();
@@ -7002,14 +7026,27 @@ impl SonarClient {
             .engine
             .historical_group_name(group_id)
             .unwrap_or_default();
-        let live = match peers.as_slice() {
-            [] => {
-                return Err(Error::InvalidInput(
-                    "this recovered chat cannot send until the other members update Sonar".into(),
-                ))
-            }
-            [peer] => self.start_dm(*peer, &name).await?,
-            many => self.start_group(many.to_vec(), &name).await?,
+        if peers.is_empty() {
+            return Err(Error::InvalidInput(
+                "this recovered chat cannot send until the other members update Sonar".into(),
+            ));
+        }
+        let packages = self.fetch_resume_key_packages(&peers).await?;
+        if packages.is_empty() {
+            return Err(Error::KeyPackageNotFound(peers[0]));
+        }
+        // A recovered room with only some peers on 0.9 must stay a group, even
+        // when one reachable member would look like a DM. Reusing start_dm
+        // would fold the room onto an existing 1:1 with that peer.
+        let live = if peers.len() == 1 {
+            self.start_dm_with_key_package(packages.into_iter().next().expect("nonempty"), &name)
+                .await?
+        } else {
+            let creation = self
+                .engine
+                .create_group(&name, packages, self.relays.clone())
+                .await?;
+            self.publish_group_creation(creation).await?
         };
         self.record_resume_fold(group_id, &live);
         Ok(live)
