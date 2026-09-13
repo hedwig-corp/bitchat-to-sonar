@@ -2147,23 +2147,67 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
     )
     .expect("keep only the chat name");
     std::fs::write(
+        db_path.with_file_name("marmot.sqlite.sonar-historical-members.json"),
+        format!("{{\"{chat_hex}\":[\"{}\"]}}", bob.public_key().to_hex()),
+    )
+    .expect("keep only the chat peer");
+    std::fs::write(
         db_path.with_file_name("marmot.sqlite.sonar-mdk08-migrated.json"),
         serde_json::json!({ "status": "complete", "from": "mdk-0.8" }).to_string(),
     )
     .expect("old marker without metadata_backfill");
 
-    let engine =
-        MarmotEngine::persistent(alice, &db_path, DB_KEY).expect("reopen must backfill from bak");
+    // Real upgraded installs already have a conversation-index file. Seed only
+    // the chat that the old extract knew about so connect() has to
+    // seed_missing_recovered — not materialize_from on an empty index.
+    let index_path = sonar_core::conversation_index::index_db_path_for_db(&db_path);
+    let index = sonar_core::conversation_index::ConversationIndex::open(&index_path, DB_KEY)
+        .expect("0.8-era index");
+    index
+        .upsert_summary(
+            &chat_hex,
+            "alice & bob",
+            "photo",
+            &bob.public_key().to_string(),
+            1_700_000_000,
+            false,
+            true,
+        )
+        .expect("existing chat row");
+    drop(index);
+
+    let client = SonarClient::connect(alice, Vec::new(), &db_path, DB_KEY)
+        .await
+        .expect("connectLocal must backfill then seed the chat list");
     let welcome = GroupId::new(welcome_id);
-    let listed = engine.historical_groups().expect("list after backfill");
+    let listed = client.historical_groups().expect("list after backfill");
+    let welcome_row = listed
+        .iter()
+        .find(|g| g.id == welcome && g.name == "pending room")
+        .expect("pending welcome must come back from the quarantined bak");
     assert!(
-        listed
+        welcome_row
+            .members
             .iter()
-            .any(|g| g.id == welcome && g.name == "pending room"),
-        "pending welcome must come back from the quarantined bak: {listed:?}"
+            .any(|pk| *pk == welcomer.public_key()),
+        "backfill must restore the welcomer so resume has a peer: {welcome_row:?}"
+    );
+    let summaries = client.conversation_summaries();
+    let chat_row = summaries
+        .iter()
+        .find(|s| s.name == "alice & bob")
+        .expect("upgraded chat row must stay");
+    assert_eq!(
+        chat_row.unread_count, 1,
+        "backfill must not reset unread on the existing index row: {chat_row:?}"
+    );
+    assert!(
+        summaries.iter().any(|s| s.name == "pending room"),
+        "connect() must seed the recovered invite onto the home list: {summaries:?}"
     );
     let chat = GroupId::new(chat_id);
-    let plain = engine
+    let plain = client
+        .engine()
         .decrypt_media_by_url(&chat, url, &upload.encrypted_data)
         .expect("labeled secret must come back from the bak");
     assert_eq!(plain, b"photo-bytes");

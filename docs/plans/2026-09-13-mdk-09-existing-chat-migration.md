@@ -149,6 +149,8 @@ Guarded by:
 - `mdk08_migrate::copies_imeta_and_p_tags_from_stored_message_tags`
 - `marmot::historical_fold_tests::recovered_08_media_is_unavailable_even_with_imeta`
 - `client::tests::fetch_media_rejects_recovered_08_attachments_before_http`
+- `client::tests::fetch_media_with_stored_08_exporter_is_not_unavailable`
+  (pins `fetch_media` + iOS `fetch_media_to_file` after a labeled secret is stored)
 - `e2e::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
@@ -172,6 +174,9 @@ Guarded by:
 - `persistence::mdk08_media_exporter_secret_survives_migrate_and_backup`
 - `mdk08_migrate::metadata_backfill_is_one_shot_after_the_marker_lands`
 - `persistence::mdk08_bak_backfills_welcome_and_media_secrets_on_reopen`
+  (pins `SonarClient::connect` → `conversation_summaries()` on a non-empty
+  0.8-era index: pending welcome + welcomer resume peers land, existing
+  unread is not reset)
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`

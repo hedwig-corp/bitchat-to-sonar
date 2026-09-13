@@ -390,6 +390,9 @@ class ConversationFoldTest {
             ),
         )
         assertFalse(recoveredLegacyMediaUnavailable("hash verification failed"))
+        assertFalse(
+            recoveredLegacyMediaUnavailable("error sending request for url (https://127.0.0.1:1/old.bin)"),
+        )
         assertEquals(
             "This attachment is from an older Sonar and can't be opened after the update.",
             RECOVERED_LEGACY_MEDIA_COPY,

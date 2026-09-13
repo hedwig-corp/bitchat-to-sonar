@@ -9069,6 +9069,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_media_with_stored_08_exporter_is_not_unavailable() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let url = "https://127.0.0.1:1/old.bin";
+        client.engine().push_transcript_message(ChatMessage {
+            id: EventId::from_slice(&[1u8; 32]).expect("event id"),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: true,
+            delivery_state: DeliveryState::Sent,
+            media: vec![crate::marmot::MediaRef {
+                url: url.to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                filename: "old.jpg".to_owned(),
+                width: Some(100),
+                height: Some(80),
+                duration_ms: None,
+                original_hash: Some([1u8; 32]),
+                nonce: Some([2u8; 12]),
+            }],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+            reply: None,
+        });
+        client
+            .engine()
+            .add_historical_media_secret(historical.clone(), vec![0xABu8; 32]);
+        assert!(
+            !client
+                .engine()
+                .recovered_08_media_unavailable(&historical, url),
+            "a stored exporter must leave the host download path open"
+        );
+        let err = client
+            .fetch_media(&historical, url)
+            .await
+            .expect_err("loopback download should fail after the unavailable gate");
+        assert!(
+            !err.to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "hosts must attempt download when the 0.8 exporter was copied: {err}"
+        );
+        struct NoopDownload;
+        impl MediaDownloadObserver for NoopDownload {
+            fn on_progress(&self, _: u64, _: Option<u64>) {}
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+        let dest_dir = tempfile::tempdir().expect("media dest");
+        let dest = dest_dir.path().join("old.bin.partial");
+        let file_err = client
+            .fetch_media_to_file(&historical, url, &dest, &NoopDownload)
+            .await
+            .expect_err("iOS fetch_media_to_file must pass the same gate");
+        assert!(
+            !file_err
+                .to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "hosts writing to a file must also attempt download: {file_err}"
+        );
+    }
+
+    #[tokio::test]
     async fn send_text_on_unknown_group_is_not_a_recovered_chat_error() {
         let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await

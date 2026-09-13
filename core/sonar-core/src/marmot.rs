@@ -785,7 +785,7 @@ pub struct MarmotEngine {
     pending_mdk08: Mutex<Option<crate::mdk08_migrate::PendingMdk08Remainder>>,
     /// MIP-04 exporter secrets copied from the 0.8 `group_exporter_secrets`
     /// table (`encrypted-media` label). Used only to decrypt recovered blobs.
-    historical_media_secrets: HashMap<GroupId, Vec<Vec<u8>>>,
+    historical_media_secrets: Mutex<HashMap<GroupId, Vec<Vec<u8>>>>,
     /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
     _tempdir: Option<tempfile::TempDir>,
 }
@@ -976,7 +976,7 @@ impl MarmotEngine {
             historical_members,
             historical_folds: Mutex::new(historical_folds),
             pending_mdk08: Mutex::new(pending_mdk08),
-            historical_media_secrets,
+            historical_media_secrets: Mutex::new(historical_media_secrets),
             _tempdir: None,
         })
     }
@@ -1398,9 +1398,13 @@ impl MarmotEngine {
     }
 
     fn historical_media_secrets_for(&self, group_id: &GroupId) -> Vec<Vec<u8>> {
+        let map = self
+            .historical_media_secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = Vec::new();
         for id in self.fold_family(group_id) {
-            if let Some(secrets) = self.historical_media_secrets.get(&id) {
+            if let Some(secrets) = map.get(&id) {
                 for secret in secrets {
                     if !out.iter().any(|existing| existing == secret) {
                         out.push(secret.clone());
@@ -2943,8 +2947,10 @@ impl MarmotEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn add_historical_media_secret(&mut self, group_id: GroupId, secret: Vec<u8>) {
+    pub(crate) fn add_historical_media_secret(&self, group_id: GroupId, secret: Vec<u8>) {
         self.historical_media_secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(group_id)
             .or_default()
             .push(secret);
@@ -3955,7 +3961,7 @@ mod historical_fold_tests {
     fn recovered_08_media_decrypts_with_stored_exporter_secret() {
         let alice = Identity::generate();
         let bob = Identity::generate();
-        let mut engine = MarmotEngine::in_memory(alice.clone());
+        let engine = MarmotEngine::in_memory(alice.clone());
         let historical = GroupId::new(vec![0x11; 16]);
         let url = "https://blossom.example/old.bin";
         let secret = vec![0xABu8; 32];

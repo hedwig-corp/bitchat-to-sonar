@@ -50,6 +50,11 @@ struct SonarConversationFoldTests {
         )
         #expect(!snRecoveredLegacyMediaUnavailable("hash verification failed"))
         #expect(
+            !snRecoveredLegacyMediaUnavailable(
+                "error sending request for url (https://127.0.0.1:1/old.bin)"
+            )
+        )
+        #expect(
             SNRecoveredLegacyMediaCopy
                 == "This attachment is from an older Sonar and can't be opened after the update."
         )
