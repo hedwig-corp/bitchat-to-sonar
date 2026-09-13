@@ -64,8 +64,10 @@ What the user does **not** keep automatically:
 
 - The ability to send into the old 0.8 MLS group. That group is dead on
   this device once the 0.9 store is the live engine.
-- Media decrypt keys that lived only in 0.8 imeta rows (v1 copies text;
-  MIP-04 attachment recovery is a follow-up).
+- Media **decrypt** keys that lived only in the 0.8 MLS exporter secret.
+  v1 copies `imeta` / sticker / reply tags onto the transcript so the
+  attachment still renders as a row; opening the blob still needs a
+  follow-up MIP-04 recovery path.
 - Pending 0.8 welcomes that were never accepted.
 
 ## Runtime path (implemented on this PR)
@@ -110,6 +112,7 @@ Guarded by:
 - `e2e::recovered_08_group_adds_late_member_on_sync_without_a_local_send`
   (pins `ensure_subscriptions`, the host idle path)
 - `mdk08_migrate::outbound_only_chat_keeps_admin_peer`
+- `mdk08_migrate::copies_imeta_and_p_tags_from_stored_message_tags`
 - `e2e::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
