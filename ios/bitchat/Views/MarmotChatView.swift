@@ -256,6 +256,7 @@ func snShortNpubLabel(_ value: String) -> String {
 }
 
 func snDirectMarmotPeerKey(for group: MarmotService.MarmotGroup, ownNpub: String?) -> String? {
+    guard group.isDirect else { return nil }
     let ownKey = ownNpub.map(SNMarmotProfileCache.canonicalKey)
     let others = Array(Set(group.memberNpubs.map(SNMarmotProfileCache.canonicalKey).filter {
         guard !$0.isEmpty else { return false }

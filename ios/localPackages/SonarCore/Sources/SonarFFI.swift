@@ -4289,16 +4289,22 @@ public struct GroupInfo: Equatable, Hashable {
     public var idHex: String
     public var name: String
     public var memberNpubs: [String]
+    /**
+     * False for recovered/live rooms, even when only one other member is listed.
+     * Hosts must not fold those onto a 1:1 by npub.
+     */
+    public var isDirect: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
          * Hex of the MLS group id (stable; use it for `send_text`/`messages`).
-         */idHex: String, name: String, memberNpubs: [String]) {
+         */idHex: String, name: String, memberNpubs: [String], isDirect: Bool) {
         self.idHex = idHex
         self.name = name
         self.memberNpubs = memberNpubs
+        self.isDirect = isDirect
     }
 
 
@@ -4319,7 +4325,8 @@ public struct FfiConverterTypeGroupInfo: FfiConverterRustBuffer {
             try GroupInfo(
                 idHex: FfiConverterString.read(from: &buf),
                 name: FfiConverterString.read(from: &buf),
-                memberNpubs: FfiConverterSequenceString.read(from: &buf)
+                memberNpubs: FfiConverterSequenceString.read(from: &buf),
+                isDirect: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -4327,6 +4334,7 @@ public struct FfiConverterTypeGroupInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.idHex, into: &buf)
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterSequenceString.write(value.memberNpubs, into: &buf)
+        FfiConverterBool.write(value.isDirect, into: &buf)
     }
 }
 

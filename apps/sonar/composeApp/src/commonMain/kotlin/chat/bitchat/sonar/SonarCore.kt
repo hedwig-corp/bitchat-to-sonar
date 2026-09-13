@@ -8,6 +8,8 @@ data class SonarChat(
     val id: String,        // MLS group id hex
     val name: String,
     val members: List<String>,
+    /** False for recovered/live rooms that currently list only one other peer. */
+    val isDirect: Boolean = true,
 )
 
 /** Pending multi-member group invite awaiting explicit accept/decline. */

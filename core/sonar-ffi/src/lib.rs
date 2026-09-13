@@ -542,6 +542,9 @@ pub struct GroupInfo {
     pub id_hex: String,
     pub name: String,
     pub member_npubs: Vec<String>,
+    /// False for recovered/live rooms, even when only one other member is listed.
+    /// Hosts must not fold those onto a 1:1 by npub.
+    pub is_direct: bool,
 }
 
 /// FFI-friendly pending group invite summary.
@@ -1692,10 +1695,12 @@ impl SonarNode {
                 .into_iter()
                 .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
                 .collect();
+            let is_direct = self.client.group_is_direct(&g.id);
             out.push(GroupInfo {
                 id_hex,
                 name: g.name,
                 member_npubs: members,
+                is_direct,
             });
         }
         for hist in self.client.historical_groups()? {
@@ -1703,6 +1708,7 @@ impl SonarNode {
             if !seen.insert(id_hex.clone()) {
                 continue;
             }
+            let is_direct = self.client.group_is_direct(&hist.id);
             let member_npubs = hist
                 .members
                 .into_iter()
@@ -1712,6 +1718,7 @@ impl SonarNode {
                 id_hex,
                 name: hist.name,
                 member_npubs,
+                is_direct,
             });
         }
         Ok(out)

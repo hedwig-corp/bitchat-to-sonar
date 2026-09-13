@@ -349,8 +349,8 @@ Never Uninstall Device Apps):
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
-| iOS (`ios/`) | same | same | none |
+| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| iOS (`ios/`) | same (`MarmotGroup.isDirect`) | same | none |
 | Mesh | untouched | untouched | none |
 
 Resume-chat fold: recovered 0.8 rows appear in FFI `groups()` with

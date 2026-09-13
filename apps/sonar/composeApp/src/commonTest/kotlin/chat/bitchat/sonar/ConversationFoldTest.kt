@@ -366,6 +366,34 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
+        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf(ownNpub, peerNpub))
+        val pendingRoom = SonarChat(
+            id = "pending-room",
+            name = "pending room",
+            members = listOf(ownNpub, peerNpub),
+            isDirect = false,
+        )
+
+        val visible = dedupeDirectMarmotChats(
+            chats = listOf(dm, pendingRoom),
+            ownNpub = ownNpub,
+            latestSecs = { if (it == dm.id) 2L else 1L },
+        )
+
+        assertEquals(listOf(dm, pendingRoom), visible)
+        assertEquals(null, directMarmotPeerKey(pendingRoom, ownNpub))
+        assertEquals(
+            chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw),
+            directMarmotPeerKey(dm, ownNpub),
+        )
+    }
+
+    @Test
     fun recoveredChatWaitsForPeerUpdateUntilLiveSiblingExists() {
         assertEquals(
             RecoveredChatResumeUi.WaitingForPeerUpdate,

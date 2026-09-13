@@ -191,7 +191,7 @@ actual object SonarCore {
 
     actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
-        n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
+        n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs, isDirect = it.isDirect) }
     }
 
     actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {

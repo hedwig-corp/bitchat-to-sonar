@@ -122,7 +122,7 @@ roughly halves it. The ranking is stable across all three.)
 
 **Guarded by:** `ConversationRegressionSmokeTest.duplicateSaraGroupsKeepOneNewestTranscript`
 
-**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`, `ConversationFoldTest.recoveredChatWaitsForPeerUpdateUntilLiveSiblingExists`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`, `SonarConversationFoldTests.recoveredAndResumedDirectChatsPreferLiveSendTarget`, `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`, `e2e.rs::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `e2e.rs::recovered_08_group_adds_a_member_who_updates_later`, `e2e.rs::recovered_08_group_adds_late_member_on_sync_without_a_local_send`, `e2e.rs::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`, `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`, `mdk08_migrate.rs::copies_imeta_and_p_tags_from_stored_message_tags`, `marmot.rs::recovered_history_survives_fold_onto_new_group`, `marmot.rs::historical_fold_survives_account_backup_restore`, `conversation_index.rs::copy_summary_promotes_recovered_row_onto_live_id`, `persistence.rs::mdk08_account_backup_preserves_recovered_transcript`
+**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`, `ConversationFoldTest.recoveredChatWaitsForPeerUpdateUntilLiveSiblingExists`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`, `SonarConversationFoldTests.recoveredAndResumedDirectChatsPreferLiveSendTarget`, `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`, `e2e.rs::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `e2e.rs::recovered_08_group_adds_a_member_who_updates_later`, `e2e.rs::recovered_08_group_adds_late_member_on_sync_without_a_local_send`, `e2e.rs::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`, `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `mdk08_migrate.rs::copies_imeta_and_p_tags_from_stored_message_tags`, `marmot.rs::recovered_history_survives_fold_onto_new_group`, `marmot.rs::historical_fold_survives_account_backup_restore`, `conversation_index.rs::copy_summary_promotes_recovered_row_onto_live_id`, `persistence.rs::mdk08_account_backup_preserves_recovered_transcript`
 
 **Partly guarded:** the cited tests pin *chat-list* dedup and identity routing. The "one transcript" half is not pinned: if duplicate groups still collapse to one row but transcript loading stopped merging every duplicate group's messages, all of them stay green. See Unguarded.
 
@@ -2670,24 +2670,22 @@ member after extract is not enough to treat the room as a DM.
 not updated) collapses into a 1:1 with the welcomer. Later members cannot be
 invited; the room name disappears; sends land in the wrong chat.
 
-**Call sites:** Rust `client.rs::resolve_send_group` and
-`client.rs::maybe_fold_new_group`. Hosts (`ios/`, `apps/sonar/`) send the
-recovered id through core and do not choose DM vs group; no host-side mirror
-beyond the existing “Waiting for them to update Sonar” banner.
+**Call sites:** Rust `client.rs::resolve_send_group`,
+`client.rs::maybe_fold_new_group`, `client.rs::group_is_direct`; Compose
+`directMarmotPeerKey` / `dedupeDirectMarmotChats`; iOS `snDirectMarmotPeerKey` /
+`snCanonicalDirectMarmotGroups`. FFI `GroupInfo.is_direct` is the host signal.
 
 **Guarded by:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`
 
-**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`,
-`mdk08_migrate.rs::pending_welcome_is_kept_for_resume`,
-`e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`
+**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`
 
-**Not guarded:** a real 0.8 device upgrade with a pending White Noise room, and
-hosts rendering the recovered room as its own chat-list row (they consume FFI
-`groups()`; no UI test builds a store).
+**Not guarded:** a real 0.8 device upgrade with a pending White Noise room. Host chat-list rendering still needs a constructible store (the helper pins are the R-001 shape).
 
 **History:** #613. `historical_resume_is_direct` landed first; resume still used
 `start_dm_with_key_package`, then `maybe_fold_new_group` absorbed the room into
-a new 1:1 with the same known peer. Both paths had to be closed.
+a new 1:1 with the same known peer. Hosts then folded any two-member FFI row
+by npub, so a pending room with only the welcomer listed still vanished into
+the 1:1. Core, FFI `is_direct`, and both hosts had to agree.
 
 **Rejected:**
 - *Pinning only `historical_resume_is_direct` / `groups().len() == 2`.*

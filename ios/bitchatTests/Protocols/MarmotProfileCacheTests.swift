@@ -202,6 +202,27 @@ struct MarmotProfileCacheTests {
     }
 
     @Test
+    func recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect() throws {
+        let ownRaw = Data(repeating: 1, count: 32)
+        let peerRaw = Data(repeating: 2, count: 32)
+        let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
+        let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
+        let dm = MarmotService.MarmotGroup(id: "bob-dm", name: "bob dm", memberNpubs: [ownNpub, peerNpub])
+        let pendingRoom = MarmotService.MarmotGroup(
+            id: "pending-room",
+            name: "pending room",
+            memberNpubs: [ownNpub, peerNpub],
+            isDirect: false
+        )
+
+        let grouped = snCanonicalDirectMarmotGroups([dm, pendingRoom], ownNpub: ownNpub)
+
+        #expect(snDirectMarmotPeerKey(for: pendingRoom, ownNpub: ownNpub) == nil)
+        #expect(snDirectMarmotPeerKey(for: dm, ownNpub: ownNpub) == peerNpub)
+        #expect(grouped[peerNpub]?.map(\.id) == ["bob-dm"])
+    }
+
+    @Test
     func chatSnapshotKeepsRowsWithoutPersistingMessages() {
         let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

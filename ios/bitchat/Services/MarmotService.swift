@@ -82,6 +82,35 @@ final class MarmotService: @unchecked Sendable {
         let id: String
         let name: String
         let memberNpubs: [String]
+        /// Core-authored: false for rooms that currently list only one peer.
+        var isDirect: Bool
+
+        init(id: String, name: String, memberNpubs: [String], isDirect: Bool = true) {
+            self.id = id
+            self.name = name
+            self.memberNpubs = memberNpubs
+            self.isDirect = isDirect
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id, name, memberNpubs, isDirect
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            name = try container.decode(String.self, forKey: .name)
+            memberNpubs = try container.decode([String].self, forKey: .memberNpubs)
+            isDirect = try container.decodeIfPresent(Bool.self, forKey: .isDirect) ?? true
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try container.encode(name, forKey: .name)
+            try container.encode(memberNpubs, forKey: .memberNpubs)
+            try container.encode(isDirect, forKey: .isDirect)
+        }
     }
 
     struct GroupInvite: Sendable, Equatable {
@@ -1253,7 +1282,7 @@ final class MarmotService: @unchecked Sendable {
     func groups() async throws -> [MarmotGroup] {
         try await readOnly {
             try $0.groups().map {
-                MarmotGroup(id: $0.idHex, name: $0.name, memberNpubs: $0.memberNpubs)
+                MarmotGroup(id: $0.idHex, name: $0.name, memberNpubs: $0.memberNpubs, isDirect: $0.isDirect)
             }
         }
     }

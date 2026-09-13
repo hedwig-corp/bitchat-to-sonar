@@ -7027,6 +7027,26 @@ impl SonarClient {
         self.engine.historical_groups()
     }
 
+    /// Hosts fold 1:1s by the single other npub. A recovered or live room
+    /// that currently lists only one reachable peer must not ride that path.
+    pub fn group_is_direct(&self, group_id: &GroupId) -> bool {
+        if self.engine.is_historical_group(group_id).unwrap_or(false) {
+            return self.engine.historical_resume_is_direct(group_id);
+        }
+        let Ok(groups) = self.engine.groups() else {
+            return false;
+        };
+        let Some(group) = groups.into_iter().find(|g| g.id == *group_id) else {
+            return false;
+        };
+        let Ok(members) = self.engine.members(group_id) else {
+            return false;
+        };
+        members.len() == 2
+            && (group.description == SONAR_DIRECT_DM_DESCRIPTION
+                || (group.description.is_empty() && group.name.is_empty()))
+    }
+
     /// Route a send aimed at a recovered 0.8 group onto a live 0.9 group.
     ///
     /// Creates a new DM/group with the same peers when no fold exists yet.

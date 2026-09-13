@@ -1490,6 +1490,18 @@ async fn recovered_08_pending_room_send_creates_named_group_not_dm() {
     );
     assert_ne!(room.id, bob_dm, "send target must not be the existing DM");
     assert_ne!(room.id, historical);
+    assert!(
+        alice.group_is_direct(&bob_dm),
+        "hosts must still fold the real 1:1 by npub"
+    );
+    assert!(
+        !alice.group_is_direct(&historical),
+        "FFI is_direct must stay false on the recovered room id"
+    );
+    assert!(
+        !alice.group_is_direct(&room.id),
+        "the resumed 2-member live room must not look like a DM to hosts"
+    );
 
     let on_room = alice.messages(&room.id).expect("room transcript");
     let on_dm = alice.messages(&bob_dm).expect("dm transcript");

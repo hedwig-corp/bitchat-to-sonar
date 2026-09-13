@@ -474,6 +474,7 @@ internal fun aliasesHaveMutualFavorite(
 }
 
 internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
+    if (!chat.isDirect) return null
     val mine = canonicalProfileKey(ownNpub)
     val others = chat.members
         .map { canonicalProfileKey(it) }
@@ -2198,7 +2199,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun pendingMarmotGroupChats(): List<SonarChat> =
         pendingMarmotGroups.entries.sortedByDescending { it.value.createdAtSecs }.map { (id, pending) ->
-            SonarChat(id = id, name = pending.name, members = listOf(npub) + pending.members)
+            SonarChat(id = id, name = pending.name, members = listOf(npub) + pending.members, isDirect = false)
         }
 
     private fun pendingMarmotChatId(peer: String): String? {
@@ -6768,7 +6769,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotGroups = pendingMarmotGroups - pendingChatId
         refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
-            ?: SonarChat(id = chatId, name = pending.name, members = listOf(npub) + pending.members)
+            ?: SonarChat(id = chatId, name = pending.name, members = listOf(npub) + pending.members, isDirect = false)
         moveSendEchoes(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {
