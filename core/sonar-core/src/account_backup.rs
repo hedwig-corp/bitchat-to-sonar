@@ -28,7 +28,9 @@ use crate::conversation_index::index_db_path_for_db;
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"SONARBAK";
-const FORMAT_VERSION: u32 = 1;
+/// v1: db + optional index. v2: plus recovered-chat sidecars / `*.mdk08.bak`.
+const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION_V1: u32 = 1;
 const HKDF_SALT: &[u8] = b"sonar-backup";
 const HKDF_INFO: &[u8] = b"sonar-account-backup-v1";
 const NONCE_LEN: usize = 12;
@@ -667,6 +669,9 @@ pub struct AccountBackupPackage {
     pub db_key_hex: String,
     pub db_bytes: Vec<u8>,
     pub index_bytes: Option<Vec<u8>>,
+    /// Allow-listed host sidecars keyed by suffix (`.sonar-transcript.json`,
+    /// `.mdk08.bak`, …). Empty on v1 backups.
+    pub sidecar_files: Vec<(String, Vec<u8>)>,
 }
 
 /// Result of uploading a sealed backup to Blossom.
@@ -711,6 +716,22 @@ fn encode_plaintext(package: &AccountBackupPackage) -> Result<Vec<u8>> {
     out.extend_from_slice(&package.db_bytes);
     out.extend_from_slice(&(index.len() as u64).to_le_bytes());
     out.extend_from_slice(index);
+    out.extend_from_slice(&(package.sidecar_files.len() as u32).to_le_bytes());
+    for (name, bytes) in &package.sidecar_files {
+        if !sidecar_suffix_allowed(name) {
+            return Err(Error::InvalidInput(format!(
+                "backup sidecar suffix not allowed: {name}"
+            )));
+        }
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > 128 {
+            return Err(Error::InvalidInput("backup sidecar name too long".into()));
+        }
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
     Ok(out)
 }
 
@@ -722,7 +743,7 @@ fn decode_plaintext(bytes: &[u8]) -> Result<AccountBackupPackage> {
         return Err(Error::InvalidInput("bad backup magic".into()));
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 {
         return Err(Error::InvalidInput(format!(
             "unsupported backup version {version}"
         )));
@@ -753,19 +774,164 @@ fn decode_plaintext(bytes: &[u8]) -> Result<AccountBackupPackage> {
     }
     let index_len = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as usize;
     off += 8;
-    if off + index_len != bytes.len() {
-        return Err(Error::InvalidInput("backup trailing bytes mismatch".into()));
+    if off + index_len > bytes.len() {
+        return Err(Error::InvalidInput("bad index payload in backup".into()));
     }
     let index_bytes = if index_len == 0 {
         None
     } else {
-        Some(bytes[off..].to_vec())
+        Some(bytes[off..off + index_len].to_vec())
+    };
+    off += index_len;
+    let sidecar_files = if version == FORMAT_VERSION_V1 {
+        if off != bytes.len() {
+            return Err(Error::InvalidInput("backup trailing bytes mismatch".into()));
+        }
+        Vec::new()
+    } else {
+        decode_sidecar_files(bytes, &mut off)?
     };
     Ok(AccountBackupPackage {
         db_key_hex,
         db_bytes,
         index_bytes,
+        sidecar_files,
     })
+}
+
+fn decode_sidecar_files(bytes: &[u8], off: &mut usize) -> Result<Vec<(String, Vec<u8>)>> {
+    if *off + 4 > bytes.len() {
+        return Err(Error::InvalidInput("truncated backup sidecar count".into()));
+    }
+    let count = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap()) as usize;
+    *off += 4;
+    if count > 16 {
+        return Err(Error::InvalidInput("backup sidecar count too large".into()));
+    }
+    let mut sidecar_files = Vec::with_capacity(count);
+    for _ in 0..count {
+        if *off + 2 > bytes.len() {
+            return Err(Error::InvalidInput("truncated backup sidecar name".into()));
+        }
+        let name_len = u16::from_le_bytes(bytes[*off..*off + 2].try_into().unwrap()) as usize;
+        *off += 2;
+        if name_len == 0 || name_len > 128 || *off + name_len > bytes.len() {
+            return Err(Error::InvalidInput("bad backup sidecar name".into()));
+        }
+        let name = std::str::from_utf8(&bytes[*off..*off + name_len])
+            .map_err(|e| Error::InvalidInput(format!("sidecar name utf8: {e}")))?
+            .to_string();
+        *off += name_len;
+        if !sidecar_suffix_allowed(&name) {
+            return Err(Error::InvalidInput(format!(
+                "backup sidecar suffix not allowed: {name}"
+            )));
+        }
+        if *off + 8 > bytes.len() {
+            return Err(Error::InvalidInput(
+                "truncated backup sidecar length".into(),
+            ));
+        }
+        let data_len = u64::from_le_bytes(bytes[*off..*off + 8].try_into().unwrap()) as usize;
+        *off += 8;
+        if *off + data_len > bytes.len() {
+            return Err(Error::InvalidInput("bad sidecar payload in backup".into()));
+        }
+        sidecar_files.push((name, bytes[*off..*off + data_len].to_vec()));
+        *off += data_len;
+    }
+    if *off != bytes.len() {
+        return Err(Error::InvalidInput("backup trailing bytes mismatch".into()));
+    }
+    Ok(sidecar_files)
+}
+
+fn backup_sidecar_suffixes() -> &'static [&'static str] {
+    &[
+        crate::marmot::TRANSCRIPT_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
+        crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
+        crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX,
+        crate::mdk08_migrate::MDK08_BACKUP_SUFFIX,
+        "-wal.mdk08.bak",
+        "-shm.mdk08.bak",
+        "-journal.mdk08.bak",
+    ]
+}
+
+fn sidecar_suffix_allowed(name: &str) -> bool {
+    !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && backup_sidecar_suffixes()
+            .iter()
+            .any(|suffix| *suffix == name)
+}
+
+fn sidecar_named(db_path: &Path, suffix: &str) -> PathBuf {
+    let name = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("marmot.sqlite");
+    db_path.with_file_name(format!("{name}{suffix}"))
+}
+
+fn read_backup_sidecars(db_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut files = Vec::new();
+    for suffix in backup_sidecar_suffixes() {
+        let path = sidecar_named(db_path, suffix);
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .map_err(|e| Error::Storage(format!("read sidecar {}: {e}", path.display())))?;
+        files.push(((*suffix).to_string(), bytes));
+    }
+    Ok(files)
+}
+
+fn write_backup_sidecars(db_path: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+    remove_backup_sidecars(db_path);
+    for (suffix, bytes) in files {
+        if !sidecar_suffix_allowed(suffix) {
+            return Err(Error::InvalidInput(format!(
+                "backup sidecar suffix not allowed: {suffix}"
+            )));
+        }
+        let path = sidecar_named(db_path, suffix);
+        fs::write(&path, bytes)
+            .map_err(|e| Error::Storage(format!("write sidecar {}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
+fn remove_backup_sidecars(db_path: &Path) {
+    for suffix in backup_sidecar_suffixes() {
+        let _ = fs::remove_file(sidecar_named(db_path, suffix));
+    }
+}
+
+fn promote_staged_sidecars_best_effort(db_path: &Path) {
+    let staged = staging_db_path(db_path);
+    for suffix in backup_sidecar_suffixes() {
+        let from = sidecar_named(&staged, suffix);
+        let to = sidecar_named(db_path, suffix);
+        if from.is_file() {
+            let _ = fs::remove_file(&to);
+            if let Err(e) = fs::rename(&from, &to) {
+                tracing::warn!(
+                    error = %e,
+                    "account restore: sidecar rename failed; main DB committed, staged sidecar kept"
+                );
+            }
+        } else if to.is_file() {
+            // Restored package omitted this file — drop leftover history from
+            // the outgoing account so a v1 blob cannot keep the previous
+            // install's recovered transcript.
+            let _ = fs::remove_file(&to);
+        }
+    }
 }
 
 /// AEAD-seal a package with a key derived from the account secret.
@@ -829,10 +995,8 @@ fn checkpoint_sqlcipher_file(path: &Path, db_key_hex: &str) -> Result<()> {
     // Wrong SQLCipher keys often "succeed" as an empty DB — require user tables
     // before sealing so we never backup garbage under a bad key.
     verify_sqlcipher_opens(path, db_key_hex)?;
-    let conn = Connection::open(path)
+    let conn = open_sqlcipher_with_host_key(path, db_key_hex)
         .map_err(|e| Error::Storage(format!("backup checkpoint open {}: {e}", path.display())))?;
-    conn.execute_batch(&format!("PRAGMA key = \"x'{db_key_hex}'\";"))
-        .map_err(|e| Error::Storage(format!("backup checkpoint key: {e}")))?;
     // Inspect the busy column — execute_batch success does not mean TRUNCATE
     // finished if another connection still holds the WAL.
     let busy: i64 = conn
@@ -869,6 +1033,7 @@ pub fn read_account_backup_package(
         db_key_hex: db_key_hex.to_string(),
         db_bytes,
         index_bytes,
+        sidecar_files: read_backup_sidecars(db_path)?,
     })
 }
 
@@ -925,6 +1090,7 @@ fn remove_db_tree(db_path: &Path) {
         p.push(suffix);
         let _ = fs::remove_file(Path::new(&p));
     }
+    remove_backup_sidecars(db_path);
 }
 
 /// Write a restored package to disk. Parent dirs must exist. Caller must not
@@ -944,6 +1110,7 @@ pub fn write_account_backup_package(db_path: &Path, package: &AccountBackupPacka
         let index_path = index_db_path_for_db(db_path);
         fs::write(&index_path, index).map_err(|e| Error::Storage(format!("write index: {e}")))?;
     }
+    write_backup_sidecars(db_path, &package.sidecar_files)?;
     Ok(())
 }
 
@@ -984,6 +1151,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     if !staged.is_file() {
         // Already promoted (or never staged). Finish any leftover staged index.
         promote_staged_index_best_effort(db_path);
+        promote_staged_sidecars_best_effort(db_path);
         // Staging gone AND intent still set means a previous call renamed but
         // died before finishing cleanup, so the slot below may still be the
         // OUTGOING install's. Finish it here, gated on the intent marker: called
@@ -1023,6 +1191,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     // which is the narrower form of the bug this cleanup exists to prevent.
     drop_outgoing_key_package_slot(db_path);
     promote_staged_index_best_effort(db_path);
+    promote_staged_sidecars_best_effort(db_path);
     promote_staged_backup_policy_best_effort(db_path);
     // Drop leftover staging DB sidecars (index may remain if rename failed).
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -1052,7 +1221,10 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
 /// is cleared immediately afterwards.
 fn drop_outgoing_key_package_slot(db_path: &Path) {
     let live_slot = crate::marmot::key_package_slot_path_for(db_path);
-    for path in [crate::marmot::key_package_slot_tmp_path(&live_slot), live_slot] {
+    for path in [
+        crate::marmot::key_package_slot_tmp_path(&live_slot),
+        live_slot,
+    ] {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1169,26 +1341,43 @@ pub fn abort_staged_account_restore(db_path: &Path) {
     clear_restore_intent(db_path);
 }
 
-fn verify_sqlcipher_opens(path: &Path, db_key_hex: &str) -> Result<()> {
+fn sqlcipher_key_pragmas(db_key_hex: &str) -> [String; 2] {
+    [
+        format!("PRAGMA key = \"x'{db_key_hex}'\";"),
+        format!("PRAGMA key = '{db_key_hex}';"),
+    ]
+}
+
+fn sqlcipher_user_table_count(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Storage(format!("verify schema: {e}")))
+}
+
+fn open_sqlcipher_with_host_key(path: &Path, db_key_hex: &str) -> Result<Connection> {
     validate_db_key_hex(db_key_hex)?;
-    let conn = Connection::open(path)
-        .map_err(|e| Error::Storage(format!("verify open {}: {e}", path.display())))?;
-    conn.execute_batch(&format!("PRAGMA key = \"x'{db_key_hex}'\";"))
-        .map_err(|e| Error::Storage(format!("verify key: {e}")))?;
-    // Wrong SQLCipher keys often "succeed" as an empty DB — require user tables.
-    let table_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| Error::Storage(format!("verify schema: {e}")))?;
-    if table_count <= 0 {
-        return Err(Error::Storage(
-            "staged restore DB empty or wrong key".into(),
-        ));
+    let mut last_err = None;
+    for pragma in sqlcipher_key_pragmas(db_key_hex) {
+        let conn = Connection::open(path)
+            .map_err(|e| Error::Storage(format!("open {}: {e}", path.display())))?;
+        if let Err(e) = conn.execute_batch(&pragma) {
+            last_err = Some(Error::Storage(format!("key: {e}")));
+            continue;
+        }
+        match sqlcipher_user_table_count(&conn) {
+            Ok(count) if count > 0 => return Ok(conn),
+            Ok(_) => last_err = Some(Error::Storage("empty or wrong key".into())),
+            Err(e) => last_err = Some(e),
+        }
     }
-    Ok(())
+    Err(last_err.unwrap_or_else(|| Error::Storage("sqlcipher open failed".into())))
+}
+
+fn verify_sqlcipher_opens(path: &Path, db_key_hex: &str) -> Result<()> {
+    open_sqlcipher_with_host_key(path, db_key_hex).map(|_| ())
 }
 
 /// Boot-time recovery: if `*.sonar-restore-staging` remains and `db_key_hex`
@@ -1201,6 +1390,7 @@ pub fn reconcile_staged_account_restore(db_path: &Path, db_key_hex: &str) -> Res
     if !staged.is_file() {
         // Crash after DB rename / before index rename — finish the index only.
         promote_staged_index_best_effort(db_path);
+        promote_staged_sidecars_best_effort(db_path);
         // And the stats, under the same intent gate commit uses: the promotion
         // is the last thing commit does, so this window is exactly where a
         // restored install would otherwise keep reporting "Never" forever and
@@ -1419,7 +1609,9 @@ fn backup_blob_url(base: &Url, sha256: &Sha256Hash) -> Result<Url> {
 /// small fixed amount instead and let the `Vec` grow — growth is amortized, and
 /// the streaming check in `download_blob_capped_to` is the real bound.
 fn download_buffer_capacity(content_length: Option<u64>) -> usize {
-    content_length.unwrap_or(0).min(INITIAL_DOWNLOAD_CAPACITY as u64) as usize
+    content_length
+        .unwrap_or(0)
+        .min(INITIAL_DOWNLOAD_CAPACITY as u64) as usize
 }
 
 /// Download a blob, refusing to buffer more than `MAX_BACKUP_BYTES`.
@@ -1780,6 +1972,12 @@ fn plaintext_fingerprint(package: &AccountBackupPackage) -> String {
     hasher.update(&package.db_bytes);
     hasher.update((index.len() as u64).to_le_bytes());
     hasher.update(index);
+    for (name, bytes) in &package.sidecar_files {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
     // The wrapped SQLCipher key is part of what a restore needs: if it ever
     // changed without the DB changing, the old blob would no longer open.
     hasher.update(package.db_key_hex.as_bytes());
@@ -1802,7 +2000,9 @@ fn upload_is_redundant(policy: &BackupPolicy, fingerprint: &str, now_secs: u64) 
 }
 
 fn backup_upload_is_redundant(db_path: &Path, fingerprint: &str, now_secs: u64) -> bool {
-    with_policy_state(|map| upload_is_redundant(&cached_policy(map, db_path), fingerprint, now_secs))
+    with_policy_state(|map| {
+        upload_is_redundant(&cached_policy(map, db_path), fingerprint, now_secs)
+    })
 }
 
 /// Close the in-flight window opened by [`record_backup_attempt`] without
@@ -2100,7 +2300,10 @@ mod tests {
             .await
             .expect("must search the legacy host too");
         assert_eq!(got, sealed);
-        assert_eq!(uploaded, 7, "the descriptor timestamp travels with the blob");
+        assert_eq!(
+            uploaded, 7,
+            "the descriptor timestamp travels with the blob"
+        );
     }
 
     /// A real error on the first host must not be retried onto the next and
@@ -2237,8 +2440,7 @@ mod tests {
         // "NSE": a different process writes the sidecar directly with a newer
         // bump (fs write = exactly what crosses the process boundary).
         let path = backup_policy_path_for_db(&db);
-        let mut disk: BackupPolicy =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut disk: BackupPolicy = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         disk.dirty = true;
         disk.dirty_seq += 1;
         disk.last_dirty_at = Some(4242);
@@ -2324,7 +2526,9 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let mut buf = [0u8; 8192];
-                let Ok(n) = stream.read(&mut buf) else { continue };
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
                 let head = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = head
                     .lines()
@@ -2335,7 +2539,9 @@ mod tests {
                     .unwrap_or("")
                     .to_string();
                 if path != list_path {
-                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                     continue;
                 }
                 // No Content-Length: body runs until close. Deliberately valid
@@ -2501,6 +2707,7 @@ mod tests {
             db_key_hex: "ab".repeat(32),
             db_bytes: b"fake-sqlcipher-bytes".to_vec(),
             index_bytes: Some(b"index".to_vec()),
+            sidecar_files: Vec::new(),
         };
         let sealed = seal_account_backup(&secret_bytes(&keys), &package).unwrap();
         let opened = open_account_backup(&secret_bytes(&keys), &sealed).unwrap();
@@ -2515,6 +2722,7 @@ mod tests {
             db_key_hex: "cd".repeat(32),
             db_bytes: vec![1, 2, 3, 4],
             index_bytes: None,
+            sidecar_files: Vec::new(),
         };
         let sealed = seal_account_backup(&secret_bytes(&a), &package).unwrap();
         assert!(open_account_backup(&secret_bytes(&b), &sealed).is_err());
@@ -2528,6 +2736,7 @@ mod tests {
             db_key_hex: "ef".repeat(32),
             db_bytes: b"db-body".to_vec(),
             index_bytes: Some(b"idx-body".to_vec()),
+            sidecar_files: Vec::new(),
         };
         write_account_backup_package(&db_path, &package).unwrap();
         // Checkpoint needs a real SQLCipher DB; skip read_account for fake bytes.
@@ -2538,6 +2747,118 @@ mod tests {
     }
 
     #[test]
+    fn decode_v1_package_has_empty_sidecars() {
+        let key = "ab".repeat(32);
+        let db = b"legacy-db";
+        let index = b"legacy-idx";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&(64u32).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&(db.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(db);
+        bytes.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(index);
+        let opened = decode_plaintext(&bytes).unwrap();
+        assert_eq!(opened.db_key_hex, key);
+        assert_eq!(opened.db_bytes, db);
+        assert_eq!(opened.index_bytes.as_deref(), Some(index.as_slice()));
+        assert!(
+            opened.sidecar_files.is_empty(),
+            "v1 backups predate recovered-chat sidecars"
+        );
+    }
+
+    #[test]
+    fn seal_open_roundtrip_keeps_recovered_sidecars() {
+        let keys = Keys::generate();
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"fake-sqlcipher-bytes".to_vec(),
+            index_bytes: Some(b"index".to_vec()),
+            sidecar_files: vec![(
+                crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                b"{\"g\":[]}".to_vec(),
+            )],
+        };
+        let sealed = seal_account_backup(&secret_bytes(&keys), &package).unwrap();
+        let opened = open_account_backup(&secret_bytes(&keys), &sealed).unwrap();
+        assert_eq!(opened, package);
+    }
+
+    #[test]
+    fn encode_rejects_sidecar_path_traversal() {
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![("../escape.json".into(), b"no".to_vec())],
+        };
+        assert!(encode_plaintext(&package).is_err());
+    }
+
+    #[test]
+    fn write_read_package_files_roundtrips_sidecars() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let transcript = b"{\"messages\":[]}";
+        let package = AccountBackupPackage {
+            db_key_hex: "ef".repeat(32),
+            db_bytes: b"db-body".to_vec(),
+            index_bytes: Some(b"idx-body".to_vec()),
+            sidecar_files: vec![(
+                crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                transcript.to_vec(),
+            )],
+        };
+        write_account_backup_package(&db_path, &package).unwrap();
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::marmot::TRANSCRIPT_FILE_SUFFIX
+            ))
+            .unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn staged_restore_replaces_outgoing_sidecars() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        std::fs::write(&db_path, b"old-db").unwrap();
+        std::fs::write(
+            sidecar_named(&db_path, crate::marmot::TRANSCRIPT_FILE_SUFFIX),
+            b"old-account-transcript",
+        )
+        .unwrap();
+        let package = AccountBackupPackage {
+            db_key_hex: "aa".repeat(32),
+            db_bytes: b"staged-db".to_vec(),
+            index_bytes: Some(b"staged-idx".to_vec()),
+            sidecar_files: vec![(
+                crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                b"{\"new\":true}".to_vec(),
+            )],
+        };
+        write_account_backup_package(&staging_db_path(&db_path), &package).unwrap();
+        commit_staged_account_restore(&db_path).unwrap();
+        assert!(
+            !sidecar_named(&db_path, crate::marmot::TRANSCRIPT_FILE_SUFFIX).exists(),
+            "restore without a transcript sidecar must drop leftover outgoing history"
+        );
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX
+            ))
+            .unwrap(),
+            b"{\"new\":true}"
+        );
+    }
+
+    #[test]
     fn staged_restore_commit_roundtrip() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("marmot.sqlite");
@@ -2545,6 +2866,7 @@ mod tests {
             db_key_hex: "aa".repeat(32),
             db_bytes: b"staged-db".to_vec(),
             index_bytes: Some(b"staged-idx".to_vec()),
+            sidecar_files: Vec::new(),
         };
         write_account_backup_package(&staging_db_path(&db_path), &package).unwrap();
         assert!(!db_path.exists());
@@ -3029,7 +3351,10 @@ mod tests {
             "boot must finish the restore's stats, not leave 'Never'"
         );
         assert_eq!(policy.last_message_count, Some(3));
-        assert!(!staged_policy.exists(), "no sidecar left in the account dir");
+        assert!(
+            !staged_policy.exists(),
+            "no sidecar left in the account dir"
+        );
     }
 
     /// An abandoned restore must leave nothing a later commit could adopt: the
@@ -3106,7 +3431,11 @@ mod tests {
     #[test]
     fn a_lying_content_length_cannot_size_the_download_buffer() {
         assert_eq!(download_buffer_capacity(None), 0);
-        assert_eq!(download_buffer_capacity(Some(4096)), 4096, "honest small body");
+        assert_eq!(
+            download_buffer_capacity(Some(4096)),
+            4096,
+            "honest small body"
+        );
         assert_eq!(
             download_buffer_capacity(Some(MAX_BACKUP_BYTES as u64)),
             INITIAL_DOWNLOAD_CAPACITY,
@@ -3137,10 +3466,7 @@ mod tests {
         let err = download_blob_capped_to(&keys, &base, sha, 1024)
             .await
             .expect_err("4096 bytes must not pass a 1024 byte ceiling");
-        assert!(
-            err.to_string().contains("exceeds size cap"),
-            "got {err:?}"
-        );
+        assert!(err.to_string().contains("exceeds size cap"), "got {err:?}");
 
         // Same blob, ample ceiling: the cap must not break honest restores.
         let ok = download_blob_capped_to(&keys, &base, sha, 8192)
@@ -3181,7 +3507,10 @@ mod tests {
             "scratch {} escaped the account dir",
             path.display()
         );
-        assert!(path.is_dir(), "scratch dir was not created (parent unmade?)");
+        assert!(
+            path.is_dir(),
+            "scratch dir was not created (parent unmade?)"
+        );
         drop(scratch);
         assert!(!path.exists(), "scratch dir must be reaped on drop");
     }
@@ -3262,6 +3591,7 @@ mod tests {
             db_key_hex: "55".repeat(32),
             db_bytes: db.to_vec(),
             index_bytes: index.map(|b| b.to_vec()),
+            sidecar_files: Vec::new(),
         }
     }
 
@@ -3293,8 +3623,14 @@ mod tests {
             plaintext_fingerprint(&package_of(b"chats", Some(b"index"))),
             "same bytes must fingerprint the same — otherwise nothing is ever skipped"
         );
-        assert_ne!(a, plaintext_fingerprint(&package_of(b"chatz", Some(b"index"))));
-        assert_ne!(a, plaintext_fingerprint(&package_of(b"chats", Some(b"indeX"))));
+        assert_ne!(
+            a,
+            plaintext_fingerprint(&package_of(b"chatz", Some(b"index")))
+        );
+        assert_ne!(
+            a,
+            plaintext_fingerprint(&package_of(b"chats", Some(b"indeX")))
+        );
         // Length-delimited: moving the boundary must not collide.
         assert_ne!(
             plaintext_fingerprint(&package_of(b"ab", Some(b"c"))),
@@ -3304,6 +3640,14 @@ mod tests {
         let mut rekeyed = package_of(b"chats", Some(b"index"));
         rekeyed.db_key_hex = "66".repeat(32);
         assert_ne!(a, plaintext_fingerprint(&rekeyed));
+        // Recovered-chat sidecars are part of the sealed account. A 0.8
+        // migrate that only writes host JSON must dirty the next backup.
+        let mut with_history = package_of(b"chats", Some(b"index"));
+        with_history.sidecar_files = vec![(
+            crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+            b"history".to_vec(),
+        )];
+        assert_ne!(a, plaintext_fingerprint(&with_history));
     }
 
     #[test]
@@ -3360,14 +3704,20 @@ mod tests {
             !upload_is_redundant(&daily, "abc", now),
             "a daily account must still refresh daily, identical bytes or not"
         );
-        assert_eq!(unchanged_refresh_window_secs(&daily), DEFAULT_DAILY_INTERVAL_SECS);
+        assert_eq!(
+            unchanged_refresh_window_secs(&daily),
+            DEFAULT_DAILY_INTERVAL_SECS
+        );
 
         // Weekly sits exactly at the ceiling, so both agree.
         let weekly = BackupPolicy {
             daily_interval_secs: 7 * DEFAULT_DAILY_INTERVAL_SECS,
             ..Default::default()
         };
-        assert_eq!(unchanged_refresh_window_secs(&weekly), UNCHANGED_REFRESH_SECS);
+        assert_eq!(
+            unchanged_refresh_window_secs(&weekly),
+            UNCHANGED_REFRESH_SECS
+        );
     }
 
     /// Upgrade path and "nothing ever succeeded" path: with no recorded success
@@ -3593,7 +3943,10 @@ mod tests {
         let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
         record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
         record_backup_failure(&db_path, "blossom upload timed out").unwrap();
-        assert!(load_backup_policy(&db_path).last_error.is_some(), "precondition");
+        assert!(
+            load_backup_policy(&db_path).last_error.is_some(),
+            "precondition"
+        );
 
         assert!(matches!(
             seal_account_backup_files(&keys, &db_path, &key_hex),

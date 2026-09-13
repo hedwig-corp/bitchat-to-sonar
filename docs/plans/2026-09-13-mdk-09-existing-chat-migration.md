@@ -59,6 +59,8 @@ What the user keeps after upgrade:
 - Full local Marmot transcript, copied onto `.sonar-transcript.json`.
 - The original 0.8 SQLCipher file, renamed `*.mdk08.bak` (never deleted
   by the migrate path).
+- Account backups taken after upgrade (v2) include those sidecars, so
+  nsec restore still paints the recovered transcript.
 
 What the user does **not** keep automatically:
 
@@ -141,6 +143,29 @@ Guarded by:
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
+- `account_backup::decode_v1_package_has_empty_sidecars`
+- `account_backup::seal_open_roundtrip_keeps_recovered_sidecars`
+- `account_backup::staged_restore_replaces_outgoing_sidecars`
+- `persistence::mdk08_account_backup_preserves_recovered_transcript`
+
+## Account backup after upgrade
+
+A backup taken **after** the 0.8 → 0.9 migrate is the only copy of recovered
+history once the user deletes the app data or restores onto a new phone.
+v1 packages carried only `marmot.sqlite` + the conversation index. After
+migrate, the live SQLCipher file is an empty-of-history 0.9 session; the
+transcript lives in host sidecars and `*.mdk08.bak`.
+
+v2 (`FORMAT_VERSION = 2`) packs those allow-listed suffixes into the
+sealed blob. Decoders still accept v1 (empty sidecar list). Restore writes
+the sidecars next to the DB, including the staged-restore rename path.
+A restore that omits a sidecar deletes the leftover outgoing file so the
+previous account's transcript cannot leak across nsec restore.
+
+SQLCipher open for seal/verify tries the 0.8 raw key (`x'<hex>'`) and the
+0.9 passphrase (`'<hex>'`) and requires at least one user table. The
+conversation index stays on the raw key; the live Marmot file is
+passphrase-keyed after migrate.
 
 ## How users keep access after the flag-day
 
@@ -197,6 +222,7 @@ cd core
 cargo test -p sonar-core --lib mdk08_migrate
 cargo test -p sonar-core --lib historical_fold
 cargo test -p sonar-core --test persistence
+cargo test -p sonar-core --lib account_backup
 cargo test -p sonar-core --test e2e recovered_08
 cargo test -p sonar-core --test group_invites
 cargo test -p sonar-core --lib client::tests

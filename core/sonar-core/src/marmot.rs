@@ -77,7 +77,7 @@ pub(crate) const TRANSCRIPT_FILE_SUFFIX: &str = ".sonar-transcript.json";
 const PARKED_INVITES_FILE_SUFFIX: &str = ".sonar-parked-invites.json";
 const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json";
 /// historical MLS group id hex → live 0.9 group id hex.
-const HISTORICAL_FOLDS_FILE_SUFFIX: &str = ".sonar-historical-folds.json";
+pub(crate) const HISTORICAL_FOLDS_FILE_SUFFIX: &str = ".sonar-historical-folds.json";
 
 /// A recovered 0.8 conversation that is not a live 0.9 MLS group.
 #[derive(Debug, Clone)]
