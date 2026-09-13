@@ -1536,3 +1536,67 @@ async fn recovered_08_group_adds_a_member_who_updates_later() {
         1
     );
 }
+
+/// Leftover members must be invited on background sync, not only when the
+/// local user types. First paint / sending to people already in the room
+/// must not wait on this.
+#[tokio::test]
+async fn recovered_08_group_adds_late_member_on_sync_without_a_local_send() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(alice.members(&live).expect("members").len(), 2);
+
+    carol.publish_key_package().await.expect("carol updates");
+    alice.sync().await.expect("background reconcile");
+    let members = alice.members(&live).expect("members after sync");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "sync must invite leftover members without a local send"
+    );
+
+    carol.sync().await.expect("carol syncs invite");
+    let carol_invite = carol
+        .pending_group_invites()
+        .expect("carol invites")
+        .into_iter()
+        .next()
+        .expect("late member invited on alice sync");
+    carol
+        .accept_group_invite(&carol_invite.id)
+        .await
+        .expect("carol accepts");
+    assert_eq!(carol.groups().expect("carol joined").len(), 1);
+}

@@ -5651,6 +5651,7 @@ impl SonarClient {
             tracing::info!("sync() short-circuited — live subscriptions active");
             self.save_or_rewind_without_advancing_watermark(process_report)?;
             self.retry_outbox().await;
+            self.reconcile_historical_resume_members().await;
             self.share_push_token_with_groups().await;
             return Ok(());
         }
@@ -5779,6 +5780,7 @@ impl SonarClient {
             self.save_sync_state()?;
         }
         self.retry_outbox().await;
+        self.reconcile_historical_resume_members().await;
         self.share_push_token_with_groups().await;
         Ok(())
     }
@@ -6264,6 +6266,7 @@ impl SonarClient {
         // (Publish failures also schedule a core-owned backoff retry; this path
         // covers Pending rows stranded while relays were briefly unavailable.)
         self.retry_outbox().await;
+        self.reconcile_historical_resume_members().await;
         Ok(())
     }
 
@@ -7052,6 +7055,14 @@ impl SonarClient {
         };
         self.record_resume_fold(group_id, &live);
         Ok(live)
+    }
+
+    /// Background reconcile: leftover 0.8 room members who later publish a
+    /// 0.9 KeyPackage are invited without waiting for a local send.
+    async fn reconcile_historical_resume_members(&self) {
+        for live in self.engine.live_resume_targets() {
+            self.maybe_add_late_resume_members(&live).await;
+        }
     }
 
     /// After a mixed 0.8/0.9 room resume, invite leftover members the next

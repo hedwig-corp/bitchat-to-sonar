@@ -1218,6 +1218,18 @@ impl MarmotEngine {
         })
     }
 
+    /// Live 0.9 groups that carry a recovered 0.8 fold sibling.
+    pub fn live_resume_targets(&self) -> Vec<GroupId> {
+        let folds = self
+            .historical_folds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut lives: Vec<GroupId> = folds.values().cloned().collect();
+        lives.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        lives.dedup();
+        lives
+    }
+
     /// Live 0.9 group that should carry sends for a recovered 0.8 row.
     pub fn live_fold_target(&self, group_id: &GroupId) -> Option<GroupId> {
         let folds = self

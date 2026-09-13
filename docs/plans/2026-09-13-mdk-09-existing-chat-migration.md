@@ -101,6 +101,7 @@ Guarded by:
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
 - `e2e::recovered_08_group_resumes_with_whichever_peers_have_updated`
 - `e2e::recovered_08_group_adds_a_member_who_updates_later`
+- `e2e::recovered_08_group_adds_late_member_on_sync_without_a_local_send`
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
@@ -160,7 +161,7 @@ cd core
 cargo test -p sonar-core --lib mdk08_migrate
 cargo test -p sonar-core --lib historical_fold
 cargo test -p sonar-core --test persistence
-cargo test -p sonar-core --test e2e recovered_08_chat_resumes
+cargo test -p sonar-core --test e2e recovered_08
 cargo test -p sonar-core --test group_invites
 cargo test -p sonar-core --lib client::tests
 cargo test -p sonar-core --test failed_events
@@ -204,7 +205,7 @@ Device / interop (not substitutable by unit tests):
 
 | Surface | History | Live 0.9 send | Gap |
 | --- | --- | --- | --- |
-| Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on a later send | none |
+| Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
 | Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing | none |
 | iOS (`ios/`) | same | same | none |
