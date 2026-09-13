@@ -7059,6 +7059,8 @@ impl SonarClient {
 
     /// Background reconcile: leftover 0.8 room members who later publish a
     /// 0.9 KeyPackage are invited without waiting for a local send.
+    /// Hosts hit this from `ensure_subscriptions`; tests may also hit it
+    /// from `sync()`.
     async fn reconcile_historical_resume_members(&self) {
         for live in self.engine.live_resume_targets() {
             self.maybe_add_late_resume_members(&live).await;

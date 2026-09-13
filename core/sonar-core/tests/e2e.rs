@@ -1537,9 +1537,9 @@ async fn recovered_08_group_adds_a_member_who_updates_later() {
     );
 }
 
-/// Leftover members must be invited on background sync, not only when the
-/// local user types. First paint / sending to people already in the room
-/// must not wait on this.
+/// Leftover members must be invited on the host idle path
+/// (`ensure_subscriptions`), not only when the local user types. First
+/// paint / sending to people already in the room must not wait on this.
 #[tokio::test]
 async fn recovered_08_group_adds_late_member_on_sync_without_a_local_send() {
     let relay = MockRelay::run().await.expect("mock relay starts");
@@ -1580,11 +1580,16 @@ async fn recovered_08_group_adds_late_member_on_sync_without_a_local_send() {
     assert_eq!(alice.members(&live).expect("members").len(), 2);
 
     carol.publish_key_package().await.expect("carol updates");
-    alice.sync().await.expect("background reconcile");
-    let members = alice.members(&live).expect("members after sync");
+    // Persistent connect() already opened live subscriptions. Hosts then
+    // poll ensure_subscriptions (not sync) on the idle path.
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("host idle reconcile");
+    let members = alice.members(&live).expect("members after idle reconcile");
     assert!(
         members.contains(&carol.identity().public_key()),
-        "sync must invite leftover members without a local send"
+        "ensure_subscriptions must invite leftover members without a local send"
     );
 
     carol.sync().await.expect("carol syncs invite");

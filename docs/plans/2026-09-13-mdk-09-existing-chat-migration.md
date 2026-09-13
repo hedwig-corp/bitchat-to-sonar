@@ -102,6 +102,7 @@ Guarded by:
 - `e2e::recovered_08_group_resumes_with_whichever_peers_have_updated`
 - `e2e::recovered_08_group_adds_a_member_who_updates_later`
 - `e2e::recovered_08_group_adds_late_member_on_sync_without_a_local_send`
+  (pins `ensure_subscriptions`, the host idle path)
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
