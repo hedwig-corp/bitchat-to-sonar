@@ -7145,9 +7145,17 @@ impl SonarClient {
             let mut hist_others: Vec<PublicKey> =
                 group.members.into_iter().filter(|pk| *pk != me).collect();
             hist_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
-            if hist_others == live_others {
-                self.record_resume_fold(&group.id, live_id);
+            if hist_others != live_others {
+                continue;
             }
+            // R-003 folds a recovered *DM* onto a new 1:1 with the same peer.
+            // A recovered room (member_count > 2) must not ride that path:
+            // only the welcomer may be known yet, and folding would absorb
+            // the room into a DM. Rooms resume only via resolve_send_group.
+            if !self.engine.historical_resume_is_direct(&group.id) {
+                continue;
+            }
+            self.record_resume_fold(&group.id, live_id);
         }
     }
 

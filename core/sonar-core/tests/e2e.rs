@@ -1333,6 +1333,177 @@ async fn recovered_08_outbound_only_chat_resumes_from_admin_pubkeys() {
     assert_eq!(alice.conversation_summaries().len(), 1);
 }
 
+/// Pending 0.8 welcome, 3 members, no kind-9 rows. Used to pin resume at
+/// `send_text` → `resolve_send_group` (not just `historical_resume_is_direct`).
+fn write_mdk08_pending_room_welcome(
+    path: &std::path::Path,
+    local: PublicKey,
+    welcomer: PublicKey,
+) -> GroupId {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );
+        CREATE TABLE welcomes (
+            id BLOB PRIMARY KEY,
+            event TEXT NOT NULL,
+            mls_group_id BLOB NOT NULL,
+            nostr_group_id BLOB NOT NULL,
+            group_name TEXT NOT NULL,
+            group_description TEXT NOT NULL,
+            group_admin_pubkeys TEXT NOT NULL,
+            group_relays TEXT NOT NULL,
+            welcomer BLOB NOT NULL,
+            member_count INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x77u8; 16];
+    let admins = serde_json::json!([local.to_hex(), welcomer.to_hex()]).to_string();
+    conn.execute(
+        "INSERT INTO welcomes
+            (id, event, mls_group_id, nostr_group_id, group_name, group_description,
+             group_admin_pubkeys, group_relays, welcomer, member_count, state,
+             wrapper_event_id)
+         VALUES (?1, '{}', ?2, ?3, 'pending room', '', ?4, '[]', ?5, 3, 'pending', ?1)",
+        rusqlite::params![
+            vec![0xAAu8; 32],
+            group_bytes.clone(),
+            vec![0xBBu8; 32],
+            admins,
+            welcomer.to_bytes().to_vec(),
+        ],
+    )
+    .expect("pending welcome");
+    GroupId::new(group_bytes)
+}
+
+/// A 3-member pending invite must not become a DM at the real send call site.
+///
+/// `historical_resume_is_direct` alone is not enough: the old resume used
+/// `start_dm_with_key_package`, which always mints a new `sonar.direct-dm.v1`
+/// group and never calls `find_dm_group_with`. Pinning `groups().len() == 2`
+/// after resume would stay green on that path. The send must create a named
+/// room whose description is not a DM, and must not fold onto an existing 1:1
+/// with the welcomer (`maybe_fold_new_group` used to do that).
+#[tokio::test]
+async fn recovered_08_pending_room_send_creates_named_group_not_dm() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_pending_room_welcome(
+        &db_path,
+        alice_identity.public_key(),
+        bob_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    assert!(
+        !alice.engine().historical_resume_is_direct(&historical),
+        "member_count=3 must keep the pending room off the DM path"
+    );
+    bob.publish_key_package().await.expect("bob kp");
+    let bob_dm = alice
+        .start_dm(bob.identity().public_key(), "bob dm")
+        .await
+        .expect("existing 1:1 with the welcomer");
+    assert_eq!(
+        alice.groups().expect("dm only").len(),
+        1,
+        "start_dm must not mint a second live group"
+    );
+    assert!(
+        alice
+            .historical_groups()
+            .expect("historical")
+            .iter()
+            .any(|g| g.id == historical && g.name == "pending room"),
+        "creating a 1:1 with the welcomer must not swallow the pending room"
+    );
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "maybe_fold_new_group must not fold a 3-member room onto the DM"
+    );
+    assert_eq!(
+        alice.conversation_summaries().len(),
+        2,
+        "pending room and the new DM are two conversation-index rows"
+    );
+
+    alice
+        .send_text(&historical, "hello room")
+        .await
+        .expect("pending room resume");
+
+    let live = alice.groups().expect("live groups");
+    assert_eq!(
+        live.len(),
+        2,
+        "resume must keep the existing DM and add a room"
+    );
+    let dm = live
+        .iter()
+        .find(|g| g.description == "sonar.direct-dm.v1")
+        .expect("existing Bob DM");
+    assert_eq!(dm.id, bob_dm);
+    let room = live
+        .iter()
+        .find(|g| g.name == "pending room")
+        .expect("resumed room keeps the 0.8 name");
+    assert_ne!(
+        room.description, "sonar.direct-dm.v1",
+        "resolve_send_group must create_group, not start_dm_with_key_package"
+    );
+    assert_ne!(room.id, bob_dm, "send target must not be the existing DM");
+    assert_ne!(room.id, historical);
+
+    let on_room = alice.messages(&room.id).expect("room transcript");
+    let on_dm = alice.messages(&bob_dm).expect("dm transcript");
+    assert!(
+        on_room.iter().any(|m| m.content == "hello room"),
+        "resume send must land on the new room"
+    );
+    assert!(
+        !on_dm.iter().any(|m| m.content == "hello room"),
+        "resume send must not land on the existing 1:1"
+    );
+    assert_eq!(alice.conversation_summaries().len(), 2);
+}
+
 fn write_mdk08_alice_bob_carol_store(
     path: &std::path::Path,
     bob: PublicKey,

@@ -357,9 +357,13 @@ Resume-chat fold: recovered 0.8 rows appear in FFI `groups()` with
 members inferred from the transcript. A send on that id creates a new
 0.9 group with the same peer npubs, records
 `.sonar-historical-folds.json`, and `messages()` unions both ids so
-history is not wiped or split. Hosts still collapse the person by npub
-(R-003). Peer still on 0.8: `KeyPackageNotFound` → "Waiting for them
-to update Sonar".
+history is not wiped or split. A pending welcome with
+`member_count > 2` never uses `start_dm` even if only the welcomer is
+known — that would fold the room onto a 1:1. `maybe_fold_new_group`
+(new DM with the same known peer) is the same hazard and must skip
+recovered rooms; rooms resume only via `resolve_send_group`. Hosts
+still collapse a *person* by npub (R-003 / R-045). Peer still on 0.8:
+`KeyPackageNotFound` → "Waiting for them to update Sonar".
 
 ## Explicitly out of scope here
 
