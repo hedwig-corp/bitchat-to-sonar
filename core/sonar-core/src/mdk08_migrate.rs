@@ -16,7 +16,7 @@
 //! Live 0.8 MLS membership is **not** reconstructed here. See
 //! `docs/plans/2026-09-13-mdk-09-existing-chat-migration.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use nostr::prelude::*;
@@ -43,8 +43,12 @@ pub(crate) const HISTORICAL_MEMBERS_FILE_SUFFIX: &str = ".sonar-historical-membe
 pub(crate) const MDK08_MIGRATED_MARKER_SUFFIX: &str = ".sonar-mdk08-migrated.json";
 
 /// Newest chat rows copied onto the sidecar before `connectLocal` returns.
-/// Older rows stay in `*.mdk08.bak` until [`finish_remainder`].
+/// Older rows stay in `*.mdk08.bak` until [`detect_and_extract_remainder`].
 pub(crate) const FIRST_PAINT_MESSAGES_PER_GROUP: usize = 80;
+
+/// Chat rows copied from `*.mdk08.bak` on one idle / `messages()` tick.
+/// Ids are ranked without payloads; only this many blobs are joined.
+pub(crate) const REMAINDER_MESSAGES_PER_TICK: usize = 400;
 
 /// Chat rows and group titles recovered from a 0.8 store.
 #[derive(Debug, Clone, Default)]
@@ -91,6 +95,8 @@ impl Quarantine {
 
 /// Probe `path` with the 0.8 raw-key encoding. `Ok(None)` means this is not a
 /// readable 0.8 `messages` store under `key` (wrong key, 0.9 store, corrupt).
+/// Production uses first-paint + remainder pages; this full extract is for tests.
+#[cfg(test)]
 pub(crate) fn detect_and_extract(
     path: &Path,
     key: [u8; 32],
@@ -123,6 +129,27 @@ pub(crate) fn detect_and_extract_first_paint(
         local_pk,
         Some(FIRST_PAINT_MESSAGES_PER_GROUP),
     )?))
+}
+
+/// Next bounded page of leftover kind-9 rows. `skip` is event ids already
+/// on the transcript (the first-paint window plus earlier remainder ticks).
+/// `more` is true when another tick is still needed.
+pub(crate) fn detect_and_extract_remainder(
+    path: &Path,
+    key: [u8; 32],
+    local_pk: PublicKey,
+    skip: &HashSet<EventId>,
+    budget: usize,
+) -> Result<Option<(Mdk08Migration, bool)>> {
+    let Some(conn) = open_mdk08(path, key)? else {
+        return Ok(None);
+    };
+    if !table_exists(&conn, "messages")? {
+        return Ok(None);
+    }
+    let budget = budget.max(1);
+    let (extracted, more) = extract_remainder_page(&conn, local_pk, skip, budget)?;
+    Ok(Some((extracted, more)))
 }
 
 /// Write the host sidecars **before** the 0.8 file is renamed.
@@ -553,6 +580,77 @@ fn extract_newest_kind9_per_group(
         )?;
     }
     Ok(())
+}
+
+fn remainder_candidate_sql(has_state: bool) -> String {
+    format!(
+        "SELECT mls_group_id, id FROM messages WHERE {} \
+         ORDER BY created_at DESC, id DESC",
+        kind9_filter(has_state)
+    )
+}
+
+fn remainder_payload_sql(cols: &MessageSelectColumns, n: usize) -> String {
+    let placeholders = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT m.mls_group_id, m.id, m.pubkey, m.kind, m.created_at, m.content, \
+                {}, {}, {} \
+         FROM messages m \
+         WHERE m.id IN ({placeholders})",
+        cols.state, cols.tags, cols.event
+    )
+}
+
+fn extract_remainder_page(
+    conn: &Connection,
+    local_pk: PublicKey,
+    skip: &HashSet<EventId>,
+    budget: usize,
+) -> Result<(Mdk08Migration, bool)> {
+    let cols = message_select_columns(conn)?;
+    let mut extracted = Mdk08Migration::default();
+    let mut stmt = conn
+        .prepare(&remainder_candidate_sql(cols.has_state))
+        .map_err(|e| Error::Storage(format!("mdk08 remainder ids prepare: {e}")))?;
+    let rows = stmt
+        .query_map((), |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| Error::Storage(format!("mdk08 remainder ids query: {e}")))?;
+    let mut chosen = Vec::new();
+    let mut more = false;
+    for row in rows {
+        let (_group_id, id) =
+            row.map_err(|e| Error::Storage(format!("mdk08 remainder ids row: {e}")))?;
+        let Ok(event_id) = EventId::from_slice(&id) else {
+            continue;
+        };
+        if skip.contains(&event_id) {
+            continue;
+        }
+        if chosen.len() >= budget {
+            more = true;
+            break;
+        }
+        chosen.push(id);
+    }
+    if chosen.is_empty() {
+        return Ok((extracted, false));
+    }
+    let mut payload = conn
+        .prepare(&remainder_payload_sql(&cols, chosen.len()))
+        .map_err(|e| Error::Storage(format!("mdk08 remainder payload prepare: {e}")))?;
+    ingest_message_rows(
+        &mut payload,
+        rusqlite::params_from_iter(chosen),
+        local_pk,
+        &mut extracted,
+    )?;
+    extracted.truncated = more;
+    Ok((extracted, more))
 }
 
 fn ingest_message_rows(
@@ -1374,5 +1472,79 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(path.exists(), "failed probe must not delete the 0.8 file");
+    }
+
+    #[test]
+    fn remainder_candidate_sql_ranks_ids_without_payload_columns() {
+        let sql = remainder_candidate_sql(true);
+        assert!(sql.contains("ORDER BY created_at DESC"));
+        assert!(!sql.contains("content"));
+        assert!(!sql.contains("tags"));
+        assert!(!sql.contains("event"));
+    }
+
+    #[test]
+    fn remainder_page_skips_copied_ids_and_reports_more() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&path, &local, peer, "seed");
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let group_id = vec![0x11u8; 16];
+        for i in 1..=105 {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    group_id.clone(),
+                    id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("msg-{i}"),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let window = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("first paint");
+        let skip: HashSet<EventId> = window
+            .messages
+            .values()
+            .flatten()
+            .map(|msg| msg.id)
+            .collect();
+        assert_eq!(skip.len(), FIRST_PAINT_MESSAGES_PER_GROUP);
+
+        let (page, more) = detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 10)
+            .unwrap()
+            .expect("remainder page");
+        let msgs = page.messages.values().next().unwrap();
+        assert!(more);
+        assert_eq!(msgs.len(), 10);
+        assert!(msgs.iter().any(|m| m.content == "msg-25"));
+        assert!(msgs.iter().any(|m| m.content == "msg-16"));
+        assert!(!msgs.iter().any(|m| m.content == "msg-105"));
+        assert!(!msgs.iter().any(|m| m.content == "seed"));
+
+        let mut skip = skip;
+        skip.extend(msgs.iter().map(|m| m.id));
+        let (rest, more) = detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 400)
+            .unwrap()
+            .expect("remainder tail");
+        assert!(!more);
+        let rest_len = rest.messages.values().map(|m| m.len()).sum::<usize>();
+        // seed + msg-1..15 remain after the first-paint 80 and the 10-row page.
+        assert_eq!(rest_len, 16);
     }
 }

@@ -89,8 +89,10 @@ What the user does **not** keep automatically:
      blobs.
    - Rename the 0.8 file (and WAL/SHM) to `*.mdk08.bak`.
    - Create a fresh 0.9 store at the original path.
-   - Copy leftover older rows from the bak on `messages()` / idle
-     `ensure_subscriptions` / `sync` (`ensure_mdk08_remainder`).
+   - Copy leftover older rows from the bak in bounded pages (400
+     payloads per tick) on idle `ensure_subscriptions` / `sync`.
+     `messages()` drains every page so the full-history API stays
+     complete. Host first-paint pages do not.
    - If 0.9 create fails, rename the 0.8 file back. Never delete it.
 4. Wrong key / unknown file: return `protocol migration required`. Do not
    wipe, do not quarantine.
@@ -117,6 +119,8 @@ Guarded by:
 - `mdk08_migrate::first_paint_skips_invalid_and_non_chat_rows_in_the_window`
 - `mdk08_migrate::first_paint_per_group_fallback_keeps_newest_window`
 - `mdk08_migrate::first_paint_windows_each_group_independently`
+- `mdk08_migrate::remainder_candidate_sql_ranks_ids_without_payload_columns`
+- `mdk08_migrate::remainder_page_skips_copied_ids_and_reports_more`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
 - `e2e::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
@@ -245,8 +249,9 @@ Never Uninstall Device Apps):
    `MarmotEngine::persistent` / `connect()` — it must not sit on the
    relay path. First-upgrade extract now ranks ids then joins payloads
    for the newest 80 kind-9 rows per group; leftover blobs stay in
-   `*.mdk08.bak` until `ensure_mdk08_remainder`. Measure a large 0.8
-   DB; do not guess.
+   `*.mdk08.bak` and copy 400 ids-then-payloads per idle tick
+   (`ensure_mdk08_remainder`). `messages()` drains. Measure a large
+   0.8 DB; do not guess.
 
 ## Surfaces
 

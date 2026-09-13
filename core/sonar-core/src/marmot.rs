@@ -978,8 +978,21 @@ impl MarmotEngine {
     }
 
     /// Copy leftover 0.8 chat rows from `*.mdk08.bak` into the transcript.
-    /// First paint only keeps a bounded recent window; this is the rest.
+    /// One idle tick joins at most [`REMAINDER_MESSAGES_PER_TICK`] payloads.
     pub fn ensure_mdk08_remainder(&self) -> Result<()> {
+        self.ensure_mdk08_remainder_budget(crate::mdk08_migrate::REMAINDER_MESSAGES_PER_TICK)
+    }
+
+    /// `messages()` must return the full recovered transcript, so drain every
+    /// remainder page. Host first-paint pages and idle sync use one tick.
+    pub fn drain_mdk08_remainder(&self) -> Result<()> {
+        while self.has_pending_mdk08_remainder() {
+            self.ensure_mdk08_remainder()?;
+        }
+        Ok(())
+    }
+
+    fn ensure_mdk08_remainder_budget(&self, budget: usize) -> Result<()> {
         let pending = {
             let mut slot = self
                 .pending_mdk08
@@ -990,12 +1003,34 @@ impl MarmotEngine {
         let Some(pending) = pending else {
             return Ok(());
         };
-        let extracted = match crate::mdk08_migrate::detect_and_extract(
+        let skip = {
+            let transcript = self
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            transcript
+                .values()
+                .flatten()
+                .map(|msg| msg.id)
+                .collect::<HashSet<_>>()
+        };
+        let extracted = match crate::mdk08_migrate::detect_and_extract_remainder(
             &pending.bak_path,
             pending.key,
             pending.local_pk,
+            &skip,
+            budget,
         ) {
-            Ok(Some(extracted)) => extracted,
+            Ok(Some((extracted, more))) => {
+                if more {
+                    let mut slot = self
+                        .pending_mdk08
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *slot = Some(pending);
+                }
+                extracted
+            }
             Ok(None) => {
                 if let Some(path) = self.db_path.as_ref() {
                     crate::mdk08_migrate::mark_remainder_complete(path)?;
@@ -1026,8 +1061,10 @@ impl MarmotEngine {
             }
         }
         self.persist_transcript();
-        if let Some(path) = self.db_path.as_ref() {
-            crate::mdk08_migrate::mark_remainder_complete(path)?;
+        if !self.has_pending_mdk08_remainder() {
+            if let Some(path) = self.db_path.as_ref() {
+                crate::mdk08_migrate::mark_remainder_complete(path)?;
+            }
         }
         Ok(())
     }
@@ -2594,7 +2631,7 @@ impl MarmotEngine {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
-        self.ensure_mdk08_remainder()?;
+        self.drain_mdk08_remainder()?;
         self.mapped_transcript(group_id)
     }
 
