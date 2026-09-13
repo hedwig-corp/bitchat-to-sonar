@@ -1339,8 +1339,29 @@ async fn recovered_08_group_resumes_on_a_new_09_group_through_a_relay() {
     assert!(from_old.iter().any(|m| m.content == "room is back"));
     assert_eq!(alice.conversation_summaries().len(), 1);
 
-    bob.sync().await.expect("bob syncs");
-    carol.sync().await.expect("carol syncs");
+    bob.sync().await.expect("bob syncs welcome");
+    carol.sync().await.expect("carol syncs welcome");
+    let bob_invite = bob
+        .pending_group_invites()
+        .expect("bob invites")
+        .into_iter()
+        .next()
+        .expect("recovered room resume must invite bob to the new 0.9 group");
+    let carol_invite = carol
+        .pending_group_invites()
+        .expect("carol invites")
+        .into_iter()
+        .next()
+        .expect("recovered room resume must invite carol to the new 0.9 group");
+    bob.accept_group_invite(&bob_invite.id)
+        .await
+        .expect("bob accepts");
+    carol
+        .accept_group_invite(&carol_invite.id)
+        .await
+        .expect("carol accepts");
+    bob.sync().await.expect("bob syncs after accept");
+    carol.sync().await.expect("carol syncs after accept");
     assert_eq!(bob.groups().expect("bob joined").len(), 1);
     assert_eq!(carol.groups().expect("carol joined").len(), 1);
     assert_eq!(

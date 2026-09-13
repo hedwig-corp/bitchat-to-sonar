@@ -202,7 +202,7 @@ Device / interop (not substitutable by unit tests):
 
 | Surface | History | Live 0.9 send | Gap |
 | --- | --- | --- | --- |
-| Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `start_group` and records a fold | none |
+| Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `start_group` and records a fold. Direct chats auto-join; recovered rooms use the existing pending-invite accept path | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
 | Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing | none |
 | iOS (`ios/`) | same | same | none |
