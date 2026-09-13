@@ -10,6 +10,7 @@ use nostr_sdk::Client as NostrClient;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 use sonar_core::marmot::KEY_PACKAGE_KIND;
+use sonar_core::GroupId;
 use tokio::time::{timeout, Duration};
 
 #[tokio::test]
@@ -994,4 +995,198 @@ async fn profile_republish_against_empty_relay_keeps_sidecar_fields() {
         Some("https://example.com/pic.png"),
         "picture must survive an empty-fetch republish"
     );
+}
+
+const MDK08_DB_KEY: [u8; 32] = [0x42; 32];
+
+/// On-disk MDK 0.8 SQLCipher store with one kind-9 chat from `peer`.
+fn write_mdk08_alice_bob_store(
+    path: &std::path::Path,
+    peer: PublicKey,
+    body: &str,
+) -> (GroupId, EventId) {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x11u8; 16];
+    let event_id = EventId::from_slice(&[0xABu8; 32]).expect("event id");
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+         VALUES (?1, ?2, 'alice & bob', '')",
+        rusqlite::params![group_bytes.clone(), vec![0x22u8; 32]],
+    )
+    .expect("group row");
+    conn.execute(
+        "INSERT INTO messages
+            (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+             wrapper_event_id, state)
+         VALUES (?1, ?2, ?3, 9, 1_700_000_000, ?4, '[]', '{}', ?2, 'processed')",
+        rusqlite::params![
+            group_bytes.clone(),
+            event_id.as_bytes().to_vec(),
+            peer.to_bytes().to_vec(),
+            body,
+        ],
+    )
+    .expect("chat row");
+    (GroupId::new(group_bytes), event_id)
+}
+
+/// Sending on a recovered 0.8 row must create a live 0.9 group, keep the old
+/// transcript, fold both ids, and deliver to a peer who already speaks 0.9.
+///
+/// This is the production pin for the flag-day resume path: decrypt-and-move
+/// is not enough; the next send has to start a new encrypted session with the
+/// same npub without splitting the person.
+#[tokio::test]
+async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, old_event) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+
+    let alice = SonarClient::connect(
+        alice_identity.clone(),
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates the 0.8 store");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    assert_eq!(
+        alice.groups().expect("live groups before resume").len(),
+        0,
+        "0.8 MLS membership is not imported"
+    );
+    let recovered = alice.historical_groups().expect("recovered conversations");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, historical);
+    let pre = alice.messages(&historical).expect("recovered transcript");
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0].id, old_event);
+    assert_eq!(pre[0].content, "keep this chat");
+
+    let too_soon = alice
+        .send_text(&historical, "too soon")
+        .await
+        .expect_err("resume send needs the peer's 0.9 key package");
+    assert!(
+        too_soon.to_string().contains("no key package"),
+        "peer still on 0.8 / unpublished KP: {too_soon}"
+    );
+    assert_eq!(
+        alice.groups().expect("still no live group").len(),
+        0,
+        "a failed resume must not mint an empty 0.9 group"
+    );
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    alice
+        .send_text(&historical, "resume hello")
+        .await
+        .expect("resume send creates a live 0.9 group");
+
+    let live_groups = alice.groups().expect("live 0.9 groups");
+    assert_eq!(live_groups.len(), 1, "exactly one new 0.9 group");
+    let live = live_groups[0].id.clone();
+    assert_ne!(
+        live, historical,
+        "resume must not reuse the dead 0.8 group id"
+    );
+
+    let from_old = alice.messages(&historical).expect("historical messages");
+    let from_new = alice.messages(&live).expect("live messages");
+    assert!(
+        from_old.iter().any(|m| m.content == "keep this chat"),
+        "old transcript must survive the resume send"
+    );
+    assert!(
+        from_old.iter().any(|m| m.content == "resume hello"),
+        "new send must be readable on the recovered id"
+    );
+    assert_eq!(
+        from_old.len(),
+        from_new.len(),
+        "either id must read the same folded family"
+    );
+    assert!(
+        !from_old.iter().any(|m| m.content == "too soon"),
+        "the failed pre-KP send must not land in the transcript"
+    );
+
+    let pages = alice
+        .recent_message_pages(8, 8)
+        .expect("home-list pages after resume");
+    assert_eq!(
+        pages.len(),
+        1,
+        "recovered+resumed person must occupy one home-list slot"
+    );
+    assert_eq!(pages[0].group_id, live);
+
+    bob.sync().await.expect("bob syncs welcome + message");
+    let bob_groups = bob.groups().expect("bob groups");
+    assert_eq!(bob_groups.len(), 1);
+    let bob_view = bob.messages(&bob_groups[0].id).expect("bob messages");
+    assert_eq!(bob_view.len(), 1, "bob only sees the new 0.9 traffic");
+    assert_eq!(bob_view[0].content, "resume hello");
+    assert_eq!(bob_view[0].sender, alice.identity().public_key());
+
+    drop(alice);
+    let alice2 = SonarClient::connect(alice_identity, vec![relay_url], &db_path, MDK08_DB_KEY)
+        .await
+        .expect("alice reopens the 0.9 store");
+    assert_eq!(
+        alice2.groups().expect("reopened live groups").len(),
+        1,
+        "the 0.9 group must survive process restart"
+    );
+    alice2
+        .send_text(&historical, "second resume")
+        .await
+        .expect("reopened client reuses the fold");
+    assert_eq!(
+        alice2.groups().expect("still one live group").len(),
+        1,
+        "a second send must reuse the folded 0.9 group"
+    );
+    let after_reopen = alice2.messages(&historical).expect("folded transcript");
+    assert!(after_reopen.iter().any(|m| m.content == "keep this chat"));
+    assert!(after_reopen.iter().any(|m| m.content == "resume hello"));
+    assert!(after_reopen.iter().any(|m| m.content == "second resume"));
 }

@@ -2501,8 +2501,19 @@ impl MarmotEngine {
         }
         let mut pages = Vec::new();
         let mut seen: HashSet<GroupId> = HashSet::new();
+        // Live groups first. A recovered 0.8 id that already has a 0.9 fold
+        // sibling must not take a second bounded home-list slot — hosts fold
+        // by npub, but this page window is the first-paint source.
         let mut ids: Vec<GroupId> = self.groups()?.into_iter().map(|g| g.id).collect();
-        ids.extend(self.historical_groups()?.into_iter().map(|g| g.id));
+        for hist in self.historical_groups()? {
+            if let Some(live) = self.live_fold_target(&hist.id) {
+                if !ids.iter().any(|id| id == &live) {
+                    ids.push(live);
+                }
+                continue;
+            }
+            ids.push(hist.id);
+        }
         for group_id in ids {
             if !seen.insert(group_id.clone()) {
                 continue;
@@ -3495,5 +3506,16 @@ mod historical_fold_tests {
             vec![bob.public_key()]
         );
         assert_eq!(engine.live_fold_target(&historical).as_ref(), Some(&live));
+
+        let pages = engine
+            .recent_message_pages(8, 8)
+            .expect("home-list pages after fold");
+        assert_eq!(
+            pages.len(),
+            1,
+            "a recovered+resumed person must occupy one bounded page slot"
+        );
+        assert_eq!(pages[0].group_id, live);
+        assert_eq!(pages[0].messages.len(), 2);
     }
 }

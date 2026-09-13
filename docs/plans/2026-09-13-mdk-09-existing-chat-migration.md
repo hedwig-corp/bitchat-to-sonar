@@ -97,6 +97,7 @@ Guarded by:
 - `persistence::mdk08_store_decrypts_and_moves_plaintext_without_wiping`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
+- `e2e::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
 
@@ -153,7 +154,9 @@ Local / CI:
 ```sh
 cd core
 cargo test -p sonar-core --lib mdk08_migrate
+cargo test -p sonar-core --lib historical_fold
 cargo test -p sonar-core --test persistence
+cargo test -p sonar-core --test e2e recovered_08_chat_resumes
 cargo test -p sonar-core --test group_invites
 cargo test -p sonar-core --lib client::tests
 cargo test -p sonar-core --test failed_events
