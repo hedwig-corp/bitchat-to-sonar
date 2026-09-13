@@ -483,6 +483,21 @@ internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     return others.singleOrNull()
 }
 
+/** 1:1 row for [peerNpub], ignoring recovered/live rooms that currently list
+ *  only that peer. */
+internal fun directMarmotChatIdForPeer(
+    chats: List<SonarChat>,
+    ownNpub: String,
+    peerNpub: String,
+): String? {
+    val peer = canonicalProfileKey(peerNpub)
+    if (peer.isBlank()) return null
+    return chats.firstOrNull { directMarmotPeerKey(it, ownNpub) == peer }?.id
+}
+
+internal fun marmotNotificationGroupName(chat: SonarChat): String? =
+    chat.name.takeIf { !chat.isDirect && it.isNotBlank() }
+
 /** After an MDK 0.8→0.9 resume, send to the newest duplicate group so the
  *  recovered row stays the history bucket and the live 0.9 group takes traffic. */
 internal fun marmotSendTargetGroupId(
@@ -5407,7 +5422,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 newestTrill = trillCandidate
             }
         }
-        val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
+        val groupName = marmotNotificationGroupName(c)
         newestIncoming?.let { incoming ->
             notifyIncoming(
                 idKey = idKey,
@@ -5454,7 +5469,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun notificationSenderName(chat: SonarChat, message: SonarMsg): String? {
         if (message.senderNpub.isBlank()) return null
-        if (chat.members.size > 2) {
+        if (!chat.isDirect) {
             return resolveGroupAuthorName(message, isGroup = true, profilesByNpub, ::ensureProfile)
         }
         val key = canonicalProfileKey(message.senderNpub)
@@ -12308,7 +12323,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             wnMsgs += summaryCount ?: ms.size
             processCallLines(c.id, visibleMs)
             processPayLines(c.id, visibleMs)
-            if (c.members.size > 2) {
+            if (!c.isDirect) {
                 for (m in visibleMs) {
                     if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
                 }

@@ -255,6 +255,10 @@ func snShortNpubLabel(_ value: String) -> String {
     value.count > 16 ? "\(value.prefix(10))…\(value.suffix(4))" : value
 }
 
+func snMarmotTreatsAsGroupChat(_ group: MarmotService.MarmotGroup) -> Bool {
+    !group.isDirect
+}
+
 func snDirectMarmotPeerKey(for group: MarmotService.MarmotGroup, ownNpub: String?) -> String? {
     guard group.isDirect else { return nil }
     let ownKey = ownNpub.map(SNMarmotProfileCache.canonicalKey)

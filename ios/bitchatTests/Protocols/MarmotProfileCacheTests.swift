@@ -220,6 +220,8 @@ struct MarmotProfileCacheTests {
         #expect(snDirectMarmotPeerKey(for: pendingRoom, ownNpub: ownNpub) == nil)
         #expect(snDirectMarmotPeerKey(for: dm, ownNpub: ownNpub) == peerNpub)
         #expect(grouped[peerNpub]?.map(\.id) == ["bob-dm"])
+        #expect(snMarmotTreatsAsGroupChat(pendingRoom))
+        #expect(!snMarmotTreatsAsGroupChat(dm))
     }
 
     @Test

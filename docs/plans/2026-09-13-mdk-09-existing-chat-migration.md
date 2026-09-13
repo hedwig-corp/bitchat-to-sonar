@@ -320,7 +320,10 @@ Never Uninstall Device Apps):
 2. **Open a recovered DM and a recovered room** with the radio off or
    before relays connect. Local history must paint. Scrolling up past
    the newest 80 rows must keep loading from `*.mdk08.bak` without
-   waiting on relays. Relays must not gate first paint or typing.
+   waiting on relays. Relays must not gate first paint or typing. A
+   pending 3-member room that only lists the welcomer must stay its
+   own chat-list row next to any 1:1 with that person; banners must
+   use the room name, not the welcomer’s DM title.
 3. **Peer already on 0.9 / White Noise.** Send in the recovered row.
    A new 0.9 group is created; the old transcript stays; home list
    stays one row. The peer decrypts the new traffic only (not the

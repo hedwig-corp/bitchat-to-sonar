@@ -3739,7 +3739,7 @@ final class SonarAppStore: ObservableObject {
                     seenMarmotNotificationMessageIDs.insert(message.id)
                     continue
                 }
-                let groupName = group.memberNpubs.count > 2 ? title : nil
+                let groupName = snMarmotTreatsAsGroupChat(group) ? title : nil
                 // Push wake already bannered this message id — mark seen, no second banner.
                 if marmot.pushWakeNotifiedMessageIDs.contains(message.id) {
                     seenMarmotNotificationMessageIDs.insert(message.id)
@@ -3757,7 +3757,7 @@ final class SonarAppStore: ObservableObject {
                 // transcript, which renders no mention styling there. Mute is
                 // enforced downstream in NotificationService, so a mention does
                 // NOT pierce it (R-022).
-                let isGroupMessage = group.memberNpubs.count > 2
+                let isGroupMessage = snMarmotTreatsAsGroupChat(group)
                 let kind: SonarLocalNotificationKind =
                     (classified == .message && isGroupMessage && mentionsMe(message.content))
                         ? .mention
@@ -9366,7 +9366,7 @@ final class SonarAppStore: ObservableObject {
                     isBlocked: isMarmotSenderBlocked(m.senderNpub),
                     conversationTitle: title,
                     senderName: senderName,
-                    groupName: group.memberNpubs.count > 2 ? title : nil,
+                    groupName: snMarmotTreatsAsGroupChat(group) ? title : nil,
                     content: m.content
                 )
             }

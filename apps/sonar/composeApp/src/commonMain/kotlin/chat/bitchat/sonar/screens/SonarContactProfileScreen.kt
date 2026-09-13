@@ -45,6 +45,7 @@ import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.canonicalProfileKey
+import chat.bitchat.sonar.directMarmotChatIdForPeer
 import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -96,11 +97,8 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             else -> null
         }
         if (resolvedNpub != null) {
-            val mine = canonicalProfileKey(state.npub)
-            state.chats.firstOrNull { chat ->
-                val members = chat.members.map { canonicalProfileKey(it) }
-                members.size == 2 && mine in members && resolvedNpub in members
-            }?.id ?: screen.chatId
+            directMarmotChatIdForPeer(state.chats, state.npub, resolvedNpub)
+                ?: screen.chatId
         } else {
             screen.chatId
         }

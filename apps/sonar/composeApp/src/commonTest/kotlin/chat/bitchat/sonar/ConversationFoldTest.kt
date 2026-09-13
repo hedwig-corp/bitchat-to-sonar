@@ -391,6 +391,9 @@ class ConversationFoldTest {
             chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw),
             directMarmotPeerKey(dm, ownNpub),
         )
+        assertEquals(dm.id, directMarmotChatIdForPeer(listOf(pendingRoom, dm), ownNpub, peerNpub))
+        assertEquals("pending room", marmotNotificationGroupName(pendingRoom))
+        assertEquals(null, marmotNotificationGroupName(dm))
     }
 
     @Test

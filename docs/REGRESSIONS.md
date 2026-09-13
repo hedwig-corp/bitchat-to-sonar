@@ -2694,6 +2694,9 @@ the 1:1. Core, FFI `is_direct`, and both hosts had to agree.
 - *Auto-folding any recovered chat whose known peer set matches a new live
   group.* Correct for recovered DMs (R-003); wrong for rooms where only the
   welcomer is known yet.
+- *Using `members.count > 2` on hosts for notifications or contact-profile
+  1:1 resolution.* A pending room lists only the welcomer after extract, so
+  count-based checks still treat it as a DM. `is_direct` is the signal.
 
 ## Unguarded
 
