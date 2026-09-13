@@ -81,8 +81,12 @@ What the user does **not** keep automatically:
 3. If 0.9 open fails and the file exists:
    - Open with the 0.8 raw key.
    - If `messages` is readable, copy group titles, resume members, and the
-     newest 80 `kind = 9` rows per group onto the transcript sidecar
-     (`connectLocal` / first paint must not scan the whole 0.8 file).
+     newest 80 `kind = 9` rows per group onto the transcript sidecar.
+     First paint ranks on `mls_group_id` / `id` / `created_at` only, then
+     joins `content` / `tags` / `event` for the winners (`ROW_NUMBER`
+     window, or per-group `ORDER BY created_at DESC LIMIT 80` if the
+     window prepare fails). `connectLocal` must not project older payload
+     blobs.
    - Rename the 0.8 file (and WAL/SHM) to `*.mdk08.bak`.
    - Create a fresh 0.9 store at the original path.
    - Copy leftover older rows from the bak on `messages()` / idle
@@ -109,6 +113,10 @@ Guarded by:
 - `persistence::mdk08_store_decrypts_and_moves_plaintext_without_wiping`
 - `persistence::mdk08_first_paint_defers_older_rows_until_remainder`
 - `mdk08_migrate::first_paint_keeps_newest_window_and_marks_truncated`
+- `mdk08_migrate::first_paint_window_sql_ranks_ids_without_payload_columns`
+- `mdk08_migrate::first_paint_skips_invalid_and_non_chat_rows_in_the_window`
+- `mdk08_migrate::first_paint_per_group_fallback_keeps_newest_window`
+- `mdk08_migrate::first_paint_windows_each_group_independently`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
 - `e2e::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
@@ -235,7 +243,10 @@ Never Uninstall Device Apps):
 7. **Cold-start.** Debug + `SONAR_BENCH_NSEC`. Compare `t0→t4` to
    `docs/PERFORMANCE.md`. First-upgrade migrate is local disk on
    `MarmotEngine::persistent` / `connect()` — it must not sit on the
-   relay path. A huge 0.8 DB can stall boot; measure, do not guess.
+   relay path. First-upgrade extract now ranks ids then joins payloads
+   for the newest 80 kind-9 rows per group; leftover blobs stay in
+   `*.mdk08.bak` until `ensure_mdk08_remainder`. Measure a large 0.8
+   DB; do not guess.
 
 ## Surfaces
 

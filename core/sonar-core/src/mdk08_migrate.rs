@@ -375,22 +375,194 @@ fn extract_from_connection(
     }
 
     extract_message_members(conn, &mut extracted)?;
+    extract_chat_rows(conn, local_pk, per_group_limit, &mut extracted)?;
+    Ok(extracted)
+}
 
+struct MessageSelectColumns {
+    has_state: bool,
+    state: &'static str,
+    tags: &'static str,
+    event: &'static str,
+}
+
+fn message_select_columns(conn: &Connection) -> Result<MessageSelectColumns> {
     let has_state = column_exists(conn, "messages", "state")?;
-    let has_tags = column_exists(conn, "messages", "tags")?;
-    let has_event = column_exists(conn, "messages", "event")?;
+    Ok(MessageSelectColumns {
+        has_state,
+        state: if has_state { "m.state" } else { "NULL" },
+        tags: if column_exists(conn, "messages", "tags")? {
+            "m.tags"
+        } else {
+            "NULL"
+        },
+        event: if column_exists(conn, "messages", "event")? {
+            "m.event"
+        } else {
+            "NULL"
+        },
+    })
+}
+
+fn kind9_filter(has_state: bool) -> &'static str {
+    if has_state {
+        "kind = 9 AND (state IS NULL OR (state != 'invalid' AND state != 'failed'))"
+    } else {
+        "kind = 9"
+    }
+}
+
+fn kind9_exceeds_limit(conn: &Connection, limit: usize) -> Result<bool> {
+    let has_state = column_exists(conn, "messages", "state")?;
     let sql = format!(
-        "SELECT mls_group_id, id, pubkey, kind, created_at, content, {}, {}, {} FROM messages \
-         ORDER BY created_at DESC, id DESC",
-        if has_state { "state" } else { "NULL" },
-        if has_tags { "tags" } else { "NULL" },
-        if has_event { "event" } else { "NULL" },
+        "SELECT 1 FROM messages WHERE {} \
+         GROUP BY mls_group_id HAVING COUNT(*) > ?1 LIMIT 1",
+        kind9_filter(has_state)
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| Error::Storage(format!("mdk08 count prepare: {e}")))?;
+    let mut rows = stmt
+        .query(rusqlite::params![limit as i64])
+        .map_err(|e| Error::Storage(format!("mdk08 count query: {e}")))?;
+    Ok(rows
+        .next()
+        .map_err(|e| Error::Storage(format!("mdk08 count row: {e}")))?
+        .is_some())
+}
+
+/// Rank on `mls_group_id` / `id` / `created_at` only, then join payloads.
+/// The ranking subquery must not project `content`, `tags`, or `event`.
+fn first_paint_window_sql(cols: &MessageSelectColumns) -> String {
+    format!(
+        "SELECT m.mls_group_id, m.id, m.pubkey, m.kind, m.created_at, m.content, \
+                {}, {}, {} \
+         FROM messages m \
+         INNER JOIN ( \
+            SELECT mls_group_id, id \
+            FROM ( \
+                SELECT mls_group_id, id, \
+                       ROW_NUMBER() OVER ( \
+                           PARTITION BY mls_group_id \
+                           ORDER BY created_at DESC, id DESC \
+                       ) AS rn \
+                FROM messages \
+                WHERE {} \
+            ) \
+            WHERE rn <= ?1 \
+         ) w ON m.mls_group_id = w.mls_group_id AND m.id = w.id",
+        cols.state,
+        cols.tags,
+        cols.event,
+        kind9_filter(cols.has_state),
+    )
+}
+
+fn first_paint_per_group_sql(cols: &MessageSelectColumns) -> String {
+    format!(
+        "SELECT m.mls_group_id, m.id, m.pubkey, m.kind, m.created_at, m.content, \
+                {}, {}, {} \
+         FROM messages m \
+         INNER JOIN ( \
+            SELECT id \
+            FROM messages \
+            WHERE mls_group_id = ?1 AND {} \
+            ORDER BY created_at DESC, id DESC \
+            LIMIT ?2 \
+         ) w ON m.mls_group_id = ?1 AND m.id = w.id",
+        cols.state,
+        cols.tags,
+        cols.event,
+        kind9_filter(cols.has_state),
+    )
+}
+
+fn extract_chat_rows(
+    conn: &Connection,
+    local_pk: PublicKey,
+    per_group_limit: Option<usize>,
+    extracted: &mut Mdk08Migration,
+) -> Result<()> {
+    let cols = message_select_columns(conn)?;
+    if let Some(limit) = per_group_limit {
+        extracted.truncated = kind9_exceeds_limit(conn, limit)?;
+        match conn.prepare(&first_paint_window_sql(&cols)) {
+            Ok(mut stmt) => {
+                ingest_message_rows(
+                    &mut stmt,
+                    rusqlite::params![limit as i64],
+                    local_pk,
+                    extracted,
+                )?;
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "0.8 first-paint window query unsupported; using per-group LIMIT"
+                );
+                extract_newest_kind9_per_group(conn, local_pk, limit, &cols, extracted)?;
+                return Ok(());
+            }
+        }
+    }
+
+    let sql = format!(
+        "SELECT m.mls_group_id, m.id, m.pubkey, m.kind, m.created_at, m.content, \
+                {}, {}, {} \
+         FROM messages m \
+         WHERE {}",
+        cols.state,
+        cols.tags,
+        cols.event,
+        kind9_filter(cols.has_state),
     );
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| Error::Storage(format!("mdk08 messages prepare: {e}")))?;
+    ingest_message_rows(&mut stmt, (), local_pk, extracted)
+}
+
+fn extract_newest_kind9_per_group(
+    conn: &Connection,
+    local_pk: PublicKey,
+    limit: usize,
+    cols: &MessageSelectColumns,
+    extracted: &mut Mdk08Migration,
+) -> Result<()> {
+    let mut groups = conn
+        .prepare("SELECT DISTINCT mls_group_id FROM messages")
+        .map_err(|e| Error::Storage(format!("mdk08 group ids prepare: {e}")))?;
+    let group_ids: Vec<Vec<u8>> = groups
+        .query_map((), |row| row.get(0))
+        .map_err(|e| Error::Storage(format!("mdk08 group ids query: {e}")))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::Storage(format!("mdk08 group ids row: {e}")))?;
+    let mut stmt = conn
+        .prepare(&first_paint_per_group_sql(cols))
+        .map_err(|e| Error::Storage(format!("mdk08 per-group prepare: {e}")))?;
+    for group_id in group_ids {
+        if group_id.is_empty() {
+            continue;
+        }
+        ingest_message_rows(
+            &mut stmt,
+            rusqlite::params![group_id, limit as i64],
+            local_pk,
+            extracted,
+        )?;
+    }
+    Ok(())
+}
+
+fn ingest_message_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+    local_pk: PublicKey,
+    extracted: &mut Mdk08Migration,
+) -> Result<()> {
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params, |row| {
             Ok((
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -404,8 +576,6 @@ fn extract_from_connection(
             ))
         })
         .map_err(|e| Error::Storage(format!("mdk08 messages query: {e}")))?;
-
-    let mut kind9_counts: HashMap<GroupId, usize> = HashMap::new();
     for row in rows {
         let (group_id, id, pubkey, kind, created_at, content, state, tags_raw, event_raw) =
             row.map_err(|e| Error::Storage(format!("mdk08 messages row: {e}")))?;
@@ -419,22 +589,12 @@ fn extract_from_connection(
             continue;
         }
         let gid = GroupId::new(group_id.clone());
-        let seen = kind9_counts.entry(gid.clone()).or_insert(0);
-        *seen += 1;
-        if per_group_limit.is_some_and(|limit| {
-            extracted
-                .messages
-                .get(&gid)
-                .is_some_and(|msgs| msgs.len() >= limit)
-        }) {
-            continue;
-        }
         let tags = merge_stored_tags(tags_raw.as_deref(), event_raw.as_deref());
         if let Ok(pk) = PublicKey::from_slice(&pubkey) {
-            note_member(&mut extracted, &gid, pk);
+            note_member(extracted, &gid, pk);
         }
         for pk in p_tag_pubkeys(&tags) {
-            note_member(&mut extracted, &gid, pk);
+            note_member(extracted, &gid, pk);
         }
         let Some(msg) = chat_from_mdk08_row(
             &group_id, &id, &pubkey, created_at, content, local_pk, &tags,
@@ -447,10 +607,7 @@ fn extract_from_connection(
             .or_default()
             .push(msg);
     }
-    if let Some(limit) = per_group_limit {
-        extracted.truncated = kind9_counts.values().any(|count| *count > limit);
-    }
-    Ok(extracted)
+    Ok(())
 }
 
 fn extract_message_members(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
@@ -1011,6 +1168,199 @@ mod tests {
             FIRST_PAINT_MESSAGES_PER_GROUP + 1
         );
         assert!(!full.truncated);
+    }
+
+    #[test]
+    fn first_paint_window_sql_ranks_ids_without_payload_columns() {
+        let sql = first_paint_window_sql(&MessageSelectColumns {
+            has_state: true,
+            state: "m.state",
+            tags: "m.tags",
+            event: "m.event",
+        });
+        let ranking = sql
+            .split("INNER JOIN")
+            .nth(1)
+            .expect("id-join ranking subquery");
+        assert!(sql.contains("ROW_NUMBER()"));
+        assert!(
+            !ranking.contains("content"),
+            "ranking must not load content overflow pages"
+        );
+        assert!(!ranking.contains("tags") && !ranking.contains("event"));
+        assert!(kind9_filter(true).contains("state != 'invalid'"));
+    }
+
+    #[test]
+    fn first_paint_skips_invalid_and_non_chat_rows_in_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&path, &local, peer, "oldest");
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let group_id = vec![0x11u8; 16];
+        for i in 1..=FIRST_PAINT_MESSAGES_PER_GROUP {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    group_id.clone(),
+                    id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_700_000_100 + i as i64,
+                    format!("keep-{i}"),
+                ],
+            )
+            .unwrap();
+        }
+        for (i, (kind, state, body)) in [
+            (9i64, "invalid", "bad-invalid"),
+            (9, "failed", "bad-failed"),
+            (445, "processed", "commit-noise"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut id = [0xFFu8; 32];
+            id[1] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', '{}', ?2, ?7, 1)",
+                rusqlite::params![
+                    group_id.clone(),
+                    id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    kind,
+                    1_700_000_400 + i as i64,
+                    body,
+                    state,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let window = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        let msgs = window.messages.values().next().unwrap();
+        assert_eq!(msgs.len(), FIRST_PAINT_MESSAGES_PER_GROUP);
+        assert!(window.truncated);
+        assert!(msgs.iter().any(|m| m.content == "keep-80"));
+        assert!(!msgs.iter().any(|m| m.content == "oldest"));
+        assert!(!msgs.iter().any(|m| m.content.starts_with("bad-")));
+        assert!(!msgs.iter().any(|m| m.content == "commit-noise"));
+    }
+
+    #[test]
+    fn first_paint_per_group_fallback_keeps_newest_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&path, &local, peer, "oldest");
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let group_id = vec![0x11u8; 16];
+        for i in 1..=FIRST_PAINT_MESSAGES_PER_GROUP {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    group_id.clone(),
+                    id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("msg-{i}"),
+                ],
+            )
+            .unwrap();
+        }
+        let cols = message_select_columns(&conn).unwrap();
+        let mut extracted = Mdk08Migration::default();
+        extract_newest_kind9_per_group(
+            &conn,
+            local.public_key(),
+            FIRST_PAINT_MESSAGES_PER_GROUP,
+            &cols,
+            &mut extracted,
+        )
+        .unwrap();
+        let msgs = extracted.messages.values().next().unwrap();
+        assert_eq!(msgs.len(), FIRST_PAINT_MESSAGES_PER_GROUP);
+        assert!(msgs.iter().any(|m| m.content == "msg-80"));
+        assert!(!msgs.iter().any(|m| m.content == "oldest"));
+    }
+
+    #[test]
+    fn first_paint_windows_each_group_independently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&path, &local, peer, "g1-oldest");
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let group_a = vec![0x11u8; 16];
+        let group_b = vec![0x33u8; 16];
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'carol', '')",
+            rusqlite::params![group_b.clone(), vec![0x44u8; 32]],
+        )
+        .unwrap();
+        for (group_id, prefix) in [(&group_a, "a"), (&group_b, "b")] {
+            for i in 1..=FIRST_PAINT_MESSAGES_PER_GROUP {
+                let mut id = [0u8; 32];
+                id[0] = if prefix == "a" { 0xA0 } else { 0xB0 };
+                id[1] = i as u8;
+                conn.execute(
+                    "INSERT INTO messages
+                        (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                         wrapper_event_id, state, epoch)
+                     VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                    rusqlite::params![
+                        group_id.clone(),
+                        id.to_vec(),
+                        peer.to_bytes().to_vec(),
+                        1_700_000_000 + i as i64,
+                        format!("{prefix}-{i}"),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+
+        let window = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        assert!(window.truncated);
+        assert_eq!(window.messages.len(), 2);
+        for msgs in window.messages.values() {
+            assert_eq!(msgs.len(), FIRST_PAINT_MESSAGES_PER_GROUP);
+            assert!(!msgs
+                .iter()
+                .any(|m| m.content.ends_with("-oldest") || m.content == "g1-oldest"));
+        }
     }
 
     #[test]
