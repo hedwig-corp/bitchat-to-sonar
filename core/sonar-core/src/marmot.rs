@@ -753,6 +753,10 @@ pub struct MarmotEngine {
     parked_invites: Mutex<HashMap<EventId, GroupInvite>>,
     dropped_groups: Mutex<HashSet<GroupId>>,
     transcript: Mutex<HashMap<GroupId, Vec<ChatMessage>>>,
+    /// Groups whose last ingest left a MIP-03 `Buffered` commit. The host
+    /// (and sonar-sim) must call [`Self::apply_pending_convergence`] after
+    /// the quiescence window — ingest itself does not wait.
+    pending_convergence: Mutex<HashSet<GroupId>>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
     historical_group_names: HashMap<GroupId, String>,
     /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
@@ -925,6 +929,7 @@ impl MarmotEngine {
             parked_invites: Mutex::new(parked),
             dropped_groups: Mutex::new(dropped),
             transcript: Mutex::new(transcript),
+            pending_convergence: Mutex::new(HashSet::new()),
             historical_group_names,
             _tempdir: None,
         })
@@ -1478,6 +1483,32 @@ impl MarmotEngine {
     /// a later relay redelivery of the same ciphertext is a durable
     /// Duplicate keyed by content-id, which `lookup_chat` cannot find from
     /// the Nostr event id.
+    fn note_pending_convergence(&self, group_id: GroupId) {
+        self.pending_convergence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id);
+    }
+
+    /// Apply MIP-03 buffered commits for every group ingest parked.
+    ///
+    /// Call this after a relay-sync batch or, in tests/sim, after sleeping
+    /// the ~1.1s quiescence window. Ingest itself must not wait on that
+    /// window (Signal-comparable receive path).
+    pub async fn apply_pending_convergence(&self) -> Result<()> {
+        let ids: Vec<GroupId> = self
+            .pending_convergence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        for id in ids {
+            self.advance_group_convergence(&id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn advance_group_convergence(&self, group_id: &GroupId) -> Result<()> {
         let mut lease = self.lease_session().await;
         let _ = lease.get_mut().ensure_group_hydrated(group_id);
@@ -1962,8 +1993,17 @@ impl MarmotEngine {
             IngestOutcome::Rejected { .. } | IngestOutcome::Stale { .. } => {
                 return Ok(Incoming::Failed)
             }
-            IngestOutcome::Buffered { .. } if effects.events.is_empty() => {
-                return Ok(Incoming::Failed)
+            IngestOutcome::Buffered { group_id, .. } => {
+                // MDK accepted the commit into durable storage but will not
+                // apply it until `advance_convergence` after the MIP-03
+                // quiescence window. Returning Failed here made sonar-sim
+                // and relay sync treat a valid add-members commit as a
+                // decrypt miss, so the roster never grew past the founding
+                // batch. Schedule the group and surface GroupUpdated so the
+                // host can apply it off the ingest path.
+                self.note_pending_convergence(group_id.clone());
+                let _ = self.persist_session_effects(effects);
+                return Ok(Incoming::GroupUpdated(group_id));
             }
             IngestOutcome::TransportDeferred { .. } | IngestOutcome::ResourceRefused { .. } => {
                 return Ok(Incoming::Failed)

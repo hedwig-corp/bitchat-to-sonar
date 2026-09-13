@@ -241,6 +241,27 @@ async fn deliver_welcomes(
 /// Fan an event out to every active agent except `skip`. Returns the number of
 /// **distinct recipients** that did not accept it (one per broken member, never
 /// two), and appends one diagnostic per broken recipient to `errors`.
+/// Sleep the MIP-03 quiescence window, then apply every agent's buffered
+/// kind-445 commits. Ingest must not do this itself.
+async fn settle_buffered_commits(
+    agents: &mut [Agent],
+    group_id: &sonar_core::GroupId,
+    anomalies: &mut Vec<String>,
+) {
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    for (i, agent) in agents.iter_mut().enumerate() {
+        if !agent.active {
+            continue;
+        }
+        if let Err(e) = agent.engine.advance_group_convergence(group_id).await {
+            anomalies.push(format!("agent-{i}: advance_group_convergence: {e}"));
+        }
+        if let Err(e) = agent.engine.apply_pending_convergence().await {
+            anomalies.push(format!("agent-{i}: apply_pending_convergence: {e}"));
+        }
+    }
+}
+
 async fn fan_out(
     agents: &mut [Agent],
     skip: PublicKey,
@@ -389,6 +410,11 @@ async fn run_step(
                 anomalies.push(format!("merge_pending_commit(at {added}): {e}"));
             }
         }
+        // MDK 0.9 leaves kind-445 commits Buffered until the MIP-03
+        // quiescence window closes. Existing members ingested the commit
+        // above; apply it before the next batch or the roster stays at
+        // the founding size (N=50 was failing here).
+        settle_buffered_commits(&mut agents, &group_id, &mut anomalies).await;
         added += chunk.len();
     }
     let build_ms = t_build.elapsed().as_millis();
@@ -538,6 +564,9 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
             }
         }
     }
+    let mut settle_anomalies = Vec::new();
+    settle_buffered_commits(&mut agents, &group_id, &mut settle_anomalies).await;
+    outcomes.extend(settle_anomalies);
     // Deliver each committer's welcome to ITS invitee and fold both into the
     // swarm: fresh_a joins via the winning commit, fresh_b via the stale one.
     // Without this, an invitee stranded on the losing branch is silently dropped

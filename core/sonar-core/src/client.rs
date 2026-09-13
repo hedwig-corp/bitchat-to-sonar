@@ -6613,6 +6613,12 @@ impl SonarClient {
         let mut notifications: Vec<DrainNotification> = Vec::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
         let mut sticker_refs: Vec<StickerRef> = Vec::new();
+        // Replay MIP-03 buffered commits from an earlier ingest. Ingest
+        // itself returns immediately (Buffered → GroupUpdated); applying
+        // here keeps the quiescence wait off the receive path.
+        if let Err(err) = self.engine.apply_pending_convergence().await {
+            tracing::debug!(%err, context, "pending MIP-03 convergence apply failed");
+        }
         let group_names: HashMap<Vec<u8>, String> = self
             .engine
             .groups()

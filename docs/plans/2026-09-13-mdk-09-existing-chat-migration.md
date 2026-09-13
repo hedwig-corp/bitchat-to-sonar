@@ -159,7 +159,14 @@ cargo test -p sonar-core --test media
 cargo test -p sonar-sim
 ```
 
-MDK-bump rule (`docs/GROUP-SCALE-SIM.md`):
+MIP-03: kind-445 commits stay `Buffered` until `advance_group_convergence`
+after ~1.1s. Ingest returns `GroupUpdated` and parks the group;
+`process_marmot_events` / `sonar-sim` apply the drain off the receive
+path. Treating `Buffered` as `Failed` froze incremental `add_members`
+at the founding batch.
+
+MDK-bump rule (`docs/GROUP-SCALE-SIM.md`): the v0.9.14 ceiling is **50**
+(`--batch 25`). N=100 fails wrapping the next welcome (NIP-44).
 
 ```sh
 cargo run -p sonar-sim --release -- group-scale \

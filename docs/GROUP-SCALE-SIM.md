@@ -83,23 +83,26 @@ Interpreting a run against a previous one (the "numbers when updating" case):
 - A moved ceiling after an **MDK rev bump** is the signal to watch: it means the
   wire format changed, which is exactly what can break White Noise interop.
 
-**Current pin: MDK v0.9.14 (`235c8ade`).** The table under
-[Findings](#findings-2026-07-mdk-rev-e8cd584) is the **0.8 baseline** (rev
-`e8cd584`, wire `0xf2ee`). It is **not** a valid comparison target for 0.9.14
-(`0xf2f1`) until the sim is re-run on this rev.
+**Current pin: MDK v0.9.14 (`235c8ade`, wire `0xf2f1`).** The live baseline is
+[Findings (2026-09-13)](#findings-2026-09-13-mdk-v0914-235c8ade). The 0.8
+table under [Findings (2026-07)](#findings-2026-07-mdk-rev-e8cd584) is
+historical only.
 
-> **TODO (pending `sonar-sim group-scale` rerun on v0.9.14):** replace the
-> 0.8 table below with a new baseline for `--batch 25` / `--mode incremental`
-> on `235c8ade`. Do **not** invent numbers. Until that run lands, treat the
-> 0.8 ceiling/welcome-size columns as historical only.
->
-> Reproduce:
-> ```sh
-> cargo run -p sonar-sim --release -- group-scale \
->   --ramp 2,5,10,25 --mode incremental --batch 25 --no-nip11 \
->   --out /tmp/scale-mdk09.json
-> ```
-> Full ramp `2,5,10,25,50,100,110,120,130` can follow once the smoke sizes pass.
+Reproduce the current baseline (`--no-nip11` keeps the run machine-local;
+`--chaos` is expected not to stage on 0.9.14 — see Finding 2):
+
+```sh
+cargo run -p sonar-sim --release -- group-scale \
+  --ramp 2,5,10,25,50,100,110,120,130 \
+  --mode incremental --batch 25 --chaos --no-nip11 \
+  --out /tmp/scale-mdk09.json
+```
+
+MDK 0.9 leaves kind-445 commits `Buffered` until the MIP-03 quiescence
+window (~1.1s). The sim now sleeps that window and calls
+`advance_group_convergence` after each `add_members` fan-out. Without
+that drain the roster freezes at the founding batch (N=25) and N=50
+looks like a false ceiling.
 
 ## Reproduce with an agent (prompt)
 
@@ -116,11 +119,53 @@ re-measure and report:
 >    the first failing N failed; the `--chaos` `converged`/`post_race_fanout_ok`
 >    values and branch populations; and the welcome-bytes column.
 > 4. Compare against the **current-rev** baseline table in
->    `docs/GROUP-SCALE-SIM.md`. Until the v0.9.14 table exists, report the raw
->    JSON and do not treat the 0.8 (`e8cd584`) numbers as a pass/fail gate —
->    the wire format moved (`0xf2ee` → `0xf2f1`). Flag structural outcomes
+>    `docs/GROUP-SCALE-SIM.md` (v0.9.14 section). Flag structural outcomes
 >    (ceiling N, `ok`, `converged`, welcome bytes). Ignore `build`/`fanout`
 >    timings (machine-bound). Note the current MDK rev from `core/Cargo.toml`.
+
+## Findings (2026-09-13, MDK v0.9.14 `235c8ade`)
+
+Measured on this PR with `--batch 25 --mode incremental --no-nip11 --chaos`.
+`sonar-sim` settles MIP-03 buffered commits after each add-batch.
+
+### 1. Hard ceiling = 50 members, still gated by the welcome NIP-44 seal
+
+The founding wave (N≤25) and the first `add_members` batch (N=50) converge
+and fan out. Growing past 50 fails while wrapping the next welcome:
+
+`add_members(at 50): wrap failed: nip44 encryption error: message too long`
+
+Same binding constraint as 0.8 (NIP-44 65535-byte plaintext, not relay
+`max_message_length`). The wrapped welcome is already 66 045 B at N=50.
+0.8's welcome at N=25 was 27.8 KB; 0.9.14 is 38.7 KB — the `0xf2f1` tree
+is heavier, so the ceiling moved **120 → 50**.
+
+Baseline — `--batch 25`, MDK v0.9.14 `235c8ade`:
+
+| N   | welcome (wrapped) | evolution | build    | result |
+| --- | ----------------- | --------- | -------- | ------ |
+| 2   | 5.3 KB            | —         | 0.45 s   | ok     |
+| 5   | 11.4 KB           | —         | 0.52 s   | ok     |
+| 10  | 16.9 KB           | —         | 0.83 s   | ok     |
+| 25  | 38.7 KB           | —         | 2.4 s    | ok     |
+| 50  | 66.0 KB           | 18.6 KB   | 16.8 s   | ok     |
+| 100 | 66.0 KB           | 19.2 KB   | 17.4 s   | welcome too long |
+
+Build timings are machine-bound. Treat 50 as the safe default-config
+ceiling until a smaller `--batch` (or a welcome-format change) is
+re-measured. Re-verify White Noise interop at N≈25 and N≈50 before
+calling the ceiling a product limit.
+
+### 2. Concurrent same-epoch add commits do not stage
+
+`--chaos` could not create two in-flight `add_members` commits on the
+same epoch (`concurrent add_members failed to stage` at every N). This
+is **not** the 0.8 fork (`converged=false` with populations like
+`[121, 1]`). 0.9.14 refuses the second staging instead of accepting a
+rival commit. `converged` and `post_race_fanout_ok` stay `false`
+because the race never starts. A future engine that stages both and
+self-heals would flip those to `true`; an engine that stages both and
+forks would look like the 0.8 finding again.
 
 ## Findings (2026-07, MDK rev `e8cd584` — 0.8 historical baseline)
 
