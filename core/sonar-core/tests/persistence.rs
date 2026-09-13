@@ -805,3 +805,140 @@ async fn a_commit_with_no_restore_in_flight_leaves_the_slot_alone() {
         "a healthy install must keep its coordinate"
     );
 }
+
+/// An on-disk MDK 0.8 SQLCipher store (raw-key `x'<hex>'`, `messages` table)
+/// must not fail open and must not be wiped. Plaintext chat is copied onto the
+/// 0.9 transcript sidecar so existing installs keep readable history.
+#[tokio::test]
+async fn mdk08_store_decrypts_and_moves_plaintext_without_wiping() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let event_id = nostr::EventId::from_slice(&[0xABu8; 32]).expect("event id");
+    let group_id = vec![0x11u8; 16];
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open 0.8 file");
+        let hex_key = DB_KEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .expect("0.8 raw key");
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );",
+        )
+        .expect("0.8 schema");
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'alice & bob', '')",
+            rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
+        )
+        .expect("group row");
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, 1_700_000_000, 'keep this chat', '[]', '{}', ?2, 'processed')",
+            rusqlite::params![
+                group_id.clone(),
+                event_id.as_bytes().to_vec(),
+                bob.public_key().to_bytes().to_vec(),
+            ],
+        )
+        .expect("chat row");
+    }
+
+    let engine = MarmotEngine::persistent(alice.clone(), &db_path, DB_KEY)
+        .expect("0.8 store must migrate instead of failing open");
+    let recovered = engine
+        .messages(&sonar_core::GroupId::new(group_id.clone()))
+        .expect("recovered transcript");
+    assert_eq!(recovered.len(), 1, "plaintext chat must be readable");
+    assert_eq!(recovered[0].id, event_id);
+    assert_eq!(recovered[0].content, "keep this chat");
+    assert_eq!(recovered[0].sender, bob.public_key());
+    assert_eq!(
+        engine
+            .historical_group_name(&sonar_core::GroupId::new(group_id.clone()))
+            .as_deref(),
+        Some("alice & bob")
+    );
+    assert_eq!(engine.groups().expect("live 0.9 groups").len(), 0);
+
+    let bak = db_path.with_file_name("marmot.sqlite.mdk08.bak");
+    assert!(bak.exists(), "0.8 file must be quarantined, not deleted");
+    assert!(
+        db_path.exists(),
+        "a fresh 0.9 store must occupy the original path"
+    );
+
+    let index = sonar_core::conversation_index::ConversationIndex::open_in_memory().expect("index");
+    index.materialize_from(&engine).expect("seed from sidecar");
+    let summaries = index.summaries_ordered().expect("summaries");
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].latest_content, "keep this chat");
+    assert_eq!(summaries[0].name, "alice & bob");
+    assert_eq!(summaries[0].unread_count, 0);
+
+    drop(engine);
+    let reopened = MarmotEngine::persistent(alice, &db_path, DB_KEY).expect("0.9 reopen");
+    assert_eq!(
+        reopened
+            .messages(&sonar_core::GroupId::new(group_id))
+            .expect("sidecar survives reopen")
+            .len(),
+        1
+    );
+    assert!(bak.exists(), "quarantine must survive a later 0.9 reopen");
+}
+
+/// A 0.8-shaped store with the wrong host key must stay on disk and must not
+/// be treated as a migratable store (Account Key Durability).
+#[tokio::test]
+async fn mdk08_store_wrong_key_is_left_intact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        let hex_key = DB_KEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .expect("0.8 raw key");
+        conn.execute_batch("CREATE TABLE messages (id BLOB PRIMARY KEY);")
+            .expect("schema");
+    }
+    let result = MarmotEngine::persistent(Identity::generate(), &db_path, [0x13; 32]);
+    assert!(result.is_err(), "wrong key must fail");
+    let err = result.err().expect("error").to_string();
+    assert!(
+        err.contains("protocol migration required"),
+        "wrong key is not a successful migrate: {err}"
+    );
+    assert!(db_path.exists(), "wrong key must not wipe the 0.8 store");
+    assert!(
+        !db_path.with_file_name("marmot.sqlite.mdk08.bak").exists(),
+        "wrong key must not quarantine the store"
+    );
+}

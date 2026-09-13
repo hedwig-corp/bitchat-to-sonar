@@ -14,6 +14,7 @@ pub mod handles;
 pub mod identity;
 pub mod invite_link;
 pub mod marmot;
+pub(crate) mod mdk08_migrate;
 pub mod media_crypto;
 pub mod media_staging;
 pub mod mention;

@@ -73,7 +73,7 @@ pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
 pub(crate) const KEY_PACKAGE_SLOT_FILE_SUFFIX: &str = ".sonar-keypackage-slot";
 
 /// Host-owned chat transcript (MDK 0.9 no longer stores plaintext app events).
-const TRANSCRIPT_FILE_SUFFIX: &str = ".sonar-transcript.json";
+pub(crate) const TRANSCRIPT_FILE_SUFFIX: &str = ".sonar-transcript.json";
 const PARKED_INVITES_FILE_SUFFIX: &str = ".sonar-parked-invites.json";
 const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json";
 
@@ -753,6 +753,8 @@ pub struct MarmotEngine {
     parked_invites: Mutex<HashMap<EventId, GroupInvite>>,
     dropped_groups: Mutex<HashSet<GroupId>>,
     transcript: Mutex<HashMap<GroupId, Vec<ChatMessage>>>,
+    /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
+    historical_group_names: HashMap<GroupId, String>,
     /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
     _tempdir: Option<tempfile::TempDir>,
 }
@@ -806,8 +808,12 @@ impl MarmotEngine {
     ///
     /// `key` is the 32-byte host key. It is encoded as lowercase hex and passed
     /// to MDK 0.9 as a SQLCipher passphrase (`PRAGMA key = '<hex>'`), not the
-    /// 0.8 raw-key form `x'<hex>'`. Existing 0.8 databases therefore cannot be
-    /// opened in place.
+    /// 0.8 raw-key form `x'<hex>'`.
+    ///
+    /// An existing 0.8 store is **not** wiped. Plaintext chat rows are copied
+    /// into the host transcript sidecar, the 0.8 file is quarantined as
+    /// `*.mdk08.bak`, and a fresh 0.9 store is created at `db_path`. MLS
+    /// membership is not imported — 0.8 and 0.9 cannot decrypt each other.
     ///
     /// Group hydration is deferred so chat-list first paint does not wait on
     /// every MLS group. Sends/ingest hydrate on demand.
@@ -834,10 +840,48 @@ impl MarmotEngine {
                 );
                 Ok(engine)
             }
-            Err(e) if path.exists() => Err(Error::Storage(format!(
-                "MDK 0.9 cannot open this store (protocol migration required): {e}"
-            ))),
+            Err(e) if path.exists() => Self::migrate_mdk08_or_fail(identity, path, key, e),
             Err(e) => Err(e),
+        }
+    }
+
+    fn migrate_mdk08_or_fail(
+        identity: Identity,
+        path: &Path,
+        key: [u8; 32],
+        open_err: Error,
+    ) -> Result<Self> {
+        let extracted =
+            match crate::mdk08_migrate::detect_and_extract(path, key, identity.public_key()) {
+                Ok(Some(extracted)) => extracted,
+                Ok(None) => {
+                    return Err(Error::Storage(format!(
+                        "MDK 0.9 cannot open this store (protocol migration required): {open_err}"
+                    )))
+                }
+                Err(migrate_err) => {
+                    return Err(Error::Storage(format!(
+                        "MDK 0.8 extract failed (store left intact): {migrate_err}"
+                    )))
+                }
+            };
+        crate::mdk08_migrate::write_sidecars(path, &extracted)?;
+        let quarantine = crate::mdk08_migrate::quarantine_store(path)?;
+        match Self::open_session(identity, path, key, true) {
+            Ok(engine) => {
+                tracing::info!(
+                    groups = extracted.messages.len(),
+                    messages = extracted.messages.values().map(|m| m.len()).sum::<usize>(),
+                    "marmot: recovered 0.8 plaintext transcript; 0.8 store quarantined"
+                );
+                Ok(engine)
+            }
+            Err(e) => {
+                let _ = quarantine.restore();
+                Err(Error::Storage(format!(
+                    "MDK 0.9 recreate after 0.8 extract failed; 0.8 store restored: {e}"
+                )))
+            }
         }
     }
 
@@ -870,6 +914,7 @@ impl MarmotEngine {
         let parked = load_parked(db_path);
         let dropped = load_dropped(db_path);
         let transcript = load_transcript(db_path);
+        let historical_group_names = crate::mdk08_migrate::load_historical_group_names(db_path);
         Ok(Self {
             session: Mutex::new(Some(session)),
             identity,
@@ -880,6 +925,7 @@ impl MarmotEngine {
             parked_invites: Mutex::new(parked),
             dropped_groups: Mutex::new(dropped),
             transcript: Mutex::new(transcript),
+            historical_group_names,
             _tempdir: None,
         })
     }
@@ -1056,7 +1102,26 @@ impl MarmotEngine {
                 Err(e) => return Err(Error::Storage(format!("wipe {}: {e}", path.display()))),
             }
         }
-        Ok(())
+        crate::mdk08_migrate::wipe_mdk08_backups(base)
+    }
+
+    /// Group ids that have host-owned transcript rows, including history
+    /// recovered from an MDK 0.8 store. These may not be live 0.9 MLS groups.
+    pub fn transcript_group_ids(&self) -> Vec<GroupId> {
+        let mut ids: Vec<GroupId> = self
+            .transcript
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        ids
+    }
+
+    /// Title recovered from an MDK 0.8 `groups` row, if any.
+    pub fn historical_group_name(&self, group_id: &GroupId) -> Option<String> {
+        self.historical_group_names.get(group_id).cloned()
     }
 
     fn key_package_slot_path(&self) -> Option<PathBuf> {
@@ -2572,6 +2637,8 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         TRANSCRIPT_FILE_SUFFIX,
         PARKED_INVITES_FILE_SUFFIX,
         DROPPED_GROUPS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
+        crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))

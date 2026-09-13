@@ -383,31 +383,52 @@ impl ConversationIndex {
     pub fn materialize_from(&self, engine: &MarmotEngine) -> Result<()> {
         let groups = engine.groups()?;
         for group in &groups {
-            let group_id_hex = hex::encode(group.id.as_slice());
-            let page = engine.messages_page(&group.id, 1, 0)?;
-            if let Some(msg) = page.first() {
-                let sender = msg.sender.to_string();
-                self.upsert_summary(
-                    &group_id_hex,
-                    &group.name,
-                    &crate::client::index_preview(msg),
-                    &sender,
-                    msg.created_at.as_secs(),
-                    msg.mine,
-                    // Rebuild from storage resets unread below anyway.
-                    msg.classification.is_transcript_visible(),
-                )?;
-                self.db
-                    .execute(
-                        "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
-                        params![group_id_hex],
-                    )
-                    .map_err(|e| {
-                        crate::Error::Storage(format!("index materialize unread reset: {e}"))
-                    })?;
-            } else {
-                self.ensure_group(&group_id_hex, &group.name)?;
+            self.materialize_one(engine, &group.id, &group.name)?;
+        }
+        // Recovered 0.8 history lives on the transcript sidecar, not in the
+        // 0.9 MLS group list. Seed those rows so chat-list first paint keeps
+        // the old conversations after a protocol port.
+        for group_id in engine.transcript_group_ids() {
+            let hex = hex::encode(group_id.as_slice());
+            if self.summary(&hex)?.is_some() {
+                continue;
             }
+            let name = engine.historical_group_name(&group_id).unwrap_or_default();
+            self.materialize_one(engine, &group_id, &name)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_one(
+        &self,
+        engine: &MarmotEngine,
+        group_id: &crate::GroupId,
+        name: &str,
+    ) -> Result<()> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let page = engine.messages_page(group_id, 1, 0)?;
+        if let Some(msg) = page.first() {
+            let sender = msg.sender.to_string();
+            self.upsert_summary(
+                &group_id_hex,
+                name,
+                &crate::client::index_preview(msg),
+                &sender,
+                msg.created_at.as_secs(),
+                msg.mine,
+                // Rebuild from storage resets unread below anyway.
+                msg.classification.is_transcript_visible(),
+            )?;
+            self.db
+                .execute(
+                    "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
+                    params![group_id_hex],
+                )
+                .map_err(|e| {
+                    crate::Error::Storage(format!("index materialize unread reset: {e}"))
+                })?;
+        } else {
+            self.ensure_group(&group_id_hex, name)?;
         }
         Ok(())
     }
@@ -417,7 +438,6 @@ impl ConversationIndex {
 mod tests {
     use super::*;
 
-    #[test]
     #[test]
     fn repair_json_previews_rewrites_legacy_rows_once() {
         let idx = ConversationIndex::open_in_memory().unwrap();
