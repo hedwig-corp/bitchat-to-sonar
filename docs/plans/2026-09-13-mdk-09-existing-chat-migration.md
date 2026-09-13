@@ -165,6 +165,7 @@ Guarded by:
 - `persistence::mdk08_account_backup_keeps_bak_when_transcript_is_missing`
 - `persistence::mdk08_unreadable_bak_keeps_remainder_pending`
 - `mdk08_migrate::leftover_bak_needed_follows_transcript_not_just_the_marker`
+  (also pins `bak_needed_for_backup` until `metadata_backfill=complete`)
 - `mdk08_migrate::empty_named_group_is_kept_for_resume`
 - `mdk08_migrate::pending_welcome_is_kept_for_resume`
 - `mdk08_migrate::labeled_media_exporter_secret_is_copied_unlabeled_is_not`
@@ -212,9 +213,14 @@ otherwise restore keeps only the first-paint window. Once leftover rows
 are copied onto the transcript, later backups omit the bak so the sealed
 blob does not double (cap 400 MiB while bak is still packed). If the
 transcript sidecar is missing, the bak is packed even when the marker
-says `complete`. An unreadable bak fails the remainder tick and stays
-pending — it is never treated as an empty remainder. The local
-`*.mdk08.bak` file stays on disk until a later cleanup release.
+says `complete`. If `metadata_backfill` is not `complete`, the bak is
+packed even after leftover rows are in the transcript — otherwise an
+early 0.9 backup would drop pending welcomes and labeled media secrets
+on nsec restore. Remainder ticks still follow leftover rows only, so
+idle sync does not reopen the bak after history is copied. An
+unreadable bak fails the remainder tick and stays pending — it is never
+treated as an empty remainder. The local `*.mdk08.bak` file stays on
+disk until a later cleanup release.
 
 ## How users keep access after the flag-day
 
@@ -373,13 +379,15 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on `253d5f75` (this cloud agent). All green:
+Re-run on `51d95ef2` (this cloud agent) after the host-path pins. All green.
+`bak_needed_for_backup` landed after that commit and is covered by the
+leftover-bak + persist backfill tests above.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `mdk08_migrate` + `historical_fold` + `account_backup` | 92 passed |
-| `--test persistence` | 27 passed |
-| `--lib client::tests` | 71 passed |
+| `--lib` `mdk08_migrate` + `historical_fold` + `account_backup` | 93 passed |
+| `--test persistence` | 28 passed |
+| `--lib client::tests` | 72 passed |
 | `--test e2e` `recovered_08` | 6 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |

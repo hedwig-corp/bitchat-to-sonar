@@ -369,8 +369,9 @@ pub(crate) fn mark_remainder_complete(db_path: &Path) -> Result<()> {
 
 /// True while leftover 0.8 rows still live only in `*.mdk08.bak`.
 ///
-/// Account backup uses the same rule so a completed remainder does not
-/// double the sealed blob by uploading the quarantined file again.
+/// Remainder ticks use this. Account backup uses
+/// [`bak_needed_for_backup`] so a completed remainder can still pack the
+/// bak until pending welcomes / labeled media secrets have been copied.
 pub(crate) fn leftover_bak_needed(db_path: &Path) -> bool {
     if !backup_path(db_path).exists() {
         return false;
@@ -392,6 +393,14 @@ pub(crate) fn leftover_bak_needed(db_path: &Path) -> bool {
         Some("complete") | None if transcript_exists => false,
         _ => true,
     }
+}
+
+/// Pack `*.mdk08.bak` in an account backup while remainder is pending **or**
+/// metadata backfill has not landed. An early 0.9 open may have finished
+/// leftover rows before welcomes/secrets were extracted; omitting the bak
+/// then drops those on nsec restore.
+pub(crate) fn bak_needed_for_backup(db_path: &Path) -> bool {
+    leftover_bak_needed(db_path) || metadata_backfill_pending(db_path)
 }
 
 /// Resume leftover 0.8 rows from the quarantined file after first paint.
@@ -1410,6 +1419,15 @@ mod tests {
         assert!(
             !leftover_bak_needed(&db),
             "complete + transcript is the durable copy"
+        );
+        assert!(
+            bak_needed_for_backup(&db),
+            "pre-welcome extracts must still pack the bak so restore can backfill"
+        );
+        mark_metadata_backfill_complete(&db).unwrap();
+        assert!(
+            !bak_needed_for_backup(&db),
+            "once metadata is copied the bak can drop from later backups"
         );
     }
 

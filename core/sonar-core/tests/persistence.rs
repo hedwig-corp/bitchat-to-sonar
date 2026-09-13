@@ -2176,6 +2176,25 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
         .expect("existing chat row");
     drop(index);
 
+    let key_hex = DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let package = sonar_core::account_backup::read_account_backup_package(&db_path, &key_hex)
+        .expect("early-0.9 backup must still pack the bak");
+    assert!(
+        package
+            .sidecar_files
+            .iter()
+            .any(|(name, _)| name == ".mdk08.bak"),
+        "metadata_backfill is not complete; restore needs the bak: {:?}",
+        package
+            .sidecar_files
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+    );
+
     let client = SonarClient::connect(alice, Vec::new(), &db_path, DB_KEY)
         .await
         .expect("connectLocal must backfill then seed the chat list");

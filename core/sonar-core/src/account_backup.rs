@@ -915,10 +915,10 @@ fn is_mdk08_bak_suffix(suffix: &str) -> bool {
         || suffix == "-journal.mdk08.bak"
 }
 
-/// Pack the quarantined 0.8 file only while leftover rows are still not
-/// in the transcript. See [`crate::mdk08_migrate::leftover_bak_needed`].
+/// Pack the quarantined 0.8 file while leftover rows or bak metadata
+/// (pending welcomes / labeled media secrets) are still only in the bak.
 fn pack_mdk08_bak(db_path: &Path) -> bool {
-    crate::mdk08_migrate::leftover_bak_needed(db_path)
+    crate::mdk08_migrate::bak_needed_for_backup(db_path)
 }
 
 fn read_backup_sidecars(db_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
