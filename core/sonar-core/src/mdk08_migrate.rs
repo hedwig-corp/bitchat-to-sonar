@@ -403,6 +403,27 @@ pub(crate) fn bak_needed_for_backup(db_path: &Path) -> bool {
     leftover_bak_needed(db_path) || metadata_backfill_pending(db_path)
 }
 
+/// Group titles from a quarantined 0.8 file, including pending welcomes.
+/// Settings preview uses this when the conversation index never stored those
+/// rows (an early 0.9 extract).
+pub(crate) fn preview_group_names_from_bak(bak_path: &Path, key: [u8; 32]) -> Vec<String> {
+    let Some(conn) = open_mdk08(bak_path, key).ok().flatten() else {
+        return Vec::new();
+    };
+    let mut extracted = Mdk08Migration::default();
+    if extract_metadata(&conn, &mut extracted).is_err() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = extracted
+        .group_names
+        .into_values()
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Resume leftover 0.8 rows from the quarantined file after first paint.
 pub(crate) fn pending_remainder(
     db_path: &Path,

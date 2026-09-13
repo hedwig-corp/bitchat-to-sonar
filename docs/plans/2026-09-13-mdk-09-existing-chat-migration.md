@@ -177,7 +177,8 @@ Guarded by:
 - `persistence::mdk08_bak_backfills_welcome_and_media_secrets_on_reopen`
   (pins `SonarClient::connect` → `conversation_summaries()` on a non-empty
   0.8-era index: pending welcome + welcomer resume peers land, existing
-  unread is not reset)
+  unread is not reset. Also pins nsec restore of that blob and Settings
+  preview listing a bak-only invite)
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
@@ -205,7 +206,9 @@ A **v1 backup taken before upgrade** is only the 0.8 SQLCipher file.
 Restore writes those bytes; `MarmotEngine::persistent` runs decrypt-and-move
 again. Preview of a v2 blob with no (or empty) index lists recovered chats
 from the transcript / historical-groups sidecars so Settings does not say
-the backup is empty. Parked invites, dropped-group ids, the outbox, and
+the backup is empty. A non-empty index is unioned with titles from a
+packed `*.mdk08.bak` so a pending invite that never reached the index
+still appears in the dry run. Parked invites, dropped-group ids, the outbox, and
 sync watermarks travel with v2 so a pending 0.9 send or room resume
 survives nsec restore. The quarantined `*.mdk08.bak` plus the partial
 migrate marker must be in the blob **while remainder is still pending** —

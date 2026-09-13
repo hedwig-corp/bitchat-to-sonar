@@ -1866,15 +1866,60 @@ async fn preview_account_backup_from(
 /// Prefer the conversation index. If it is missing or empty — a backup
 /// taken after the 0.8 migrate, before chat-list rows were seeded — list
 /// recovered chats from the transcript / historical-groups sidecars.
-fn preview_conversations(
+/// Always union titles from a packed `*.mdk08.bak` so a pending 0.8 invite
+/// that never reached the index still appears in Settings.
+pub fn preview_conversations(
     db_path: &Path,
     package: &AccountBackupPackage,
 ) -> Vec<BackupPreviewConversation> {
-    let from_index = preview_from_index(db_path, package);
-    if !from_index.is_empty() {
-        return from_index;
+    let mut out = preview_from_index(db_path, package);
+    if out.is_empty() {
+        out = preview_from_recovered_sidecars(package);
     }
-    preview_from_recovered_sidecars(package)
+    for row in preview_from_packed_bak(db_path, package) {
+        if row.name.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|existing| existing.name == row.name) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+fn preview_from_packed_bak(
+    db_path: &Path,
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let Some((_, bytes)) = package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::mdk08_migrate::MDK08_BACKUP_SUFFIX)
+    else {
+        return Vec::new();
+    };
+    let Ok(scratch) = preview_scratch_dir(db_path) else {
+        return Vec::new();
+    };
+    let bak_path = scratch.path().join("preview.mdk08.bak");
+    if fs::write(&bak_path, bytes).is_err() {
+        return Vec::new();
+    }
+    let key: [u8; 32] = match hex::decode(&package.db_key_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(key) => key,
+        None => return Vec::new(),
+    };
+    crate::mdk08_migrate::preview_group_names_from_bak(&bak_path, key)
+        .into_iter()
+        .map(|name| BackupPreviewConversation {
+            name,
+            latest_content: String::new(),
+            message_count: 0,
+        })
+        .collect()
 }
 
 fn preview_from_index(

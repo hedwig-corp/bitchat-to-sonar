@@ -2194,6 +2194,60 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>()
     );
+    let preview = sonar_core::account_backup::preview_conversations(&db_path, &package);
+    assert!(
+        preview.iter().any(|c| c.name == "pending room"),
+        "Settings preview must list a bak-only invite: {preview:?}"
+    );
+
+    let restore_dir = tempfile::tempdir().expect("restore dir");
+    let restore_path = restore_dir.path().join("marmot.sqlite");
+    sonar_core::account_backup::write_account_backup_package(&restore_path, &package)
+        .expect("nsec restore of the early-0.9 blob");
+    assert!(
+        restore_path
+            .with_file_name("marmot.sqlite.mdk08.bak")
+            .exists(),
+        "restore must put the packed bak next to the 0.9 store"
+    );
+    let restored = SonarClient::connect(alice.clone(), Vec::new(), &restore_path, DB_KEY)
+        .await
+        .expect("restore connectLocal must backfill from the packed bak");
+    let welcome = GroupId::new(welcome_id.clone());
+    let restored_listed = restored
+        .historical_groups()
+        .expect("list after nsec restore");
+    let restored_welcome = restored_listed
+        .iter()
+        .find(|g| g.id == welcome && g.name == "pending room")
+        .expect("pending welcome must survive nsec restore from bak");
+    assert!(
+        restored_welcome
+            .members
+            .iter()
+            .any(|pk| *pk == welcomer.public_key()),
+        "restored invite must still have a resume peer: {restored_welcome:?}"
+    );
+    let restored_summaries = restored.conversation_summaries();
+    let restored_chat = restored_summaries
+        .iter()
+        .find(|s| s.name == "alice & bob")
+        .expect("restored upgraded chat row must stay");
+    assert_eq!(
+        restored_chat.unread_count, 1,
+        "nsec restore must not reset unread: {restored_chat:?}"
+    );
+    assert!(
+        restored_summaries.iter().any(|s| s.name == "pending room"),
+        "nsec restore must seed the invite onto the home list: {restored_summaries:?}"
+    );
+    let chat = GroupId::new(chat_id.clone());
+    let restored_plain = restored
+        .engine()
+        .decrypt_media_by_url(&chat, url, &upload.encrypted_data)
+        .expect("labeled secret must survive nsec restore from bak");
+    assert_eq!(restored_plain, b"photo-bytes");
+    drop(restored);
 
     let client = SonarClient::connect(alice, Vec::new(), &db_path, DB_KEY)
         .await
