@@ -277,8 +277,8 @@ pub struct ChatMessage {
 }
 
 /// Stable `Error::Media` body when a recovered 0.8 attachment cannot be
-/// opened. Hosts match this string and must not offer Retry — the 0.8 MLS
-/// exporter secret is not imported into the 0.9 session.
+/// opened. Hosts match this string and must not offer Retry — used when
+/// the 0.8 store had no `encrypted-media` exporter secret to copy.
 pub const RECOVERED_08_MEDIA_UNAVAILABLE: &str =
     "this attachment is from an older Sonar and cannot be opened after the update";
 
@@ -783,6 +783,9 @@ pub struct MarmotEngine {
     historical_folds: Mutex<HashMap<GroupId, GroupId>>,
     /// Leftover 0.8 rows still in `*.mdk08.bak` after the first-paint window.
     pending_mdk08: Mutex<Option<crate::mdk08_migrate::PendingMdk08Remainder>>,
+    /// MIP-04 exporter secrets copied from the 0.8 `group_exporter_secrets`
+    /// table (`encrypted-media` label). Used only to decrypt recovered blobs.
+    historical_media_secrets: HashMap<GroupId, Vec<Vec<u8>>>,
     /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
     _tempdir: Option<tempfile::TempDir>,
 }
@@ -951,6 +954,7 @@ impl MarmotEngine {
         let historical_folds = load_historical_folds(db_path);
         let pending_mdk08 =
             crate::mdk08_migrate::pending_remainder(db_path, key, identity.public_key());
+        let historical_media_secrets = crate::mdk08_migrate::load_historical_media_secrets(db_path);
         Ok(Self {
             session: Mutex::new(Some(session)),
             identity,
@@ -966,6 +970,7 @@ impl MarmotEngine {
             historical_members,
             historical_folds: Mutex::new(historical_folds),
             pending_mdk08: Mutex::new(pending_mdk08),
+            historical_media_secrets,
             _tempdir: None,
         })
     }
@@ -1355,9 +1360,14 @@ impl MarmotEngine {
     }
 
     /// True when `url` is a recovered 0.8 attachment. Those rows keep `imeta`
-    /// for the transcript bubble, but the 0.8 MLS exporter secret is not in
-    /// the 0.9 session, so download/decrypt cannot succeed.
+    /// for the transcript bubble. Download/decrypt is refused unless a stored
+    /// 0.8 `encrypted-media` exporter secret was copied onto the sidecar.
     pub fn recovered_08_media_unavailable(&self, group_id: &GroupId, url: &str) -> bool {
+        self.is_recovered_08_attachment(group_id, url)
+            && self.historical_media_secrets_for(group_id).is_empty()
+    }
+
+    fn is_recovered_08_attachment(&self, group_id: &GroupId, url: &str) -> bool {
         let msgs = self.transcript_for_family(group_id);
         let Ok(historical) = self.historical_groups() else {
             return false;
@@ -1379,6 +1389,20 @@ impl MarmotEngine {
             }
         }
         false
+    }
+
+    fn historical_media_secrets_for(&self, group_id: &GroupId) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for id in self.fold_family(group_id) {
+            if let Some(secrets) = self.historical_media_secrets.get(&id) {
+                for secret in secrets {
+                    if !out.iter().any(|existing| existing == secret) {
+                        out.push(secret.clone());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Other members of a recovered conversation (everyone except the local key).
@@ -2156,8 +2180,21 @@ impl MarmotEngine {
         url: &str,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        if self.recovered_08_media_unavailable(group_id, url) {
-            return Err(Error::Media(RECOVERED_08_MEDIA_UNAVAILABLE.to_owned()));
+        if self.is_recovered_08_attachment(group_id, url) {
+            let secrets = self.historical_media_secrets_for(group_id);
+            if secrets.is_empty() {
+                return Err(Error::Media(RECOVERED_08_MEDIA_UNAVAILABLE.to_owned()));
+            }
+            let mut last_err = None;
+            for secret in secrets {
+                match self.decrypt_media_url_with_secret(group_id, url, ciphertext, &secret) {
+                    Ok(plain) => return Ok(plain),
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            return Err(
+                last_err.unwrap_or_else(|| Error::Media(RECOVERED_08_MEDIA_UNAVAILABLE.to_owned()))
+            );
         }
         // After resume the host may still pass the recovered id. New 0.9
         // attachments live on the fold target and must use that exporter.
@@ -2165,6 +2202,16 @@ impl MarmotEngine {
             .live_fold_target(group_id)
             .unwrap_or_else(|| group_id.clone());
         let secret = self.media_exporter_secret(&secret_group)?;
+        self.decrypt_media_url_with_secret(group_id, url, ciphertext, &secret)
+    }
+
+    fn decrypt_media_url_with_secret(
+        &self,
+        group_id: &GroupId,
+        url: &str,
+        ciphertext: &[u8],
+        secret: &[u8],
+    ) -> Result<Vec<u8>> {
         let msgs = self.mapped_transcript(group_id)?;
         for m in msgs {
             for media in &m.media {
@@ -2186,13 +2233,13 @@ impl MarmotEngine {
                         scheme_version: media_crypto::DEFAULT_SCHEME_VERSION.to_owned(),
                         nonce,
                     };
-                    return media_crypto::decrypt_from_download(&secret, ciphertext, &reference);
+                    return media_crypto::decrypt_from_download(secret, ciphertext, &reference);
                 }
             }
             for tag in rumor_imeta_from_media(&m) {
                 if let Ok(r) = media_crypto::parse_imeta_tag(&tag) {
                     if r.url == url {
-                        return media_crypto::decrypt_from_download(&secret, ciphertext, &r);
+                        return media_crypto::decrypt_from_download(secret, ciphertext, &r);
                     }
                 }
             }
@@ -2889,6 +2936,14 @@ impl MarmotEngine {
         self.store_chat(msg);
     }
 
+    #[cfg(test)]
+    pub(crate) fn add_historical_media_secret(&mut self, group_id: GroupId, secret: Vec<u8>) {
+        self.historical_media_secrets
+            .entry(group_id)
+            .or_default()
+            .push(secret);
+    }
+
     fn park_invite(&self, invite: GroupInvite) {
         self.parked_invites
             .lock()
@@ -3115,6 +3170,7 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         DROPPED_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_EXPORTER_SECRETS_SUFFIX,
         crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
         HISTORICAL_FOLDS_FILE_SUFFIX,
     ]
@@ -3887,5 +3943,36 @@ mod historical_fold_tests {
             err.to_string().contains(RECOVERED_08_MEDIA_UNAVAILABLE),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn recovered_08_media_decrypts_with_stored_exporter_secret() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let mut engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let url = "https://blossom.example/old.bin";
+        let secret = vec![0xABu8; 32];
+        let upload = crate::media_crypto::encrypt_for_upload(
+            &secret,
+            b"photo-bytes",
+            "image/jpeg",
+            "old.jpg",
+        )
+        .expect("encrypt with stored 0.8 exporter");
+        engine.push_transcript_message(chat_with_media(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            url,
+            Some(upload.original_hash),
+            Some(upload.nonce),
+        ));
+        engine.add_historical_media_secret(historical.clone(), secret);
+        assert!(!engine.recovered_08_media_unavailable(&historical, url));
+        let plain = engine
+            .decrypt_media_by_url(&historical, url, &upload.encrypted_data)
+            .expect("stored 0.8 exporter must open the blob");
+        assert_eq!(plain, b"photo-bytes");
     }
 }

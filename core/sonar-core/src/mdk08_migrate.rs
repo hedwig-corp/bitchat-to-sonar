@@ -42,6 +42,11 @@ pub(crate) const HISTORICAL_MEMBERS_FILE_SUFFIX: &str = ".sonar-historical-membe
 /// Marker written after a successful extract so operators can see what moved.
 pub(crate) const MDK08_MIGRATED_MARKER_SUFFIX: &str = ".sonar-mdk08-migrated.json";
 
+/// 0.8 `group_exporter_secrets` rows with label `encrypted-media`.
+/// Used to decrypt recovered MIP-04 blobs without importing MLS state.
+pub(crate) const HISTORICAL_EXPORTER_SECRETS_SUFFIX: &str =
+    ".sonar-historical-exporter-secrets.json";
+
 /// Newest chat rows copied onto the sidecar before `connectLocal` returns.
 /// Older rows stay in `*.mdk08.bak` until [`detect_and_extract_remainder`].
 pub(crate) const FIRST_PAINT_MESSAGES_PER_GROUP: usize = 80;
@@ -56,6 +61,8 @@ pub(crate) struct Mdk08Migration {
     pub messages: HashMap<GroupId, Vec<ChatMessage>>,
     pub group_names: HashMap<GroupId, String>,
     pub members: HashMap<GroupId, Vec<PublicKey>>,
+    /// MIP-04 exporter secrets copied from `group_exporter_secrets`.
+    pub media_exporter_secrets: HashMap<GroupId, Vec<Vec<u8>>>,
     /// True when at least one group has more kind-9 rows than the first-paint
     /// window. The rest must be copied from `*.mdk08.bak`.
     pub truncated: bool,
@@ -187,6 +194,23 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         &members,
     )?;
 
+    if !extracted.media_exporter_secrets.is_empty() {
+        let secrets: HashMap<String, Vec<String>> = extracted
+            .media_exporter_secrets
+            .iter()
+            .map(|(id, values)| {
+                (
+                    hex::encode(id.as_slice()),
+                    values.iter().map(hex::encode).collect(),
+                )
+            })
+            .collect();
+        write_json(
+            &sidecar_named(db_path, HISTORICAL_EXPORTER_SECRETS_SUFFIX),
+            &secrets,
+        )?;
+    }
+
     let marker = serde_json::json!({
         "from": "mdk-0.8",
         "to": "mdk-0.9.14-transcript-sidecar",
@@ -311,6 +335,30 @@ pub(crate) fn load_historical_members(db_path: &Path) -> HashMap<GroupId, Vec<Pu
         .collect()
 }
 
+pub(crate) fn load_historical_media_secrets(db_path: &Path) -> HashMap<GroupId, Vec<Vec<u8>>> {
+    let path = sidecar_named(db_path, HISTORICAL_EXPORTER_SECRETS_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<HashMap<String, Vec<String>>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(hex_id, secrets)| {
+            let id = hex::decode(hex_id).ok().map(GroupId::new)?;
+            let values: Vec<Vec<u8>> = secrets
+                .into_iter()
+                .filter_map(|hex_secret| hex::decode(hex_secret).ok())
+                .filter(|secret| secret.len() >= 32)
+                .collect();
+            if values.is_empty() {
+                None
+            } else {
+                Some((id, values))
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn wipe_mdk08_backups(db_path: &Path) -> Result<()> {
     for src in sqlite_file_set(db_path) {
         let bak = backup_path(&src);
@@ -328,6 +376,7 @@ pub(crate) fn wipe_mdk08_backups(db_path: &Path) -> Result<()> {
     for suffix in [
         HISTORICAL_GROUPS_FILE_SUFFIX,
         HISTORICAL_MEMBERS_FILE_SUFFIX,
+        HISTORICAL_EXPORTER_SECRETS_SUFFIX,
         MDK08_MIGRATED_MARKER_SUFFIX,
     ] {
         let path = sidecar_named(db_path, suffix);
@@ -400,9 +449,93 @@ fn extract_from_connection(
         }
     }
 
+    extract_pending_welcomes(conn, &mut extracted)?;
+    extract_media_exporter_secrets(conn, &mut extracted)?;
     extract_message_members(conn, &mut extracted)?;
     extract_chat_rows(conn, local_pk, per_group_limit, &mut extracted)?;
     Ok(extracted)
+}
+
+fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
+    if !table_exists(conn, "welcomes")? {
+        return Ok(());
+    }
+    if !column_exists(conn, "welcomes", "state")? {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT mls_group_id, group_name, group_admin_pubkeys, welcomer
+             FROM welcomes WHERE state = 'pending'",
+        )
+        .map_err(|e| Error::Storage(format!("mdk08 welcomes prepare: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })
+        .map_err(|e| Error::Storage(format!("mdk08 welcomes query: {e}")))?;
+    for row in rows {
+        let (id, name, admins, welcomer) =
+            row.map_err(|e| Error::Storage(format!("mdk08 welcomes row: {e}")))?;
+        if id.is_empty() {
+            continue;
+        }
+        let group_id = GroupId::new(id);
+        extracted
+            .group_names
+            .entry(group_id.clone())
+            .or_insert(name);
+        if let Some(raw) = admins {
+            for pk in parse_admin_pubkeys(&raw) {
+                note_member(extracted, &group_id, pk);
+            }
+        }
+        if let Ok(pk) = PublicKey::from_slice(&welcomer) {
+            note_member(extracted, &group_id, pk);
+        }
+    }
+    Ok(())
+}
+
+fn extract_media_exporter_secrets(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
+    if !table_exists(conn, "group_exporter_secrets")? {
+        return Ok(());
+    }
+    // Pre-V005 rows are MIP-03 `group-event` secrets, not media keys.
+    if !column_exists(conn, "group_exporter_secrets", "label")? {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT mls_group_id, secret FROM group_exporter_secrets
+             WHERE label = 'encrypted-media'",
+        )
+        .map_err(|e| Error::Storage(format!("mdk08 exporter prepare: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| Error::Storage(format!("mdk08 exporter query: {e}")))?;
+    for row in rows {
+        let (id, secret) = row.map_err(|e| Error::Storage(format!("mdk08 exporter row: {e}")))?;
+        if id.is_empty() || secret.len() < 32 {
+            continue;
+        }
+        let group_id = GroupId::new(id);
+        let secrets = extracted
+            .media_exporter_secrets
+            .entry(group_id)
+            .or_default();
+        if !secrets.iter().any(|existing| existing == &secret) {
+            secrets.push(secret);
+        }
+    }
+    Ok(())
 }
 
 struct MessageSelectColumns {
@@ -1229,6 +1362,138 @@ mod tests {
         let members = extracted.members.values().next().expect("admins");
         assert!(members.contains(&peer));
         assert!(!extracted.truncated);
+    }
+
+    #[test]
+    fn pending_welcome_is_kept_for_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let welcomer = Identity::generate().public_key();
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );
+            CREATE TABLE welcomes (
+                id BLOB PRIMARY KEY,
+                event TEXT NOT NULL,
+                mls_group_id BLOB NOT NULL,
+                nostr_group_id BLOB NOT NULL,
+                group_name TEXT NOT NULL,
+                group_description TEXT NOT NULL,
+                group_admin_pubkeys TEXT NOT NULL,
+                group_relays TEXT NOT NULL,
+                welcomer BLOB NOT NULL,
+                member_count INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL
+            );",
+        )
+        .unwrap();
+        let group_id = vec![0x77u8; 16];
+        let admins =
+            serde_json::json!([local.public_key().to_hex(), welcomer.to_hex()]).to_string();
+        conn.execute(
+            "INSERT INTO welcomes
+                (id, event, mls_group_id, nostr_group_id, group_name, group_description,
+                 group_admin_pubkeys, group_relays, welcomer, member_count, state,
+                 wrapper_event_id)
+             VALUES (?1, '{}', ?2, ?3, 'pending room', '', ?4, '[]', ?5, 3, 'pending', ?1)",
+            rusqlite::params![
+                vec![0xAAu8; 32],
+                group_id.clone(),
+                vec![0xBBu8; 32],
+                admins,
+                welcomer.to_bytes().to_vec(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let extracted = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        assert_eq!(
+            extracted.group_names.values().next().map(String::as_str),
+            Some("pending room")
+        );
+        let members = extracted.members.values().next().expect("welcome members");
+        assert!(members.contains(&welcomer));
+    }
+
+    #[test]
+    fn labeled_media_exporter_secret_is_copied_unlabeled_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );
+            CREATE TABLE group_exporter_secrets (
+                mls_group_id BLOB NOT NULL,
+                epoch INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                secret BLOB NOT NULL,
+                PRIMARY KEY (mls_group_id, epoch, label)
+            );",
+        )
+        .unwrap();
+        let group_id = vec![0x88u8; 16];
+        let media_secret = vec![0xCDu8; 32];
+        let event_secret = vec![0xEFu8; 32];
+        conn.execute(
+            "INSERT INTO group_exporter_secrets (mls_group_id, epoch, label, secret)
+             VALUES (?1, 1, 'encrypted-media', ?2), (?1, 1, 'group-event', ?3)",
+            rusqlite::params![group_id.clone(), media_secret.clone(), event_secret],
+        )
+        .unwrap();
+        drop(conn);
+
+        let extracted = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        let gid = GroupId::new(group_id);
+        let secrets = extracted
+            .media_exporter_secrets
+            .get(&gid)
+            .expect("media secret");
+        assert_eq!(secrets, &vec![media_secret.clone()]);
+        write_sidecars(&path, &extracted).unwrap();
+        let loaded = load_historical_media_secrets(&path);
+        assert_eq!(
+            loaded.get(&gid),
+            Some(&vec![media_secret]),
+            "labeled MIP-04 secret must survive the sidecar write"
+        );
     }
 
     #[test]

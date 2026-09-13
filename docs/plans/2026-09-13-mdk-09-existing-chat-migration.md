@@ -66,12 +66,15 @@ What the user does **not** keep automatically:
 
 - The ability to send into the old 0.8 MLS group. That group is dead on
   this device once the 0.9 store is the live engine.
-- Media **decrypt** keys that lived only in the 0.8 MLS exporter secret.
-  v1 copies `imeta` / sticker / reply tags onto the transcript so the
-  attachment still renders as a row. Opening the blob is a non-retryable
-  “older Sonar” state — the 0.9 session does not import the 0.8 exporter.
-  MIP-04 recovery from the quarantined `*.mdk08.bak` is still deferred.
-- Pending 0.8 welcomes that were never accepted.
+- Media **decrypt** when the 0.8 store has no `encrypted-media` exporter
+  secret (pre-V005 unlabeled rows are MIP-03 `group-event` only). When
+  the labeled secret is present it is copied onto
+  `.sonar-historical-exporter-secrets.json` and recovered blobs decrypt.
+  Otherwise the attachment stays a non-retryable “older Sonar” row.
+- The ability to *accept* a stored 0.8 welcome event (0.8 wire). Pending
+  `welcomes` rows are listed as recovered chats (name + welcomer /
+  admins) so the user can resume on a new 0.9 group after the peer
+  updates.
 
 ## Runtime path (implemented on this PR)
 
@@ -82,8 +85,10 @@ What the user does **not** keep automatically:
    self-heal).
 3. If 0.9 open fails and the file exists:
    - Open with the 0.8 raw key.
-   - If `messages` is readable, copy group titles, resume members, and the
-     newest 80 `kind = 9` rows per group onto the transcript sidecar.
+   - If `messages` is readable, copy group titles, resume members, pending
+     `welcomes` (name + welcomer/admins, not the 0.8 event), labeled
+     `encrypted-media` exporter secrets, and the newest 80 `kind = 9`
+     rows per group onto the transcript sidecar.
      First paint ranks on `mls_group_id` / `id` / `created_at` only, then
      joins `content` / `tags` / `event` for the winners (`ROW_NUMBER`
      window, or per-group `ORDER BY created_at DESC LIMIT 80` if the
@@ -154,6 +159,11 @@ Guarded by:
 - `persistence::mdk08_unreadable_bak_keeps_remainder_pending`
 - `mdk08_migrate::leftover_bak_needed_follows_transcript_not_just_the_marker`
 - `mdk08_migrate::empty_named_group_is_kept_for_resume`
+- `mdk08_migrate::pending_welcome_is_kept_for_resume`
+- `mdk08_migrate::labeled_media_exporter_secret_is_copied_unlabeled_is_not`
+- `marmot.rs::recovered_08_media_decrypts_with_stored_exporter_secret`
+- `persistence::mdk08_pending_welcome_is_listed_for_resume`
+- `persistence::mdk08_media_exporter_secret_survives_migrate_and_backup`
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
@@ -333,7 +343,9 @@ to update Sonar".
 - Stage 2 multi-device (same nsec, several live devices) — #327
 - Dual-stack 0.8+0.9 sender
 - Importing 0.8 MLS secrets into a 0.9 session
-- MIP-04 media-key recovery from 0.8 `imeta` / `event` JSON
+- Accepting a stored 0.8 welcome *event* (0.8 wire) — pending rows are
+  listed and can resume on a new 0.9 group, but the old welcome cannot
+  be ingested
 - Deleting `*.mdk08.bak` automatically
 - Cold-start bench numbers on this machine (Debug + `SONAR_BENCH_NSEC`)
 
