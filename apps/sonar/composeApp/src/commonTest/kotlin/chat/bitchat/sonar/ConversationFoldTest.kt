@@ -308,6 +308,61 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun chatSnapshotPreservesRecoveredRoomIsDirect() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
+        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf(ownNpub, peerNpub))
+        val pendingRoom = SonarChat(
+            id = "pending-room",
+            name = "pending room",
+            members = listOf(ownNpub, peerNpub),
+            isDirect = false,
+        )
+
+        val decoded = decodeChatSnapshot(
+            encodeChatSnapshot(listOf(dm, pendingRoom), emptyMap(), mapOf(dm.id to 2L, pendingRoom.id to 1L)),
+        ).first
+
+        assertEquals(listOf(true, false), decoded.map { it.isDirect })
+        assertEquals(listOf(dm, pendingRoom), decoded)
+        assertEquals(null, directMarmotPeerKey(decoded[1], ownNpub))
+        assertEquals(
+            listOf(dm, pendingRoom),
+            dedupeDirectMarmotChats(
+                chats = decoded,
+                ownNpub = ownNpub,
+                latestSecs = { if (it == dm.id) 2L else 1L },
+            ),
+        )
+        assertEquals(
+            mapOf(dm.id to 2L, pendingRoom.id to 1L),
+            decodeChatSnapshotLatest(
+                encodeChatSnapshot(listOf(dm, pendingRoom), emptyMap(), mapOf(dm.id to 2L, pendingRoom.id to 1L)),
+            ),
+        )
+    }
+
+    @Test
+    fun legacyChatSnapshotWithoutIsDirectDefaultsToDirect() {
+        val room = SonarChat(
+            id = "pending-room",
+            name = "pending room",
+            members = listOf("npub1me", "npub1bob"),
+            isDirect = false,
+        )
+        val modern = encodeChatSnapshot(listOf(room), emptyMap(), mapOf(room.id to 9L)).trimEnd()
+        val legacy = modern.removeSuffix("\t0")
+
+        val decoded = decodeChatSnapshot(legacy).first.single()
+        assertTrue(decoded.isDirect)
+        assertEquals(room.id, decoded.id)
+        assertEquals(room.name, decoded.name)
+        assertEquals(mapOf(room.id to 9L), decodeChatSnapshotLatest(legacy))
+    }
+
+    @Test
     fun directMarmotPeerKeyCanonicalizesHexAndNpub() {
         val ownRaw = ByteArray(32) { 1 }
         val peerRaw = ByteArray(32) { 2 }

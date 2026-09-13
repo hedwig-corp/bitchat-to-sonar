@@ -2677,9 +2677,9 @@ invited; the room name disappears; sends land in the wrong chat.
 
 **Guarded by:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`
 
-**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`
+**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`
 
-**Not guarded:** a real 0.8 device upgrade with a pending White Noise room. Host chat-list rendering still needs a constructible store (the helper pins are the R-001 shape).
+**Not guarded:** a real 0.8 device upgrade with a pending White Noise room. Host chat-list rendering still needs a constructible store (the helper pins are the R-001 shape). A pre-`isDirect` first-paint snapshot still defaults the room to a DM until the first `groups()` persist after this build (`ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDefaultsToDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDefaultsToDirect`).
 
 **History:** #613. `historical_resume_is_direct` landed first; resume still used
 `start_dm_with_key_package`, then `maybe_fold_new_group` absorbed the room into

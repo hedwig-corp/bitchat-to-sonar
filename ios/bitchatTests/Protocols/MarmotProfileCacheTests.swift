@@ -265,6 +265,50 @@ struct MarmotProfileCacheTests {
     }
 
     @Test
+    func chatSnapshotPreservesRecoveredRoomIsDirect() {
+        let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pendingRoom = MarmotService.MarmotGroup(
+            id: "pending-room",
+            name: "pending room",
+            memberNpubs: ["npub1sara", "npub1me"],
+            isDirect: false
+        )
+
+        SNMarmotChatSnapshotCache.save(
+            groups: [pendingRoom],
+            messagesByGroup: [:],
+            to: defaults
+        )
+
+        let loaded = SNMarmotChatSnapshotCache.load(from: defaults)
+        #expect(loaded.0 == [pendingRoom])
+        #expect(loaded.0.first?.isDirect == false)
+        #expect(snDirectMarmotPeerKey(for: loaded.0[0], ownNpub: "npub1me") == nil)
+        #expect(snMarmotTreatsAsGroupChat(loaded.0[0]))
+    }
+
+    @Test
+    func legacyChatSnapshotWithoutIsDirectDefaultsToDirect() throws {
+        let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let json = """
+        {"groups":[{"id":"pending-room","name":"pending room","memberNpubs":["npub1sara","npub1me"]}]}
+        """
+        defaults.set(Data(json.utf8), forKey: "marmot.chatSnapshot.v1")
+
+        let loaded = SNMarmotChatSnapshotCache.load(from: defaults)
+        #expect(loaded.0.count == 1)
+        #expect(loaded.0.first?.id == "pending-room")
+        #expect(loaded.0.first?.isDirect == true)
+        #expect(snDirectMarmotPeerKey(for: loaded.0[0], ownNpub: "npub1me") == "npub1sara")
+    }
+
+    @Test
     func clearRemovesChatSnapshot() {
         let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

@@ -470,13 +470,16 @@ internal fun encodeChatSnapshot(
         // computed recency order and lets Home paint without an ID-order flash
         // while the encrypted core database opens. Only the thread-style latest
         // timestamp is cached for cross-transport sorting; message bodies stay
-        // out of this preferences blob.
+        // out of this preferences blob. The 6th field is `isDirect` so a
+        // two-member recovered room does not first-paint as a DM (R-045).
         chats.forEach { chat ->
             append("c\t")
             append(hexEnc(chat.id)).append('\t')
             append(hexEnc(chat.name)).append('\t')
             append(chat.members.joinToString(",") { hexEnc(it) }).append('\t')
             append(messagesByChat[chat.id]?.lastOrNull()?.tsSecs ?: latestByChat[chat.id] ?: 0L)
+            append('\t')
+            append(if (chat.isDirect) "1" else "0")
             append('\n')
         }
     }
@@ -488,7 +491,7 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
         val parts = line.split('\t')
         when (parts.firstOrNull()) {
             "c" -> {
-                if (parts.size !in 4..5) return@forEach
+                if (parts.size !in 4..6) return@forEach
                 val id = hexDec(parts[1]) ?: return@forEach
                 val name = hexDec(parts[2]) ?: return@forEach
                 val members = parts[3]
@@ -496,7 +499,11 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
                     ?.split(",")
                     ?.mapNotNull { hexDec(it) }
                     .orEmpty()
-                chats += SonarChat(id, name, members)
+                // Missing 6th field is a pre-isDirect snapshot. Default true
+                // matches old DMs; a two-member recovered room stays wrong
+                // until the first groups() persist after this build.
+                val isDirect = parts.getOrNull(5)?.let { it != "0" } ?: true
+                chats += SonarChat(id, name, members, isDirect = isDirect)
             }
         }
     }
@@ -508,7 +515,7 @@ internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
     buildMap {
         blob.lineSequence().forEach { line ->
             val parts = line.split('\t')
-            if (parts.firstOrNull() != "c" || parts.size != 5) return@forEach
+            if (parts.firstOrNull() != "c" || parts.size !in 5..6) return@forEach
             val id = hexDec(parts[1]) ?: return@forEach
             val latest = parts[4].toLongOrNull()?.takeIf { it > 0L } ?: return@forEach
             put(id, latest)
