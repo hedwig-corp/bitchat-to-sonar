@@ -550,6 +550,30 @@ fn count_indexed_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
     Some(summaries.iter().map(|s| s.message_count).sum())
 }
 
+/// Index first; recovered-chat transcript sidecar if the index is missing
+/// or still empty (a backup taken after the 0.8 migrate, before connect
+/// seeded chat-list rows).
+fn count_restored_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
+    match count_indexed_messages(db_path, db_key_hex) {
+        Some(n) if n > 0 => Some(n),
+        _ => count_transcript_sidecar_messages(db_path),
+    }
+}
+
+fn count_transcript_sidecar_messages(db_path: &Path) -> Option<u64> {
+    let bytes = fs::read(sidecar_named(
+        db_path,
+        crate::marmot::TRANSCRIPT_FILE_SUFFIX,
+    ))
+    .ok()?;
+    count_transcript_bytes(&bytes)
+}
+
+fn count_transcript_bytes(bytes: &[u8]) -> Option<u64> {
+    let keyed: HashMap<String, Vec<serde_json::Value>> = serde_json::from_slice(bytes).ok()?;
+    Some(keyed.values().map(|msgs| msgs.len() as u64).sum())
+}
+
 /// Wipe hook: remove a plaintext key sidecar left by builds that briefly wrote
 /// one. The Account Key Durability Rule requires wipe to clear every location
 /// that can hold key material.
@@ -853,6 +877,8 @@ fn backup_sidecar_suffixes() -> &'static [&'static str] {
         crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
         crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
         crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX,
+        crate::marmot::PARKED_INVITES_FILE_SUFFIX,
+        crate::marmot::DROPPED_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::MDK08_BACKUP_SUFFIX,
         "-wal.mdk08.bak",
         "-shm.mdk08.bak",
@@ -1260,7 +1286,7 @@ fn stage_restored_backup_policy(staged_db: &Path, db_key_hex: &str, meta: Restor
         last_size_bytes: Some(meta.size_bytes),
         // Counted from the staged index, which is what the blob actually
         // contains — the live index at commit time has post-restore traffic.
-        last_message_count: count_indexed_messages(staged_db, db_key_hex),
+        last_message_count: count_restored_messages(staged_db, db_key_hex),
         ..BackupPolicy::default()
     };
     if let Err(e) = save_backup_policy_to_disk(staged_db, &restored) {
@@ -1804,29 +1830,55 @@ async fn preview_account_backup_from(
     let (sealed, uploaded_at_secs) = download_latest_sealed_backup_from(keys, hosts).await?;
     let package = open_account_backup(&secret_bytes(keys), &sealed)?;
     let size_bytes = sealed.len() as u64;
-    let Some(index_bytes) = package.index_bytes.as_ref() else {
-        // A backup with no index still restores; there is just nothing to list.
-        return Ok(AccountBackupPreview {
-            conversations: Vec::new(),
-            total_messages: 0,
-            size_bytes,
-            uploaded_at_secs,
-        });
-    };
+    let conversations = preview_conversations(db_path, &package);
+    let total_messages = conversations.iter().map(|c| c.message_count).sum();
+    Ok(AccountBackupPreview {
+        conversations,
+        total_messages,
+        size_bytes,
+        uploaded_at_secs,
+    })
+}
 
-    let scratch = preview_scratch_dir(db_path)?;
+/// Prefer the conversation index. If it is missing or empty — a backup
+/// taken after the 0.8 migrate, before chat-list rows were seeded — list
+/// recovered chats from the transcript / historical-groups sidecars.
+fn preview_conversations(
+    db_path: &Path,
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let from_index = preview_from_index(db_path, package);
+    if !from_index.is_empty() {
+        return from_index;
+    }
+    preview_from_recovered_sidecars(package)
+}
+
+fn preview_from_index(
+    db_path: &Path,
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let Some(index_bytes) = package.index_bytes.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(scratch) = preview_scratch_dir(db_path) else {
+        return Vec::new();
+    };
     let index_path = scratch.path().join("preview-index.db");
-    fs::write(&index_path, index_bytes)
-        .map_err(|e| Error::Storage(format!("backup preview index write: {e}")))?;
-    let key: [u8; 32] = hex::decode(&package.db_key_hex)
+    if fs::write(&index_path, index_bytes).is_err() {
+        return Vec::new();
+    }
+    let key: [u8; 32] = match hex::decode(&package.db_key_hex)
         .ok()
         .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| Error::InvalidInput("backup db key malformed".into()))?;
-
+    {
+        Some(key) => key,
+        None => return Vec::new(),
+    };
     let summaries = crate::conversation_index::ConversationIndex::open(&index_path, key)
         .and_then(|idx| idx.summaries_ordered())
         .unwrap_or_default();
-    let conversations: Vec<_> = summaries
+    summaries
         .into_iter()
         .map(|s| BackupPreviewConversation {
             name: s.name,
@@ -1840,15 +1892,63 @@ async fn preview_account_backup_from(
             },
             message_count: s.message_count,
         })
+        .collect()
+}
+
+fn preview_from_recovered_sidecars(
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let transcript = package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::marmot::TRANSCRIPT_FILE_SUFFIX)
+        .and_then(|(_, bytes)| {
+            serde_json::from_slice::<HashMap<String, Vec<crate::marmot::ChatMessage>>>(bytes).ok()
+        })
+        .unwrap_or_default();
+    let names = package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX)
+        .and_then(|(_, bytes)| serde_json::from_slice::<HashMap<String, String>>(bytes).ok())
+        .unwrap_or_default();
+    if transcript.is_empty() && names.is_empty() {
+        return Vec::new();
+    }
+    let mut ids: Vec<String> = transcript
+        .keys()
+        .cloned()
+        .chain(names.keys().cloned())
         .collect();
-    let total_messages = conversations.iter().map(|c| c.message_count).sum();
-    // `scratch` drops here: the decrypted index never outlives the call.
-    Ok(AccountBackupPreview {
-        conversations,
-        total_messages,
-        size_bytes,
-        uploaded_at_secs,
-    })
+    ids.sort();
+    ids.dedup();
+    let mut conversations: Vec<BackupPreviewConversation> = ids
+        .into_iter()
+        .map(|id| {
+            let name = names.get(&id).cloned().unwrap_or_default();
+            let msgs = transcript.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+            let latest = msgs.iter().max_by_key(|msg| msg.created_at.as_secs());
+            let latest_content = latest
+                .map(
+                    |msg| match crate::notification::classify_content(&msg.content) {
+                        crate::notification::NotificationKind::Message => msg.content.clone(),
+                        _ => String::new(),
+                    },
+                )
+                .unwrap_or_default();
+            BackupPreviewConversation {
+                name,
+                latest_content,
+                message_count: msgs.len() as u64,
+            }
+        })
+        .collect();
+    conversations.sort_by(|a, b| {
+        b.message_count
+            .cmp(&a.message_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    conversations
 }
 
 /// List this pubkey's blobs and download the newest account-backup MIME.
@@ -2820,6 +2920,54 @@ mod tests {
             ))
             .unwrap(),
             transcript
+        );
+    }
+
+    #[test]
+    fn preview_lists_recovered_chats_when_index_is_missing() {
+        let peer = Keys::generate();
+        let group_id = crate::GroupId::new(vec![0x11u8; 16]);
+        let hex_id = hex::encode(group_id.as_slice());
+        let msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xABu8; 32]).unwrap(),
+            group_id: group_id.clone(),
+            sender: peer.public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        };
+        let mut transcript = HashMap::new();
+        transcript.insert(hex_id.clone(), vec![msg]);
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(hex_id, "alice & bob".into());
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&transcript).unwrap(),
+                ),
+                (
+                    crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&names).unwrap(),
+                ),
+            ],
+        };
+        let listed = preview_from_recovered_sidecars(&package);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "alice & bob");
+        assert_eq!(listed[0].latest_content, "keep this chat");
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(
+            count_transcript_bytes(&serde_json::to_vec(&transcript).unwrap()),
+            Some(1)
         );
     }
 

@@ -74,8 +74,8 @@ pub(crate) const KEY_PACKAGE_SLOT_FILE_SUFFIX: &str = ".sonar-keypackage-slot";
 
 /// Host-owned chat transcript (MDK 0.9 no longer stores plaintext app events).
 pub(crate) const TRANSCRIPT_FILE_SUFFIX: &str = ".sonar-transcript.json";
-const PARKED_INVITES_FILE_SUFFIX: &str = ".sonar-parked-invites.json";
-const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json";
+pub(crate) const PARKED_INVITES_FILE_SUFFIX: &str = ".sonar-parked-invites.json";
+pub(crate) const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json";
 /// historical MLS group id hex → live 0.9 group id hex.
 pub(crate) const HISTORICAL_FOLDS_FILE_SUFFIX: &str = ".sonar-historical-folds.json";
 

@@ -146,7 +146,9 @@ Guarded by:
 - `account_backup::decode_v1_package_has_empty_sidecars`
 - `account_backup::seal_open_roundtrip_keeps_recovered_sidecars`
 - `account_backup::staged_restore_replaces_outgoing_sidecars`
+- `account_backup::preview_lists_recovered_chats_when_index_is_missing`
 - `persistence::mdk08_account_backup_preserves_recovered_transcript`
+- `persistence::mdk08_v1_backup_restores_and_migrates`
 
 ## Account backup after upgrade
 
@@ -166,6 +168,13 @@ SQLCipher open for seal/verify tries the 0.8 raw key (`x'<hex>'`) and the
 0.9 passphrase (`'<hex>'`) and requires at least one user table. The
 conversation index stays on the raw key; the live Marmot file is
 passphrase-keyed after migrate.
+
+A **v1 backup taken before upgrade** is only the 0.8 SQLCipher file.
+Restore writes those bytes; `MarmotEngine::persistent` runs decrypt-and-move
+again. Preview of a v2 blob with no (or empty) index lists recovered chats
+from the transcript / historical-groups sidecars so Settings does not say
+the backup is empty. Parked invites and dropped-group ids travel with v2
+so a pending 0.9 room resume survives nsec restore.
 
 ## How users keep access after the flag-day
 
