@@ -7062,7 +7062,7 @@ impl SonarClient {
         // A recovered room with only some peers on 0.9 must stay a group, even
         // when one reachable member would look like a DM. Reusing start_dm
         // would fold the room onto an existing 1:1 with that peer.
-        let live = if peers.len() == 1 {
+        let live = if self.engine.historical_resume_is_direct(group_id) {
             self.start_dm_with_key_package(packages.into_iter().next().expect("nonempty"), &name)
                 .await?
         } else {

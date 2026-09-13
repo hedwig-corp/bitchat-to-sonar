@@ -168,6 +168,7 @@ Guarded by:
   (also pins `bak_needed_for_backup` until `metadata_backfill=complete`)
 - `mdk08_migrate::empty_named_group_is_kept_for_resume`
 - `mdk08_migrate::pending_welcome_is_kept_for_resume`
+  (stores `member_count` so a 3+ pending room does not `start_dm`)
 - `mdk08_migrate::labeled_media_exporter_secret_is_copied_unlabeled_is_not`
 - `marmot.rs::recovered_08_media_decrypts_with_stored_exporter_secret`
 - `persistence::mdk08_pending_welcome_is_listed_for_resume`

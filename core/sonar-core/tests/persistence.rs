@@ -2137,6 +2137,9 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
         db_path.with_file_name("marmot.sqlite.sonar-historical-exporter-secrets.json"),
     )
     .expect("drop secrets sidecar to simulate a pre-welcome extract");
+    let _ = std::fs::remove_file(
+        db_path.with_file_name("marmot.sqlite.sonar-historical-member-counts.json"),
+    );
     let chat_hex = chat_id
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -2234,6 +2237,10 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
             .any(|pk| *pk == welcomer.public_key()),
         "restored invite must still have a resume peer: {restored_welcome:?}"
     );
+    assert!(
+        !restored.engine().historical_resume_is_direct(&welcome),
+        "restored 3-member pending room must not resume as a DM"
+    );
     let restored_summaries = restored.conversation_summaries();
     let restored_chat = restored_summaries
         .iter()
@@ -2270,6 +2277,10 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
             .iter()
             .any(|pk| *pk == welcomer.public_key()),
         "backfill must restore the welcomer so resume has a peer: {welcome_row:?}"
+    );
+    assert!(
+        !client.engine().historical_resume_is_direct(&welcome),
+        "a 3-member pending room must not resume as a DM"
     );
     let summaries = client.conversation_summaries();
     let chat_row = summaries

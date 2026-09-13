@@ -38,6 +38,8 @@ pub(crate) const HISTORICAL_GROUPS_FILE_SUFFIX: &str = ".sonar-historical-groups
 /// Member pubkeys recovered from 0.8 `admin_pubkeys`, every `messages.pubkey`,
 /// and `p` tags. Needed so a chat you only ever sent into can still resume.
 pub(crate) const HISTORICAL_MEMBERS_FILE_SUFFIX: &str = ".sonar-historical-members.json";
+/// hex group id → original 0.8 member_count (pending welcomes).
+pub(crate) const HISTORICAL_MEMBER_COUNTS_SUFFIX: &str = ".sonar-historical-member-counts.json";
 
 /// Marker written after a successful extract so operators can see what moved.
 pub(crate) const MDK08_MIGRATED_MARKER_SUFFIX: &str = ".sonar-mdk08-migrated.json";
@@ -61,6 +63,9 @@ pub(crate) struct Mdk08Migration {
     pub messages: HashMap<GroupId, Vec<ChatMessage>>,
     pub group_names: HashMap<GroupId, String>,
     pub members: HashMap<GroupId, Vec<PublicKey>>,
+    /// Original 0.8 `welcomes.member_count`. A 3+ room must not resume as a DM
+    /// just because only the welcomer is known after extract.
+    pub member_counts: HashMap<GroupId, u32>,
     /// MIP-04 exporter secrets copied from `group_exporter_secrets`.
     pub media_exporter_secrets: HashMap<GroupId, Vec<Vec<u8>>>,
     /// True when at least one group has more kind-9 rows than the first-paint
@@ -193,6 +198,7 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         &sidecar_named(db_path, HISTORICAL_MEMBERS_FILE_SUFFIX),
         &members,
     )?;
+    write_member_counts(db_path, &extracted.member_counts)?;
 
     if !extracted.media_exporter_secrets.is_empty() {
         let secrets: HashMap<String, Vec<String>> = extracted
@@ -332,6 +338,12 @@ fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
             &keyed,
         )?;
     }
+    let mut counts = load_historical_member_counts(db_path);
+    for (id, count) in &extracted.member_counts {
+        let entry = counts.entry(id.clone()).or_insert(0);
+        *entry = (*entry).max(*count);
+    }
+    write_member_counts(db_path, &counts)?;
     if !secrets.is_empty() {
         let keyed: HashMap<String, Vec<String>> = secrets
             .iter()
@@ -488,6 +500,41 @@ pub(crate) fn load_historical_members(db_path: &Path) -> HashMap<GroupId, Vec<Pu
         .collect()
 }
 
+pub(crate) fn load_historical_member_counts(db_path: &Path) -> HashMap<GroupId, u32> {
+    let path = sidecar_named(db_path, HISTORICAL_MEMBER_COUNTS_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<HashMap<String, u32>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(hex_id, count)| {
+            hex::decode(hex_id)
+                .ok()
+                .filter(|_| count > 0)
+                .map(|b| (GroupId::new(b), count))
+        })
+        .collect()
+}
+
+fn write_member_counts(db_path: &Path, counts: &HashMap<GroupId, u32>) -> Result<()> {
+    if counts.is_empty() {
+        return Ok(());
+    }
+    let keyed: HashMap<String, u32> = counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(id, count)| (hex::encode(id.as_slice()), *count))
+        .collect();
+    if keyed.is_empty() {
+        return Ok(());
+    }
+    write_json(
+        &sidecar_named(db_path, HISTORICAL_MEMBER_COUNTS_SUFFIX),
+        &keyed,
+    )
+}
+
 pub(crate) fn load_historical_media_secrets(db_path: &Path) -> HashMap<GroupId, Vec<Vec<u8>>> {
     let path = sidecar_named(db_path, HISTORICAL_EXPORTER_SECRETS_SUFFIX);
     let Ok(bytes) = std::fs::read(path) else {
@@ -529,6 +576,7 @@ pub(crate) fn wipe_mdk08_backups(db_path: &Path) -> Result<()> {
     for suffix in [
         HISTORICAL_GROUPS_FILE_SUFFIX,
         HISTORICAL_MEMBERS_FILE_SUFFIX,
+        HISTORICAL_MEMBER_COUNTS_SUFFIX,
         HISTORICAL_EXPORTER_SECRETS_SUFFIX,
         MDK08_MIGRATED_MARKER_SUFFIX,
     ] {
@@ -620,11 +668,16 @@ fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -
     if !column_exists(conn, "welcomes", "state")? {
         return Ok(());
     }
+    let has_count = column_exists(conn, "welcomes", "member_count")?;
+    let sql = if has_count {
+        "SELECT mls_group_id, group_name, group_admin_pubkeys, welcomer, member_count
+         FROM welcomes WHERE state = 'pending'"
+    } else {
+        "SELECT mls_group_id, group_name, group_admin_pubkeys, welcomer, NULL
+         FROM welcomes WHERE state = 'pending'"
+    };
     let mut stmt = conn
-        .prepare(
-            "SELECT mls_group_id, group_name, group_admin_pubkeys, welcomer
-             FROM welcomes WHERE state = 'pending'",
-        )
+        .prepare(sql)
         .map_err(|e| Error::Storage(format!("mdk08 welcomes prepare: {e}")))?;
     let rows = stmt
         .query_map([], |row| {
@@ -633,11 +686,12 @@ fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })
         .map_err(|e| Error::Storage(format!("mdk08 welcomes query: {e}")))?;
     for row in rows {
-        let (id, name, admins, welcomer) =
+        let (id, name, admins, welcomer, member_count) =
             row.map_err(|e| Error::Storage(format!("mdk08 welcomes row: {e}")))?;
         if id.is_empty() {
             continue;
@@ -654,6 +708,11 @@ fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -
         }
         if let Ok(pk) = PublicKey::from_slice(&welcomer) {
             note_member(extracted, &group_id, pk);
+        }
+        if let Some(count) = member_count {
+            if count > 0 {
+                note_member_count(extracted, &group_id, count as u32);
+            }
         }
     }
     Ok(())
@@ -1077,6 +1136,11 @@ fn note_member(extracted: &mut Mdk08Migration, group_id: &GroupId, pk: PublicKey
     if !members.contains(&pk) {
         members.push(pk);
     }
+}
+
+fn note_member_count(extracted: &mut Mdk08Migration, group_id: &GroupId, count: u32) {
+    let entry = extracted.member_counts.entry(group_id.clone()).or_insert(0);
+    *entry = (*entry).max(count);
 }
 
 fn parse_admin_pubkeys(raw: &str) -> Vec<PublicKey> {
@@ -1623,6 +1687,11 @@ mod tests {
         );
         let members = extracted.members.values().next().expect("welcome members");
         assert!(members.contains(&welcomer));
+        assert_eq!(
+            extracted.member_counts.values().next().copied(),
+            Some(3),
+            "pending room size must survive extract so resume does not start_dm"
+        );
     }
 
     #[test]

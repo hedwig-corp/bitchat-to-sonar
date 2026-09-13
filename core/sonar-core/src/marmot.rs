@@ -779,6 +779,8 @@ pub struct MarmotEngine {
     /// pubkey). Transcript senders are merged at read time so a chat you
     /// only ever sent into can still resume.
     historical_members: HashMap<GroupId, Vec<PublicKey>>,
+    /// Original 0.8 welcome `member_count` so a 3+ room does not resume as a DM.
+    historical_member_counts: HashMap<GroupId, u32>,
     /// Recovered 0.8 group id → new 0.9 group created with the same members.
     historical_folds: Mutex<HashMap<GroupId, GroupId>>,
     /// Leftover 0.8 rows still in `*.mdk08.bak` after the first-paint window.
@@ -974,6 +976,7 @@ impl MarmotEngine {
             pending_convergence: Mutex::new(HashSet::new()),
             historical_group_names,
             historical_members,
+            historical_member_counts: crate::mdk08_migrate::load_historical_member_counts(db_path),
             historical_folds: Mutex::new(historical_folds),
             pending_mdk08: Mutex::new(pending_mdk08),
             historical_media_secrets: Mutex::new(historical_media_secrets),
@@ -1422,6 +1425,15 @@ impl MarmotEngine {
             .into_iter()
             .filter(|pk| *pk != me)
             .collect()
+    }
+
+    /// True when this recovered chat should resume with `start_dm`.
+    /// A pending 0.8 room (`member_count > 2`) stays a group even if only one
+    /// peer is known — otherwise resume folds the room onto a 1:1.
+    pub fn historical_resume_is_direct(&self, group_id: &GroupId) -> bool {
+        let peers = self.historical_resume_peers(group_id).len();
+        let stored = self.historical_member_counts.get(group_id).copied();
+        stored.unwrap_or((peers as u32).saturating_add(1)) <= 2
     }
 
     fn historical_members(&self, group_id: &GroupId) -> Vec<PublicKey> {
@@ -3182,6 +3194,7 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         DROPPED_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_MEMBER_COUNTS_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_EXPORTER_SECRETS_SUFFIX,
         crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
         HISTORICAL_FOLDS_FILE_SUFFIX,
