@@ -311,40 +311,17 @@ not a silent pass.
 
 Device / interop (not substitutable by unit tests). In-place replace
 only — never uninstall the personal app (Account Key Durability /
-Never Uninstall Device Apps):
+Never Uninstall Device Apps). Record pass/fail against this sheet:
 
-1. **0.8 → this build, same device.** Install over the existing 0.8
-   app. Settings still show the same npub. Wallet restore material is
-   still present (do not print it). `*.mdk08.bak` exists next to the
-   Marmot DB. Chat list shows recovered Marmot rows on first paint.
-2. **Open a recovered DM and a recovered room** with the radio off or
-   before relays connect. Local history must paint. Scrolling up past
-   the newest 80 rows must keep loading from `*.mdk08.bak` without
-   waiting on relays. Relays must not gate first paint or typing. A
-   pending 3-member room that only lists the welcomer must stay its
-   own chat-list row next to any 1:1 with that person; banners must
-   use the room name, not the welcomer’s DM title.
-3. **Peer already on 0.9 / White Noise.** Send in the recovered row.
-   A new 0.9 group is created; the old transcript stays; home list
-   stays one row. The peer decrypts the new traffic only (not the
-   recovered 0.8 ciphertext).
-4. **Peer still on 0.8.** Send shows “Waiting for them to update
-   Sonar”. No second chat. No wipe. Mesh/BLE still sends if the
-   conversation is folded.
-5. **Mixed room.** Resume with whoever already published a 0.9
-   KeyPackage. After a leftover member updates, the next idle
-   `ensure_subscriptions` (or send) invites them. They accept the
-   pending invite (3+ member rooms) or auto-join (2-member welcome).
-6. **Sonar 0.9.14 ↔ White Noise iOS 0.9** DM and group, both
-   directions, including N≈25 (welcome is ~38.7 KB vs 0.8’s 27.8 KB).
-7. **Cold-start.** Debug + `SONAR_BENCH_NSEC`. Compare `t0→t4` to
-   `docs/PERFORMANCE.md`. First-upgrade migrate is local disk on
-   `MarmotEngine::persistent` / `connect()` — it must not sit on the
-   relay path. First-upgrade extract now ranks ids then joins payloads
-   for the newest 80 kind-9 rows per group; leftover blobs stay in
-   `*.mdk08.bak` and copy 400 ids-then-payloads per idle tick
-   (`ensure_mdk08_remainder`). `messages()` drains. Measure a large
-   0.8 DB; do not guess.
+| # | Pass | Fail |
+| --- | --- | --- |
+| 1. **0.8 → this build, same device** | Same npub in Settings; wallet restore material still present (do not print it); `*.mdk08.bak` next to the Marmot DB; recovered Marmot rows on first paint | New npub, missing wallet material, wiped DB, or empty chat list |
+| 2. **Open recovered DM + room offline** | History paints with radio off / before relays; scroll past the newest 80 rows loads from bak; typing works; a pending 3-member room that only lists the welcomer stays its own row next to any 1:1 with that person; banners use the room name | First paint waits on relay; bak remainder never appears; room collapses into the welcomer DM |
+| 3. **Peer already on 0.9 / White Noise** | Send in the recovered row creates a new 0.9 group; old transcript stays; home list stays one row; peer decrypts only the new traffic | Split chat, lost history, or peer cannot decrypt the new send |
+| 4. **Peer still on 0.8** | Send shows “Waiting for them to update Sonar”; no second chat; no wipe; mesh/BLE still sends if the conversation is folded | Silent send, new empty chat, or account wipe |
+| 5. **Mixed room** | Resume includes whoever already published a 0.9 KeyPackage; leftover members are invited on the next idle `ensure_subscriptions` or send; 3+ rooms stay pending invites, 2-member welcomes auto-join | Room becomes a DM; leftover members never invited |
+| 6. **Sonar 0.9.14 ↔ White Noise iOS 0.9** | DM and group both directions, including N≈25 (welcome ~38.7 KB vs 0.8’s 27.8 KB) | Either direction fails, or N≈25 cannot join |
+| 7. **Cold-start** | Debug + `SONAR_BENCH_NSEC`; `t0→t4` vs `docs/PERFORMANCE.md`; first-upgrade extract is local disk on `connect()` (newest 80/group, then 400/tick from bak), not on the relay path | Sync or migrate sits on the critical path; large 0.8 DB guessed rather than measured |
 
 ## Surfaces
 
@@ -390,20 +367,20 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on `51d95ef2` (this cloud agent) after the host-path pins. All green.
-`bak_needed_for_backup` landed after that commit and is covered by the
-leftover-bak + persist backfill tests above.
+Re-run on `13c0fd47` (this cloud agent) after R-045 (`is_direct` on
+core, FFI, and both hosts). All green.
 
 | Gate | Result |
 | --- | --- |
 | `--lib` `mdk08_migrate` + `historical_fold` + `account_backup` | 93 passed |
 | `--test persistence` | 28 passed |
 | `--lib client::tests` | 72 passed |
-| `--test e2e` `recovered_08` | 6 passed |
+| `--test e2e` `recovered_08` | 7 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 26 passed |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 27 passed |
+| `scripts/check-regression-ledger.sh` | 227 citations |
 
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
