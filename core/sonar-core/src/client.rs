@@ -4791,21 +4791,11 @@ impl SonarClient {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
-        let send_group = self.resolve_send_group(group_id).await?;
-        let group_id = &send_group;
-        // Direct send is intentional — clear any prior stopPolling / wipe latch
-        // so a new upload is not immediately cancelled (Android can race a
-        // concurrent send between stopPolling and the next resume pass).
-        self.clear_media_upload_cancel();
-        tracing::info!(
-            items = items.len(),
-            client_pending_id,
-            "media send_media_multi_with_progress enter"
-        );
         // Receivers hard-cap downloads at MAX_MEDIA_PLAINTEXT_BYTES, so an
         // over-limit upload would publish a message NO client can ever fetch.
-        // Reject before any encrypt/upload work. The aggregate cap bounds the
-        // whole album's resident plaintext (every item is in memory at once).
+        // Reject before resume-group creation or any encrypt/upload work. The
+        // aggregate cap bounds the whole album's resident plaintext (every
+        // item is in memory at once).
         let mut total_bytes: u64 = 0;
         for item in &items {
             if item.data.len() > MAX_MEDIA_PLAINTEXT_BYTES {
@@ -4822,6 +4812,17 @@ impl SonarClient {
                 max: MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64,
             });
         }
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
+        // Direct send is intentional — clear any prior stopPolling / wipe latch
+        // so a new upload is not immediately cancelled (Android can race a
+        // concurrent send between stopPolling and the next resume pass).
+        self.clear_media_upload_cancel();
+        tracing::info!(
+            items = items.len(),
+            client_pending_id,
+            "media send_media_multi_with_progress enter"
+        );
 
         let entry_id = if client_pending_id.is_empty() {
             new_media_staging_id()?
@@ -6991,6 +6992,11 @@ impl SonarClient {
         if let Some(live) = self.engine.live_fold_target(group_id) {
             return Ok(live);
         }
+        if !self.engine.is_historical_group(group_id)? {
+            // Unknown / not-yet-created ids keep the existing send error
+            // (group missing, media cap, …). Only recovered 0.8 rows resume.
+            return Ok(group_id.clone());
+        }
         let peers = self.engine.historical_resume_peers(group_id);
         let name = self
             .engine
@@ -8855,6 +8861,21 @@ mod tests {
                 if bytes == (count * per_item) as u64
                     && max == MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_text_on_unknown_group_is_not_a_recovered_chat_error() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let err = client
+            .send_text(&GroupId::new([7u8; 32]), "hi")
+            .await
+            .expect_err("unknown group must fail");
+        assert!(
+            !err.to_string().contains("other members update Sonar"),
+            "resume-fold error is only for recovered 0.8 rows: {err}"
         );
     }
 

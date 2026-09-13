@@ -1180,6 +1180,14 @@ impl MarmotEngine {
         Ok(out)
     }
 
+    /// True when `group_id` is recovered 0.8 history and not a live 0.9 group.
+    pub fn is_historical_group(&self, group_id: &GroupId) -> Result<bool> {
+        Ok(self
+            .historical_groups()?
+            .iter()
+            .any(|group| group.id == *group_id))
+    }
+
     /// Other members of a recovered conversation (everyone except the local key).
     pub fn historical_resume_peers(&self, group_id: &GroupId) -> Vec<PublicKey> {
         let me = self.identity.public_key();
