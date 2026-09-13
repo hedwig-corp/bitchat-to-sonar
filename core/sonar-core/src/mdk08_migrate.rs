@@ -42,12 +42,27 @@ pub(crate) const HISTORICAL_MEMBERS_FILE_SUFFIX: &str = ".sonar-historical-membe
 /// Marker written after a successful extract so operators can see what moved.
 pub(crate) const MDK08_MIGRATED_MARKER_SUFFIX: &str = ".sonar-mdk08-migrated.json";
 
+/// Newest chat rows copied onto the sidecar before `connectLocal` returns.
+/// Older rows stay in `*.mdk08.bak` until [`finish_remainder`].
+pub(crate) const FIRST_PAINT_MESSAGES_PER_GROUP: usize = 80;
+
 /// Chat rows and group titles recovered from a 0.8 store.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Mdk08Migration {
     pub messages: HashMap<GroupId, Vec<ChatMessage>>,
     pub group_names: HashMap<GroupId, String>,
     pub members: HashMap<GroupId, Vec<PublicKey>>,
+    /// True when at least one group has more kind-9 rows than the first-paint
+    /// window. The rest must be copied from `*.mdk08.bak`.
+    pub truncated: bool,
+}
+
+/// Enough to reopen the quarantined 0.8 file and copy the remaining rows.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMdk08Remainder {
+    pub bak_path: PathBuf,
+    pub key: [u8; 32],
+    pub local_pk: PublicKey,
 }
 
 /// Files moved aside so a fresh 0.9 store can occupy the original path.
@@ -87,7 +102,27 @@ pub(crate) fn detect_and_extract(
     if !table_exists(&conn, "messages")? {
         return Ok(None);
     }
-    Ok(Some(extract_from_connection(&conn, local_pk)?))
+    Ok(Some(extract_from_connection(&conn, local_pk, None)?))
+}
+
+/// Same probe, but only the newest [`FIRST_PAINT_MESSAGES_PER_GROUP`] chat
+/// rows per group. Group titles and resume members are still complete.
+pub(crate) fn detect_and_extract_first_paint(
+    path: &Path,
+    key: [u8; 32],
+    local_pk: PublicKey,
+) -> Result<Option<Mdk08Migration>> {
+    let Some(conn) = open_mdk08(path, key)? else {
+        return Ok(None);
+    };
+    if !table_exists(&conn, "messages")? {
+        return Ok(None);
+    }
+    Ok(Some(extract_from_connection(
+        &conn,
+        local_pk,
+        Some(FIRST_PAINT_MESSAGES_PER_GROUP),
+    )?))
 }
 
 /// Write the host sidecars **before** the 0.8 file is renamed.
@@ -127,6 +162,8 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
     let marker = serde_json::json!({
         "from": "mdk-0.8",
         "to": "mdk-0.9.14-transcript-sidecar",
+        "status": if extracted.truncated { "partial" } else { "complete" },
+        "first_paint_per_group": FIRST_PAINT_MESSAGES_PER_GROUP,
         "groups": extracted.messages.len(),
         "messages": extracted.messages.values().map(|m| m.len()).sum::<usize>(),
         "wire": "0xf2ee-plaintext-only",
@@ -136,6 +173,65 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         &marker,
     )?;
     Ok(())
+}
+
+pub(crate) fn mark_remainder_complete(db_path: &Path) -> Result<()> {
+    let path = sidecar_named(db_path, MDK08_MIGRATED_MARKER_SUFFIX);
+    let mut marker = if let Ok(bytes) = std::fs::read(&path) {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(obj) = marker.as_object_mut() {
+        obj.insert(
+            "status".into(),
+            serde_json::Value::String("complete".into()),
+        );
+    }
+    write_json(&path, &marker)
+}
+
+/// Resume leftover 0.8 rows from the quarantined file after first paint.
+pub(crate) fn pending_remainder(
+    db_path: &Path,
+    key: [u8; 32],
+    local_pk: PublicKey,
+) -> Option<PendingMdk08Remainder> {
+    let bak = backup_path(db_path);
+    if !bak.exists() {
+        return None;
+    }
+    let marker_path = sidecar_named(db_path, MDK08_MIGRATED_MARKER_SUFFIX);
+    let status = std::fs::read(&marker_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("status")
+                .and_then(|s| s.as_str())
+                .map(str::to_owned)
+        });
+    match status.as_deref() {
+        Some("complete") => None,
+        Some("partial") => Some(PendingMdk08Remainder {
+            bak_path: bak,
+            key,
+            local_pk,
+        }),
+        // Pre-window migrates wrote no status and copied every row.
+        None if sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX).exists() => None,
+        None => Some(PendingMdk08Remainder {
+            bak_path: bak,
+            key,
+            local_pk,
+        }),
+        Some(_) => Some(PendingMdk08Remainder {
+            bak_path: bak,
+            key,
+            local_pk,
+        }),
+    }
 }
 
 /// Rename the 0.8 SQLCipher file (and WAL/SHM/journal) to `*.mdk08.bak`.
@@ -237,7 +333,11 @@ fn open_mdk08(path: &Path, key: [u8; 32]) -> Result<Option<Connection>> {
     }
 }
 
-fn extract_from_connection(conn: &Connection, local_pk: PublicKey) -> Result<Mdk08Migration> {
+fn extract_from_connection(
+    conn: &Connection,
+    local_pk: PublicKey,
+    per_group_limit: Option<usize>,
+) -> Result<Mdk08Migration> {
     let mut extracted = Mdk08Migration::default();
     if table_exists(conn, "groups")? {
         let has_admins = column_exists(conn, "groups", "admin_pubkeys")?;
@@ -274,11 +374,14 @@ fn extract_from_connection(conn: &Connection, local_pk: PublicKey) -> Result<Mdk
         }
     }
 
+    extract_message_members(conn, &mut extracted)?;
+
     let has_state = column_exists(conn, "messages", "state")?;
     let has_tags = column_exists(conn, "messages", "tags")?;
     let has_event = column_exists(conn, "messages", "event")?;
     let sql = format!(
-        "SELECT mls_group_id, id, pubkey, kind, created_at, content, {}, {}, {} FROM messages",
+        "SELECT mls_group_id, id, pubkey, kind, created_at, content, {}, {}, {} FROM messages \
+         ORDER BY created_at DESC, id DESC",
         if has_state { "state" } else { "NULL" },
         if has_tags { "tags" } else { "NULL" },
         if has_event { "event" } else { "NULL" },
@@ -302,24 +405,36 @@ fn extract_from_connection(conn: &Connection, local_pk: PublicKey) -> Result<Mdk
         })
         .map_err(|e| Error::Storage(format!("mdk08 messages query: {e}")))?;
 
+    let mut kind9_counts: HashMap<GroupId, usize> = HashMap::new();
     for row in rows {
         let (group_id, id, pubkey, kind, created_at, content, state, tags_raw, event_raw) =
             row.map_err(|e| Error::Storage(format!("mdk08 messages row: {e}")))?;
-        let tags = merge_stored_tags(tags_raw.as_deref(), event_raw.as_deref());
-        if !group_id.is_empty() {
-            let gid = GroupId::new(group_id.clone());
-            if let Ok(pk) = PublicKey::from_slice(&pubkey) {
-                note_member(&mut extracted, &gid, pk);
-            }
-            for pk in p_tag_pubkeys(&tags) {
-                note_member(&mut extracted, &gid, pk);
-            }
-        }
         if kind as u16 != CHAT_RUMOR_KIND {
             continue;
         }
         if state.as_deref().is_some_and(is_invalid_message_state) {
             continue;
+        }
+        if group_id.is_empty() {
+            continue;
+        }
+        let gid = GroupId::new(group_id.clone());
+        let seen = kind9_counts.entry(gid.clone()).or_insert(0);
+        *seen += 1;
+        if per_group_limit.is_some_and(|limit| {
+            extracted
+                .messages
+                .get(&gid)
+                .is_some_and(|msgs| msgs.len() >= limit)
+        }) {
+            continue;
+        }
+        let tags = merge_stored_tags(tags_raw.as_deref(), event_raw.as_deref());
+        if let Ok(pk) = PublicKey::from_slice(&pubkey) {
+            note_member(&mut extracted, &gid, pk);
+        }
+        for pk in p_tag_pubkeys(&tags) {
+            note_member(&mut extracted, &gid, pk);
         }
         let Some(msg) = chat_from_mdk08_row(
             &group_id, &id, &pubkey, created_at, content, local_pk, &tags,
@@ -332,7 +447,32 @@ fn extract_from_connection(conn: &Connection, local_pk: PublicKey) -> Result<Mdk
             .or_default()
             .push(msg);
     }
+    if let Some(limit) = per_group_limit {
+        extracted.truncated = kind9_counts.values().any(|count| *count > limit);
+    }
     Ok(extracted)
+}
+
+fn extract_message_members(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT mls_group_id, pubkey FROM messages")
+        .map_err(|e| Error::Storage(format!("mdk08 members prepare: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| Error::Storage(format!("mdk08 members query: {e}")))?;
+    for row in rows {
+        let (group_id, pubkey) =
+            row.map_err(|e| Error::Storage(format!("mdk08 members row: {e}")))?;
+        if group_id.is_empty() {
+            continue;
+        }
+        if let Ok(pk) = PublicKey::from_slice(&pubkey) {
+            note_member(extracted, &GroupId::new(group_id), pk);
+        }
+    }
+    Ok(())
 }
 
 fn note_member(extracted: &mut Mdk08Migration, group_id: &GroupId, pk: PublicKey) {
@@ -820,6 +960,57 @@ mod tests {
         assert_eq!(msg.media[0].filename, "sunset.jpg");
         assert_eq!(msg.media[0].width, Some(800));
         assert_eq!(msg.media[0].nonce, None);
+    }
+
+    #[test]
+    fn first_paint_keeps_newest_window_and_marks_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&path, &local, peer, "oldest");
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let group_id = vec![0x11u8; 16];
+        for i in 1..=FIRST_PAINT_MESSAGES_PER_GROUP {
+            let mut id = [0u8; 32];
+            id[0] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    group_id.clone(),
+                    id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("msg-{i}"),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let window = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        let msgs = window.messages.values().next().unwrap();
+        assert_eq!(msgs.len(), FIRST_PAINT_MESSAGES_PER_GROUP);
+        assert!(window.truncated);
+        assert!(msgs.iter().any(|m| m.content == "msg-80"));
+        assert!(!msgs.iter().any(|m| m.content == "oldest"));
+
+        let full = detect_and_extract(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("full extract");
+        assert_eq!(
+            full.messages.values().next().unwrap().len(),
+            FIRST_PAINT_MESSAGES_PER_GROUP + 1
+        );
+        assert!(!full.truncated);
     }
 
     #[test]

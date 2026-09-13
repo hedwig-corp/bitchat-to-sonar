@@ -80,10 +80,13 @@ What the user does **not** keep automatically:
    self-heal).
 3. If 0.9 open fails and the file exists:
    - Open with the 0.8 raw key.
-   - If `messages` is readable, copy `kind = 9` rows onto the transcript
-     sidecar and group titles onto `.sonar-historical-groups.json`.
+   - If `messages` is readable, copy group titles, resume members, and the
+     newest 80 `kind = 9` rows per group onto the transcript sidecar
+     (`connectLocal` / first paint must not scan the whole 0.8 file).
    - Rename the 0.8 file (and WAL/SHM) to `*.mdk08.bak`.
    - Create a fresh 0.9 store at the original path.
+   - Copy leftover older rows from the bak on `messages()` / idle
+     `ensure_subscriptions` / `sync` (`ensure_mdk08_remainder`).
    - If 0.9 create fails, rename the 0.8 file back. Never delete it.
 4. Wrong key / unknown file: return `protocol migration required`. Do not
    wipe, do not quarantine.
@@ -104,6 +107,8 @@ Guarded by:
 - `mdk08_migrate::tests::extracts_plaintext_chat_and_ignores_non_chat_rows`
 - `mdk08_migrate::tests::wrong_key_is_not_a_0_8_store`
 - `persistence::mdk08_store_decrypts_and_moves_plaintext_without_wiping`
+- `persistence::mdk08_first_paint_defers_older_rows_until_remainder`
+- `mdk08_migrate::first_paint_keeps_newest_window_and_marks_truncated`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
 - `e2e::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`

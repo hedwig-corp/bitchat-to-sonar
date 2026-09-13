@@ -781,6 +781,8 @@ pub struct MarmotEngine {
     historical_members: HashMap<GroupId, Vec<PublicKey>>,
     /// Recovered 0.8 group id → new 0.9 group created with the same members.
     historical_folds: Mutex<HashMap<GroupId, GroupId>>,
+    /// Leftover 0.8 rows still in `*.mdk08.bak` after the first-paint window.
+    pending_mdk08: Mutex<Option<crate::mdk08_migrate::PendingMdk08Remainder>>,
     /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
     _tempdir: Option<tempfile::TempDir>,
 }
@@ -877,20 +879,23 @@ impl MarmotEngine {
         key: [u8; 32],
         open_err: Error,
     ) -> Result<Self> {
-        let extracted =
-            match crate::mdk08_migrate::detect_and_extract(path, key, identity.public_key()) {
-                Ok(Some(extracted)) => extracted,
-                Ok(None) => {
-                    return Err(Error::Storage(format!(
-                        "MDK 0.9 cannot open this store (protocol migration required): {open_err}"
-                    )))
-                }
-                Err(migrate_err) => {
-                    return Err(Error::Storage(format!(
-                        "MDK 0.8 extract failed (store left intact): {migrate_err}"
-                    )))
-                }
-            };
+        let extracted = match crate::mdk08_migrate::detect_and_extract_first_paint(
+            path,
+            key,
+            identity.public_key(),
+        ) {
+            Ok(Some(extracted)) => extracted,
+            Ok(None) => {
+                return Err(Error::Storage(format!(
+                    "MDK 0.9 cannot open this store (protocol migration required): {open_err}"
+                )))
+            }
+            Err(migrate_err) => {
+                return Err(Error::Storage(format!(
+                    "MDK 0.8 extract failed (store left intact): {migrate_err}"
+                )))
+            }
+        };
         crate::mdk08_migrate::write_sidecars(path, &extracted)?;
         let quarantine = crate::mdk08_migrate::quarantine_store(path)?;
         match Self::open_session(identity, path, key, true) {
@@ -898,6 +903,7 @@ impl MarmotEngine {
                 tracing::info!(
                     groups = extracted.messages.len(),
                     messages = extracted.messages.values().map(|m| m.len()).sum::<usize>(),
+                    truncated = extracted.truncated,
                     "marmot: recovered 0.8 plaintext transcript; 0.8 store quarantined"
                 );
                 Ok(engine)
@@ -943,6 +949,8 @@ impl MarmotEngine {
         let historical_group_names = crate::mdk08_migrate::load_historical_group_names(db_path);
         let historical_members = crate::mdk08_migrate::load_historical_members(db_path);
         let historical_folds = load_historical_folds(db_path);
+        let pending_mdk08 =
+            crate::mdk08_migrate::pending_remainder(db_path, key, identity.public_key());
         Ok(Self {
             session: Mutex::new(Some(session)),
             identity,
@@ -957,8 +965,71 @@ impl MarmotEngine {
             historical_group_names,
             historical_members,
             historical_folds: Mutex::new(historical_folds),
+            pending_mdk08: Mutex::new(pending_mdk08),
             _tempdir: None,
         })
+    }
+
+    pub fn has_pending_mdk08_remainder(&self) -> bool {
+        self.pending_mdk08
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Copy leftover 0.8 chat rows from `*.mdk08.bak` into the transcript.
+    /// First paint only keeps a bounded recent window; this is the rest.
+    pub fn ensure_mdk08_remainder(&self) -> Result<()> {
+        let pending = {
+            let mut slot = self
+                .pending_mdk08
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.take()
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let extracted = match crate::mdk08_migrate::detect_and_extract(
+            &pending.bak_path,
+            pending.key,
+            pending.local_pk,
+        ) {
+            Ok(Some(extracted)) => extracted,
+            Ok(None) => {
+                if let Some(path) = self.db_path.as_ref() {
+                    crate::mdk08_migrate::mark_remainder_complete(path)?;
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                let mut slot = self
+                    .pending_mdk08
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = Some(pending);
+                return Err(err);
+            }
+        };
+        {
+            let mut transcript = self
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for msgs in extracted.messages.into_values() {
+                for msg in msgs {
+                    let rows = transcript.entry(msg.group_id.clone()).or_default();
+                    if !rows.iter().any(|existing| existing.id == msg.id) {
+                        rows.push(msg);
+                    }
+                }
+            }
+        }
+        self.persist_transcript();
+        if let Some(path) = self.db_path.as_ref() {
+            crate::mdk08_migrate::mark_remainder_complete(path)?;
+        }
+        Ok(())
     }
 
     pub fn identity(&self) -> &Identity {
@@ -1214,9 +1285,7 @@ impl MarmotEngine {
     /// for the transcript bubble, but the 0.8 MLS exporter secret is not in
     /// the 0.9 session, so download/decrypt cannot succeed.
     pub fn recovered_08_media_unavailable(&self, group_id: &GroupId, url: &str) -> bool {
-        let Ok(msgs) = self.messages(group_id) else {
-            return false;
-        };
+        let msgs = self.transcript_for_family(group_id);
         let Ok(historical) = self.historical_groups() else {
             return false;
         };
@@ -2023,7 +2092,7 @@ impl MarmotEngine {
             .live_fold_target(group_id)
             .unwrap_or_else(|| group_id.clone());
         let secret = self.media_exporter_secret(&secret_group)?;
-        let msgs = self.messages(group_id)?;
+        let msgs = self.mapped_transcript(group_id)?;
         for m in msgs {
             for media in &m.media {
                 if media.url != url {
@@ -2525,6 +2594,11 @@ impl MarmotEngine {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
+        self.ensure_mdk08_remainder()?;
+        self.mapped_transcript(group_id)
+    }
+
+    fn mapped_transcript(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
         let mut mapped = self.transcript_for_family(group_id);
         mapped.sort_by(|a, b| {
             a.created_at
@@ -2544,7 +2618,7 @@ impl MarmotEngine {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut msgs = self.messages(group_id)?;
+        let mut msgs = self.mapped_transcript(group_id)?;
         msgs.sort_by(compare_message_cursor_desc);
         let page: Vec<ChatMessage> = msgs.into_iter().skip(offset).take(limit).collect();
         Ok(page)

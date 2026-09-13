@@ -926,6 +926,93 @@ async fn mdk08_store_decrypts_and_moves_plaintext_without_wiping() {
     assert!(bak.exists(), "quarantine must survive a later 0.9 reopen");
 }
 
+#[tokio::test]
+async fn mdk08_first_paint_defers_older_rows_until_remainder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let group_id = vec![0x11u8; 16];
+    let total = 100usize;
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open 0.8 file");
+        let hex_key = DB_KEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .expect("0.8 raw key");
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );",
+        )
+        .expect("0.8 schema");
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'alice & bob', '')",
+            rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
+        )
+        .expect("group row");
+        for i in 0..total {
+            let mut id = [0u8; 32];
+            id[0] = (i / 256) as u8;
+            id[1] = (i % 256) as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed')",
+                rusqlite::params![
+                    group_id.clone(),
+                    id.to_vec(),
+                    bob.public_key().to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("row-{i}"),
+                ],
+            )
+            .expect("chat row");
+        }
+    }
+
+    let engine =
+        MarmotEngine::persistent(alice.clone(), &db_path, DB_KEY).expect("0.8 store must migrate");
+    assert!(
+        engine.has_pending_mdk08_remainder(),
+        "older rows stay in the bak until remainder"
+    );
+    let gid = sonar_core::GroupId::new(group_id.clone());
+    let page = engine.messages_page(&gid, 40, 0).expect("first-paint page");
+    assert_eq!(page.len(), 40);
+    assert_eq!(page[0].content, "row-99", "newest row must paint first");
+    assert!(
+        engine.has_pending_mdk08_remainder(),
+        "a bounded page must not force the remainder"
+    );
+
+    let all = engine.messages(&gid).expect("full history after remainder");
+    assert_eq!(all.len(), total);
+    assert_eq!(all[0].content, "row-0");
+    assert_eq!(all[total - 1].content, "row-99");
+    assert!(!engine.has_pending_mdk08_remainder());
+}
+
 /// A 0.8-shaped store with the wrong host key must stay on disk and must not
 /// be treated as a migratable store (Account Key Durability).
 #[tokio::test]

@@ -5663,6 +5663,9 @@ impl SonarClient {
             self.retry_outbox().await;
             self.reconcile_historical_resume_members().await;
             self.share_push_token_with_groups().await;
+            if let Err(err) = self.engine.ensure_mdk08_remainder() {
+                tracing::warn!(%err, "mdk08 remainder extract failed");
+            }
             return Ok(());
         }
 
@@ -5792,6 +5795,9 @@ impl SonarClient {
         self.retry_outbox().await;
         self.reconcile_historical_resume_members().await;
         self.share_push_token_with_groups().await;
+        if let Err(err) = self.engine.ensure_mdk08_remainder() {
+            tracing::warn!(%err, "mdk08 remainder extract failed");
+        }
         Ok(())
     }
 
@@ -6277,6 +6283,9 @@ impl SonarClient {
         // covers Pending rows stranded while relays were briefly unavailable.)
         self.retry_outbox().await;
         self.reconcile_historical_resume_members().await;
+        if let Err(err) = self.engine.ensure_mdk08_remainder() {
+            tracing::warn!(%err, "mdk08 remainder extract failed");
+        }
         Ok(())
     }
 
