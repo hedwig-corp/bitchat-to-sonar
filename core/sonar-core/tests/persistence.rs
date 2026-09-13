@@ -1005,11 +1005,11 @@ async fn mdk08_account_backup_preserves_recovered_transcript() {
         "recovered transcript must be inside the sealed account"
     );
     assert!(
-        package
+        !package
             .sidecar_files
             .iter()
-            .any(|(name, bytes)| name == ".mdk08.bak" && !bytes.is_empty()),
-        "quarantined 0.8 store must travel with the backup"
+            .any(|(name, _)| name == ".mdk08.bak"),
+        "first-paint copied every row; packing bak would double the blob"
     );
 
     let restore_dir = tempfile::tempdir().expect("restore dir");
@@ -1152,6 +1152,126 @@ async fn mdk08_account_backup_preserves_remainder_after_restore() {
     assert_eq!(all[0].content, "row-0");
     assert_eq!(all[total - 1].content, "row-529");
     assert!(!restored.has_pending_mdk08_remainder());
+}
+
+/// Once leftover rows are in the transcript, a later backup must not
+/// upload `*.mdk08.bak`. Restore still paints the full history.
+#[tokio::test]
+async fn mdk08_account_backup_omits_bak_after_remainder_complete() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let group_id = vec![0x11u8; 16];
+    let total = 530usize;
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open 0.8 file");
+        let hex_key = DB_KEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .expect("0.8 raw key");
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );",
+        )
+        .expect("0.8 schema");
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'alice & bob', '')",
+            rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
+        )
+        .expect("group row");
+        for i in 0..total {
+            let mut id = [0u8; 32];
+            id[0] = (i / 256) as u8;
+            id[1] = (i % 256) as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed')",
+                rusqlite::params![
+                    group_id.clone(),
+                    id.to_vec(),
+                    bob.public_key().to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("row-{i}"),
+                ],
+            )
+            .expect("chat row");
+        }
+    }
+
+    let engine =
+        MarmotEngine::persistent(alice.clone(), &db_path, DB_KEY).expect("0.8 store must migrate");
+    assert!(engine.has_pending_mdk08_remainder());
+    let gid = sonar_core::GroupId::new(group_id);
+    let drained = engine.messages(&gid).expect("drain leftover 0.8 rows");
+    assert_eq!(drained.len(), total);
+    assert!(!engine.has_pending_mdk08_remainder());
+    drop(engine);
+
+    let key_hex = DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let package = sonar_core::account_backup::read_account_backup_package(&db_path, &key_hex)
+        .expect("post-drain backup must open the 0.9 passphrase store");
+    assert!(
+        !package
+            .sidecar_files
+            .iter()
+            .any(|(name, _)| name == ".mdk08.bak"),
+        "complete remainder is already in the transcript; bak would double the blob"
+    );
+    assert!(
+        package
+            .sidecar_files
+            .iter()
+            .any(|(name, bytes)| name == ".sonar-transcript.json" && !bytes.is_empty()),
+        "transcript sidecar is the durable copy after remainder completes"
+    );
+    assert!(
+        db_path.with_file_name("marmot.sqlite.mdk08.bak").exists(),
+        "local quarantine stays on disk until a later cleanup release"
+    );
+
+    let restore_dir = tempfile::tempdir().expect("restore dir");
+    let restore_path = restore_dir.path().join("marmot.sqlite");
+    sonar_core::account_backup::write_account_backup_package(&restore_path, &package)
+        .expect("restore package");
+    assert!(
+        !restore_path
+            .with_file_name("marmot.sqlite.mdk08.bak")
+            .exists(),
+        "restore must not recreate a bak the blob omitted"
+    );
+    let restored = MarmotEngine::persistent(alice, &restore_path, DB_KEY)
+        .expect("restored 0.9 store from transcript sidecar");
+    assert!(!restored.has_pending_mdk08_remainder());
+    let recovered = restored.messages(&gid).expect("full history after restore");
+    assert_eq!(recovered.len(), total);
+    assert_eq!(recovered[0].content, "row-0");
+    assert_eq!(recovered[total - 1].content, "row-529");
 }
 
 /// A v1-shaped backup taken *before* the 0.8 → 0.9 migrate is only the

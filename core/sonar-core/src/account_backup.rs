@@ -50,9 +50,11 @@ use crate::client::DEFAULT_BLOSSOM_SERVER;
 /// restore finds it by LISTING one host, so moving the default would otherwise
 /// orphan every backup already sitting on the old one.
 const LEGACY_BACKUP_BLOSSOM_SERVERS: &[&str] = &["https://nostr.download"];
-/// Soft ceiling for a downloaded backup (DB + index). Far above typical chats;
-/// guards memory against a malicious Blossom response.
-const MAX_BACKUP_BYTES: usize = 200 * 1024 * 1024;
+/// Soft ceiling for a downloaded backup (DB + index + recovered-chat sidecars).
+/// After an MDK 0.8 migrate the quarantined bak can roughly double the blob
+/// while remainder is still pending. Far above typical chats; guards memory
+/// against a malicious Blossom response.
+const MAX_BACKUP_BYTES: usize = 400 * 1024 * 1024;
 
 /// Cap on the BUD-03 listing body. The listing is descriptors only — one small
 /// JSON object per blob — so even a pathological account fits far under this,
@@ -905,9 +907,26 @@ fn sidecar_named(db_path: &Path, suffix: &str) -> PathBuf {
     db_path.with_file_name(format!("{name}{suffix}"))
 }
 
+fn is_mdk08_bak_suffix(suffix: &str) -> bool {
+    suffix == crate::mdk08_migrate::MDK08_BACKUP_SUFFIX
+        || suffix == "-wal.mdk08.bak"
+        || suffix == "-shm.mdk08.bak"
+        || suffix == "-journal.mdk08.bak"
+}
+
+/// Pack the quarantined 0.8 file only while leftover rows are still not
+/// in the transcript. See [`crate::mdk08_migrate::leftover_bak_needed`].
+fn pack_mdk08_bak(db_path: &Path) -> bool {
+    crate::mdk08_migrate::leftover_bak_needed(db_path)
+}
+
 fn read_backup_sidecars(db_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let include_bak = pack_mdk08_bak(db_path);
     let mut files = Vec::new();
     for suffix in backup_sidecar_suffixes() {
+        if is_mdk08_bak_suffix(suffix) && !include_bak {
+            continue;
+        }
         let path = sidecar_named(db_path, suffix);
         if !path.is_file() {
             continue;
@@ -1632,10 +1651,11 @@ fn backup_blob_url(base: &Url, sha256: &Sha256Hash) -> Result<Url> {
 ///
 /// `Content-Length` is the server's claim about a body it has not sent yet, so
 /// it must never size the allocation. Bounding the hint by `MAX_BACKUP_BYTES`
-/// is not enough: a hostile host can advertise 200 MiB and then send nothing,
-/// and the phone is out of memory before the first byte arrives. Reserve a
-/// small fixed amount instead and let the `Vec` grow — growth is amortized, and
-/// the streaming check in `download_blob_capped_to` is the real bound.
+/// is not enough: a hostile host can advertise the whole cap and then send
+/// nothing, and the phone is out of memory before the first byte arrives.
+/// Reserve a small fixed amount instead and let the `Vec` grow — growth is
+/// amortized, and the streaming check in `download_blob_capped_to` is the
+/// real bound.
 fn download_buffer_capacity(content_length: Option<u64>) -> usize {
     content_length
         .unwrap_or(0)
@@ -1654,7 +1674,7 @@ async fn download_blob_capped(keys: &Keys, base: &Url, sha256: Sha256Hash) -> Re
 }
 
 /// Same, with an injectable ceiling so tests can prove the mid-stream abort
-/// without moving 200 MiB.
+/// without moving the full download cap.
 async fn download_blob_capped_to(
     keys: &Keys,
     base: &Url,
@@ -2063,7 +2083,7 @@ pub fn seal_account_backup_files(keys: &Keys, db_path: &Path, db_key_hex: &str) 
 ///
 /// Fed to the hasher incrementally rather than assembled into one buffer. An
 /// account snapshot is tens of MB (the reported account was ~46 MB sealed, and
-/// the cap is 200 MiB); a concatenated copy would double that at the exact
+/// the cap is 400 MiB); a concatenated copy would double that at the exact
 /// moment the sealed ciphertext is about to be allocated too — inside a BGTask
 /// with a memory ceiling.
 fn plaintext_fingerprint(package: &AccountBackupPackage) -> String {
@@ -3613,7 +3633,7 @@ mod tests {
 
     /// A server's `Content-Length` must never drive the allocation. Bounding
     /// the hint by `MAX_BACKUP_BYTES` looks safe and is not: a hostile host can
-    /// advertise 200 MiB, send nothing, and the phone is out of memory before
+    /// advertise the whole cap, send nothing, and the phone is out of memory before
     /// the first byte — on the restore path, which the user only reaches after
     /// they have already wiped.
     #[test]

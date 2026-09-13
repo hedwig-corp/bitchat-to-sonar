@@ -220,15 +220,13 @@ pub(crate) fn mark_remainder_complete(db_path: &Path) -> Result<()> {
     write_json(&path, &marker)
 }
 
-/// Resume leftover 0.8 rows from the quarantined file after first paint.
-pub(crate) fn pending_remainder(
-    db_path: &Path,
-    key: [u8; 32],
-    local_pk: PublicKey,
-) -> Option<PendingMdk08Remainder> {
-    let bak = backup_path(db_path);
-    if !bak.exists() {
-        return None;
+/// True while leftover 0.8 rows still live only in `*.mdk08.bak`.
+///
+/// Account backup uses the same rule so a completed remainder does not
+/// double the sealed blob by uploading the quarantined file again.
+pub(crate) fn leftover_bak_needed(db_path: &Path) -> bool {
+    if !backup_path(db_path).exists() {
+        return false;
     }
     let marker_path = sidecar_named(db_path, MDK08_MIGRATED_MARKER_SUFFIX);
     let status = std::fs::read(&marker_path)
@@ -241,25 +239,25 @@ pub(crate) fn pending_remainder(
                 .map(str::to_owned)
         });
     match status.as_deref() {
-        Some("complete") => None,
-        Some("partial") => Some(PendingMdk08Remainder {
-            bak_path: bak,
-            key,
-            local_pk,
-        }),
+        Some("complete") => false,
+        Some("partial") => true,
         // Pre-window migrates wrote no status and copied every row.
-        None if sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX).exists() => None,
-        None => Some(PendingMdk08Remainder {
-            bak_path: bak,
-            key,
-            local_pk,
-        }),
-        Some(_) => Some(PendingMdk08Remainder {
-            bak_path: bak,
-            key,
-            local_pk,
-        }),
+        None if sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX).exists() => false,
+        _ => true,
     }
+}
+
+/// Resume leftover 0.8 rows from the quarantined file after first paint.
+pub(crate) fn pending_remainder(
+    db_path: &Path,
+    key: [u8; 32],
+    local_pk: PublicKey,
+) -> Option<PendingMdk08Remainder> {
+    leftover_bak_needed(db_path).then(|| PendingMdk08Remainder {
+        bak_path: backup_path(db_path),
+        key,
+        local_pk,
+    })
 }
 
 /// Rename the 0.8 SQLCipher file (and WAL/SHM/journal) to `*.mdk08.bak`.

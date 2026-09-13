@@ -149,6 +149,7 @@ Guarded by:
 - `account_backup::preview_lists_recovered_chats_when_index_is_missing`
 - `persistence::mdk08_account_backup_preserves_recovered_transcript`
 - `persistence::mdk08_account_backup_preserves_remainder_after_restore`
+- `persistence::mdk08_account_backup_omits_bak_after_remainder_complete`
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
@@ -179,8 +180,11 @@ from the transcript / historical-groups sidecars so Settings does not say
 the backup is empty. Parked invites, dropped-group ids, the outbox, and
 sync watermarks travel with v2 so a pending 0.9 send or room resume
 survives nsec restore. The quarantined `*.mdk08.bak` plus the partial
-migrate marker must be in the blob — otherwise restore keeps only the
-first-paint window.
+migrate marker must be in the blob **while remainder is still pending** —
+otherwise restore keeps only the first-paint window. Once leftover rows
+are copied onto the transcript, later backups omit the bak so the sealed
+blob does not double (cap 400 MiB while bak is still packed). The local
+`*.mdk08.bak` file stays on disk until a later cleanup release.
 
 ## How users keep access after the flag-day
 
