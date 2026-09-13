@@ -1806,6 +1806,41 @@ async fn mdk08_pending_welcome_is_listed_for_resume() {
     let summaries = index.summaries_ordered().expect("summaries");
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].name, "pending room");
+    drop(engine);
+
+    let key_hex = DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let package = sonar_core::account_backup::read_account_backup_package(&db_path, &key_hex)
+        .expect("post-migrate backup");
+    assert!(
+        package
+            .sidecar_files
+            .iter()
+            .any(|(name, bytes)| { name == ".sonar-historical-groups.json" && !bytes.is_empty() }),
+        "pending welcome name must travel with the account backup"
+    );
+    assert!(
+        package
+            .sidecar_files
+            .iter()
+            .any(|(name, bytes)| { name == ".sonar-historical-members.json" && !bytes.is_empty() }),
+        "pending welcome members must travel with the account backup"
+    );
+
+    let restore_dir = tempfile::tempdir().expect("restore dir");
+    let restore_path = restore_dir.path().join("marmot.sqlite");
+    sonar_core::account_backup::write_account_backup_package(&restore_path, &package)
+        .expect("restore package");
+    let restored = MarmotEngine::persistent(alice, &restore_path, DB_KEY)
+        .expect("restored store plus pending welcome");
+    let listed = restored
+        .historical_groups()
+        .expect("pending welcome must survive nsec restore");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "pending room");
+    assert!(listed[0].members.contains(&welcomer.public_key()));
 }
 
 /// Labeled 0.8 `encrypted-media` exporter secrets must decrypt recovered

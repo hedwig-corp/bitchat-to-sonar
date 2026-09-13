@@ -163,6 +163,7 @@ Guarded by:
 - `mdk08_migrate::labeled_media_exporter_secret_is_copied_unlabeled_is_not`
 - `marmot.rs::recovered_08_media_decrypts_with_stored_exporter_secret`
 - `persistence::mdk08_pending_welcome_is_listed_for_resume`
+  (also pins nsec restore of the name + welcomer sidecar)
 - `persistence::mdk08_media_exporter_secret_survives_migrate_and_backup`
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
