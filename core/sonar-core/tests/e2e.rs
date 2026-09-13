@@ -1441,16 +1441,15 @@ async fn recovered_08_group_resumes_with_whichever_peers_have_updated() {
     assert!(carol.groups().expect("carol groups").is_empty());
 
     bob.sync().await.expect("bob syncs welcome");
-    let bob_invite = bob
-        .pending_group_invites()
-        .expect("bob invites")
-        .into_iter()
-        .next()
-        .expect("bob is invited to the resumed room");
-    bob.accept_group_invite(&bob_invite.id)
-        .await
-        .expect("bob accepts");
-    bob.sync().await.expect("bob syncs after accept");
+    // Two-member welcomes auto-join (same budget as a DM). The room still
+    // must not be a pending invite-only group just because carol lagged.
+    if let Some(invite) = bob.pending_group_invites().expect("bob invites").first() {
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts");
+        bob.sync().await.expect("bob syncs after accept");
+    }
+    assert_eq!(bob.groups().expect("bob joined").len(), 1);
     assert_eq!(
         bob.messages(&bob.groups().unwrap()[0].id)
             .unwrap()
