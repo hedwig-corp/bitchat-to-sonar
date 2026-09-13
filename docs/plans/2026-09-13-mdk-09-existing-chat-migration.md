@@ -189,18 +189,34 @@ Commit the new ceiling + welcome-size table. A moved ceiling is expected
 (`0xf2ee` → `0xf2f1`) and is the signal to re-check White Noise interop,
 not a silent pass.
 
-Device / interop (not substitutable by unit tests):
+Device / interop (not substitutable by unit tests). In-place replace
+only — never uninstall the personal app (Account Key Durability /
+Never Uninstall Device Apps):
 
-- Existing 0.8 install → in-place upgrade of this build: same npub,
-  wallet intact, Marmot chat list shows recovered rows, opening a
-  recovered chat paints local history without waiting on relays.
-- Send on a recovered chat creates a **new** 0.9 group and does not
-  delete the old transcript.
-- Sonar 0.9.14 ↔ White Noise iOS 0.9 DM + group, both directions.
-- Sonar 0.9.14 → leftover 0.8 peer: typed mismatch, no wipe, mesh still
-  sends if the conversation is folded.
-- Cold-start `t0→t4` stays within `docs/PERFORMANCE.md` noise;
-  migration is local disk only and must not sit on the relay path.
+1. **0.8 → this build, same device.** Install over the existing 0.8
+   app. Settings still show the same npub. Wallet restore material is
+   still present (do not print it). `*.mdk08.bak` exists next to the
+   Marmot DB. Chat list shows recovered Marmot rows on first paint.
+2. **Open a recovered DM and a recovered room** with the radio off or
+   before relays connect. Local history must paint. Relays must not
+   gate first paint or typing.
+3. **Peer already on 0.9 / White Noise.** Send in the recovered row.
+   A new 0.9 group is created; the old transcript stays; home list
+   stays one row. The peer decrypts the new traffic only (not the
+   recovered 0.8 ciphertext).
+4. **Peer still on 0.8.** Send shows “Waiting for them to update
+   Sonar”. No second chat. No wipe. Mesh/BLE still sends if the
+   conversation is folded.
+5. **Mixed room.** Resume with whoever already published a 0.9
+   KeyPackage. After a leftover member updates, the next idle
+   `ensure_subscriptions` (or send) invites them. They accept the
+   pending invite (3+ member rooms) or auto-join (2-member welcome).
+6. **Sonar 0.9.14 ↔ White Noise iOS 0.9** DM and group, both
+   directions, including N≈25 (welcome is ~38.7 KB vs 0.8’s 27.8 KB).
+7. **Cold-start.** Debug + `SONAR_BENCH_NSEC`. Compare `t0→t4` to
+   `docs/PERFORMANCE.md`. First-upgrade migrate is local disk on
+   `MarmotEngine::persistent` / `connect()` — it must not sit on the
+   relay path. A huge 0.8 DB can stall boot; measure, do not guess.
 
 ## Surfaces
 
