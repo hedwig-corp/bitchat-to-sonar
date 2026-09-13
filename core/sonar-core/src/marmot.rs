@@ -769,6 +769,10 @@ pub struct MarmotEngine {
     pending_convergence: Mutex<HashSet<GroupId>>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
     historical_group_names: HashMap<GroupId, String>,
+    /// Members recovered from a 0.8 store (`admin_pubkeys` + every message
+    /// pubkey). Transcript senders are merged at read time so a chat you
+    /// only ever sent into can still resume.
+    historical_members: HashMap<GroupId, Vec<PublicKey>>,
     /// Recovered 0.8 group id → new 0.9 group created with the same members.
     historical_folds: Mutex<HashMap<GroupId, GroupId>>,
     /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
@@ -931,6 +935,7 @@ impl MarmotEngine {
         let dropped = load_dropped(db_path);
         let transcript = load_transcript(db_path);
         let historical_group_names = crate::mdk08_migrate::load_historical_group_names(db_path);
+        let historical_members = crate::mdk08_migrate::load_historical_members(db_path);
         let historical_folds = load_historical_folds(db_path);
         Ok(Self {
             session: Mutex::new(Some(session)),
@@ -944,6 +949,7 @@ impl MarmotEngine {
             transcript: Mutex::new(transcript),
             pending_convergence: Mutex::new(HashSet::new()),
             historical_group_names,
+            historical_members,
             historical_folds: Mutex::new(historical_folds),
             _tempdir: None,
         })
@@ -1163,7 +1169,7 @@ impl MarmotEngine {
     pub fn historical_groups(&self) -> Result<Vec<HistoricalGroup>> {
         let live = self.live_group_id_set()?;
         let mut out = Vec::new();
-        for id in self.transcript_group_ids() {
+        for id in self.recovered_group_ids() {
             if live.contains(&id) || self.is_dropped(&id) {
                 continue;
             }
@@ -1178,6 +1184,16 @@ impl MarmotEngine {
             });
         }
         Ok(out)
+    }
+
+    /// Transcript ids plus named / member-only 0.8 rows (outbound-only chats).
+    pub fn recovered_group_ids(&self) -> Vec<GroupId> {
+        let mut ids = self.transcript_group_ids();
+        ids.extend(self.historical_group_names.keys().cloned());
+        ids.extend(self.historical_members.keys().cloned());
+        ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        ids.dedup();
+        ids
     }
 
     /// True when `group_id` is recovered 0.8 history and not a live 0.9 group.
@@ -1204,6 +1220,9 @@ impl MarmotEngine {
             .into_iter()
             .map(|m| m.sender)
             .collect();
+        if let Some(stored) = self.historical_members.get(group_id) {
+            members.extend(stored.iter().cloned());
+        }
         members.push(me);
         members.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
         members.dedup();
@@ -2891,6 +2910,7 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         PARKED_INVITES_FILE_SUFFIX,
         DROPPED_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
         crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
         HISTORICAL_FOLDS_FILE_SUFFIX,
     ]

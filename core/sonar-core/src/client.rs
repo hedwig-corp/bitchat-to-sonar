@@ -7413,10 +7413,14 @@ impl SonarClient {
             return;
         };
         let idx_guard = idx.lock().unwrap();
-        if !idx_guard.is_empty() {
-            return;
-        }
-        if let Err(e) = idx_guard.materialize_from(&self.engine) {
+        let result = if idx_guard.is_empty() {
+            idx_guard.materialize_from(&self.engine)
+        } else {
+            // An upgraded 0.8 install already has index rows. Still seed any
+            // recovered transcript / admin-member chats the old index missed.
+            idx_guard.seed_missing_recovered(&self.engine)
+        };
+        if let Err(e) = result {
             tracing::warn!(%e, "index materialize failed");
         }
     }

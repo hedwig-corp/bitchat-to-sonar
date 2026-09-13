@@ -438,7 +438,13 @@ impl ConversationIndex {
         // Recovered 0.8 history lives on the transcript sidecar, not in the
         // 0.9 MLS group list. Seed those rows so chat-list first paint keeps
         // the old conversations after a protocol port.
-        for group_id in engine.transcript_group_ids() {
+        self.seed_missing_recovered(engine)
+    }
+
+    /// Add recovered 0.8 rows that the existing index never stored. Safe on a
+    /// non-empty index: existing summaries (and their unread counts) stay put.
+    pub fn seed_missing_recovered(&self, engine: &MarmotEngine) -> Result<()> {
+        for group_id in engine.recovered_group_ids() {
             let hex = hex::encode(group_id.as_slice());
             if self.summary(&hex)?.is_some() {
                 continue;

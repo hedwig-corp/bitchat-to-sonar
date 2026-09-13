@@ -85,10 +85,16 @@ What the user does **not** keep automatically:
 4. Wrong key / unknown file: return `protocol migration required`. Do not
    wipe, do not quarantine.
 
-`ConversationIndex::materialize_from` then seeds empty index rows from
-transcript group ids, so chat-list first paint does not wait on live MLS
-groups (Signal-comparable / XChat startup). Existing index files are left
-alone.
+`ConversationIndex::materialize_from` seeds empty index rows from
+recovered group ids. A non-empty upgraded index only adds **missing**
+recovered rows (`seed_missing_recovered`) so unread counts on existing
+chats are not reset. Chat-list first paint does not wait on live MLS
+groups (Signal-comparable / XChat startup).
+
+Resume peers come from transcript senders **and** the 0.8
+`admin_pubkeys` / every `messages.pubkey` sidecar
+(`.sonar-historical-members.json`). A DM you only ever sent into still
+has the other npub after the flag-day.
 
 Guarded by:
 
@@ -103,6 +109,8 @@ Guarded by:
 - `e2e::recovered_08_group_adds_a_member_who_updates_later`
 - `e2e::recovered_08_group_adds_late_member_on_sync_without_a_local_send`
   (pins `ensure_subscriptions`, the host idle path)
+- `mdk08_migrate::outbound_only_chat_keeps_admin_peer`
+- `e2e::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
@@ -222,7 +230,7 @@ Never Uninstall Device Apps):
 
 | Surface | History | Live 0.9 send | Gap |
 | --- | --- | --- | --- |
-| Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
+| Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
 | Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing | none |
 | iOS (`ios/`) | same | same | none |

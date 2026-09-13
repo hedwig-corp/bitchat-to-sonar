@@ -1058,6 +1058,68 @@ fn write_mdk08_alice_bob_store(
     (GroupId::new(group_bytes), event_id)
 }
 
+/// 0.8 DM where only the local user sent. The peer is in `admin_pubkeys`
+/// (the 0.8 groups table), not in kind-9 rows.
+fn write_mdk08_alice_outbound_store(
+    path: &std::path::Path,
+    local: PublicKey,
+    peer: PublicKey,
+    body: &str,
+) -> GroupId {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            admin_pubkeys TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x55u8; 16];
+    let admins = serde_json::json!([local.to_hex(), peer.to_hex()]).to_string();
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys)
+         VALUES (?1, ?2, 'outbound only', '', ?3)",
+        rusqlite::params![group_bytes.clone(), vec![0x66u8; 32], admins],
+    )
+    .expect("group row");
+    conn.execute(
+        "INSERT INTO messages
+            (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+             wrapper_event_id, state)
+         VALUES (?1, ?2, ?3, 9, 1_700_000_000, ?4, '[]', '{}', ?2, 'processed')",
+        rusqlite::params![
+            group_bytes.clone(),
+            vec![0xABu8; 32],
+            local.to_bytes().to_vec(),
+            body,
+        ],
+    )
+    .expect("local chat row");
+    GroupId::new(group_bytes)
+}
+
 /// Sending on a recovered 0.8 row must create a live 0.9 group, keep the old
 /// transcript, fold both ids, and deliver to a peer who already speaks 0.9.
 ///
@@ -1218,6 +1280,57 @@ async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
     assert!(after_reopen.iter().any(|m| m.content == "keep this chat"));
     assert!(after_reopen.iter().any(|m| m.content == "resume hello"));
     assert!(after_reopen.iter().any(|m| m.content == "second resume"));
+}
+
+/// A recovered DM that only has local kind-9 rows must still resume using the
+/// 0.8 `admin_pubkeys` list. This is the common "I wrote first, they never
+/// replied" case — transcript senders alone cannot recover the peer.
+#[tokio::test]
+async fn recovered_08_outbound_only_chat_resumes_from_admin_pubkeys() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_outbound_store(
+        &db_path,
+        alice_identity.public_key(),
+        bob_identity.public_key(),
+        "only I sent this",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    let hist = alice
+        .historical_groups()
+        .expect("historical")
+        .into_iter()
+        .find(|g| g.id == historical)
+        .expect("outbound chat listed");
+    assert!(
+        hist.members.contains(&bob.identity().public_key()),
+        "silent peer must be a resume target"
+    );
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "resume after they update")
+        .await
+        .expect("outbound-only chat must resume");
+    assert_eq!(alice.groups().expect("live").len(), 1);
+    assert_eq!(alice.conversation_summaries().len(), 1);
 }
 
 fn write_mdk08_alice_bob_carol_store(

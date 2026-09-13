@@ -33,6 +33,10 @@ pub(crate) const MDK08_BACKUP_SUFFIX: &str = ".mdk08.bak";
 /// Group-name map written next to the transcript sidecar.
 pub(crate) const HISTORICAL_GROUPS_FILE_SUFFIX: &str = ".sonar-historical-groups.json";
 
+/// Member pubkeys recovered from 0.8 `admin_pubkeys` and every `messages.pubkey`.
+/// Needed so a chat you only ever sent into can still resume after the flag-day.
+pub(crate) const HISTORICAL_MEMBERS_FILE_SUFFIX: &str = ".sonar-historical-members.json";
+
 /// Marker written after a successful extract so operators can see what moved.
 pub(crate) const MDK08_MIGRATED_MARKER_SUFFIX: &str = ".sonar-mdk08-migrated.json";
 
@@ -41,6 +45,7 @@ pub(crate) const MDK08_MIGRATED_MARKER_SUFFIX: &str = ".sonar-mdk08-migrated.jso
 pub(crate) struct Mdk08Migration {
     pub messages: HashMap<GroupId, Vec<ChatMessage>>,
     pub group_names: HashMap<GroupId, String>,
+    pub members: HashMap<GroupId, Vec<PublicKey>>,
 }
 
 /// Files moved aside so a fresh 0.9 store can occupy the original path.
@@ -102,6 +107,21 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         &names,
     )?;
 
+    let members: HashMap<String, Vec<String>> = extracted
+        .members
+        .iter()
+        .map(|(id, pks)| {
+            (
+                hex::encode(id.as_slice()),
+                pks.iter().map(|pk| pk.to_hex()).collect(),
+            )
+        })
+        .collect();
+    write_json(
+        &sidecar_named(db_path, HISTORICAL_MEMBERS_FILE_SUFFIX),
+        &members,
+    )?;
+
     let marker = serde_json::json!({
         "from": "mdk-0.8",
         "to": "mdk-0.9.14-transcript-sidecar",
@@ -148,6 +168,25 @@ pub(crate) fn load_historical_group_names(db_path: &Path) -> HashMap<GroupId, St
         .collect()
 }
 
+pub(crate) fn load_historical_members(db_path: &Path) -> HashMap<GroupId, Vec<PublicKey>> {
+    let path = sidecar_named(db_path, HISTORICAL_MEMBERS_FILE_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<HashMap<String, Vec<String>>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(hex_id, pks)| {
+            let id = hex::decode(hex_id).ok().map(GroupId::new)?;
+            let mut members: Vec<PublicKey> =
+                pks.iter().filter_map(|s| parse_pubkey_str(s)).collect();
+            members.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+            members.dedup();
+            Some((id, members))
+        })
+        .collect()
+}
+
 pub(crate) fn wipe_mdk08_backups(db_path: &Path) -> Result<()> {
     for src in sqlite_file_set(db_path) {
         let bak = backup_path(&src);
@@ -162,7 +201,11 @@ pub(crate) fn wipe_mdk08_backups(db_path: &Path) -> Result<()> {
             }
         }
     }
-    for suffix in [HISTORICAL_GROUPS_FILE_SUFFIX, MDK08_MIGRATED_MARKER_SUFFIX] {
+    for suffix in [
+        HISTORICAL_GROUPS_FILE_SUFFIX,
+        HISTORICAL_MEMBERS_FILE_SUFFIX,
+        MDK08_MIGRATED_MARKER_SUFFIX,
+    ] {
         let path = sidecar_named(db_path, suffix);
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -195,18 +238,36 @@ fn open_mdk08(path: &Path, key: [u8; 32]) -> Result<Option<Connection>> {
 fn extract_from_connection(conn: &Connection, local_pk: PublicKey) -> Result<Mdk08Migration> {
     let mut extracted = Mdk08Migration::default();
     if table_exists(conn, "groups")? {
+        let has_admins = column_exists(conn, "groups", "admin_pubkeys")?;
+        let sql = if has_admins {
+            "SELECT mls_group_id, name, admin_pubkeys FROM groups"
+        } else {
+            "SELECT mls_group_id, name, NULL FROM groups"
+        };
         let mut stmt = conn
-            .prepare("SELECT mls_group_id, name FROM groups")
+            .prepare(sql)
             .map_err(|e| Error::Storage(format!("mdk08 groups prepare: {e}")))?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(|e| Error::Storage(format!("mdk08 groups query: {e}")))?;
         for row in rows {
-            let (id, name) = row.map_err(|e| Error::Storage(format!("mdk08 groups row: {e}")))?;
-            if !id.is_empty() {
-                extracted.group_names.insert(GroupId::new(id), name);
+            let (id, name, admins) =
+                row.map_err(|e| Error::Storage(format!("mdk08 groups row: {e}")))?;
+            if id.is_empty() {
+                continue;
+            }
+            let group_id = GroupId::new(id);
+            extracted.group_names.insert(group_id.clone(), name);
+            if let Some(raw) = admins {
+                for pk in parse_admin_pubkeys(&raw) {
+                    note_member(&mut extracted, &group_id, pk);
+                }
             }
         }
     }
@@ -237,6 +298,11 @@ fn extract_from_connection(conn: &Connection, local_pk: PublicKey) -> Result<Mdk
     for row in rows {
         let (group_id, id, pubkey, kind, created_at, content, state) =
             row.map_err(|e| Error::Storage(format!("mdk08 messages row: {e}")))?;
+        if !group_id.is_empty() {
+            if let Ok(pk) = PublicKey::from_slice(&pubkey) {
+                note_member(&mut extracted, &GroupId::new(group_id.clone()), pk);
+            }
+        }
         if kind as u16 != CHAT_RUMOR_KIND {
             continue;
         }
@@ -254,6 +320,39 @@ fn extract_from_connection(conn: &Connection, local_pk: PublicKey) -> Result<Mdk
             .push(msg);
     }
     Ok(extracted)
+}
+
+fn note_member(extracted: &mut Mdk08Migration, group_id: &GroupId, pk: PublicKey) {
+    let members = extracted.members.entry(group_id.clone()).or_default();
+    if !members.contains(&pk) {
+        members.push(pk);
+    }
+}
+
+fn parse_admin_pubkeys(raw: &str) -> Vec<PublicKey> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            if let Some(s) = item.as_str() {
+                parse_pubkey_str(s)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn parse_pubkey_str(raw: &str) -> Option<PublicKey> {
+    let trimmed = raw.trim();
+    PublicKey::from_hex(trimmed)
+        .ok()
+        .or_else(|| PublicKey::parse(trimmed).ok())
 }
 
 fn chat_from_mdk08_row(
@@ -458,6 +557,68 @@ mod tests {
             extracted.group_names.values().next().map(String::as_str),
             Some("alice & bob")
         );
+    }
+
+    #[test]
+    fn outbound_only_chat_keeps_admin_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                admin_pubkeys TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );",
+        )
+        .unwrap();
+        let group_id = vec![0x33u8; 16];
+        let admins = serde_json::json!([local.public_key().to_hex(), peer.to_hex()]).to_string();
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys)
+             VALUES (?1, ?2, 'just alice sent', '', ?3)",
+            rusqlite::params![group_id.clone(), vec![0x44u8; 32], admins],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, 1_700_000_000, 'only me', '[]', '{}', ?2, 'processed')",
+            rusqlite::params![
+                group_id,
+                vec![0xABu8; 32],
+                local.public_key().to_bytes().to_vec(),
+            ],
+        )
+        .unwrap();
+
+        let extracted = detect_and_extract(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        let members = extracted.members.values().next().expect("members");
+        assert!(members.contains(&peer), "silent peer must survive extract");
+        assert!(members.contains(&local.public_key()));
     }
 
     #[test]
