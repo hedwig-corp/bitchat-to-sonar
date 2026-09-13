@@ -101,7 +101,9 @@ final class MarmotService: @unchecked Sendable {
             id = try container.decode(String.self, forKey: .id)
             name = try container.decode(String.self, forKey: .name)
             memberNpubs = try container.decode([String].self, forKey: .memberNpubs)
-            isDirect = try container.decodeIfPresent(Bool.self, forKey: .isDirect) ?? true
+            // Missing key is a pre-isDirect snapshot. Default false so a
+            // two-member recovered room stays visible on first-upgrade paint.
+            isDirect = try container.decodeIfPresent(Bool.self, forKey: .isDirect) ?? false
         }
 
         func encode(to encoder: Encoder) throws {

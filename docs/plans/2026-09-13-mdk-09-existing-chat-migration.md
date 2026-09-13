@@ -329,8 +329,8 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs still default true until the first persist after this build. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
-| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key still default true for one launch. | same | none |
+| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** so the room stays visible on the first-upgrade paint; old DMs may show room chrome until the first persist. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct so the room stays visible; old DMs may show room chrome until the first persist. | same | none |
 | Mesh | untouched | untouched | none |
 
 Resume-chat fold: recovered 0.8 rows appear in FFI `groups()` with
@@ -380,13 +380,15 @@ core, FFI, and both hosts). All green.
 | `--test failed_events` | 1 passed |
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 27 passed |
-| `scripts/check-regression-ledger.sh` | 227 citations |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 29 passed (includes first-paint `isDirect` pins) |
+| `scripts/check-regression-ledger.sh` | 231 citations |
 
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
-now persists `isDirect`. Pin:
-`ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`. iOS
-already encoded the Codable key; pin
-`MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`.
+now persists `isDirect`. A missing 6th field / Codable key defaults
+not-direct so a recovered room stays visible on the first-upgrade paint.
+Pins: `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`,
+`ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`,
+`MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`,
+`MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`.

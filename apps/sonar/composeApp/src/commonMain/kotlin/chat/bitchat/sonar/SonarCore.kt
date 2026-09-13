@@ -499,10 +499,11 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
                     ?.split(",")
                     ?.mapNotNull { hexDec(it) }
                     .orEmpty()
-                // Missing 6th field is a pre-isDirect snapshot. Default true
-                // matches old DMs; a two-member recovered room stays wrong
-                // until the first groups() persist after this build.
-                val isDirect = parts.getOrNull(5)?.let { it != "0" } ?: true
+                // Missing 6th field is a pre-isDirect snapshot. Default false
+                // so a two-member recovered room stays its own row on the
+                // first-upgrade paint (R-045). Old DMs may show room chrome
+                // until the first groups() persist writes the real flag.
+                val isDirect = parts.getOrNull(5)?.let { it != "0" } ?: false
                 chats += SonarChat(id, name, members, isDirect = isDirect)
             }
         }

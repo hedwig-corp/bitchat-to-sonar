@@ -291,7 +291,7 @@ struct MarmotProfileCacheTests {
     }
 
     @Test
-    func legacyChatSnapshotWithoutIsDirectDefaultsToDirect() throws {
+    func legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect() throws {
         let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -304,8 +304,9 @@ struct MarmotProfileCacheTests {
         let loaded = SNMarmotChatSnapshotCache.load(from: defaults)
         #expect(loaded.0.count == 1)
         #expect(loaded.0.first?.id == "pending-room")
-        #expect(loaded.0.first?.isDirect == true)
-        #expect(snDirectMarmotPeerKey(for: loaded.0[0], ownNpub: "npub1me") == "npub1sara")
+        #expect(loaded.0.first?.isDirect == false)
+        #expect(snDirectMarmotPeerKey(for: loaded.0[0], ownNpub: "npub1me") == nil)
+        #expect(snMarmotTreatsAsGroupChat(loaded.0[0]))
     }
 
     @Test

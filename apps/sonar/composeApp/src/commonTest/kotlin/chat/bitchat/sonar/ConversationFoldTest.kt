@@ -345,20 +345,25 @@ class ConversationFoldTest {
     }
 
     @Test
-    fun legacyChatSnapshotWithoutIsDirectDefaultsToDirect() {
+    fun legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
         val room = SonarChat(
             id = "pending-room",
             name = "pending room",
-            members = listOf("npub1me", "npub1bob"),
+            members = listOf(ownNpub, peerNpub),
             isDirect = false,
         )
         val modern = encodeChatSnapshot(listOf(room), emptyMap(), mapOf(room.id to 9L)).trimEnd()
         val legacy = modern.removeSuffix("\t0")
 
         val decoded = decodeChatSnapshot(legacy).first.single()
-        assertTrue(decoded.isDirect)
+        assertFalse(decoded.isDirect)
         assertEquals(room.id, decoded.id)
         assertEquals(room.name, decoded.name)
+        assertEquals(null, directMarmotPeerKey(decoded, ownNpub))
         assertEquals(mapOf(room.id to 9L), decodeChatSnapshotLatest(legacy))
     }
 
