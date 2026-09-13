@@ -104,6 +104,11 @@ What the user does **not** keep automatically:
      page so the full-history API stays complete. Newest first-paint
      pages that already fit do not.
    - If 0.9 create fails, rename the 0.8 file back. Never delete it.
+   - A later 0.9 open that already has `*.mdk08.bak` runs a **one-shot**
+     metadata backfill (pending welcomes + labeled `encrypted-media`
+     secrets + group names/members). It does not join leftover chat
+     payloads. The migrate marker records `metadata_backfill=complete`
+     so cold start does not reopen the bak every launch.
 4. Wrong key / unknown file: return `protocol migration required`. Do not
    wipe, do not quarantine.
 
@@ -165,6 +170,8 @@ Guarded by:
 - `persistence::mdk08_pending_welcome_is_listed_for_resume`
   (also pins nsec restore of the name + welcomer sidecar)
 - `persistence::mdk08_media_exporter_secret_survives_migrate_and_backup`
+- `mdk08_migrate::metadata_backfill_is_one_shot_after_the_marker_lands`
+- `persistence::mdk08_bak_backfills_welcome_and_media_secrets_on_reopen`
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`

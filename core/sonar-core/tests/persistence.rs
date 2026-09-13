@@ -1987,3 +1987,184 @@ async fn mdk08_media_exporter_secret_survives_migrate_and_backup() {
         .expect("restored exporter must still open the blob");
     assert_eq!(plain, b"photo-bytes");
 }
+
+/// An earlier 0.9 open may have quarantined the 0.8 file before welcomes
+/// and labeled media secrets were copied. The next open must backfill
+/// those from `*.mdk08.bak` without waiting for a remainder tick.
+#[tokio::test]
+async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice = Identity::generate();
+    let welcomer = Identity::generate();
+    let bob = Identity::generate();
+    let chat_id = vec![0x11u8; 16];
+    let welcome_id = vec![0x77u8; 16];
+    let secret = vec![0xABu8; 32];
+    let url = "https://blossom.example/old.bin";
+    let upload = sonar_core::media_crypto::encrypt_for_upload(
+        &secret,
+        b"photo-bytes",
+        "image/jpeg",
+        "old.jpg",
+    )
+    .expect("encrypt");
+    let tags = serde_json::json!([[
+        "imeta",
+        format!("url {url}"),
+        "m image/jpeg",
+        "filename old.jpg",
+        format!(
+            "x {}",
+            upload
+                .original_hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        format!(
+            "n {}",
+            upload
+                .nonce
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ),
+        "v mip04-v2"
+    ]])
+    .to_string();
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open 0.8 file");
+        let hex_key = DB_KEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .expect("0.8 raw key");
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );
+            CREATE TABLE welcomes (
+                id BLOB PRIMARY KEY,
+                event TEXT NOT NULL,
+                mls_group_id BLOB NOT NULL,
+                nostr_group_id BLOB NOT NULL,
+                group_name TEXT NOT NULL,
+                group_description TEXT NOT NULL,
+                group_admin_pubkeys TEXT NOT NULL,
+                group_relays TEXT NOT NULL,
+                welcomer BLOB NOT NULL,
+                member_count INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL
+            );
+            CREATE TABLE group_exporter_secrets (
+                mls_group_id BLOB NOT NULL,
+                epoch INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                secret BLOB NOT NULL,
+                PRIMARY KEY (mls_group_id, epoch, label)
+            );",
+        )
+        .expect("0.8 schema");
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'alice & bob', '')",
+            rusqlite::params![chat_id.clone(), vec![0x22u8; 32]],
+        )
+        .expect("group");
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, 1_700_000_000, '', ?4, '{}', ?2, 'processed')",
+            rusqlite::params![
+                chat_id.clone(),
+                vec![0xABu8; 32],
+                bob.public_key().to_bytes().to_vec(),
+                tags,
+            ],
+        )
+        .expect("media row");
+        let admins =
+            serde_json::json!([alice.public_key().to_hex(), welcomer.public_key().to_hex()])
+                .to_string();
+        conn.execute(
+            "INSERT INTO welcomes
+                (id, event, mls_group_id, nostr_group_id, group_name, group_description,
+                 group_admin_pubkeys, group_relays, welcomer, member_count, state,
+                 wrapper_event_id)
+             VALUES (?1, '{}', ?2, ?3, 'pending room', '', ?4, '[]', ?5, 3, 'pending', ?1)",
+            rusqlite::params![
+                vec![0xAAu8; 32],
+                welcome_id.clone(),
+                vec![0xBBu8; 32],
+                admins,
+                welcomer.public_key().to_bytes().to_vec(),
+            ],
+        )
+        .expect("pending welcome");
+        conn.execute(
+            "INSERT INTO group_exporter_secrets (mls_group_id, epoch, label, secret)
+             VALUES (?1, 1, 'encrypted-media', ?2)",
+            rusqlite::params![chat_id.clone(), secret.clone()],
+        )
+        .expect("media secret");
+    }
+
+    let engine = MarmotEngine::persistent(alice.clone(), &db_path, DB_KEY).expect("first migrate");
+    drop(engine);
+
+    std::fs::remove_file(
+        db_path.with_file_name("marmot.sqlite.sonar-historical-exporter-secrets.json"),
+    )
+    .expect("drop secrets sidecar to simulate a pre-welcome extract");
+    let chat_hex = chat_id
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    std::fs::write(
+        db_path.with_file_name("marmot.sqlite.sonar-historical-groups.json"),
+        format!("{{\"{chat_hex}\":\"alice & bob\"}}"),
+    )
+    .expect("keep only the chat name");
+    std::fs::write(
+        db_path.with_file_name("marmot.sqlite.sonar-mdk08-migrated.json"),
+        serde_json::json!({ "status": "complete", "from": "mdk-0.8" }).to_string(),
+    )
+    .expect("old marker without metadata_backfill");
+
+    let engine =
+        MarmotEngine::persistent(alice, &db_path, DB_KEY).expect("reopen must backfill from bak");
+    let welcome = GroupId::new(welcome_id);
+    let listed = engine.historical_groups().expect("list after backfill");
+    assert!(
+        listed
+            .iter()
+            .any(|g| g.id == welcome && g.name == "pending room"),
+        "pending welcome must come back from the quarantined bak: {listed:?}"
+    );
+    let chat = GroupId::new(chat_id);
+    let plain = engine
+        .decrypt_media_by_url(&chat, url, &upload.encrypted_data)
+        .expect("labeled secret must come back from the bak");
+    assert_eq!(plain, b"photo-bytes");
+}

@@ -855,6 +855,12 @@ impl MarmotEngine {
     ) -> Result<Self> {
         crate::sqlcipher_runtime::ensure_no_checkpoint_on_close()?;
         let path = db_path.as_ref();
+        // Cheap one-shot: if an earlier 0.9 open already quarantined the 0.8
+        // file, recover pending welcomes + labeled media secrets from the bak
+        // without joining leftover chat payloads.
+        if let Err(err) = crate::mdk08_migrate::backfill_metadata_from_bak(path, key) {
+            tracing::warn!(error = %err, "0.8 bak metadata backfill failed");
+        }
         match Self::open_session(identity.clone(), path, key, true) {
             Ok(engine) => Ok(engine),
             Err(e) if path.exists() && is_unencrypted_sqlite(path) => {

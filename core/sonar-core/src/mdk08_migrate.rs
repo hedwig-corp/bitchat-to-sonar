@@ -219,11 +219,134 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         "groups": extracted.messages.len(),
         "messages": extracted.messages.values().map(|m| m.len()).sum::<usize>(),
         "wire": "0xf2ee-plaintext-only",
+        "metadata_backfill": "complete",
     });
     write_json(
         &sidecar_named(db_path, MDK08_MIGRATED_MARKER_SUFFIX),
         &marker,
     )?;
+    Ok(())
+}
+
+/// One-shot: copy pending welcomes + labeled media secrets from `*.mdk08.bak`
+/// onto the host sidecars. Used when an earlier 0.9 open already quarantined
+/// the 0.8 file before those columns were extracted. Does not join chat
+/// payloads — remainder still owns leftover history.
+pub(crate) fn backfill_metadata_from_bak(db_path: &Path, key: [u8; 32]) -> Result<bool> {
+    if !metadata_backfill_pending(db_path) {
+        return Ok(false);
+    }
+    let Some(conn) = open_mdk08(&backup_path(db_path), key)? else {
+        return Ok(false);
+    };
+    let mut extracted = Mdk08Migration::default();
+    extract_metadata(&conn, &mut extracted)?;
+    merge_historical_sidecars(db_path, &extracted)?;
+    mark_metadata_backfill_complete(db_path)?;
+    Ok(true)
+}
+
+fn metadata_backfill_pending(db_path: &Path) -> bool {
+    if !backup_path(db_path).exists() {
+        return false;
+    }
+    metadata_backfill_status(db_path).as_deref() != Some("complete")
+}
+
+fn metadata_backfill_status(db_path: &Path) -> Option<String> {
+    let bytes = std::fs::read(sidecar_named(db_path, MDK08_MIGRATED_MARKER_SUFFIX)).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("metadata_backfill")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn mark_metadata_backfill_complete(db_path: &Path) -> Result<()> {
+    let path = sidecar_named(db_path, MDK08_MIGRATED_MARKER_SUFFIX);
+    let mut marker = if let Ok(bytes) = std::fs::read(&path) {
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let Some(obj) = marker.as_object_mut() {
+        obj.insert(
+            "metadata_backfill".into(),
+            serde_json::Value::String("complete".into()),
+        );
+    }
+    write_json(&path, &marker)
+}
+
+fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Result<()> {
+    let mut names = load_historical_group_names(db_path);
+    for (id, name) in &extracted.group_names {
+        let entry = names.entry(id.clone()).or_default();
+        if entry.is_empty() && !name.is_empty() {
+            *entry = name.clone();
+        }
+    }
+    let mut members = load_historical_members(db_path);
+    for (id, pks) in &extracted.members {
+        let entry = members.entry(id.clone()).or_default();
+        for pk in pks {
+            if !entry.contains(pk) {
+                entry.push(*pk);
+            }
+        }
+        entry.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        entry.dedup();
+    }
+    let mut secrets = load_historical_media_secrets(db_path);
+    for (id, values) in &extracted.media_exporter_secrets {
+        let entry = secrets.entry(id.clone()).or_default();
+        for secret in values {
+            if !entry.iter().any(|existing| existing == secret) {
+                entry.push(secret.clone());
+            }
+        }
+    }
+    if !names.is_empty() {
+        let keyed: HashMap<String, String> = names
+            .iter()
+            .map(|(id, name)| (hex::encode(id.as_slice()), name.clone()))
+            .collect();
+        write_json(
+            &sidecar_named(db_path, HISTORICAL_GROUPS_FILE_SUFFIX),
+            &keyed,
+        )?;
+    }
+    if !members.is_empty() {
+        let keyed: HashMap<String, Vec<String>> = members
+            .iter()
+            .map(|(id, pks)| {
+                (
+                    hex::encode(id.as_slice()),
+                    pks.iter().map(|pk| pk.to_hex()).collect(),
+                )
+            })
+            .collect();
+        write_json(
+            &sidecar_named(db_path, HISTORICAL_MEMBERS_FILE_SUFFIX),
+            &keyed,
+        )?;
+    }
+    if !secrets.is_empty() {
+        let keyed: HashMap<String, Vec<String>> = secrets
+            .iter()
+            .map(|(id, values)| {
+                (
+                    hex::encode(id.as_slice()),
+                    values.iter().map(hex::encode).collect(),
+                )
+            })
+            .collect();
+        write_json(
+            &sidecar_named(db_path, HISTORICAL_EXPORTER_SECRETS_SUFFIX),
+            &keyed,
+        )?;
+    }
     Ok(())
 }
 
@@ -414,6 +537,12 @@ fn extract_from_connection(
     per_group_limit: Option<usize>,
 ) -> Result<Mdk08Migration> {
     let mut extracted = Mdk08Migration::default();
+    extract_metadata(conn, &mut extracted)?;
+    extract_chat_rows(conn, local_pk, per_group_limit, &mut extracted)?;
+    Ok(extracted)
+}
+
+fn extract_metadata(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
     if table_exists(conn, "groups")? {
         let has_admins = column_exists(conn, "groups", "admin_pubkeys")?;
         let sql = if has_admins {
@@ -443,17 +572,15 @@ fn extract_from_connection(
             extracted.group_names.insert(group_id.clone(), name);
             if let Some(raw) = admins {
                 for pk in parse_admin_pubkeys(&raw) {
-                    note_member(&mut extracted, &group_id, pk);
+                    note_member(extracted, &group_id, pk);
                 }
             }
         }
     }
 
-    extract_pending_welcomes(conn, &mut extracted)?;
-    extract_media_exporter_secrets(conn, &mut extracted)?;
-    extract_message_members(conn, &mut extracted)?;
-    extract_chat_rows(conn, local_pk, per_group_limit, &mut extracted)?;
-    Ok(extracted)
+    extract_pending_welcomes(conn, extracted)?;
+    extract_media_exporter_secrets(conn, extracted)?;
+    extract_message_members(conn, extracted)
 }
 
 fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
@@ -1303,6 +1430,30 @@ mod tests {
         )
         .unwrap();
         assert!(leftover_bak_needed(&db));
+    }
+
+    #[test]
+    fn metadata_backfill_is_one_shot_after_the_marker_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        std::fs::write(&db, b"live").unwrap();
+        std::fs::write(backup_path(&db), b"bak").unwrap();
+        write_json(
+            &sidecar_named(&db, MDK08_MIGRATED_MARKER_SUFFIX),
+            &serde_json::json!({ "status": "complete" }),
+        )
+        .unwrap();
+        assert!(
+            metadata_backfill_pending(&db),
+            "pre-welcome extracts must backfill once from the bak"
+        );
+        mark_metadata_backfill_complete(&db).unwrap();
+        assert!(!metadata_backfill_pending(&db));
+        assert_eq!(
+            backfill_metadata_from_bak(&db, KEY).unwrap(),
+            false,
+            "complete backfill must not reopen the bak"
+        );
     }
 
     #[test]
