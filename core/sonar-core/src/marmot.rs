@@ -1037,10 +1037,14 @@ impl MarmotEngine {
                 extracted
             }
             Ok(None) => {
-                if let Some(path) = self.db_path.as_ref() {
-                    crate::mdk08_migrate::mark_remainder_complete(path)?;
-                }
-                return Ok(());
+                let mut slot = self
+                    .pending_mdk08
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *slot = Some(pending);
+                return Err(Error::Storage(
+                    "0.8 remainder bak unreadable; leftover rows kept pending".into(),
+                ));
             }
             Err(err) => {
                 let mut slot = self

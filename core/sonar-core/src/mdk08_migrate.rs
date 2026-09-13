@@ -238,11 +238,11 @@ pub(crate) fn leftover_bak_needed(db_path: &Path) -> bool {
                 .and_then(|s| s.as_str())
                 .map(str::to_owned)
         });
+    let transcript_exists = sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX).exists();
     match status.as_deref() {
-        Some("complete") => false,
-        Some("partial") => true,
-        // Pre-window migrates wrote no status and copied every row.
-        None if sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX).exists() => false,
+        // Complete (or a pre-window full extract) only if the transcript is
+        // actually on disk. A missing sidecar means the bak is the last copy.
+        Some("complete") | None if transcript_exists => false,
         _ => true,
     }
 }
@@ -1125,6 +1125,110 @@ mod tests {
             extracted.group_names.values().next().map(String::as_str),
             Some("alice & bob")
         );
+    }
+
+    #[test]
+    fn leftover_bak_needed_follows_transcript_not_just_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        std::fs::write(&db, b"live").unwrap();
+        std::fs::write(backup_path(&db), b"bak").unwrap();
+        write_json(
+            &sidecar_named(&db, MDK08_MIGRATED_MARKER_SUFFIX),
+            &serde_json::json!({ "status": "complete" }),
+        )
+        .unwrap();
+        assert!(
+            leftover_bak_needed(&db),
+            "complete marker without a transcript still needs the bak"
+        );
+        write_json(
+            &sidecar_named(&db, TRANSCRIPT_FILE_SUFFIX),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert!(
+            !leftover_bak_needed(&db),
+            "complete + transcript is the durable copy"
+        );
+    }
+
+    #[test]
+    fn leftover_bak_needed_is_true_while_remainder_is_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        std::fs::write(&db, b"live").unwrap();
+        std::fs::write(backup_path(&db), b"bak").unwrap();
+        write_json(
+            &sidecar_named(&db, MDK08_MIGRATED_MARKER_SUFFIX),
+            &serde_json::json!({ "status": "partial" }),
+        )
+        .unwrap();
+        write_json(
+            &sidecar_named(&db, TRANSCRIPT_FILE_SUFFIX),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert!(leftover_bak_needed(&db));
+    }
+
+    #[test]
+    fn empty_named_group_is_kept_for_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                admin_pubkeys TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );",
+        )
+        .unwrap();
+        let group_id = vec![0x55u8; 16];
+        let admins = serde_json::json!([local.public_key().to_hex(), peer.to_hex()]).to_string();
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys)
+             VALUES (?1, ?2, 'quiet room', '', ?3)",
+            rusqlite::params![group_id.clone(), vec![0x66u8; 32], admins],
+        )
+        .unwrap();
+        drop(conn);
+
+        let extracted = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        assert!(
+            extracted.messages.values().all(|msgs| msgs.is_empty()),
+            "no chat rows; the group still has to resume"
+        );
+        assert_eq!(
+            extracted.group_names.values().next().map(String::as_str),
+            Some("quiet room")
+        );
+        let members = extracted.members.values().next().expect("admins");
+        assert!(members.contains(&peer));
+        assert!(!extracted.truncated);
     }
 
     #[test]

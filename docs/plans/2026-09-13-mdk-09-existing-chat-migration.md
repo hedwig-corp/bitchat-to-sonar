@@ -150,6 +150,10 @@ Guarded by:
 - `persistence::mdk08_account_backup_preserves_recovered_transcript`
 - `persistence::mdk08_account_backup_preserves_remainder_after_restore`
 - `persistence::mdk08_account_backup_omits_bak_after_remainder_complete`
+- `persistence::mdk08_account_backup_keeps_bak_when_transcript_is_missing`
+- `persistence::mdk08_unreadable_bak_keeps_remainder_pending`
+- `mdk08_migrate::leftover_bak_needed_follows_transcript_not_just_the_marker`
+- `mdk08_migrate::empty_named_group_is_kept_for_resume`
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
@@ -183,7 +187,10 @@ survives nsec restore. The quarantined `*.mdk08.bak` plus the partial
 migrate marker must be in the blob **while remainder is still pending** —
 otherwise restore keeps only the first-paint window. Once leftover rows
 are copied onto the transcript, later backups omit the bak so the sealed
-blob does not double (cap 400 MiB while bak is still packed). The local
+blob does not double (cap 400 MiB while bak is still packed). If the
+transcript sidecar is missing, the bak is packed even when the marker
+says `complete`. An unreadable bak fails the remainder tick and stays
+pending — it is never treated as an empty remainder. The local
 `*.mdk08.bak` file stays on disk until a later cleanup release.
 
 ## How users keep access after the flag-day
