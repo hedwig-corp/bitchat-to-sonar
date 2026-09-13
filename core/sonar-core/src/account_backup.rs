@@ -879,6 +879,8 @@ fn backup_sidecar_suffixes() -> &'static [&'static str] {
         crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX,
         crate::marmot::PARKED_INVITES_FILE_SUFFIX,
         crate::marmot::DROPPED_GROUPS_FILE_SUFFIX,
+        crate::outbox::OUTBOX_STATE_FILE_SUFFIX,
+        crate::marmot::SYNC_STATE_FILE_SUFFIX,
         crate::mdk08_migrate::MDK08_BACKUP_SUFFIX,
         "-wal.mdk08.bak",
         "-shm.mdk08.bak",
@@ -2968,6 +2970,44 @@ mod tests {
         assert_eq!(
             count_transcript_bytes(&serde_json::to_vec(&transcript).unwrap()),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn write_read_package_files_roundtrips_outbox_and_sync() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let package = AccountBackupPackage {
+            db_key_hex: "ef".repeat(32),
+            db_bytes: b"db-body".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::outbox::OUTBOX_STATE_FILE_SUFFIX.to_string(),
+                    b"{\"version\":1,\"entries\":[]}".to_vec(),
+                ),
+                (
+                    crate::marmot::SYNC_STATE_FILE_SUFFIX.to_string(),
+                    b"{\"version\":1,\"watermark_secs\":9,\"processed_event_ids\":[]}".to_vec(),
+                ),
+            ],
+        };
+        write_account_backup_package(&db_path, &package).unwrap();
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::outbox::OUTBOX_STATE_FILE_SUFFIX
+            ))
+            .unwrap(),
+            b"{\"version\":1,\"entries\":[]}"
+        );
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::marmot::SYNC_STATE_FILE_SUFFIX
+            ))
+            .unwrap(),
+            b"{\"version\":1,\"watermark_secs\":9,\"processed_event_ids\":[]}"
         );
     }
 

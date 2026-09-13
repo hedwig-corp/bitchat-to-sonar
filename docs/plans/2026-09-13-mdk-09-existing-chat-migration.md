@@ -148,7 +148,9 @@ Guarded by:
 - `account_backup::staged_restore_replaces_outgoing_sidecars`
 - `account_backup::preview_lists_recovered_chats_when_index_is_missing`
 - `persistence::mdk08_account_backup_preserves_recovered_transcript`
+- `persistence::mdk08_account_backup_preserves_remainder_after_restore`
 - `persistence::mdk08_v1_backup_restores_and_migrates`
+- `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 
 ## Account backup after upgrade
 
@@ -173,8 +175,11 @@ A **v1 backup taken before upgrade** is only the 0.8 SQLCipher file.
 Restore writes those bytes; `MarmotEngine::persistent` runs decrypt-and-move
 again. Preview of a v2 blob with no (or empty) index lists recovered chats
 from the transcript / historical-groups sidecars so Settings does not say
-the backup is empty. Parked invites and dropped-group ids travel with v2
-so a pending 0.9 room resume survives nsec restore.
+the backup is empty. Parked invites, dropped-group ids, the outbox, and
+sync watermarks travel with v2 so a pending 0.9 send or room resume
+survives nsec restore. The quarantined `*.mdk08.bak` plus the partial
+migrate marker must be in the blob — otherwise restore keeps only the
+first-paint window.
 
 ## How users keep access after the flag-day
 
