@@ -384,6 +384,16 @@ class ConversationFoldTest {
             "Waiting for them to update Sonar",
             marmotSendUserMessage("no key package found on relays for npub1abc"),
         )
+        assertTrue(
+            recoveredLegacyMediaUnavailable(
+                "encrypted media error: this attachment is from an older Sonar and cannot be opened after the update",
+            ),
+        )
+        assertFalse(recoveredLegacyMediaUnavailable("hash verification failed"))
+        assertEquals(
+            "This attachment is from an older Sonar and can't be opened after the update.",
+            RECOVERED_LEGACY_MEDIA_COPY,
+        )
     }
 
     @Test

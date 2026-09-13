@@ -4055,6 +4055,7 @@ private fun MediaBubble(
             val load = rememberTranscriptMediaLoad(state, chatId, media, transfer)
             val decoded = (load as? TranscriptMediaLoad.Ready)?.decoded
             val failed = transfer.phase == MediaTransferPhase.Failed ||
+                transfer.phase == MediaTransferPhase.Unavailable ||
                 load is TranscriptMediaLoad.Missing
             // Signal pre-sizes media cells from stored attachment dimensions so
             // the decoded image never reflows the transcript (Signal-Android
@@ -4089,6 +4090,7 @@ private fun MediaBubble(
                                 state.requestMediaDownload(chatId, media)
                             MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
                             MediaTransferPhase.Available -> if (decoded != null) onOpen(media)
+                            MediaTransferPhase.Unavailable -> Unit
                         }
                     },
                 contentAlignment = Alignment.Center
@@ -4116,7 +4118,7 @@ private fun MediaBubble(
                         MediaMetaChip(m.tsSecs, mesh, Modifier.align(Alignment.BottomEnd).padding(8.dp))
                     }
                     decoded != null -> InlineMediaFileChip(media, transfer) { onOpen(media) }
-                    failed -> MediaUnavailable(media)
+                    failed -> MediaUnavailable(transfer)
                     showsMediaDownloadSkeleton(state, media, transfer) ->
                         MediaLoadingSkeleton(media, placeholderModifier)
                     // Locally available image still decoding: keep the bubble a
@@ -4150,6 +4152,7 @@ private fun MediaBubble(
                         state.requestMediaDownload(chatId, media)
                     MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
                     MediaTransferPhase.Available -> onOpen(media)
+                    MediaTransferPhase.Unavailable -> Unit
                 }
             }
         }
@@ -4259,6 +4262,7 @@ private fun MediaDeckCard(
     val load = rememberTranscriptMediaLoad(state, chatId, media, transfer)
     val decoded = (load as? TranscriptMediaLoad.Ready)?.decoded
     val failed = transfer.phase == MediaTransferPhase.Failed ||
+        transfer.phase == MediaTransferPhase.Unavailable ||
         load is TranscriptMediaLoad.Missing
     Box(
         modifier.clip(RoundedCornerShape(18.dp)).background(s.surface2)
@@ -4271,6 +4275,7 @@ private fun MediaDeckCard(
                                 state.requestMediaDownload(chatId, media)
                             MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
                             MediaTransferPhase.Available -> if (decoded != null) onOpen()
+                            MediaTransferPhase.Unavailable -> Unit
                         }
                     }
                 } else m
@@ -4289,7 +4294,7 @@ private fun MediaDeckCard(
                 modifier = Modifier.fillMaxSize()
             )
             decoded != null -> InlineMediaFileChip(media, transfer) { onOpen?.invoke() }
-            failed -> MediaUnavailable(media)
+            failed -> MediaUnavailable(transfer)
             showsMediaDownloadSkeleton(state, media, transfer) -> MediaLoadingSkeleton(media)
             // Locally available image still decoding: stay a quiet surface.
             else -> Spacer(Modifier.fillMaxSize())
@@ -4395,19 +4400,34 @@ private fun MediaLoadingSkeleton(
     }
 }
 
-/** Failed/unavailable media — quiet surface tile with an explicit retry
- *  affordance (the whole bubble tap retries). */
+/** Failed/unavailable media — quiet surface tile. Recovered 0.8 blobs
+ *  cannot decrypt, so they omit Retry. */
 @Composable
-private fun MediaUnavailable(media: SonarMedia) {
+private fun MediaUnavailable(transfer: MediaTransferState) {
     val s = sonar
+    val legacy = transfer.phase == MediaTransferPhase.Unavailable
     Box(
         Modifier.size(width = 216.dp, height = 150.dp).background(s.surface2),
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
             SNIcon(SNIconName.Camera, 24.dp, s.text3, weight = 1.7f)
-            Text("Media unavailable", color = s.text2, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Text("Tap to retry", color = s.accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                if (legacy) "Older attachment" else "Media unavailable",
+                color = s.text2,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                if (legacy) {
+                    transfer.userMessage ?: RECOVERED_LEGACY_MEDIA_COPY
+                } else {
+                    "Tap to retry"
+                },
+                color = if (legacy) s.text3 else s.accent,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
     }
 }
@@ -4543,7 +4563,9 @@ private fun InlineMediaFileChip(
             )
             Text(
                 mediaTransferLabel(transfer, media.mimeType),
-                color = if (transfer.phase == MediaTransferPhase.Failed) s.danger else s.text3,
+                color = if (transfer.phase == MediaTransferPhase.Failed ||
+                    transfer.phase == MediaTransferPhase.Unavailable
+                ) s.danger else s.text3,
                 fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -4555,6 +4577,7 @@ private fun InlineMediaFileChip(
             MediaTransferPhase.NotDownloaded -> Text("↓", color = s.accent, fontSize = 19.sp, fontWeight = FontWeight.Bold)
             MediaTransferPhase.Available -> Text("↗", color = s.accent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             MediaTransferPhase.Failed -> Text("↻", color = s.danger, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            MediaTransferPhase.Unavailable -> Text("—", color = s.text3, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -4565,6 +4588,8 @@ private fun mediaTransferLabel(transfer: MediaTransferState, fallback: String): 
         MediaTransferPhase.Downloading -> transfer.progress?.let { "Downloading ${(it * 100).toInt()}%" } ?: "Downloading"
         MediaTransferPhase.Available -> fallback
         MediaTransferPhase.Failed -> "Download failed · tap to retry"
+        MediaTransferPhase.Unavailable ->
+            transfer.userMessage ?: RECOVERED_LEGACY_MEDIA_COPY
     }
 
 @Composable
@@ -5085,6 +5110,7 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
                 MediaTransferPhase.NotDownloaded -> Text("↓", color = if (m.mine) Color.White else s.accentDeep, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 MediaTransferPhase.Downloading -> MediaTransferProgress(transfer, 24.dp)
                 MediaTransferPhase.Failed -> Text("↻", color = if (m.mine) Color.White else s.accentDeep, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                MediaTransferPhase.Unavailable -> Text("—", color = if (m.mine) Color.White else s.text3, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 MediaTransferPhase.Available -> SNIcon(
                     if (playing) SNIconName.Pause else SNIconName.Play, 14.dp,
                     (if (m.mine) Color.White else s.accentDeep)

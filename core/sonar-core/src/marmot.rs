@@ -276,6 +276,12 @@ pub struct ChatMessage {
     pub reply: Option<ReplyRef>,
 }
 
+/// Stable `Error::Media` body when a recovered 0.8 attachment cannot be
+/// opened. Hosts match this string and must not offer Retry — the 0.8 MLS
+/// exporter secret is not imported into the 0.9 session.
+pub const RECOVERED_08_MEDIA_UNAVAILABLE: &str =
+    "this attachment is from an older Sonar and cannot be opened after the update";
+
 fn compare_message_cursor_desc(a: &ChatMessage, b: &ChatMessage) -> Ordering {
     compare_message_cursor_keys_desc(a.created_at, &a.id, b.created_at, &b.id)
 }
@@ -1204,6 +1210,35 @@ impl MarmotEngine {
             .any(|group| group.id == *group_id))
     }
 
+    /// True when `url` is a recovered 0.8 attachment. Those rows keep `imeta`
+    /// for the transcript bubble, but the 0.8 MLS exporter secret is not in
+    /// the 0.9 session, so download/decrypt cannot succeed.
+    pub fn recovered_08_media_unavailable(&self, group_id: &GroupId, url: &str) -> bool {
+        let Ok(msgs) = self.messages(group_id) else {
+            return false;
+        };
+        let Ok(historical) = self.historical_groups() else {
+            return false;
+        };
+        let historical_ids: HashSet<&GroupId> = historical.iter().map(|group| &group.id).collect();
+        for msg in &msgs {
+            for media in &msg.media {
+                if media.url != url {
+                    continue;
+                }
+                if historical_ids.contains(&msg.group_id) {
+                    return true;
+                }
+                if (media.original_hash.is_none() || media.nonce.is_none())
+                    && !self.is_live_group(&msg.group_id).unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Other members of a recovered conversation (everyone except the local key).
     pub fn historical_resume_peers(&self, group_id: &GroupId) -> Vec<PublicKey> {
         let me = self.identity.public_key();
@@ -1979,7 +2014,15 @@ impl MarmotEngine {
         url: &str,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
-        let secret = self.media_exporter_secret(group_id)?;
+        if self.recovered_08_media_unavailable(group_id, url) {
+            return Err(Error::Media(RECOVERED_08_MEDIA_UNAVAILABLE.to_owned()));
+        }
+        // After resume the host may still pass the recovered id. New 0.9
+        // attachments live on the fold target and must use that exporter.
+        let secret_group = self
+            .live_fold_target(group_id)
+            .unwrap_or_else(|| group_id.clone());
+        let secret = self.media_exporter_secret(&secret_group)?;
         let msgs = self.messages(group_id)?;
         for m in msgs {
             for media in &m.media {
@@ -3557,5 +3600,72 @@ mod historical_fold_tests {
         );
         assert_eq!(pages[0].group_id, live);
         assert_eq!(pages[0].messages.len(), 2);
+    }
+
+    fn photo(url: &str, hash: Option<[u8; 32]>, nonce: Option<[u8; 12]>) -> MediaRef {
+        MediaRef {
+            url: url.to_owned(),
+            mime_type: "image/jpeg".to_owned(),
+            filename: "old.jpg".to_owned(),
+            width: Some(100),
+            height: Some(80),
+            duration_ms: None,
+            original_hash: hash,
+            nonce,
+        }
+    }
+
+    fn chat_with_media(
+        id: u8,
+        group: &[u8],
+        sender: PublicKey,
+        url: &str,
+        hash: Option<[u8; 32]>,
+        nonce: Option<[u8; 12]>,
+    ) -> ChatMessage {
+        let mut msg = chat(id, group, sender, "", false);
+        msg.media = vec![photo(url, hash, nonce)];
+        msg
+    }
+
+    #[test]
+    fn recovered_08_media_is_unavailable_even_with_imeta() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        let old_url = "https://blossom.example/old.bin";
+        let new_url = "https://blossom.example/new.bin";
+        engine.push_transcript_message(chat_with_media(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            old_url,
+            Some([1u8; 32]),
+            Some([2u8; 12]),
+        ));
+        engine.push_transcript_message(chat_with_media(
+            2,
+            live.as_slice(),
+            alice.public_key(),
+            new_url,
+            Some([3u8; 32]),
+            Some([4u8; 12]),
+        ));
+        engine.record_historical_fold(&historical, &live);
+
+        assert!(engine.recovered_08_media_unavailable(&historical, old_url));
+        assert!(engine.recovered_08_media_unavailable(&live, old_url));
+        assert!(!engine.recovered_08_media_unavailable(&historical, new_url));
+        assert!(!engine.recovered_08_media_unavailable(&live, new_url));
+
+        let err = engine
+            .decrypt_media_by_url(&historical, old_url, b"cipher")
+            .expect_err("0.8 blobs must not try the 0.9 exporter");
+        assert!(
+            err.to_string().contains(RECOVERED_08_MEDIA_UNAVAILABLE),
+            "unexpected error: {err}"
+        );
     }
 }

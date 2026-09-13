@@ -43,6 +43,16 @@ struct SonarConversationFoldTests {
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))
         #expect(!snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: true, keyPackageMissing: true))
+        #expect(
+            snRecoveredLegacyMediaUnavailable(
+                "encrypted media error: this attachment is from an older Sonar and cannot be opened after the update"
+            )
+        )
+        #expect(!snRecoveredLegacyMediaUnavailable("hash verification failed"))
+        #expect(
+            SNRecoveredLegacyMediaCopy
+                == "This attachment is from an older Sonar and can't be opened after the update."
+        )
     }
 
     @Test

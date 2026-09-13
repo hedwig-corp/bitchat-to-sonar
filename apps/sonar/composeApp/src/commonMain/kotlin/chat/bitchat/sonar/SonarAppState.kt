@@ -518,6 +518,14 @@ internal fun marmotSendUserMessage(error: String): String {
 internal fun marmotSendNeedsPeerUpdate(error: String): Boolean =
     marmotSendUserMessage(error) == "Waiting for them to update Sonar"
 
+internal const val RECOVERED_LEGACY_MEDIA_COPY =
+    "This attachment is from an older Sonar and can't be opened after the update."
+
+internal fun recoveredLegacyMediaUnavailable(error: String): Boolean {
+    val lower = error.lowercase()
+    return "older sonar" in lower && "cannot be opened after the update" in lower
+}
+
 internal fun dedupeDirectMarmotChats(
     chats: List<SonarChat>,
     ownNpub: String,
@@ -9014,6 +9022,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun prepareMedia(chatId: String, media: SonarMedia, autoDownload: Boolean) {
         val key = media.url
         if (mediaTransfers[key]?.phase == MediaTransferPhase.Downloading) return
+        if (mediaTransfers[key]?.phase == MediaTransferPhase.Unavailable) return
         val finalPath = MediaCache.finalPath(key)
         if (MediaCache.existsSync(finalPath)) {
             if (shouldPublishDiskHit(mediaTransfers[key]?.phase)) {
@@ -9031,6 +9040,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun requestMediaDownload(chatId: String, media: SonarMedia) {
         val key = media.url
+        if (mediaTransfers[key]?.phase == MediaTransferPhase.Unavailable) return
         if (mediaDownloadJobs[key]?.isActive == true) return
         val generation = ++nextMediaDownloadGeneration
         val finalPath = MediaCache.finalPath(key)
@@ -9093,11 +9103,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (mediaDownloadGenerations[key] == generation) {
                     setMediaTransfer(key, MediaTransferState.NotDownloaded)
                 }
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
                 if (mediaDownloadGenerations[key] == generation) {
+                    val message = error.message.orEmpty()
                     setMediaTransfer(
                         key,
-                        if (control.isCancelled()) MediaTransferState.NotDownloaded else MediaTransferState.Failed,
+                        when {
+                            control.isCancelled() -> MediaTransferState.NotDownloaded
+                            recoveredLegacyMediaUnavailable(message) ->
+                                MediaTransferState.unavailable(RECOVERED_LEGACY_MEDIA_COPY)
+                            else -> MediaTransferState.Failed
+                        },
                     )
                 }
             } finally {

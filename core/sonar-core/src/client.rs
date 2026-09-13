@@ -5455,6 +5455,11 @@ impl SonarClient {
     /// Download the encrypted blob at `url` and decrypt it with the group media
     /// key (resolved from the message's imeta tag). Returns plaintext bytes.
     pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
+        if self.engine.recovered_08_media_unavailable(group_id, url) {
+            return Err(Error::Media(
+                crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
+            ));
+        }
         let ciphertext = http_get_with_retries(url, None).await?;
         self.engine.decrypt_media_by_url(group_id, url, &ciphertext)
     }
@@ -5470,6 +5475,11 @@ impl SonarClient {
         destination: &Path,
         observer: &dyn MediaDownloadObserver,
     ) -> Result<u64> {
+        if self.engine.recovered_08_media_unavailable(group_id, url) {
+            return Err(Error::Media(
+                crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
+            ));
+        }
         let ciphertext = http_get_with_retries(url, Some(observer)).await?;
         if observer.is_cancelled() {
             return Err(Error::MediaDownloadCancelled);
@@ -9006,6 +9016,46 @@ mod tests {
                 if bytes == (count * per_item) as u64
                     && max == MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_media_rejects_recovered_08_attachments_before_http() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let url = "https://blossom.example/old.bin";
+        client.engine().push_transcript_message(ChatMessage {
+            id: EventId::from_slice(&[1u8; 32]).expect("event id"),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: true,
+            delivery_state: DeliveryState::Sent,
+            media: vec![crate::marmot::MediaRef {
+                url: url.to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                filename: "old.jpg".to_owned(),
+                width: Some(100),
+                height: Some(80),
+                duration_ms: None,
+                original_hash: Some([1u8; 32]),
+                nonce: Some([2u8; 12]),
+            }],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+            reply: None,
+        });
+        let err = client
+            .fetch_media(&historical, url)
+            .await
+            .expect_err("recovered 0.8 media must fail before HTTP");
+        assert!(
+            err.to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "unexpected error: {err}"
         );
     }
 

@@ -66,8 +66,9 @@ What the user does **not** keep automatically:
   this device once the 0.9 store is the live engine.
 - Media **decrypt** keys that lived only in the 0.8 MLS exporter secret.
   v1 copies `imeta` / sticker / reply tags onto the transcript so the
-  attachment still renders as a row; opening the blob still needs a
-  follow-up MIP-04 recovery path.
+  attachment still renders as a row. Opening the blob is a non-retryable
+  “older Sonar” state — the 0.9 session does not import the 0.8 exporter.
+  MIP-04 recovery from the quarantined `*.mdk08.bak` is still deferred.
 - Pending 0.8 welcomes that were never accepted.
 
 ## Runtime path (implemented on this PR)
@@ -113,6 +114,8 @@ Guarded by:
   (pins `ensure_subscriptions`, the host idle path)
 - `mdk08_migrate::outbound_only_chat_keeps_admin_peer`
 - `mdk08_migrate::copies_imeta_and_p_tags_from_stored_message_tags`
+- `marmot::historical_fold_tests::recovered_08_media_is_unavailable_even_with_imeta`
+- `client::tests::fetch_media_rejects_recovered_08_attachments_before_http`
 - `e2e::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
@@ -235,7 +238,7 @@ Never Uninstall Device Apps):
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing | none |
+| Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
 | iOS (`ios/`) | same | same | none |
 | Mesh | untouched | untouched | none |
 

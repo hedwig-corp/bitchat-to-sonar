@@ -2940,7 +2940,7 @@ struct SNMediaBubble: View {
             // so the bubble skips the single-item load path.
             guard !isDeck, let item else { return }
             let transfer = pipeline.state(item)
-            failed = transfer.phase == .failed
+            failed = transfer.phase == .failed || transfer.phase == .unavailable
             guard transfer.phase == .available else { return }
             if keepThumb { return }
             if item.isImage, !(item.isGif) {
@@ -3036,21 +3036,32 @@ struct SNMediaBubble: View {
                     .overlay {
                         if failed {
                             VStack(spacing: 8) {
-                                Text(verbatim: "Couldn't load image")
+                                Text(verbatim: pipeline.state(item).phase == .unavailable
+                                     ? "Older attachment"
+                                     : "Couldn't load image")
                                     .font(SonarTheme.uiFont(size: 12))
                                     .foregroundColor(SonarTheme.text3)
-                                Button {
-                                    if pipeline.state(item).phase == .failed {
-                                        pipeline.request(item)
-                                    } else {
-                                        loadAttempt += 1
+                                if pipeline.state(item).phase == .unavailable {
+                                    Text(verbatim: pipeline.state(item).userMessage
+                                         ?? SNRecoveredLegacyMediaCopy)
+                                        .font(SonarTheme.uiFont(size: 11))
+                                        .foregroundColor(SonarTheme.text3)
+                                        .multilineTextAlignment(.center)
+                                        .padding(.horizontal, 10)
+                                } else {
+                                    Button {
+                                        if pipeline.state(item).phase == .failed {
+                                            pipeline.request(item)
+                                        } else {
+                                            loadAttempt += 1
+                                        }
+                                    } label: {
+                                        Text(verbatim: "Retry")
+                                            .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                            .foregroundColor(SonarTheme.accent)
                                     }
-                                } label: {
-                                    Text(verbatim: "Retry")
-                                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                                        .foregroundColor(SonarTheme.accent)
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
                             }
                         } else if pipeline.state(item).phase == .notDownloaded {
                             VStack(spacing: 6) {
@@ -3144,6 +3155,9 @@ struct SNMediaBubble: View {
         case .failed:
             Image(systemName: "exclamationmark.circle")
                 .foregroundColor(.red)
+        case .unavailable:
+            Image(systemName: "minus")
+                .foregroundColor(SonarTheme.text3)
         }
     }
 
@@ -3156,6 +3170,8 @@ struct SNMediaBubble: View {
             return "Downloading"
         case .available: return fallback
         case .failed: return "Download failed · tap to retry"
+        case .unavailable:
+            return transfer.userMessage ?? SNRecoveredLegacyMediaCopy
         }
     }
 
@@ -3165,6 +3181,8 @@ struct SNMediaBubble: View {
             pipeline.request(item)
         case .downloading:
             pipeline.cancel(item)
+        case .unavailable:
+            break
         case .available:
             if item.isImage {
                 viewerOpen = true
@@ -3251,7 +3269,7 @@ private struct SNMediaCardImage: View {
                     thumb = nil
                 }
                 let transfer = pipeline.state(item)
-                failed = transfer.phase == .failed
+                failed = transfer.phase == .failed || transfer.phase == .unavailable
                 guard transfer.phase == .available else { return }
                 if keepThumb { return }
                 if item.isGif {
@@ -3318,18 +3336,26 @@ private struct SNMediaCardImage: View {
                 .fill(SonarTheme.surface2)
                 .overlay {
                     if failed, dim == 0 {
-                        Button {
-                            if pipeline.state(item).phase == .failed {
-                                pipeline.request(item)
-                            } else {
-                                loadAttempt += 1
+                        if pipeline.state(item).phase == .unavailable {
+                            Text(verbatim: "Older attachment")
+                                .font(SonarTheme.uiFont(size: 11))
+                                .foregroundColor(SonarTheme.text3)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 8)
+                        } else {
+                            Button {
+                                if pipeline.state(item).phase == .failed {
+                                    pipeline.request(item)
+                                } else {
+                                    loadAttempt += 1
+                                }
+                            } label: {
+                                Text(verbatim: "Retry")
+                                    .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                    .foregroundColor(SonarTheme.accent)
                             }
-                        } label: {
-                            Text(verbatim: "Retry")
-                                .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                                .foregroundColor(SonarTheme.accent)
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     } else if pipeline.state(item).phase == .notDownloaded, dim == 0 {
                         Image(systemName: "arrow.down.circle")
                             .font(.system(size: 24, weight: .medium))
@@ -3463,6 +3489,8 @@ private struct SNMediaDeck: View {
             pipeline.request(item)
         case .downloading:
             pipeline.cancel(item)
+        case .unavailable:
+            break
         case .available:
             onOpen(index)
         }
@@ -4255,6 +4283,8 @@ struct SNAudioBubble: View {
                     onRequest()
                 case .downloading:
                     onCancel()
+                case .unavailable:
+                    break
                 case .available:
                     player.toggle(bytes)
                 }
@@ -4312,6 +4342,10 @@ struct SNAudioBubble: View {
                     .foregroundColor(color)
             case .failed:
                 Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(color)
+            case .unavailable:
+                Image(systemName: "minus")
                     .font(.system(size: 13, weight: .bold))
                     .foregroundColor(color)
             }

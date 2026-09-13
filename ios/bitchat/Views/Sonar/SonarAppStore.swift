@@ -289,6 +289,15 @@ func snRecoveredChatNeedsPeerUpdate(
     !hasLiveFoldSibling && keyPackageMissing
 }
 
+let SNRecoveredLegacyMediaCopy =
+    "This attachment is from an older Sonar and can't be opened after the update."
+
+func snRecoveredLegacyMediaUnavailable(_ error: String) -> Bool {
+    let lower = error.lowercased()
+    return lower.contains("older sonar")
+        && lower.contains("cannot be opened after the update")
+}
+
 /// A stored call record: its timeline `date` (used to merge it
 /// chronologically into the transcript) plus the prebuilt CallLog message.
 struct SNCallRecord: Identifiable, Equatable {
@@ -704,6 +713,8 @@ enum SNMediaTransferPhase: Equatable {
     case downloading
     case available
     case failed
+    /// Recovered 0.8 attachment — cannot decrypt; do not offer Retry.
+    case unavailable
 }
 
 /// Signal-style attachment state. A remote pointer becomes a local file before
@@ -712,6 +723,7 @@ struct SNMediaTransferState: Equatable {
     let phase: SNMediaTransferPhase
     let progress: Double?
     let localURL: URL?
+    var userMessage: String? = nil
 
     static let notDownloaded = SNMediaTransferState(
         phase: .notDownloaded,
@@ -728,6 +740,15 @@ struct SNMediaTransferState: Equatable {
     }
 
     static let failed = SNMediaTransferState(phase: .failed, progress: nil, localURL: nil)
+
+    static func unavailable(_ message: String) -> SNMediaTransferState {
+        SNMediaTransferState(
+            phase: .unavailable,
+            progress: nil,
+            localURL: nil,
+            userMessage: message
+        )
+    }
 }
 
 private final class SNMediaDownloadListener: MediaDownloadListener, @unchecked Sendable {
@@ -8094,10 +8115,13 @@ final class SonarAppStore: ObservableObject {
     /// transcript during chat open (Signal avoids this churn).
     func prepareMedia(_ item: SNMediaItem, autoDownload: Bool) {
         let key = Self.mediaKey(item)
+        if mediaTransferStates[key]?.phase == .unavailable { return }
         if let url = existingMediaURL(item) {
             switch mediaTransferStates[key]?.phase {
             case .downloading, .failed:
                 mediaTransferStates[key] = .available(url)
+            case .unavailable:
+                break
             default:
                 break // nil / .available: no @Published churn
             }
@@ -8110,6 +8134,7 @@ final class SonarAppStore: ObservableObject {
 
     func requestMediaDownload(_ item: SNMediaItem) {
         let key = Self.mediaKey(item)
+        if mediaTransferStates[key]?.phase == .unavailable { return }
         if let url = existingMediaURL(item) {
             mediaTransferStates[key] = .available(url)
             return
@@ -8178,9 +8203,13 @@ final class SonarAppStore: ObservableObject {
                     try? FileManager.default.removeItem(at: partialURL)
                 }.value
                 guard mediaDownloadGenerations[key] == generation else { return }
-                mediaTransferStates[key] = listener.isCancelled() || error is CancellationError
-                    ? .notDownloaded
-                    : .failed
+                if listener.isCancelled() || error is CancellationError {
+                    mediaTransferStates[key] = .notDownloaded
+                } else if snRecoveredLegacyMediaUnavailable(error.localizedDescription) {
+                    mediaTransferStates[key] = .unavailable(SNRecoveredLegacyMediaCopy)
+                } else {
+                    mediaTransferStates[key] = .failed
+                }
             }
             if mediaDownloadGenerations[key] == generation {
                 mediaDownloadTasks[key] = nil

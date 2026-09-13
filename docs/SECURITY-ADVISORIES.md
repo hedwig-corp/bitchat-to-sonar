@@ -146,10 +146,11 @@ a lockfile bump:
   drain: MDK may decrypt PeelDeferred application messages there, and a later
   relay redelivery of the same ciphertext is a content-id Duplicate.
   Same-epoch fork selection uses committer/digest, not Nostr `created_at`.
-- **Group-scale baseline is pending.** Re-run `sonar-sim group-scale` and
-  replace the 0.8 table in [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md); do not
-  invent numbers. Until that lands, the 0.8 ceiling/welcome-size columns are
-  historical only.
+- **Group-scale baseline is committed** in [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md)
+  (2026-09-13, MDK v0.9.14 `235c8ade`). Ceiling moved **120 → 50** because
+  `0xf2f1` welcomes are larger (N=25 is ~38.7 KB vs 0.8’s 27.8 KB). N=100
+  fails wrapping the next welcome (NIP-44). Re-run the sim after any later
+  MDK rev; do not invent numbers.
 
 The previously deferred advisories (libcrux incremental SHAKE, secrets
 `ct_swap`/`ct_select`, AVX2 SHAKE panic) remain a reachability question on the
