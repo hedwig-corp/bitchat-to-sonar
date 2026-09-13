@@ -358,3 +358,21 @@ Stay draft until:
 2. The 0.9.14 group-scale table is committed.
 3. Device upgrade + White Noise interop still need a human pass
    (cannot be substituted by unit tests).
+
+## Local gates last verified
+
+Re-run on `253d5f75` (this cloud agent). All green:
+
+| Gate | Result |
+| --- | --- |
+| `--lib` `mdk08_migrate` + `historical_fold` + `account_backup` | 92 passed |
+| `--test persistence` | 27 passed |
+| `--lib client::tests` | 71 passed |
+| `--test e2e` `recovered_08` | 6 passed |
+| `--test group_invites` | 17 passed |
+| `--test failed_events` | 1 passed |
+| `--test media` | 4 passed |
+| `-p sonar-sim` | 5 passed |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 26 passed |
+
+Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
