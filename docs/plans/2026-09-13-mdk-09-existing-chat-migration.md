@@ -177,8 +177,8 @@ Guarded by:
 - `persistence::mdk08_bak_backfills_welcome_and_media_secrets_on_reopen`
   (pins `SonarClient::connect` → `conversation_summaries()` on a non-empty
   0.8-era index: pending welcome + welcomer resume peers land, existing
-  unread is not reset. Also pins nsec restore of that blob and Settings
-  preview listing a bak-only invite)
+  unread is not reset. Also pins host stage→commit nsec restore of that
+  blob and Settings preview listing a bak-only invite)
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`

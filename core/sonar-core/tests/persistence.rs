@@ -2202,13 +2202,19 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
 
     let restore_dir = tempfile::tempdir().expect("restore dir");
     let restore_path = restore_dir.path().join("marmot.sqlite");
-    sonar_core::account_backup::write_account_backup_package(&restore_path, &package)
-        .expect("nsec restore of the early-0.9 blob");
+    // Hosts stage via restore_account_from_blossom, then commit_account_restore.
+    let mut staged = restore_path.as_os_str().to_owned();
+    staged.push(".sonar-restore-staging");
+    let staged = std::path::PathBuf::from(staged);
+    sonar_core::account_backup::write_account_backup_package(&staged, &package)
+        .expect("host stages beside the live path");
+    sonar_core::account_backup::commit_staged_account_restore(&restore_path)
+        .expect("commit_account_restore must promote the packed bak");
     assert!(
         restore_path
             .with_file_name("marmot.sqlite.mdk08.bak")
             .exists(),
-        "restore must put the packed bak next to the 0.9 store"
+        "staged restore must rename the bak onto the live store"
     );
     let restored = SonarClient::connect(alice.clone(), Vec::new(), &restore_path, DB_KEY)
         .await
