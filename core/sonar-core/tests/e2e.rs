@@ -1459,3 +1459,80 @@ async fn recovered_08_group_resumes_with_whichever_peers_have_updated() {
         1
     );
 }
+
+/// After a mixed resume, a leftover 0.8 member who later publishes a 0.9
+/// KeyPackage must be invited on the next send. The first send to Bob must
+/// still succeed even if Carol has not updated yet.
+#[tokio::test]
+async fn recovered_08_group_adds_a_member_who_updates_later() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(alice.members(&live).expect("members").len(), 2);
+
+    carol.publish_key_package().await.expect("carol updates");
+    alice
+        .send_text(&historical, "carol caught up")
+        .await
+        .expect("late add must not block the send");
+    let members = alice.members(&live).expect("members after late add");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "carol must join the live 0.9 room once she publishes a key package"
+    );
+    assert_eq!(members.len(), 3);
+
+    carol.sync().await.expect("carol syncs invite");
+    let carol_invite = carol
+        .pending_group_invites()
+        .expect("carol invites")
+        .into_iter()
+        .next()
+        .expect("late-updating member gets a 0.9 invite");
+    carol
+        .accept_group_invite(&carol_invite.id)
+        .await
+        .expect("carol accepts");
+    carol.sync().await.expect("carol syncs after accept");
+    assert_eq!(
+        carol
+            .messages(&carol.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "carol caught up")
+            .count(),
+        1
+    );
+}

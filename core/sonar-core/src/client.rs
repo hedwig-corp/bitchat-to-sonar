@@ -7011,9 +7011,11 @@ impl SonarClient {
     /// The old transcript stays; MLS membership is not imported.
     async fn resolve_send_group(&self, group_id: &GroupId) -> Result<GroupId> {
         if self.engine.is_live_group(group_id)? {
+            self.maybe_add_late_resume_members(group_id).await;
             return Ok(group_id.clone());
         }
         if let Some(live) = self.engine.live_fold_target(group_id) {
+            self.maybe_add_late_resume_members(&live).await;
             return Ok(live);
         }
         if !self.engine.is_historical_group(group_id)? {
@@ -7050,6 +7052,47 @@ impl SonarClient {
         };
         self.record_resume_fold(group_id, &live);
         Ok(live)
+    }
+
+    /// After a mixed 0.8/0.9 room resume, invite leftover members the next
+    /// time they publish a 0.9 KeyPackage. Failure must not block the send
+    /// to people already in the live group.
+    async fn maybe_add_late_resume_members(&self, live: &GroupId) {
+        let missing = self.missing_resume_peers(live);
+        if missing.is_empty() {
+            return;
+        }
+        let Ok(packages) = self.fetch_resume_key_packages(&missing).await else {
+            return;
+        };
+        if packages.is_empty() {
+            return;
+        }
+        if let Err(err) = self.commit_add_members(live, packages).await {
+            tracing::warn!(%err, "late resume add_members failed");
+        }
+    }
+
+    fn missing_resume_peers(&self, live: &GroupId) -> Vec<PublicKey> {
+        let aliases = self.engine.fold_aliases(live);
+        let has_historical = aliases
+            .iter()
+            .any(|id| self.engine.is_historical_group(id).unwrap_or(false));
+        if !has_historical {
+            return Vec::new();
+        }
+        let live_members = self.engine.members(live).unwrap_or_default();
+        let me = self.identity().public_key();
+        let mut wanted = Vec::new();
+        for alias in aliases {
+            wanted.extend(self.engine.historical_resume_peers(&alias));
+        }
+        wanted.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        wanted.dedup();
+        wanted
+            .into_iter()
+            .filter(|pk| *pk != me && !live_members.contains(pk))
+            .collect()
     }
 
     fn maybe_fold_new_group(&self, live_id: &GroupId) {
