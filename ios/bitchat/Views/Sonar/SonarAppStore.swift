@@ -257,6 +257,38 @@ func snFoldedDirectMarmotHomeTitle(
     isDirectGroup ? marmotProfileTitle : peerDerivedTitle
 }
 
+func snMarmotSendTargetGroupId(
+    openChatId: String,
+    duplicateGroupIds: [String],
+    latestSecs: (String) -> TimeInterval
+) -> String {
+    duplicateGroupIds.max { lhs, rhs in
+        let left = latestSecs(lhs)
+        let right = latestSecs(rhs)
+        if left != right { return left < right }
+        return lhs < rhs
+    } ?? openChatId
+}
+
+func snMarmotSendNeedsPeerUpdate(_ error: String) -> Bool {
+    let lower = error.lowercased()
+    return lower.contains("no key package")
+        || lower.contains("cannot send until the other members update")
+}
+
+func snMarmotSendUserMessage(_ error: String) -> String {
+    snMarmotSendNeedsPeerUpdate(error)
+        ? "Waiting for them to update Sonar"
+        : "Couldn't send: \(error)"
+}
+
+func snRecoveredChatNeedsPeerUpdate(
+    hasLiveFoldSibling: Bool,
+    keyPackageMissing: Bool
+) -> Bool {
+    !hasLiveFoldSibling && keyPackageMissing
+}
+
 /// A stored call record: its timeline `date` (used to merge it
 /// chronologically into the transcript) plus the prebuilt CallLog message.
 struct SNCallRecord: Identifiable, Equatable {
@@ -1335,6 +1367,8 @@ final class SonarAppStore: ObservableObject {
     /// Navigation stack below the home root.
     @Published var path: [SonarRoute] = []
     @Published var toast: String? = nil
+    /// Recovered 0.8 chats whose resume send failed because the peer has no 0.9 KeyPackage.
+    @Published private(set) var recoveredChatNeedsUpdate: Set<String> = []
     /// External payments this process is currently sending, keyed by activity
     /// id. The persisted ledger owns the outcome; this holds only what it
     /// deliberately does not keep — the resolving/paying/slow split and the
@@ -3114,6 +3148,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
+        recoveredChatNeedsUpdate = []
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil
@@ -5074,6 +5109,36 @@ final class SonarAppStore: ObservableObject {
         (pendingMarmotNpub(for: id) != nil && marmotGroupId(id) == nil) || isPendingMarmotGroup(id)
     }
 
+    func marmotSendTargetGroupId(_ id: String) -> String? {
+        guard let groupId = marmotGroupId(id) else { return nil }
+        guard let group = marmotGroup(byId: groupId),
+              let peer = directMarmotPeerKey(in: group)
+        else { return groupId }
+        return preferredDirectMarmotGroup(in: marmotGroups(forNpub: peer))?.id ?? groupId
+    }
+
+    func recoveredChatWaitingForPeerUpdate(_ id: String) -> Bool {
+        let groupId = marmotGroupId(id)
+        let groups: [MarmotService.MarmotGroup]
+        if let groupId, let group = marmotGroup(byId: groupId), let peer = directMarmotPeerKey(in: group) {
+            groups = marmotGroups(forNpub: peer)
+        } else {
+            groups = []
+        }
+        let flagged = recoveredChatNeedsUpdate.contains(id)
+            || groupId.map { recoveredChatNeedsUpdate.contains($0) } == true
+        return snRecoveredChatNeedsPeerUpdate(
+            hasLiveFoldSibling: groups.count > 1,
+            keyPackageMissing: flagged
+        )
+    }
+
+    func noteRecoveredChatSendFailure(_ chatId: String, error: String) {
+        guard snMarmotSendNeedsPeerUpdate(error) else { return }
+        recoveredChatNeedsUpdate.insert(chatId)
+        showToast(snMarmotSendUserMessage(error))
+    }
+
     func marmotGroupId(_ id: String) -> String? {
         if isPendingMarmotGroup(id) { return nil }
         if let pendingNpub = pendingMarmotNpub(for: id),
@@ -6475,8 +6540,11 @@ final class SonarAppStore: ObservableObject {
             chatViewModel.sendPrivateMessage(text, to: PeerID(str: route), replyTo: reply?.parentId)
             return
         }
-        if let groupId = marmotGroupId(id) {
-            marmot.send(text, to: groupId, reply: marmotReply)
+        if let groupId = marmotSendTargetGroupId(id) {
+            marmot.send(text, to: groupId, reply: marmotReply, onFailure: { [weak self] in
+                guard let self else { return }
+                self.noteRecoveredChatSendFailure(id, error: self.marmot.errorText ?? "")
+            })
             return
         }
         if let pendingNpub = pendingMarmotNpub(for: id) {
@@ -10433,6 +10501,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
+        recoveredChatNeedsUpdate = []
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil
@@ -10569,6 +10638,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
+        recoveredChatNeedsUpdate = []
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil

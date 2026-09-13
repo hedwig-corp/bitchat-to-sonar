@@ -340,6 +340,53 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun recoveredAndResumedDirectChatsRenderOnceByPeer() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
+        val historical = SonarChat(id = "group-08", name = "alice & bob", members = listOf(ownNpub, peerNpub))
+        val live = SonarChat(id = "group-09", name = "alice & bob", members = listOf(ownNpub, peerNpub))
+
+        val visible = dedupeDirectMarmotChats(
+            chats = listOf(historical, live),
+            ownNpub = ownNpub,
+            latestSecs = { if (it == live.id) 2L else 1L },
+        )
+
+        assertEquals(listOf(live), visible)
+        assertEquals(
+            live.id,
+            marmotSendTargetGroupId(
+                openChatId = historical.id,
+                duplicateGroupIds = listOf(historical.id, live.id),
+                latestSecs = { if (it == live.id) 2L else 1L },
+            ),
+        )
+    }
+
+    @Test
+    fun recoveredChatWaitsForPeerUpdateUntilLiveSiblingExists() {
+        assertEquals(
+            RecoveredChatResumeUi.WaitingForPeerUpdate,
+            recoveredChatResumeUi(hasLiveFoldSibling = false, keyPackageMissing = true),
+        )
+        assertEquals(
+            RecoveredChatResumeUi.Live,
+            recoveredChatResumeUi(hasLiveFoldSibling = true, keyPackageMissing = true),
+        )
+        assertEquals(
+            RecoveredChatResumeUi.Live,
+            recoveredChatResumeUi(hasLiveFoldSibling = false, keyPackageMissing = false),
+        )
+        assertTrue(marmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
+        assertEquals(
+            "Waiting for them to update Sonar",
+            marmotSendUserMessage("no key package found on relays for npub1abc"),
+        )
+    }
+
+    @Test
     fun meshFingerprintsLinkedToSameNpubFormOneConversation() {
         val sharedNpubHex = "ab".repeat(32)
         val groups = groupMeshPeerIdsByIdentity(

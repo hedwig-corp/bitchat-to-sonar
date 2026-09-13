@@ -31,6 +31,21 @@ struct SonarConversationFoldTests {
     }
 
     @Test
+    func recoveredAndResumedDirectChatsPreferLiveSendTarget() {
+        #expect(
+            snMarmotSendTargetGroupId(
+                openChatId: "group-08",
+                duplicateGroupIds: ["group-08", "group-09"],
+                latestSecs: { $0 == "group-09" ? 2 : 1 }
+            ) == "group-09"
+        )
+        #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
+        #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
+        #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))
+        #expect(!snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: true, keyPackageMissing: true))
+    }
+
+    @Test
     func sameNpubMeshFingerprintsShareIdentityKey() {
         let npub = String(repeating: "ab", count: 32)
         #expect(

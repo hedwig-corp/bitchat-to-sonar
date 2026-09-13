@@ -2176,6 +2176,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     bold = "Out of range", rest = " — messages will wait until you meet again"
                 )
             }
+        } else if (state.recoveredChatWaitingForPeerUpdate(screen.id)) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
+                bold = "Waiting for them to update Sonar",
+                rest = " — this chat’s history is here; internet send needs their new version",
+            )
         } else if (verified) {
             chat.bitchat.sonar.ui.SNBanner(
                 icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,

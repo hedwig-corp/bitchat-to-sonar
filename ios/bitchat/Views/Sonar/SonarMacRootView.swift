@@ -820,6 +820,12 @@ private struct MacConversationPane: View {
     @ViewBuilder private var banner: some View {
         if isChannel {
             SNBanner(icon: .people, tone: .publicRoom, bold: "Public channel", rest: " - anyone nearby can read")
+        } else if store.recoveredChatWaitingForPeerUpdate(id) {
+            SNBanner(
+                icon: .globe, tone: .net,
+                bold: "Waiting for them to update Sonar",
+                rest: " - this chat's history is here; internet send needs their new version"
+            )
         } else if verified {
             SNBanner(icon: .shieldCheck, tone: .enc, bold: "Verified", rest: " - you confirmed \(peer.name)'s safety number")
         } else if isMultiMemberMarmot {

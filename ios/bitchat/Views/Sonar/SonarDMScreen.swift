@@ -663,6 +663,12 @@ struct SonarDMScreenContent: View {
     private var banner: some View {
         if !isMarmot && !peer.inRange {
             outOfRangeBanner
+        } else if store.recoveredChatWaitingForPeerUpdate(peerId) {
+            SNBanner(
+                icon: .globe, tone: .net,
+                bold: "Waiting for them to update Sonar",
+                rest: " — this chat’s history is here; internet send needs their new version"
+            )
         } else if verified {
             SNBanner(
                 icon: .shieldCheck, tone: .enc,

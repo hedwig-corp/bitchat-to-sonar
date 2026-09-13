@@ -482,6 +482,42 @@ internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     return others.singleOrNull()
 }
 
+/** After an MDK 0.8→0.9 resume, send to the newest duplicate group so the
+ *  recovered row stays the history bucket and the live 0.9 group takes traffic. */
+internal fun marmotSendTargetGroupId(
+    openChatId: String,
+    duplicateGroupIds: List<String>,
+    latestSecs: (String) -> Long,
+): String =
+    duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
+
+internal enum class RecoveredChatResumeUi { Live, WaitingForPeerUpdate }
+
+internal fun recoveredChatResumeUi(
+    hasLiveFoldSibling: Boolean,
+    keyPackageMissing: Boolean,
+): RecoveredChatResumeUi =
+    if (!hasLiveFoldSibling && keyPackageMissing) {
+        RecoveredChatResumeUi.WaitingForPeerUpdate
+    } else {
+        RecoveredChatResumeUi.Live
+    }
+
+internal fun marmotSendUserMessage(error: String): String {
+    val lower = error.lowercase()
+    return if (
+        "no key package" in lower ||
+            "cannot send until the other members update" in lower
+    ) {
+        "Waiting for them to update Sonar"
+    } else {
+        "send failed: $error"
+    }
+}
+
+internal fun marmotSendNeedsPeerUpdate(error: String): Boolean =
+    marmotSendUserMessage(error) == "Waiting for them to update Sonar"
+
 internal fun dedupeDirectMarmotChats(
     chats: List<SonarChat>,
     ownNpub: String,
@@ -890,6 +926,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  instead of treating them as epoch-zero after the recency merge. */
     private var pendingMarmotChatNpubs by mutableStateOf<Map<String, PendingMarmotDirect>>(emptyMap())
     private var pendingMarmotGroups by mutableStateOf<Map<String, PendingMarmotGroup>>(emptyMap())
+    /** Recovered 0.8 chats whose resume send failed because the peer has no 0.9 KeyPackage. */
+    private var recoveredChatNeedsUpdate by mutableStateOf<Set<String>>(emptySet())
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
     private val pendingInviteTokens = mutableListOf<String>()
@@ -1028,6 +1066,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             socialState = SonarSocialState(); persistSocialState()
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
+            recoveredChatNeedsUpdate = emptySet()
             pendingDirectMarmotSends.clear()
             pendingMarmotGroupSends.clear()
             outbox.clear()
@@ -1095,6 +1134,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
+            recoveredChatNeedsUpdate = emptySet()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCacheNow()
@@ -2506,6 +2546,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         val right = chats.firstOrNull { it.id == rightId } ?: return false
         val leftKey = directMarmotPeerKey(left) ?: return false
         return leftKey == directMarmotPeerKey(right)
+    }
+
+    fun recoveredChatWaitingForPeerUpdate(chatId: String): Boolean {
+        val groups = duplicateDirectMarmotChats(chatId)
+        val hasLiveSibling = groups.size > 1
+        val flagged = chatId in recoveredChatNeedsUpdate || groups.any { it.id in recoveredChatNeedsUpdate }
+        return recoveredChatResumeUi(
+            hasLiveFoldSibling = hasLiveSibling,
+            keyPackageMissing = flagged,
+        ) == RecoveredChatResumeUi.WaitingForPeerUpdate
+    }
+
+    private fun noteRecoveredChatSendFailure(chatId: String, error: String) {
+        if (marmotSendNeedsPeerUpdate(error)) {
+            recoveredChatNeedsUpdate = recoveredChatNeedsUpdate + chatId
+        }
     }
 
     fun isMultiMemberChat(chatId: String): Boolean =
@@ -3982,6 +4038,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 persistMeshNames()
                 pendingMarmotChatNpubs = emptyMap()
                 pendingMarmotGroups = emptyMap()
+                recoveredChatNeedsUpdate = emptySet()
                 pendingInviteTokens.clear()
                 linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
                 persistLinks(); persistLinkCaps(); persistGroupFolds()
@@ -6630,7 +6687,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 .onSuccess { clearSendEcho(chatId, send.echoId) }
                 .onFailure {
                     failSendEcho(chatId, send.echoId)
-                    toast = "send failed: ${it.message}"
+                    val message = it.message.orEmpty()
+                    noteRecoveredChatSendFailure(chatId, message)
+                    toast = marmotSendUserMessage(message)
                 }
         }
     }
@@ -7147,9 +7206,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val echo = createSendEcho(chatId, t, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
+        val sendTarget = marmotSendTargetGroupId(
+            chatId,
+            directMarmotChatIds(chatId),
+            ::localLatestTs,
+        )
         scope.launch {
             runMarmotSendWithBestEffortReconciliation(
-                send = { sendMarmotTextOrdered(chatId, t, reply) },
+                send = { sendMarmotTextOrdered(sendTarget, t, reply) },
                 onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                 reconcile = {
                     val refreshGeneration = transcriptGeneration
@@ -7180,7 +7244,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 },
                 onSendFailure = { error ->
                     failSendEcho(chatId, echo.id)
-                    toast = "send failed: ${error.message}"
+                    val message = error.message.orEmpty()
+                    noteRecoveredChatSendFailure(chatId, message)
+                    toast = marmotSendUserMessage(message)
                 },
                 onReconciliationFailure = { markSendEchoAccepted(chatId, echo.id) },
             )

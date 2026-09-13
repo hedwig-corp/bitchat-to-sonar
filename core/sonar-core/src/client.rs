@@ -34,8 +34,8 @@ use crate::conversation_index::{
 use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
-    ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
-    MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, HistoricalGroup,
+    Incoming, MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
@@ -3121,6 +3121,7 @@ impl SonarClient {
             .and_then(|gs| gs.into_iter().find(|g| g.id == group_id).map(|g| g.name))
             .unwrap_or_default();
         self.ensure_index_for_group(&group_id, &name);
+        self.maybe_fold_new_group(&group_id);
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
@@ -3478,6 +3479,8 @@ impl SonarClient {
         text: &str,
         reply: Option<&crate::reply::ReplyTo>,
     ) -> Result<()> {
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
         let local_started = Instant::now();
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
@@ -3507,6 +3510,7 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        self.notify_fold_aliases(group_id);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
@@ -3670,6 +3674,8 @@ impl SonarClient {
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
     pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
@@ -4785,6 +4791,8 @@ impl SonarClient {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
         // Direct send is intentional — clear any prior stopPolling / wipe latch
         // so a new upload is not immediately cancelled (Android can race a
         // concurrent send between stopPolling and the next resume pass).
@@ -6966,6 +6974,74 @@ impl SonarClient {
 
     pub fn groups(&self) -> Result<Vec<cgka_traits::group::Group>> {
         self.engine.groups()
+    }
+
+    pub fn historical_groups(&self) -> Result<Vec<HistoricalGroup>> {
+        self.engine.historical_groups()
+    }
+
+    /// Route a send aimed at a recovered 0.8 group onto a live 0.9 group.
+    ///
+    /// Creates a new DM/group with the same peers when no fold exists yet.
+    /// The old transcript stays; MLS membership is not imported.
+    async fn resolve_send_group(&self, group_id: &GroupId) -> Result<GroupId> {
+        if self.engine.is_live_group(group_id)? {
+            return Ok(group_id.clone());
+        }
+        if let Some(live) = self.engine.live_fold_target(group_id) {
+            return Ok(live);
+        }
+        let peers = self.engine.historical_resume_peers(group_id);
+        let name = self
+            .engine
+            .historical_group_name(group_id)
+            .unwrap_or_default();
+        let live = match peers.as_slice() {
+            [] => {
+                return Err(Error::InvalidInput(
+                    "this recovered chat cannot send until the other members update Sonar".into(),
+                ))
+            }
+            [peer] => self.start_dm(*peer, &name).await?,
+            many => self.start_group(many.to_vec(), &name).await?,
+        };
+        self.engine.record_historical_fold(group_id, &live);
+        self.notify_fold_aliases(group_id);
+        Ok(live)
+    }
+
+    fn maybe_fold_new_group(&self, live_id: &GroupId) {
+        let Ok(live_members) = self.engine.members(live_id) else {
+            return;
+        };
+        let me = self.identity().public_key();
+        let mut live_others: Vec<PublicKey> =
+            live_members.into_iter().filter(|pk| *pk != me).collect();
+        live_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        if live_others.is_empty() {
+            return;
+        }
+        let Ok(historical) = self.engine.historical_groups() else {
+            return;
+        };
+        for group in historical {
+            let mut hist_others: Vec<PublicKey> =
+                group.members.into_iter().filter(|pk| *pk != me).collect();
+            hist_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+            if hist_others == live_others {
+                self.engine.record_historical_fold(&group.id, live_id);
+                self.notify_fold_aliases(&group.id);
+            }
+        }
+    }
+
+    fn notify_fold_aliases(&self, group_id: &GroupId) {
+        for alias in self.engine.fold_aliases(group_id) {
+            if alias == *group_id {
+                continue;
+            }
+            self.notify_conversation_changed(&hex::encode(alias.as_slice()));
+        }
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {

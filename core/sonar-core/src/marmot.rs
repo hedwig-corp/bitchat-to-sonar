@@ -76,6 +76,16 @@ pub(crate) const KEY_PACKAGE_SLOT_FILE_SUFFIX: &str = ".sonar-keypackage-slot";
 pub(crate) const TRANSCRIPT_FILE_SUFFIX: &str = ".sonar-transcript.json";
 const PARKED_INVITES_FILE_SUFFIX: &str = ".sonar-parked-invites.json";
 const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json";
+/// historical MLS group id hex → live 0.9 group id hex.
+const HISTORICAL_FOLDS_FILE_SUFFIX: &str = ".sonar-historical-folds.json";
+
+/// A recovered 0.8 conversation that is not a live 0.9 MLS group.
+#[derive(Debug, Clone)]
+pub struct HistoricalGroup {
+    pub id: GroupId,
+    pub name: String,
+    pub members: Vec<PublicKey>,
+}
 
 /// Documented encoding of the host's 32-byte SQLCipher key for MDK 0.9.
 /// MDK 0.9 applies the string via `PRAGMA key = '<passphrase>'`, not the 0.8
@@ -759,6 +769,8 @@ pub struct MarmotEngine {
     pending_convergence: Mutex<HashSet<GroupId>>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
     historical_group_names: HashMap<GroupId, String>,
+    /// Recovered 0.8 group id → new 0.9 group created with the same members.
+    historical_folds: Mutex<HashMap<GroupId, GroupId>>,
     /// Keeps the temp SQLCipher file alive for [`Self::in_memory`].
     _tempdir: Option<tempfile::TempDir>,
 }
@@ -919,6 +931,7 @@ impl MarmotEngine {
         let dropped = load_dropped(db_path);
         let transcript = load_transcript(db_path);
         let historical_group_names = crate::mdk08_migrate::load_historical_group_names(db_path);
+        let historical_folds = load_historical_folds(db_path);
         Ok(Self {
             session: Mutex::new(Some(session)),
             identity,
@@ -931,6 +944,7 @@ impl MarmotEngine {
             transcript: Mutex::new(transcript),
             pending_convergence: Mutex::new(HashSet::new()),
             historical_group_names,
+            historical_folds: Mutex::new(historical_folds),
             _tempdir: None,
         })
     }
@@ -1127,6 +1141,146 @@ impl MarmotEngine {
     /// Title recovered from an MDK 0.8 `groups` row, if any.
     pub fn historical_group_name(&self, group_id: &GroupId) -> Option<String> {
         self.historical_group_names.get(group_id).cloned()
+    }
+
+    /// True when `group_id` is a live (or still-unhydrated) 0.9 MLS group.
+    pub fn is_live_group(&self, group_id: &GroupId) -> Result<bool> {
+        self.with_session_mut(|session| {
+            if session.live_group_ids()?.iter().any(|id| id == group_id) {
+                return Ok(true);
+            }
+            Ok(session
+                .unhydrated_group_ids()
+                .iter()
+                .any(|id| id == group_id))
+        })
+    }
+
+    /// Recovered 0.8 conversations that are not live 0.9 MLS groups.
+    ///
+    /// Members are unique transcript senders plus the local identity, so hosts
+    /// can fold by npub the same way they fold duplicate direct DMs.
+    pub fn historical_groups(&self) -> Result<Vec<HistoricalGroup>> {
+        let live = self.live_group_id_set()?;
+        let mut out = Vec::new();
+        for id in self.transcript_group_ids() {
+            if live.contains(&id) || self.is_dropped(&id) {
+                continue;
+            }
+            // A live fold sibling may only exist as transcript until MLS lists it.
+            if self.live_fold_target(&id).as_ref() == Some(&id) {
+                continue;
+            }
+            out.push(HistoricalGroup {
+                name: self.historical_group_name(&id).unwrap_or_default(),
+                members: self.historical_members(&id),
+                id,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Other members of a recovered conversation (everyone except the local key).
+    pub fn historical_resume_peers(&self, group_id: &GroupId) -> Vec<PublicKey> {
+        let me = self.identity.public_key();
+        self.historical_members(group_id)
+            .into_iter()
+            .filter(|pk| *pk != me)
+            .collect()
+    }
+
+    fn historical_members(&self, group_id: &GroupId) -> Vec<PublicKey> {
+        let me = self.identity.public_key();
+        let mut members: Vec<PublicKey> = self
+            .transcript_for(group_id)
+            .into_iter()
+            .map(|m| m.sender)
+            .collect();
+        members.push(me);
+        members.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        members.dedup();
+        members
+    }
+
+    fn live_group_id_set(&self) -> Result<HashSet<GroupId>> {
+        self.with_session_mut(|session| {
+            let mut ids: HashSet<GroupId> = session.live_group_ids()?.into_iter().collect();
+            ids.extend(session.unhydrated_group_ids());
+            Ok(ids)
+        })
+    }
+
+    /// Live 0.9 group that should carry sends for a recovered 0.8 row.
+    pub fn live_fold_target(&self, group_id: &GroupId) -> Option<GroupId> {
+        let folds = self
+            .historical_folds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(live) = folds.get(group_id) {
+            return Some(live.clone());
+        }
+        if folds.values().any(|live| live == group_id) {
+            return Some(group_id.clone());
+        }
+        None
+    }
+
+    /// Bind a recovered 0.8 group to the 0.9 group created with the same peers.
+    pub fn record_historical_fold(&self, historical: &GroupId, live: &GroupId) {
+        if historical == live {
+            return;
+        }
+        let mut folds = self
+            .historical_folds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        folds.insert(historical.clone(), live.clone());
+        drop(folds);
+        self.persist_historical_folds();
+    }
+
+    /// Recovered and live ids that share one conversation after resume.
+    pub fn fold_aliases(&self, group_id: &GroupId) -> Vec<GroupId> {
+        self.fold_family(group_id)
+    }
+
+    fn fold_family(&self, group_id: &GroupId) -> Vec<GroupId> {
+        let folds = self
+            .historical_folds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut family = vec![group_id.clone()];
+        if let Some(live) = folds.get(group_id) {
+            if !family.iter().any(|id| id == live) {
+                family.push(live.clone());
+            }
+        }
+        for (historical, live) in folds.iter() {
+            if live == group_id && !family.iter().any(|id| id == historical) {
+                family.push(historical.clone());
+            }
+        }
+        family
+    }
+
+    fn persist_historical_folds(&self) {
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        let folds = self
+            .historical_folds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keyed: HashMap<String, String> = folds
+            .iter()
+            .map(|(historical, live)| {
+                (
+                    hex::encode(historical.as_slice()),
+                    hex::encode(live.as_slice()),
+                )
+            })
+            .collect();
+        let _ = atomic_write_json(&sidecar_named(path, HISTORICAL_FOLDS_FILE_SUFFIX), &keyed);
     }
 
     fn key_package_slot_path(&self) -> Option<PathBuf> {
@@ -2289,7 +2443,7 @@ impl MarmotEngine {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
-        let mut mapped = self.transcript_for(group_id);
+        let mut mapped = self.transcript_for_family(group_id);
         mapped.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -2325,7 +2479,7 @@ impl MarmotEngine {
             return Ok(Vec::new());
         }
         let mut candidates: Vec<ChatMessage> = self
-            .transcript_for(group_id)
+            .transcript_for_family(group_id)
             .into_iter()
             .filter(|m| {
                 is_before_message_cursor(m.created_at.as_secs(), &m.id, before_secs, before_id)
@@ -2346,13 +2500,19 @@ impl MarmotEngine {
             return Ok(Vec::new());
         }
         let mut pages = Vec::new();
-        for group in self.groups()? {
-            let messages = self.messages_page(&group.id, page_limit, 0)?;
+        let mut seen: HashSet<GroupId> = HashSet::new();
+        let mut ids: Vec<GroupId> = self.groups()?.into_iter().map(|g| g.id).collect();
+        ids.extend(self.historical_groups()?.into_iter().map(|g| g.id));
+        for group_id in ids {
+            if !seen.insert(group_id.clone()) {
+                continue;
+            }
+            let messages = self.messages_page(&group_id, page_limit, 0)?;
             let Some(latest_created_at) = messages.iter().map(|m| m.created_at).max() else {
                 continue;
             };
             pages.push(RecentMessagePage {
-                group_id: group.id,
+                group_id,
                 latest_created_at,
                 messages,
             });
@@ -2367,13 +2527,16 @@ impl MarmotEngine {
     }
 
     pub fn members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
-        self.with_session(|session| {
-            let members = session.members(group_id)?;
-            Ok(members
-                .into_iter()
-                .filter_map(|m| PublicKey::from_slice(m.id.as_slice()).ok())
-                .collect())
-        })
+        if self.is_live_group(group_id).unwrap_or(false) {
+            return self.with_session(|session| {
+                let members = session.members(group_id)?;
+                Ok(members
+                    .into_iter()
+                    .filter_map(|m| PublicKey::from_slice(m.id.as_slice()).ok())
+                    .collect())
+            });
+        }
+        Ok(self.historical_members(group_id))
     }
 
     pub fn latest_message_secs(&self) -> u64 {
@@ -2402,7 +2565,7 @@ impl MarmotEngine {
 
     pub fn latest_remote_chat_message_secs(&self, group_id: &GroupId) -> Option<u64> {
         let me = self.identity.public_key();
-        self.transcript_for(group_id)
+        self.transcript_for_family(group_id)
             .into_iter()
             .filter(|m| m.sender != me)
             .map(|m| m.created_at.as_secs())
@@ -2451,6 +2614,25 @@ impl MarmotEngine {
             .get(group_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn transcript_for_family(&self, group_id: &GroupId) -> Vec<ChatMessage> {
+        let mut msgs = Vec::new();
+        let mut seen = HashSet::new();
+        for id in self.fold_family(group_id) {
+            for msg in self.transcript_for(&id) {
+                if seen.insert(msg.id) {
+                    msgs.push(msg);
+                }
+            }
+        }
+        msgs
+    }
+
+    /// Test helper: append a host-owned transcript row without MLS ingest.
+    #[cfg(test)]
+    pub(crate) fn push_transcript_message(&self, msg: ChatMessage) {
+        self.store_chat(msg);
     }
 
     fn park_invite(&self, invite: GroupInvite) {
@@ -2679,6 +2861,7 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         DROPPED_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
+        HISTORICAL_FOLDS_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
@@ -2884,6 +3067,22 @@ fn load_dropped(db_path: &Path) -> HashSet<GroupId> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|h| hex::decode(h).ok().map(GroupId::new))
+        .collect()
+}
+
+fn load_historical_folds(db_path: &Path) -> HashMap<GroupId, GroupId> {
+    let path = sidecar_named(db_path, HISTORICAL_FOLDS_FILE_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<HashMap<String, String>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(historical, live)| {
+            let historical = hex::decode(historical).ok().map(GroupId::new)?;
+            let live = hex::decode(live).ok().map(GroupId::new)?;
+            Some((historical, live))
+        })
         .collect()
 }
 
@@ -3223,5 +3422,78 @@ mod classification_tests {
         .is_transcript_visible());
         // A malformed control line renders as text, so it stays countable.
         assert!(C::of("☎CALL|not-a-version|X|y").is_transcript_visible());
+    }
+}
+
+#[cfg(test)]
+mod historical_fold_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    use crate::identity::Identity;
+
+    fn chat(id: u8, group: &[u8], sender: PublicKey, body: &str, mine: bool) -> ChatMessage {
+        ChatMessage {
+            id: EventId::from_slice(&[id; 32]).expect("event id"),
+            group_id: GroupId::new(group.to_vec()),
+            sender,
+            content: body.to_owned(),
+            created_at: Timestamp::from_secs(1_700_000_000 + u64::from(id)),
+            mine,
+            delivery_state: if mine {
+                DeliveryState::Sent
+            } else {
+                DeliveryState::Received
+            },
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: MessageClassification::of(body),
+            reply: None,
+        }
+    }
+
+    #[test]
+    fn recovered_history_survives_fold_onto_new_group() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        engine.push_transcript_message(chat(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            "old hello",
+            false,
+        ));
+        engine.push_transcript_message(chat(
+            2,
+            live.as_slice(),
+            alice.public_key(),
+            "new hello",
+            true,
+        ));
+        engine.record_historical_fold(&historical, &live);
+
+        let from_old = engine.messages(&historical).expect("historical messages");
+        let from_new = engine.messages(&live).expect("live messages");
+        assert_eq!(from_old.len(), 2, "fold must merge both transcripts");
+        assert_eq!(from_new.len(), 2, "either id must read the same family");
+        assert!(from_old.iter().any(|m| m.content == "old hello"));
+        assert!(from_old.iter().any(|m| m.content == "new hello"));
+        assert_eq!(
+            from_old.iter().map(|m| m.id).collect::<HashSet<_>>(),
+            from_new.iter().map(|m| m.id).collect::<HashSet<_>>()
+        );
+
+        let recovered = engine.historical_groups().expect("historical groups");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, historical);
+        assert!(recovered[0].members.contains(&bob.public_key()));
+        assert_eq!(
+            engine.historical_resume_peers(&historical),
+            vec![bob.public_key()]
+        );
+        assert_eq!(engine.live_fold_target(&historical).as_ref(), Some(&live));
     }
 }

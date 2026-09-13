@@ -96,6 +96,8 @@ Guarded by:
 - `mdk08_migrate::tests::wrong_key_is_not_a_0_8_store`
 - `persistence::mdk08_store_decrypts_and_moves_plaintext_without_wiping`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
+- `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
+- `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
 
 ## How users keep access after the flag-day
@@ -195,15 +197,19 @@ Device / interop (not substitutable by unit tests):
 
 | Surface | History | Live 0.9 send | Gap |
 | --- | --- | --- | --- |
-| Rust core | decrypt-and-move (this PR) | new group after upgrade | fold recovered row ↔ new group id |
+| Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `start_group` and records a fold | none |
 | Conversation index | preserved + seeded from sidecar | unchanged | none |
-| Compose (`apps/sonar`) | paints from index + `messages()` | existing `openChat` / `openDm` | UX copy for "update needed" / resume |
-| iOS (`ios/`) | same | same | same |
+| Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing | none |
+| iOS (`ios/`) | same | same | none |
 | Mesh | untouched | untouched | none |
 
-The fold + "waiting for peer update" UI is the next slice after this
-core path. It must land on both hosts (Cross-Platform Feature Rule)
-before calling the migration user-complete.
+Resume-chat fold: recovered 0.8 rows appear in FFI `groups()` with
+members inferred from the transcript. A send on that id creates a new
+0.9 group with the same peer npubs, records
+`.sonar-historical-folds.json`, and `messages()` unions both ids so
+history is not wiped or split. Hosts still collapse the person by npub
+(R-003). Peer still on 0.8: `KeyPackageNotFound` → "Waiting for them
+to update Sonar".
 
 ## Explicitly out of scope here
 
@@ -218,8 +224,7 @@ before calling the migration user-complete.
 
 Stay draft until:
 
-1. The persistence / extract tests above are green in CI.
+1. The persistence / extract / fold tests above are green in CI.
 2. The 0.9.14 group-scale table is committed.
-3. The resume-chat fold has a tracked follow-up (or lands on both
-   hosts) so users are not left with read-only Marmot rows and no
-   way to talk to an upgraded peer.
+3. Device upgrade + White Noise interop still need a human pass
+   (cannot be substituted by unit tests).

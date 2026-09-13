@@ -884,6 +884,20 @@ async fn mdk08_store_decrypts_and_moves_plaintext_without_wiping() {
         Some("alice & bob")
     );
     assert_eq!(engine.groups().expect("live 0.9 groups").len(), 0);
+    let recovered_groups = engine
+        .historical_groups()
+        .expect("recovered conversations must be listed");
+    assert_eq!(recovered_groups.len(), 1);
+    assert_eq!(recovered_groups[0].id.as_slice(), group_id.as_slice());
+    assert!(
+        recovered_groups[0].members.contains(&bob.public_key()),
+        "hosts fold by the recovered peer npub"
+    );
+    let pages = engine
+        .recent_message_pages(8, 8)
+        .expect("home list pages include recovered chats");
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].messages[0].content, "keep this chat");
 
     let bak = db_path.with_file_name("marmot.sqlite.mdk08.bak");
     assert!(bak.exists(), "0.8 file must be quarantined, not deleted");

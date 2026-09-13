@@ -1678,25 +1678,43 @@ impl SonarNode {
             .collect())
     }
 
-    /// All groups this identity belongs to.
+    /// All groups this identity belongs to, including recovered 0.8 history
+    /// that is not a live 0.9 MLS group. Hosts fold those rows by npub.
     pub fn groups(&self) -> FfiResult<Vec<GroupInfo>> {
-        let groups = self.client.groups()?;
-        groups
-            .into_iter()
-            .map(|g| {
-                let members = self
-                    .client
-                    .members(&g.id)?
-                    .into_iter()
-                    .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
-                    .collect();
-                Ok(GroupInfo {
-                    id_hex: hex::encode(g.id.as_slice()),
-                    name: g.name,
-                    member_npubs: members,
-                })
-            })
-            .collect()
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for g in self.client.groups()? {
+            let id_hex = hex::encode(g.id.as_slice());
+            seen.insert(id_hex.clone());
+            let members = self
+                .client
+                .members(&g.id)?
+                .into_iter()
+                .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
+                .collect();
+            out.push(GroupInfo {
+                id_hex,
+                name: g.name,
+                member_npubs: members,
+            });
+        }
+        for hist in self.client.historical_groups()? {
+            let id_hex = hex::encode(hist.id.as_slice());
+            if !seen.insert(id_hex.clone()) {
+                continue;
+            }
+            let member_npubs = hist
+                .members
+                .into_iter()
+                .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
+                .collect();
+            out.push(GroupInfo {
+                id_hex,
+                name: hist.name,
+                member_npubs,
+            });
+        }
+        Ok(out)
     }
 
     /// Decrypted message history for a group, oldest first.
