@@ -140,6 +140,7 @@ pub(crate) fn detect_and_extract_remainder(
     local_pk: PublicKey,
     skip: &HashSet<EventId>,
     budget: usize,
+    only_group: Option<&GroupId>,
 ) -> Result<Option<(Mdk08Migration, bool)>> {
     let Some(conn) = open_mdk08(path, key)? else {
         return Ok(None);
@@ -148,7 +149,7 @@ pub(crate) fn detect_and_extract_remainder(
         return Ok(None);
     }
     let budget = budget.max(1);
-    let (extracted, more) = extract_remainder_page(&conn, local_pk, skip, budget)?;
+    let (extracted, more) = extract_remainder_page(&conn, local_pk, skip, budget, only_group)?;
     Ok(Some((extracted, more)))
 }
 
@@ -582,12 +583,20 @@ fn extract_newest_kind9_per_group(
     Ok(())
 }
 
-fn remainder_candidate_sql(has_state: bool) -> String {
-    format!(
-        "SELECT mls_group_id, id FROM messages WHERE {} \
-         ORDER BY created_at DESC, id DESC",
-        kind9_filter(has_state)
-    )
+fn remainder_candidate_sql(has_state: bool, only_group: bool) -> String {
+    if only_group {
+        format!(
+            "SELECT mls_group_id, id FROM messages WHERE {} AND mls_group_id = ?1 \
+             ORDER BY created_at DESC, id DESC",
+            kind9_filter(has_state)
+        )
+    } else {
+        format!(
+            "SELECT mls_group_id, id FROM messages WHERE {} \
+             ORDER BY created_at DESC, id DESC",
+            kind9_filter(has_state)
+        )
+    }
 }
 
 fn remainder_payload_sql(cols: &MessageSelectColumns, n: usize) -> String {
@@ -604,27 +613,66 @@ fn remainder_payload_sql(cols: &MessageSelectColumns, n: usize) -> String {
     )
 }
 
+fn remainder_has_unskipped(
+    conn: &Connection,
+    has_state: bool,
+    skip: &HashSet<EventId>,
+    extra: &HashSet<EventId>,
+) -> Result<bool> {
+    let mut stmt = conn
+        .prepare(&remainder_candidate_sql(has_state, false))
+        .map_err(|e| Error::Storage(format!("mdk08 remainder more prepare: {e}")))?;
+    let rows = stmt
+        .query_map((), |row| row.get::<_, Vec<u8>>(1))
+        .map_err(|e| Error::Storage(format!("mdk08 remainder more query: {e}")))?;
+    for row in rows {
+        let id = row.map_err(|e| Error::Storage(format!("mdk08 remainder more row: {e}")))?;
+        let Ok(event_id) = EventId::from_slice(&id) else {
+            continue;
+        };
+        if skip.contains(&event_id) || extra.contains(&event_id) {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn remainder_candidate_ids(
+    conn: &Connection,
+    has_state: bool,
+    only_group: Option<&GroupId>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut stmt = conn
+        .prepare(&remainder_candidate_sql(has_state, only_group.is_some()))
+        .map_err(|e| Error::Storage(format!("mdk08 remainder ids prepare: {e}")))?;
+    let map_row =
+        |row: &rusqlite::Row<'_>| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?));
+    let mapped = if let Some(group_id) = only_group {
+        stmt.query_map(rusqlite::params![group_id.as_slice()], map_row)
+    } else {
+        stmt.query_map((), map_row)
+    }
+    .map_err(|e| Error::Storage(format!("mdk08 remainder ids query: {e}")))?;
+    mapped
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::Storage(format!("mdk08 remainder ids row: {e}")))
+}
+
 fn extract_remainder_page(
     conn: &Connection,
     local_pk: PublicKey,
     skip: &HashSet<EventId>,
     budget: usize,
+    only_group: Option<&GroupId>,
 ) -> Result<(Mdk08Migration, bool)> {
     let cols = message_select_columns(conn)?;
     let mut extracted = Mdk08Migration::default();
-    let mut stmt = conn
-        .prepare(&remainder_candidate_sql(cols.has_state))
-        .map_err(|e| Error::Storage(format!("mdk08 remainder ids prepare: {e}")))?;
-    let rows = stmt
-        .query_map((), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(|e| Error::Storage(format!("mdk08 remainder ids query: {e}")))?;
-    let mut chosen = Vec::new();
-    let mut more = false;
-    for row in rows {
-        let (_group_id, id) =
-            row.map_err(|e| Error::Storage(format!("mdk08 remainder ids row: {e}")))?;
+    let candidates = remainder_candidate_ids(conn, cols.has_state, only_group)?;
+    let mut chosen: Vec<Vec<u8>> = Vec::new();
+    let mut chosen_ids = HashSet::new();
+    let mut hit_budget = false;
+    for (_group_id, id) in candidates {
         let Ok(event_id) = EventId::from_slice(&id) else {
             continue;
         };
@@ -632,13 +680,19 @@ fn extract_remainder_page(
             continue;
         }
         if chosen.len() >= budget {
-            more = true;
+            hit_budget = true;
             break;
         }
+        chosen_ids.insert(event_id);
         chosen.push(id);
     }
+    let more = if only_group.is_some() {
+        remainder_has_unskipped(conn, cols.has_state, skip, &chosen_ids)?
+    } else {
+        hit_budget
+    };
     if chosen.is_empty() {
-        return Ok((extracted, false));
+        return Ok((extracted, more));
     }
     let mut payload = conn
         .prepare(&remainder_payload_sql(&cols, chosen.len()))
@@ -1476,7 +1530,7 @@ mod tests {
 
     #[test]
     fn remainder_candidate_sql_ranks_ids_without_payload_columns() {
-        let sql = remainder_candidate_sql(true);
+        let sql = remainder_candidate_sql(true, false);
         assert!(sql.contains("ORDER BY created_at DESC"));
         assert!(!sql.contains("content"));
         assert!(!sql.contains("tags"));
@@ -1526,9 +1580,10 @@ mod tests {
             .collect();
         assert_eq!(skip.len(), FIRST_PAINT_MESSAGES_PER_GROUP);
 
-        let (page, more) = detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 10)
-            .unwrap()
-            .expect("remainder page");
+        let (page, more) =
+            detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 10, None)
+                .unwrap()
+                .expect("remainder page");
         let msgs = page.messages.values().next().unwrap();
         assert!(more);
         assert_eq!(msgs.len(), 10);
@@ -1539,12 +1594,101 @@ mod tests {
 
         let mut skip = skip;
         skip.extend(msgs.iter().map(|m| m.id));
-        let (rest, more) = detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 400)
-            .unwrap()
-            .expect("remainder tail");
+        let (rest, more) =
+            detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 400, None)
+                .unwrap()
+                .expect("remainder tail");
         assert!(!more);
         let rest_len = rest.messages.values().map(|m| m.len()).sum::<usize>();
         // seed + msg-1..15 remain after the first-paint 80 and the 10-row page.
         assert_eq!(rest_len, 16);
+    }
+
+    #[test]
+    fn remainder_page_can_target_one_group_without_clearing_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&path, &local, peer, "g1-oldest");
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let group_a = vec![0x11u8; 16];
+        let group_b = vec![0x33u8; 16];
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'carol', '')",
+            rusqlite::params![group_b.clone(), vec![0x44u8; 32]],
+        )
+        .unwrap();
+        for i in 1..=FIRST_PAINT_MESSAGES_PER_GROUP {
+            let mut id = [0u8; 32];
+            id[0] = 0xA0;
+            id[1] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    group_a.clone(),
+                    id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("a-{i}"),
+                ],
+            )
+            .unwrap();
+        }
+        for i in 1..=(FIRST_PAINT_MESSAGES_PER_GROUP + 5) {
+            let mut id = [0u8; 32];
+            id[0] = 0xB0;
+            id[1] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    group_b.clone(),
+                    id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_800_000_000 + i as i64,
+                    format!("b-{i}"),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let window = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("first paint");
+        let skip: HashSet<EventId> = window
+            .messages
+            .values()
+            .flatten()
+            .map(|msg| msg.id)
+            .collect();
+        let (page, more) = detect_and_extract_remainder(
+            &path,
+            KEY,
+            local.public_key(),
+            &skip,
+            5,
+            Some(&GroupId::new(group_b)),
+        )
+        .unwrap()
+        .expect("group-b remainder");
+        assert!(more, "group a leftover must keep the bak pending");
+        assert_eq!(page.messages.len(), 1);
+        let msgs = page.messages.values().next().unwrap();
+        assert_eq!(msgs.len(), 5);
+        assert!(msgs.iter().all(|m| m.content.starts_with("b-")));
+        assert!(!msgs
+            .iter()
+            .any(|m| m.content.starts_with("a-") || m.content.contains("oldest")));
     }
 }

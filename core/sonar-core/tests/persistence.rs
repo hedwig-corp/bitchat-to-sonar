@@ -933,7 +933,7 @@ async fn mdk08_first_paint_defers_older_rows_until_remainder() {
     let alice = Identity::generate();
     let bob = Identity::generate();
     let group_id = vec![0x11u8; 16];
-    let total = 100usize;
+    let total = 530usize;
     {
         let conn = rusqlite::Connection::open(&db_path).expect("open 0.8 file");
         let hex_key = DB_KEY
@@ -1000,16 +1000,36 @@ async fn mdk08_first_paint_defers_older_rows_until_remainder() {
     let gid = sonar_core::GroupId::new(group_id.clone());
     let page = engine.messages_page(&gid, 40, 0).expect("first-paint page");
     assert_eq!(page.len(), 40);
-    assert_eq!(page[0].content, "row-99", "newest row must paint first");
+    assert_eq!(page[0].content, "row-529", "newest row must paint first");
     assert!(
         engine.has_pending_mdk08_remainder(),
         "a bounded page must not force the remainder"
     );
 
+    let window = engine
+        .messages_page(&gid, 80, 0)
+        .expect("first-paint window");
+    assert_eq!(window.len(), 80);
+    let oldest_window = window.last().expect("oldest first-paint row");
+    let older = engine
+        .messages_cursor_page(
+            &gid,
+            Some(oldest_window.created_at.as_secs()),
+            Some(&oldest_window.id),
+            10,
+        )
+        .expect("scroll-up must copy leftover bak rows");
+    assert_eq!(older.len(), 10);
+    assert_eq!(older[0].content, "row-449");
+    assert!(
+        engine.has_pending_mdk08_remainder(),
+        "filling one older page must not drain the rest of the bak"
+    );
+
     let all = engine.messages(&gid).expect("full history after remainder");
     assert_eq!(all.len(), total);
     assert_eq!(all[0].content, "row-0");
-    assert_eq!(all[total - 1].content, "row-99");
+    assert_eq!(all[total - 1].content, "row-529");
     assert!(!engine.has_pending_mdk08_remainder());
 }
 

@@ -91,8 +91,11 @@ What the user does **not** keep automatically:
    - Create a fresh 0.9 store at the original path.
    - Copy leftover older rows from the bak in bounded pages (400
      payloads per tick) on idle `ensure_subscriptions` / `sync`.
-     `messages()` drains every page so the full-history API stays
-     complete. Host first-paint pages do not.
+     Scrolling a recovered chat (`messages_page` / `messages_cursor_page`
+     past the local window) fills that conversation from the bak
+     without draining every other chat. `messages()` drains every
+     page so the full-history API stays complete. Newest first-paint
+     pages that already fit do not.
    - If 0.9 create fails, rename the 0.8 file back. Never delete it.
 4. Wrong key / unknown file: return `protocol migration required`. Do not
    wipe, do not quarantine.
@@ -121,6 +124,7 @@ Guarded by:
 - `mdk08_migrate::first_paint_windows_each_group_independently`
 - `mdk08_migrate::remainder_candidate_sql_ranks_ids_without_payload_columns`
 - `mdk08_migrate::remainder_page_skips_copied_ids_and_reports_more`
+- `mdk08_migrate::remainder_page_can_target_one_group_without_clearing_others`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
 - `e2e::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
@@ -229,8 +233,9 @@ Never Uninstall Device Apps):
    still present (do not print it). `*.mdk08.bak` exists next to the
    Marmot DB. Chat list shows recovered Marmot rows on first paint.
 2. **Open a recovered DM and a recovered room** with the radio off or
-   before relays connect. Local history must paint. Relays must not
-   gate first paint or typing.
+   before relays connect. Local history must paint. Scrolling up past
+   the newest 80 rows must keep loading from `*.mdk08.bak` without
+   waiting on relays. Relays must not gate first paint or typing.
 3. **Peer already on 0.9 / White Noise.** Send in the recovered row.
    A new 0.9 group is created; the old transcript stays; home list
    stays one row. The peer decrypts the new traffic only (not the

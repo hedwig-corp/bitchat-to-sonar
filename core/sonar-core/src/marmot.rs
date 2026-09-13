@@ -980,7 +980,7 @@ impl MarmotEngine {
     /// Copy leftover 0.8 chat rows from `*.mdk08.bak` into the transcript.
     /// One idle tick joins at most [`REMAINDER_MESSAGES_PER_TICK`] payloads.
     pub fn ensure_mdk08_remainder(&self) -> Result<()> {
-        self.ensure_mdk08_remainder_budget(crate::mdk08_migrate::REMAINDER_MESSAGES_PER_TICK)
+        self.ensure_mdk08_remainder_budget(crate::mdk08_migrate::REMAINDER_MESSAGES_PER_TICK, None)
     }
 
     /// `messages()` must return the full recovered transcript, so drain every
@@ -992,7 +992,11 @@ impl MarmotEngine {
         Ok(())
     }
 
-    fn ensure_mdk08_remainder_budget(&self, budget: usize) -> Result<()> {
+    fn ensure_mdk08_remainder_budget(
+        &self,
+        budget: usize,
+        only_group: Option<&GroupId>,
+    ) -> Result<()> {
         let pending = {
             let mut slot = self
                 .pending_mdk08
@@ -1020,6 +1024,7 @@ impl MarmotEngine {
             pending.local_pk,
             &skip,
             budget,
+            only_group,
         ) {
             Ok(Some((extracted, more))) => {
                 if more {
@@ -1064,6 +1069,33 @@ impl MarmotEngine {
         if !self.has_pending_mdk08_remainder() {
             if let Some(path) = self.db_path.as_ref() {
                 crate::mdk08_migrate::mark_remainder_complete(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy leftover bak rows for this conversation until `enough` or the
+    /// group's remaining 0.8 rows are exhausted. Other chats stay pending.
+    fn fill_mdk08_remainder_for_page(
+        &self,
+        group_id: &GroupId,
+        enough: impl Fn(&Self) -> bool,
+    ) -> Result<()> {
+        while self.has_pending_mdk08_remainder() && !enough(self) {
+            let before = self.transcript_for_family(group_id).len();
+            let mut progressed = false;
+            for target in self.fold_family(group_id) {
+                self.ensure_mdk08_remainder_budget(
+                    crate::mdk08_migrate::REMAINDER_MESSAGES_PER_TICK,
+                    Some(&target),
+                )?;
+                if self.transcript_for_family(group_id).len() > before {
+                    progressed = true;
+                    break;
+                }
+            }
+            if !progressed {
+                break;
             }
         }
         Ok(())
@@ -2655,6 +2687,10 @@ impl MarmotEngine {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let want = offset.saturating_add(limit);
+        self.fill_mdk08_remainder_for_page(group_id, |engine| {
+            engine.transcript_for_family(group_id).len() >= want
+        })?;
         let mut msgs = self.mapped_transcript(group_id)?;
         msgs.sort_by(compare_message_cursor_desc);
         let page: Vec<ChatMessage> = msgs.into_iter().skip(offset).take(limit).collect();
@@ -2671,6 +2707,16 @@ impl MarmotEngine {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        self.fill_mdk08_remainder_for_page(group_id, |engine| {
+            engine
+                .transcript_for_family(group_id)
+                .into_iter()
+                .filter(|m| {
+                    is_before_message_cursor(m.created_at.as_secs(), &m.id, before_secs, before_id)
+                })
+                .count()
+                >= limit
+        })?;
         let mut candidates: Vec<ChatMessage> = self
             .transcript_for_family(group_id)
             .into_iter()
