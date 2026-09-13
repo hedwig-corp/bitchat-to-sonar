@@ -270,6 +270,56 @@ impl ConversationIndex {
         Ok(())
     }
 
+    /// Copy a recovered-chat summary onto its live 0.9 sibling without
+    /// incrementing counts. Used when a fold is recorded so home-list /
+    /// unread / backup see one row immediately.
+    pub fn copy_summary(&self, from_hex: &str, to_hex: &str) -> Result<()> {
+        if from_hex == to_hex {
+            return Ok(());
+        }
+        let Some(src) = self.summary(from_hex)? else {
+            return Ok(());
+        };
+        self.db
+            .execute(
+                "INSERT INTO conversation_summary
+                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs,
+                     latest_mine, message_count, unread_count, version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END,
+                    latest_content = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_content ELSE latest_content END,
+                    latest_sender = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_sender ELSE latest_sender END,
+                    latest_at_secs = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_at_secs ELSE latest_at_secs END,
+                    latest_mine = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_mine ELSE latest_mine END,
+                    unread_count = CASE
+                        WHEN unread_count = 0 THEN excluded.unread_count
+                        ELSE unread_count END,
+                    version = version + 1",
+                params![
+                    to_hex,
+                    src.name,
+                    src.latest_content,
+                    src.latest_sender,
+                    src.latest_at_secs as i64,
+                    src.latest_mine as i32,
+                    src.message_count as i64,
+                    src.unread_count as i64,
+                    src.version as i64,
+                ],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index copy_summary: {e}")))?;
+        Ok(())
+    }
+
     pub fn ensure_group(&self, group_id_hex: &str, name: &str) -> Result<()> {
         self.db
             .execute(
@@ -568,6 +618,31 @@ mod tests {
         idx.remove_group("g1").unwrap();
         assert!(idx.is_empty());
         assert!(idx.summary("g1").unwrap().is_none());
+    }
+
+    #[test]
+    fn copy_summary_promotes_recovered_row_onto_live_id() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary(
+            "hist",
+            "alice & bob",
+            "keep this chat",
+            "bob",
+            100,
+            false,
+            true,
+        )
+        .unwrap();
+        idx.copy_summary("hist", "live").unwrap();
+
+        let live = idx.summary("live").unwrap().unwrap();
+        assert_eq!(live.name, "alice & bob");
+        assert_eq!(live.latest_content, "keep this chat");
+        assert_eq!(live.unread_count, 1);
+        assert_eq!(
+            idx.summary("hist").unwrap().unwrap().latest_content,
+            "keep this chat"
+        );
     }
 
     #[test]

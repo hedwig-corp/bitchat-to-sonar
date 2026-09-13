@@ -1100,6 +1100,13 @@ async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
     assert_eq!(pre.len(), 1);
     assert_eq!(pre[0].id, old_event);
     assert_eq!(pre[0].content, "keep this chat");
+    let pre_summaries = alice.conversation_summaries();
+    assert_eq!(
+        pre_summaries.len(),
+        1,
+        "migrated history must occupy one index row"
+    );
+    assert_eq!(pre_summaries[0].latest_content, "keep this chat");
 
     let too_soon = alice
         .send_text(&historical, "too soon")
@@ -1149,6 +1156,28 @@ async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
         "the failed pre-KP send must not land in the transcript"
     );
 
+    let summaries = alice.conversation_summaries();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "recovered+resumed person must occupy one conversation-index row"
+    );
+    assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+    assert!(
+        alice
+            .conversation_summary(&hex::encode(historical.as_slice()))
+            .is_some(),
+        "the recovered id must still resolve for the open chat"
+    );
+    alice.mark_conversation_read(&hex::encode(historical.as_slice()));
+    assert_eq!(
+        alice
+            .conversation_summary(&hex::encode(live.as_slice()))
+            .expect("live summary")
+            .unread_count,
+        0
+    );
+
     let pages = alice
         .recent_message_pages(8, 8)
         .expect("home-list pages after resume");
@@ -1189,4 +1218,146 @@ async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
     assert!(after_reopen.iter().any(|m| m.content == "keep this chat"));
     assert!(after_reopen.iter().any(|m| m.content == "resume hello"));
     assert!(after_reopen.iter().any(|m| m.content == "second resume"));
+}
+
+fn write_mdk08_alice_bob_carol_store(
+    path: &std::path::Path,
+    bob: PublicKey,
+    carol: PublicKey,
+) -> GroupId {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x33u8; 16];
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+         VALUES (?1, ?2, 'alice bob carol', '')",
+        rusqlite::params![group_bytes.clone(), vec![0x44u8; 32]],
+    )
+    .expect("group row");
+    for (seed, peer, body, created_at) in [
+        (0xB1u8, bob, "bob in the room", 1_700_000_000i64),
+        (0xC1u8, carol, "carol in the room", 1_700_000_001),
+    ] {
+        let event_id = EventId::from_slice(&[seed; 32]).expect("event id");
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed')",
+            rusqlite::params![
+                group_bytes.clone(),
+                event_id.as_bytes().to_vec(),
+                peer.to_bytes().to_vec(),
+                created_at,
+                body,
+            ],
+        )
+        .expect("chat row");
+    }
+    GroupId::new(group_bytes)
+}
+
+/// A recovered 0.8 room with two peers must resume via `start_group`, not a DM.
+#[tokio::test]
+async fn recovered_08_group_resumes_on_a_new_09_group_through_a_relay() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    let recovered = alice.historical_groups().expect("recovered room");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].members.len(), 3, "alice + bob + carol");
+
+    bob.publish_key_package().await.expect("bob kp");
+    carol.publish_key_package().await.expect("carol kp");
+    alice
+        .send_text(&historical, "room is back")
+        .await
+        .expect("resume start_group");
+
+    let live = alice.groups().expect("live groups");
+    assert_eq!(live.len(), 1);
+    assert_ne!(live[0].id, historical);
+    let members = alice.members(&live[0].id).expect("live members");
+    assert_eq!(members.len(), 3);
+
+    let from_old = alice.messages(&historical).expect("folded transcript");
+    assert!(from_old.iter().any(|m| m.content == "bob in the room"));
+    assert!(from_old.iter().any(|m| m.content == "carol in the room"));
+    assert!(from_old.iter().any(|m| m.content == "room is back"));
+    assert_eq!(alice.conversation_summaries().len(), 1);
+
+    bob.sync().await.expect("bob syncs");
+    carol.sync().await.expect("carol syncs");
+    assert_eq!(bob.groups().expect("bob joined").len(), 1);
+    assert_eq!(carol.groups().expect("carol joined").len(), 1);
+    assert_eq!(
+        bob.messages(&bob.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "room is back")
+            .count(),
+        1
+    );
+    assert_eq!(
+        carol
+            .messages(&carol.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "room is back")
+            .count(),
+        1
+    );
 }

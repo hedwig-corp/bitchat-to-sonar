@@ -98,6 +98,8 @@ Guarded by:
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
 - `e2e::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
+- `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
+- `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
 
@@ -201,7 +203,7 @@ Device / interop (not substitutable by unit tests):
 | Surface | History | Live 0.9 send | Gap |
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `start_group` and records a fold | none |
-| Conversation index | preserved + seeded from sidecar | unchanged | none |
+| Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
 | Compose (`apps/sonar`) | `groups()` includes recovered rows; transcript merge by npub | send prefers newest duplicate; toast/banner if KeyPackage missing | none |
 | iOS (`ios/`) | same | same | none |
 | Mesh | untouched | untouched | none |

@@ -7011,8 +7011,7 @@ impl SonarClient {
             [peer] => self.start_dm(*peer, &name).await?,
             many => self.start_group(many.to_vec(), &name).await?,
         };
-        self.engine.record_historical_fold(group_id, &live);
-        self.notify_fold_aliases(group_id);
+        self.record_resume_fold(group_id, &live);
         Ok(live)
     }
 
@@ -7035,10 +7034,52 @@ impl SonarClient {
                 group.members.into_iter().filter(|pk| *pk != me).collect();
             hist_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
             if hist_others == live_others {
-                self.engine.record_historical_fold(&group.id, live_id);
-                self.notify_fold_aliases(&group.id);
+                self.record_resume_fold(&group.id, live_id);
             }
         }
+    }
+
+    fn record_resume_fold(&self, historical: &GroupId, live: &GroupId) {
+        self.engine.record_historical_fold(historical, live);
+        self.promote_index_fold(historical, live);
+        self.notify_fold_aliases(historical);
+    }
+
+    fn promote_index_fold(&self, historical: &GroupId, live: &GroupId) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        if let Err(e) = idx.lock().unwrap().copy_summary(&hist_hex, &live_hex) {
+            tracing::warn!(%e, "index fold promote failed");
+            let name = self
+                .engine
+                .historical_group_name(historical)
+                .unwrap_or_default();
+            if let Err(e) = idx.lock().unwrap().ensure_group(&live_hex, &name) {
+                tracing::warn!(%e, "index fold ensure_group failed");
+            }
+        }
+    }
+
+    fn is_folded_historical_summary(&self, group_id_hex: &str) -> bool {
+        let Ok(bytes) = hex::decode(group_id_hex) else {
+            return false;
+        };
+        let id = GroupId::new(bytes);
+        matches!(self.engine.live_fold_target(&id), Some(live) if live != id)
+    }
+
+    fn fold_index_ids(&self, group_id_hex: &str) -> Vec<String> {
+        let Ok(bytes) = hex::decode(group_id_hex) else {
+            return vec![group_id_hex.to_string()];
+        };
+        self.engine
+            .fold_aliases(&GroupId::new(bytes))
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect()
     }
 
     fn notify_fold_aliases(&self, group_id: &GroupId) {
@@ -7150,7 +7191,9 @@ impl SonarClient {
         let Some(ref idx) = self.conversation_index else {
             return Vec::new();
         };
-        idx.lock().unwrap().summaries_ordered().unwrap_or_default()
+        let mut summaries = idx.lock().unwrap().summaries_ordered().unwrap_or_default();
+        summaries.retain(|s| !self.is_folded_historical_summary(&s.group_id_hex));
+        summaries
     }
 
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
@@ -7159,11 +7202,16 @@ impl SonarClient {
     }
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
+        let ids = self.fold_index_ids(group_id_hex);
         if let Some(ref idx) = self.conversation_index {
-            if let Err(e) = idx.lock().unwrap().mark_read(group_id_hex) {
-                tracing::warn!(%e, "index mark_read failed");
+            for id in &ids {
+                if let Err(e) = idx.lock().unwrap().mark_read(id) {
+                    tracing::warn!(%e, "index mark_read failed");
+                }
             }
-            self.notify_conversation_changed(group_id_hex);
+        }
+        for id in &ids {
+            self.notify_conversation_changed(id);
         }
     }
 
