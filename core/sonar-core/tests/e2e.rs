@@ -1827,6 +1827,12 @@ async fn recovered_08_group_adds_a_member_who_updates_later() {
         .expect("partial resume");
     let live = alice.groups().expect("live")[0].id.clone();
     assert_eq!(alice.members(&live).expect("members").len(), 2);
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol.identity().public_key()),
+        "FFI groups() must still list leftover 0.8 members after remount"
+    );
+    assert_eq!(painted.len(), 3, "alice + bob + leftover carol");
 
     carol.publish_key_package().await.expect("carol updates");
     alice
@@ -1904,6 +1910,12 @@ async fn recovered_08_group_adds_late_member_on_sync_without_a_local_send() {
         .expect("partial resume");
     let live = alice.groups().expect("live")[0].id.clone();
     assert_eq!(alice.members(&live).expect("members").len(), 2);
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol.identity().public_key()),
+        "FFI groups() must still list leftover 0.8 members after remount"
+    );
+    assert_eq!(painted.len(), 3, "alice + bob + leftover carol");
 
     carol.publish_key_package().await.expect("carol updates");
     // Persistent connect() already opened live subscriptions. Hosts then

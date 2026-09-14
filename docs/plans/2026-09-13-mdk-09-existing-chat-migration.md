@@ -511,6 +511,11 @@ members / exporter secrets / folds / transcript / parked invites),
 `marmot::historical_fold_tests::display_members_unions_folded_historical_roster`
 (FFI paint unions leftover 0.8 members; `members(live)` stays single-id
 so late-resume still invites them),
+`e2e.rs::recovered_08_group_adds_a_member_who_updates_later` and
+`e2e.rs::recovered_08_group_adds_late_member_on_sync_without_a_local_send`
+(after a mixed resume `members(live)==2` and `display_members` still
+lists leftover Carol so late-resume and the remounted member sheet
+cannot be collapsed into one helper),
 `ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
 (open-transcript remount matches notification remap: a hidden 0.8 id
 moves onto `live_fold_target` even before `chats()` lists the live
@@ -574,12 +579,11 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on `fb08afe5` after wipe-tmp completeness. Next commit adds
-backup-policy unique-tmp wipe.
+Re-run on `47856509` after `display_members` (FFI remount roster).
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 189 passed on `fb08afe5` |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 191 passed on `47856509` |
 | `--test persistence` | 30 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
