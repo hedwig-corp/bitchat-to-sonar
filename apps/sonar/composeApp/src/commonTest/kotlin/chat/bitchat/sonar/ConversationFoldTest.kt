@@ -1886,6 +1886,28 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        // Live 0.9 empty after resume; leftover hist cache is already paint.
+        assertFalse(
+            familyTranscriptNeedsNetworkBackfill(
+                "group-09",
+                mapOf("group-08" to listOf("old from 0.8")),
+                folds,
+            ),
+        )
+        assertTrue(
+            familyTranscriptNeedsNetworkBackfill(
+                "group-09",
+                mapOf("group-08" to listOf("old from 0.8")),
+                emptyMap(),
+            ),
+        )
+        assertTrue(
+            familyTranscriptNeedsNetworkBackfill(
+                "group-09",
+                emptyMap(),
+                folds,
+            ),
+        )
     }
 
     @Test

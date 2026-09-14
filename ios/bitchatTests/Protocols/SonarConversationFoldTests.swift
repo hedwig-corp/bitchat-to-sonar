@@ -658,6 +658,27 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            !snFamilyTranscriptNeedsNetworkBackfill(
+                groupId: "group-09",
+                messagesByGroup: ["group-08": ["old from 0.8"]],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            snFamilyTranscriptNeedsNetworkBackfill(
+                groupId: "group-09",
+                messagesByGroup: ["group-08": ["old from 0.8"]],
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snFamilyTranscriptNeedsNetworkBackfill(
+                groupId: "group-09",
+                messagesByGroup: [:],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
             snUnreadForFoldFamily(
                 groupId: "group-09",
                 unreadByGroup: [:],

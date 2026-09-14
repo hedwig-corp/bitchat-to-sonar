@@ -600,6 +600,22 @@ func snBlankTranscriptFamilyRendered<Message>(
     ).contains { !(messagesByGroup[$0] ?? []).isEmpty }
 }
 
+/// First-open must not wait on relay when any fold-family cache already
+/// has rows. A live-only empty 0.9 row after resume used to keep the
+/// hydrating spinner up while recovered 0.8 history sat on hist.
+/// Compose `familyTranscriptNeedsNetworkBackfill`.
+func snFamilyTranscriptNeedsNetworkBackfill<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String]
+) -> Bool {
+    !snBlankTranscriptFamilyRendered(
+        groupId: groupId,
+        messagesByGroup: messagesByGroup,
+        historicalFolds: historicalFolds
+    )
+}
+
 /// Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
 /// Comparing overflow to the 500-row retained cap hid bak remainder after
 /// the first-paint extract (80). Page-size overflow or a short live FFI
@@ -6774,9 +6790,10 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
-    /// Listed 1:1 duplicates plus the hidden 0.8 sibling. Used for unread
-    /// suppress / mark-read — FFI `messages()` already unions the family, so
-    /// transcript hydration must not page these as a second source.
+    /// Listed 1:1 duplicates plus the hidden 0.8 sibling. Unread / mark-read
+    /// walk this set. First-open hydrate and load-older also page it: core
+    /// `fold_family(live)` may not exist yet after persist-folds, so a
+    /// live-only `messages_cursor_page` misses bak remainder.
     private func transcriptSourceIds(forGroupId groupId: String) -> [String] {
         let groups = directMarmotGroups(matchingGroupId: groupId)
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
@@ -10957,13 +10974,19 @@ final class SonarAppStore: ObservableObject {
             let hydratedGroupId = groupId
                 ?? sonarProfile.flatMap { self.marmotGroup(forNpub: $0.npub)?.id }
             if let hydratedGroupId {
+                // Page the hidden 0.8 sibling too. Listed 1:1 duplicates miss
+                // bak remainder after persist-folds. Compose
+                // `marmotMessagesForPeer` / `meshFoldTranscriptSourceIds`.
+                let paging = self.localTranscriptGroups(for: id)
                 let groups = self.directMarmotGroups(matchingGroupId: hydratedGroupId)
-                let sourceGroups = groups.isEmpty
-                    ? [MarmotService.MarmotGroup(id: hydratedGroupId, name: "", memberNpubs: [])]
-                    : groups
+                let sourceGroups = !paging.isEmpty
+                    ? paging
+                    : (groups.isEmpty
+                        ? [MarmotService.MarmotGroup(id: hydratedGroupId, name: "", memberNpubs: [])]
+                        : groups)
                 for group in sourceGroups {
                     // `loadLocalWhenConnected(groupId:)` already painted the
-                    // known source. Only hydrate additional folded groups here.
+                    // known source. Only hydrate additional family ids here.
                     if groupId == nil || group.id != groupId {
                         await self.marmot.loadLocalPage(groupId: group.id, mode: .newestPage)
                     }
@@ -10977,12 +11000,16 @@ final class SonarAppStore: ObservableObject {
             if let hydratedGroupId {
                 Task { await self.marmot.preferCatchupGroup(hydratedGroupId) }
             }
+            let folds = (self.defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             let needsHistoryBackfill = hydratedGroupId.map {
-                let groups = self.directMarmotGroups(matchingGroupId: $0)
-                let sourceGroups = groups.isEmpty
-                    ? [MarmotService.MarmotGroup(id: $0, name: "", memberNpubs: [])]
-                    : groups
-                return sourceGroups.contains { self.marmot.messagesByGroup[$0.id]?.isEmpty ?? true }
+                // Live 0.9 is empty after resume; leftover hist cache is
+                // already paint. Do not wait on relay for that. Compose
+                // blank recovery uses `blankTranscriptKnownNonEmpty`.
+                snFamilyTranscriptNeedsNetworkBackfill(
+                    groupId: $0,
+                    messagesByGroup: self.marmot.messagesByGroup,
+                    historicalFolds: folds
+                )
             } ?? false
             if !needsHistoryBackfill {
                 self.localHydratingDMs.remove(id)

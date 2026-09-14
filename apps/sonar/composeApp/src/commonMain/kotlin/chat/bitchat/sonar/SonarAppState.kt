@@ -759,6 +759,16 @@ internal fun blankTranscriptKnownNonEmpty(
     (latestByChat[id] ?: 0L) > 0L || (messageCountByChat[id] ?: 0L) > 0L
 }
 
+/** First-open must not wait on relay when any fold-family cache already
+ *  has rows. iOS `openDM` used a live-only empty check
+ *  (`snFamilyTranscriptNeedsNetworkBackfill`). */
+internal fun familyTranscriptNeedsNetworkBackfill(
+    chatId: String,
+    messagesByChat: Map<String, List<*>>,
+    historicalFolds: Map<String, String>,
+): Boolean = transcriptSourceIds(chatId, emptyList(), historicalFolds)
+    .all { messagesByChat[it].isNullOrEmpty() }
+
 /** Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
  *  Comparing overflow to the 500-row retained cap hid bak remainder after
  *  the first-paint extract (80). Page-size overflow or a short live FFI

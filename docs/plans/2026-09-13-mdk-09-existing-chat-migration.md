@@ -1024,6 +1024,16 @@ those live / resolved ids through the fold family (iOS
 `ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
 `SonarConversationFoldTests` `snMeshFoldTranscriptSourceIds`.
 
+iOS openDM hydrate hole closed after this commit: extra newest-page
+and `needsHistoryBackfill` used listed 1:1 groups only. After
+persist-folds live is empty while recovered rows sit on hist, so first
+open waited on relay and never newest-paged bak remainder. Extra hydrate
+now pages `localTranscriptGroups`; backfill waits only when the fold
+family cache is empty (`snFamilyTranscriptNeedsNetworkBackfill` /
+`familyTranscriptNeedsNetworkBackfill`). Pins:
+`ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
+`SonarConversationFoldTests` `snFamilyTranscriptNeedsNetworkBackfill`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
