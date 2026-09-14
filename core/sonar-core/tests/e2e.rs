@@ -2564,3 +2564,76 @@ async fn persist_folds_lost_core_sidecar_invite_family_sees_hist_requests() {
         "invite_mint_group must restore the bind instead of rejecting hist as unresumed"
     );
 }
+
+/// Leftover-member / persist-folds sends may still name the recovered
+/// 0.8 id. After the JSON sidecar is lost, `resolve_send_group` must
+/// restore the recorded bind instead of minting a second 0.9 group and
+/// stealing hist via `record_resume_fold`.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_send_on_hist_reuses_live() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live)
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    alice
+        .send_text(&historical, "still the same room")
+        .await
+        .expect("send on hist after sidecar loss");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "send on hist must reuse the first live sibling"
+    );
+    let lives = alice.groups().expect("groups");
+    assert_eq!(
+        lives.len(),
+        1,
+        "send on hist must not mint a second 0.9 room"
+    );
+    assert_eq!(lives[0].id, live);
+    let on_live = alice.messages(&live).expect("live family");
+    assert!(
+        on_live.iter().any(|m| m.content == "still the same room"),
+        "the send must land on the existing live sibling"
+    );
+}

@@ -7133,12 +7133,16 @@ impl SonarClient {
         if self.engine.is_dropped(group_id) {
             return Err(Error::InvalidInput("this chat was deleted".into()));
         }
+        // Host persist-folds and leftover-member sends may still name the
+        // recovered 0.8 id. A lost JSON sidecar made `live_fold_target`
+        // miss, so this minted a second 0.9 group and
+        // `record_resume_fold` stole hist off the first live sibling.
+        self.restore_recorded_folds_touching(group_id);
         if self.engine.is_live_group(group_id)? {
             // Persist-folds can remount onto this live id after the core
             // sidecar was lost. Restore a recorded index bind first
             // (empty-desc rooms cannot use topic-match). Then rebuild
             // leftover-member invite so `missing_resume_peers` sees hist.
-            self.restore_recorded_folds_touching(group_id);
             self.maybe_fold_new_group(group_id);
             self.maybe_add_late_resume_members(group_id).await;
             return Ok(group_id.clone());
