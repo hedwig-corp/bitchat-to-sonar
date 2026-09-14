@@ -646,13 +646,13 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on `d5e2a5b6` after named-pair incoming fold.
+Re-run on `0486044e` after concurrent-resume fold pin.
 
 | Gate | Result |
 | --- | --- |
 | `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 201 passed on `d5e2a5b6` |
-| `--lib` `--` `incoming_09_` | 8 passed on `d5e2a5b6` |
-| `--lib` `--` `historical_fold` `copy_summary` | 14 passed on `d5e2a5b6` |
+| `--lib` `--` `incoming_09_` | 9 passed on `0486044e` |
+| `--lib` `--` `historical_fold` `copy_summary` | 14 passed on `0486044e` (`historical_fold` 12) |
 | `--test persistence` | 30 passed on `d5e2a5b6` |
 | `--test group_invites` | 17 passed earlier on this branch |
 | `--test failed_events` | 1 passed earlier on this branch |
