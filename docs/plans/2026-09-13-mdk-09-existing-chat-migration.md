@@ -472,6 +472,10 @@ union the fold family so a pre-migration `sinvite1` token still
 surfaces on the live group-info screen; `approve_join_request` commits
 on `resolve_send_group`),
 `invite_link::tests::fold_family_unions_historical_invite_sidecar`,
+`account_backup::tests::write_read_package_files_roundtrips_invite_sidecar`
+(v2 backup packs `.sonar-invites.json` so nsec restore keeps minted
+`sinvite1` secrets and pending join requests),
+`persistence::wipe_removes_the_database` (wipe deletes the invite sidecar),
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
@@ -535,9 +539,11 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after invite-fold union. Lib migrate/fold/
-backup/client was **179** before the invite pin; `group_invites` **17**.
-Full rust suite last verified on `e218e2f0`.
+Re-run on this cloud agent after packing `.sonar-invites.json` into
+v2 backup. On `e36f8e85`: persistence **30**, media **4**, failed_events
+**1**, sonar-sim **5**, recovered_08 **7**, group_invites **17**, lib
+migrate/fold/backup/client **179**. Invite-sidecar backup pin added
+after that.
 
 | Gate | Result |
 | --- | --- |

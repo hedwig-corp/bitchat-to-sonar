@@ -883,6 +883,7 @@ fn backup_sidecar_suffixes() -> &'static [&'static str] {
         crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
         crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX,
         crate::marmot::PARKED_INVITES_FILE_SUFFIX,
+        crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX,
         crate::marmot::DROPPED_GROUPS_FILE_SUFFIX,
         crate::outbox::OUTBOX_STATE_FILE_SUFFIX,
         crate::marmot::SYNC_STATE_FILE_SUFFIX,
@@ -2983,6 +2984,43 @@ mod tests {
             sidecar_files: vec![("../escape.json".into(), b"no".to_vec())],
         };
         assert!(encode_plaintext(&package).is_err());
+    }
+
+    #[test]
+    fn write_read_package_files_roundtrips_invite_sidecar() {
+        let dir = tempdir().unwrap();
+        let mint_db = dir.path().join("mint.sqlite");
+        let group_id = crate::GroupId::new([0x08u8; 16]);
+        let store = crate::invite_link::InviteLinkStore::load(Some(
+            crate::invite_link::invite_link_state_path_for_db(&mint_db),
+        ));
+        let admin = crate::identity::Identity::generate();
+        let token = store
+            .create_link(&group_id, "standup", &admin, Vec::new())
+            .unwrap();
+        let decoded = crate::invite_link::decode_invite_token(&token).unwrap();
+        let hash = crate::invite_link::sha256(&decoded.invite_secret);
+        let invite_bytes =
+            std::fs::read(crate::invite_link::invite_link_state_path_for_db(&mint_db)).unwrap();
+        let package = AccountBackupPackage {
+            db_key_hex: "ef".repeat(32),
+            db_bytes: b"db-body".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![(
+                crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX.to_string(),
+                invite_bytes,
+            )],
+        };
+        let restored = dir.path().join("restored.sqlite");
+        write_account_backup_package(&restored, &package).unwrap();
+        let restored_store = crate::invite_link::InviteLinkStore::load(Some(
+            crate::invite_link::invite_link_state_path_for_db(&restored),
+        ));
+        assert!(
+            restored_store.validate_secret(&group_id, &hash),
+            "nsec restore must keep minted invite secrets"
+        );
+        assert_eq!(restored_store.active_links(&group_id).len(), 1);
     }
 
     #[test]

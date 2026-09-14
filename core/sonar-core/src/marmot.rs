@@ -3423,6 +3423,7 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
         TRANSCRIPT_FILE_SUFFIX,
         PARKED_INVITES_FILE_SUFFIX,
+        crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX,
         DROPPED_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
@@ -3437,6 +3438,11 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{KEY_PACKAGE_SLOT_FILE_SUFFIX}.tmp")));
+    paths.push(base.with_file_name(format!(
+        "{name}{}{}",
+        crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX,
+        ".tmp"
+    )));
     paths
 }
 
