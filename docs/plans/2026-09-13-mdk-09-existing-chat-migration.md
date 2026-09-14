@@ -611,9 +611,11 @@ a live 0.9 banner). A recovered room with no
 live MLS group can still be deleted: Leave degrades to a local family purge. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
-(new DM with the same known peer) is the same hazard and must skip
-recovered rooms; rooms resume only via `resolve_send_group`. Hosts
-still collapse a *person* by npub (R-003 / R-045). Peer still on 0.8:
+must still skip folding a recovered room onto a welcomer 1:1 (R-045).
+Rooms fold onto a matching live non-DM (exact 3+ members, unique
+subset, or named 2-person name+member match) on incoming welcome
+and via `resolve_send_group`. Hosts still collapse a *person* by
+npub (R-003 / R-045). Peer still on 0.8:
 `KeyPackageNotFound` → "Waiting for them to update Sonar". After a later
 successful resume, that banner must clear: FFI hide drops listed 1:1
 duplicates back to 1 (rooms never have them), so the host treats a
@@ -642,17 +644,19 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on `47856509` after `display_members` (FFI remount roster).
+Re-run on `d5e2a5b6` after named-pair incoming fold.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 191 passed on `47856509` |
-| `--test persistence` | 30 passed |
-| `--test group_invites` | 17 passed |
-| `--test failed_events` | 1 passed |
-| `--test media` | 4 passed |
-| `-p sonar-sim` | 5 passed |
-| `--test e2e` `recovered_08` | 7 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 201 passed on `d5e2a5b6` |
+| `--lib` `--` `incoming_09_` | 8 passed on `d5e2a5b6` |
+| `--lib` `--` `historical_fold` `copy_summary` | 14 passed on `d5e2a5b6` |
+| `--test persistence` | 30 passed earlier on this branch |
+| `--test group_invites` | 17 passed earlier on this branch |
+| `--test failed_events` | 1 passed earlier on this branch |
+| `--test media` | 4 passed earlier on this branch |
+| `-p sonar-sim` | 5 passed earlier on this branch |
+| `--test e2e` `recovered_08` | 7 passed on `d5e2a5b6` |
 | Compose `SonarNotificationHandoffTest` + `ConversationFoldTest` | passed earlier on this branch |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with
@@ -695,8 +699,8 @@ auto-join as `Incoming::GroupUpdated` and parked 2-member Accept uses
 local `publish_group_creation` did), so a peer who already updated
 could start a new 0.9 DM and leave the recovered 0.8 row listed. Hosts
 dedupe 1:1s by npub while both ids are listed, but a send on the 0.8 id
-then minted a *second* 0.9 group. Rooms still skip inside
-`maybe_fold_new_group` (R-045). Pins:
+then minted a *second* 0.9 group. Recovered rooms still must not
+fold onto a welcomer 1:1 (R-045). Pins:
 `client::tests::incoming_09_dm_welcome_folds_recovered_08_direct_chat`.
 
 Incoming-DM unread hole closed after this commit: `copy_summary` used to
