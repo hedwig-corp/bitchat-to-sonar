@@ -2512,6 +2512,19 @@ internal fun verifiedForFoldFamily(
 ): Boolean = transcriptSourceIds(chatId, listedDuplicateIds, historicalFolds)
     .any { it in verifiedIds }
 
+/** Preview sheet stays up when remount rewrites chatId to live.
+ *  iOS `snPendingMediaPreviewBelongsToChat`. */
+internal fun pendingMediaPreviewBelongsToChat(
+    previewChatId: String,
+    screenId: String,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    if (openedConversationIdMatches(previewChatId, screenId)) return true
+    val previewBare = previewChatId.removePrefix("marmot:")
+    val screenBare = screenId.removePrefix("marmot:")
+    return conversationsMatchFoldFamily(previewBare, screenBare, historicalFolds)
+}
+
 /** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
 internal fun conversationsMatchFoldFamily(
     left: String,
@@ -10749,6 +10762,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
     private var mediaPreviewGeneration = 0L
 
+    fun pendingMediaPreviewsMatching(chatId: String): List<PendingMediaPreview> =
+        pendingMediaPreviews.filter {
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = it.chatId,
+                screenId = chatId,
+                historicalFolds = historicalFoldMap,
+            )
+        }
+
     private fun nextMediaPreviewGeneration(): Long {
         mediaPreviewGeneration += 1
         return mediaPreviewGeneration
@@ -10821,14 +10843,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         val items = if (chatId == null) {
             pendingMediaPreviews
         } else {
-            pendingMediaPreviews.filter { it.chatId == chatId }
+            pendingMediaPreviewsMatching(chatId)
         }
         if (items.isEmpty()) return
         nextMediaPreviewGeneration()
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
-            pendingMediaPreviews.filterNot { it.chatId == chatId }
+            pendingMediaPreviews.filterNot {
+                pendingMediaPreviewBelongsToChat(
+                    previewChatId = it.chatId,
+                    screenId = chatId,
+                    historicalFolds = historicalFoldMap,
+                )
+            }
         }
         scope.launch {
             // Finalize every staged item IN ORDER (lazy jpeg re-encode happens
@@ -10890,12 +10918,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         val toRemove = if (chatId == null) {
             pendingMediaPreviews
         } else {
-            pendingMediaPreviews.filter { it.chatId == chatId }
+            pendingMediaPreviewsMatching(chatId)
         }
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
-            pendingMediaPreviews.filterNot { it.chatId == chatId }
+            pendingMediaPreviews.filterNot {
+                pendingMediaPreviewBelongsToChat(
+                    previewChatId = it.chatId,
+                    screenId = chatId,
+                    historicalFolds = historicalFoldMap,
+                )
+            }
         }
         deletePreviewTempFilesAsync(toRemove)
     }

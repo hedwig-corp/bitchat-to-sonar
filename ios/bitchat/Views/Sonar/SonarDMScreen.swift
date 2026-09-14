@@ -527,14 +527,14 @@ struct SonarDMScreenContent: View {
 
     private var mediaPreviewPresented: Binding<Bool> {
         Binding(
-            get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
+            get: { !store.pendingMediaPreviewsMatching(peerId).isEmpty },
             set: { if !$0 { store.cancelPreview(peerId: peerId) } }
         )
     }
 
     @ViewBuilder
     private var mediaPreviewContent: some View {
-        let previews = store.pendingMediaPreviews.filter { $0.peerId == peerId }
+        let previews = store.pendingMediaPreviewsMatching(peerId)
         if !previews.isEmpty {
             MediaSendPreviewLoaderView(
                 previews: previews,

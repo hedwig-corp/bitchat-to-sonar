@@ -414,7 +414,31 @@ func snNotificationLiveFoldTarget(
     )
 }
 
-/// Same recovered conversation under either the hidden 0.8 or live 0.9 id.
+/// Preview sheet stays up when remount rewrites `peerId` to live while
+/// iPhone still paints `.dm(hist)`. Compose `pendingMediaPreviewBelongsToChat`.
+func snPendingMediaPreviewBelongsToChat(
+    previewPeerId: String,
+    chatId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    historicalFolds: [String: String]
+) -> Bool {
+    if snConversationsMatchFoldFamily(
+        left: previewPeerId,
+        right: chatId,
+        historicalFolds: historicalFolds
+    ) { return true }
+    if snOpenedConversationIdMatches(previewPeerId, openedConversationId)
+        && snOpenedConversationIdMatches(chatId, openedConversationPaneId) {
+        return true
+    }
+    if snOpenedConversationIdMatches(previewPeerId, openedConversationPaneId)
+        && snOpenedConversationIdMatches(chatId, openedConversationId) {
+        return true
+    }
+    return false
+}
+
 func snConversationsMatchFoldFamily(
     left: String,
     right: String,
@@ -4572,12 +4596,30 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    func pendingMediaPreviewsMatching(_ chatId: String) -> [PendingMediaPreview] {
+        pendingMediaPreviews.filter { pendingMediaPreviewMatches($0, chatId: chatId) }
+    }
+
+    private func pendingMediaPreviewMatches(
+        _ preview: PendingMediaPreview,
+        chatId: String
+    ) -> Bool {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snPendingMediaPreviewBelongsToChat(
+            previewPeerId: preview.peerId,
+            chatId: chatId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            historicalFolds: folds
+        )
+    }
+
     func confirmSendPreview(peerId: String? = nil) {
-        let items = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
+        let items = peerId.map { pendingMediaPreviewsMatching($0) } ?? pendingMediaPreviews
         guard !items.isEmpty else { return }
         _ = nextMediaPreviewGeneration()
         if let peerId {
-            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+            pendingMediaPreviews.removeAll { pendingMediaPreviewMatches($0, chatId: peerId) }
         } else {
             pendingMediaPreviews = []
         }
@@ -4682,9 +4724,9 @@ final class SonarAppStore: ObservableObject {
 
     func cancelPreview(peerId: String? = nil) {
         _ = nextMediaPreviewGeneration()
-        let toRemove = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
+        let toRemove = peerId.map { pendingMediaPreviewsMatching($0) } ?? pendingMediaPreviews
         if let peerId {
-            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+            pendingMediaPreviews.removeAll { pendingMediaPreviewMatches($0, chatId: peerId) }
         } else {
             pendingMediaPreviews = []
         }

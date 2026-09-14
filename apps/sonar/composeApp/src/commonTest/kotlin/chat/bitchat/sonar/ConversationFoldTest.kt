@@ -1249,6 +1249,24 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun pendingMediaPreviewBelongsToRemountedLiveSibling() {
+        assertTrue(
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = "marmot:group-09",
+                screenId = "marmot:group-08",
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertFalse(
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = "marmot:other",
+                screenId = "marmot:group-08",
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+    }
+
+    @Test
     fun remountShouldPreserveOpenTranscriptRouteKeepsPaintedDm() {
         assertTrue(
             remountShouldPreserveOpenTranscriptRoute(

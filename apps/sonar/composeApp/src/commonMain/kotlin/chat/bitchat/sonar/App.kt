@@ -2290,7 +2290,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             modifier = Modifier.matchParentSize()
         )
     }
-    val chatPreviews = state.pendingMediaPreviews.filter { it.chatId == screen.id }
+    val chatPreviews = state.pendingMediaPreviewsMatching(screen.id)
     if (chatPreviews.isNotEmpty()) {
         val previewKey = chatPreviews.joinToString("|") { it.tempPath }
         val loaded by androidx.compose.runtime.produceState<List<SendPreviewItem>?>(null, previewKey) {
