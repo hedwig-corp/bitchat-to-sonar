@@ -641,6 +641,20 @@ struct SonarConversationFoldTests {
                 "group-09", "marmot:group-09",
             ]
         )
+        #expect(snLeaveFamilyCorePurgeIds(leaveId: "group-09", historicalFolds: wakeFolds) == ["group-08"])
+        #expect(snLeaveFamilyCorePurgeIds(leaveId: "group-09", historicalFolds: [:]).isEmpty)
+        #expect(
+            snDeletedConversationCorePurgeIds(
+                listedIds: ["group-09"],
+                historicalFolds: wakeFolds
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snDeletedConversationCorePurgeIds(
+                listedIds: ["group-09"],
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
         #expect(SonarNSEDecoratePolicy.historicalFoldsUserDefaultsKey == snHistoricalFoldsDefaultsKey)
         #expect(
             Set(snMeshNotificationSuppressIds(

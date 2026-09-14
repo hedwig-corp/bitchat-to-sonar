@@ -7294,6 +7294,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.saveBlob(MUTE_BLOB_KEY, encodeMuteMap(mutedUntilByChat))
     }
 
+    /** Host fold blob plus FFI `fold_aliases` for one mutating action.
+     *  Same merge as wake mute — unmute / leave / delete must see a
+     *  hidden 0.8 sibling before persist-folds rewrites the blob. */
+    private fun mergeActionHistoricalFolds(actionIds: Collection<String>): Map<String, String> =
+        wakeMuteHistoricalFolds(
+            persisted = historicalFoldMap.toMap(),
+            listedIds = actionIds.map { it.trim() }.filter { it.isNotBlank() },
+            foldAliases = { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+
+    private fun adoptActionHistoricalFolds(folds: Map<String, String>) {
+        if (folds == historicalFoldMap) return
+        historicalFoldMap.clear()
+        historicalFoldMap.putAll(folds)
+    }
+
     /** All ids a chat's alerts can arrive under (mirrors the folded-id set used
      *  by [clearNotificationsForChat]): the row id itself, duplicate direct
      *  groups, folded White Noise groups, and the mesh row of a folded group. */
@@ -7326,17 +7343,23 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  killed-app push-wake drain, which cannot resolve folding — match the
      *  mute by direct lookup. */
     fun muteChat(chatId: String, durationSecs: Long?) {
+        adoptActionHistoricalFolds(mergeActionHistoricalFolds(listOf(chatId) + muteIdsFor(chatId)))
         val now = SonarClock.nowSecs()
         val until = muteUntilFor(durationSecs, now)
         mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) +
             muteIdsFor(chatId).associateWith { until }
         persistMutes()
+        persistHistoricalFolds()
     }
 
     fun unmuteChat(chatId: String) {
         val now = SonarClock.nowSecs()
-        mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) - muteIdsFor(chatId)
+        val folds = mergeActionHistoricalFolds(listOf(chatId) + muteIdsFor(chatId))
+        val family = muteIdsFor(chatId) + foldFamilyIds(chatId, folds)
+        mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) - family
         persistMutes()
+        adoptActionHistoricalFolds(folds)
+        persistHistoricalFolds()
     }
 
     // ── Trill (nudge) — docs/SONAR-TRILL.md ──
@@ -8806,13 +8829,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         // the same peer; delete the whole set so hidden duplicates don't resurface.
         // After an MDK 0.8→0.9 resume the hidden 0.8 sibling must leave too,
         // or the next cold-start snapshot can resurrect a deleted room.
+        val folds = mergeActionHistoricalFolds(
+            (if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)) + chatId,
+        )
+        adoptActionHistoricalFolds(folds)
         val deleteIds = (
             if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
-            ) + foldFamilyIds(chatId, historicalFoldMap)
+            ) + foldFamilyIds(chatId, folds)
         val deleteIdSet = deleteIds.toSet()
         // Capture before forget: persist-folds sidecar is the only name
         // core leave has for the hidden 0.8 sibling.
-        val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, historicalFoldMap)
+        val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, folds)
         forgetHistoricalFolds(deleteIdSet)
         chats = chats.filterNot { it.id in deleteIdSet }
         chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it !in deleteIdSet }
@@ -8869,8 +8896,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                         peerIdForMarmotGroup(group)?.let { it in aliases } == true
                 }
             ).distinctBy { it.id }
+        val meshFolds = mergeActionHistoricalFolds(foldedGroups.map { it.id })
+        adoptActionHistoricalFolds(meshFolds)
         val foldedGroupIdsToDelete = foldedGroups.flatMapTo(hashSetOf()) { group ->
-            foldFamilyIds(group.id, historicalFoldMap) + group.id
+            foldFamilyIds(group.id, meshFolds) + group.id
         }
         aliases.forEach { alias ->
             meshChats.remove(alias)
@@ -8921,7 +8950,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             aliases.forEach { MessageStore.deleteMeshDm(it) }
             val purgeIds = deletedConversationCorePurgeIds(
                 foldedGroupIdsToDelete,
-                historicalFoldMap,
+                meshFolds,
             )
             for (id in purgeIds) {
                 runCatching { SonarCore.deleteChat(id) }

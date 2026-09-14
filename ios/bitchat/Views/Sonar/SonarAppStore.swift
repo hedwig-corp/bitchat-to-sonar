@@ -12733,12 +12733,35 @@ final class SonarAppStore: ObservableObject {
     /// `marmot:`-prefixed), and — for direct chats only — the peer's npub
     /// (the push drain path has no group id). Group-chat mutes never store an
     /// npub so muting a group cannot silence the member's direct chat.
-    private func muteKeys(forChatId id: String) -> [String] {
+    /// Host blob plus FFI `fold_aliases` for mute / leave / delete.
+    /// Same merge as wake mute so a hidden 0.8 sibling is visible before
+    /// persist-folds rewrites the App Group map.
+    private func mergedActionHistoricalFolds(for id: String) async -> [String: String] {
+        let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let bare = snBareMarmotGroupId(id)
+        let listed = [bare, id].filter { !$0.isEmpty }
+        var aliasesById: [String: [String]] = [:]
+        var liveById: [String: String] = [:]
+        for actionId in Set(listed) {
+            aliasesById[actionId] = await marmot.foldAliases(groupId: actionId)
+            if let live = await marmot.liveFoldTarget(groupId: actionId) {
+                liveById[actionId] = live
+            }
+        }
+        return snWakeMuteHistoricalFolds(
+            persisted: persisted,
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
+    }
+
+    private func muteKeys(forChatId id: String, historicalFolds folds: [String: String]? = nil) -> [String] {
         var keys: Set<String> = [id, chatAlertKey(id)]
         for alias in meshPeerAliases(for: id) {
             keys.insert(alias)
         }
-        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let folds = folds ?? (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let bareId = id.hasPrefix(Self.marmotIDPrefix)
             ? String(id.dropFirst(Self.marmotIDPrefix.count))
             : id
@@ -12791,12 +12814,37 @@ final class SonarAppStore: ObservableObject {
         SonarChatMuteStore.shared.mute(keys: muteKeys(forChatId: id), until: until)
         invalidateHomeDMRows()
         objectWillChange.send()
+        Task { @MainActor in
+            let folds = await mergedActionHistoricalFolds(for: id)
+            SonarChatMuteStore.shared.mute(
+                keys: muteKeys(forChatId: id, historicalFolds: folds),
+                until: until
+            )
+            let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if folds != persisted {
+                snPersistHistoricalFolds(folds, to: defaults)
+            }
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
     }
 
     func unmuteChat(_ id: String) {
         SonarChatMuteStore.shared.unmute(keys: muteKeys(forChatId: id))
         invalidateHomeDMRows()
         objectWillChange.send()
+        Task { @MainActor in
+            let folds = await mergedActionHistoricalFolds(for: id)
+            SonarChatMuteStore.shared.unmute(
+                keys: muteKeys(forChatId: id, historicalFolds: folds)
+            )
+            let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if folds != persisted {
+                snPersistHistoricalFolds(folds, to: defaults)
+            }
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
     }
 
     /// A Marmot group folded into a Sonar peer's conversation replies on
@@ -13766,6 +13814,20 @@ final class SonarAppStore: ObservableObject {
     @discardableResult
     private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia, messageId: String) -> Bool {
         let conversationId = callConversationId(convId)
+        if isContactBlocked(conversationId, npub: callNpub(conversationId) ?? "") {
+            SecureLogger.debug(
+                "SonarCall: ignoring blocked call control convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16))",
+                category: .session
+            )
+            if case let .offer(callId, _, _, _) = ctrl {
+                _ = sendCallControl(
+                    convId,
+                    callEncodeAnswer(callId: callId, answer: .decline, nodeAddrB64: ""),
+                    via: via
+                )
+            }
+            return true
+        }
         if case let .offer(callId, _, _, _) = ctrl, !canCall(conversationId) {
             if shouldDeferOfferForSonarDescriptor(conversationId) {
                 SecureLogger.debug("SonarCall: deferring offer until Sonar descriptor lookup completes convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16))", category: .session)
@@ -13903,16 +13965,12 @@ final class SonarAppStore: ObservableObject {
             // resurface after the next refresh. After an MDK 0.8→0.9 resume the
             // hidden 0.8 sibling must leave too, or the next cold-start snapshot
             // can resurrect a deleted room.
-            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let blobFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
-            let family = snFoldFamilyIds(id: groupId, historicalFolds: folds)
+            let family = snFoldFamilyIds(id: groupId, historicalFolds: blobFolds)
             let groupIds = Array(Set((matching.isEmpty ? [groupId] : matching) + family))
-            let familyPurgeIds = snLeaveFamilyCorePurgeIds(
-                leaveId: groupId,
-                historicalFolds: folds
-            )
-            let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: Set(groupIds))
-            if nextFolds != folds {
+            let nextFolds = snPurgedHistoricalFolds(blobFolds, deletedIds: Set(groupIds))
+            if nextFolds != blobFolds {
                 snPersistHistoricalFolds(nextFolds, to: defaults)
             }
             for gid in groupIds {
@@ -13926,14 +13984,32 @@ final class SonarAppStore: ObservableObject {
             }
             objectWillChange.send()
             Task { @MainActor in
+                let folds = await mergedActionHistoricalFolds(for: groupId)
+                let mergedPurge = snLeaveFamilyCorePurgeIds(
+                    leaveId: groupId,
+                    historicalFolds: folds
+                )
+                let mergedDelete = snDeletedConversationCorePurgeIds(
+                    listedIds: groupIds,
+                    historicalFolds: folds
+                )
+                for gid in mergedDelete where !groupIds.contains(gid) {
+                    discardRetainedConversation(gid)
+                    forgetMarmotGroupMappings(forGroupId: gid)
+                    marmot.dropGroupFromLocalState(gid)
+                }
+                let purged = snPurgedHistoricalFolds(folds, deletedIds: Set(mergedDelete + mergedPurge))
+                if purged != folds {
+                    snPersistHistoricalFolds(purged, to: defaults)
+                }
                 do {
                     if shouldLeave {
                         try await marmot.leaveGroup(groupId)
-                        for gid in familyPurgeIds {
+                        for gid in mergedPurge {
                             try await marmot.deleteGroup(gid)
                         }
                     } else {
-                        for gid in groupIds { try await marmot.deleteGroup(gid) }
+                        for gid in mergedDelete { try await marmot.deleteGroup(gid) }
                     }
                 } catch {
                     // Optimistic hide already ran — reload from durable state so a
@@ -13981,10 +14057,25 @@ final class SonarAppStore: ObservableObject {
             return false
         }
         objectWillChange.send()
-        if !meshPurgeIds.isEmpty {
+        if !meshPurgeIds.isEmpty || !foldedGroups.isEmpty {
             Task { @MainActor in
+                var purge = Set(meshPurgeIds)
+                for group in foldedGroups {
+                    let folds = await mergedActionHistoricalFolds(for: group.id)
+                    purge.formUnion(
+                        snDeletedConversationCorePurgeIds(
+                            listedIds: [group.id],
+                            historicalFolds: folds
+                        )
+                    )
+                }
+                for gid in purge where !meshPurgeIds.contains(gid) {
+                    discardRetainedConversation(gid)
+                    forgetMarmotGroupMappings(forGroupId: gid)
+                    marmot.dropGroupFromLocalState(gid)
+                }
                 do {
-                    for gid in meshPurgeIds { try await marmot.deleteGroup(gid) }
+                    for gid in purge { try await marmot.deleteGroup(gid) }
                 } catch {
                     _ = await marmot.loadLocalSummaries(resolveMembers: false)
                     showToast("Couldn't delete chat: \(error.localizedDescription)")

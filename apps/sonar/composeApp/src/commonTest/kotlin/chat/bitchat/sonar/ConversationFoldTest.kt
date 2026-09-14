@@ -2029,6 +2029,22 @@ class ConversationFoldTest {
                 liveFoldTarget = { null },
             ),
         )
+        val mutesOnBoth = mapOf("group-08" to 9_999L, "group-09" to 9_999L)
+        assertEquals(emptyMap(), mutesOnBoth - foldFamilyIds("group-09", folds))
+        assertEquals(
+            mapOf("group-08" to 9_999L),
+            mutesOnBoth - foldFamilyIds("group-09", emptyMap()),
+        )
+        assertEquals(listOf("group-08"), leaveFamilyCorePurgeIds("group-09", folds))
+        assertEquals(emptyList(), leaveFamilyCorePurgeIds("group-09", emptyMap()))
+        assertEquals(
+            listOf("group-08", "group-09"),
+            deletedConversationCorePurgeIds(listOf("group-09"), folds),
+        )
+        assertEquals(
+            listOf("group-09"),
+            deletedConversationCorePurgeIds(listOf("group-09"), emptyMap()),
+        )
     }
 
     @Test
