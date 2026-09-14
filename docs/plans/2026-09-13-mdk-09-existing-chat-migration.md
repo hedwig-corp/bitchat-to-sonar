@@ -367,14 +367,13 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on `13c0fd47` (this cloud agent) after R-045 (`is_direct` on
-core, FFI, and both hosts). All green.
+Re-run on `385e2b2d` (this cloud agent) after the first-paint `isDirect`
+snapshot pins. All green.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `mdk08_migrate` + `historical_fold` + `account_backup` | 93 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 164 passed |
 | `--test persistence` | 28 passed |
-| `--lib client::tests` | 72 passed |
 | `--test e2e` `recovered_08` | 7 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
@@ -382,6 +381,10 @@ core, FFI, and both hosts). All green.
 | `-p sonar-sim` | 5 passed |
 | Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 29 passed (includes first-paint `isDirect` pins) |
 | `scripts/check-regression-ledger.sh` | 231 citations |
+
+CI on `385e2b2d`: Compose JVM unit tests and TranscriptEngine SPM are green.
+Rust core, iOS app build, and Android device tests were still running when
+this was recorded.
 
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
