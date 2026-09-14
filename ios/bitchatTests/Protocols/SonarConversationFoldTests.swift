@@ -693,6 +693,27 @@ struct SonarConversationFoldTests {
             ).isEmpty
         )
         #expect(
+            snMediaFetchGroupIds(startGroupId: "group-09", historicalFolds: [:]) == ["group-09"]
+        )
+        #expect(
+            snMediaFetchGroupIds(startGroupId: "group-09", historicalFolds: wakeFolds)
+                == ["group-09", "group-08"]
+        )
+        #expect(
+            !snNotificationClearIds(
+                conversationId: "group-09",
+                relatedIds: [],
+                historicalFolds: [:]
+            ).contains("group-08")
+        )
+        #expect(
+            snNotificationClearIds(
+                conversationId: "group-09",
+                relatedIds: [],
+                historicalFolds: wakeFolds
+            ).isSuperset(of: ["group-09", "group-08"])
+        )
+        #expect(
             SNUnreadCounts.remountFoldedUnread(
                 next: [:],
                 previous: [:],

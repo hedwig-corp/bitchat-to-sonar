@@ -10570,7 +10570,9 @@ final class SonarAppStore: ObservableObject {
     /// that is not yet in `messagesByGroup` still lands in the exclude set.
     /// Compose `existingPublishedMediaUrls`.
     private func existingPublishedMediaUrls(groupId: String) async -> Set<String> {
-        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        // First send after resume can mint live 0.9 before persist-folds.
+        // A live-only exclude set misses recovered 0.8 blossom URLs.
+        let folds = await adoptMergedActionFolds(for: [groupId])
         let ids = snMediaFetchGroupIds(
             startGroupId: groupId,
             historicalFolds: folds
@@ -11443,7 +11445,7 @@ final class SonarAppStore: ObservableObject {
                     guard !item.groupId.isEmpty, !item.url.isEmpty else {
                         throw MarmotService.ServiceError.invalidInput("attachment has no download route")
                     }
-                    let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+                    let folds = await self.adoptMergedActionFolds(for: [item.groupId])
                     let groupIds = snMediaFetchGroupIds(
                         startGroupId: item.groupId,
                         historicalFolds: folds
@@ -13535,14 +13537,30 @@ final class SonarAppStore: ObservableObject {
                 ids.insert(Self.marmotIDPrefix + mapped)
             }
         }
-        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         NotificationService.shared.clearNotifications(
             forConversationIds: snNotificationClearIds(
                 conversationId: conversationId,
                 relatedIds: Array(ids),
-                historicalFolds: folds
+                historicalFolds: persisted
             )
         )
+        let seed = marmotGroupId(conversationId) ?? conversationId
+        if snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted)
+            && !firstOpenFoldMergeSeeds.contains(snBareMarmotGroupId(seed))
+        {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let folds = await self.adoptMergedActionFolds(for: [conversationId, seed])
+                NotificationService.shared.clearNotifications(
+                    forConversationIds: snNotificationClearIds(
+                        conversationId: conversationId,
+                        relatedIds: Array(ids),
+                        historicalFolds: folds
+                    )
+                )
+            }
+        }
     }
 
     func pop() {

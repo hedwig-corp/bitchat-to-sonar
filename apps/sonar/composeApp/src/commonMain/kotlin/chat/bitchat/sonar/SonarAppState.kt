@@ -7575,6 +7575,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Dismiss OS notifications for this chat and every folded/duplicate id. */
     private fun clearNotificationsForChat(chatId: String) {
+        // First open after upgrade can have shade entries on the hidden
+        // 0.8 id while the host blob is empty. Merge FFI aliases before
+        // `notificationClearIds` so opening the live row dismisses them.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(
+            listOf(chatId) + directMarmotChatIds(chatId) + transcriptGroupIds(chatId),
+        )
+        adoptActionHistoricalFolds(folds)
+        if (folds != beforeFolds) persistHistoricalFolds()
         val related = buildList {
             addAll(directMarmotChatIds(chatId))
             addAll(transcriptGroupIds(chatId))
@@ -10541,6 +10550,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> {
+        // First send after resume can mint live 0.9 before persist-folds.
+        // A live-only exclude set misses recovered 0.8 blossom URLs and
+        // `cacheUploadedMediaBytes` can bind new bytes onto that attachment.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(listOf(groupId))
+        adoptActionHistoricalFolds(folds)
+        if (folds != beforeFolds) persistHistoricalFolds()
         val ids = mediaFetchGroupIds(groupId, historicalFoldMap).ifEmpty { listOf(groupId) }
         val pages = ids.map { id ->
             val loaded = runCatching {
@@ -11612,6 +11628,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                         else -> {
                             val startGroupId = resolveMarmotGroupId(chatId)
                                 ?: throw IllegalStateException("attachment has no secure media route")
+                            val beforeFolds = historicalFoldMap.toMap()
+                            val folds = mergeActionHistoricalFolds(listOf(startGroupId, chatId))
+                            adoptActionHistoricalFolds(folds)
+                            if (folds != beforeFolds) persistHistoricalFolds()
                             val groupIds = mediaFetchGroupIds(startGroupId, historicalFoldMap)
                             var lastError: Throwable? = null
                             var fetched = false

@@ -2129,6 +2129,10 @@ class ConversationFoldTest {
                 emptyMap(),
             ),
         )
+        assertEquals(listOf("group-09"), mediaFetchGroupIds("group-09", emptyMap()))
+        assertEquals(listOf("group-09", "group-08"), mediaFetchGroupIds("group-09", folds))
+        assertEquals(setOf("group-09"), notificationClearIds("group-09", emptyList(), emptyMap()))
+        assertEquals(setOf("group-09", "group-08"), notificationClearIds("group-09", emptyList(), folds))
     }
 
     @Test
