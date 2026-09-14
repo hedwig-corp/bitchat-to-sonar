@@ -1309,6 +1309,32 @@ struct SonarConversationFoldTests {
                 idOf: { $0 }
             ) == ["old from 0.8", "snap"]
         )
+        #expect(
+            Set(
+                snFirstOpenTranscriptPaintRows(
+                    chatId: "group-09",
+                    retainedByChat: [
+                        "group-09": ["new 0.9"],
+                        "group-08": ["old from 0.8"],
+                    ],
+                    snapshotPaint: ["new 0.9"],
+                    historicalFolds: ["group-08": "group-09"],
+                    idOf: { $0 }
+                )
+            ) == ["new 0.9", "old from 0.8"]
+        )
+        #expect(
+            snFirstOpenTranscriptPaintRows(
+                chatId: "group-09",
+                retainedByChat: [
+                    "group-09": ["new 0.9"],
+                    "group-08": ["old from 0.8"],
+                ],
+                snapshotPaint: ["new 0.9"],
+                historicalFolds: [:],
+                idOf: { $0 }
+            ) == ["new 0.9"]
+        )
         #expect(snFirstOpenHasLocalTranscriptPaint(retained: [String](), familyCached: ["old from 0.8"]))
         #expect(snFirstOpenHasLocalTranscriptPaint(retained: ["leave"], familyCached: [String]()))
         #expect(!snFirstOpenHasLocalTranscriptPaint(retained: [String](), familyCached: [String]()))

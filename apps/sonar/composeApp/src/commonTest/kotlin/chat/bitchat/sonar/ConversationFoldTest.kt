@@ -1490,6 +1490,34 @@ class ConversationFoldTest {
                 folds,
             ),
         )
+        assertEquals(
+            listOf(historical.single(), liveLeave.single()),
+            firstOpenTranscriptPaintRows(
+                "group-09",
+                mapOf("group-09" to liveLeave, "group-08" to historical),
+                liveLeave,
+                folds,
+            ),
+            "short live leave-frame must not hide hist-keyed retained rows",
+        )
+        assertEquals(
+            liveLeave,
+            firstOpenTranscriptPaintRows(
+                "group-09",
+                mapOf("group-09" to liveLeave, "group-08" to historical),
+                liveLeave,
+                emptyMap(),
+            ),
+            "empty persist-folds cannot see hist retained — merge FFI first",
+        )
+        assertEquals(
+            listOf(historical.single(), liveLeave.single()),
+            firstOpenFamilyRetainedRows(
+                "group-09",
+                mapOf("group-09" to liveLeave, "group-08" to historical),
+                folds,
+            ).sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id }),
+        )
         assertTrue(firstOpenHasLocalTranscriptPaint(emptyList(), snapshot))
         assertTrue(firstOpenHasLocalTranscriptPaint(historical, emptyList()))
         assertFalse(firstOpenHasLocalTranscriptPaint(emptyList(), emptyList()))

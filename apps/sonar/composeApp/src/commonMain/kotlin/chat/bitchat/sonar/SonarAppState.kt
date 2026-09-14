@@ -1891,6 +1891,29 @@ internal fun retainedTranscriptForChat(
 internal fun firstOpenFoldFamilySeedRows(snapshot: List<SonarMsg>): List<SonarMsg> =
     snapshot.withoutSyntheticSummaryRows().takeLast(TRANSCRIPT_RETAINED_ROWS)
 
+/** Union leave-paint across the fold family. A short live 0.9 leave-frame
+ *  must not hide recovered 0.8 rows still keyed on the hidden sibling.
+ *  `retainedTranscriptForChat` is first-hit (any paint exists); first-open
+ *  paint has to keep every family window. iOS `snFirstOpenFamilyRetainedRows`. */
+internal fun firstOpenFamilyRetainedRows(
+    chatId: String,
+    retainedByChat: Map<String, List<SonarMsg>>,
+    historicalFolds: Map<String, String>,
+): List<SonarMsg> {
+    val ids = linkedSetOf(chatId)
+    ids += foldFamilyIds(chatId, historicalFolds)
+    var merged: List<SonarMsg> = emptyList()
+    for (id in ids) {
+        val rows = retainedByChat[id]?.takeIf { it.isNotEmpty() } ?: continue
+        merged = if (merged.isEmpty()) {
+            rows
+        } else {
+            mergedFoldedMessageLists(merged, rows) { it.id }
+        }
+    }
+    return merged
+}
+
 /** Prefer last leave paint (including a hidden 0.8 sibling), then union any
  *  remounted family snapshot rows so a short live leave-frame cannot hide
  *  recovered 0.8 history. iOS `snFirstOpenTranscriptPaintRows`. */
@@ -1900,7 +1923,7 @@ internal fun firstOpenTranscriptPaintRows(
     snapshotPaint: List<SonarMsg>,
     historicalFolds: Map<String, String>,
 ): List<SonarMsg> {
-    val retained = retainedTranscriptForChat(chatId, retainedByChat, historicalFolds)
+    val retained = firstOpenFamilyRetainedRows(chatId, retainedByChat, historicalFolds)
     val snapshot = snapshotPaint.withoutSyntheticSummaryRows()
     if (retained.isEmpty()) return snapshot
     if (snapshot.isEmpty()) return retained

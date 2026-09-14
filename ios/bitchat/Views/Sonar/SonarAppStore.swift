@@ -1898,6 +1898,35 @@ func snRetainedTranscriptForChat<Message>(
     return []
 }
 
+/// Union leave-paint across the fold family. A short live 0.9 leave-frame
+/// must not hide recovered 0.8 rows still keyed on the hidden sibling.
+/// `snRetainedTranscriptForChat` is first-hit; first-open paint keeps every
+/// family window. Compose `firstOpenFamilyRetainedRows`.
+func snFirstOpenFamilyRetainedRows<Message>(
+    chatId: String,
+    retainedByChat: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String,
+    prefix: String = "marmot:"
+) -> [Message] {
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    var ids: [String] = [chatId]
+    var seen: Set<String> = [chatId]
+    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+        for key in [alias, prefix + alias] where seen.insert(key).inserted {
+            ids.append(key)
+        }
+    }
+    var merged: [Message] = []
+    for id in ids {
+        guard let rows = retainedByChat[id], !rows.isEmpty else { continue }
+        merged = merged.isEmpty
+            ? rows
+            : snMergedFoldedMessageLists(historical: merged, live: rows, idOf: idOf)
+    }
+    return merged
+}
+
 /// Prefer last leave paint, then union remounted family snapshot rows so a
 /// short live leave-frame cannot hide recovered 0.8 history.
 /// Compose `firstOpenTranscriptPaintRows`.
@@ -1908,10 +1937,11 @@ func snFirstOpenTranscriptPaintRows<Message>(
     historicalFolds: [String: String],
     idOf: (Message) -> String
 ) -> [Message] {
-    let retained = snRetainedTranscriptForChat(
+    let retained = snFirstOpenFamilyRetainedRows(
         chatId: chatId,
         retainedByChat: retainedByChat,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        idOf: idOf
     )
     if retained.isEmpty { return snapshotPaint }
     if snapshotPaint.isEmpty { return retained }
