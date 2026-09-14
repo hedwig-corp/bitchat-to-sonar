@@ -5807,6 +5807,10 @@ impl SonarClient {
         tracing::info!(is_live, since_secs, force, "sync() called");
         if is_live && since_secs > 0 && !force {
             tracing::info!("sync() short-circuited — live subscriptions active");
+            // Live drain can join an empty 0.9 sibling after the one-shot
+            // populate. Idle hosts never re-enter the full sync path, so
+            // drain the empty-transcript queue here too.
+            process_report.absorb(self.run_empty_transcript_backfills().await);
             self.save_or_rewind_without_advancing_watermark(process_report)?;
             self.retry_outbox().await;
             self.reconcile_historical_resume_members().await;
@@ -5866,29 +5870,7 @@ impl SonarClient {
         // transcript page is empty. Full-backfill those groups once. The scan
         // is deferred from client construction to the first sync so it does not
         // delay local-only first paint.
-        self.populate_empty_transcript_backfills_once();
-        let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
-        if !empty_transcript_group_ids.is_empty() {
-            // Cap per-sync to avoid stacking timeouts when many groups need repair.
-            let (batch, overflow): (Vec<_>, Vec<_>) = empty_transcript_group_ids
-                .into_iter()
-                .enumerate()
-                .partition(|(i, _)| *i < MAX_BACKFILLS_PER_SYNC);
-            for (_, id) in &overflow {
-                self.requeue_initial_empty_transcript_backfill(id);
-            }
-            let batch_ids: Vec<String> = batch.into_iter().map(|(_, id)| id).collect();
-            match self.backfill_groups(&batch_ids).await {
-                Ok(report) => process_report.absorb(report),
-                Err(err) => {
-                    tracing::debug!(%err, "batched empty transcript backfill failed");
-                    for id in &batch_ids {
-                        self.requeue_initial_empty_transcript_backfill(id);
-                    }
-                    process_report.record_retryable(Timestamp::now().as_secs());
-                }
-            }
-        }
+        process_report.absorb(self.run_empty_transcript_backfills().await);
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed during sync");
         }
@@ -6106,6 +6088,49 @@ impl SonarClient {
         self.rediscover_unbound_historical_folds();
         let mut set = self.initial_empty_transcript_backfills.lock().unwrap();
         *set = Self::empty_transcript_group_ids(&self.engine);
+    }
+
+    /// Queue a newly joined live group that still has no 0.9 chat rows.
+    /// Folded hist does not count — that sibling needs a full `#h` backfill.
+    fn enqueue_empty_live_transcript_backfill(&self, group_id: &GroupId) {
+        if !self.engine.live_chat_page_empty(group_id) {
+            return;
+        }
+        let Some(h) = self.engine.nostr_h_tag_hex(group_id).ok().flatten() else {
+            return;
+        };
+        self.requeue_initial_empty_transcript_backfill(&h);
+    }
+
+    async fn run_empty_transcript_backfills(&self) -> MarmotProcessReport {
+        let mut report = MarmotProcessReport::default();
+        if self.relays.is_empty() {
+            return report;
+        }
+        self.populate_empty_transcript_backfills_once();
+        let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
+        if empty_transcript_group_ids.is_empty() {
+            return report;
+        }
+        let (batch, overflow): (Vec<_>, Vec<_>) = empty_transcript_group_ids
+            .into_iter()
+            .enumerate()
+            .partition(|(i, _)| *i < MAX_BACKFILLS_PER_SYNC);
+        for (_, id) in &overflow {
+            self.requeue_initial_empty_transcript_backfill(id);
+        }
+        let batch_ids: Vec<String> = batch.into_iter().map(|(_, id)| id).collect();
+        match self.backfill_groups(&batch_ids).await {
+            Ok(backfill) => report.absorb(backfill),
+            Err(err) => {
+                tracing::debug!(%err, "batched empty transcript backfill failed");
+                for id in &batch_ids {
+                    self.requeue_initial_empty_transcript_backfill(id);
+                }
+                report.record_retryable(Timestamp::now().as_secs());
+            }
+        }
+        report
     }
 
     fn take_initial_empty_transcript_backfills(&self) -> Vec<String> {
@@ -6456,6 +6481,10 @@ impl SonarClient {
             Ok(report) => self.save_or_rewind_without_advancing_watermark(report)?,
             Err(err) => tracing::debug!(%err, "initial Marmot per-group catch-up failed"),
         }
+        // Hosts idle here, not on `sync()`. A live welcome after the one-shot
+        // populate must still full-backfill an empty 0.9 sibling.
+        let empty_report = self.run_empty_transcript_backfills().await;
+        self.save_or_rewind_without_advancing_watermark(empty_report)?;
         // The apps use this lightweight idle path instead of `sync()`. Retry
         // the durable outbox here too so a transient outage self-heals after
         // relay reconnection even when the user does not tap the retry button.
@@ -7044,6 +7073,12 @@ impl SonarClient {
                                 // second matching welcome cannot steal history.
                                 // Rooms still must not fold onto a 1:1 (R-045).
                                 self.maybe_fold_new_group(group_id);
+                                // Auto-joined welcomes land here, not
+                                // `accept_group_invite`. Folded 0.8 hist must
+                                // not count as a live page — enqueue a full
+                                // 0.9 backfill or idle sync never fetches
+                                // traffic older than the live tail.
+                                self.enqueue_empty_live_transcript_backfill(group_id);
                             }
                             changed_groups.insert(hex::encode(group_id.as_slice()));
                         }
@@ -11378,6 +11413,68 @@ mod tests {
             floors_after.get(&h).copied(),
             Some(live_remote_secs),
             "catch-up floor must be the live 0.9 remote, not folded hist {HIST_REMOTE_SECS}"
+        );
+    }
+
+    /// Auto-joined 0.9 DMs go through drain `GroupUpdated`, not
+    /// `accept_group_invite`. After the one-shot empty-transcript scan,
+    /// idle `ensure_subscriptions` would never full-backfill that sibling
+    /// unless the welcome re-queues it.
+    #[tokio::test]
+    async fn incoming_09_welcome_enqueues_empty_live_after_oneshot_scan() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(22),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        bob.populate_empty_transcript_backfills_once();
+        assert!(
+            bob.take_initial_empty_transcript_backfills().is_empty(),
+            "one-shot scan before the welcome must not see a live 0.9 group"
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        let h = bob
+            .engine
+            .nostr_h_tag_hex(&live)
+            .expect("routing")
+            .expect("founding group has nostr routing");
+        let queued = bob.take_initial_empty_transcript_backfills();
+        assert!(
+            queued.iter().any(|id| id == &h),
+            "drain welcome must re-queue the empty live group after the one-shot scan: {queued:?}"
         );
     }
 

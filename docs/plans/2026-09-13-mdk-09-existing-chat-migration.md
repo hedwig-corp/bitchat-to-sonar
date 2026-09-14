@@ -1613,6 +1613,16 @@ hist timestamp as `since` — missing 0.9 traffic older than the last
 0.8 message (peer upgraded first). Scan live MLS rows only. Pin:
 `client::tests::catchup_and_empty_backfill_ignore_folded_hist_transcript`.
 
+Auto-joined 0.9 DMs land on drain `GroupUpdated`, not
+`accept_group_invite`. After the first watermarked session, idle
+`ensure_subscriptions` never re-enters full `sync()`, so a welcome
+after the one-shot empty-transcript scan never full-backfilled.
+The live tail is only ~30 minutes — a peer who upgraded first can
+have days of 0.9 traffic. Enqueue empty live groups on
+`GroupUpdated` and drain that queue from `ensure_subscriptions` /
+short-circuit `sync()`. Pin:
+`client::tests::incoming_09_welcome_enqueues_empty_live_after_oneshot_scan`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
