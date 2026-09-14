@@ -13008,9 +13008,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  if the encrypted store cannot be read right now. Survives a cold launch,
      *  so it is the signal that a blank transcript is wrong rather than empty. */
     private fun transcriptKnownNonEmpty(chatId: String): Boolean {
+        val ids = transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }
         val latest = buildMap {
-            for (id in transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }) {
-                put(id, localLatestTs(id))
+            for (id in ids) {
+                // iOS feeds summary `latestAt` here. `copy_summary` leaves live
+                // `message_count` at 0 on conflict; snapshot-only latest then
+                // skips recovery while bak remainder sat on hist.
+                put(id, maxOf(localLatestTs(id), conversationLatestAtByChat[id] ?: 0L))
             }
         }
         return blankTranscriptKnownNonEmpty(

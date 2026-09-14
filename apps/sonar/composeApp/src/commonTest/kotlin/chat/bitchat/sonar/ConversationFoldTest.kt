@@ -2400,6 +2400,38 @@ class ConversationFoldTest {
                 historicalFolds = mapOf("group-08" to "group-09"),
             ),
         )
+        val liveAfterCopy = SonarConversationSummary(
+            groupIdHex = "group-09",
+            name = "",
+            latestContent = "from 0.8",
+            latestSenderNpub = "npub1peer",
+            latestAtSecs = 50L,
+            latestMine = false,
+            messageCount = 0L,
+            unreadCount = 0L,
+        )
+        val liveLatest = conversationLatestAtFromSummaries(listOf(liveAfterCopy), emptyMap())
+        val liveCounts = conversationMessageCountsFromSummaries(listOf(liveAfterCopy), emptyMap())
+        assertEquals(mapOf("group-09" to 50L), liveLatest)
+        assertEquals(mapOf("group-09" to 0L), liveCounts)
+        assertTrue(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = liveLatest,
+                messageCountByChat = liveCounts,
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+            "copy_summary leaves live message_count at 0; index latest_at must still recover",
+        )
+        assertFalse(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = emptyMap(),
+                messageCountByChat = liveCounts,
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+            "count-only live 0 must not look non-empty without index latest_at",
+        )
     }
 
     @Test

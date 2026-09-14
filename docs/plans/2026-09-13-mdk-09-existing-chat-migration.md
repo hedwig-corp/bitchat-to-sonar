@@ -1456,6 +1456,13 @@ after resume was trusted and replaced the 0.8 extract. The same
 index newest now gates that keep. Pin: same
 `expectedNewestTsUsesRemountedIndexLatestWhenSnapshotStale`.
 
+Compose `transcriptKnownNonEmpty` still built `latestByChat` from
+snapshot `localLatestTs` only. After `copy_summary`, live
+`message_count` stays 0 on conflict, so blank recovery skipped while
+index `latest_at` already held the hist newest. iOS already feeds
+summary `latestAt`. Merge cached index latest into that map. Pin:
+`ConversationFoldTest.failedSummariesProbeKeepsHistMessageCountForBlankRecovery`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot
