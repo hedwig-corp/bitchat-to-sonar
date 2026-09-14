@@ -1249,6 +1249,18 @@ Pins: `ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`
 (`foldFamilyCanonicalMessageIds` / live extract not newest-paged),
 `SonarConversationFoldTests` `snFoldFamilyCanonicalMessageIDs`.
 
+Lost-core-sidecar mixed-resume hole closed after this commit: a 2-person
+live room from a partial 0.8 resume (`alice+bob`, leftover carol) only
+got `record_historical_fold` at mint time. Host persist-folds can keep
+that remount after the core sidecar is gone; `maybe_fold_new_group`
+skipped `live_count < 3` (R-045 guard for DMs). Idle
+`ensure_subscriptions` and a later send on the listed live id now
+rebuild a unique non-DM subset bind and invite leftover members.
+A 1:1 still must not absorb a 3-member room. Pins:
+`persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscriptions`,
+`recovered_08_pending_room_send_creates_named_group_not_dm`
+(`ensure_subscriptions` after `start_dm`).
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

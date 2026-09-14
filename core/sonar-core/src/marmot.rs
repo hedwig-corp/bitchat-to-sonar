@@ -1607,6 +1607,19 @@ impl MarmotEngine {
         None
     }
 
+    /// Drop hist→live bindings (in-memory + sidecar).
+    ///
+    /// Tests use this to simulate a lost core fold sidecar after the host
+    /// still remounts via `sonar.historicalFolds`. Production hosts must
+    /// not call this — rebuild with `maybe_fold_new_group` instead.
+    pub fn clear_historical_folds(&self) {
+        self.historical_folds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.persist_historical_folds();
+    }
+
     /// Bind a recovered 0.8 group to the 0.9 group created with the same peers.
     pub fn record_historical_fold(&self, historical: &GroupId, live: &GroupId) {
         if historical == live {

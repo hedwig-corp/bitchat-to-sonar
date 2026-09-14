@@ -7120,6 +7120,10 @@ impl SonarClient {
             return Err(Error::InvalidInput("this chat was deleted".into()));
         }
         if self.engine.is_live_group(group_id)? {
+            // Persist-folds can remount onto this live id after the core
+            // sidecar was lost. Rebuild the bind before leftover-member
+            // invite so `missing_resume_peers` sees the recovered room.
+            self.maybe_fold_new_group(group_id);
             self.maybe_add_late_resume_members(group_id).await;
             return Ok(group_id.clone());
         }
@@ -7181,8 +7185,23 @@ impl SonarClient {
     /// Hosts hit this from `ensure_subscriptions`; tests may also hit it
     /// from `sync()`.
     async fn reconcile_historical_resume_members(&self) {
+        // Host persist-folds remounts hist onto live before (or after)
+        // core `fold_aliases` exist. Rebuild matching binds first so
+        // leftover 0.8 members are invited without a send on the hidden
+        // hist id. `maybe_fold_new_group` still refuses R-045 (room onto
+        // a 1:1).
+        self.maybe_fold_live_groups();
         for live in self.engine.live_resume_targets() {
             self.maybe_add_late_resume_members(&live).await;
+        }
+    }
+
+    fn maybe_fold_live_groups(&self) {
+        let Ok(groups) = self.engine.groups() else {
+            return;
+        };
+        for group in groups {
+            self.maybe_fold_new_group(&group.id);
         }
     }
 
@@ -7284,6 +7303,19 @@ impl SonarClient {
             {
                 // Named 2-person room / White Noise DM without the Sonar
                 // marker: fold only on exact name + member match.
+                room_candidates.push((group.id, group.name, hist_others));
+                continue;
+            }
+            // Mixed resume: a named 2-person live room (not a DM) that is
+            // a unique subset of one recovered 3+ room. `resolve_send_group`
+            // records that bind when minting; persist-folds can lose the
+            // sidecar. Idle reconcile / a later live send must rebuild it.
+            // A 1:1 (`live_direct`) must not absorb that room (R-045).
+            if !live_direct
+                && live_count == 2
+                && hist_count >= 3
+                && live_others.iter().all(|pk| hist_others.contains(pk))
+            {
                 room_candidates.push((group.id, group.name, hist_others));
                 continue;
             }

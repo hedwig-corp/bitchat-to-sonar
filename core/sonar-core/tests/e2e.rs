@@ -1458,6 +1458,14 @@ async fn recovered_08_pending_room_send_creates_named_group_not_dm() {
         alice.engine().live_fold_target(&historical).is_none(),
         "maybe_fold_new_group must not fold a 3-member room onto the DM"
     );
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("idle reconcile after start_dm");
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "ensure_subscriptions must not fold a 3-member room onto the DM"
+    );
     assert_eq!(
         alice.conversation_summaries().len(),
         2,
@@ -1942,4 +1950,89 @@ async fn recovered_08_group_adds_late_member_on_sync_without_a_local_send() {
         .await
         .expect("carol accepts");
     assert_eq!(carol.groups().expect("carol joined").len(), 1);
+}
+
+/// Persist-folds can remount a mixed-resume room after the core fold
+/// sidecar is gone. Idle `ensure_subscriptions` must rebuild the bind
+/// and invite leftover members — a send on the listed live id never
+/// walks the hidden hist id (`resolve_send_group` mint path).
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscriptions() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "mixed resume must bind hist onto the new 0.9 room"
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "lost core sidecar: host persist-folds remounts without fold_aliases"
+    );
+    assert_eq!(
+        alice
+            .display_members(&live)
+            .expect("live-only roster")
+            .len(),
+        2,
+        "without a fold, FFI display_members must not invent leftover carol"
+    );
+
+    carol.publish_key_package().await.expect("carol updates");
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("idle reconcile rebuilds the lost bind");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "ensure_subscriptions must re-fold the mixed-resume room"
+    );
+    let members = alice
+        .members(&live)
+        .expect("members after lost-sidecar heal");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "rebuilt fold must invite leftover 0.8 members without a hist send"
+    );
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol.identity().public_key()),
+        "FFI groups() must list leftover carol after the bind is rebuilt"
+    );
 }
