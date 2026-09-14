@@ -504,7 +504,9 @@ private struct SonarMacMainPane: View {
             // reuses the pane instance, .onDisappear never fires for A, and
             // store.closedDM(A) is skipped — leaking A's ConversationViewState
             // (it would keep rebuilding on every store invalidation forever).
-            .id(id)
+            // Remount hops selection hist→live; keep hist identity so the
+            // pane is not remade (scroll / unread / composer).
+            .id(store.macConversationPaneIdentity(forSelectionId: id))
         case .profile:
             MacProfilePane()
         }

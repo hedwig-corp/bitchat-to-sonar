@@ -1976,6 +1976,31 @@ internal fun remountLocalHydratingIds(
     return next
 }
 
+/** Keep ChatScreen viewport remembers across remount hist→live.
+ *  Changing [screenId] would remake LazyListState / unread / tail-pin
+ *  and snap a scrolled recovered transcript. iOS
+ *  `snRemountStableTranscriptSessionKey`. */
+internal fun remountStableTranscriptSessionKey(
+    previousKey: String?,
+    screenId: String,
+    historicalFolds: Map<String, String>,
+): String {
+    val screen = screenId.trim()
+    if (screen.isEmpty()) return previousKey?.trim().orEmpty()
+    val previous = previousKey?.trim().orEmpty()
+    if (previous.isEmpty()) return screen
+    if (openedDMShouldSkipHydrate(screen, setOf(previous))) return previous
+    val previousBare = previous.removePrefix("marmot:")
+    val screenBare = screen.removePrefix("marmot:")
+    if (previousBare.isNotEmpty() && screenBare.isNotEmpty()) {
+        if (screenBare in foldFamilyIds(previousBare, historicalFolds)) return previous
+        if (previousBare in foldFamilyIds(screenBare, historicalFolds)) return previous
+    }
+    if (screen in foldFamilyIds(previous, historicalFolds)) return previous
+    if (previous in foldFamilyIds(screen, historicalFolds)) return previous
+    return screen
+}
+
 /** Warmup / pane keys whose in-flight `openChat` newest-page must stop
  *  when remount copies the window onto live. iOS
  *  `snRemountOpeningHydrateKeys`. */
@@ -3884,6 +3909,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Hidden 0.8 sibling exists — first Marmot paint may be live-only. */
     fun chatHasFoldFamily(chatId: String): Boolean =
         foldFamilyIds(chatId, historicalFoldMap).size > 1
+
+    /** Viewport remember key that stays on hist when remount hops to live. */
+    fun remountTranscriptSessionKey(previousKey: String, screenId: String): String =
+        remountStableTranscriptSessionKey(previousKey, screenId, historicalFoldMap)
 
     /** Newest known local timestamp across the fold family (index + snapshot).
      *  Home-list recency, unread retire, and extract-keep must use this —

@@ -1767,6 +1767,69 @@ func snRemountMarksTranscriptHydrated(
     return next
 }
 
+/// Keep ChatScreen / Mac pane identity across remount hist→live.
+/// Changing the SwiftUI `.id` remakes the pane and snaps scroll.
+/// Compose `remountStableTranscriptSessionKey`.
+func snRemountStableTranscriptSessionKey(
+    previousKey: String?,
+    screenId: String,
+    historicalFolds: [String: String]
+) -> String {
+    let screen = screenId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if screen.isEmpty {
+        return previousKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+    let previous = previousKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if previous.isEmpty { return screen }
+    if snOpenedDMShouldSkipHydrate(openingId: screen, suppressedIds: [previous]) {
+        return previous
+    }
+    let previousBare = snBareMarmotGroupId(previous)
+    let screenBare = snBareMarmotGroupId(screen)
+    if !previousBare.isEmpty && !screenBare.isEmpty {
+        if snFoldFamilyIds(id: previousBare, historicalFolds: historicalFolds).contains(screenBare) {
+            return previous
+        }
+        if snFoldFamilyIds(id: screenBare, historicalFolds: historicalFolds).contains(previousBare) {
+            return previous
+        }
+    }
+    if snFoldFamilyIds(id: previous, historicalFolds: historicalFolds).contains(screen) {
+        return previous
+    }
+    if snFoldFamilyIds(id: screen, historicalFolds: historicalFolds).contains(previous) {
+        return previous
+    }
+    return screen
+}
+
+/// Mac `.id(selection)` remakes the pane on remount hop. Keep hist identity
+/// while selection is already live and the pane is still hist.
+func snMacConversationPaneIdentity(
+    selectionId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?
+) -> String {
+    if let pane = openedConversationPaneId, !pane.isEmpty,
+       !snOpenedConversationIdMatches(selectionId, pane),
+       snOpenedConversationIdMatches(selectionId, openedConversationId) {
+        return pane
+    }
+    return selectionId
+}
+
+/// Path / `.id` hop disappears hist after remount already opened live.
+/// Skip `closedDM(hist)` so the hop does not clear currentDM.
+func snClosedDMShouldSkipFoldRemountHop(
+    closingId: String,
+    openedConversationId: String?,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> Bool {
+    guard let replacement = routeReplacement else { return false }
+    return snOpenedConversationIdMatches(closingId, replacement.pendingId)
+        && snOpenedConversationIdMatches(openedConversationId, replacement.realId)
+}
+
 /// Keep the empty-pane spinner on live when remount cancels hist hydrate.
 func snRemountLocalHydratingIds(
     historicalKeys: [String],
@@ -4241,6 +4304,15 @@ final class SonarAppStore: ObservableObject {
         return snCurrentOpenConversationId(
             pathDMId: pathId,
             openedConversationId: openedConversationId
+        )
+    }
+
+    /// Mac `.id` that stays on hist while remount hops selection to live.
+    func macConversationPaneIdentity(forSelectionId id: String) -> String {
+        snMacConversationPaneIdentity(
+            selectionId: id,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
         )
     }
 
@@ -12663,6 +12735,14 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
+        if snClosedDMShouldSkipFoldRemountHop(
+            closingId: id,
+            openedConversationId: openedConversationId,
+            routeReplacement: pendingMarmotRouteReplacement
+        ) {
+            conversationViewStates[id]?.deactivate()
+            return
+        }
         if snClosedDMShouldClearOpened(
             closingId: id,
             openedConversationId: openedConversationId,

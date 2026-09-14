@@ -1249,6 +1249,42 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun remountStableTranscriptSessionKeyKeepsHistAcrossLiveHop() {
+        assertEquals(
+            "group-08",
+            remountStableTranscriptSessionKey(
+                previousKey = "group-08",
+                screenId = "group-09",
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "marmot:group-08",
+            remountStableTranscriptSessionKey(
+                previousKey = "marmot:group-08",
+                screenId = "marmot:group-09",
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "marmot:group-08",
+            remountStableTranscriptSessionKey(
+                previousKey = "marmot:group-08",
+                screenId = "group-09",
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "marmot:other",
+            remountStableTranscriptSessionKey(
+                previousKey = "marmot:group-08",
+                screenId = "marmot:other",
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+    }
+
+    @Test
     fun remountLocalHydratingIdsStaysEmptyWhenHistWasNotHydrating() {
         assertEquals(
             emptySet(),

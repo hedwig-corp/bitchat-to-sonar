@@ -1329,6 +1329,14 @@ internal fun TranscriptTailPinning(
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
     val scope = rememberCoroutineScope()
+    val transcriptSessionHolder = remember { mutableStateOf(screen.id) }
+    val transcriptSessionKey = state.remountTranscriptSessionKey(
+        transcriptSessionHolder.value,
+        screen.id,
+    )
+    if (transcriptSessionHolder.value != transcriptSessionKey) {
+        transcriptSessionHolder.value = transcriptSessionKey
+    }
     val draft = state.composerDraft(screen.id)
     var emojiTray by remember { mutableStateOf(false) }
     var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
@@ -1431,10 +1439,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // row ID at first computation so messages arriving while the chat is open
     // (already marked read in core) cannot drift the divider down. The frozen
     // ID persists in state so back-revealing this chat reuses it verbatim.
-    var unreadAnchorId by remember(screen.id) {
+    var unreadAnchorId by remember(transcriptSessionKey) {
         mutableStateOf(state.openChatUnreadAnchor[screen.id])
     }
-    var userScrolled by remember(screen.id) { mutableStateOf(false) }
+    var userScrolled by remember(transcriptSessionKey) { mutableStateOf(false) }
     val unreadAnchorIndex = unreadAnchorId
         ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
         ?: -1
@@ -1460,7 +1468,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Open pinned at the first unread row, or at the newest row for a read
     // chat (Signal parity): start the list state there so the first frame
     // never shows the wrong page and then visibly jumps.
-    val listState = remember(screen.id) {
+    val listState = remember(transcriptSessionKey) {
         val feedAnchor = unreadAnchorId
             ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
             ?.takeIf { it >= 0 }
@@ -1484,26 +1492,26 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         jumpMessageId = state.jumpMessageIdForChat(screen.id),
     )
     val phase2Host = SonarTranscriptPolicyHost.isEnabled()
-    var isNearBottom by remember(screen.id) { mutableStateOf(true) }
-    var didInitialScroll by remember(screen.id) { mutableStateOf(false) }
-    var didLeaveTail by remember(screen.id) { mutableStateOf(false) }
-    var isPrepending by remember(screen.id) { mutableStateOf(false) }
+    var isNearBottom by remember(transcriptSessionKey) { mutableStateOf(true) }
+    var didInitialScroll by remember(transcriptSessionKey) { mutableStateOf(false) }
+    var didLeaveTail by remember(transcriptSessionKey) { mutableStateOf(false) }
+    var isPrepending by remember(transcriptSessionKey) { mutableStateOf(false) }
     // Fully-read / provisional-live-edge open: keep re-anchoring across
     // hydration index shifts until the newest row is actually on screen.
     // Without this, agent DMs land mid-history after older rows prepend.
-    var needsLiveEdgeOpen by remember(screen.id) {
+    var needsLiveEdgeOpen by remember(transcriptSessionKey) {
         mutableStateOf(transcriptOpenAction == TranscriptOpenAction.LiveEdge)
     }
 
     // The divider must not resurrect or re-scroll once the reader takes over.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         listState.interactionSource.interactions.first { it is DragInteraction.Start }
         userScrolled = true
     }
     // Freeze the unread anchor on the first CAUGHT-UP feed that can resolve
     // it, and re-resolve only if its row vanishes (a snapshot row replaced by
     // the canonical DB page) before the user scrolls.
-    LaunchedEffect(screen.id, feed, state.openChatUnread[screen.id]) {
+    LaunchedEffect(transcriptSessionKey, feed, state.openChatUnread[screen.id]) {
         val unreadAtOpen = state.openChatUnread[screen.id] ?: 0L
         if (unreadAtOpen <= 0L || feed.isEmpty()) return@LaunchedEffect
         val current = unreadAnchorId
@@ -1541,7 +1549,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // Observe the position independently of transcript publication. A newly
     // appended row follows only when the user was already reading the tail.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         snapshotFlow {
             val info = listState.layoutInfo
             val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
@@ -1565,7 +1573,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // White Noise leg in, which can insert only OLDER rows. That leaves the
     // newest key untouched while shifting every index — the tail moves and the
     // viewport is left showing older content until something re-anchors it.
-    LaunchedEffect(screen.id, newestFeedKey, feed.size, state.openChatUnread[screen.id]) {
+    LaunchedEffect(transcriptSessionKey, newestFeedKey, feed.size, state.openChatUnread[screen.id]) {
         if (feed.isEmpty()) return@LaunchedEffect
         val hydrated = feedCaughtUp(feed)
         // Settled unread takes over from provisional live edge. Do NOT force
@@ -1674,7 +1682,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // Quote tap after the transcript has already opened: the open-path
     // LaunchedEffect above only runs while `didInitialScroll` is false.
-    LaunchedEffect(screen.id, state.jumpMessageIdForChat(screen.id), quotedJumpRetry, didInitialScroll) {
+    LaunchedEffect(transcriptSessionKey, state.jumpMessageIdForChat(screen.id), quotedJumpRetry, didInitialScroll) {
         if (!didInitialScroll) return@LaunchedEffect
         val jumpId = state.jumpMessageIdForChat(screen.id) ?: return@LaunchedEffect
         val jumpIdx = feed.indexOfFirst { transcriptFeedKey(it) == jumpId }
@@ -1699,7 +1707,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Load one local cursor page when the reader reaches the top. Capture a
     // stable visible message and pixel offset, then restore it after prepend so
     // the existing content does not jump under the reader's finger.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         snapshotFlow {
             didInitialScroll && listState.layoutInfo.totalItemsCount > 0 &&
                 listState.firstVisibleItemIndex <= 2
@@ -1729,7 +1737,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // A 500-row window can move away from the tail. Reaching its bottom after
     // the reader has left the tail resets to a fresh bounded newest page.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         snapshotFlow {
             didInitialScroll && didLeaveTail && state.canLoadNewestMessages(screen.id) &&
                 listState.layoutInfo.totalItemsCount > 0 &&
@@ -1762,7 +1770,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     if (!phase2Host) {
         TranscriptTailPinning(
             listState,
-            key = screen.id,
+            key = transcriptSessionKey,
             isPrepending = { isPrepending || unreadAnchorPending() },
         )
     }
@@ -2247,7 +2255,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             // Phase 2: owned pad + IME overlay; Pin+Lockstep; top-align (not reverseLayout).
             TranscriptPhase2HostScaffold(
                 listState = listState,
-                listKey = screen.id,
+                listKey = transcriptSessionKey,
                 isPrepending = { isPrepending || unreadAnchorPending() },
                 suppressPin = { unreadAnchorPending() },
                 modifier = Modifier.weight(1f).fillMaxWidth(),

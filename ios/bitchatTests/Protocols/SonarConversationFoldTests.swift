@@ -1531,6 +1531,42 @@ struct SonarConversationFoldTests {
             liveKeys: ["marmot:group-09", "group-09"],
             hydrating: []
         ).isEmpty)
+        #expect(snRemountStableTranscriptSessionKey(
+            previousKey: "marmot:group-08",
+            screenId: "marmot:group-09",
+            historicalFolds: ["group-08": "group-09"]
+        ) == "marmot:group-08")
+        #expect(snRemountStableTranscriptSessionKey(
+            previousKey: "marmot:group-08",
+            screenId: "marmot:other",
+            historicalFolds: ["group-08": "group-09"]
+        ) == "marmot:other")
+        #expect(snMacConversationPaneIdentity(
+            selectionId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == "marmot:group-08")
+        #expect(snMacConversationPaneIdentity(
+            selectionId: "marmot:other",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == "marmot:other")
+        #expect(snClosedDMShouldSkipFoldRemountHop(
+            closingId: "marmot:group-08",
+            openedConversationId: "marmot:group-09",
+            routeReplacement: SNMarmotRouteReplacement(
+                pendingId: "marmot:group-08",
+                realId: "marmot:group-09"
+            )
+        ))
+        #expect(!snClosedDMShouldSkipFoldRemountHop(
+            closingId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            routeReplacement: SNMarmotRouteReplacement(
+                pendingId: "marmot:group-08",
+                realId: "marmot:group-09"
+            )
+        ))
         #expect(snClosedDMShouldClearOpened(
             closingId: "marmot:group-08",
             openedConversationId: "marmot:group-09",
