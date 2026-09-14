@@ -186,6 +186,7 @@ Guarded by:
 - `persistence::mdk08_v1_backup_restores_and_migrates`
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
+- `marmot::historical_fold_tests::delete_live_group_purges_folded_historical_history`
 - `ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalMuteMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalComposerDraftMovesOntoLiveSibling`
@@ -367,7 +368,10 @@ blank between `groups()` hide and the next bounded page. A notification
 tap whose payload still names the hidden 0.8 id remaps onto
 `live_fold_target` instead of toasting that the chat is gone. Persisted
 call-log rows on the hidden id are merged onto the live sibling so resume
-does not drop the recovered call history. A pending welcome with
+does not drop the recovered call history. Leave/delete of the live sibling
+purges the whole fold family so a later `start_dm` with the same peer cannot
+resurrect a conversation the user already removed. A recovered room with no
+live MLS group can still be deleted: Leave degrades to a local family purge. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
 (new DM with the same known peer) is the same hazard and must skip

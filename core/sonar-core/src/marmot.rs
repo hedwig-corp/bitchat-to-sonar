@@ -2921,14 +2921,45 @@ impl MarmotEngine {
     }
 
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
-        self.drop_group(group_id);
-        self.transcript
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(group_id);
-        self.persist_transcript();
-        let _ = self.leave_group(group_id).await;
+        let leave_ids: Vec<GroupId> = self
+            .fold_family(group_id)
+            .into_iter()
+            .filter(|id| self.is_live_group(id).unwrap_or(false))
+            .collect();
+        self.purge_fold_family(group_id);
+        for id in leave_ids {
+            let _ = self.leave_group(&id).await;
+        }
         Ok(())
+    }
+
+    /// Drop local transcript + fold bindings for this conversation and every
+    /// recovered sibling. A later `start_dm` with the same peer must not
+    /// resurrect a chat the user already deleted.
+    pub fn purge_fold_family(&self, group_id: &GroupId) {
+        let family = self.fold_family(group_id);
+        {
+            let mut transcript = self
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in &family {
+                transcript.remove(id);
+            }
+        }
+        self.persist_transcript();
+        for id in &family {
+            self.drop_group(id);
+        }
+        {
+            let mut folds = self
+                .historical_folds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            folds
+                .retain(|historical, live| !family.iter().any(|id| id == historical || id == live));
+        }
+        self.persist_historical_folds();
     }
 
     fn store_chat(&self, msg: ChatMessage) {
@@ -3867,6 +3898,51 @@ mod historical_fold_tests {
         );
         assert_eq!(pages[0].group_id, live);
         assert_eq!(pages[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn delete_live_group_purges_folded_historical_history() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        engine.push_transcript_message(chat(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            "old hello",
+            false,
+        ));
+        engine.push_transcript_message(chat(
+            2,
+            live.as_slice(),
+            alice.public_key(),
+            "new hello",
+            true,
+        ));
+        engine.record_historical_fold(&historical, &live);
+        engine.purge_fold_family(&live);
+
+        assert!(
+            engine.messages(&historical).expect("historical").is_empty(),
+            "deleted conversation must not keep recovered 0.8 rows"
+        );
+        assert!(
+            engine.messages(&live).expect("live").is_empty(),
+            "deleted conversation must not keep live 0.9 rows"
+        );
+        assert!(
+            engine
+                .historical_groups()
+                .expect("historical groups")
+                .is_empty(),
+            "dropped recovered row must not stay listable for a later resume fold"
+        );
+        assert!(
+            engine.live_fold_target(&historical).is_none(),
+            "fold binding must die with the conversation"
+        );
     }
 
     /// A backup taken after resume-chat must keep the fold. Otherwise restore

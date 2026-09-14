@@ -3258,32 +3258,37 @@ impl SonarClient {
     /// create the leave proposal (MIP-03).
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
-        let leave_update = match self.engine.leave_group(group_id).await {
-            Ok(update) => update,
+        let leave_id = self
+            .engine
+            .live_fold_target(group_id)
+            .filter(|live| self.engine.is_live_group(live).unwrap_or(false))
+            .unwrap_or_else(|| group_id.clone());
+        let leave_update = match self.engine.leave_group(&leave_id).await {
+            Ok(update) => Some(update),
             Err(err) if is_admin_self_remove_blocked(&err) => {
-                let demote = self.engine.self_demote(group_id).await?;
+                let demote = self.engine.self_demote(&leave_id).await?;
                 self.best_effort_membership_publish(demote, "self-demote before leave")
                     .await;
-                self.engine.leave_group(group_id).await?
+                Some(self.engine.leave_group(&leave_id).await?)
             }
+            Err(_) if !self.engine.is_live_group(&leave_id).unwrap_or(false) => None,
             Err(err) => return Err(err),
         };
         // Always purge locally first — Leave is a user intent to drop this chat.
         // Leave updates are proposals (`requires_commit_merge == false`), so the
         // evolution event can be published after MDK group state is gone.
-        let group_id_hex = hex::encode(group_id.as_slice());
-        self.engine.delete_group(group_id).await?;
-        self.outbox_state
-            .lock()
-            .unwrap()
-            .remove_group_entries(&group_id_hex)?;
-        self.remove_index_for_group(group_id);
-        self.notify_conversation_changed(&group_id_hex);
+        // Purge the recovered 0.8 sibling too so a later start_dm cannot
+        // re-fold deleted history onto a new live group.
+        let family = self.engine.fold_aliases(&leave_id);
+        self.engine.delete_group(&leave_id).await?;
+        self.purge_conversation_ids(&family);
         if let Some(ref db_path) = self.marmot_db_path {
             crate::account_backup::mark_backup_dirty(db_path);
         }
         self.schedule_resubscribe_marmot_groups_if_live();
-        self.schedule_best_effort_leave_publish(leave_update);
+        if let Some(leave_update) = leave_update {
+            self.schedule_best_effort_leave_publish(leave_update);
+        }
         Ok(())
     }
 
@@ -7318,19 +7323,25 @@ impl SonarClient {
     /// Returns after durable local purge. Live-subscription narrowing runs in
     /// the background so delete never waits on relay round-trips.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
-        let group_id_hex = hex::encode(group_id.as_slice());
+        let family = self.engine.fold_aliases(group_id);
         self.engine.delete_group(group_id).await?;
-        self.outbox_state
-            .lock()
-            .unwrap()
-            .remove_group_entries(&group_id_hex)?;
-        self.remove_index_for_group(group_id);
+        self.purge_conversation_ids(&family);
         if let Some(ref db_path) = self.marmot_db_path {
             crate::account_backup::mark_backup_dirty(db_path);
         }
-        self.notify_conversation_changed(&group_id_hex);
         self.schedule_resubscribe_marmot_groups_if_live();
         Ok(())
+    }
+
+    fn purge_conversation_ids(&self, ids: &[GroupId]) {
+        for id in ids {
+            let hex = hex::encode(id.as_slice());
+            if let Err(e) = self.outbox_state.lock().unwrap().remove_group_entries(&hex) {
+                tracing::warn!(%e, "outbox family purge failed");
+            }
+            self.remove_index_for_group(id);
+            self.notify_conversation_changed(&hex);
+        }
     }
 
     // ── Conversation index (Signal-style summary table) ──────────────────
