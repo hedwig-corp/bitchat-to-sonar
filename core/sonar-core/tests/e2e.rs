@@ -1514,6 +1514,10 @@ async fn recovered_08_pending_room_send_creates_named_group_not_dm() {
         "resume send must not land on the existing 1:1"
     );
     assert_eq!(alice.conversation_summaries().len(), 2);
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "resumed pending room must not stay on the FFI chat list beside the live group"
+    );
 }
 
 fn write_mdk08_alice_bob_carol_store(
@@ -1634,6 +1638,14 @@ async fn recovered_08_group_resumes_on_a_new_09_group_through_a_relay() {
     assert!(from_old.iter().any(|m| m.content == "carol in the room"));
     assert!(from_old.iter().any(|m| m.content == "room is back"));
     assert_eq!(alice.conversation_summaries().len(), 1);
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "FFI groups() must hide the recovered room after resume so the home list stays one row"
+    );
+    assert!(
+        !alice.is_folded_historical_group(&live[0].id),
+        "the live 0.9 room is the listed chat"
+    );
 
     bob.sync().await.expect("bob syncs welcome");
     carol.sync().await.expect("carol syncs welcome");

@@ -7207,8 +7207,13 @@ impl SonarClient {
         let Ok(bytes) = hex::decode(group_id_hex) else {
             return false;
         };
-        let id = GroupId::new(bytes);
-        matches!(self.engine.live_fold_target(&id), Some(live) if live != id)
+        self.is_folded_historical_group(&GroupId::new(bytes))
+    }
+
+    /// True when `group_id` is a recovered 0.8 row that already has a live
+    /// 0.9 fold sibling. Hosts must not paint that id as a second chat.
+    pub fn is_folded_historical_group(&self, group_id: &GroupId) -> bool {
+        matches!(self.engine.live_fold_target(group_id), Some(live) if live != *group_id)
     }
 
     fn fold_index_ids(&self, group_id_hex: &str) -> Vec<String> {

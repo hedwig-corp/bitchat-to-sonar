@@ -2685,7 +2685,10 @@ invited; the room name disappears; sends land in the wrong chat.
 `start_dm_with_key_package`, then `maybe_fold_new_group` absorbed the room into
 a new 1:1 with the same known peer. Hosts then folded any two-member FFI row
 by npub, so a pending room with only the welcomer listed still vanished into
-the 1:1. Core, FFI `is_direct`, and both hosts had to agree. Joined rooms were
+the 1:1. Core, FFI `is_direct`, and both hosts had to agree. FFI `groups()`
+also had to omit a folded historical room — `conversation_summaries()` already
+hid it, but hosts paint `chats()` / `groups()`, so a resumed room split into
+two home-list rows. Joined rooms were
 a second hole: the 0.8 `groups` table has no `member_count`, so a named room
 where only one peer ever sent fell back to `peers+1 <= 2` and resumed as a DM.
 Extract now copies `groups.description` and processed-welcome counts, and

@@ -1704,6 +1704,9 @@ impl SonarNode {
             });
         }
         for hist in self.client.historical_groups()? {
+            if self.client.is_folded_historical_group(&hist.id) {
+                continue;
+            }
             let id_hex = hex::encode(hist.id.as_slice());
             if !seen.insert(id_hex.clone()) {
                 continue;
