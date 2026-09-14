@@ -1064,6 +1064,15 @@ when bak is empty — stayed unreachable. `rebuildNow` now raises
 `ConversationFoldTest` `cachedFoldFamilySourceLimit`,
 `SonarConversationFoldTests` `snCachedFoldFamilySourceLimit`.
 
+Compose quote-jump miss hole closed after this commit: after a
+load-older miss (`!added`) `App.kt` cleared the jump. An empty first
+bak page / persist-folds hist miss is not exhaustion, so recovered 0.8
+quote and notification jumps were dropped before remainder could
+admit the parent. Clear only through `shouldClearQuotedJumpAfterMiss`
+(`shouldSettleQuotedJump`). iOS `applyQuotedJump` already kept the
+target. Pins: `ConversationFoldTest` `shouldClearQuotedJumpAfterMiss`,
+`SonarConversationFoldTests` `snShouldClearQuotedJumpAfterMiss`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

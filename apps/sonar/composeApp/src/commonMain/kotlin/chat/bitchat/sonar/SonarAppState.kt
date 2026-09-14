@@ -857,6 +857,16 @@ internal fun quotedMessageRevealLimit(
  *  admit the row. iOS `snShouldSettleQuotedJump`. */
 internal fun shouldSettleQuotedJump(parentInFeed: Boolean): Boolean = parentInFeed
 
+/** Soft-fail after a load-older miss must keep the jump. An empty first
+ *  bak page / persist-folds-before-core-fold hist miss is not exhaustion.
+ *  iOS `applyQuotedJump` does not clear on a failed page.
+ *  [added] is ignored on purpose — do not `if (!added) clear`. */
+@Suppress("UNUSED_PARAMETER")
+internal fun shouldClearQuotedJumpAfterMiss(
+    added: Boolean,
+    parentInFeed: Boolean,
+): Boolean = shouldSettleQuotedJump(parentInFeed)
+
 /** Quote-jump parent stored on any fold-family key. After remount the
  *  open screen may still look up hist / mesh while the live sibling
  *  holds the target — or the reverse. iOS `snQuotedJumpParentId`. */

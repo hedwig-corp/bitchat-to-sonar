@@ -1667,7 +1667,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             // Parent not painted yet. Pull one older local page (including
             // 0.8 remainder) so this effect can retry when feed.size grows.
             val added = state.loadOlderMessages(screen.id)
-            if (!added) {
+            if (shouldClearQuotedJumpAfterMiss(added = added, parentInFeed = false)) {
                 state.clearOpenChatJump(screen.id)
             }
             return@LaunchedEffect

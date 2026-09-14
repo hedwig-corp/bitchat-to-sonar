@@ -1820,8 +1820,15 @@ struct SNMsgList: View {
         guard let loadOlder, !isLoadingOlder else { return }
         isLoadingOlder = true
         Task {
-            _ = await loadOlder()
-            await MainActor.run { isLoadingOlder = false }
+            let added = await loadOlder()
+            await MainActor.run {
+                isLoadingOlder = false
+                // Empty first bak page is not exhaustion. Compose
+                // `shouldClearQuotedJumpAfterMiss`.
+                if snShouldClearQuotedJumpAfterMiss(added: added, parentVisible: false) {
+                    onJumpSettled?()
+                }
+            }
         }
     }
 

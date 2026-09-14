@@ -1126,6 +1126,15 @@ struct SonarConversationFoldTests {
         #expect(snShouldSettleQuotedJump(parentInFeed: true))
         #expect(!snShouldSettleQuotedJump(parentInFeed: false))
         #expect(
+            !snShouldClearQuotedJumpAfterMiss(added: false, parentVisible: false)
+        )
+        #expect(
+            !snShouldClearQuotedJumpAfterMiss(added: true, parentVisible: false)
+        )
+        #expect(
+            snShouldClearQuotedJumpAfterMiss(added: true, parentVisible: true)
+        )
+        #expect(
             snQuotedJumpParentId(
                 conversationId: "marmot:group-09",
                 jumps: ["group-08": "parent-08"],

@@ -690,6 +690,14 @@ func snShouldSettleQuotedJump(parentInFeed: Bool) -> Bool {
     parentInFeed
 }
 
+/// Soft-fail after a load-older miss must keep the jump. An empty first
+/// bak page is not exhaustion. Compose `shouldClearQuotedJumpAfterMiss`.
+/// `added` is ignored on purpose — do not `if !added { clear }`.
+func snShouldClearQuotedJumpAfterMiss(added: Bool, parentVisible: Bool) -> Bool {
+    _ = added
+    return snShouldSettleQuotedJump(parentInFeed: parentVisible)
+}
+
 /// Quote-jump parent stored on any fold-family key. After remount the
 /// screen may still write `peerId` (hist / mesh) while
 /// `ConversationViewState` is live-keyed — or the reverse `marmot:` /

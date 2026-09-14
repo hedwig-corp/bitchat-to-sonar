@@ -1309,6 +1309,11 @@ class ConversationFoldTest {
         )
         assertTrue(shouldSettleQuotedJump(parentInFeed = true))
         assertFalse(shouldSettleQuotedJump(parentInFeed = false))
+        // Empty first bak page / hist miss is not exhaustion. Clearing
+        // here dropped recovered 0.8 quote + notification jumps.
+        assertFalse(shouldClearQuotedJumpAfterMiss(added = false, parentInFeed = false))
+        assertFalse(shouldClearQuotedJumpAfterMiss(added = true, parentInFeed = false))
+        assertTrue(shouldClearQuotedJumpAfterMiss(added = true, parentInFeed = true))
         val folds = mapOf("group-08" to "group-09")
         val histJump = mapOf("group-08" to "parent-08")
         assertEquals("parent-08", quotedJumpParentId("group-09", histJump, folds))
