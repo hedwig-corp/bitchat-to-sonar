@@ -1132,6 +1132,13 @@ internal fun retainedTranscriptForChat(
     return emptyList()
 }
 
+/** Family snapshot a first-open local page must keep through FFI.
+ *  Persist-folds can remount recovered 0.8 rows onto the host cache before
+ *  `messages(live)` lists them; merge that seed with the live page instead
+ *  of replacing it. iOS `loadLocalPage` already merges `hiddenSiblingHasRows`. */
+internal fun firstOpenFoldFamilySeedRows(snapshot: List<SonarMsg>): List<SonarMsg> =
+    snapshot.withoutSyntheticSummaryRows().takeLast(TRANSCRIPT_RETAINED_ROWS)
+
 /** Prefer last leave paint (including a hidden 0.8 sibling), then union any
  *  remounted family snapshot rows so a short live leave-frame cannot hide
  *  recovered 0.8 history. iOS `snFirstOpenTranscriptPaintRows`. */
@@ -3432,7 +3439,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Keep the full family-unioned host cache in the source window so first
      *  paint takeLast(page) cannot hide recovered 0.8 rows or disable load-older. */
     private fun seedFoldFamilyTranscriptWindows(chatId: String, snapshot: List<SonarMsg>) {
-        val rows = snapshot.withoutSyntheticSummaryRows().takeLast(TRANSCRIPT_RETAINED_ROWS)
+        val rows = firstOpenFoldFamilySeedRows(snapshot)
         if (rows.isEmpty()) return
         val hasMore = seededFoldFamilyTranscriptHasMore(
             cachedCount = rows.size,
@@ -7394,6 +7401,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         // First open (Signal-Android): load the bounded local page *before*
         // ChatScreen mounts. Snapshot→async replace was the rebuild flash.
         // Home stays up for the local read; Chat's frame 0 is the final page.
+        // Seed remounted family rows first so a live-only FFI page cannot
+        // drop recovered 0.8 history (persist-folds before core fold).
+        seedFoldFamilyTranscriptWindows(
+            chat.id,
+            snapshotMessagesForChat(chat.id),
+        )
         scope.launch {
             val local = withSendEchoes(
                 chat.id,
@@ -7455,6 +7468,11 @@ class SonarAppState(private val scope: CoroutineScope) {
 
         // First open: merge mesh + White Noise local page before Chat mounts
         // so frame 0 is not a seed that later jumps when WN merges.
+        // Seed remounted WN family rows so a live-only cursor cannot drop
+        // recovered 0.8 history after a mesh-folded resume.
+        for (groupId in transcriptGroupIds(id)) {
+            seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
+        }
         scope.launch {
             val mesh = refreshMeshTranscriptWindow(canonicalPeerId)
             val wn = marmotMessagesForPeer(canonicalPeerId, id, generation)

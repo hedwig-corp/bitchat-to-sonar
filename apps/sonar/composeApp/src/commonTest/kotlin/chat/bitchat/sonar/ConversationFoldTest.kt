@@ -1071,6 +1071,39 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun firstOpenFoldFamilySeedSurvivesLiveOnlyLocalPage() {
+        val hist = (1..40).map { i ->
+            SonarMsg(
+                id = "h$i",
+                senderNpub = "npub1peer",
+                content = "old $i",
+                mine = false,
+                tsSecs = i.toLong(),
+            )
+        }
+        val liveOnly = listOf(
+            SonarMsg(id = "l1", senderNpub = "npub1me", content = "new 0.9", mine = true, tsSecs = 100L),
+        )
+        val seeded = firstOpenFoldFamilySeedRows(hist)
+        val afterLocal = mergeTranscriptRows(seeded, liveOnly)
+        assertTrue(afterLocal.any { it.id == "h1" })
+        assertTrue(afterLocal.any { it.id == "l1" })
+        assertTrue(seededFoldFamilyTranscriptHasMore(cachedCount = afterLocal.size))
+        assertEquals(
+            hist,
+            firstOpenFoldFamilySeedRows(hist + listOf(
+                SonarMsg(
+                    id = "${SYNTHETIC_SUMMARY_ID_PREFIX}group-09:1:1",
+                    senderNpub = "npub1peer",
+                    content = "preview",
+                    mine = false,
+                    tsSecs = 1L,
+                ),
+            )),
+        )
+    }
+
+    @Test
     fun composerDraftReadAndClearWalkFoldFamily() {
         val folds = mapOf("group-08" to "group-09")
         val drafts = mapOf("group-08" to "hello from 0.8")

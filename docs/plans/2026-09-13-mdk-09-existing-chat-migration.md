@@ -971,6 +971,16 @@ unions via `dmMsgs`. Pins:
 `ConversationFoldTest.retainedTranscriptReadWalksFoldFamily`,
 `SonarConversationFoldTests` `snFirstOpenTranscriptPaintRows`.
 
+First-open FFI hole closed after this commit: with no leave-paint,
+`openChat` / `openDm` waited on `messagesCursorPage(live)` without
+seeding the remounted family snapshot. A live-only page (persist-folds
+before core fold) replaced recovered 0.8 rows. First-open now seeds
+`firstOpenFoldFamilySeedRows` into the source window so the local
+merge keeps them; still waits for the cursor before push (no
+snapshot→async flash). iOS `loadLocalPage` already merges
+`hiddenSiblingHasRows`. Pins:
+`ConversationFoldTest.firstOpenFoldFamilySeedSurvivesLiveOnlyLocalPage`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

@@ -2597,6 +2597,8 @@ final class MarmotChatModel: ObservableObject {
                 // A live-only newest page must not drop recovered 0.8 rows that
                 // still sit on the hidden sibling (persist-folds before core
                 // fold). Merge, then keep the newest retained window.
+                // Compose first-open seeds `firstOpenFoldFamilySeedRows` into
+                // the source window before the same local cursor read.
                 canonical = Array(
                     Self.mergeMessages(existing: existingCanonical, incoming: page)
                         .suffix(Self.localTranscriptRetainedLimit)
