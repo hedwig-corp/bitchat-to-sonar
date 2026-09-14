@@ -747,9 +747,10 @@ internal fun seededFoldFamilyTranscriptHasMore(
 ): Boolean = familyHasOlder || foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)
 
 /** Blank-transcript recovery must treat a leftover hist summary / latest
- *  as proof the conversation is non-empty. A live-only 0.9 summary is 0
- *  after resume and used to skip recovery while bak remainder sat on hist.
- *  iOS `snBlankTranscriptKnownNonEmpty`. */
+ *  as proof the conversation is non-empty. `copy_summary` leaves live
+ *  `message_count` at 0 on conflict; a live-only 0.9 count then skips
+ *  recovery while bak remainder sat on hist.
+ *  iOS `snBlankTranscriptKnownNonEmpty` now also uses latest-or-count. */
 internal fun blankTranscriptKnownNonEmpty(
     chatId: String,
     latestByChat: Map<String, Long>,

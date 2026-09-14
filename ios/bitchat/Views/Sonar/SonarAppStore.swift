@@ -570,20 +570,24 @@ func snSeededFoldFamilyTranscriptHasMore(
     familyHasOlder || snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize)
 }
 
-/// Blank-transcript recovery must treat a leftover hist summary as
-/// proof the conversation is non-empty. A live-only 0.9 count is 0
-/// after resume and used to skip recovery while bak remainder sat on
-/// hist. Compose `blankTranscriptKnownNonEmpty`.
+/// Blank-transcript recovery must treat a leftover hist summary /
+/// remounted latest as proof the conversation is non-empty. `copy_summary`
+/// leaves live `message_count` at 0 on conflict; a live-only 0.9 count
+/// then skips recovery while bak remainder sat on hist.
+/// Compose `blankTranscriptKnownNonEmpty` already uses latest-or-count.
 func snBlankTranscriptKnownNonEmpty(
     groupId: String,
     messageCountByGroup: [String: UInt64],
+    latestAtByGroup: [String: TimeInterval] = [:],
     historicalFolds: [String: String]
 ) -> Bool {
     snTranscriptSourceIds(
         groupId: groupId,
         listedDirectIds: [],
         historicalFolds: historicalFolds
-    ).contains { (messageCountByGroup[$0] ?? 0) > 0 }
+    ).contains {
+        (messageCountByGroup[$0] ?? 0) > 0 || (latestAtByGroup[$0] ?? 0) > 0
+    }
 }
 
 /// Family cache already has rows — do not start blank recovery, and

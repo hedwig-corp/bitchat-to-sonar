@@ -1199,6 +1199,14 @@ Pins: `ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
 `SonarConversationFoldTests` `snPagedFoldFamilyGroupIds` /
 `snLoadOlderHiddenSiblingsNeedingNewestPage`.
 
+iOS blank-recovery latestAt hole closed after this commit: `copy_summary`
+leaves live `message_count` at 0 on conflict. iOS
+`snBlankTranscriptKnownNonEmpty` used count only, so persist-folds
+skipped recovery while bak remainder sat on hist. Compose already
+used latest-or-count. iOS now matches. Pins:
+`SonarConversationFoldTests` `snBlankTranscriptKnownNonEmpty` latestAt,
+`ConversationFoldTest` `blankTranscriptKnownNonEmpty` latestByChat.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

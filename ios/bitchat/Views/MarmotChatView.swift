@@ -2418,9 +2418,15 @@ final class MarmotChatModel: ObservableObject {
         let counts = Dictionary(
             uniqueKeysWithValues: conversationSummariesByGroup.map { ($0.key, $0.value.messageCount) }
         )
+        let latestAt = Dictionary(
+            uniqueKeysWithValues: conversationSummariesByGroup.map {
+                ($0.key, $0.value.latestAt.timeIntervalSince1970)
+            }
+        )
         let knownNonEmpty = snBlankTranscriptKnownNonEmpty(
             groupId: groupId,
             messageCountByGroup: counts,
+            latestAtByGroup: latestAt,
             historicalFolds: folds
         )
         let listed = Set(groups.map(\.id))
@@ -2492,11 +2498,17 @@ final class MarmotChatModel: ObservableObject {
                         ($0.key, $0.value.messageCount)
                     }
                 )
+                let latestAt = Dictionary(
+                    uniqueKeysWithValues: self.conversationSummariesByGroup.map {
+                        ($0.key, $0.value.latestAt.timeIntervalSince1970)
+                    }
+                )
                 let listed = Set(self.groups.map(\.id))
                 if !SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript(
                     knownNonEmpty: snBlankTranscriptKnownNonEmpty(
                         groupId: groupId,
                         messageCountByGroup: counts,
+                        latestAtByGroup: latestAt,
                         historicalFolds: folds
                     ),
                     storeReadable: storeReadable,

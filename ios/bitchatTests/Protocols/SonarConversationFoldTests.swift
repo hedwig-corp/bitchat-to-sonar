@@ -668,6 +668,22 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snBlankTranscriptKnownNonEmpty(
+                groupId: "group-09",
+                messageCountByGroup: [:],
+                latestAtByGroup: ["group-09": 1_700_000_000],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snBlankTranscriptKnownNonEmpty(
+                groupId: "group-09",
+                messageCountByGroup: [:],
+                latestAtByGroup: ["group-09": 0],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
             snBlankTranscriptFamilyRendered(
                 groupId: "group-09",
                 messagesByGroup: ["group-08": ["old from 0.8"]],
