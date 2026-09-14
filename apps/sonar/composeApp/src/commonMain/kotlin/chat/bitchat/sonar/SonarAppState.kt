@@ -538,6 +538,13 @@ internal fun <V> remountFoldedOpenValues(
     return next
 }
 
+/** Rebind one open-chat id from a hidden 0.8 row onto the live sibling. */
+internal fun remountFoldedOpenId(
+    historicalKeys: Collection<String>,
+    liveId: String,
+    id: String,
+): String = if (id in historicalKeys) liveId else id
+
 /** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
 internal fun promotedFoldedMutes(
     previousIds: Set<String>,
@@ -12469,6 +12476,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         ).let { remounted ->
             freshCanonicalByGroup.clear()
             freshCanonicalByGroup.putAll(remounted)
+        }
+        if (pendingMediaPreviews.any { it.chatId == open.id }) {
+            pendingMediaPreviews = pendingMediaPreviews.map { preview ->
+                preview.copy(chatId = remountFoldedOpenId(listOf(open.id), live, preview.chatId))
+            }
         }
         openChatUnread[open.id]?.let { openChatUnread = openChatUnread - open.id + (live to it) }
         openChatUnreadAnchor[open.id]?.let { openChatUnreadAnchor = openChatUnreadAnchor - open.id + (live to it) }

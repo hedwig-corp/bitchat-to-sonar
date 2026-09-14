@@ -306,6 +306,15 @@ func snRemountFoldedOpenValues<Value>(
     return next
 }
 
+/// Rebind one open-chat id from a hidden 0.8 row onto the live sibling.
+func snRemountFoldedOpenId(
+    historicalKeys: [String],
+    liveId: String,
+    id: String
+) -> String {
+    historicalKeys.contains(id) ? liveId : id
+}
+
 /// Historical group ids that disappeared because they folded onto a listed live id.
 func snPromotedFoldedMutePairs(
     previousGroupIds: Set<String>,
@@ -7479,6 +7488,21 @@ final class SonarAppStore: ObservableObject {
             values: pendingJumpMessageIdByDM
         )
         remountFoldedConversationViewState(from: openId, groupId: groupId, onto: realId)
+        if pendingMediaPreviews.contains(where: { $0.peerId == openId || $0.peerId == groupId }) {
+            pendingMediaPreviews = pendingMediaPreviews.map { preview in
+                PendingMediaPreview(
+                    peerId: snRemountFoldedOpenId(
+                        historicalKeys: [openId, groupId],
+                        liveId: realId,
+                        id: preview.peerId
+                    ),
+                    tempURL: preview.tempURL,
+                    filename: preview.filename,
+                    mime: preview.mime,
+                    caption: preview.caption
+                )
+            }
+        }
         if let draft = composerDrafts[openId], !draft.isEmpty,
            composerDraft(for: realId).isEmpty {
             setComposerDraft(draft, for: realId)

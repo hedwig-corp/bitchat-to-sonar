@@ -367,7 +367,9 @@ count / jump target and the in-session transcript window
 `ConversationViewState` plus the Marmot older-edge cursor on iOS) so
 resume does not treat the live sibling as a fresh open and snap a
 scrolled recovered chat back to the tail. iOS remount does **not** call
-`openedDM` (that hydrates newest-page). A mute on the recovered id is copied onto
+`openedDM` (that hydrates newest-page). An in-progress media confirmation
+sheet is rebound onto the live id so Send does not lose the staged
+files. A mute on the recovered id is copied onto
 the live sibling when the historical row disappears, so resume does not
 start notifying a chat the user already silenced. An in-progress composer
 draft or reply target on that hidden id is copied the same way — including

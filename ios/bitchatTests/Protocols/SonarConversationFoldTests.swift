@@ -97,6 +97,20 @@ struct SonarConversationFoldTests {
                 preferExisting: { !$0.isEmpty }
             )["group-09"] == ["already-live"]
         )
+        #expect(
+            snRemountFoldedOpenId(
+                historicalKeys: ["marmot:group-08", "group-08"],
+                liveId: "marmot:group-09",
+                id: "marmot:group-08"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snRemountFoldedOpenId(
+                historicalKeys: ["marmot:group-08"],
+                liveId: "marmot:group-09",
+                id: "other"
+            ) == "other"
+        )
         // Notification / deep-link ids stay on the hidden 0.8 row until remap.
         #expect(
             snRemountFoldedOpenGroupId(

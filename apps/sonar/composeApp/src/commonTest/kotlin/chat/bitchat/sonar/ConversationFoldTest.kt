@@ -510,6 +510,8 @@ class ConversationFoldTest {
                 preferExisting = { it.isNotEmpty() },
             ),
         )
+        assertEquals("group-09", remountFoldedOpenId(listOf("group-08"), "group-09", "group-08"))
+        assertEquals("other", remountFoldedOpenId(listOf("group-08"), "group-09", "other"))
     }
 
     @Test
