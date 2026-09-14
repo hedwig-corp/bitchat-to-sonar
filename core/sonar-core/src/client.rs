@@ -7912,16 +7912,11 @@ impl SonarClient {
             if hist.unread_count == 0 && hist.latest_at_secs == 0 && hist.message_count == 0 {
                 continue;
             }
-            if let Some(live_summary) = summaries
-                .iter_mut()
-                .find(|s| s.group_id_hex == live_hex)
-            {
+            if let Some(live_summary) = summaries.iter_mut().find(|s| s.group_id_hex == live_hex) {
                 Self::remount_hist_fields_onto_live(live_summary, &hist);
                 continue;
             }
-            if self.engine.is_dropped(&live)
-                || !self.engine.is_live_group(&live).unwrap_or(false)
-            {
+            if self.engine.is_dropped(&live) || !self.engine.is_live_group(&live).unwrap_or(false) {
                 continue;
             }
             let mut published = hist.clone();
