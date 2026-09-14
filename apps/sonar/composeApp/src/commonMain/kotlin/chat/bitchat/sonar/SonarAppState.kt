@@ -523,8 +523,31 @@ internal fun directMarmotChatIdForPeer(
     return chats.firstOrNull { directMarmotPeerKey(it, ownNpub) == peer }?.id
 }
 
-internal fun marmotNotificationGroupName(chat: SonarChat): String? =
-    chat.name.takeIf { !chat.isDirect && it.isNotBlank() }
+internal fun marmotNotificationGroupName(chat: SonarChat, paintedTitle: String? = null): String? {
+    if (chat.isDirect) return null
+    return paintedTitle?.trim()?.takeIf { it.isNotEmpty() }
+        ?: chat.name.takeIf { it.isNotBlank() }
+}
+
+/** iOS `SonarPushProcessor` wake titles: room name is conversationTitle
+ *  when present, and `groupName` only when a distinct sender is known —
+ *  otherwise the router renders "standup in standup". */
+internal data class WakeNotificationNames(
+    val conversationTitle: String?,
+    val groupName: String?,
+)
+
+internal fun wakeNotificationNames(
+    summaryName: String,
+    senderName: String?,
+): WakeNotificationNames {
+    val room = summaryName.trim().takeIf { it.isNotEmpty() }
+    val sender = senderName?.trim()?.takeIf { it.isNotEmpty() }
+    return WakeNotificationNames(
+        conversationTitle = room ?: sender,
+        groupName = if (sender != null && room != null && room != sender) room else null,
+    )
+}
 
 /** After an MDK 0.8→0.9 resume, send to the newest duplicate group so the
  *  recovered row stays the history bucket and the live 0.9 group takes traffic. */
@@ -7619,7 +7642,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 newestTrill = trillCandidate
             }
         }
-        val groupName = marmotNotificationGroupName(c)
+        val groupName = marmotNotificationGroupName(c, paintedTitle = title)
         newestIncoming?.let { incoming ->
             notifyIncoming(
                 idKey = idKey,

@@ -3105,6 +3105,10 @@ class ConversationFoldTest {
         assertEquals(dm.id, directMarmotChatIdForPeer(listOf(resumedRoom, dm), ownNpub, peerNpub))
         assertEquals(null, marmotNotificationGroupName(resumedRoom))
         assertEquals(
+            "standup",
+            marmotNotificationGroupName(resumedRoom, paintedTitle = "standup"),
+        )
+        assertEquals(
             "Group chat",
             marmotChatDisplayTitle(
                 isDirect = resumedRoom.isDirect,
@@ -3354,5 +3358,23 @@ class ConversationFoldTest {
                 isNpubBlocked = { false },
             ),
         )
+    }
+
+    @Test
+    fun wakeNamesForRecoveredGroupKeepRoomAndAvoidTitleInTitle() {
+        val names = wakeNotificationNames(
+            summaryName = "standup",
+            senderName = "Alice",
+        )
+        assertEquals("standup", names.conversationTitle)
+        assertEquals("standup", names.groupName)
+
+        val dm = wakeNotificationNames(summaryName = "", senderName = "Alice")
+        assertEquals("Alice", dm.conversationTitle)
+        assertNull(dm.groupName)
+
+        val roomOnly = wakeNotificationNames(summaryName = "standup", senderName = null)
+        assertEquals("standup", roomOnly.conversationTitle)
+        assertNull(roomOnly.groupName)
     }
 }

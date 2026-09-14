@@ -18,6 +18,7 @@ import chat.bitchat.sonar.decodeMuteMap
 import chat.bitchat.sonar.decodeProfileCache
 import chat.bitchat.sonar.isMutedAt
 import chat.bitchat.sonar.resolvePushSenderName
+import chat.bitchat.sonar.wakeNotificationNames
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withTimeoutOrNull
@@ -88,19 +89,25 @@ internal object SonarWakeNotifications {
             )
             if (kind == SonarNotificationKind.Call) continue
 
+            val senderName = if (!prefs.showNames) null else summary.latestSenderNpub
+                .takeIf { it.isNotBlank() }
+                ?.let { npub ->
+                    // Everything is prefetched above under one budget, so
+                    // the fetch lambda is a pure map read (no network).
+                    resolvePushSenderName(npub, cachedProfiles) { missing ->
+                        fetchedProfiles[canonicalProfileKey(missing)]
+                    }
+                }
+            // Remounted hist room names live on summary.name. Passing only
+            // conversationTitle lets visibleLabel prefer the sender and drop
+            // the room (iOS always sets groupName when they differ).
+            val names = wakeNotificationNames(summary.name, senderName)
             val notif = SonarNotificationRouter.build(
                 idKey = summary.groupIdHex,
                 kind = kind,
-                conversationTitle = summary.name.ifBlank { null },
-                senderName = if (!prefs.showNames) null else summary.latestSenderNpub
-                    .takeIf { it.isNotBlank() }
-                    ?.let { npub ->
-                        // Everything is prefetched above under one budget, so
-                        // the fetch lambda is a pure map read (no network).
-                        resolvePushSenderName(npub, cachedProfiles) { missing ->
-                            fetchedProfiles[canonicalProfileKey(missing)]
-                        }
-                    },
+                conversationTitle = names.conversationTitle,
+                senderName = senderName,
+                groupName = names.groupName,
                 preview = summary.latestContent,
                 unreadCount = summary.unreadCount,
                 prefs = prefs,

@@ -1539,6 +1539,19 @@ and remap onto the live sibling first. `fetch_media` /
 0.9 blob can use the live exporter after sidecar loss. Pin:
 `client::tests::prefer_catchup_maps_folded_hist_to_live_mls_hex`.
 
+Android killed-app wake dropped remounted room names. `visibleLabel`
+prefers `senderName` over `conversationTitle`, and the drain passed
+only the latter, so a recovered named group bannered **"Alice"**
+instead of **"Alice in standup"** (iOS host wake already sets
+`groupName` when sender and room differ). `wakeNotificationNames`
+mirrors that: room is `conversationTitle`, and `groupName` only when
+a distinct sender is known (otherwise the router renders
+"standup in standup"). Foreground `marmotNotificationGroupName` now
+prefers the painted title so an empty-topic room stays "Group chat".
+Pins: `ConversationFoldTest.wakeNamesForRecoveredGroupKeepRoomAndAvoidTitleInTitle`,
+`SonarNotificationRouterTest.recoveredWakePassesRoomAsConversationTitleAndGroupName`,
+`ConversationFoldTest.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
