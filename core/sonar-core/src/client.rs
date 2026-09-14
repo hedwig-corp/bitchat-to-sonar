@@ -11866,6 +11866,25 @@ mod tests {
             !bob.engine.historical_resume_is_direct(&historical),
             "a named 2-person room must stay a room, not a DM"
         );
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(
+                &hist_hex,
+                "standup",
+                "standup from 0.8",
+                "alice",
+                50,
+                false,
+                true,
+            )
+            .unwrap();
+        }
 
         let bob_kp = bob
             .engine
@@ -11907,10 +11926,16 @@ mod tests {
                 .any(|m| m.content == "standup from 0.8"),
             "messages(live) must include the recovered named-pair transcript"
         );
+        let summaries = bob.conversation_summaries();
         assert_eq!(
-            bob.conversation_summaries().len(),
+            summaries.len(),
             1,
-            "folded historical named pair must leave one home-list row"
+            "folded historical named pair must leave one home-list row: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+        assert_eq!(
+            summaries[0].unread_count, 1,
+            "recovered named-pair unread must land on the live row"
         );
     }
 
