@@ -2790,6 +2790,36 @@ struct SonarConversationFoldTests {
             ) == "marmot:other"
         )
         #expect(
+            snPaymentConversationStoreId(
+                peerKey: "marmot:group-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snPaymentConversationStoreId(
+                peerKey: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            snPaymentConversationStoreId(
+                peerKey: "wallet",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "wallet"
+        )
+        #expect(
+            snPaymentConversationStoreId(
+                peerKey: "unify:peer",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "unify:peer"
+        )
+        #expect(
             snRemountedPaymentPeerKey(
                 peerKey: "marmot:group-08",
                 historicalKeys: ["marmot:group-08", "group-08"],

@@ -939,6 +939,35 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        assertEquals(
+            "group-09",
+            paymentConversationStoreId(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals("group-09", paymentConversationStoreId("group-08", mapOf("group-08" to "group-09")))
+        assertEquals("wallet", paymentConversationStoreId("wallet", mapOf("group-08" to "group-09")))
+        assertEquals(
+            "unify:peer",
+            paymentConversationStoreId(
+                "unify:peer",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "group-other",
+            paymentConversationStoreId(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

@@ -2804,6 +2804,27 @@ func snCallConversationStoreId(
     return conversationId
 }
 
+/// Key new conversation-scoped payment rows on the remounted live sibling.
+/// Wallet / Unify keys stay put. Compose `paymentConversationStoreId`.
+func snPaymentConversationStoreId(
+    peerKey: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    if peerKey == "wallet" || peerKey.hasPrefix("unify:") {
+        return peerKey
+    }
+    return snCallConversationStoreId(
+        conversationId: peerKey,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    )
+}
+
 /// Conversation keys a chat-scoped payment read must check after a fold.
 /// Includes both bare MLS ids and `marmot:` conversation ids. Empty
 /// persist-folds still union the remount pair so a moved live row stays
@@ -9139,6 +9160,20 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    /// Store new conversation-scoped payments on remount live. Wallet /
+    /// Unify keys stay put.
+    private func paymentConversationStoreId(for id: String) -> String {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        return snPaymentConversationStoreId(
+            peerKey: id,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
     func cachedCallRecordCount(_ id: String) -> Int {
         callLogsForChat(id).count
     }
@@ -13506,7 +13541,7 @@ final class SonarAppStore: ObservableObject {
         paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
             kind: .sonarDirect,
-            peerKey: id,
+            peerKey: paymentConversationStoreId(for: id),
             peerName: peerItem(id).name,
             direction: .outgoing,
             sats: sats,
@@ -13531,7 +13566,7 @@ final class SonarAppStore: ObservableObject {
         // ledger is consistent even if the chat send path ever fails.
         paymentActivityLedger.markPaid(activityId, payment: payment)
         payLedger.record(SonarPayEntry(
-            id: activityId, peerKey: id, sats: sats,
+            id: activityId, peerKey: paymentConversationStoreId(for: id), sats: sats,
             direction: .outgoing, state: .claimed, via: via.rawValue
         ))
         let receiptOk = await sendPaymentReceiptLines(
@@ -13992,7 +14027,7 @@ final class SonarAppStore: ObservableObject {
         switch line {
         case .pay(let id, let sats):
             payLedger.record(SonarPayEntry(
-                id: id, peerKey: convId, sats: sats,
+                id: id, peerKey: paymentConversationStoreId(for: convId), sats: sats,
                 direction: .incoming, state: .sealed, via: via.rawValue
             ))
 

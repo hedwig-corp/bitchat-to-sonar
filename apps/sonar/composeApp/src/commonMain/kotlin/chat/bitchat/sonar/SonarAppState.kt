@@ -2679,6 +2679,23 @@ internal fun callConversationStoreId(
     return chatId
 }
 
+/** Key new conversation-scoped payment rows on the remounted live sibling.
+ *  Wallet / Unify keys stay put. iOS `snPaymentConversationStoreId`. */
+internal fun paymentConversationStoreId(
+    peerKey: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    if (peerKey == "wallet" || peerKey.startsWith("unify:")) return peerKey
+    return callConversationStoreId(
+        peerKey,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+}
+
 /** Conversation keys a chat-scoped payment read must check after a fold.
  *  Empty persist-folds still union the remount pair so a moved live row
  *  stays visible on the painted hist pane. */
@@ -6290,6 +6307,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val offer = directPaymentOffer(chatId)
         if (offer == null) return "Fetching payment details — try again in a moment."
         val payId = randomPayId()
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val storePeerKey = paymentConversationStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         // iOS parity (SonarAppStore.sendPay → SonarPaymentActivityLedger):
         // record a pending sonarDirect activity BEFORE the wallet send, then
         // settle or fail it below so the Wallet screen shows direct sends.
@@ -6297,7 +6321,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             SonarPaymentActivity(
                 id = payId,
                 kind = SonarPaymentActivity.Kind.SonarDirect,
-                peerKey = chatId,
+                peerKey = storePeerKey,
                 peerName = callPeerName(chatId),
                 direction = SonarPaymentActivity.Direction.Outgoing,
                 sats = sats,
