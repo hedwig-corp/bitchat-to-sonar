@@ -167,7 +167,15 @@ Guarded by:
   0.8 row listed and a send on that id mints a second 0.9 group)
 - `client::tests::incoming_09_room_welcome_folds_recovered_08_room`
   (accepting a 3+ 0.9 room whose other members match the recovered
-  sidecar folds history; 2-person named rooms stay off this path)
+  sidecar folds history)
+- `client::tests::incoming_09_named_pair_welcome_folds_recovered_named_room`
+  (auto-accepted 2-person `create_group("standup")` folds a recovered
+  named pair on unique name + exact member match; White Noise DMs
+  without `sonar.direct-dm.v1` take this path)
+- `client::tests::incoming_09_named_pair_welcome_skips_when_names_differ`
+- `client::tests::incoming_09_named_pair_welcome_does_not_fold_three_member_room`
+  (R-045: a recovered 3-person standup must not fold onto a 2-person
+  live standup just because the names match)
 - `client::tests::incoming_09_room_welcome_folds_when_live_is_subset_of_recovered`
   (incoming mixed resume matches `resolve_send_group`: live others
   may be a unique subset of the recovered roster; leftovers stay
@@ -670,6 +678,16 @@ have 3+ members, and the other-member sets match. A recovered room
 still must not fold onto a welcomer 1:1 (R-045). Pins:
 `incoming_09_room_welcome_folds_recovered_08_room`,
 `incoming_09_dm_welcome_does_not_fold_recovered_room`.
+
+Incoming named-pair hole closed after this commit: a recovered 0.8
+named 2-person room (or White Noise DM without `sonar.direct-dm.v1`)
+classifies as a room, and incoming `create_group("standup", [peer])`
+auto-joins. Folding only 3+ rooms left that history as a second row.
+Fold on unique name + exact member match only. Name mismatch and a
+3-person recovered standup with the same title stay unfolder. Pins:
+`incoming_09_named_pair_welcome_folds_recovered_named_room`,
+`incoming_09_named_pair_welcome_skips_when_names_differ`,
+`incoming_09_named_pair_welcome_does_not_fold_three_member_room`.
 
 Incoming 0.9 DM welcome hole closed after this commit: 1:1 welcomes
 auto-join as `Incoming::GroupUpdated` and parked 2-member Accept uses
