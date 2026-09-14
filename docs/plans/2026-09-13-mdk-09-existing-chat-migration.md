@@ -801,6 +801,14 @@ Quote-jump after Leave is not a remount hole: both hosts clear the
 jump on pop (`back()` / `pop()`). In-chat quote while fold lands is
 already remounted with the open chat.
 
+Mesh-banner hole closed after this commit: Compose `maybeNotify` for a
+White Noise group folded into a mesh row suppressed only `[live, mesh]`.
+Sitting in the recovered 0.8 transcript rang the mesh identity. Scan
+stays on the listed live id; suppress now walks the fold family.
+iOS already matches fold family via `conversationsMatchForNotification`.
+Pins: `ConversationFoldTest.notificationSuppressIdsIncludeHiddenHistoricalSibling`
+(mesh case), `SonarConversationFoldTests` `snMeshNotificationSuppressIds`.
+
 Load-older hole closed after this commit: iOS remounted `messagesByGroup`
 after fold but left `hasOlder` / load-older cursors on the hidden 0.8 id.
 Fold after Leave, then reopen the live row offline, could not page bak

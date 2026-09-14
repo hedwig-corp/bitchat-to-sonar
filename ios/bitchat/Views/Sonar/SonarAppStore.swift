@@ -821,6 +821,24 @@ func snPendingUploadLookupGroupIds(
 }
 
 /// Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold.
+/// Mesh-folded White Noise notify: suppress the live group, the mesh row,
+/// and the hidden 0.8 sibling so sitting in recovered history does not ring.
+func snMeshNotificationSuppressIds(
+    groupId: String,
+    meshId: String,
+    historicalFolds: [String: String]
+) -> [String] {
+    var out: [String] = []
+    var seen = Set<String>()
+    for id in [groupId, meshId] where !id.isEmpty {
+        if seen.insert(id).inserted { out.append(id) }
+        for alias in snFoldFamilyIds(id: id, historicalFolds: historicalFolds) {
+            if seen.insert(alias).inserted { out.append(alias) }
+        }
+    }
+    return out
+}
+
 func snRetainedTranscriptForChat<Message>(
     chatId: String,
     retainedByChat: [String: [Message]],

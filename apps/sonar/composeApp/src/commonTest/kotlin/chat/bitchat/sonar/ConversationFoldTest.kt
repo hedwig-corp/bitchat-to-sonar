@@ -1313,6 +1313,11 @@ class ConversationFoldTest {
         )
         assertTrue("group-08" in notificationSuppressIds(listOf("group-09"), folds))
         assertFalse("group-08" in listOf("group-09"))
+        val mesh = meshNotificationSuppressIds("group-09", "mesh:peer", folds)
+        assertTrue("group-08" in mesh)
+        assertTrue("group-09" in mesh)
+        assertTrue("mesh:peer" in mesh)
+        assertFalse("group-08" in listOf("group-09", "mesh:peer"))
     }
 
     @Test

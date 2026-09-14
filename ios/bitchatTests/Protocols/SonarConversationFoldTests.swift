@@ -509,6 +509,13 @@ struct SonarConversationFoldTests {
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])
         #expect(SonarNSEDecoratePolicy.historicalFoldsUserDefaultsKey == snHistoricalFoldsDefaultsKey)
         #expect(
+            Set(snMeshNotificationSuppressIds(
+                groupId: "group-09",
+                meshId: "mesh:peer",
+                historicalFolds: ["group-08": "group-09"]
+            )).isSuperset(of: ["group-08", "group-09", "mesh:peer"])
+        )
+        #expect(
             snTranscriptSourceIds(
                 groupId: "group-09",
                 listedDirectIds: ["group-09"],

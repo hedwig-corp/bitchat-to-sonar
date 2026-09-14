@@ -1087,6 +1087,14 @@ internal fun notificationSuppressIds(
     return out.toList()
 }
 
+/** Mesh-folded White Noise notify: suppress the live group, the mesh row,
+ *  and the hidden 0.8 sibling so sitting in recovered history does not ring. */
+internal fun meshNotificationSuppressIds(
+    groupId: String,
+    meshId: String,
+    historicalFolds: Map<String, String>,
+): List<String> = notificationSuppressIds(listOf(groupId, meshId), historicalFolds)
+
 /** Marmot ids whose unread / transcript belong to the open chat after a fold.
  *  Listed 1:1 duplicates plus the hidden 0.8 sibling. */
 internal fun transcriptSourceIds(
@@ -6229,7 +6237,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notifyChatIfNew(
                 c,
                 scanIds = listOf(groupId),
-                suppressIds = listOf(groupId, meshId),
+                suppressIds = meshNotificationSuppressIds(groupId, meshId, historicalFoldMap),
                 openChatId = openChatId,
                 idKey = meshId,
                 title = meshPeerName(peerId),
