@@ -1309,8 +1309,15 @@ Pending 0.8 outbox hole closed after this commit: first 0.9
 `retry_outbox` used only live MLS ids, so `retryable_events` deleted a
 recovered-id pending row and `messages()` painted the mine bubble Sent.
 Active ids now include recovered 0.8 groups and fold aliases. Historical
-ciphertext is not republished on the 0.9 wire. Pin:
-`e2e.rs::recovered_08_pending_outbox_survives_upgrade_connect`.
+ciphertext is not republished on the 0.9 wire. Leaving the row Pending
+then painted eternal Sending, and a retry tap still published the dead
+wrapper (a relay ACK would flip it Sent). Those rows now mark Failed
+once; `retry_message` refuses with `HistoricalProtocolRetry` before
+flipping them back to Pending (R-046). Do not include fold aliases of
+a live group in the publishable set — after resume the hist wrapper is
+still 0.8. Pin:
+`e2e.rs::recovered_08_pending_outbox_survives_upgrade_connect`,
+`outbox.rs::retryable_events_keeps_unpublishable_active_rows_and_marks_failed`.
 
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
