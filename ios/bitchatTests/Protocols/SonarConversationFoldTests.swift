@@ -630,6 +630,30 @@ struct SonarConversationFoldTests {
             ).isEmpty
         )
         #expect(
+            snMediaFetchGroupIds(
+                startGroupId: "group-09",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snMediaFetchGroupIds(
+                startGroupId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snMediaFetchGroupIds(
+                startGroupId: "group-09",
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
+        #expect(
+            snMediaFetchGroupIds(
+                startGroupId: "",
+                historicalFolds: ["group-08": "group-09"]
+            ).isEmpty
+        )
+        #expect(
             snBlankTranscriptKnownNonEmpty(
                 groupId: "group-09",
                 messageCountByGroup: ["group-08": 80],

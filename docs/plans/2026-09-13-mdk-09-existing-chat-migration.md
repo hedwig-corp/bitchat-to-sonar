@@ -1044,6 +1044,15 @@ family count + hidden-sibling/previous arm). Compose
 `ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
 `SonarConversationFoldTests` `snNewestPageFamilyHasOlder`.
 
+Recovered-media fetch hole closed after this commit: Compose
+`fetchMediaToFile` used `resolveMarmotGroupId` (live) and iOS stamped
+`SNMediaItem.groupId` with the painted source. Persist-folds can land
+before core `fold_family`, so a live-only fetch misses hist exporter
+secrets. Both hosts now try `mediaFetchGroupIds` /
+`snMediaFetchGroupIds`. Pins:
+`ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
+`SonarConversationFoldTests` `snMediaFetchGroupIds`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

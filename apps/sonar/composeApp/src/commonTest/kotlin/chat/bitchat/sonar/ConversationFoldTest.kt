@@ -1864,6 +1864,22 @@ class ConversationFoldTest {
             emptyList(),
             meshFoldTranscriptSourceIds(emptyList(), folds),
         )
+        assertEquals(
+            listOf("group-09", "group-08"),
+            mediaFetchGroupIds("group-09", folds),
+        )
+        assertEquals(
+            listOf("group-08", "group-09"),
+            mediaFetchGroupIds("group-08", folds),
+        )
+        assertEquals(
+            listOf("group-09"),
+            mediaFetchGroupIds("group-09", emptyMap()),
+        )
+        assertEquals(
+            emptyList(),
+            mediaFetchGroupIds("", folds),
+        )
         assertTrue(
             blankTranscriptKnownNonEmpty(
                 chatId = "group-09",

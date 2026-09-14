@@ -1072,6 +1072,28 @@ func snTranscriptSourceIds(
     return out
 }
 
+/// Download/decrypt must try every fold-family id. Hosts stamp media with
+/// the painted live id; persist-folds can land before core `fold_family`,
+/// so a live-only fetch misses hist exporter secrets.
+/// Compose `mediaFetchGroupIds`.
+func snMediaFetchGroupIds(
+    startGroupId: String,
+    historicalFolds: [String: String]
+) -> [String] {
+    let start = startGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !start.isEmpty else { return [] }
+    var seen = Set<String>()
+    var out: [String] = []
+    for id in [start] + snTranscriptSourceIds(
+        groupId: start,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds
+    ) where seen.insert(id).inserted {
+        out.append(id)
+    }
+    return out
+}
+
 /// Mesh-folded DMs resolve to listed live groups only. After persist-folds
 /// the 0.8 sibling is hidden from `groups()`, so load-older / newest /
 /// preserve must still expand those live ids through the fold family.
@@ -10560,12 +10582,29 @@ final class SonarAppStore: ObservableObject {
                     guard !item.groupId.isEmpty, !item.url.isEmpty else {
                         throw MarmotService.ServiceError.invalidInput("attachment has no download route")
                     }
-                    _ = try await marmot.fetchMediaToFile(
-                        groupId: item.groupId,
-                        url: item.url,
-                        destination: partialURL,
-                        listener: listener
+                    let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+                    let groupIds = snMediaFetchGroupIds(
+                        startGroupId: item.groupId,
+                        historicalFolds: folds
                     )
+                    var lastError: Error?
+                    for groupId in groupIds {
+                        do {
+                            _ = try await marmot.fetchMediaToFile(
+                                groupId: groupId,
+                                url: item.url,
+                                destination: partialURL,
+                                listener: listener
+                            )
+                            lastError = nil
+                            break
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            lastError = error
+                        }
+                    }
+                    if let lastError { throw lastError }
                 }
                 guard !listener.isCancelled(), !Task.isCancelled else {
                     throw CancellationError()

@@ -1414,6 +1414,21 @@ internal fun transcriptSourceIds(
  *  the 0.8 sibling is hidden from `groups()`, so load-older / first-open
  *  FFI must still expand those live ids through the fold family.
  *  iOS `snMeshFoldTranscriptSourceIds` / `localTranscriptGroups`. */
+/** Download/decrypt must try every fold-family id. Hosts stamp media with
+ *  the painted live id; persist-folds can land before core `fold_family`,
+ *  so a live-only fetch misses hist exporter secrets.
+ *  iOS `snMediaFetchGroupIds`. */
+internal fun mediaFetchGroupIds(
+    startGroupId: String,
+    historicalFolds: Map<String, String>,
+): List<String> {
+    val start = startGroupId.trim()
+    if (start.isEmpty()) return emptyList()
+    val out = linkedSetOf(start)
+    out.addAll(transcriptSourceIds(start, emptyList(), historicalFolds))
+    return out.toList()
+}
+
 internal fun meshFoldTranscriptSourceIds(
     listedDirectIds: Collection<String>,
     historicalFolds: Map<String, String>,
@@ -10646,10 +10661,25 @@ class SonarAppState(private val scope: CoroutineScope) {
                             bytes != null && MediaCache.write(partialPath, bytes)
                         }
                         else -> {
-                            val groupId = resolveMarmotGroupId(chatId)
+                            val startGroupId = resolveMarmotGroupId(chatId)
                                 ?: throw IllegalStateException("attachment has no secure media route")
-                            SonarCore.fetchMediaToFile(groupId, key, partialPath, control)
-                            true
+                            val groupIds = mediaFetchGroupIds(startGroupId, historicalFoldMap)
+                            var lastError: Throwable? = null
+                            var fetched = false
+                            for (groupId in groupIds) {
+                                try {
+                                    SonarCore.fetchMediaToFile(groupId, key, partialPath, control)
+                                    lastError = null
+                                    fetched = true
+                                    break
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Throwable) {
+                                    lastError = e
+                                }
+                            }
+                            lastError?.let { throw it }
+                            fetched
                         }
                     }
                     if (!wrotePartial) throw IllegalStateException("could not write attachment cache")
