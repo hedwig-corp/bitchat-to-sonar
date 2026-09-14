@@ -1374,6 +1374,14 @@ called `marmot.messagesPage` but only `MarmotService` exposed it.
 `MarmotChatModel` now forwards that bounded page so a remounted 0.8
 attachment still lands in the exclude set.
 
+A folded hist id answers `messagesPage` with `[]` (not a throw).
+Treating that empty success as authoritative dropped cached 0.8
+blossom URLs from the send exclude set, so a new photo with the
+same filename could bind over the recovered attachment. Both hosts
+now union the FFI page with the host cache
+(`publishedMediaScanRows` / `snPublishedMediaScanRows`). Pin:
+`ConversationFoldTest.publishedMediaUrlsIncludeHiddenHistoricalSibling`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

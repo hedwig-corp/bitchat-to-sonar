@@ -1390,6 +1390,17 @@ func snMediaFetchGroupIds(
 /// `cachePublishedUploadMedia` cannot bind new bytes to a 0.8
 /// attachment that shares filename/mime.
 /// Compose `publishedMediaUrlsFromMessages`.
+/// Newest-page a persist-folds sibling for the send exclude set.
+/// A folded hist id answers `[]` (not a throw); treating that as
+/// authoritative drops cached 0.8 blossom URLs so a new send can bind
+/// over the recovered attachment. Compose `publishedMediaScanRows`.
+func snPublishedMediaScanRows<Message>(
+    loaded: [Message]?,
+    cached: [Message]
+) -> [Message] {
+    (loaded ?? []) + cached
+}
+
 func snPublishedMediaUrlsFromMessages(
     _ messages: [MarmotService.MarmotMessage],
     pendingPrefix: String = "pending-media-"
@@ -10359,10 +10370,10 @@ final class SonarAppStore: ObservableObject {
                 groupId: id,
                 limit: Self.publishedMediaScanLimit
             )
-            pages[id] = fetched
-                ?? marmot.messagesByGroup[id]
+            let cached = marmot.messagesByGroup[id]
                 ?? marmot.messagesByGroup[snBareMarmotGroupId(id)]
                 ?? []
+            pages[id] = snPublishedMediaScanRows(loaded: fetched, cached: cached)
         }
         return snPublishedMediaUrlsFromFamilyPages(
             startGroupId: groupId,

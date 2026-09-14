@@ -809,6 +809,25 @@ struct SonarConversationFoldTests {
             ).isEmpty
         )
         #expect(
+            snPublishedMediaScanRows(
+                loaded: nil as [MarmotService.MarmotMessage]?,
+                cached: [recoveredAttachment]
+            ).map(\.id) == [recoveredAttachment.id]
+        )
+        #expect(
+            snPublishedMediaScanRows(
+                loaded: [] as [MarmotService.MarmotMessage],
+                cached: [recoveredAttachment]
+            ).map(\.id) == [recoveredAttachment.id],
+            "empty FFI success on a folded hist id must keep cached 0.8 attachments"
+        )
+        #expect(
+            snPublishedMediaScanRows(
+                loaded: liveOnly,
+                cached: [recoveredAttachment]
+            ).map(\.id) == liveOnly.map(\.id) + [recoveredAttachment.id]
+        )
+        #expect(
             snBlankTranscriptKnownNonEmpty(
                 groupId: "group-09",
                 messageCountByGroup: ["group-08": 80],

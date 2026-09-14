@@ -2454,6 +2454,24 @@ class ConversationFoldTest {
                 pageForId = { liveOnly },
             ),
         )
+        val cachedHist = listOf(histPhoto)
+        assertEquals(
+            cachedHist,
+            publishedMediaScanRows(loaded = null, cached = cachedHist),
+        )
+        assertEquals(
+            cachedHist,
+            publishedMediaScanRows(loaded = emptyList(), cached = cachedHist),
+            "empty FFI success on a folded hist id must keep cached 0.8 attachments",
+        )
+        assertEquals(
+            liveOnly + cachedHist,
+            publishedMediaScanRows(loaded = liveOnly, cached = cachedHist),
+        )
+        assertEquals(
+            emptyList<SonarMsg>(),
+            publishedMediaScanRows(loaded = emptyList(), cached = emptyList()),
+        )
     }
 
     @Test

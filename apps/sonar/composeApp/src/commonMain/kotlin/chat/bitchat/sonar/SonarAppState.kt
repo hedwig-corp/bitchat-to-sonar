@@ -1792,6 +1792,17 @@ internal fun mediaFetchGroupIds(
     return out.toList()
 }
 
+/**
+ * Newest-page a persist-folds sibling for the send exclude set.
+ * A folded hist id answers `[]` (not a throw); treating that as
+ * authoritative drops cached 0.8 blossom URLs so a new send can bind
+ * over the recovered attachment.
+ */
+internal fun publishedMediaScanRows(
+    loaded: List<SonarMsg>?,
+    cached: List<SonarMsg>,
+): List<SonarMsg> = (loaded ?: emptyList()) + cached
+
 /** Blossom URLs already on recovered or live rows. Pending echo blobs are
  *  not published. A new send must exclude these so
  *  `cacheUploadedMediaBytes` cannot bind new bytes to a 0.8 attachment
@@ -10093,10 +10104,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> {
         val ids = mediaFetchGroupIds(groupId, historicalFoldMap).ifEmpty { listOf(groupId) }
         val pages = ids.map { id ->
-            runCatching { SonarCore.messagesPage(id, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }
-                .getOrNull()
-                ?: chatSnapshotMessagesByChat[id].orEmpty()
-                    .ifEmpty { if (id == groupId) messages else emptyList() }
+            val loaded = runCatching {
+                SonarCore.messagesPage(id, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+            }.getOrNull()
+            val cached = chatSnapshotMessagesByChat[id].orEmpty()
+                .ifEmpty { if (id == groupId) messages else emptyList() }
+            publishedMediaScanRows(loaded, cached)
         }
         return publishedMediaUrlsFromMessages(
             pages.asSequence().flatten(),
