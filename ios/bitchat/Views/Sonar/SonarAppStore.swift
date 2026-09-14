@@ -327,6 +327,18 @@ func snNotificationOpenGroupId(
     return live
 }
 
+/// Shade taps stay open after a hist→live remap, or when either id is listed.
+/// Empty persist + FFI miss + live-only listing is not ready — refresh folds first.
+func snNotificationOpenIsReady(
+    requestedGroupId: String,
+    remounted: String,
+    listed: Set<String>
+) -> Bool {
+    remounted != requestedGroupId
+        || listed.contains(requestedGroupId)
+        || listed.contains(remounted)
+}
+
 /// Prefer the listed MLS id. If FFI hid a folded 0.8 row or has not
 /// painted the live sibling yet, return the other listed fold sibling
 /// so title / members / verify / call lookups stay valid.
@@ -12981,8 +12993,9 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// A shade tap can still carry the hidden 0.8 group id after resume.
-    /// Refresh local groups, then remap onto `live_fold_target` even if the
-    /// home list has not listed the live sibling yet.
+    /// Refresh local groups and rediscover hist→live (the host blob is empty
+    /// after nsec restore) before fail-closing. Compose
+    /// `openConversationFromNotification` refreshes once and retries.
     @MainActor
     private func openFoldedNotificationConversation(_ id: String, jump: String?) async {
         let groupId = marmotGroupId(id) ?? {
@@ -12992,19 +13005,46 @@ final class SonarAppStore: ObservableObject {
             clearNotificationsForConversation(id)
             return
         }
-        _ = await marmot.loadLocalSummaries(resolveMembers: false)
-        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let live = snNotificationLiveFoldTarget(
-            tappedGroupId: groupId,
-            ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId),
-            historicalFolds: folds
-        )
-        let remounted = snNotificationOpenGroupId(
-            tappedGroupId: groupId,
-            liveFoldTarget: live
-        )
-        let listed = Set(marmot.groups.map(\.id))
-        guard remounted != groupId || listed.contains(groupId) || listed.contains(remounted) else {
+
+        func refreshFolds() async {
+            _ = await marmot.loadLocalSummaries(resolveMembers: false)
+            await rememberHistoricalFolds(
+                from: lastMarmotGroupIds,
+                to: Set(marmot.groups.map(\.id))
+            )
+        }
+
+        func resolve() async -> (folds: [String: String], remounted: String, listed: Set<String>) {
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let live = snNotificationLiveFoldTarget(
+                tappedGroupId: groupId,
+                ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId),
+                historicalFolds: folds
+            )
+            let remounted = snNotificationOpenGroupId(
+                tappedGroupId: groupId,
+                liveFoldTarget: live
+            )
+            return (folds, remounted, Set(marmot.groups.map(\.id)))
+        }
+
+        await refreshFolds()
+        var resolved = await resolve()
+        if !snNotificationOpenIsReady(
+            requestedGroupId: groupId,
+            remounted: resolved.remounted,
+            listed: resolved.listed
+        ) {
+            await refreshFolds()
+            resolved = await resolve()
+        }
+        let folds = resolved.folds
+        let remounted = resolved.remounted
+        guard snNotificationOpenIsReady(
+            requestedGroupId: groupId,
+            remounted: remounted,
+            listed: resolved.listed
+        ) else {
             showToast("That chat isn’t ready yet — try again from Messages.")
             clearNotificationsForConversation(id)
             return

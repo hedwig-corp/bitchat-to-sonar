@@ -2021,6 +2021,69 @@ struct SonarConversationFoldTests {
     }
 
     @Test
+    func notificationTapRecoversFoldFromAliasesWhenPersistBlobEmpty() {
+        let persist: [String: String] = [:]
+        let listed = ["group-09"]
+        #expect(
+            !snNotificationOpenIsReady(
+                requestedGroupId: "group-08",
+                remounted: snNotificationOpenGroupId(
+                    tappedGroupId: "group-08",
+                    liveFoldTarget: snNotificationLiveFoldTarget(
+                        tappedGroupId: "group-08",
+                        ffiLiveFoldTarget: nil,
+                        historicalFolds: persist
+                    )
+                ),
+                listed: Set(listed)
+            )
+        )
+        let discovered = snHistoricalFoldsFromAliases(
+            listedIds: listed,
+            foldAliases: { $0 == "group-09" ? ["group-09", "group-08"] : [$0] },
+            liveFoldTarget: { $0 == "group-09" ? "group-09" : nil }
+        )
+        #expect(discovered == ["group-08": "group-09"])
+        let remounted = snNotificationOpenGroupId(
+            tappedGroupId: "group-08",
+            liveFoldTarget: snNotificationLiveFoldTarget(
+                tappedGroupId: "group-08",
+                ffiLiveFoldTarget: nil,
+                historicalFolds: persist.merging(discovered) { _, new in new }
+            )
+        )
+        #expect(remounted == "group-09")
+        #expect(
+            snNotificationOpenIsReady(
+                requestedGroupId: "group-08",
+                remounted: remounted,
+                listed: Set(listed)
+            )
+        )
+        #expect(
+            snNotificationOpenIsReady(
+                requestedGroupId: "group-08",
+                remounted: "group-09",
+                listed: []
+            )
+        )
+        #expect(
+            snNotificationOpenIsReady(
+                requestedGroupId: "group-09",
+                remounted: "group-09",
+                listed: ["group-09"]
+            )
+        )
+        #expect(
+            !snNotificationOpenIsReady(
+                requestedGroupId: "group-08",
+                remounted: "group-08",
+                listed: ["group-09"]
+            )
+        )
+    }
+
+    @Test
     func remountKeepsPendingJoinRequestsOnFoldFamily() {
         let folds = ["group-08": "group-09"]
         let requests = ["npub1joiner"]

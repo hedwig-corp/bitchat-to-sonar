@@ -1423,6 +1423,16 @@ tail. Both hosts now share `shouldRetireOpenUnread` /
 `shouldRetireOpenChatUnread` (`familyHasOlder` gate). Pin:
 `SNUnreadCountsTests.recoveredFoldUnreadDoesNotRetireBeforeFamilyHasOlder`.
 
+iOS `openFoldedNotificationConversation` used to `loadLocalSummaries`
+then read an empty persist blob and fail-close (toast + clear the
+shade entry) before `rememberHistoricalFolds` could rediscover
+`group-08 → group-09` from FFI aliases. After nsec restore the host
+blob is wiped; the `$groups` sink rediscovers asynchronously, so a
+cold-start tap named the hidden 0.8 id and left the user on Home.
+The path now awaits fold rediscovery and retries once (Compose
+`openConversationFromNotification`) before toasting. Pin:
+`SonarConversationFoldTests.notificationTapRecoversFoldFromAliasesWhenPersistBlobEmpty`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot
