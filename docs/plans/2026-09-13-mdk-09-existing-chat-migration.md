@@ -1188,6 +1188,17 @@ groups-only; `snChatSnapshotLatestTs` is the persist contract.
 Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
 `SonarConversationFoldTests` `snChatSnapshotLatestTs`.
 
+Compose load-older paged-keys hole closed after this commit: seed
+copied the remounted extract onto hist `transcriptWindows` before
+any FFI page. Passing those keys as “paged” made
+`hiddenFoldFamilyNeedsPage` false and load-older skip hist, so bak
+remainder stayed in the DB until the 30s heartbeat. Trusted FFI
+page ids (`freshCanonicalByGroup`) match iOS cursor ∪ hasOlder.
+`loadOlderHiddenSiblingsNeedingNewestPage` newest-pages hist first.
+Pins: `ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
+`SonarConversationFoldTests` `snPagedFoldFamilyGroupIds` /
+`snLoadOlderHiddenSiblingsNeedingNewestPage`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

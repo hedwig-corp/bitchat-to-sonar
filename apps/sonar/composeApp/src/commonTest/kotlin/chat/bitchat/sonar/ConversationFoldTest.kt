@@ -907,8 +907,21 @@ class ConversationFoldTest {
         assertTrue(hasOlderForFoldFamily("group-09", mapOf("group-09" to true), folds))
         assertFalse(hasOlderForFoldFamily("group-09", mapOf("group-08" to false, "group-09" to false), folds))
         assertFalse(hasOlderForFoldFamily("group-09", mapOf("group-08" to true), emptyMap()))
+        assertEquals(setOf("group-09"), pagedFoldFamilyGroupIds(setOf("group-09", "")))
         assertTrue(hiddenFoldFamilyNeedsPage("group-09", folds, setOf("group-09")))
         assertEquals(listOf("group-08"), hiddenFoldFamilyIdsNeedingPage("group-09", folds, setOf("group-09")))
+        assertEquals(
+            listOf("group-08"),
+            loadOlderHiddenSiblingsNeedingNewestPage(listOf("group-09"), folds, setOf("group-09")),
+        )
+        assertEquals(
+            emptyList<String>(),
+            loadOlderHiddenSiblingsNeedingNewestPage(
+                listOf("group-09"),
+                folds,
+                setOf("group-08", "group-09"),
+            ),
+        )
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", folds, setOf("group-08", "group-09")))
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", emptyMap(), setOf("group-09")))
         assertTrue(foldFamilySourceNeedsNewestPage("group-08", setOf("group-09"), cachedRowCount = 0))

@@ -2771,8 +2771,8 @@ final class MarmotChatModel: ObservableObject {
         ) {
             return await loadLocalPage(groupId: groupId, mode: .newestPage)
         }
-        let unpaged = snHiddenFoldFamilyIdsNeedingPage(
-            groupId: groupId,
+        let unpaged = snLoadOlderHiddenSiblingsNeedingNewestPage(
+            listedLiveIds: [groupId],
             historicalFolds: folds,
             pagedGroupIds: paged
         )
@@ -2891,7 +2891,10 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func pagedLocalTranscriptGroupIds() -> Set<String> {
-        Set(localTranscriptCursorByGroup.keys).union(localTranscriptHasOlderByGroup.keys)
+        snPagedFoldFamilyGroupIds(
+            trustedFfiPageIds: Set(localTranscriptCursorByGroup.keys)
+                .union(localTranscriptHasOlderByGroup.keys)
+        )
     }
 
     func hasOlderLocalMessages(groupId: String) -> Bool {

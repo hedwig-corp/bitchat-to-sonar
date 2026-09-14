@@ -930,6 +930,31 @@ internal fun quotedJumpCleared(
     return next
 }
 
+/** Ids that have had a trusted FFI newest/cursor page.
+ *  Seeded `transcriptWindows` keys and remounted host-cache copies are
+ *  not paging keys — passing those made hist look paged before
+ *  `messagesCursorPage(hist)` ran, so load-older skipped bak remainder.
+ *  iOS `pagedLocalTranscriptGroupIds` is cursor ∪ hasOlder, not
+ *  `messagesByGroup.keys`. */
+internal fun pagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>): Set<String> =
+    trustedFfiPageIds.filterTo(linkedSetOf()) { it.isNotBlank() }
+
+/** Newest-page these hidden siblings before cursor-paging. Walk listed
+ *  live ids only — passing hist would newest-page a remounted live
+ *  extract and snap. iOS `loadOlderLocalPage` hidden-sibling preflight. */
+internal fun loadOlderHiddenSiblingsNeedingNewestPage(
+    listedLiveIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+): List<String> {
+    val out = linkedSetOf<String>()
+    for (listed in listedLiveIds) {
+        if (listed.isBlank()) continue
+        out.addAll(hiddenFoldFamilyIdsNeedingPage(listed, historicalFolds, pagedGroupIds))
+    }
+    return out.sorted()
+}
+
 /** Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
  *  hist onto live and drops the hist cache key; paging maps keep hist
  *  once it has been paged. iOS `snHiddenFoldFamilyNeedsPage`. */
@@ -12772,7 +12797,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 unpagedHiddenSibling = hiddenFoldFamilyNeedsPage(
                     groupId,
                     historicalFoldMap,
-                    transcriptWindows.keys,
+                    pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys),
                 ),
             )
     }
@@ -12868,9 +12893,24 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
 
         val groupIds = transcriptGroupIds(chatId)
+        val paged = pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys)
+        val listed = chats.mapTo(hashSetOf()) { it.id }
+        for (sibling in loadOlderHiddenSiblingsNeedingNewestPage(
+            groupIds.filter { it in listed },
+            historicalFoldMap,
+            paged,
+        )) {
+            refreshTranscriptGroupWindow(sibling, chatId, generation)
+            if (!isCurrentTranscriptSession(chatId, generation)) return false
+        }
         for (groupId in groupIds) {
             var window = transcriptWindows[groupId]
-            if (window == null) {
+            if (window == null || foldFamilySourceNeedsNewestPage(
+                    groupId,
+                    paged,
+                    window.rows.size,
+                )
+            ) {
                 refreshTranscriptGroupWindow(groupId, chatId, generation)
                 if (!isCurrentTranscriptSession(chatId, generation)) return false
                 window = transcriptWindows[groupId]
@@ -14225,7 +14265,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!shouldPageHiddenFoldFamilyForOpenLive(
                 sc.id,
                 historicalFoldMap,
-                transcriptWindows.keys,
+                pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys),
                 familyIds,
             )
         ) return

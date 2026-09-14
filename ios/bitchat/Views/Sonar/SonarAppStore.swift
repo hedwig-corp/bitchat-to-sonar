@@ -779,6 +779,31 @@ func snQuotedJumpCleared(
     return next
 }
 
+/// Ids that have had a trusted FFI newest/cursor page.
+/// Seeded cache keys are not paging keys. Compose `pagedFoldFamilyGroupIds`.
+func snPagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>) -> Set<String> {
+    Set(trustedFfiPageIds.filter { !$0.isEmpty })
+}
+
+/// Newest-page these hidden siblings before cursor-paging. Walk listed
+/// live ids only — passing hist would newest-page a remounted live
+/// extract and snap. Compose `loadOlderHiddenSiblingsNeedingNewestPage`.
+func snLoadOlderHiddenSiblingsNeedingNewestPage(
+    listedLiveIds: [String],
+    historicalFolds: [String: String],
+    pagedGroupIds: Set<String>
+) -> [String] {
+    var out = Set<String>()
+    for listed in listedLiveIds where !listed.isEmpty {
+        out.formUnion(snHiddenFoldFamilyIdsNeedingPage(
+            groupId: listed,
+            historicalFolds: historicalFolds,
+            pagedGroupIds: pagedGroupIds
+        ))
+    }
+    return out.sorted()
+}
+
 /// Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
 /// hist onto live and drops the hist cache key; cursor / hasOlder maps
 /// keep hist once it has been paged, so a missing paging key means
