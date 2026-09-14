@@ -1941,6 +1941,8 @@ internal fun firstOpenHasLocalTranscriptPaint(
 
 /** Empty persist-folds hide a recovered 0.8 sibling from retained paint
  *  and `transcriptGroupIds`. Merge FFI `fold_aliases` before first paint.
+ *  Do not cache a family-of-one result: an unresumed 0.8 chat looks
+ *  unfolded until the first 0.9 send.
  *  iOS `snFirstOpenShouldMergeFolds` / `openDM`. */
 internal fun firstOpenShouldMergeFolds(
     seedId: String,
@@ -1949,6 +1951,20 @@ internal fun firstOpenShouldMergeFolds(
     val bare = seedId.removePrefix("marmot:").trim()
     if (bare.isEmpty()) return false
     return foldFamilyIds(bare, persistedFolds).size <= 1
+}
+
+/** A process-local "already merged, no family" cache must not skip the
+ *  next FFI hop. Recovered 0.8 chats look unfolded until the first 0.9
+ *  send; persist-folds with a family is the only reuse.
+ *  iOS `snFirstOpenShouldReuseCachedFoldMerge`. */
+internal fun firstOpenShouldReuseCachedFoldMerge(
+    seedId: String,
+    persistedFolds: Map<String, String>,
+    cachedSeeds: Set<String>,
+): Boolean {
+    val bare = seedId.removePrefix("marmot:").trim()
+    if (bare.isEmpty() || (bare !in cachedSeeds && seedId !in cachedSeeds)) return false
+    return !firstOpenShouldMergeFolds(seedId, persistedFolds)
 }
 
 /** Newest-page hydrate must keep remounted fold-family rows.

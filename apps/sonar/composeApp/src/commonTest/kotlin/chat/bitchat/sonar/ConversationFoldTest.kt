@@ -1466,6 +1466,20 @@ class ConversationFoldTest {
         assertTrue(firstOpenShouldMergeFolds("marmot:group-09", emptyMap()))
         assertFalse(firstOpenShouldMergeFolds("group-09", folds))
         assertFalse(firstOpenShouldMergeFolds("marmot:group-09", folds))
+        // Unresumed first open looks like family-of-one. Caching that empty
+        // merge must not skip the hop after the first 0.9 send.
+        assertFalse(
+            firstOpenShouldReuseCachedFoldMerge("group-08", emptyMap(), setOf("group-08")),
+        )
+        assertFalse(
+            firstOpenShouldReuseCachedFoldMerge("group-09", emptyMap(), setOf("group-09")),
+        )
+        assertTrue(
+            firstOpenShouldReuseCachedFoldMerge("group-09", folds, setOf("group-09")),
+        )
+        assertFalse(
+            firstOpenShouldReuseCachedFoldMerge("group-09", folds, emptySet()),
+        )
         assertEquals(
             listOf(historical.single(), snapshot.single()),
             firstOpenTranscriptPaintRows("group-09", retained, snapshot, folds),
@@ -2103,6 +2117,8 @@ class ConversationFoldTest {
         )
         assertTrue(firstOpenShouldMergeFolds("group-09", emptyMap()))
         assertFalse(firstOpenShouldMergeFolds("group-09", folds))
+        assertFalse(firstOpenShouldReuseCachedFoldMerge("group-09", emptyMap(), setOf("group-09")))
+        assertTrue(firstOpenShouldReuseCachedFoldMerge("group-09", folds, setOf("group-09")))
         assertEquals(
             emptyList(),
             retainedTranscriptForChat("group-09", mapOf("group-08" to histRetained), emptyMap()),

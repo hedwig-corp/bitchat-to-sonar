@@ -678,6 +678,16 @@ struct SonarConversationFoldTests {
         )
         #expect(snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: [:]))
         #expect(!snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: wakeFolds))
+        #expect(!snFirstOpenShouldReuseCachedFoldMerge(
+            seedId: "group-09",
+            persistedFolds: [:],
+            cachedSeeds: ["group-09"]
+        ))
+        #expect(snFirstOpenShouldReuseCachedFoldMerge(
+            seedId: "group-09",
+            persistedFolds: wakeFolds,
+            cachedSeeds: ["group-09"]
+        ))
         #expect(
             snRetainedTranscriptForChat(
                 chatId: "group-09",
@@ -1312,6 +1322,28 @@ struct SonarConversationFoldTests {
         #expect(snFirstOpenShouldMergeFolds(seedId: "marmot:group-09", persistedFolds: [:]))
         #expect(!snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: ["group-08": "group-09"]))
         #expect(!snFirstOpenShouldMergeFolds(seedId: "marmot:group-09", persistedFolds: ["group-08": "group-09"]))
+        // Unresumed first open looks like family-of-one. Caching that empty
+        // merge must not skip the hop after the first 0.9 send.
+        #expect(!snFirstOpenShouldReuseCachedFoldMerge(
+            seedId: "group-08",
+            persistedFolds: [:],
+            cachedSeeds: ["group-08"]
+        ))
+        #expect(!snFirstOpenShouldReuseCachedFoldMerge(
+            seedId: "group-09",
+            persistedFolds: [:],
+            cachedSeeds: ["group-09"]
+        ))
+        #expect(snFirstOpenShouldReuseCachedFoldMerge(
+            seedId: "group-09",
+            persistedFolds: ["group-08": "group-09"],
+            cachedSeeds: ["group-09"]
+        ))
+        #expect(!snFirstOpenShouldReuseCachedFoldMerge(
+            seedId: "group-09",
+            persistedFolds: ["group-08": "group-09"],
+            cachedSeeds: []
+        ))
         #expect(
             snFirstOpenTranscriptPaintRows(
                 chatId: "marmot:group-09",

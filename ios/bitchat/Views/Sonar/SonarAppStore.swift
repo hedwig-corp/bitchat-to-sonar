@@ -1960,8 +1960,10 @@ func snFirstOpenHasLocalTranscriptPaint<Message>(
 
 /// Empty persist-folds hide a recovered 0.8 sibling from retained paint
 /// and `localTranscriptGroups`. Merge FFI `fold_aliases` before first
-/// paint and before hydrate paging. Compose always merges in
-/// `captureOpenChatUnread` before `firstOpenTranscriptPaintRows`.
+/// paint and before hydrate paging. Do not cache a family-of-one
+/// result: an unresumed 0.8 chat looks unfolded until the first 0.9
+/// send. Compose always merges in `captureOpenChatUnread` before
+/// `firstOpenTranscriptPaintRows`.
 func snFirstOpenShouldMergeFolds(
     seedId: String,
     persistedFolds: [String: String]
@@ -1969,6 +1971,20 @@ func snFirstOpenShouldMergeFolds(
     let bare = snBareMarmotGroupId(seedId)
     guard !bare.isEmpty else { return false }
     return snFoldFamilyIds(id: bare, historicalFolds: persistedFolds).count <= 1
+}
+
+/// A process-local "already merged, no family" cache must not skip the
+/// next FFI hop. Recovered 0.8 chats look unfolded until the first 0.9
+/// send; persist-folds with a family is the only reuse. Compose
+/// `firstOpenShouldReuseCachedFoldMerge`.
+func snFirstOpenShouldReuseCachedFoldMerge(
+    seedId: String,
+    persistedFolds: [String: String],
+    cachedSeeds: Set<String>
+) -> Bool {
+    let bare = snBareMarmotGroupId(seedId)
+    guard !bare.isEmpty, cachedSeeds.contains(bare) else { return false }
+    return !snFirstOpenShouldMergeFolds(seedId: seedId, persistedFolds: persistedFolds)
 }
 
 /// Listed live pages plus leftover hist cache. After collapse
@@ -5370,7 +5386,6 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.marmotVerified)
         defaults.removeObject(forKey: Keys.historicalFolds)
         UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
-        firstOpenFoldMergeSeeds.removeAll()
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
@@ -8354,9 +8369,7 @@ final class SonarAppStore: ObservableObject {
         var result = SNConversationTranscriptLoadResult.none
         let seed = marmotGroupId(id) ?? id
         let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        if snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted)
-            && !firstOpenFoldMergeSeeds.contains(snBareMarmotGroupId(seed))
-        {
+        if snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted) {
             _ = await adoptMergedActionFolds(for: [id, seed])
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
@@ -11757,10 +11770,6 @@ final class SonarAppStore: ObservableObject {
 
     /// Generations cancel a superseded first-open Task when the user taps another chat.
     private var dmOpenGenerations: [String: UUID] = [:]
-    /// Seeds whose FFI fold family was already merged this process. Unfolded
-    /// chats keep `foldFamilyIds.count == 1`; skip a second Task hop after
-    /// the first local `fold_aliases` read. Cleared on wipe / restore.
-    private var firstOpenFoldMergeSeeds: Set<String> = []
 
     /// True when a local newest page (or retained ConversationViewState) can
     /// paint without awaiting disk — Compose `retainedTranscriptByChat` reopen.
@@ -11835,8 +11844,10 @@ final class SonarAppStore: ObservableObject {
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
             ?? id
         let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        // Persist-folds with a family is the only skip. A prior empty-family
+        // merge (unresumed 0.8) must not hide the sibling the first 0.9 send
+        // creates. Compose `captureOpenChatUnread` always merges.
         let shouldMergeFolds = snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted)
-            && !firstOpenFoldMergeSeeds.contains(snBareMarmotGroupId(seed))
         // Blob-only retained paint can be a live leave-frame while recovered
         // 0.8 rows sit on the hidden sibling. Merge FFI folds before present
         // so `localTranscriptGroups` / retained walk see hist. Compose
@@ -11932,7 +11943,8 @@ final class SonarAppStore: ObservableObject {
             // (Mac selection, already-pushed DM) still merge before
             // `localTranscriptGroups` walks the blob.
             let hydrateSeed = groupId ?? id
-            if !self.firstOpenFoldMergeSeeds.contains(snBareMarmotGroupId(hydrateSeed)) {
+            let hydrateFolds = (self.defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if snFirstOpenShouldMergeFolds(seedId: hydrateSeed, persistedFolds: hydrateFolds) {
                 _ = await self.adoptMergedActionFolds(for: [id, hydrateSeed])
             }
             guard await self.marmot.loadLocalWhenConnected(groupId: groupId) else {
@@ -12867,23 +12879,14 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
-    /// Persist the FFI fold family and remember the seed so a later open of
-    /// an unfolded chat does not hop through another merge Task.
+    /// Persist the FFI fold family. Do not cache an empty-family merge —
+    /// recovered 0.8 chats look unfolded until the first 0.9 send.
     @discardableResult
     private func adoptMergedActionFolds(for ids: [String]) async -> [String: String] {
         let folds = await mergedActionHistoricalFolds(for: ids)
         let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         if folds != persisted {
             snPersistHistoricalFolds(folds, to: defaults)
-        }
-        for id in ids {
-            let bare = snBareMarmotGroupId(id)
-            if !bare.isEmpty {
-                firstOpenFoldMergeSeeds.insert(bare)
-            }
-            for alias in snFoldFamilyIds(id: bare.isEmpty ? id : bare, historicalFolds: folds) {
-                firstOpenFoldMergeSeeds.insert(alias)
-            }
         }
         return folds
     }
@@ -13295,20 +13298,7 @@ final class SonarAppStore: ObservableObject {
             // Already on this DM — still apply Jump so a tap while backgrounded
             // on the open chat scrolls to the notified message (#376 GLM Medium).
             if let jump {
-                let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-                pendingJumpMessageIdByDM = snQuotedJumpWritten(
-                    conversationId: id,
-                    parentId: jump,
-                    jumps: pendingJumpMessageIdByDM,
-                    historicalFolds: folds
-                )
-                jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
-                    conversationId: id,
-                    parentId: jump,
-                    jumps: jumpMessageIdAtOpenByDM,
-                    historicalFolds: folds
-                )
-                objectWillChange.send()
+                applyOpenConversationJump(id, parentId: jump)
             }
             return
         }
@@ -13410,6 +13400,41 @@ final class SonarAppStore: ObservableObject {
             openDM(liveId, marmotGroupId: remounted, jumpMessageId: jump)
         }
         clearNotificationsForConversation(id)
+    }
+
+    /// Write Jump onto the open id and every persist-folds sibling. When the
+    /// blob is still empty after an unresumed first open, merge FFI so a
+    /// hist-id tap while viewing live still expands the family.
+    private func applyOpenConversationJump(_ conversationId: String, parentId: String) {
+        let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        writeOpenConversationJump(conversationId, parentId: parentId, folds: blob)
+        let seed = marmotGroupId(conversationId) ?? conversationId
+        guard snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: blob) else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let folds = await self.adoptMergedActionFolds(for: [conversationId, seed])
+            self.writeOpenConversationJump(conversationId, parentId: parentId, folds: folds)
+        }
+    }
+
+    private func writeOpenConversationJump(
+        _ conversationId: String,
+        parentId: String,
+        folds: [String: String]
+    ) {
+        pendingJumpMessageIdByDM = snQuotedJumpWritten(
+            conversationId: conversationId,
+            parentId: parentId,
+            jumps: pendingJumpMessageIdByDM,
+            historicalFolds: folds
+        )
+        jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+            conversationId: conversationId,
+            parentId: parentId,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds
+        )
+        objectWillChange.send()
     }
 
     /// Drop a one-shot Jump target after the host has applied (or soft-failed)
@@ -13546,9 +13571,7 @@ final class SonarAppStore: ObservableObject {
             )
         )
         let seed = marmotGroupId(conversationId) ?? conversationId
-        if snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted)
-            && !firstOpenFoldMergeSeeds.contains(snBareMarmotGroupId(seed))
-        {
+        if snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted) {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let folds = await self.adoptMergedActionFolds(for: [conversationId, seed])
@@ -14300,7 +14323,6 @@ final class SonarAppStore: ObservableObject {
         marmot.groups = []
         defaults.removeObject(forKey: Keys.historicalFolds)
         UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
-        firstOpenFoldMergeSeeds.removeAll()
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         applyBLEDiscoveryPolicy()
         publishedBolt12Offer = nil
@@ -14384,7 +14406,6 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.marmotVerified)
         defaults.removeObject(forKey: Keys.historicalFolds)
         UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
-        firstOpenFoldMergeSeeds.removeAll()
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).
