@@ -7207,8 +7207,11 @@ impl SonarClient {
     pub fn groups(&self) -> Result<Vec<cgka_traits::group::Group>> {
         // Hosts paint `chats()` / FFI `groups()` before summaries. A lost
         // JSON sidecar must not re-list a recovered 0.8 row as a second
-        // home conversation — restore recorded binds first.
+        // home conversation — restore recorded binds first. If the index
+        // bind is gone too, re-discover by members so first paint does
+        // not wait on idle reconcile or a send.
         self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         self.engine.groups()
     }
 
@@ -7644,6 +7647,32 @@ impl SonarClient {
         self.restore_recorded_folds_from_index();
     }
 
+    /// Re-bind recovered 0.8 rows onto an already-joined 0.9 sibling when
+    /// both fold sidecars are gone. No-op when there is no live group or
+    /// every hist row is already folded — first paint after upgrade (live
+    /// empty) and the steady folded path stay cheap. Must not be called
+    /// from [`Self::restore_recorded_folds_from_index`]:
+    /// [`Self::maybe_fold_new_group`] already restores, and that would
+    /// recurse.
+    fn rediscover_unbound_historical_folds(&self) {
+        let Ok(live) = self.engine.groups() else {
+            return;
+        };
+        if live.is_empty() {
+            return;
+        }
+        let Ok(historical) = self.engine.historical_groups() else {
+            return;
+        };
+        if historical
+            .iter()
+            .all(|group| self.is_folded_historical_group(&group.id))
+        {
+            return;
+        }
+        self.maybe_fold_live_groups();
+    }
+
     fn restore_recorded_folds_from_index(&self) {
         let Some(ref idx) = self.conversation_index else {
             return;
@@ -7792,6 +7821,7 @@ impl SonarClient {
         page_limit: usize,
     ) -> Result<Vec<RecentMessagePage>> {
         self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         self.engine
             .recent_message_pages(group_limit, page_limit)
             .map(|pages| {
@@ -7883,6 +7913,9 @@ impl SonarClient {
         // Lost JSON sidecar: hist summaries reappear until a page restores
         // the bind. Home list must not split a person into two rows.
         self.restore_recorded_folds_from_index();
+        // Lost index bind too: restore is a no-op. Re-discover before
+        // hide/remount so NSE / wake / home do not publish hist + live.
+        self.rediscover_unbound_historical_folds();
         let Some(ref idx) = self.conversation_index else {
             return Vec::new();
         };
@@ -12367,6 +12400,87 @@ mod tests {
             decoded.group_id,
             live.as_slice(),
             "invite token must name the rebound live id"
+        );
+    }
+
+    /// Lost JSON + index binds must not split the home list. Send/invite
+    /// rebind; first paint (`groups` / `conversation_summaries`) must too,
+    /// or the person is two rows until idle reconcile.
+    #[tokio::test]
+    async fn conversation_summaries_rebind_lost_fold_without_waiting_for_send() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+        }
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "test setup: both binds must be gone"
+        );
+
+        let summaries = bob.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "conversation_summaries must hide rebound hist without a send: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+        assert!(
+            bob.is_folded_historical_group(&historical),
+            "first summaries paint must re-record the bind"
+        );
+        assert_eq!(
+            bob.groups().expect("live listing").len(),
+            1,
+            "groups() must not mint or split after the rebound"
         );
     }
 

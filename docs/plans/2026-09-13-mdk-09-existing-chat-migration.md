@@ -1591,6 +1591,12 @@ sibling with that peer was already joined. Idle
 `invite_mint_group` now re-discover before mint / refuse. Pin:
 `client::tests::send_on_recovered_dm_rebinds_existing_live_after_lost_fold`.
 
+Lost JSON + index binds still split the home list until idle reconcile
+or a send. `groups()` / `conversation_summaries()` / `recent_message_pages`
+now re-discover unbound hist onto an already-joined live sibling
+(no-op when live is empty or every hist row is already folded). Pin:
+`client::tests::conversation_summaries_rebind_lost_fold_without_waiting_for_send`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
