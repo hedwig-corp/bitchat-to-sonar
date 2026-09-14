@@ -888,6 +888,16 @@ the hidden sibling. Pins:
 `HomeMessageRowsTest.foldedHistoricalPageHydratesOntoLiveSibling`,
 `SonarConversationFoldTests` `snFoldFamilyCachedMessages`.
 
+Call-log hole closed after this commit: payment reads already walked the
+fold family (`paymentActivityPeerKeys` / `snPaymentActivityPeerKeys`), but
+`callRecords` / `mergeCallLogs` keyed only the open id. After collapse,
+persisted 0.8 call rows stayed on the hist key until async promote — first
+paint of the live transcript dropped recovered CallLog rows. `callRecordsForChat`
+/ `snCallLogsForChat` reuse the payment key set (bare + `marmot:` on iOS)
+and last-wins on the live id. Pins:
+`ConversationFoldTest.callRecordsReadWalksFoldFamily`,
+`SonarConversationFoldTests` `snCallLogsForChat`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

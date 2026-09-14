@@ -763,6 +763,55 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun callRecordsReadWalksFoldFamily() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = CallRecord(
+            id = "call-08",
+            video = false,
+            mine = true,
+            durSecs = 12,
+            tsSecs = 1L,
+        )
+        val live = CallRecord(
+            id = "call-09",
+            video = true,
+            mine = false,
+            durSecs = 4,
+            tsSecs = 2L,
+        )
+        val logs = mapOf(
+            "group-08" to listOf(historical),
+            "group-09" to listOf(live),
+        )
+        assertEquals(
+            setOf("call-08", "call-09"),
+            callRecordsForChat("group-09", logs, folds).map { it.id }.toSet(),
+        )
+        assertEquals(
+            setOf("call-08", "call-09"),
+            callRecordsForChat("group-08", logs, folds).map { it.id }.toSet(),
+        )
+        assertEquals(
+            listOf(live),
+            callRecordsForChat("group-09", logs, emptyMap()),
+        )
+        val updatedLive = live.copy(durSecs = 40)
+        assertEquals(
+            listOf(updatedLive),
+            dedupeCallRecordsLastWins(
+                callRecordsForChat(
+                    "group-09",
+                    mapOf(
+                        "group-08" to listOf(live),
+                        "group-09" to listOf(updatedLive),
+                    ),
+                    folds,
+                ),
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling() {
         assertEquals(
             mapOf("group-09" to listOf("uploading")),

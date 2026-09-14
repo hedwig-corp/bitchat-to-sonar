@@ -1215,6 +1215,26 @@ internal fun paymentActivityPeerKeys(
     return keys.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
+/**
+ * Call-log rows for the open id plus its hidden 0.8 sibling. Promote copies
+ * hist onto live asynchronously; first paint of the live transcript must
+ * still show recovered calls before that rewrite lands.
+ */
+internal fun <V> callRecordsForChat(
+    chatId: String,
+    callLogs: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+): List<V> {
+    val keys = paymentActivityPeerKeys(chatId, historicalFolds)
+    if (keys.size <= 1) return callLogs[chatId].orEmpty()
+    val rows = ArrayList<V>()
+    for (id in keys) {
+        if (id != chatId) rows += callLogs[id].orEmpty()
+    }
+    rows += callLogs[chatId].orEmpty()
+    return rows
+}
+
 /** Drop host fold bindings whose historical or live id was just deleted. */
 internal fun purgedHistoricalFolds(
     folds: Map<String, String>,
@@ -2313,7 +2333,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Call-log records for [chatId] (oldest first). Deduped last-wins so a
      *  hangup-then-finalize race never feeds duplicate LazyColumn keys. */
     fun callRecords(chatId: String): List<CallRecord> =
-        dedupeCallRecordsLastWins(callLogs[chatId].orEmpty())
+        dedupeCallRecordsLastWins(
+            callRecordsForChat(chatId, callLogs, historicalFoldMap),
+        )
 
     /** Insert or replace by call id — hangup/decline and finalize share one id. */
     private fun upsertCallRecord(chatId: String, record: CallRecord) {

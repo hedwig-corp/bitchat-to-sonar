@@ -1107,6 +1107,39 @@ func snPaymentActivityPeerKeys(
     return keys.filter { !$0.isEmpty }
 }
 
+/// Call-log rows for the open id plus its hidden 0.8 sibling. Promote copies
+/// hist onto live asynchronously; first paint of the live transcript must
+/// still show recovered calls before that rewrite lands.
+func snCallLogsForChat<Record>(
+    conversationId: String,
+    callLogs: [String: [Record]],
+    historicalFolds: [String: String],
+    idOf: (Record) -> String,
+    dateOf: (Record) -> Date
+) -> [Record] {
+    let keys = snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds
+    )
+    if keys.isEmpty { return callLogs[conversationId] ?? [] }
+    let bare = snBareMarmotGroupId(conversationId)
+    let liveKeys = Set(
+        [conversationId, bare, "marmot:" + bare].filter { !$0.isEmpty }
+    )
+    var byId: [String: Record] = [:]
+    for key in keys.subtracting(liveKeys).sorted() {
+        for record in callLogs[key] ?? [] {
+            byId[idOf(record)] = record
+        }
+    }
+    for key in liveKeys {
+        for record in callLogs[key] ?? [] {
+            byId[idOf(record)] = record
+        }
+    }
+    return byId.values.sorted { dateOf($0) < dateOf($1) }
+}
+
 /// Rewrite a conversation-scoped payment peerKey onto the live sibling.
 /// Wallet / Unify keys stay put — those are not Marmot conversation ids.
 func snRemountedPaymentPeerKey(
@@ -7135,7 +7168,19 @@ final class SonarAppStore: ObservableObject {
     }
 
     func cachedCallRecordCount(_ id: String) -> Int {
-        callLogs[id]?.count ?? 0
+        callLogsForChat(id).count
+    }
+
+    /// Open id plus hidden 0.8 sibling — same family walk as payments.
+    private func callLogsForChat(_ id: String) -> [SNCallRecord] {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snCallLogsForChat(
+            conversationId: id,
+            callLogs: callLogs,
+            historicalFolds: folds,
+            idOf: { $0.id },
+            dateOf: { $0.date }
+        )
     }
 
     func hasCachedRenderOnlyOlderDM(
@@ -7644,7 +7689,7 @@ final class SonarAppStore: ObservableObject {
         limit: Int?,
         newestOffset: Int
     ) -> [SNMessage] {
-        let calls = callLogs[id] ?? []
+        let calls = callLogsForChat(id)
         var combined = dated
         for c in Self.transcriptSource(calls, limit: limit, newestOffset: newestOffset) {
             var message = c.message

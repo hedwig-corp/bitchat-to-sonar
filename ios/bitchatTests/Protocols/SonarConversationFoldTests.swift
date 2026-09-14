@@ -817,6 +817,36 @@ struct SonarConversationFoldTests {
             ]
         )
         #expect(
+            snCallLogsForChat(
+                conversationId: "marmot:group-09",
+                callLogs: [
+                    "marmot:group-08": [historicalCall],
+                    "marmot:group-09": [liveCall],
+                ],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0.id },
+                dateOf: { $0.date }
+            ).map(\.id) == ["call-08", "call-09"]
+        )
+        #expect(
+            snCallLogsForChat(
+                conversationId: "marmot:group-09",
+                callLogs: ["marmot:group-08": [historicalCall]],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0.id },
+                dateOf: { $0.date }
+            ).map(\.id) == ["call-08"]
+        )
+        #expect(
+            snCallLogsForChat(
+                conversationId: "marmot:group-09",
+                callLogs: ["marmot:group-08": [historicalCall]],
+                historicalFolds: [:],
+                idOf: { $0.id },
+                dateOf: { $0.date }
+            ).isEmpty
+        )
+        #expect(
             snPaymentActivityPeerKeys(
                 conversationId: "group-08",
                 historicalFolds: ["group-08": "group-09"]
