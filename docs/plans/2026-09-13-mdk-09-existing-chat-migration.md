@@ -760,6 +760,12 @@ upload-cache remount merges colliding live keys instead of overwriting.
 Pins: `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarConversationFoldTests` `snRemountedPendingUploadMediaKey`.
 
+Compose remount catch-up hole closed after this commit: opening the
+recovered 0.8 id called `preferCatchupGroup` on a group FFI no longer
+lists. iOS remount already `refreshWhenConnected` the live sibling.
+Remount now catch-up-prioritizes the live 0.9 id. Trill cooldown
+promotion no longer returns early when there are no in-flight echoes.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

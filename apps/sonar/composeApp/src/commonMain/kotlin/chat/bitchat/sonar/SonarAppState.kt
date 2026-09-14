@@ -12913,10 +12913,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
             idOf = { it.id },
         )
-        if (next == pendingSendEchoes.mapValues { it.value.toList() }) return
-        pendingSendEchoes.clear()
-        for ((id, echoes) in next) {
-            if (echoes.isNotEmpty()) pendingSendEchoes[id] = echoes.toMutableList()
+        if (next != pendingSendEchoes.mapValues { it.value.toList() }) {
+            pendingSendEchoes.clear()
+            for ((id, echoes) in next) {
+                if (echoes.isNotEmpty()) pendingSendEchoes[id] = echoes.toMutableList()
+            }
         }
         val nextTrill = promotedFoldedValues(
             previousIds = previousIds,
@@ -13071,6 +13072,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             } else {
                 s
             }
+        }
+        // iOS remount calls refreshWhenConnected on the live sibling.
+        // Opening the recovered 0.8 id catch-up'd a group FFI no longer lists.
+        if (live.isNotBlank()) {
+            scope.launch { runCatching { SonarCore.preferCatchupGroup(live) } }
         }
         }
         val nextStack = remountFoldedNavStack(stack, ::liveFor)
