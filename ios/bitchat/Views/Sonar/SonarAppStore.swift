@@ -1140,6 +1140,38 @@ func snCallLogsForChat<Record>(
     return byId.values.sorted { dateOf($0) < dateOf($1) }
 }
 
+/// Conversation keys whose in-flight / failed send echoes belong on this
+/// transcript after a fold. Includes listed 1:1 duplicates and the hidden
+/// 0.8 sibling (`marmot:` + bare).
+func snPendingMessageKeys(
+    conversationId: String,
+    sourceGroupIds: [String],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> [String] {
+    var seen = Set<String>()
+    var keys: [String] = []
+    func append(_ id: String) {
+        guard !id.isEmpty, seen.insert(id).inserted else { return }
+        keys.append(id)
+    }
+    append(conversationId)
+    for groupId in sourceGroupIds {
+        append(groupId)
+        if !groupId.hasPrefix(prefix) {
+            append(prefix + groupId)
+        }
+    }
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    ).sorted() {
+        append(key)
+    }
+    return keys
+}
+
 /// Rewrite a conversation-scoped payment peerKey onto the live sibling.
 /// Wallet / Unify keys stay put — those are not Marmot conversation ids.
 func snRemountedPaymentPeerKey(
@@ -7516,9 +7548,12 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
-            let echoIds = ([id] + sourceGroups.map { Self.marmotIDPrefix + $0.id }).reduce(into: [String]()) { ids, echoId in
-                if !ids.contains(echoId) { ids.append(echoId) }
-            }
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let echoIds = snPendingMessageKeys(
+                conversationId: id,
+                sourceGroupIds: sourceGroups.map(\.id),
+                historicalFolds: folds
+            )
             for echoId in echoIds {
                 dated += Self.transcriptSource(
                     pendingMarmotMessagesByChat[echoId] ?? [],

@@ -812,6 +812,54 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun pendingMessagesReadWalksFoldFamily() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = listOf(
+            SonarMsg(id = "echo-08", senderNpub = "me", content = "queued", mine = true, tsSecs = 1L, state = "Couldn't send"),
+        )
+        val live = listOf(
+            SonarMsg(id = "echo-09", senderNpub = "me", content = "live", mine = true, tsSecs = 2L, state = "Sending"),
+        )
+        val byChat = mapOf("group-08" to historical, "group-09" to live)
+        assertEquals(
+            setOf("echo-08", "echo-09"),
+            pendingMessagesForChat("group-09", byChat, folds).map { it.id }.toSet(),
+        )
+        assertEquals(
+            setOf("echo-08", "echo-09"),
+            pendingMessagesForChat("group-08", byChat, folds).map { it.id }.toSet(),
+        )
+        assertEquals(live, pendingMessagesForChat("group-09", byChat, emptyMap()))
+    }
+
+    @Test
+    fun pendingMessagesMutateWalksFoldFamily() {
+        val folds = mapOf("group-08" to "group-09")
+        val byChat = mutableMapOf(
+            "group-08" to mutableListOf(
+                SonarMsg(id = "echo-08", senderNpub = "me", content = "queued", mine = true, tsSecs = 1L, state = "Sending"),
+            ),
+            "group-09" to mutableListOf(
+                SonarMsg(id = "echo-09", senderNpub = "me", content = "live", mine = true, tsSecs = 2L, state = "Sending"),
+            ),
+        )
+        assertTrue(
+            updatePendingMessagesForChat(
+                "group-09",
+                byChat,
+                folds,
+                matches = { it.id == "echo-08" },
+                update = { it.copy(state = "Couldn't send") },
+            ),
+        )
+        assertEquals("Couldn't send", byChat["group-08"]!!.single().state)
+        assertEquals("Sending", byChat["group-09"]!!.single().state)
+        removePendingMessagesForChat("group-09", byChat, folds) { it.id == "echo-08" }
+        assertTrue("group-08" !in byChat)
+        assertEquals(listOf("echo-09"), byChat["group-09"]!!.map { it.id })
+    }
+
+    @Test
     fun foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling() {
         assertEquals(
             mapOf("group-09" to listOf("uploading")),

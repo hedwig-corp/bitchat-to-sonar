@@ -898,6 +898,17 @@ and last-wins on the live id. Pins:
 `ConversationFoldTest.callRecordsReadWalksFoldFamily`,
 `SonarConversationFoldTests` `snCallLogsForChat`.
 
+Pending-echo hole closed after this commit: `withSendEchoes` / `dmMsgs`
+keyed only the open id (plus listed 1:1 duplicates). A failed or in-flight
+send left on the hidden 0.8 id vanished from the live transcript until
+async promote. `pendingMessagesForChat` / `snPendingMessageKeys` reuse the
+same fold-family key set as payments and call logs. Compose clear / fail /
+accept / terminal-accepted cleanup also walk the family so a hist-keyed
+echo cannot stay "Sending" on the live row. Pins:
+`ConversationFoldTest.pendingMessagesReadWalksFoldFamily`,
+`ConversationFoldTest.pendingMessagesMutateWalksFoldFamily`,
+`SonarConversationFoldTests` `snPendingMessageKeys`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

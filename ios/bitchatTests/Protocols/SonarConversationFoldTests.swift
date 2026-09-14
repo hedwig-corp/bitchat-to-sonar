@@ -847,6 +847,23 @@ struct SonarConversationFoldTests {
             ).isEmpty
         )
         #expect(
+            Set(snPendingMessageKeys(
+                conversationId: "marmot:group-09",
+                sourceGroupIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            )).isSuperset(of: [
+                "marmot:group-09", "group-09",
+                "marmot:group-08", "group-08",
+            ])
+        )
+        #expect(
+            !snPendingMessageKeys(
+                conversationId: "marmot:group-09",
+                sourceGroupIds: ["group-09"],
+                historicalFolds: [:]
+            ).contains("marmot:group-08")
+        )
+        #expect(
             snPaymentActivityPeerKeys(
                 conversationId: "group-08",
                 historicalFolds: ["group-08": "group-09"]
