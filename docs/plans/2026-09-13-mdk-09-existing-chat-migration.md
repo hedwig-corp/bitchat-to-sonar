@@ -730,6 +730,19 @@ could ring the live banner. Suppress the fold family; keep scan on
 listed ids so a bak remainder cannot replay recovered history.
 Pin: `ConversationFoldTest.notificationSuppressIdsIncludeHiddenHistoricalSibling`.
 
+Viewing-unread hole closed after this commit: Compose
+`transcriptGroupIds` for a non-mesh room was only
+`directMarmotChatIds` (the listed live id). iOS
+`syncViewingUnreadGroups` only walked `directMarmotGroups` (1:1
+duplicates). Sitting in a remounted room — or in the recovered 0.8
+transcript before remount — left the hidden sibling's unread on the
+home-list badge. `transcriptSourceIds` / `snTranscriptSourceIds`
+union the listed ids with the fold family for viewing suppress,
+mark-read, and unread-at-open. FFI `messages()` already unions the
+family, so iOS transcript hydration still pages listed groups only.
+Pins: `ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
+`SonarConversationFoldTests` `snTranscriptSourceIds`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

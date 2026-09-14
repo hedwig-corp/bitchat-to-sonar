@@ -462,6 +462,20 @@ struct SonarConversationFoldTests {
         #expect(snFoldFamilyIds(id: "group-08", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])
         #expect(
+            snTranscriptSourceIds(
+                groupId: "group-09",
+                listedDirectIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snTranscriptSourceIds(
+                groupId: "group-09",
+                listedDirectIds: ["group-09"],
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
+        #expect(
             snPaymentActivityPeerKeys(
                 conversationId: "marmot:group-09",
                 historicalFolds: ["group-08": "group-09"]

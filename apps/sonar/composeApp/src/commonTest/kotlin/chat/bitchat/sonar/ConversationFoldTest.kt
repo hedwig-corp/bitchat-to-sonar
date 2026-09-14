@@ -1121,6 +1121,19 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun transcriptSourceIdsIncludeHiddenHistoricalSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            listOf("group-09", "group-08"),
+            transcriptSourceIds("group-09", listOf("group-09"), folds),
+        )
+        assertEquals(
+            listOf("group-09"),
+            transcriptSourceIds("group-09", listOf("group-09"), emptyMap()),
+        )
+    }
+
+    @Test
     fun deleteAfterFoldDropsTheHiddenHistoricalSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-09", folds))

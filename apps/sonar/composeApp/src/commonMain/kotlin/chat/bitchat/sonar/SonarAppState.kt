@@ -908,6 +908,22 @@ internal fun notificationSuppressIds(
     return out.toList()
 }
 
+/** Marmot ids whose unread / transcript belong to the open chat after a fold.
+ *  Listed 1:1 duplicates plus the hidden 0.8 sibling. */
+internal fun transcriptSourceIds(
+    chatId: String,
+    listedDirectIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+): List<String> {
+    val out = linkedSetOf<String>()
+    if (chatId.isNotBlank()) out += chatId
+    for (id in listedDirectIds) {
+        if (id.isNotBlank()) out += id
+    }
+    out.addAll(foldFamilyIds(chatId, historicalFolds))
+    return out.toList()
+}
+
 /** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
 internal fun conversationsMatchFoldFamily(
     left: String,
@@ -11674,7 +11690,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun transcriptGroupIds(chatId: String): List<String> {
-        if (!isMeshChat(chatId)) return directMarmotChatIds(chatId).distinct()
+        if (!isMeshChat(chatId)) {
+            return transcriptSourceIds(
+                chatId,
+                directMarmotChatIds(chatId),
+                historicalFoldMap,
+            )
+        }
         val peerId = canonicalMeshPeerId(meshPeerId(chatId))
         val aliases = meshPeerAliases(peerId)
         val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }

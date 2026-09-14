@@ -670,6 +670,27 @@ func snFoldFamilyIds(
     return family
 }
 
+/// Marmot ids whose unread / transcript belong to the open chat after a fold.
+/// Order is stable: open id, then listed 1:1 duplicates, then sorted family extras.
+func snTranscriptSourceIds(
+    groupId: String,
+    listedDirectIds: [String],
+    historicalFolds: [String: String]
+) -> [String] {
+    var seen = Set<String>()
+    var out: [String] = []
+    func append(_ id: String) {
+        guard !id.isEmpty, seen.insert(id).inserted else { return }
+        out.append(id)
+    }
+    append(groupId)
+    for id in listedDirectIds { append(id) }
+    for id in snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds).sorted() {
+        append(id)
+    }
+    return out
+}
+
 /// Conversation keys a chat-scoped payment read must check after a fold.
 /// Includes both bare MLS ids and `marmot:` conversation ids.
 func snPaymentActivityPeerKeys(
@@ -5851,12 +5872,25 @@ final class SonarAppStore: ObservableObject {
         groups.contains { marmotVerified[$0.id] ?? false }
     }
 
-    private func markMarmotGroupsRead(matchingGroupId groupId: String) {
+    /// Listed 1:1 duplicates plus the hidden 0.8 sibling. Used for unread
+    /// suppress / mark-read — FFI `messages()` already unions the family, so
+    /// transcript hydration must not page these as a second source.
+    private func transcriptSourceIds(forGroupId groupId: String) -> [String] {
         let groups = directMarmotGroups(matchingGroupId: groupId)
-        if groups.isEmpty {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snTranscriptSourceIds(
+            groupId: groupId,
+            listedDirectIds: groups.map(\.id),
+            historicalFolds: folds
+        )
+    }
+
+    private func markMarmotGroupsRead(matchingGroupId groupId: String) {
+        let ids = transcriptSourceIds(forGroupId: groupId)
+        if ids.isEmpty {
             marmot.markConversationRead(groupId: groupId)
         } else {
-            for group in groups { marmot.markConversationRead(groupId: group.id) }
+            for id in ids { marmot.markConversationRead(groupId: id) }
         }
     }
 
@@ -8025,7 +8059,10 @@ final class SonarAppStore: ObservableObject {
     @MainActor
     private func remountFoldedOpenChatIfNeeded() async {
         let listed = Set(marmot.groups.map(\.id))
-        defer { remountFoldedNavigationPath(listedGroupIds: listed) }
+        defer {
+            remountFoldedNavigationPath(listedGroupIds: listed)
+            syncViewingUnreadGroups()
+        }
         guard let openId = currentDMId, let groupId = marmotGroupId(openId) else { return }
         let live = await marmot.liveFoldTarget(groupId: groupId)
         let remounted = snRemountFoldedOpenGroupId(
@@ -9630,8 +9667,7 @@ final class SonarAppStore: ObservableObject {
             unreadCountAtOpenByDM[id] = 0
             return
         }
-        let groups = directMarmotGroups(matchingGroupId: groupId)
-        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        let ids = transcriptSourceIds(forGroupId: groupId)
         let hasCachedEntry = ids.contains { marmot.unreadByGroup[$0] != nil }
         let cached = ids.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
         if hasCachedEntry || cached > 0 {
@@ -9654,8 +9690,7 @@ final class SonarAppStore: ObservableObject {
         let groupId = marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else { return nil }
-        let groups = directMarmotGroups(matchingGroupId: groupId)
-        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        let ids = transcriptSourceIds(forGroupId: groupId)
         return ids.compactMap { marmot.conversationSummariesByGroup[$0]?.latestAt }.max()
     }
 
@@ -11248,8 +11283,7 @@ final class SonarAppStore: ObservableObject {
             marmot.setViewingUnreadGroups([])
             return
         }
-        let groups = directMarmotGroups(matchingGroupId: groupId)
-        marmot.setViewingUnreadGroups(groups.isEmpty ? [groupId] : groups.map(\.id))
+        marmot.setViewingUnreadGroups(transcriptSourceIds(forGroupId: groupId))
     }
 
     private func popCallRouteIfNeeded() {
