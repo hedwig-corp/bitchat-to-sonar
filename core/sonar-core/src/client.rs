@@ -9341,11 +9341,17 @@ mod tests {
         client
             .engine()
             .add_historical_media_secret(historical.clone(), vec![0xABu8; 32]);
+        let live = GroupId::new(vec![0x22; 16]);
+        client.engine().record_historical_fold(&historical, &live);
         assert!(
             !client
                 .engine()
                 .recovered_08_media_unavailable(&historical, url),
             "a stored exporter must leave the host download path open"
+        );
+        assert!(
+            !client.engine().recovered_08_media_unavailable(&live, url),
+            "a remounted live id must still see the stored 0.8 exporter"
         );
         let err = client
             .fetch_media(&historical, url)
@@ -9355,6 +9361,16 @@ mod tests {
             !err.to_string()
                 .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
             "hosts must attempt download when the 0.8 exporter was copied: {err}"
+        );
+        let live_err = client
+            .fetch_media(&live, url)
+            .await
+            .expect_err("remounted live id must also pass the unavailable gate");
+        assert!(
+            !live_err
+                .to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "hosts remounted onto the live sibling must still download: {live_err}"
         );
         struct NoopDownload;
         impl MediaDownloadObserver for NoopDownload {

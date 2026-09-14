@@ -4420,5 +4420,12 @@ mod historical_fold_tests {
             .decrypt_media_by_url(&historical, url, &upload.encrypted_data)
             .expect("stored 0.8 exporter must open the blob");
         assert_eq!(plain, b"photo-bytes");
+        let live = GroupId::new(vec![0x22; 16]);
+        engine.record_historical_fold(&historical, &live);
+        assert!(!engine.recovered_08_media_unavailable(&live, url));
+        let remounted = engine
+            .decrypt_media_by_url(&live, url, &upload.encrypted_data)
+            .expect("remounted live id must still open the recovered blob");
+        assert_eq!(remounted, b"photo-bytes");
     }
 }

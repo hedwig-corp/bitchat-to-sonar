@@ -42,6 +42,43 @@ object SonarNotificationHandoff {
             .mapTo(linkedSetOf()) { notificationId(it) }
 
     /**
+     * Cold-start shade taps still name the hidden 0.8 id. FFI
+     * `liveFoldTarget` is empty until the engine is up, but the host already
+     * persisted hist→live in [sonar.historicalFolds]. FFI wins when present.
+     */
+    fun notificationLiveFoldTargets(
+        conversationId: String,
+        persistedFolds: Map<String, String>,
+        ffiLiveFoldTarget: String?,
+    ): Map<String, String> {
+        val aliases = conversationIdAliases(conversationId)
+        if (aliases.isEmpty()) return emptyMap()
+        val targets = linkedMapOf<String, String>()
+        fun remember(live: String) {
+            val dest = live.trim().removePrefix("marmot:").trim()
+            if (dest.isEmpty()) return
+            for (from in aliases) targets[from] = dest
+        }
+        for (alias in aliases) {
+            persistedFolds[alias]?.let { remember(it) }
+        }
+        ffiLiveFoldTarget?.trim()?.takeIf { it.isNotEmpty() }?.let { remember(it) }
+        return targets
+    }
+
+    /** Bare hex plus optional `marmot:` prefix so either tap shape remaps. */
+    fun conversationIdAliases(conversationId: String): Set<String> {
+        val trimmed = conversationId.trim()
+        if (trimmed.isEmpty()) return emptySet()
+        val bare = trimmed.removePrefix("marmot:")
+        return buildSet {
+            add(trimmed)
+            if (bare.isNotEmpty()) add(bare)
+            if (bare.isNotEmpty() && !trimmed.startsWith("marmot:")) add("marmot:$bare")
+        }
+    }
+
+    /**
      * Resolve a notification conversation id onto a real open target.
      * Returns null when the id is not yet known locally — callers should
      * refresh and retry instead of inventing a blank chat screen.
@@ -66,8 +103,10 @@ object SonarNotificationHandoff {
             }
             return SonarNotificationOpenTarget.Chat(id)
         }
-        liveFoldTargets[id]?.takeIf { it in knownChatIds }?.let {
-            return SonarNotificationOpenTarget.Chat(it)
+        conversationIdAliases(id).firstNotNullOfOrNull { alias ->
+            liveFoldTargets[alias]?.takeIf { it in knownChatIds }
+        }?.let { live ->
+            return SonarNotificationOpenTarget.Chat(live)
         }
         if (id.startsWith(MESH_CHAT_PREFIX)) {
             val peerId = id.removePrefix(MESH_CHAT_PREFIX)

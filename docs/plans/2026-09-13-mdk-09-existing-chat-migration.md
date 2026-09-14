@@ -400,7 +400,10 @@ non-empty live draft. Host snapshot / in-memory transcript rows on the
 hidden id are copied onto the live sibling so home preview does not go
 blank between `groups()` hide and the next bounded page. A notification
 tap whose payload still names the hidden 0.8 id remaps onto
-`live_fold_target` instead of toasting that the chat is gone. Persisted
+`live_fold_target` instead of toasting that the chat is gone. Cold start
+does that from the persisted hist→live blob (`sonar.historicalFolds` /
+`sonar.historicalFolds.v1`) when FFI is not up yet — a shade tap must
+not wait on `connect()` to open a chat the snapshot already listed. Persisted
 call-log rows on the hidden id are merged onto the live sibling so resume
 does not drop the recovered call history. A safety-number verify on the
 hidden id is copied onto the live sibling so resume does not drop the
@@ -448,6 +451,11 @@ chat stays silent when the next push names the live 0.9 id. Pins:
 `client::tests::conversation_summaries_omit_and_heal_dropped_groups`,
 `client::tests::send_text_rejects_dropped_group`,
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
+`SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
+`SonarConversationFoldTests` (`snNotificationLiveFoldTarget` remaps a
+shade tap from the persisted blob when FFI is down),
+`marmot::historical_fold_tests::recovered_08_media_decrypts_with_stored_exporter_secret`
+(also pins decrypt via the remounted live id),
 `SonarConversationFoldTests` (`snNotificationOpenGroupId` remaps a shade
 tap onto the live sibling even before that id is listed),
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
@@ -483,19 +491,19 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after iOS notification remount and pending-media fold.
+Re-run on this cloud agent after cold-start notification remap from the
+persisted hist→live blob.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 178 passed |
-| `--test persistence` | 30 passed |
-| `--test group_invites` | 17 passed |
-| `--test failed_events` | 1 passed |
-| `--test media` | 4 passed |
-| `-p sonar-sim` | 5 passed |
-| `--test e2e` `recovered_08` | 7 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 45 passed (includes delete-after-fold family purge) |
-| `scripts/check-regression-ledger.sh` | 236 citations |
+| `--lib` `--` `historical_fold` `fetch_media_with_stored` | 11 passed (includes remounted live-id decrypt) |
+| Compose `SonarNotificationHandoffTest` + `ConversationFoldTest` | passed |
+| `--test persistence` | 30 passed (previous HEAD) |
+| `--test group_invites` | 17 passed (previous HEAD) |
+| `--test failed_events` | 1 passed (previous HEAD) |
+| `--test media` | 4 passed (previous HEAD) |
+| `-p sonar-sim` | 5 passed (previous HEAD) |
+| `--test e2e` `recovered_08` | 7 passed (previous HEAD) |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with
 only one known peer no longer resumes as `start_dm`. Extract copies

@@ -299,6 +299,61 @@ func snNotificationOpenGroupId(
     return live
 }
 
+/// Bare MLS id whether the tap carried `marmot:` or not.
+func snBareMarmotGroupId(_ id: String, prefix: String = "marmot:") -> String {
+    id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : id
+}
+
+/// Cold-start shade taps must remap from the persisted hist→live blob
+/// when FFI `liveFoldTarget` is not ready yet.
+func snPersistedLiveFoldTarget(
+    tappedGroupId: String,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> String? {
+    let aliases = [tappedGroupId, snBareMarmotGroupId(tappedGroupId, prefix: prefix)]
+    for alias in aliases {
+        guard let live = historicalFolds[alias] ?? historicalFolds[snBareMarmotGroupId(alias, prefix: prefix)],
+              !live.isEmpty else { continue }
+        let bareLive = snBareMarmotGroupId(live, prefix: prefix)
+        if !bareLive.isEmpty, bareLive != snBareMarmotGroupId(tappedGroupId, prefix: prefix) {
+            return bareLive
+        }
+    }
+    return nil
+}
+
+/// FFI wins when the engine is up; otherwise the host blob.
+func snNotificationLiveFoldTarget(
+    tappedGroupId: String,
+    ffiLiveFoldTarget: String?,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> String? {
+    if let ffi = ffiLiveFoldTarget?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !ffi.isEmpty {
+        return snBareMarmotGroupId(ffi, prefix: prefix)
+    }
+    return snPersistedLiveFoldTarget(
+        tappedGroupId: tappedGroupId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    )
+}
+
+/// Same recovered conversation under either the hidden 0.8 or live 0.9 id.
+func snConversationsMatchFoldFamily(
+    left: String,
+    right: String,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> Bool {
+    let leftBare = snBareMarmotGroupId(left, prefix: prefix)
+    let rightBare = snBareMarmotGroupId(right, prefix: prefix)
+    if leftBare == rightBare { return true }
+    return snFoldFamilyIds(id: leftBare, historicalFolds: historicalFolds).contains(rightBare)
+}
+
 /// Copy an open-chat host map (unread divider, jump, window) from a hidden
 /// 0.8 id onto the live sibling so remount does not treat the chat as a
 /// fresh open.
@@ -10711,6 +10766,9 @@ final class SonarAppStore: ObservableObject {
         }
         if let target = resolveNotificationConversation(id) {
             openDM(target.id, marmotGroupId: target.marmotGroupId, jumpMessageId: jump)
+            if target.id != id {
+                clearNotificationsForConversation(id)
+            }
             return
         }
         Task { @MainActor in
@@ -10731,7 +10789,12 @@ final class SonarAppStore: ObservableObject {
             return
         }
         _ = await marmot.loadLocalSummaries(resolveMembers: false)
-        let live = await marmot.liveFoldTarget(groupId: groupId)
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let live = snNotificationLiveFoldTarget(
+            tappedGroupId: groupId,
+            ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId),
+            historicalFolds: folds
+        )
         let remounted = snNotificationOpenGroupId(
             tappedGroupId: groupId,
             liveFoldTarget: live
@@ -10786,6 +10849,18 @@ final class SonarAppStore: ObservableObject {
         if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
             return (id, nil)
         }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        if let live = snPersistedLiveFoldTarget(
+            tappedGroupId: marmotGroupId(id) ?? id,
+            historicalFolds: folds
+        ) {
+            if let row = dmRows.first(where: {
+                $0.marmotGroupId == live || $0.id == Self.marmotIDPrefix + live
+            }) {
+                return (row.id, live)
+            }
+            return (Self.marmotIDPrefix + live, live)
+        }
         if let groupId = marmotGroupId(id),
            marmot.groups.contains(where: { $0.id == groupId }) {
             if let row = dmRows.first(where: {
@@ -10826,7 +10901,12 @@ final class SonarAppStore: ObservableObject {
            leftHex == rightHex {
             return true
         }
-        return false
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snConversationsMatchFoldFamily(
+            left: left,
+            right: right,
+            historicalFolds: folds
+        )
     }
 
     /// Dismiss OS notifications that were posted for this conversation (and

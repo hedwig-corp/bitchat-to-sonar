@@ -5760,9 +5760,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         val foldLookup = conversationId.removePrefix("marmot:")
         val liveFold = runCatching { SonarCore.liveFoldTarget(foldLookup) }.getOrNull()
             ?: runCatching { SonarCore.liveFoldTarget(conversationId) }.getOrNull()
-        val liveFoldTargets = liveFold?.let {
-            mapOf(conversationId to it, foldLookup to it)
-        }.orEmpty()
+        val liveFoldTargets = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = conversationId,
+            persistedFolds = historicalFoldMap,
+            ffiLiveFoldTarget = liveFold,
+        )
         val target = SonarNotificationHandoff.resolveOpenTarget(
             conversationId = conversationId,
             knownChatIds = chats.mapTo(hashSetOf()) { it.id },
