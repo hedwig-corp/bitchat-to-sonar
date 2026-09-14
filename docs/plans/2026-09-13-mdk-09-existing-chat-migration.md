@@ -1539,6 +1539,17 @@ and remap onto the live sibling first. `fetch_media` /
 0.9 blob can use the live exporter after sidecar loss. Pin:
 `client::tests::prefer_catchup_maps_folded_hist_to_live_mls_hex`.
 
+Wake / NSE titles still read `conversation_summaries().name`. After hide
+the live MLS topic and index row can both stay blank while
+`display_name()` / sidecar still know **"standup"** (home list paints
+correctly; banners said **"Alice"**). Paint empty published names from
+`display_name`, use the same source for drain `group_name` /
+`resolve_group_name`, and remount hist names onto blank live host
+summaries (`collapsedFoldDisplayName`). Pins:
+`client::tests::conversation_summaries_paint_sidecar_name_when_index_name_blank`,
+`HomeMessageRowsTest.conversationSummariesByChatRemountsHistRoomNameOntoBlankLive`,
+`SonarConversationFoldTests` (`namedOntoLive`).
+
 Android killed-app wake dropped remounted room names. `visibleLabel`
 prefers `senderName` over `conversationTitle`, and the drain passed
 only the latter, so a recovered named group bannered **"Alice"**

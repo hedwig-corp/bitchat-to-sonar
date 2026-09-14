@@ -520,6 +520,54 @@ class HomeMessageRowsTest {
     }
 
     @Test
+    fun conversationSummariesByChatRemountsHistRoomNameOntoBlankLive() {
+        val folds = mapOf("group-08" to "group-09")
+        val hist = SonarConversationSummary(
+            "group-08",
+            "standup",
+            "from 0.8",
+            "peer",
+            50L,
+            false,
+            80L,
+            4L,
+        )
+        val previous = conversationSummariesByChat(listOf(hist), emptyMap(), folds)
+        val liveNewer = SonarConversationSummary(
+            "group-09",
+            "",
+            "already on live",
+            "peer",
+            200L,
+            true,
+            1L,
+            0L,
+        )
+        val remounted = conversationSummariesByChat(listOf(liveNewer), previous, folds)
+        assertEquals("already on live", remounted["group-09"]?.latestContent)
+        assertEquals("standup", remounted["group-09"]?.name)
+        assertEquals(
+            "standup",
+            conversationSummariesByChat(
+                listOf(
+                    SonarConversationSummary(
+                        "group-09",
+                        "",
+                        "",
+                        "peer",
+                        0L,
+                        false,
+                        0L,
+                        1L,
+                    ),
+                ),
+                previous,
+                folds,
+            )["group-09"]?.name,
+        )
+    }
+
+    @Test
     fun remountedExtractMergesNewerLivePageInsteadOfReplacing() {
         val folds = mapOf("group-08" to "group-09")
         val histRows = (1..80).map { n ->

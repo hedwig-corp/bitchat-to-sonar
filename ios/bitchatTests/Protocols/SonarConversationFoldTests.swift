@@ -1033,6 +1033,24 @@ struct SonarConversationFoldTests {
             historicalFolds: ["group-08": "group-09"]
         )
         #expect(keptLive["group-09"]?.latestContent == "already on live")
+        let namedHist = MarmotService.ConversationSummary(
+            groupIdHex: "group-08",
+            name: "standup",
+            latestContent: "keep this chat",
+            latestSenderNpub: "npub1peer",
+            latestAt: Date(timeIntervalSince1970: 100),
+            latestMine: false,
+            messageCount: 3,
+            unreadCount: 3
+        )
+        let namedOntoLive = snRemountedConversationSummaries(
+            summaries: [liveNewer],
+            activeGroupIds: ["group-09"],
+            historicalFolds: ["group-08": "group-09"],
+            previous: ["group-08": namedHist]
+        )
+        #expect(namedOntoLive["group-09"]?.latestContent == "already on live")
+        #expect(namedOntoLive["group-09"]?.name == "standup")
         let liveHidden = MarmotService.ConversationSummary(
             groupIdHex: "group-09",
             name: "",

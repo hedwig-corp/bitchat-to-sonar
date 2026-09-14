@@ -1760,17 +1760,32 @@ func snRemountedConversationSummaries(
         if out[historical] == nil { out[historical] = hist }
         if let liveSummary = out[live] {
             let liveSecs = liveSummary.latestAt.timeIntervalSince1970
+            let paintedName = snCollapsedFoldDisplayName(
+                liveName: liveSummary.name,
+                historicalName: hist.name
+            )
             if histSecs > liveSecs ||
                 (liveSecs <= 0 && hist.messageCount > liveSummary.messageCount)
             {
                 out[live] = MarmotService.ConversationSummary(
                     groupIdHex: live,
-                    name: liveSummary.name,
+                    name: paintedName,
                     latestContent: hist.latestContent,
                     latestSenderNpub: hist.latestSenderNpub,
                     latestAt: hist.latestAt,
                     latestMine: hist.latestMine,
                     messageCount: max(liveSummary.messageCount, hist.messageCount),
+                    unreadCount: liveSummary.unreadCount
+                )
+            } else if paintedName != liveSummary.name {
+                out[live] = MarmotService.ConversationSummary(
+                    groupIdHex: live,
+                    name: paintedName,
+                    latestContent: liveSummary.latestContent,
+                    latestSenderNpub: liveSummary.latestSenderNpub,
+                    latestAt: liveSummary.latestAt,
+                    latestMine: liveSummary.latestMine,
+                    messageCount: liveSummary.messageCount,
                     unreadCount: liveSummary.unreadCount
                 )
             }

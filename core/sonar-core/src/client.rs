@@ -6838,7 +6838,10 @@ impl SonarClient {
             .groups()
             .unwrap_or_default()
             .into_iter()
-            .map(|g| (g.id.as_slice().to_vec(), g.name))
+            .map(|g| {
+                let name = self.engine.display_name(&g.id, &g.name);
+                (g.id.as_slice().to_vec(), name)
+            })
             .collect();
         for event in sort_marmot_events(events) {
             if self.is_sync_event_processed(&event.id) {
@@ -6974,10 +6977,15 @@ impl SonarClient {
                     if let Some(sticker_ref) = &message.sticker_ref {
                         sticker_refs.push(sticker_ref.clone());
                     }
-                    let cached_name = group_names
+                    let painted = group_names
                         .get(message.group_id.as_slice())
-                        .map(|s| s.as_str());
-                    self.upsert_index_for_message(message, cached_name);
+                        .cloned()
+                        .unwrap_or_else(|| self.engine.display_name(&message.group_id, ""));
+                    let cached_name = painted.as_str();
+                    self.upsert_index_for_message(
+                        message,
+                        Some(cached_name).filter(|s| !s.is_empty()),
+                    );
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     if !message.mine {
                         // Same preview as conversation index (media/sticker
@@ -6988,7 +6996,7 @@ impl SonarClient {
                             message_id_hex: message.id.to_hex(),
                             sender_pubkey: message.sender.to_string(),
                             group_id_hex: hex::encode(message.group_id.as_slice()),
-                            group_name: cached_name.unwrap_or("").to_string(),
+                            group_name: painted,
                             content_preview: preview,
                         });
                     }
@@ -7884,6 +7892,11 @@ impl SonarClient {
         // NSE have no previous cache, so remount unread / latest_at /
         // message_count onto the published live id here.
         self.remount_hidden_hist_onto_published_summaries(&mut summaries);
+        // FFI `groups()` paints via `display_name` (sidecar / fold-family).
+        // Wake, NSE, and host-delta titles read `summary.name`. A blank
+        // live MLS topic plus an empty index row would otherwise banner
+        // the sender only for a named recovered room.
+        self.paint_summary_display_names(&mut summaries);
         summaries
     }
 
@@ -7934,6 +7947,21 @@ impl SonarClient {
                     .cmp(&a.latest_at_secs)
                     .then_with(|| a.group_id_hex.cmp(&b.group_id_hex))
             });
+        }
+    }
+
+    fn paint_summary_display_names(&self, summaries: &mut [ConversationSummary]) {
+        for summary in summaries.iter_mut() {
+            if !summary.name.trim().is_empty() {
+                continue;
+            }
+            let Some(id) = decode_group_id_hex(&summary.group_id_hex) else {
+                continue;
+            };
+            let painted = self.engine.display_name(&id, "");
+            if !painted.is_empty() {
+                summary.name = painted;
+            }
         }
     }
 
@@ -8053,10 +8081,14 @@ impl SonarClient {
     }
 
     fn resolve_group_name(&self, group_id: &GroupId) -> Option<String> {
-        self.engine
+        let live = self
+            .engine
             .groups()
             .ok()
             .and_then(|gs| gs.into_iter().find(|g| g.id == *group_id).map(|g| g.name))
+            .unwrap_or_default();
+        let painted = self.engine.display_name(group_id, &live);
+        (!painted.is_empty()).then_some(painted)
     }
 
     fn remove_index_for_group(&self, group_id: &GroupId) {
@@ -9555,6 +9587,52 @@ mod tests {
             after_copy[0].message_count >= 3,
             "hist count must still remount after copy_summary leaves live count stale"
         );
+    }
+
+    /// Live MLS topic and index name can both stay blank after hide.
+    /// FFI `groups()` still paints via `display_name` / sidecar. Wake and
+    /// NSE read `summary.name` and would banner the sender only.
+    #[tokio::test]
+    async fn conversation_summaries_paint_sidecar_name_when_index_name_blank() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live_hex, "", "", "", 0, true, false)
+                .unwrap();
+        }
+        client
+            .engine
+            .seed_historical_metadata(historical.clone(), "standup", vec![], 3);
+        client.engine.record_historical_fold(&historical, &live);
+
+        let summaries = client.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "folded hist must stay hidden: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, live_hex);
+        assert_eq!(
+            summaries[0].name, "standup",
+            "sidecar title must paint onto published live summary"
+        );
+        assert_eq!(summaries[0].latest_content, "keep this chat");
     }
 
     /// `summaries_ordered` ranks live `latest_at=0` below an unrelated chat.

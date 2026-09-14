@@ -873,11 +873,13 @@ internal fun conversationSummariesByChat(
             out = out + (live to hist.copy(groupIdHex = live, unreadCount = 0L))
             continue
         }
+        val paintedName = collapsedFoldDisplayName(liveSummary.name, hist.name)
         val histNewer = hist.latestAtSecs > liveSummary.latestAtSecs ||
             (liveSummary.latestAtSecs <= 0L && hist.messageCount > liveSummary.messageCount)
         if (histNewer) {
             out = out + (
                 live to liveSummary.copy(
+                    name = paintedName,
                     latestContent = hist.latestContent,
                     latestSenderNpub = hist.latestSenderNpub,
                     latestAtSecs = hist.latestAtSecs,
@@ -885,6 +887,8 @@ internal fun conversationSummariesByChat(
                     messageCount = maxOf(liveSummary.messageCount, hist.messageCount),
                 )
             )
+        } else if (paintedName != liveSummary.name) {
+            out = out + (live to liveSummary.copy(name = paintedName))
         }
     }
     return out
