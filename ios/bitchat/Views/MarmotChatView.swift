@@ -2771,7 +2771,8 @@ final class MarmotChatModel: ObservableObject {
                 self.conversationSummariesByGroup = snRemountedConversationSummaries(
                     summaries: summaries,
                     activeGroupIds: activeGroupIds,
-                    historicalFolds: latestFolds
+                    historicalFolds: latestFolds,
+                    previous: self.conversationSummariesByGroup
                 )
                 self.publishUnread(from: summaries)
             }
@@ -3041,7 +3042,8 @@ final class MarmotChatModel: ObservableObject {
                 self.conversationSummariesByGroup = snRemountedConversationSummaries(
                     summaries: summaries,
                     activeGroupIds: activeGroupIds,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    previous: self.conversationSummariesByGroup
                 )
             }
             // All service reads above suspend. Snapshot the live dictionary only

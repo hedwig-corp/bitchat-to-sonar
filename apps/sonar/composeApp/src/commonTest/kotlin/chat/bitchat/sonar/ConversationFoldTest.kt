@@ -2432,6 +2432,58 @@ class ConversationFoldTest {
             ),
             "count-only live 0 must not look non-empty without index latest_at",
         )
+        val folds = mapOf("group-08" to "group-09")
+        val liveHidden = SonarConversationSummary(
+            groupIdHex = "group-09",
+            name = "",
+            latestContent = "",
+            latestSenderNpub = "npub1peer",
+            latestAtSecs = 0L,
+            latestMine = false,
+            messageCount = 0L,
+            unreadCount = 0L,
+        )
+        val keptLatest = conversationLatestAtFromSummaries(
+            summaries = listOf(liveHidden),
+            previous = mapOf("group-08" to 50L),
+            historicalFolds = folds,
+        )
+        val keptCounts = conversationMessageCountsFromSummaries(
+            summaries = listOf(liveHidden),
+            previous = mapOf("group-08" to 80L),
+            historicalFolds = folds,
+        )
+        assertEquals(50L, keptLatest["group-08"])
+        assertEquals(50L, keptLatest["group-09"])
+        assertEquals(80L, keptCounts["group-08"])
+        assertEquals(80L, keptCounts["group-09"])
+        assertEquals(
+            emptyMap(),
+            conversationLatestAtFromSummaries(
+                summaries = emptyList(),
+                previous = mapOf("group-08" to 50L),
+                historicalFolds = folds,
+            ),
+            "empty success still clears",
+        )
+        assertEquals(
+            50L,
+            expectedNewestTsForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                latestByChat = emptyMap(),
+                summaryLatestByChat = keptLatest,
+                historicalFolds = folds,
+            ),
+        )
+        assertTrue(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = keptLatest,
+                messageCountByChat = mapOf("group-09" to 0L),
+                historicalFolds = folds,
+            ),
+        )
     }
 
     @Test

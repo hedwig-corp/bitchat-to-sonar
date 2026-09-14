@@ -1720,7 +1720,8 @@ func snHydrateMergedPageRows(
 func snRemountedConversationSummaries(
     summaries: [MarmotService.ConversationSummary],
     activeGroupIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    previous: [String: MarmotService.ConversationSummary] = [:]
 ) -> [String: MarmotService.ConversationSummary] {
     var out: [String: MarmotService.ConversationSummary] = [:]
     for summary in summaries {
@@ -1745,6 +1746,46 @@ func snRemountedConversationSummaries(
             continue
         }
         out[target] = remounted
+    }
+    // `conversation_summaries()` hides folded hist. A later live-only
+    // probe (latestAt/count 0 after restore-without-copy_summary) must
+    // not drop the previous hist newest. Empty success still clears.
+    // Compose `remountFoldedSummaryIndex`.
+    guard !out.isEmpty else { return out }
+    for (historical, live) in historicalFolds {
+        guard !live.isEmpty, live != historical else { continue }
+        guard let hist = out[historical] ?? previous[historical] else { continue }
+        let histSecs = hist.latestAt.timeIntervalSince1970
+        guard histSecs > 0 || hist.messageCount > 0 else { continue }
+        if out[historical] == nil { out[historical] = hist }
+        if let liveSummary = out[live] {
+            let liveSecs = liveSummary.latestAt.timeIntervalSince1970
+            if histSecs > liveSecs ||
+                (liveSecs <= 0 && hist.messageCount > liveSummary.messageCount)
+            {
+                out[live] = MarmotService.ConversationSummary(
+                    groupIdHex: live,
+                    name: liveSummary.name,
+                    latestContent: hist.latestContent,
+                    latestSenderNpub: hist.latestSenderNpub,
+                    latestAt: hist.latestAt,
+                    latestMine: hist.latestMine,
+                    messageCount: max(liveSummary.messageCount, hist.messageCount),
+                    unreadCount: liveSummary.unreadCount
+                )
+            }
+        } else if live.isEmpty == false {
+            out[live] = MarmotService.ConversationSummary(
+                groupIdHex: live,
+                name: hist.name,
+                latestContent: hist.latestContent,
+                latestSenderNpub: hist.latestSenderNpub,
+                latestAt: hist.latestAt,
+                latestMine: hist.latestMine,
+                messageCount: hist.messageCount,
+                unreadCount: 0
+            )
+        }
     }
     return out
 }

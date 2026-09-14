@@ -1480,6 +1480,14 @@ Max remounted snapshot timestamps with index `latestAt` via
 `snExpectedNewestTsForChat`. Pin:
 `SonarConversationFoldTests` (`snExpectedNewestTsForChat` + retire).
 
+Compose summary-index caches replaced on every successful probe.
+`conversation_summaries()` hides folded hist, so a later live-only
+row (`latest_at` / `message_count` 0 after restore-without-`copy_summary`)
+dropped hist=50 and sank the recovered home row / skipped blank
+recovery again. Remount previous fold-family values onto live; empty
+success still clears. Pin: same
+`failedSummariesProbeKeepsHistMessageCountForBlankRecovery`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

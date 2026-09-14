@@ -760,6 +760,27 @@ internal fun blankTranscriptKnownNonEmpty(
     (latestByChat[id] ?: 0L) > 0L || (messageCountByChat[id] ?: 0L) > 0L
 }
 
+/** Keep fold-family hist keys that `conversation_summaries()` hides after
+ *  remount. A successful live-only probe (live `latest_at` / `message_count`
+ *  0 after restore-without-`copy_summary`) used to replace the cache and
+ *  drop hist=50. Empty success still clears. Failed probe keeps [previous]. */
+internal fun remountFoldedSummaryIndex(
+    next: Map<String, Long>,
+    previous: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Map<String, Long> {
+    if (next.isEmpty() || historicalFolds.isEmpty()) return next
+    var out = next
+    for ((historical, live) in historicalFolds) {
+        if (live.isBlank() || live == historical) continue
+        val histValue = maxOf(out[historical] ?: 0L, previous[historical] ?: 0L)
+        if (histValue <= 0L) continue
+        if (out[historical] != histValue) out = out + (historical to histValue)
+        if (histValue > (out[live] ?: 0L)) out = out + (live to histValue)
+    }
+    return out
+}
+
 /** Index `message_count` from the last successful summaries probe.
  *  A failed probe (`null`) keeps [previous] so blank-transcript recovery
  *  can still see a recovered 0.8 hist count. Empty success clears.
@@ -767,9 +788,14 @@ internal fun blankTranscriptKnownNonEmpty(
 internal fun conversationMessageCountsFromSummaries(
     summaries: List<SonarConversationSummary>?,
     previous: Map<String, Long>,
+    historicalFolds: Map<String, String> = emptyMap(),
 ): Map<String, Long> {
     if (summaries == null) return previous
-    return summaries.associate { it.groupIdHex to it.messageCount }
+    return remountFoldedSummaryIndex(
+        summaries.associate { it.groupIdHex to it.messageCount },
+        previous,
+        historicalFolds,
+    )
 }
 
 /** Index `latest_at` from the last successful summaries probe.
@@ -778,9 +804,14 @@ internal fun conversationMessageCountsFromSummaries(
 internal fun conversationLatestAtFromSummaries(
     summaries: List<SonarConversationSummary>?,
     previous: Map<String, Long>,
+    historicalFolds: Map<String, String> = emptyMap(),
 ): Map<String, Long> {
     if (summaries == null) return previous
-    return summaries.associate { it.groupIdHex to it.latestAtSecs }
+    return remountFoldedSummaryIndex(
+        summaries.associate { it.groupIdHex to it.latestAtSecs },
+        previous,
+        historicalFolds,
+    )
 }
 
 /** Newest known timestamp across snapshot + remounted index latest.
@@ -2601,10 +2632,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         conversationMessageCountByChat = conversationMessageCountsFromSummaries(
             summaries,
             conversationMessageCountByChat,
+            historicalFoldMap,
         )
         conversationLatestAtByChat = conversationLatestAtFromSummaries(
             summaries,
             conversationLatestAtByChat,
+            historicalFoldMap,
         )
     }
 
