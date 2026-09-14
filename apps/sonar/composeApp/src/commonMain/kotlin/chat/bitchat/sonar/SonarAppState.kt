@@ -7650,16 +7650,23 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Seed the White Noise leg from the cached snapshot so the restored
             // paint is already complete (see openDm) — otherwise back-revealing
             // a mesh chat repeats the BLE-tail-then-jump on every navigation.
-            val wnSnapshot = meshWhiteNoiseSeed(chat.id)
-            val seedPaint = visibleMessagesForChat(
+            // Walk the remounted 0.8 family and seed the source window so
+            // Back cannot drop recovered rows or disable load-older.
+            val familySnapshot = mergeAllTranscriptRows(
+                refreshMeshTranscriptWindow(peerId) + meshWhiteNoiseSeed(chat.id),
+            )
+            for (groupId in transcriptGroupIds(chat.id)) {
+                seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
+            }
+            seedFoldFamilyTranscriptWindows(chat.id, familySnapshot)
+            val union = firstOpenTranscriptPaint(chat.id, familySnapshot)
+            messages = visibleMessagesForChat(
                 chat.id,
-                refreshConversationRows(
-                    refreshMeshTranscriptWindow(peerId) + wnSnapshot,
+                withSendEchoes(
                     chat.id,
-                    generation,
+                    refreshConversationRows(union, chat.id, generation),
                 ),
             )
-            messages = firstOpenTranscriptPaint(chat.id, seedPaint)
             retainOpenTranscript(chat.id, messages)
             warmOpenTranscriptThumbs(messages)
             scope.launch {
@@ -7675,14 +7682,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val snapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
         seedFoldFamilyTranscriptWindows(chat.id, snapshot)
-        val snapshotPaint = visibleMessagesForChat(
+        val union = firstOpenTranscriptPaint(chat.id, snapshot)
+        messages = visibleMessagesForChat(
             chat.id,
             withSendEchoes(
                 chat.id,
-                refreshConversationRows(snapshot, chat.id, generation),
+                refreshConversationRows(union, chat.id, generation),
             ),
         )
-        messages = firstOpenTranscriptPaint(chat.id, snapshotPaint)
         retainOpenTranscript(chat.id, messages)
         warmOpenTranscriptThumbs(messages)
         scope.launch {
