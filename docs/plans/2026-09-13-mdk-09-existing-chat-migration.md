@@ -1352,8 +1352,12 @@ throws; hosts skip unread publish when the probe is nil
 (`SNUnreadCounts.shouldPublish` / Compose `shouldApplyUnreadCounts`).
 Empty success still clears stale dots. Pin:
 `ConversationFoldTest.closedNodeInviteProbeDoesNotClearCachedWelcomes`
-(`shouldApplyUnreadCounts`),
+(`shouldApplyUnreadCounts` / `pendingJoinRequestsOrCached`),
 `SNUnreadCountsTests.failedSummariesProbeDoesNotPublishUnread`.
+Compose `loadPendingJoinRequests` used to `onResult(emptyList())` on a
+closed-node throw and wiped recovered hist join requests from group-info.
+It now keeps the painted list (`pendingJoinRequestsOrCached`). iOS already
+keeps the list on `catch`.
 
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.

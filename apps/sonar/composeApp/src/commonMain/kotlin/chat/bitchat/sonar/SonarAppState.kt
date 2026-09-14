@@ -1401,6 +1401,12 @@ internal fun pendingInvitesOrCached(
     cached: List<SonarGroupInvite>,
 ): List<SonarGroupInvite> = loaded ?: cached
 
+/** A failed join-request probe must not clear recovered pending members. */
+internal fun pendingJoinRequestsOrCached(
+    loaded: List<SonarJoinRequest>?,
+    cached: List<SonarJoinRequest>,
+): List<SonarJoinRequest> = loaded ?: cached
+
 internal fun collapsedFoldedSnapshotChats(
     chats: List<SonarChat>,
     historicalFolds: Map<String, String>,
@@ -12433,18 +12439,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    fun loadPendingJoinRequests(chatId: String, onResult: (List<SonarJoinRequest>) -> Unit) {
+    fun loadPendingJoinRequests(
+        chatId: String,
+        cached: List<SonarJoinRequest> = emptyList(),
+        onResult: (List<SonarJoinRequest>) -> Unit,
+    ) {
         if (!canManageGroup(chatId)) {
             onResult(emptyList())
             return
         }
         scope.launch {
-            try {
-                onResult(SonarCore.pendingJoinRequests(chatId))
-            } catch (e: Throwable) {
-                toast = "couldn't load join requests: ${e.message}"
-                onResult(emptyList())
-            }
+            val loaded = runCatching { SonarCore.pendingJoinRequests(chatId) }
+                .onFailure { toast = "couldn't load join requests: ${it.message}" }
+                .getOrNull()
+            onResult(pendingJoinRequestsOrCached(loaded, cached))
         }
     }
 

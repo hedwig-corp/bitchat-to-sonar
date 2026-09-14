@@ -2504,6 +2504,18 @@ class ConversationFoldTest {
         )
         assertFalse(shouldApplyUnreadCounts(null))
         assertTrue(shouldApplyUnreadCounts(emptyList()))
+        val cachedRequests = listOf(
+            SonarJoinRequest(
+                requesterNpub = "npub1joiner",
+                groupId = "group-08",
+                receivedAt = 1_700_000_000L,
+            ),
+        )
+        assertEquals(cachedRequests, pendingJoinRequestsOrCached(loaded = null, cached = cachedRequests))
+        assertEquals(
+            emptyList(),
+            pendingJoinRequestsOrCached(loaded = emptyList(), cached = cachedRequests),
+        )
     }
 
     @Test

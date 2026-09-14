@@ -76,7 +76,7 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     var approvingJoinRequests by remember(chatId) { mutableStateOf<Set<String>>(emptySet()) }
     val clipboard = LocalClipboardManager.current
     fun refreshPendingJoinRequests() {
-        state.loadPendingJoinRequests(chatId) { pendingJoinRequests = it }
+        state.loadPendingJoinRequests(chatId, pendingJoinRequests) { pendingJoinRequests = it }
     }
     LaunchedEffect(chatId, state.groupInfoPendingRevision) { refreshPendingJoinRequests() }
 
