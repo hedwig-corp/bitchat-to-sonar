@@ -1340,6 +1340,26 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == "group-08"
         )
+        #expect(snConversationOpenShouldMergeFolds(
+            openId: "marmot:group-08",
+            incomingId: "marmot:group-09",
+            persistedFolds: [:]
+        ))
+        #expect(!snConversationOpenShouldMergeFolds(
+            openId: "marmot:group-08",
+            incomingId: "marmot:group-09",
+            persistedFolds: ["group-08": "group-09"]
+        ))
+        #expect(!snConversationOpenShouldMergeFolds(
+            openId: "marmot:group-08",
+            incomingId: "marmot:group-08",
+            persistedFolds: [:]
+        ))
+        #expect(!snConversationOpenShouldMergeFolds(
+            openId: "marmot:group-09",
+            incomingId: "marmot:other",
+            persistedFolds: ["group-08": "group-09"]
+        ))
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

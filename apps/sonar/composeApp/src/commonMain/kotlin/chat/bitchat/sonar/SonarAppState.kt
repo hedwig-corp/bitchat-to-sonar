@@ -1792,6 +1792,22 @@ internal fun conversationRefreshShouldMergeFolds(
     persistedFolds: Map<String, String>,
 ): Boolean = changedIds.any { firstOpenShouldMergeFolds(it, persistedFolds) }
 
+/** Foreground APNs names the live sibling while the recovered 0.8 chat
+ *  is open and persist-folds is still empty. Merge FFI before
+ *  [isConversationOpen] or willPresent banners the chat the user is in.
+ *  iOS `snConversationOpenShouldMergeFolds`. */
+internal fun conversationOpenShouldMergeFolds(
+    openId: String,
+    incomingId: String,
+    persistedFolds: Map<String, String>,
+): Boolean {
+    val open = openId.removePrefix("marmot:").trim()
+    val incoming = incomingId.removePrefix("marmot:").trim()
+    if (open.isEmpty() || incoming.isEmpty() || open == incoming) return false
+    if (conversationsMatchFoldFamily(open, incoming, persistedFolds)) return false
+    return firstOpenShouldMergeFolds(open, persistedFolds)
+}
+
 /** Viewing the recovered 0.8 id must still mark-read a live sibling
  *  change. Empty persist-folds cannot match; merge first.
  *  iOS `snViewingConversationShouldMarkRead`. */

@@ -1589,6 +1589,24 @@ func snConversationRefreshShouldMergeFolds(
     changedGroupIds.contains { snFirstOpenShouldMergeFolds(seedId: $0, persistedFolds: persistedFolds) }
 }
 
+/// Foreground APNs names the live sibling while the recovered 0.8 chat
+/// is open and persist-folds is still empty. Merge FFI before
+/// `isConversationOpen` or `willPresent` banners the chat the user is in.
+/// Compose `conversationOpenShouldMergeFolds`.
+func snConversationOpenShouldMergeFolds(
+    openId: String,
+    incomingId: String,
+    persistedFolds: [String: String]
+) -> Bool {
+    let open = snBareMarmotGroupId(openId)
+    let incoming = snBareMarmotGroupId(incomingId)
+    if open.isEmpty || incoming.isEmpty || open == incoming { return false }
+    if snConversationsMatchFoldFamily(left: open, right: incoming, historicalFolds: persistedFolds) {
+        return false
+    }
+    return snFirstOpenShouldMergeFolds(seedId: open, persistedFolds: persistedFolds)
+}
+
 /// Viewing the recovered 0.8 id must still mark-read a live sibling
 /// change. Empty persist-folds cannot match; merge first.
 /// Compose `viewingConversationShouldMarkRead`.
@@ -13437,6 +13455,21 @@ final class SonarAppStore: ObservableObject {
     func isConversationOpen(_ conversationId: String) -> Bool {
         guard let openId = currentDMId else { return false }
         return conversationsMatchForNotification(openId, conversationId)
+    }
+
+    /// `willPresent` is already async. Merge FFI when the open recovered
+    /// chat has no persist family so a live-sibling push does not banner.
+    func shouldSuppressForegroundNotification(_ conversationId: String) async -> Bool {
+        guard let openId = currentDMId else { return false }
+        let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        if snConversationOpenShouldMergeFolds(
+            openId: openId,
+            incomingId: conversationId,
+            persistedFolds: blob
+        ) {
+            _ = await adoptMergedActionFolds(for: [openId, conversationId])
+        }
+        return isConversationOpen(conversationId)
     }
 
     /// Open a conversation from a notification tap (local or private-message).

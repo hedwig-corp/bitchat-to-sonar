@@ -496,7 +496,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
         if let conversationId = SonarNotificationHandoff.conversationId(from: userInfo) {
             Task { @MainActor in
-                if self.sonarStore?.isConversationOpen(conversationId) == true ||
+                if await self.sonarStore?.shouldSuppressForegroundNotification(conversationId) == true ||
                     self.chatViewModel?.selectedPrivateChatPeer == PeerID(str: conversationId) {
                     // Already viewing this chat — consume rather than banner.
                     NotificationService.shared.clearNotifications(

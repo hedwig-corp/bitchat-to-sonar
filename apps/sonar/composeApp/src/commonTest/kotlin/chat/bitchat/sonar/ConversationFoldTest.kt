@@ -1029,6 +1029,41 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foregroundOpenChatMergesFoldsBeforeLiveSiblingBanner() {
+        val folds = mapOf("group-08" to "group-09")
+        // Viewing recovered hist; APNs names live; persist-folds empty.
+        assertTrue(
+            conversationOpenShouldMergeFolds(
+                openId = "marmot:group-08",
+                incomingId = "marmot:group-09",
+                persistedFolds = emptyMap(),
+            ),
+        )
+        assertFalse(
+            conversationOpenShouldMergeFolds(
+                openId = "marmot:group-08",
+                incomingId = "marmot:group-09",
+                persistedFolds = folds,
+            ),
+        )
+        assertFalse(
+            conversationOpenShouldMergeFolds(
+                openId = "marmot:group-08",
+                incomingId = "marmot:group-08",
+                persistedFolds = emptyMap(),
+            ),
+        )
+        // Already sitting on a folded live row — do not FFI every other chat.
+        assertFalse(
+            conversationOpenShouldMergeFolds(
+                openId = "marmot:group-09",
+                incomingId = "marmot:other",
+                persistedFolds = folds,
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(
