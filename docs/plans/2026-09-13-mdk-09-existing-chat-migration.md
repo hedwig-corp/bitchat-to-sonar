@@ -612,6 +612,11 @@ tap onto the live sibling even before that id is listed),
 (also pins `marmotChatDisplayTitle`: a named room with one listed peer
 keeps the room name; the 1:1 profile path is `isDirect` only. iOS
 `snMarmotChatDisplayTitle` / `MarmotChatModel.title(for:)` match),
+`ConversationFoldTest.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`
+(in-memory `SonarChat` / `MarmotGroup` default is **not-direct**, matching
+snapshot decode, so an omitted flag on an empty-topic 2-person room
+cannot fold onto the welcomer 1:1; iOS
+`MarmotProfileCacheTests.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`),
 `ConversationFoldTest.recoveredChatWaitsForPeerUpdateUntilLiveSiblingExists`
 (`recoveredChatHasLiveFoldSibling` + `remountClearsRecoveredWaitingFlag`),
 `SonarConversationFoldTests` (`snRecoveredChatHasLiveFoldSibling` +
@@ -1305,7 +1310,12 @@ Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-s
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
 now persists `isDirect`. A missing 6th field / Codable key defaults
 not-direct so a recovered room stays visible on the first-upgrade paint.
+In-memory constructors (`SonarChat.isDirect`, `MarmotGroup.init`) match
+that decode default — DMs opt in — so a remounted empty-topic room
+cannot fold onto the welcomer 1:1 if a host constructor omits the flag.
 Pins: `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`,
 `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`,
+`ConversationFoldTest.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`,
 `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`,
-`MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`.
+`MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`,
+`MarmotProfileCacheTests.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`.

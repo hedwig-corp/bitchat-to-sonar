@@ -3759,7 +3759,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val npubHex = canonicalNpubHex(peerNpub) ?: return@mapNotNull null
             if (marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) != null) return@mapNotNull null
             if (socialState.isBlockedNostr(npubHex)) return@mapNotNull null
-            SonarChat(id = id, name = "", members = listOf(npub, peerNpub))
+            SonarChat(id = id, name = "", members = listOf(npub, peerNpub), isDirect = true)
         }
 
     /** Creation time for a pending secure chat/group, used as the Home-list
@@ -8579,7 +8579,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         if (refreshFirst) refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
-            ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
+            ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub), isDirect = true)
         moveSendEchoes(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {
@@ -13392,7 +13392,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      * version of this test passed while the bug was fully restorable.
      */
     internal fun seedCallableChatForTest(chatId: String, peerNpub: String, descriptor: SonarDescriptor) {
-        chats = listOf(SonarChat(id = chatId, name = "Peer", members = listOf(peerNpub, npub)))
+        chats = listOf(SonarChat(id = chatId, name = "Peer", members = listOf(peerNpub, npub), isDirect = true))
         // Keyed exactly the way the lookup keys it. Keying it by the bech32 npub
         // instead produced a fixture that silently had no route, which made the
         // capability assertion pass for the wrong reason. Loud rather than silent:

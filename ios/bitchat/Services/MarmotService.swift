@@ -85,7 +85,9 @@ final class MarmotService: @unchecked Sendable {
         /// Core-authored: false for rooms that currently list only one peer.
         var isDirect: Bool
 
-        init(id: String, name: String, memberNpubs: [String], isDirect: Bool = true) {
+        /// Default false so an omitted flag cannot fold a remounted room
+        /// onto a 1:1 (R-045). Snapshot decode matches.
+        init(id: String, name: String, memberNpubs: [String], isDirect: Bool = false) {
             self.id = id
             self.name = name
             self.memberNpubs = memberNpubs

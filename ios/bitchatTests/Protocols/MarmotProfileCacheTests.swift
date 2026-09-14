@@ -191,8 +191,8 @@ struct MarmotProfileCacheTests {
         let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
         let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
         let peerHex = peerRaw.map { String(format: "%02x", $0) }.joined()
-        let first = MarmotService.MarmotGroup(id: "group-a", name: "", memberNpubs: [ownNpub, peerHex])
-        let second = MarmotService.MarmotGroup(id: "group-b", name: "", memberNpubs: [ownNpub, peerNpub])
+        let first = MarmotService.MarmotGroup(id: "group-a", name: "", memberNpubs: [ownNpub, peerHex], isDirect: true)
+        let second = MarmotService.MarmotGroup(id: "group-b", name: "", memberNpubs: [ownNpub, peerNpub], isDirect: true)
         let room = MarmotService.MarmotGroup(id: "room", name: "", memberNpubs: [ownNpub, peerNpub, "npub1third"])
 
         let grouped = snCanonicalDirectMarmotGroups([first, second, room], ownNpub: ownNpub)
@@ -207,7 +207,7 @@ struct MarmotProfileCacheTests {
         let peerRaw = Data(repeating: 2, count: 32)
         let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
         let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
-        let dm = MarmotService.MarmotGroup(id: "bob-dm", name: "bob dm", memberNpubs: [ownNpub, peerNpub])
+        let dm = MarmotService.MarmotGroup(id: "bob-dm", name: "bob dm", memberNpubs: [ownNpub, peerNpub], isDirect: true)
         let pendingRoom = MarmotService.MarmotGroup(
             id: "pending-room",
             name: "pending room",
@@ -230,6 +230,40 @@ struct MarmotProfileCacheTests {
                 profileName: "Bob",
                 npubFallback: "npub1bob…"
             ) == "pending room"
+        )
+    }
+
+    @Test
+    func emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm() throws {
+        let ownRaw = Data(repeating: 1, count: 32)
+        let peerRaw = Data(repeating: 2, count: 32)
+        let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
+        let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
+        let dm = MarmotService.MarmotGroup(id: "bob-dm", name: "bob dm", memberNpubs: [ownNpub, peerNpub], isDirect: true)
+        // Live sibling after an empty-topic 3-person resume: two MLS members,
+        // empty name. FFI reports isDirect=false. Omitting the host flag
+        // must stay a room — the in-memory default used to be true (R-045).
+        let resumedRoom = MarmotService.MarmotGroup(
+            id: "empty-topic-live",
+            name: "",
+            memberNpubs: [ownNpub, peerNpub]
+        )
+
+        let grouped = snCanonicalDirectMarmotGroups([dm, resumedRoom], ownNpub: ownNpub)
+
+        #expect(snDirectMarmotPeerKey(for: resumedRoom, ownNpub: ownNpub) == nil)
+        #expect(snDirectMarmotPeerKey(for: dm, ownNpub: ownNpub) == peerNpub)
+        #expect(grouped[peerNpub]?.map(\.id) == ["bob-dm"])
+        #expect(snMarmotTreatsAsGroupChat(resumedRoom))
+        #expect(!snMarmotTreatsAsGroupChat(dm))
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: resumedRoom.isDirect,
+                name: resumedRoom.name,
+                otherMemberCount: 1,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "Group chat"
         )
     }
 

@@ -23,9 +23,9 @@ struct SonarConversationRegressionSmokeTests {
         let sara = npub(2)
         let vincenzo = npub(3)
         let groups = [
-            MarmotService.MarmotGroup(id: "sara-old", name: "", memberNpubs: [own, sara]),
-            MarmotService.MarmotGroup(id: "vincenzo", name: "", memberNpubs: [own, vincenzo]),
-            MarmotService.MarmotGroup(id: "sara-new", name: "", memberNpubs: [own, sara]),
+            MarmotService.MarmotGroup(id: "sara-old", name: "", memberNpubs: [own, sara], isDirect: true),
+            MarmotService.MarmotGroup(id: "vincenzo", name: "", memberNpubs: [own, vincenzo], isDirect: true),
+            MarmotService.MarmotGroup(id: "sara-new", name: "", memberNpubs: [own, sara], isDirect: true),
         ]
 
         let grouped = snCanonicalDirectMarmotGroups(groups, ownNpub: own)

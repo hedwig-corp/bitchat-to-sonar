@@ -281,8 +281,8 @@ class ConversationFoldTest {
 
     @Test
     fun chatSnapshotKeepsRowsWithoutPersistingMessages() {
-        val newest = SonarChat("group-z", "", listOf("npub1sara", "npub1me"))
-        val older = SonarChat("group-a", "", listOf("npub1bob", "npub1me"))
+        val newest = SonarChat("group-z", "", listOf("npub1sara", "npub1me"), isDirect = true)
+        val older = SonarChat("group-a", "", listOf("npub1bob", "npub1me"), isDirect = true)
         val messages = listOf(
             SonarMsg(
                 id = "msg-1",
@@ -315,7 +315,7 @@ class ConversationFoldTest {
         val peerRaw = ByteArray(32) { 2 }
         val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
         val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
-        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf(ownNpub, peerNpub))
+        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf(ownNpub, peerNpub), isDirect = true)
         val pendingRoom = SonarChat(
             id = "pending-room",
             name = "pending room",
@@ -394,7 +394,7 @@ class ConversationFoldTest {
 
     @Test
     fun modernSnapshotDoesNotNeedStartupRewrite() {
-        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf("npub1me", "npub1bob"))
+        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf("npub1me", "npub1bob"), isDirect = true)
         val room = SonarChat(
             id = "pending-room",
             name = "pending room",
@@ -415,7 +415,7 @@ class ConversationFoldTest {
         val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
         val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
         val peerHex = peerRaw.joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
-        val chat = SonarChat(id = "group-a", name = "", members = listOf(ownNpub, peerHex))
+        val chat = SonarChat(id = "group-a", name = "", members = listOf(ownNpub, peerHex), isDirect = true)
 
         assertEquals(peerNpub, directMarmotPeerKey(chat, ownNpub))
     }
@@ -427,8 +427,8 @@ class ConversationFoldTest {
         val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
         val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
         val peerHex = peerRaw.joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }
-        val older = SonarChat(id = "group-old", name = "", members = listOf(ownNpub, peerNpub))
-        val newer = SonarChat(id = "group-new", name = "", members = listOf(ownNpub, peerHex))
+        val older = SonarChat(id = "group-old", name = "", members = listOf(ownNpub, peerNpub), isDirect = true)
+        val newer = SonarChat(id = "group-new", name = "", members = listOf(ownNpub, peerHex), isDirect = true)
         val room = SonarChat(id = "group-room", name = "room", members = listOf(ownNpub, peerNpub, "npub1third"))
 
         val visible = dedupeDirectMarmotChats(
@@ -446,8 +446,8 @@ class ConversationFoldTest {
         val peerRaw = ByteArray(32) { 2 }
         val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
         val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
-        val historical = SonarChat(id = "group-08", name = "alice & bob", members = listOf(ownNpub, peerNpub))
-        val live = SonarChat(id = "group-09", name = "alice & bob", members = listOf(ownNpub, peerNpub))
+        val historical = SonarChat(id = "group-08", name = "alice & bob", members = listOf(ownNpub, peerNpub), isDirect = true)
+        val live = SonarChat(id = "group-09", name = "alice & bob", members = listOf(ownNpub, peerNpub), isDirect = true)
 
         val visible = dedupeDirectMarmotChats(
             chats = listOf(historical, live),
@@ -1754,8 +1754,8 @@ class ConversationFoldTest {
         )
         val ownNpub = "npub1me"
         val peerNpub = "npub1peer"
-        val remounted = SonarChat(id = "group-09", name = "", members = listOf(ownNpub, peerNpub))
-        val otherLive = SonarChat(id = "group-10", name = "", members = listOf(ownNpub, peerNpub))
+        val remounted = SonarChat(id = "group-09", name = "", members = listOf(ownNpub, peerNpub), isDirect = true)
+        val otherLive = SonarChat(id = "group-10", name = "", members = listOf(ownNpub, peerNpub), isDirect = true)
         val latest = { id: String ->
             localLatestTsForChat(
                 chatId = id,
@@ -2576,7 +2576,7 @@ class ConversationFoldTest {
         val peerRaw = ByteArray(32) { 2 }
         val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
         val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
-        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf(ownNpub, peerNpub))
+        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf(ownNpub, peerNpub), isDirect = true)
         val pendingRoom = SonarChat(
             id = "pending-room",
             name = "pending room",
@@ -2635,6 +2635,45 @@ class ConversationFoldTest {
                 isDirect = false,
                 name = "",
                 otherMemberCount = 2,
+                profileName = "Bob",
+                npubFallback = "npub1bob…",
+            ),
+        )
+    }
+
+    @Test
+    fun emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
+        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf(ownNpub, peerNpub), isDirect = true)
+        // Live sibling after an empty-topic 3-person resume: two MLS members,
+        // empty name. FFI reports is_direct=false. Omitting the host flag
+        // must stay a room — the in-memory default used to be true (R-045).
+        val resumedRoom = SonarChat(
+            id = "empty-topic-live",
+            name = "",
+            members = listOf(ownNpub, peerNpub),
+        )
+
+        val visible = dedupeDirectMarmotChats(
+            chats = listOf(dm, resumedRoom),
+            ownNpub = ownNpub,
+            latestSecs = { if (it == dm.id) 2L else 1L },
+        )
+
+        assertEquals(listOf(dm, resumedRoom), visible)
+        assertEquals(null, directMarmotPeerKey(resumedRoom, ownNpub))
+        assertEquals(peerNpub, directMarmotPeerKey(dm, ownNpub))
+        assertEquals(dm.id, directMarmotChatIdForPeer(listOf(resumedRoom, dm), ownNpub, peerNpub))
+        assertEquals(null, marmotNotificationGroupName(resumedRoom))
+        assertEquals(
+            "Group chat",
+            marmotChatDisplayTitle(
+                isDirect = resumedRoom.isDirect,
+                name = resumedRoom.name,
+                otherMemberCount = 1,
                 profileName = "Bob",
                 npubFallback = "npub1bob…",
             ),
