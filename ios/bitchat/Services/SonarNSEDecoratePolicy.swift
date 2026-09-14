@@ -103,6 +103,10 @@ enum SonarNSEDecoratePolicy {
     /// `SonarChatMuteStore` as write-through; JSON-encoded `[String: Date]`).
     /// Single declaration — `SonarChatMuteStore.defaultsKey` aliases this.
     static let mutesUserDefaultsKey = "sonar.chat.mutes.v1"
+    /// App Group mirror of host `sonar.historicalFolds.v1` so a muted 0.8
+    /// recovered chat still silences pushes that arrive on the live 0.9 id
+    /// before (or without) a foreground mute promotion.
+    static let historicalFoldsUserDefaultsKey = "sonar.historicalFolds.v1"
 
     /// Equivalent lookup keys for one raw conversation key, so the check
     /// works whichever id shape a path carries (see docs/CHAT-TYPES.md):
@@ -135,14 +139,37 @@ enum SonarNSEDecoratePolicy {
     /// Directness is judged with `meaningfulGroupName`, not `.isEmpty`,
     /// because `enrichEmptyContentPreviews` can backfill a DM with the
     /// "Sonar agent DM" placeholder.
+    static func foldFamilyIds(id: String, historicalFolds: [String: String]) -> Set<String> {
+        guard !id.isEmpty else { return [] }
+        let live = historicalFolds[id]
+            ?? historicalFolds.first(where: { $0.value == id })?.value
+            ?? id
+        var family: Set<String> = [id, live]
+        for (historical, target) in historicalFolds {
+            if historical == id || target == id || historical == live || target == live {
+                family.insert(historical)
+                family.insert(target)
+            }
+        }
+        return family.filter { !$0.isEmpty }
+    }
+
+    static func decodeHistoricalFolds(_ defaults: UserDefaults?) -> [String: String] {
+        (defaults?.dictionary(forKey: historicalFoldsUserDefaultsKey) as? [String: String]) ?? [:]
+    }
+
     static func mutedLookupCandidates(
         groupIdHex: String,
         senderNpub: String,
-        groupName: String
+        groupName: String,
+        historicalFolds: [String: String] = [:]
     ) -> [String] {
         var keys: [String] = []
         if !groupIdHex.isEmpty {
             keys += normalizedMuteCandidates(groupIdHex)
+            for alias in foldFamilyIds(id: groupIdHex, historicalFolds: historicalFolds) {
+                keys += normalizedMuteCandidates(alias)
+            }
         }
         let isDirectChat = meaningfulGroupName(groupName) == nil
         if isDirectChat, !senderNpub.isEmpty {
@@ -176,13 +203,15 @@ enum SonarNSEDecoratePolicy {
         senderNpub: String,
         groupName: String,
         mutes: [String: Date],
-        now: Date
+        now: Date,
+        historicalFolds: [String: String] = [:]
     ) -> Bool {
         guard !mutes.isEmpty else { return false }
         return mutedLookupCandidates(
             groupIdHex: groupIdHex,
             senderNpub: senderNpub,
-            groupName: groupName
+            groupName: groupName,
+            historicalFolds: historicalFolds
         )
         .contains { key in (mutes[key] ?? .distantPast) > now }
     }
@@ -193,14 +222,16 @@ enum SonarNSEDecoratePolicy {
         senderNpub: String,
         groupName: String,
         mutesJSON: Data?,
-        now: Date
+        now: Date,
+        historicalFolds: [String: String] = [:]
     ) -> Bool {
         isMuted(
             groupIdHex: groupIdHex,
             senderNpub: senderNpub,
             groupName: groupName,
             mutes: decodeMutes(mutesJSON),
-            now: now
+            now: now,
+            historicalFolds: historicalFolds
         )
     }
 

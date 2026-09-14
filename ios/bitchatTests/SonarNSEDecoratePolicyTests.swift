@@ -263,6 +263,25 @@ struct SonarNSEDecoratePolicyTests {
         #expect(SonarNSEDecoratePolicy.isMuted(
             groupIdHex: gid, senderNpub: "npub1x", groupName: "friends", mutesJSON: byGroup, now: now
         ))
+        // Mute stored on the recovered 0.8 id must silence a live 0.9 push.
+        let historical = String(repeating: "11", count: 32)
+        let live = String(repeating: "22", count: 32)
+        let byHistorical = try JSONEncoder().encode([historical: active])
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: live,
+            senderNpub: "",
+            groupName: "standup",
+            mutesJSON: byHistorical,
+            now: now,
+            historicalFolds: [historical: live]
+        ))
+        #expect(!SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: live,
+            senderNpub: "",
+            groupName: "standup",
+            mutesJSON: byHistorical,
+            now: now
+        ))
         // 16-hex short-form store key matches too.
         let byShortForm = try JSONEncoder().encode([String(gid.prefix(16)): active])
         #expect(SonarNSEDecoratePolicy.isMuted(

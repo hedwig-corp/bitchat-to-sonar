@@ -190,17 +190,19 @@ class NotificationService: SDKNotificationService {
                 // muted rows stay row-only — no banner, no sound — matching
                 // the silence table in docs/SONAR-TRILL.md. Decode the mirror
                 // once for the whole drain, not once per row.
+                let sharedDefaults = UserDefaults(suiteName: Self.appGroupId)
                 let mutes = SonarNSEDecoratePolicy.decodeMutes(
-                    UserDefaults(suiteName: Self.appGroupId)?
-                        .data(forKey: SonarNSEDecoratePolicy.mutesUserDefaultsKey)
+                    sharedDefaults?.data(forKey: SonarNSEDecoratePolicy.mutesUserDefaultsKey)
                 )
+                let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(sharedDefaults)
                 let unmuted = notifications.filter {
                     !SonarNSEDecoratePolicy.isMuted(
                         groupIdHex: $0.groupIdHex,
                         senderNpub: $0.senderNpub,
                         groupName: $0.groupName,
                         mutes: mutes,
-                        now: Date()
+                        now: Date(),
+                        historicalFolds: folds
                     )
                 }
                 if unmuted.isEmpty {

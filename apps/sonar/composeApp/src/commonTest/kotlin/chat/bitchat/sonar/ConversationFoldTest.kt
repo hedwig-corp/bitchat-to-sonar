@@ -595,6 +595,13 @@ class ConversationFoldTest {
                 liveFoldTarget = folds::get,
             ),
         )
+        assertEquals(
+            mapOf("group-08" to 50L, "group-09" to 50L),
+            promotedFoldedMutesFromFolds(
+                mutes = mapOf("group-08" to 50L),
+                historicalFolds = folds,
+            ),
+        )
     }
 
     @Test

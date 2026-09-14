@@ -3512,6 +3512,7 @@ final class SonarAppStore: ObservableObject {
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
         defaults.removeObject(forKey: Keys.historicalFolds)
+        UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
@@ -7628,6 +7629,38 @@ final class SonarAppStore: ObservableObject {
         if changed {
             defaults.set(map, forKey: Keys.historicalFolds)
         }
+        if let shared = UserDefaults(suiteName: Self.appGroupId) {
+            shared.set(map, forKey: Keys.historicalFolds)
+        }
+        promoteMutesFromHistoricalFolds(map)
+    }
+
+    /// A mute stored on the recovered 0.8 id must also cover the live 0.9
+    /// sibling so killed-app NSE / push can match before the next refresh.
+    @MainActor
+    private func promoteMutesFromHistoricalFolds(_ folds: [String: String]) {
+        guard !folds.isEmpty else { return }
+        var changed = false
+        for (historical, live) in folds {
+            guard !live.isEmpty, live != historical else { continue }
+            let historicalKeys = [historical, Self.marmotIDPrefix + historical]
+            guard let until = SonarChatMuteStore.shared.muteEnd(anyOf: historicalKeys) else {
+                continue
+            }
+            let liveId = Self.marmotIDPrefix + live
+            let liveUntil = SonarChatMuteStore.shared.muteEnd(anyOf: muteKeys(forChatId: liveId))
+            if liveUntil == nil || liveUntil! < until {
+                SonarChatMuteStore.shared.mute(
+                    keys: muteKeys(forChatId: liveId),
+                    until: until
+                )
+                changed = true
+            }
+        }
+        if changed {
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
     }
 
     /// Copy persisted call-log rows from a hidden 0.8 id onto the live sibling.
@@ -10278,6 +10311,14 @@ final class SonarAppStore: ObservableObject {
         for alias in meshPeerAliases(for: id) {
             keys.insert(alias)
         }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let bareId = id.hasPrefix(Self.marmotIDPrefix)
+            ? String(id.dropFirst(Self.marmotIDPrefix.count))
+            : id
+        for alias in snFoldFamilyIds(id: bareId, historicalFolds: folds) {
+            keys.insert(alias)
+            keys.insert(Self.marmotIDPrefix + alias)
+        }
         for group in localTranscriptGroups(for: id) where !group.id.isEmpty {
             keys.insert(group.id)
             keys.insert(Self.marmotIDPrefix + group.id)
@@ -11451,6 +11492,7 @@ final class SonarAppStore: ObservableObject {
         clearMarmotConversationGroups()
         marmot.groups = []
         defaults.removeObject(forKey: Keys.historicalFolds)
+        UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         applyBLEDiscoveryPolicy()
         publishedBolt12Offer = nil
@@ -11533,6 +11575,7 @@ final class SonarAppStore: ObservableObject {
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
         defaults.removeObject(forKey: Keys.historicalFolds)
+        UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).

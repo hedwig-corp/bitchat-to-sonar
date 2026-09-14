@@ -432,14 +432,21 @@ probes cannot keep a deleted recovered chat. Ingest after Leave
 (`store_chat` / `persist_session_effects` / drain `Incoming::Message`)
 also skips dropped ids so relay replay of an old kind-445 cannot rewrite
 the transcript, reindex the home row, or toast a chat the user already
-left. Pins:
+left. `purge_fold_family` also drops parked invites for that family, and
+`park_invite` / welcome ingest refuse a dropped MLS id so a declined or
+left room cannot reappear as "Group chat · invite". Hosts persist
+hist→live bindings into the App Group mute path so a muted recovered
+chat stays silent when the next push names the live 0.9 id. Pins:
 `mdk08_migrate::remainder_page_skips_omitted_groups`,
 `mdk08_migrate::backfill_skips_dropped_groups`,
 `persistence::delete_then_remainder_does_not_restore_transcript`,
 `marmot::historical_fold_tests::delete_live_group_forgets_historical_name_sidecar`,
 `marmot::historical_fold_tests::store_chat_skips_dropped_groups`,
 `marmot::historical_fold_tests::reopen_omits_dropped_transcript_rows`,
+`marmot::historical_fold_tests::purge_fold_family_clears_parked_invites`,
+`marmot::historical_fold_tests::park_invite_skips_dropped_groups`,
 `client::tests::conversation_summaries_omit_and_heal_dropped_groups`,
+`client::tests::send_text_rejects_dropped_group`,
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
 `snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no
@@ -473,11 +480,11 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after the ingest-after-Leave dropped-group skip.
+Re-run on this cloud agent after parked-invite purge and fold-aware mute.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 175 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 178 passed |
 | `--test persistence` | 30 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |

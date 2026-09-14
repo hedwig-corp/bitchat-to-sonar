@@ -1,7 +1,10 @@
 package chat.bitchat.sonar.push
 
+import chat.bitchat.sonar.HISTORICAL_FOLDS_BLOB_KEY
 import chat.bitchat.sonar.MUTE_BLOB_KEY
 import chat.bitchat.sonar.Notifier
+import chat.bitchat.sonar.decodeGroupFoldMap
+import chat.bitchat.sonar.foldFamilyIds
 import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
@@ -65,14 +68,20 @@ internal object SonarWakeNotifications {
 
         // Per-chat mute is honored on the killed-app drain too: rows and unread
         // counts still accrued in local storage — only the banner is skipped.
-        // muteChat persists the whole folded-id set, so a direct group-id
-        // lookup is sufficient here.
+        // muteChat persists the folded-id set when the fold is already known.
+        // A mute taken on the recovered 0.8 id before resume still needs the
+        // hist→live blob: walk that family so a killed-app drain on the live
+        // id stays silent.
         val mutes = decodeMuteMap(SonarCore.loadBlob(MUTE_BLOB_KEY))
+        val folds = decodeGroupFoldMap(SonarCore.loadBlob(HISTORICAL_FOLDS_BLOB_KEY))
         val nowSecs = System.currentTimeMillis() / 1000
 
         var notified = 0
         for (summary in unread) {
-            if (isMutedAt(mutes[summary.groupIdHex], nowSecs)) continue
+            val muted = foldFamilyIds(summary.groupIdHex, folds)
+                .plus(summary.groupIdHex)
+                .any { isMutedAt(mutes[it], nowSecs) }
+            if (muted) continue
             val kind = SonarNotificationRouter.classifyContent(
                 summary.latestContent,
                 isCallControl = { SonarCore.callParseControl(it) != null },

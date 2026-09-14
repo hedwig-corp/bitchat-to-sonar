@@ -111,7 +111,7 @@ private const val PRESENCE_BEAT_MS = 60_000L
 /** Stale kind-0 profile sweep (was `tick % 450` ≈ every 30 min). */
 private const val PROFILE_SWEEP_MS = 30 * 60_000L
 private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
-private const val HISTORICAL_FOLDS_BLOB_KEY = "sonar.historicalFolds"
+internal const val HISTORICAL_FOLDS_BLOB_KEY = "sonar.historicalFolds"
 private const val VERIFIED_IDS_BLOB_KEY = "verified.ids"
 private const val NPUB_BLOB_KEY = "sonar.npub"
 private const val MESH_NAMES_BLOB_KEY = "sonar.meshNames"
@@ -564,6 +564,22 @@ internal fun historicalFoldsFromAliases(
 }
 
 /** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
+/** Copy a mute from every hidden 0.8 row onto its live sibling. */
+internal fun promotedFoldedMutesFromFolds(
+    mutes: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Map<String, Long> {
+    if (mutes.isEmpty() || historicalFolds.isEmpty()) return mutes
+    var next = mutes
+    for ((historical, live) in historicalFolds) {
+        if (live.isBlank() || live == historical) continue
+        val until = mutes[historical] ?: continue
+        val existing = next[live]
+        next = next + (live to maxOf(existing ?: until, until))
+    }
+    return next
+}
+
 internal fun promotedFoldedMutes(
     previousIds: Set<String>,
     currentIds: Set<String>,
@@ -1030,7 +1046,7 @@ internal data class VisibleChatsKey(
     val holdVersion: Int,
 )
 
-private fun decodeGroupFoldMap(blob: String): Map<String, String> =
+internal fun decodeGroupFoldMap(blob: String): Map<String, String> =
     blob.lineSequence()
         .mapNotNull { line ->
             val i = line.indexOf('=')
@@ -3205,6 +3221,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             HISTORICAL_FOLDS_BLOB_KEY,
             historicalFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" },
         )
+        val next = promotedFoldedMutesFromFolds(mutedUntilByChat, historicalFoldMap)
+        if (next != mutedUntilByChat) {
+            mutedUntilByChat = next
+            persistMutes()
+        }
     }
 
     private fun forgetHistoricalFolds(deletedIds: Set<String>) {
@@ -5486,6 +5507,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         add(chatId)
         addAll(directMarmotChatIds(chatId))
         addAll(transcriptGroupIds(chatId))
+        addAll(foldFamilyIds(chatId, historicalFoldMap))
         foldedGroupPeerIds[chatId]?.let { add(meshChatId(it)) }
         if (isMeshChat(chatId)) {
             meshPeerAliases(meshPeerId(chatId)).forEach { add(meshChatId(it)) }

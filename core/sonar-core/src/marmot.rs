@@ -2364,10 +2364,20 @@ impl MarmotEngine {
         unwrapped: &UnwrappedGift,
     ) -> Result<Incoming> {
         if let Some(existing) = self.parked_for_wrapper(&wrapper.id) {
+            if self.is_dropped(&existing.group_id) {
+                return Ok(Incoming::None);
+            }
             return Ok(Incoming::GroupInvitePending(existing.group_id));
         }
         let welcomer = unwrapped.sender;
         let meta = welcome_rumor_meta(&unwrapped.rumor);
+        let welcome_group_id = parked_group_id_for_wrapper(wrapper, &meta);
+        // Leave/decline marks this MLS id dropped. A later welcome for the
+        // same group must not re-park or auto-join — resume is a new 0.9
+        // group folded by npub, not resurrection of the deleted row.
+        if self.is_dropped(&welcome_group_id) {
+            return Ok(Incoming::None);
+        }
         // Unknown size (White Noise / no `members` tag) is treated as a
         // 2-member DM so the auto-accept budget and flood caps still apply.
         let member_count = meta.member_count.unwrap_or(2);
@@ -2675,11 +2685,16 @@ impl MarmotEngine {
     }
 
     pub fn pending_group_invites(&self) -> Result<Vec<GroupInvite>> {
+        let dropped = self.dropped_group_id_set();
         let parked = self
             .parked_invites
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(parked.values().cloned().collect())
+        Ok(parked
+            .values()
+            .filter(|invite| !dropped.contains(&invite.group_id))
+            .cloned()
+            .collect())
     }
 
     pub async fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
@@ -2694,6 +2709,11 @@ impl MarmotEngine {
             )));
         };
         self.persist_parked();
+        if self.is_dropped(&invite.group_id) {
+            return Err(Error::InvalidInput(
+                "this invite belongs to a chat you already left".into(),
+            ));
+        }
         if invite.wrapper_json.is_empty() {
             self.park_invite(invite);
             return Err(Error::InvalidInput(format!(
@@ -3021,6 +3041,18 @@ impl MarmotEngine {
         if let Some(path) = self.db_path.as_ref() {
             crate::mdk08_migrate::forget_historical_metadata(path, &family);
         }
+        {
+            let mut parked = self
+                .parked_invites
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = parked.len();
+            parked.retain(|_, invite| !family.iter().any(|id| id == &invite.group_id));
+            if parked.len() != before {
+                drop(parked);
+                self.persist_parked();
+            }
+        }
     }
 
     fn store_chat(&self, msg: ChatMessage) {
@@ -3093,11 +3125,19 @@ impl MarmotEngine {
     }
 
     fn park_invite(&self, invite: GroupInvite) {
+        if self.is_dropped(&invite.group_id) {
+            return;
+        }
         self.parked_invites
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(invite.id, invite);
         self.persist_parked();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn park_invite_for_test(&self, invite: GroupInvite) {
+        self.park_invite(invite);
     }
 
     fn drop_group(&self, group_id: &GroupId) {
@@ -4123,6 +4163,67 @@ mod historical_fold_tests {
         assert!(
             !leftover.contains_key(&hex::encode(historical.as_slice())),
             "open must heal leftover dropped rows off the transcript sidecar"
+        );
+    }
+
+    fn test_invite(group_id: &GroupId, welcomer: PublicKey, seed: u8) -> GroupInvite {
+        GroupInvite {
+            id: EventId::from_slice(&[seed; 32]).expect("event id"),
+            wrapper_id: EventId::from_slice(&[seed; 32]).expect("event id"),
+            group_id: group_id.clone(),
+            group_name: "standup".into(),
+            group_description: String::new(),
+            welcomer,
+            member_count: 3,
+            relays: Vec::new(),
+            wrapper_json: String::new(),
+        }
+    }
+
+    /// Leave/delete must drop a parked multi-member invite for that family so
+    /// the next home-list fetch cannot show "Group chat · invite" again.
+    #[test]
+    fn purge_fold_family_clears_parked_invites() {
+        let alice = Identity::generate();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let key = [0x42u8; 32];
+        let gone = GroupId::new(vec![0x33; 16]);
+        let keep = GroupId::new(vec![0x44; 16]);
+        let engine = MarmotEngine::persistent(alice.clone(), &db_path, key).expect("open");
+        engine.park_invite_for_test(test_invite(&gone, alice.public_key(), 1));
+        engine.park_invite_for_test(test_invite(&keep, alice.public_key(), 2));
+        assert_eq!(engine.pending_group_invites().expect("parked").len(), 2);
+        engine.purge_fold_family(&gone);
+        let pending = engine.pending_group_invites().expect("after leave");
+        assert_eq!(pending.len(), 1, "only the unrelated invite may stay");
+        assert_eq!(pending[0].group_id, keep);
+        let parked_path = db_path.with_file_name(format!(
+            "marmot.sqlite{}",
+            crate::marmot::PARKED_INVITES_FILE_SUFFIX
+        ));
+        let leftover: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&parked_path).expect("parked sidecar"))
+                .expect("parked json");
+        assert_eq!(
+            leftover.len(),
+            1,
+            "leave must heal the parked-invite sidecar, not only the in-memory map"
+        );
+    }
+
+    /// Decline/leave marks the MLS id dropped. A later park of the same id
+    /// (relay re-delivery) must not surface the invite again.
+    #[test]
+    fn park_invite_skips_dropped_groups() {
+        let alice = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let gone = GroupId::new(vec![0x33; 16]);
+        engine.purge_fold_family(&gone);
+        engine.park_invite_for_test(test_invite(&gone, alice.public_key(), 1));
+        assert!(
+            engine.pending_group_invites().expect("pending").is_empty(),
+            "a later welcome for a left chat must not reappear as an invite"
         );
     }
 

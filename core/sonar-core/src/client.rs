@@ -7067,6 +7067,9 @@ impl SonarClient {
     /// Creates a new DM/group with the same peers when no fold exists yet.
     /// The old transcript stays; MLS membership is not imported.
     async fn resolve_send_group(&self, group_id: &GroupId) -> Result<GroupId> {
+        if self.engine.is_dropped(group_id) {
+            return Err(Error::InvalidInput("this chat was deleted".into()));
+        }
         if self.engine.is_live_group(group_id)? {
             self.maybe_add_late_resume_members(group_id).await;
             return Ok(group_id.clone());
@@ -8895,6 +8898,25 @@ mod tests {
         assert!(
             client.conversation_summary(&group_hex).is_none(),
             "index upsert after Leave must not recreate the home-list row"
+        );
+    }
+
+    /// A stale send aimed at a chat the user already left must fail closed
+    /// instead of hitting MLS on a dead id or creating a new resume group.
+    #[tokio::test]
+    async fn send_text_rejects_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x11u8; 16]);
+        client.engine.purge_fold_family(&group_id);
+        let err = client
+            .send_text(&group_id, "hi")
+            .await
+            .expect_err("send after Leave must fail");
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "deleted chat must not resume as a new group: {err:?}"
         );
     }
 
