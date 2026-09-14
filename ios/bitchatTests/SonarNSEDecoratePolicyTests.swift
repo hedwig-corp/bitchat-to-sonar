@@ -153,6 +153,14 @@ struct SonarNSEDecoratePolicyTests {
             SonarNSEDecoratePolicy.filterUnreadTips(groupIdHexes: ids, hintGroupIdHex: "zzz")
                 == ids
         )
+        #expect(
+            SonarNSEDecoratePolicy.filterUnreadTips(
+                groupIdHexes: ["group-09", "other"],
+                hintGroupIdHex: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09"],
+            "hist hide remounts the tip onto live; a 0.8 hint must still pin it"
+        )
     }
 
     @Test("hintGroupIdHex reads common push payload keys")

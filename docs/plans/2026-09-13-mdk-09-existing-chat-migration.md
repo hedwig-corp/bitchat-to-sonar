@@ -1515,6 +1515,14 @@ the published live id (add unread, max latest/count). After
 `copy_summary` hist unread is 0 so a second remount cannot double-count.
 Pin: `client::tests::conversation_summaries_remount_hidden_hist_without_copy_summary`.
 
+NSE unread-fallback and host wake-delta still keyed the published live
+id only. After hide a 0.8 `conversation_id` / `group_id` hint missed
+the remounted tip and fell through to an unrelated unread chat; a
+hist-only baseline then treated the remounted live row as brand-new.
+`filterUnreadTips` and `isNewlyAdvanced` now walk the fold family.
+Pins: `SonarNSEDecoratePolicyTests.unreadHintFilters`,
+`SonarNotificationPrefsTests.unreadDeltaSkipsUnchangedStale`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

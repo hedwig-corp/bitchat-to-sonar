@@ -329,16 +329,22 @@ enum SonarNSEDecoratePolicy {
     }
 
     /// Prefer a push-hinted group when present so unread fallback does not
-    /// banner an unrelated stale tip.
+    /// banner an unrelated stale tip. After hist hide the published tip is
+    /// the live id; a 0.8 conversation_id / group_id hint must still match.
     static func filterUnreadTips(
         groupIdHexes: [String],
-        hintGroupIdHex: String?
+        hintGroupIdHex: String?,
+        historicalFolds: [String: String] = [:]
     ) -> [String] {
         let hint = hintGroupIdHex?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard let hint, !hint.isEmpty else { return groupIdHexes }
-        let matched = groupIdHexes.filter { $0.lowercased() == hint }
+        let matched = groupIdHexes.filter { id in
+            let family = foldFamilyIds(id: id, historicalFolds: historicalFolds)
+            return id.lowercased() == hint
+                || family.contains(where: { $0.lowercased() == hint })
+        }
         return matched.isEmpty ? groupIdHexes : matched
     }
 

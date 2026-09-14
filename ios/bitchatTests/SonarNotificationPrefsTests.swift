@@ -211,6 +211,40 @@ struct SonarNotificationPrefsTests {
                 baselineHydrated: true
             ) == true
         )
+        let histPrior = SonarPushUnreadDelta.Fingerprint(
+            unread: 3,
+            latestAt: Date(timeIntervalSince1970: 50),
+            content: "keep this chat"
+        )
+        let remountedLive = SonarPushUnreadDelta.Fingerprint(
+            unread: 3,
+            latestAt: Date(timeIntervalSince1970: 50),
+            content: "keep this chat"
+        )
+        #expect(
+            SonarPushUnreadDelta.isNewlyAdvanced(
+                groupId: "group-09",
+                after: remountedLive,
+                before: ["group-08": histPrior],
+                baselineHydrated: true,
+                familyIds: ["group-08", "group-09"]
+            ) == false,
+            "core hide remounting hist unread onto live is not a new wake tip"
+        )
+        #expect(
+            SonarPushUnreadDelta.isNewlyAdvanced(
+                groupId: "group-09",
+                after: SonarPushUnreadDelta.Fingerprint(
+                    unread: 4,
+                    latestAt: Date(timeIntervalSince1970: 200),
+                    content: "new 0.9"
+                ),
+                before: ["group-08": histPrior],
+                baselineHydrated: true,
+                familyIds: ["group-08", "group-09"]
+            ) == true,
+            "a real live advance past the hist baseline must still banner"
+        )
     }
 
     #if os(iOS)

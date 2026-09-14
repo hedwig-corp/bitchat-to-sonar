@@ -366,9 +366,13 @@ class NotificationService: SDKNotificationService {
         let unread = node.conversationSummaries()
             .filter { $0.unreadCount > 0 && !$0.latestMine }
             .sorted { $0.latestAtSecs > $1.latestAtSecs }
+        let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(
+            UserDefaults(suiteName: Self.appGroupId)
+        )
         let allowedIds = SonarNSEDecoratePolicy.filterUnreadTips(
             groupIdHexes: unread.map(\.groupIdHex),
-            hintGroupIdHex: hintGroupIdHex
+            hintGroupIdHex: hintGroupIdHex,
+            historicalFolds: folds
         )
         let previewById = Dictionary(
             unread.map { ($0.groupIdHex, $0.latestContent) },
@@ -403,12 +407,20 @@ class NotificationService: SDKNotificationService {
         node: SonarNode
     ) -> [DrainNotificationInfo] {
         let summaries = node.conversationSummaries()
+        let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(
+            UserDefaults(suiteName: Self.appGroupId)
+        )
         return notifications.map { note in
             let trimmed = note.contentPreview.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.isEmpty else { return note }
             let group = note.groupIdHex.lowercased()
+            let family = SonarNSEDecoratePolicy.foldFamilyIds(
+                id: group,
+                historicalFolds: folds
+            )
             guard let summary = summaries.first(where: {
-                $0.groupIdHex.lowercased() == group
+                let id = $0.groupIdHex.lowercased()
+                return id == group || family.contains { $0.lowercased() == id }
             }) else { return note }
             let fromSummary = summary.latestContent
                 .trimmingCharacters(in: .whitespacesAndNewlines)

@@ -633,6 +633,7 @@ enum SonarPushProcessor {
         marmot: MarmotChatModel,
         prefs: SonarLocalNotificationPrefs
     ) async -> Int {
+        let folds = (UserDefaults.standard.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
         let after = marmot.conversationSummariesByGroup.values.filter { summary in
             SonarPushUnreadDelta.isNewlyAdvanced(
                 groupId: summary.groupIdHex,
@@ -642,7 +643,11 @@ enum SonarPushProcessor {
                     content: summary.latestContent
                 ),
                 before: before,
-                baselineHydrated: baselineHydrated
+                baselineHydrated: baselineHydrated,
+                familyIds: SonarNSEDecoratePolicy.foldFamilyIds(
+                    id: summary.groupIdHex,
+                    historicalFolds: folds
+                )
             )
         }
         if after.isEmpty { return 0 }

@@ -23,14 +23,25 @@ enum SonarPushUnreadDelta {
     /// missing from `before` must NOT count as new — that is the cold-wake
     /// stale-unread fan-out. After a local summary load, missing keys are
     /// genuinely new conversations.
+    ///
+    /// `familyIds` are hist↔live aliases of `groupId`. Core hide remounts
+    /// unread onto the live id; a hist-only baseline must not look like a
+    /// brand-new chat.
     static func isNewlyAdvanced(
         groupId: String,
         after: Fingerprint,
         before: [String: Fingerprint],
-        baselineHydrated: Bool
+        baselineHydrated: Bool,
+        familyIds: Set<String> = []
     ) -> Bool {
         guard after.unread > 0 else { return false }
-        guard let prior = before[groupId] else { return baselineHydrated }
+        var keys = familyIds
+        keys.insert(groupId)
+        let prior = keys.compactMap { before[$0] }.max { lhs, rhs in
+            if lhs.unread != rhs.unread { return lhs.unread < rhs.unread }
+            return lhs.latestAt < rhs.latestAt
+        }
+        guard let prior else { return baselineHydrated }
         return after.unread > prior.unread
             || after.latestAt > prior.latestAt
             || after.content != prior.content
