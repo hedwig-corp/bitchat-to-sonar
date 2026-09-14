@@ -1563,6 +1563,17 @@ Pins: `ConversationFoldTest.wakeNamesForRecoveredGroupKeepRoomAndAvoidTitleInTit
 `SonarNotificationRouterTest.recoveredWakePassesRoomAsConversationTitleAndGroupName`,
 `ConversationFoldTest.emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm`.
 
+Settings restore preview listed every index row. After resume that is
+folded hist **plus** a blank live sibling, so the dry run showed
+**standup** and **Direct chat** for one recovered room (and dropped
+chats still appeared). Remount preview like `conversation_summaries`:
+hide folded hist, copy hist name/count/content onto live, paint empty
+names from the historical-groups sidecar, and omit dropped ids.
+Sidecar-only previews hide folded hist and union family counts. Pins:
+`account_backup::tests::preview_hides_folded_hist_and_paints_live_room_name`,
+`account_backup::tests::preview_paints_sidecar_name_when_index_name_blank`,
+`account_backup::tests::preview_sidecars_hide_folded_hist_and_union_counts`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

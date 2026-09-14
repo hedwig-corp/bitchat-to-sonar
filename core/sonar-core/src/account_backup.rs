@@ -1925,6 +1925,174 @@ pub fn preview_conversations(
     out
 }
 
+fn sidecar_historical_names(package: &AccountBackupPackage) -> HashMap<String, String> {
+    package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX)
+        .and_then(|(_, bytes)| serde_json::from_slice::<HashMap<String, String>>(bytes).ok())
+        .unwrap_or_default()
+}
+
+fn sidecar_historical_folds(package: &AccountBackupPackage) -> Vec<(String, String)> {
+    package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX)
+        .and_then(|(_, bytes)| serde_json::from_slice::<HashMap<String, String>>(bytes).ok())
+        .map(|map| map.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn merge_preview_folds(
+    index_folds: Vec<(String, String)>,
+    sidecar_folds: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut out = index_folds;
+    for (historical, live) in sidecar_folds {
+        if historical.is_empty() || live.is_empty() || historical.eq_ignore_ascii_case(&live) {
+            continue;
+        }
+        if !out
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(&historical))
+        {
+            out.push((historical, live));
+        }
+    }
+    out
+}
+
+fn preview_hex_key(hex: &str) -> String {
+    hex.to_ascii_lowercase()
+}
+
+fn folded_historical_hexes(folds: &[(String, String)]) -> HashSet<String> {
+    folds
+        .iter()
+        .map(|(historical, _)| preview_hex_key(historical))
+        .collect()
+}
+
+fn preview_painted_name(
+    group_id_hex: &str,
+    index_name: &str,
+    folds: &[(String, String)],
+    names_by_hex: &HashMap<String, String>,
+    sidecar_names: &HashMap<String, String>,
+) -> String {
+    let trimmed = index_name.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let key = preview_hex_key(group_id_hex);
+    if let Some(name) = sidecar_names
+        .iter()
+        .find(|(id, _)| preview_hex_key(id) == key)
+        .map(|(_, name)| name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        return name.to_string();
+    }
+    for (historical, live) in folds {
+        if preview_hex_key(live) != key {
+            continue;
+        }
+        let hist_key = preview_hex_key(historical);
+        if let Some(name) = names_by_hex
+            .get(&hist_key)
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
+        }
+        if let Some(name) = sidecar_names
+            .iter()
+            .find(|(id, _)| preview_hex_key(id) == hist_key)
+            .map(|(_, name)| name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
+        }
+    }
+    String::new()
+}
+
+fn remount_preview_summaries(
+    summaries: Vec<crate::conversation_index::ConversationSummary>,
+    folds: &[(String, String)],
+    dropped: &HashSet<String>,
+    sidecar_names: &HashMap<String, String>,
+) -> Vec<BackupPreviewConversation> {
+    let hidden = folded_historical_hexes(folds);
+    let by_hex: HashMap<String, crate::conversation_index::ConversationSummary> = summaries
+        .into_iter()
+        .map(|summary| (preview_hex_key(&summary.group_id_hex), summary))
+        .collect();
+    let names_by_hex: HashMap<String, String> = by_hex
+        .iter()
+        .map(|(hex, summary)| (hex.clone(), summary.name.clone()))
+        .collect();
+    let mut published: HashMap<String, crate::conversation_index::ConversationSummary> = by_hex
+        .iter()
+        .filter(|(hex, _)| !dropped.contains(*hex) && !hidden.contains(*hex))
+        .map(|(hex, summary)| (hex.clone(), summary.clone()))
+        .collect();
+    for (historical, live) in folds {
+        let hist_key = preview_hex_key(historical);
+        let live_key = preview_hex_key(live);
+        if dropped.contains(&live_key) || live_key == hist_key {
+            continue;
+        }
+        let Some(hist) = by_hex.get(&hist_key) else {
+            continue;
+        };
+        if let Some(live_summary) = published.get_mut(&live_key) {
+            if hist.latest_at_secs > live_summary.latest_at_secs {
+                live_summary.latest_content = hist.latest_content.clone();
+                live_summary.latest_at_secs = hist.latest_at_secs;
+            }
+            if hist.message_count > live_summary.message_count {
+                live_summary.message_count = hist.message_count;
+            }
+            if live_summary.name.trim().is_empty() && !hist.name.trim().is_empty() {
+                live_summary.name = hist.name.clone();
+            }
+        } else {
+            let mut published_hist = hist.clone();
+            published_hist.group_id_hex = live.clone();
+            published.insert(live_key, published_hist);
+        }
+    }
+    let mut rows: Vec<BackupPreviewConversation> = published
+        .into_values()
+        .map(|summary| {
+            let name = preview_painted_name(
+                &summary.group_id_hex,
+                &summary.name,
+                folds,
+                &names_by_hex,
+                sidecar_names,
+            );
+            BackupPreviewConversation {
+                name,
+                latest_content: match crate::notification::classify_content(&summary.latest_content)
+                {
+                    crate::notification::NotificationKind::Message => summary.latest_content,
+                    _ => String::new(),
+                },
+                message_count: summary.message_count,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.message_count
+            .cmp(&a.message_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows
+}
+
 fn dropped_group_hexes(package: &AccountBackupPackage) -> HashSet<String> {
     package
         .sidecar_files
@@ -1996,24 +2164,21 @@ fn preview_from_index(
         Some(key) => key,
         None => return Vec::new(),
     };
-    let summaries = crate::conversation_index::ConversationIndex::open(&index_path, key)
-        .and_then(|idx| idx.summaries_ordered())
-        .unwrap_or_default();
-    summaries
-        .into_iter()
-        .map(|s| BackupPreviewConversation {
-            name: s.name,
-            // Control lines (⚡TRILL / ⚡PAY / ☎CALL) are transcript-hidden;
-            // leaking them here was caught on device — the dry run rendered a
-            // raw "⚡TRILL|1|…" as a chat's preview. Blank anything that is not
-            // a plain message and let hosts render name/count only.
-            latest_content: match crate::notification::classify_content(&s.latest_content) {
-                crate::notification::NotificationKind::Message => s.latest_content,
-                _ => String::new(),
-            },
-            message_count: s.message_count,
-        })
-        .collect()
+    let opened = crate::conversation_index::ConversationIndex::open(&index_path, key);
+    let Ok(idx) = opened else {
+        return Vec::new();
+    };
+    let summaries = idx.summaries_ordered().unwrap_or_default();
+    let folds = merge_preview_folds(
+        idx.list_folds().unwrap_or_default(),
+        sidecar_historical_folds(package),
+    );
+    remount_preview_summaries(
+        summaries,
+        &folds,
+        &dropped_group_hexes(package),
+        &sidecar_historical_names(package),
+    )
 }
 
 fn preview_from_recovered_sidecars(
@@ -2027,29 +2192,46 @@ fn preview_from_recovered_sidecars(
             serde_json::from_slice::<HashMap<String, Vec<crate::marmot::ChatMessage>>>(bytes).ok()
         })
         .unwrap_or_default();
-    let names = package
-        .sidecar_files
-        .iter()
-        .find(|(name, _)| name == crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX)
-        .and_then(|(_, bytes)| serde_json::from_slice::<HashMap<String, String>>(bytes).ok())
-        .unwrap_or_default();
+    let names = sidecar_historical_names(package);
     if transcript.is_empty() && names.is_empty() {
         return Vec::new();
     }
     let dropped = dropped_group_hexes(package);
+    let folds = sidecar_historical_folds(package);
+    let hidden = folded_historical_hexes(&folds);
     let mut ids: Vec<String> = transcript
         .keys()
         .cloned()
         .chain(names.keys().cloned())
-        .filter(|id| !dropped.contains(&id.to_ascii_lowercase()))
+        .filter(|id| {
+            let hex = preview_hex_key(id);
+            !dropped.contains(&hex) && !hidden.contains(&hex)
+        })
         .collect();
     ids.sort();
     ids.dedup();
     let mut conversations: Vec<BackupPreviewConversation> = ids
         .into_iter()
         .map(|id| {
-            let name = names.get(&id).cloned().unwrap_or_default();
-            let msgs = transcript.get(&id).map(Vec::as_slice).unwrap_or(&[]);
+            let name = preview_painted_name(
+                &id,
+                names.get(&id).map(String::as_str).unwrap_or(""),
+                &folds,
+                &names,
+                &names,
+            );
+            let mut msgs: Vec<&crate::marmot::ChatMessage> = transcript
+                .get(&id)
+                .map(|rows| rows.iter().collect())
+                .unwrap_or_default();
+            for (historical, live) in &folds {
+                if preview_hex_key(live) != preview_hex_key(&id) {
+                    continue;
+                }
+                if let Some(hist_msgs) = transcript.get(historical) {
+                    msgs.extend(hist_msgs.iter());
+                }
+            }
             let latest = msgs.iter().max_by_key(|msg| msg.created_at.as_secs());
             let latest_content = latest
                 .map(
@@ -3129,6 +3311,134 @@ mod tests {
             count_transcript_bytes(&serde_json::to_vec(&transcript).unwrap()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn preview_hides_folded_hist_and_paints_live_room_name() {
+        let hist = crate::conversation_index::ConversationSummary {
+            group_id_hex: "08".repeat(16),
+            name: "standup".into(),
+            latest_content: "keep this chat".into(),
+            latest_sender: "alice".into(),
+            latest_at_secs: 100,
+            latest_mine: false,
+            message_count: 50,
+            unread_count: 3,
+            version: 1,
+        };
+        let live = crate::conversation_index::ConversationSummary {
+            group_id_hex: "09".repeat(16),
+            name: String::new(),
+            latest_content: String::new(),
+            latest_sender: String::new(),
+            latest_at_secs: 0,
+            latest_mine: false,
+            message_count: 0,
+            unread_count: 0,
+            version: 1,
+        };
+        let folds = vec![(hist.group_id_hex.clone(), live.group_id_hex.clone())];
+        let listed = remount_preview_summaries(
+            vec![hist, live],
+            &folds,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "standup");
+        assert_eq!(listed[0].latest_content, "keep this chat");
+        assert_eq!(listed[0].message_count, 50);
+    }
+
+    #[test]
+    fn preview_paints_sidecar_name_when_index_name_blank() {
+        let live_hex = "09".repeat(16);
+        let hist_hex = "08".repeat(16);
+        let live = crate::conversation_index::ConversationSummary {
+            group_id_hex: live_hex.clone(),
+            name: String::new(),
+            latest_content: "new 0.9".into(),
+            latest_sender: "alice".into(),
+            latest_at_secs: 200,
+            latest_mine: false,
+            message_count: 1,
+            unread_count: 0,
+            version: 1,
+        };
+        let folds = vec![(hist_hex.clone(), live_hex)];
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(hist_hex, "standup".into());
+        let listed = remount_preview_summaries(vec![live], &folds, &HashSet::new(), &names);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "standup");
+        assert_eq!(listed[0].latest_content, "new 0.9");
+        assert_eq!(listed[0].message_count, 1);
+    }
+
+    #[test]
+    fn preview_sidecars_hide_folded_hist_and_union_counts() {
+        let peer = Keys::generate();
+        let historical = crate::GroupId::new(vec![0x08u8; 16]);
+        let live = crate::GroupId::new(vec![0x09u8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        let hist_msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xABu8; 32]).unwrap(),
+            group_id: historical,
+            sender: peer.public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        };
+        let live_msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xCDu8; 32]).unwrap(),
+            group_id: live,
+            sender: peer.public_key(),
+            content: "new 0.9".into(),
+            created_at: Timestamp::from_secs(200),
+            mine: true,
+            delivery_state: crate::marmot::DeliveryState::Sent,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("new 0.9"),
+            reply: None,
+        };
+        let mut transcript = HashMap::new();
+        transcript.insert(hist_hex.clone(), vec![hist_msg]);
+        transcript.insert(live_hex.clone(), vec![live_msg]);
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(hist_hex.clone(), "standup".into());
+        let mut folds: HashMap<String, String> = HashMap::new();
+        folds.insert(hist_hex, live_hex);
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&transcript).unwrap(),
+                ),
+                (
+                    crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&names).unwrap(),
+                ),
+                (
+                    crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&folds).unwrap(),
+                ),
+            ],
+        };
+        let listed = preview_from_recovered_sidecars(&package);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "standup");
+        assert_eq!(listed[0].latest_content, "new 0.9");
+        assert_eq!(listed[0].message_count, 2);
     }
 
     #[test]
