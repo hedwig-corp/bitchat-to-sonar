@@ -2261,3 +2261,76 @@ async fn persist_folds_lost_core_sidecar_summaries_hide_hist_from_index() {
         "conversation_summaries must keep hiding the recovered 0.8 id"
     );
 }
+
+/// Hosts remount from FFI `live_fold_target` / `fold_aliases` / `groups()`
+/// before `conversation_summaries`. A lost JSON sidecar must restore the
+/// recorded bind on those reads so the first home-list paint does not
+/// split one person into two chats.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_groups_and_aliases_restore_index_bind() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    let hist_hex = hex::encode(historical.as_slice());
+    let live_hex = hex::encode(live.as_slice());
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    assert_eq!(
+        alice.live_fold_target_hex(&hist_hex).as_deref(),
+        Some(live_hex.as_str()),
+        "first FFI alias query must restore the recorded bind"
+    );
+    assert!(
+        alice
+            .fold_aliases_hex(&live_hex)
+            .iter()
+            .any(|id| id == &hist_hex),
+        "fold_aliases(live) must rediscover the hidden 0.8 sibling"
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "cleared again so groups() is the only restore"
+    );
+    let _ = alice.groups().expect("groups restores the index bind");
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "groups() must hide hist on the first home-list paint"
+    );
+}

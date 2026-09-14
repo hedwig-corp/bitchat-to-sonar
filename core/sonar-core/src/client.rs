@@ -7089,6 +7089,10 @@ impl SonarClient {
     }
 
     pub fn groups(&self) -> Result<Vec<cgka_traits::group::Group>> {
+        // Hosts paint `chats()` / FFI `groups()` before summaries. A lost
+        // JSON sidecar must not re-list a recovered 0.8 row as a second
+        // home conversation — restore recorded binds first.
+        self.restore_recorded_folds_from_index();
         self.engine.groups()
     }
 
@@ -7550,7 +7554,12 @@ impl SonarClient {
     /// onto this id after `groups()` hides the recovered row.
     pub fn live_fold_target_hex(&self, group_id_hex: &str) -> Option<String> {
         let bytes = hex::decode(group_id_hex).ok()?;
-        let live = self.engine.live_fold_target(&GroupId::new(bytes))?;
+        let group_id = GroupId::new(bytes);
+        // Persist-folds remount from FFI aliases before summaries / page.
+        // Restore a recorded index bind so the first alias query is not
+        // hist-blind after the JSON sidecar is lost.
+        self.restore_recorded_folds_touching(&group_id);
+        let live = self.engine.live_fold_target(&group_id)?;
         Some(hex::encode(live.as_slice()))
     }
 
@@ -7558,6 +7567,9 @@ impl SonarClient {
     /// Includes `group_id_hex` itself. Hosts use this to discover hidden 0.8
     /// siblings from a listed live id (`live_fold_target(live)` is just live).
     pub fn fold_aliases_hex(&self, group_id_hex: &str) -> Vec<String> {
+        if let Ok(bytes) = hex::decode(group_id_hex) {
+            self.restore_recorded_folds_touching(&GroupId::new(bytes));
+        }
         self.fold_index_ids(group_id_hex)
     }
 

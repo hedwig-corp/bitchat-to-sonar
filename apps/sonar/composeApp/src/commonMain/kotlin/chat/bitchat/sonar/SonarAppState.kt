@@ -1445,6 +1445,20 @@ internal fun localLatestTsForChat(
     return latest
 }
 
+/** Newest home-row message. Fold remount concatenates without sorting, so
+ *  `lastOrNull()` can be the oldest recovered 0.8 extract — preview and
+ *  recency then sink under a newer empty live sibling.
+ *  iOS `latestMarmotMessage` uses `max(by: createdAt)`. */
+internal fun latestHomeRowMessage(messages: List<SonarMsg>): SonarMsg? =
+    messages.maxWithOrNull(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+
+/** Mesh-folded row timestamp when the Marmot snapshot is still empty
+ *  (process death, metadata-only blob). `latestMarmotMessage` would
+ *  return null and stamp ts=0, burying a remounted 0.8 DM under every
+ *  other row until hydrate. iOS uses remounted `latestAt`. */
+internal fun foldedMeshRowTs(latestMessageTs: Long?, localLatestTs: Long): Long =
+    maxOf(latestMessageTs ?: 0L, localLatestTs)
+
 /** Every recovered sibling that must leave with [id] on delete / leave. */
 internal fun foldFamilyIds(
     id: String,
@@ -6573,7 +6587,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun chatRowMeta(chatId: String): Pair<String, Long>? =
         directMarmotChatIds(chatId)
             .mapNotNull { id ->
-                visibleMessagesForChat(id, snapshotMessagesForChat(id)).lastOrNull()
+                latestHomeRowMessage(visibleMessagesForChat(id, snapshotMessagesForChat(id)))
             }
             .maxByOrNull { it.tsSecs }
             ?.let { messagePreview(it.content, it.stickerRef, it.media) to it.tsSecs }
@@ -6619,7 +6633,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)
             val unreadIds = transcriptSourceIds(chat.id, ids, historicalFoldMap)
             val newest = if (pending) null else ids
-                .mapNotNull { visibleMessagesForChat(it, snapshotMessagesForChat(it)).lastOrNull() }
+                .mapNotNull { latestHomeRowMessage(visibleMessagesForChat(it, snapshotMessagesForChat(it))) }
                 .maxByOrNull { it.tsSecs }
             chat.id to MarmotRowModel(
                 id = chat.id,
@@ -13252,9 +13266,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = snapshotMessagesForChat(group.id).lastOrNull()
+            val msg = latestHomeRowMessage(snapshotMessagesForChat(group.id))
             val current = latest
-            if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
+            if (msg != null && (current == null || msg.tsSecs > current.tsSecs ||
+                    (msg.tsSecs == current.tsSecs && msg.id > current.id))
+            ) {
+                latest = msg
+            }
         }
         return latest
     }
@@ -13933,7 +13951,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 groups.forEach { g -> folded += g.id; groupPeers[g.id] = peerId }
                 latestMarmotMessage(groups)?.let { if (it.tsSecs > last.tsSecs) last = it }
             }
-            upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content, last.stickerRef, last.media), last.tsSecs))
+            val remountedTs = groups.maxOfOrNull { localLatestTs(it.id) } ?: 0L
+            upsert(
+                peerId,
+                MeshDmRow(
+                    peerId,
+                    foldedPeerName(peerId, groups.firstOrNull()),
+                    messagePreview(last.content, last.stickerRef, last.media),
+                    foldedMeshRowTs(last.tsSecs, remountedTs),
+                ),
+            )
         }
         for (group in chats) {
             if (!isDirectMarmotChat(group)) continue
@@ -13954,7 +13981,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     peerId,
                     foldedPeerName(peerId, group),
                     last?.let { messagePreview(it.content, it.stickerRef, it.media) } ?: "Secure chat · reaches anywhere",
-                    last?.tsSecs ?: 0L,
+                    foldedMeshRowTs(last?.tsSecs, localLatestTs(group.id)),
                 )
             )
         }

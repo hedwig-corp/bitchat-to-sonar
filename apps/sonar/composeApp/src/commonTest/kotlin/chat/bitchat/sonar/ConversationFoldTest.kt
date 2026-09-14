@@ -1805,6 +1805,14 @@ class ConversationFoldTest {
                 latestSecs = afterDeath,
             ),
         )
+        // Home-row preview used `lastOrNull()` on the unsorted remount.
+        // Newest-first extract would show "row 1" and ts=1, then sink.
+        val newestFirstPreview = latestHomeRowMessage(newestFirstExtract)
+        assertEquals("row 80", newestFirstPreview?.content)
+        assertEquals(80L, newestFirstPreview?.tsSecs)
+        assertEquals(80L, foldedMeshRowTs(latestMessageTs = 1L, localLatestTs = 80L))
+        assertEquals(80L, foldedMeshRowTs(latestMessageTs = null, localLatestTs = 80L))
+        assertEquals(10L, foldedMeshRowTs(latestMessageTs = 10L, localLatestTs = 0L))
     }
 
     @Test
