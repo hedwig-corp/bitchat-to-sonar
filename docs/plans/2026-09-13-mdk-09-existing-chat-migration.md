@@ -782,8 +782,18 @@ stage remainder ticks on the listed live id. Pins:
 `ConversationFoldTest.pendingMediaUploadLookupWalksFoldFamily`,
 `ConversationFoldTest.composerDraftReadAndClearWalkFoldFamily`,
 `ConversationFoldTest.conversationChangeTargetPrefersListedLiveSibling`,
+`ConversationFoldTest.conversationChangeRefreshesOpenMeshFromHiddenSibling`,
 `SonarConversationFoldTests` `snPendingUploadLookupGroupIds` /
-`snComposerDraft` / `snConversationChangeTargetId`.
+`snComposerDraft` / `snConversationChangeTargetId` /
+`snConversationChangeShouldRefreshOpenMesh`.
+
+Mesh remainder-tick hole closed after this commit: Compose
+`handleConversationChange` resolved `peerIdForMarmotGroup(hist)`
+only. Persist-folds prune `groupFoldMap[hist]`, so sitting in
+`mesh:<peer>` missed bak remainder until the 30s heartbeat.
+`conversationChangeShouldRefreshOpenMesh` walks the fold family
+and resolves the peer from the listed live sibling. iOS remainder
+refresh already pages the family via `snConversationRefreshIds`.
 
 Leave-paint hole closed after this commit: Compose remounted
 `retainedTranscriptByChat` only while the recovered transcript was

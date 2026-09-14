@@ -1261,6 +1261,67 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun conversationChangeRefreshesOpenMeshFromHiddenSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val peerByGroup = mapOf("group-09" to "peer-a")
+        fun meshId(peerId: String) = "mesh:$peerId"
+        assertTrue(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-a",
+                changedGroupId = "group-08",
+                historicalFolds = folds,
+                peerIdForGroup = peerByGroup::get,
+                meshChatId = ::meshId,
+            ),
+        )
+        assertTrue(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-a",
+                changedGroupId = "group-09",
+                historicalFolds = folds,
+                peerIdForGroup = peerByGroup::get,
+                meshChatId = ::meshId,
+            ),
+        )
+        assertTrue(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-a",
+                changedGroupId = "group-08",
+                historicalFolds = emptyMap(),
+                peerIdForGroup = mapOf("group-08" to "peer-a")::get,
+                meshChatId = ::meshId,
+            ),
+        )
+        assertFalse(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-a",
+                changedGroupId = "group-08",
+                historicalFolds = folds,
+                peerIdForGroup = { null },
+                meshChatId = ::meshId,
+            ),
+        )
+        assertFalse(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-b",
+                changedGroupId = "group-08",
+                historicalFolds = folds,
+                peerIdForGroup = peerByGroup::get,
+                meshChatId = ::meshId,
+            ),
+        )
+        assertFalse(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-a",
+                changedGroupId = "other",
+                historicalFolds = folds,
+                peerIdForGroup = peerByGroup::get,
+                meshChatId = ::meshId,
+            ),
+        )
+    }
+
+    @Test
     fun pendingMediaUploadLookupWalksFoldFamily() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

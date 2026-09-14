@@ -877,6 +877,42 @@ struct SonarConversationFoldTests {
             ) == "group-09"
         )
         #expect(
+            snConversationChangeShouldRefreshOpenMesh(
+                openMeshChatId: "mesh:peer-a",
+                changedGroupId: "group-08",
+                historicalFolds: ["group-08": "group-09"],
+                peerIdForGroup: { $0 == "group-09" ? "peer-a" : nil },
+                meshChatId: { "mesh:\($0)" }
+            )
+        )
+        #expect(
+            snConversationChangeShouldRefreshOpenMesh(
+                openMeshChatId: "mesh:peer-a",
+                changedGroupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                peerIdForGroup: { $0 == "group-09" ? "peer-a" : nil },
+                meshChatId: { "mesh:\($0)" }
+            )
+        )
+        #expect(
+            !snConversationChangeShouldRefreshOpenMesh(
+                openMeshChatId: "mesh:peer-a",
+                changedGroupId: "group-08",
+                historicalFolds: ["group-08": "group-09"],
+                peerIdForGroup: { _ in nil },
+                meshChatId: { "mesh:\($0)" }
+            )
+        )
+        #expect(
+            !snConversationChangeShouldRefreshOpenMesh(
+                openMeshChatId: "mesh:peer-b",
+                changedGroupId: "group-08",
+                historicalFolds: ["group-08": "group-09"],
+                peerIdForGroup: { $0 == "group-09" ? "peer-a" : nil },
+                meshChatId: { "mesh:\($0)" }
+            )
+        )
+        #expect(
             snPendingUploadLookupGroupIds(
                 groupId: "group-08",
                 historicalFolds: ["group-08": "group-09"]

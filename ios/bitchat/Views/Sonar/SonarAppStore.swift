@@ -1302,6 +1302,32 @@ func snConversationChangeTargetId(
     return listedFamily.sorted().first ?? changedGroupId
 }
 
+/// Sitting in a mesh-folded DM while a bak remainder tick names the
+/// hidden 0.8 sibling. Persist-folds prune the hist→peer map, so a
+/// changed-id-only lookup misses. Walk the fold family and resolve
+/// the peer from the listed live sibling. Compose
+/// `conversationChangeShouldRefreshOpenMesh`. Production iOS remainder
+/// refresh pages the family via `snConversationRefreshIds` instead of
+/// this peer lookup.
+func snConversationChangeShouldRefreshOpenMesh(
+    openMeshChatId: String,
+    changedGroupId: String,
+    historicalFolds: [String: String],
+    peerIdForGroup: (String) -> String?,
+    meshChatId: (String) -> String
+) -> Bool {
+    guard !openMeshChatId.isEmpty, !changedGroupId.isEmpty else { return false }
+    if let peerId = peerIdForGroup(changedGroupId), openMeshChatId == meshChatId(peerId) {
+        return true
+    }
+    for id in snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds) where id != changedGroupId {
+        if let peerId = peerIdForGroup(id), openMeshChatId == meshChatId(peerId) {
+            return true
+        }
+    }
+    return false
+}
+
 /// Group ids that may still hold in-flight upload bytes after a hist→live remount.
 func snPendingUploadLookupGroupIds(
     groupId: String,

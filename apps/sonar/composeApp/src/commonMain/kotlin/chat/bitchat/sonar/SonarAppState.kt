@@ -1379,6 +1379,29 @@ internal fun conversationChangeTargetId(
         ?: changedId
 }
 
+/** Sitting in `mesh:<peer>` while a bak remainder tick names the hidden
+ *  0.8 sibling. Persist-folds prune `groupFoldMap[hist]`, so
+ *  `peerIdForMarmotGroup(hist)` is null. Walk the fold family and
+ *  resolve the peer from the listed live sibling.
+ *  iOS remainder refresh pages the family via `snConversationRefreshIds`
+ *  and does not need this mesh-only peer lookup; the twin is
+ *  `snConversationChangeShouldRefreshOpenMesh`. */
+internal fun conversationChangeShouldRefreshOpenMesh(
+    openMeshChatId: String,
+    changedGroupId: String,
+    historicalFolds: Map<String, String>,
+    peerIdForGroup: (String) -> String?,
+    meshChatId: (String) -> String,
+): Boolean {
+    if (openMeshChatId.isBlank() || changedGroupId.isBlank()) return false
+    peerIdForGroup(changedGroupId)?.let { if (openMeshChatId == meshChatId(it)) return true }
+    for (id in foldFamilyIds(changedGroupId, historicalFolds)) {
+        if (id == changedGroupId) continue
+        peerIdForGroup(id)?.let { if (openMeshChatId == meshChatId(it)) return true }
+    }
+    return false
+}
+
 /** Chat ids that may still hold in-flight media after a hist→live promote. */
 internal fun pendingMediaUploadLookupIds(
     chatId: String,
@@ -14367,11 +14390,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                             (directMarmotChatIds(sc.id) + foldFamilyIds(sc.id, historicalFoldMap))
                                 .distinct(),
                         )
-                    } else if (isMeshChat(sc.id)) {
-                        val peerId = peerIdForMarmotGroup(groupIdHex)
-                        if (peerId != null && sc.id == meshChatId(peerId)) {
-                            refreshOpenDm(peerId)
-                        }
+                    } else if (isMeshChat(sc.id) && conversationChangeShouldRefreshOpenMesh(
+                            openMeshChatId = sc.id,
+                            changedGroupId = groupIdHex,
+                            historicalFolds = historicalFoldMap,
+                            peerIdForGroup = { peerIdForMarmotGroup(it) },
+                            meshChatId = ::meshChatId,
+                        )
+                    ) {
+                        refreshOpenDm(meshPeerId(sc.id))
                     }
                 }
                 // Fan the rest of the maintenance work (notifications, unread
