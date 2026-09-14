@@ -8032,6 +8032,9 @@ final class SonarAppStore: ObservableObject {
 
     /// Whether any local Marmot source folded into this visible conversation
     /// still has an older database page. Each source keeps its own cursor.
+    /// Also the open-unread `familyHasOlder` signal: do not abandon the
+    /// divider while a hidden 0.8 sibling / bak remainder may still hold
+    /// incoming unread rows. Compose `familyHasOlderForOpenChat`.
     func canLoadOlderDM(_ id: String) -> Bool {
         localTranscriptGroups(for: id).contains {
             marmot.hasOlderLocalMessages(groupId: $0.id)

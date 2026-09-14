@@ -1416,6 +1416,13 @@ newest + family has-older) and also waits for hydrate on a fold
 family. Pin:
 `UnreadCountsTest.recoveredFoldUnreadDoesNotRetireBeforeIndexNewest`.
 
+iOS `resolveUnreadAnchor` then abandoned the divider as soon as
+`expectedNewestDate` was satisfied, even when `canLoadOlderDM` still
+saw bak / a hidden 0.8 sibling. Live-only first paint jumped to the
+tail. Both hosts now share `shouldRetireOpenUnread` /
+`shouldRetireOpenChatUnread` (`familyHasOlder` gate). Pin:
+`SNUnreadCountsTests.recoveredFoldUnreadDoesNotRetireBeforeFamilyHasOlder`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

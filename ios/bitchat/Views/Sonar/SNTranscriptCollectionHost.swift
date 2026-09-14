@@ -91,6 +91,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var loadNewest: (() async -> Void)? = nil
     var unreadCountAtOpen: UInt64? = nil
     var expectedNewestDate: Date? = nil
+    var familyHasOlder: Bool = false
     /// Search / deep-link jump; see #372 for Sonar search wiring.
     var jumpMessageId: String? = nil
     /// Cleared by the host after Jump applies (or soft-fails).
@@ -129,6 +130,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,
             composerVersion: composerVersion,
@@ -155,6 +157,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,
             composer: composer
@@ -188,6 +191,7 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
     var loadNewest: (() async -> Void)?
     var unreadCountAtOpen: UInt64?
     var expectedNewestDate: Date?
+    var familyHasOlder: Bool = false
     var jumpMessageId: String? = nil
     var onJumpSettled: (() -> Void)? = nil
     @ViewBuilder var composer: () -> Composer
@@ -215,6 +219,7 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
                 loadNewest: loadNewest,
                 unreadCountAtOpen: unreadCountAtOpen,
                 expectedNewestDate: expectedNewestDate,
+                familyHasOlder: familyHasOlder,
                 jumpMessageId: jumpMessageId,
                 onJumpSettled: onJumpSettled
             )

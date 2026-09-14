@@ -1727,6 +1727,9 @@ struct SNMsgList: View {
     /// this — hydration can publish one transport leg before the folded White
     /// Noise groups merge in, and the missing rows are exactly the unread ones.
     var expectedNewestDate: Date? = nil
+    /// True when bak / a hidden 0.8 sibling may still hold unread rows.
+    /// Compose `familyHasOlderForOpenChat`. Must not abandon the divider.
+    var familyHasOlder: Bool = false
     /// Search / quote / notification jump. Wins over unread/live-edge.
     var jumpMessageId: String? = nil
     /// Cleared only after the parent is painted (remainder / family reveal).
@@ -1857,7 +1860,16 @@ struct SNMsgList: View {
         unreadAnchorId = anchor
         if anchor == nil {
             // Caught-up feed cannot place a divider — fall back to live edge
-            // (agent/control-only unread budgets). Hosts must start open recovery.
+            // (agent/control-only unread budgets) only once bak / hidden 0.8
+            // remainder cannot still own the unread incoming rows.
+            let feedNewest = msgs.compactMap(\.sortDate).max()
+            guard SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: unreadCountAtOpen,
+                anchorFound: false,
+                feedNewest: feedNewest,
+                expectedNewest: expectedNewestDate,
+                familyHasOlder: familyHasOlder
+            ) else { return }
             unreadAnchorAbandoned = true
         }
     }

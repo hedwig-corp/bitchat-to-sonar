@@ -15,6 +15,26 @@ enum SNUnreadCounts {
         loaded != nil
     }
 
+    /// Compose `shouldRetireOpenChatUnread`. Do not abandon the unread
+    /// divider while bak / a hidden 0.8 sibling may still hold incoming
+    /// unread rows. `nil` feed newest is treated as older than a known
+    /// expected newest (same as Compose `feedNewestTsSecs == 0`).
+    static func shouldRetireOpenUnread(
+        unreadAtOpen: UInt64,
+        anchorFound: Bool,
+        feedNewest: Date?,
+        expectedNewest: Date?,
+        familyHasOlder: Bool
+    ) -> Bool {
+        SNTranscriptScrollPolicy.shouldRetireOpenUnread(
+            unreadAtOpen: unreadAtOpen,
+            anchorFound: anchorFound,
+            feedNewest: feedNewest,
+            expectedNewest: expectedNewest,
+            familyHasOlder: familyHasOlder
+        )
+    }
+
     /// Open-time unread from the conversation index. `nil` summaries must
     /// not settle as `0` (fully-read / jump-to-tail). Empty success is 0.
     static func openCount(

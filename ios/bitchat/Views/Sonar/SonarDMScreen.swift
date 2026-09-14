@@ -267,6 +267,7 @@ struct SonarDMScreenContent: View {
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                    familyHasOlder: store.canLoadOlderDM(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                     onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
                     composerVersion: composerVersion
@@ -301,6 +302,7 @@ struct SonarDMScreenContent: View {
                     // do not coerce to 0 (false live-edge chase).
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                    familyHasOlder: store.canLoadOlderDM(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                     onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
                 )

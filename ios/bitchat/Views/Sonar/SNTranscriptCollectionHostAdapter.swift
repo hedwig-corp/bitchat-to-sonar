@@ -409,6 +409,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let loadNewest: (() async -> Void)?
     let unreadCountAtOpen: UInt64?
     let expectedNewestDate: Date?
+    var familyHasOlder: Bool = false
     /// Search / deep-link jump target; wins over unread/live-edge open (#372).
     var jumpMessageId: String? = nil
     var onJumpSettled: (() -> Void)? = nil
@@ -442,6 +443,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
             callbacks: renderContext.makeCallbacks(),
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            familyHasOlder: familyHasOlder,
             jumpMessageId: jumpMessageId,
             loadOlder: loadOlder,
             loadNewest: loadNewest,

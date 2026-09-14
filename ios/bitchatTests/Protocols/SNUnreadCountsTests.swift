@@ -38,6 +38,57 @@ struct SNUnreadCountsTests {
     }
 
     @Test
+    func recoveredFoldUnreadDoesNotRetireBeforeFamilyHasOlder() {
+        let histNewest = Date(timeIntervalSince1970: 50)
+        let liveNewest = Date(timeIntervalSince1970: 10)
+        #expect(
+            !SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: liveNewest,
+                expectedNewest: histNewest,
+                familyHasOlder: false
+            )
+        )
+        #expect(
+            !SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 80),
+                expectedNewest: histNewest,
+                familyHasOlder: true
+            )
+        )
+        #expect(
+            SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 80),
+                expectedNewest: histNewest,
+                familyHasOlder: false
+            )
+        )
+        #expect(
+            !SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: true,
+                feedNewest: liveNewest,
+                expectedNewest: histNewest,
+                familyHasOlder: false
+            )
+        )
+        #expect(
+            !SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 0,
+                anchorFound: false,
+                feedNewest: liveNewest,
+                expectedNewest: histNewest,
+                familyHasOlder: false
+            )
+        )
+    }
+
+    @Test
     func pruneKeepsOnlyGroupsStillUnreadInCore() {
         let suppressed: Set<String> = ["g-inflight", "g-done", "g-missing"]
         let summaries: [(groupIdHex: String, unreadCount: UInt64)] = [

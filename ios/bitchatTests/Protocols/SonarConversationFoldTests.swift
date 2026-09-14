@@ -1532,6 +1532,24 @@ struct SonarConversationFoldTests {
         #expect(!snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: false))
         #expect(snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: true))
         #expect(
+            !SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 3,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 1),
+                expectedNewest: Date(timeIntervalSince1970: 100),
+                familyHasOlder: false
+            )
+        )
+        #expect(
+            !SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 3,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 200),
+                expectedNewest: Date(timeIntervalSince1970: 100),
+                familyHasOlder: true
+            )
+        )
+        #expect(
             snNewestPageFamilyHasOlder(
                 existingCount: 80,
                 incomingCount: 2,
