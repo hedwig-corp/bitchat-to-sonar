@@ -1326,6 +1326,15 @@ leave already forget the family. Pins:
 `ConversationFoldTest.emptyAuthoritativeListingDoesNotPruneFolds`,
 `SonarConversationFoldTests` empty `listedIds` + `listedAuthoritative`.
 
+Compose closed-node listing hole closed after this commit:
+`SonarCore.chats()` returned `[]` when the node was closed, and
+`refreshChats` treated that as a real empty account — wiping the
+in-memory list and persisting a blank chat snapshot. A closed node
+now throws; a failed listing keeps the painted snapshot. An empty
+success list (no chats) still replaces. iOS only assigns `groups`
+after a successful FFI read. Pin:
+`ConversationFoldTest.closedNodeListingDoesNotReplaceOrPersistCachedChats`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

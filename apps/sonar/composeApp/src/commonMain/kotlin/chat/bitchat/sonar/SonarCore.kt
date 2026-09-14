@@ -885,7 +885,8 @@ expect object SonarCore {
     /** The `#abcd` disambiguator for [pubkeyHex] — its last 4 hex, lowercased. */
     fun mentionShortSuffix(pubkeyHex: String): String?
 
-    /** All active Marmot chats we belong to. */
+    /** All active Marmot chats we belong to. Throws when the node is closed
+     *  so a seal/reconnect cannot look like a successful empty account. */
     suspend fun chats(): List<SonarChat>
 
     /** Live 0.9 group that replaced a recovered 0.8 row, or null if not folded. */

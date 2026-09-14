@@ -1374,6 +1374,27 @@ internal fun collapsedFoldDisplayChat(
  *  Persist-folds hide hist before core `fold_family`, so copy the recovered
  *  name / roster onto live here — otherwise group info and mentions only
  *  see people who already joined 0.9. */
+/**
+ * `SonarCore.chats()` must not look like a successful empty account when the
+ * node is closed (seal / reconnect). Null keeps the painted snapshot; an
+ * empty success list is a real zero-chat account.
+ */
+internal fun trustedChatListing(
+    loaded: List<SonarChat>?,
+    sessionReady: Boolean,
+): List<SonarChat>? = when {
+    loaded == null -> null
+    loaded.isNotEmpty() || sessionReady -> loaded
+    else -> null
+}
+
+internal fun chatListingOrCached(
+    loaded: List<SonarChat>?,
+    cached: List<SonarChat>,
+): List<SonarChat> = loaded ?: cached
+
+internal fun shouldPersistChatListing(loaded: List<SonarChat>?): Boolean = loaded != null
+
 internal fun collapsedFoldedSnapshotChats(
     chats: List<SonarChat>,
     historicalFolds: Map<String, String>,
@@ -1950,9 +1971,9 @@ internal fun purgedHistoricalFolds(
  * must pass [listedAuthoritative] = false so a recovered 0.8 row is not
  * forgotten before the live sibling appears.
  *
- * An empty listing is never authoritative: `SonarCore.chats()` returns `[]`
- * when the node is closed, and a transient empty `groups()` must not persist
- * an empty host fold blob. Wipe / delete already call [forgetHistoricalFolds].
+ * An empty listing is never authoritative: a closed node or reconnect
+ * must not persist an empty host fold blob. Wipe / delete already call
+ * [forgetHistoricalFolds].
  */
 internal fun prunedOrphanedHistoricalFolds(
     folds: Map<String, String>,
@@ -14108,8 +14129,12 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun refreshChatsInner() {
         val previousOrder = chats.map { it.id }
-        val loadedChats = SonarCore.chats()
-        val loadedOrCached = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
+        val loadedChats = runCatching { SonarCore.chats() }.getOrNull()
+        val trustedListing = trustedChatListing(
+            loaded = loadedChats,
+            sessionReady = localCoreReady || started,
+        )
+        val loadedOrCached = chatListingOrCached(trustedListing, chats)
         // Rediscover hist→live from FFI before first paint. After nsec restore
         // the host blob was wiped (previous account) and family walks would
         // otherwise miss the restored sidecar for one refresh cycle.
@@ -14169,7 +14194,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         promoteFoldedInFlightSends(previousOrder.toSet(), listedIds)
         promoteFoldedPendingMediaPreviews()
         promoteFoldedRetainedTranscripts(previousOrder.toSet(), listedIds)
-        if (localCoreReady || started || loadedChats.isNotEmpty()) {
+        if (shouldPersistChatListing(trustedListing)) {
             persistChatSnapshot()
         }
         refreshUnreadCounts()

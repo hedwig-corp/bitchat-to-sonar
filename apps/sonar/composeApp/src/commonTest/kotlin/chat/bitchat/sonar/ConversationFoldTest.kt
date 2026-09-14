@@ -2457,6 +2457,30 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun closedNodeListingDoesNotReplaceOrPersistCachedChats() {
+        val cached = listOf(
+            SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false),
+        )
+        assertEquals(cached, chatListingOrCached(loaded = null, cached = cached))
+        assertFalse(shouldPersistChatListing(null))
+        assertNull(trustedChatListing(loaded = null, sessionReady = true))
+        assertEquals(
+            emptyList<SonarChat>(),
+            trustedChatListing(loaded = emptyList(), sessionReady = true),
+        )
+        assertTrue(shouldPersistChatListing(emptyList()))
+        assertEquals(
+            emptyList<SonarChat>(),
+            chatListingOrCached(loaded = emptyList(), cached = cached),
+        )
+        assertEquals(cached, chatListingOrCached(trustedChatListing(null, sessionReady = false), cached))
+        assertEquals(
+            cached,
+            chatListingOrCached(trustedChatListing(emptyList(), sessionReady = false), cached),
+        )
+    }
+
+    @Test
     fun emptyAuthoritativeListingDoesNotPruneFolds() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

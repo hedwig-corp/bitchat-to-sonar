@@ -190,8 +190,9 @@ actual object SonarCore {
         )
 
     actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
-        val n = node ?: return@withContext emptyList()
-        n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs, isDirect = it.isDirect) }
+        requireNode().groups().map {
+            SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs, isDirect = it.isDirect)
+        }
     }
 
     actual fun liveFoldTarget(groupId: String): String? {
