@@ -295,6 +295,16 @@ func snResolvedMarmotAuthorName(
     return shortNpub(message.senderNpub)
 }
 
+/// `copy_summary` leaves live `message_count` at 0 on conflict but still
+/// copies `latest_*`. Count-only treated that as empty, so process-death
+/// home paint (no `messagesByGroup` extract) dropped preview + recency and
+/// buried the remounted row. Compose hydrate already uses `latestAtSecs > 0`.
+func snMarmotHomeRowSummaryKnownNonEmpty(
+    _ summary: MarmotService.ConversationSummary
+) -> Bool {
+    summary.messageCount > 0 || summary.latestAt.timeIntervalSince1970 > 0
+}
+
 /// Home-only projection of the core conversation index. Transcript pages stay
 /// bounded and authoritative; a synthetic row is used only when the summary is
 /// newer than the loaded page (or that group is outside the page window).
@@ -302,7 +312,7 @@ func snMarmotHomeRowMessage(
     loaded: MarmotService.MarmotMessage?,
     summary: MarmotService.ConversationSummary?
 ) -> MarmotService.MarmotMessage? {
-    guard let summary, summary.messageCount > 0 else { return loaded }
+    guard let summary, snMarmotHomeRowSummaryKnownNonEmpty(summary) else { return loaded }
     if let loaded {
         if loaded.createdAt > summary.latestAt { return loaded }
         if loaded.createdAt == summary.latestAt,

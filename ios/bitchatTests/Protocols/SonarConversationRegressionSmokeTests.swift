@@ -129,6 +129,27 @@ struct SonarConversationRegressionSmokeTests {
     }
 
     @Test
+    func copySummaryZeroCountStillPaintsHomeRowFromLatestAt() {
+        let summary = MarmotService.ConversationSummary(
+            groupIdHex: "group-09",
+            name: "",
+            latestContent: "recovered latest",
+            latestSenderNpub: npub(2),
+            latestAt: Date(timeIntervalSince1970: 1_700_000_000),
+            latestMine: false,
+            messageCount: 0,
+            unreadCount: 0
+        )
+
+        let row = snMarmotHomeRowMessage(loaded: nil, summary: summary)
+
+        #expect(snMarmotHomeRowSummaryKnownNonEmpty(summary))
+        #expect(row?.content == "recovered latest")
+        #expect(row?.createdAt == summary.latestAt)
+        #expect(row?.id == "summary:group-09:0")
+    }
+
+    @Test
     func retryDeliveryStateReturnsToSending() {
         let pending = MarmotService.MarmotMessage(
             id: "core-message",

@@ -117,6 +117,39 @@ class HomeMessageRowsTest {
     }
 
     @Test
+    fun copySummaryZeroCountStillHydratesPreviewFromLatestAt() {
+        // copy_summary leaves live message_count at 0 on conflict. After
+        // process death the host cache is empty; latestAt must still mint
+        // the home preview so the remounted row does not sink.
+        // iOS `snMarmotHomeRowMessage` now matches (latestAt-or-count).
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("group-09"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = listOf(
+                SonarConversationSummary(
+                    "group-09",
+                    "",
+                    "recovered latest",
+                    "peer",
+                    1_700_000_000L,
+                    false,
+                    0L,
+                    0L,
+                ),
+            ),
+            pages = emptyList(),
+            historicalFolds = mapOf("group-08" to "group-09"),
+        )
+        assertEquals(1_700_000_000L, hydration.latestByChat["group-09"])
+        assertEquals("recovered latest", hydration.messagesByChat["group-09"]?.single()?.content)
+        assertTrue(
+            hydration.messagesByChat["group-09"]?.single()?.id
+                ?.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX) == true,
+        )
+    }
+
+    @Test
     fun conversationIndexHydratesRowsOutsideBoundedTranscriptWindow() {
         val summaries = listOf(
             SonarConversationSummary("paged", "", "summary paged", "peer", 400L, false, 2L, 0L),

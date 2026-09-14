@@ -89,7 +89,7 @@ internal fun List<SonarMsg>.withoutSyntheticSummaryRows(): List<SonarMsg> =
  *  extract onto live before core `fold_family` exists, and chats outside
  *  the bounded home page window never get a page to put the rows back.
  *  iOS never writes synthetics into `messagesByGroup`; home paint uses
- *  `snMarmotHomeRowMessage` only. */
+ *  `snMarmotHomeRowMessage` only (`latestAt`-or-count after `copy_summary`). */
 internal fun hydrationHasRealTranscriptRows(rows: List<SonarMsg>): Boolean =
     rows.any { !it.id.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX) }
 

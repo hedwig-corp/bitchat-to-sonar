@@ -683,6 +683,35 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             )
         )
+        // copy_summary leaves live message_count at 0. Home paint must still
+        // use latestAt — otherwise process-death buries the remounted row.
+        let copied = MarmotService.ConversationSummary(
+            groupIdHex: "group-09",
+            name: "",
+            latestContent: "recovered latest",
+            latestSenderNpub: "npub1peer",
+            latestAt: Date(timeIntervalSince1970: 1_700_000_000),
+            latestMine: false,
+            messageCount: 0,
+            unreadCount: 0
+        )
+        #expect(snMarmotHomeRowSummaryKnownNonEmpty(copied))
+        #expect(snMarmotHomeRowMessage(loaded: nil, summary: copied)?.content == "recovered latest")
+        #expect(
+            snMarmotHomeRowMessage(loaded: nil, summary: copied)?.createdAt == copied.latestAt
+        )
+        let emptyLatest = MarmotService.ConversationSummary(
+            groupIdHex: "group-09",
+            name: "",
+            latestContent: "",
+            latestSenderNpub: "",
+            latestAt: Date(timeIntervalSince1970: 0),
+            latestMine: false,
+            messageCount: 0,
+            unreadCount: 0
+        )
+        #expect(!snMarmotHomeRowSummaryKnownNonEmpty(emptyLatest))
+        #expect(snMarmotHomeRowMessage(loaded: nil, summary: emptyLatest) == nil)
         #expect(
             snBlankTranscriptFamilyRendered(
                 groupId: "group-09",

@@ -1207,6 +1207,16 @@ used latest-or-count. iOS now matches. Pins:
 `SonarConversationFoldTests` `snBlankTranscriptKnownNonEmpty` latestAt,
 `ConversationFoldTest` `blankTranscriptKnownNonEmpty` latestByChat.
 
+iOS home-row latestAt hole closed after this commit: the same
+`copy_summary` zero-count left `snMarmotHomeRowMessage` returning nil
+when process death cleared `messagesByGroup`. Preview became the
+generic placeholder and `lastDate` sorted as distantPast, burying the
+recovered row. Compose hydrate already mints a synthetic from
+`latestAtSecs > 0`. iOS home paint now matches. Pins:
+`SonarConversationFoldTests` `snMarmotHomeRowMessage` zero-count latestAt,
+`SonarConversationRegressionSmokeTests.copySummaryZeroCountStillPaintsHomeRowFromLatestAt`,
+`HomeMessageRowsTest.copySummaryZeroCountStillHydratesPreviewFromLatestAt`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
