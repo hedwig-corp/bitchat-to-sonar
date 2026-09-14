@@ -1225,8 +1225,15 @@ internal fun quotedJumpParentId(
     chatId: String,
     jumps: Map<String, String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String? {
-    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
         jumps[id]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
     }
     return null
@@ -1234,31 +1241,47 @@ internal fun quotedJumpParentId(
 
 /** Write the Jump parent onto every fold-family key so a quote tap that
  *  lands after maps were copied but before nav remount still expands
- *  the live sibling. iOS `snQuotedJumpWritten`. */
+ *  the live sibling. Empty wake-mute persist still stamps the remount
+ *  pair. iOS `snQuotedJumpWritten`. */
 internal fun quotedJumpWritten(
     chatId: String,
     parentId: String,
     jumps: Map<String, String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, String> {
     val parent = parentId.trim()
     if (parent.isEmpty()) return jumps
     var next = jumps
-    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
         next = next + (id to parent)
     }
     return next
 }
 
 /** Drop the Jump parent from every fold-family key so Leave cannot
- *  resurrect it on the live sibling. iOS `snQuotedJumpCleared`. */
+ *  resurrect it on the live sibling. Empty persist still clears the
+ *  remount pair. iOS `snQuotedJumpCleared`. */
 internal fun quotedJumpCleared(
     chatId: String,
     jumps: Map<String, String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, String> {
     var next = jumps
-    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
         if (id in next) next = next - id
     }
     return next
@@ -2413,27 +2436,88 @@ internal fun composerDraftForChat(
     chatId: String,
     drafts: Map<String, String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String {
     drafts[chatId]?.takeIf { it.isNotEmpty() }?.let { return it }
-    for (id in foldFamilyIds(chatId, historicalFolds)) {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
         if (id == chatId) continue
         drafts[id]?.takeIf { it.isNotEmpty() }?.let { return it }
     }
     return ""
 }
 
-/** Write the draft onto [chatId] and drop leftover family keys so a clear cannot resurrect hist text. */
+/** Write the draft onto [chatId] and drop leftover family keys so a clear
+ *  cannot resurrect hist text. Empty wake-mute persist still clears the
+ *  remount-pair live copy remount already stamped. */
 internal fun composerDraftsAfterEdit(
     drafts: Map<String, String>,
     chatId: String,
     text: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, String> {
     var next = drafts
-    for (id in foldFamilyIds(chatId, historicalFolds)) {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
         if (id != chatId && id in next) next = next - id
     }
     return updatedComposerDrafts(next, chatId, text)
+}
+
+/** Read a reply chip from the open id or its remount / fold sibling.
+ *  iOS `snComposerReply`. */
+internal fun <Reply> composerReplyForChat(
+    chatId: String,
+    replies: Map<String, Reply>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Reply? {
+    replies[chatId]?.let { return it }
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (id == chatId) continue
+        replies[id]?.let { return it }
+    }
+    return null
+}
+
+/** Drop the reply chip from every remount / fold sibling so send / cancel
+ *  cannot leave a leftover that persist-folds later resurrects.
+ *  iOS `snComposerRepliesAfterClear`. */
+internal fun <Reply> composerRepliesAfterClear(
+    replies: Map<String, Reply>,
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Reply> {
+    var next = replies
+    next = next - chatId
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (id in next) next = next - id
+    }
+    return next
 }
 
 /** Latest trill cooldown across the fold family. */
@@ -4088,10 +4172,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         adoptActionHistoricalFolds(folds)
         if (folds != beforeFolds) persistHistoricalFolds()
         val ids = transcriptGroupIds(chatId)
+        val (opened, pane) = remountPairForOpenChat(chatId)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
         openChatJumpMessageId = if (jumpMessageId != null) {
-            quotedJumpWritten(chatId, jumpMessageId, openChatJumpMessageId, historicalFoldMap)
-        } else if (quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap) == null) {
+            quotedJumpWritten(
+                chatId,
+                jumpMessageId,
+                openChatJumpMessageId,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+        } else if (quotedJumpParentId(
+                chatId,
+                openChatJumpMessageId,
+                historicalFoldMap,
+                opened,
+                pane,
+            ) == null
+        ) {
             openChatJumpMessageId - chatId
         } else {
             openChatJumpMessageId
@@ -4132,12 +4231,26 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun retireOpenChatUnread(chatId: String) {
         openChatUnread = openChatUnread + (chatId to 0L)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
-        openChatJumpMessageId = quotedJumpCleared(chatId, openChatJumpMessageId, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatJumpMessageId = quotedJumpCleared(
+            chatId,
+            openChatJumpMessageId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     /** Drop a one-shot Jump target after the host applied (or soft-failed) it. */
     fun clearOpenChatJump(chatId: String) {
-        openChatJumpMessageId = quotedJumpCleared(chatId, openChatJumpMessageId, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatJumpMessageId = quotedJumpCleared(
+            chatId,
+            openChatJumpMessageId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     /** Account wipe/erase: per-open transcript state must not outlive the
@@ -5865,17 +5978,27 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val composerDrafts = mutableStateMapOf<String, String>()
     private val composerReplyByChat = mutableStateMapOf<String, SonarReplyRef>()
 
-    fun composerDraft(chatId: String): String =
-        composerDraftForChat(chatId, composerDrafts.toMap(), historicalFoldMap)
+    fun composerDraft(chatId: String): String {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return composerDraftForChat(
+            chatId,
+            composerDrafts.toMap(),
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
 
     fun composerReply(chatId: String): SonarReplyRef? {
         if (!sonarReplyUiEnabled()) return null
-        composerReplyByChat[chatId]?.let { return it }
-        for (id in foldFamilyIds(chatId, historicalFoldMap)) {
-            if (id == chatId) continue
-            composerReplyByChat[id]?.let { return it }
-        }
-        return null
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return composerReplyForChat(
+            chatId,
+            composerReplyByChat.toMap(),
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     fun beginReply(chatId: String, message: SonarMsg, preview: String, author: String? = null) {
@@ -5891,9 +6014,16 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun cancelReply(chatId: String) {
-        for (id in foldFamilyIds(chatId, historicalFoldMap).ifEmpty { setOf(chatId) }) {
-            composerReplyByChat.remove(id)
-        }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val next = composerRepliesAfterClear(
+            composerReplyByChat.toMap(),
+            chatId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        val stale = composerReplyByChat.keys - next.keys
+        for (id in stale) composerReplyByChat.remove(id)
     }
 
     /** Quote-chip parent from the fold-family cache, then the painted page. */
@@ -5911,18 +6041,23 @@ class SonarAppState(private val scope: CoroutineScope) {
             val bounded = refreshConversationRows(cached, sessionId, transcriptGeneration)
             setCurrentVisibleMessages(sessionId, withSendEchoes(sessionId, bounded))
         }
+        val (opened, pane) = remountPairForOpenChat(chatId)
         openChatJumpMessageId = quotedJumpWritten(
             chatId,
             trimmed,
             openChatJumpMessageId,
             historicalFoldMap,
+            opened,
+            pane,
         )
     }
 
     /** Jump parent for the open transcript. Walks hist / live aliases so
      *  remount cannot hide a recovered 0.8 quote. */
-    fun jumpMessageIdForChat(chatId: String): String? =
-        quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap)
+    fun jumpMessageIdForChat(chatId: String): String? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap, opened, pane)
+    }
 
     /** After a load-older miss, expand the painted page if the parent
      *  just landed in the family cache. Size-only quote-jump effects
@@ -5964,16 +6099,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun consumeComposerReply(chatId: String): SonarReplyRef? {
-        val family = foldFamilyIds(chatId, historicalFoldMap).ifEmpty { setOf(chatId) }
-        val reply = composerReplyByChat[chatId]
-            ?: family.firstNotNullOfOrNull { composerReplyByChat[it] }
-        for (id in family) composerReplyByChat.remove(id)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val current = composerReplyByChat.toMap()
+        val reply = composerReplyForChat(chatId, current, historicalFoldMap, opened, pane)
+        val next = composerRepliesAfterClear(current, chatId, historicalFoldMap, opened, pane)
+        val stale = current.keys - next.keys
+        for (id in stale) composerReplyByChat.remove(id)
         return reply
     }
 
     fun setComposerDraft(chatId: String, text: String) {
         val current = composerDrafts.toMap()
-        val next = composerDraftsAfterEdit(current, chatId, text, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val next = composerDraftsAfterEdit(current, chatId, text, historicalFoldMap, opened, pane)
         if (next == current) return
         val stale = current.keys - next.keys
         for (id in stale) composerDrafts.remove(id)
@@ -9769,7 +9907,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             retainOpenTranscript(it.id, messages)
             openChatUnread = openChatUnread - it.id
             openChatUnreadAnchor = openChatUnreadAnchor - it.id
-            openChatJumpMessageId = quotedJumpCleared(it.id, openChatJumpMessageId, historicalFoldMap)
+            val (opened, pane) = remountPairForOpenChat(it.id)
+            openChatJumpMessageId = quotedJumpCleared(
+                it.id,
+                openChatJumpMessageId,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
         }
         if (stack.size > 1) stack = stack.dropLast(1)
         restoreRevealedChatOrClear()

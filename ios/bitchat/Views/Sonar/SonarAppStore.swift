@@ -1009,11 +1009,15 @@ func snQuotedJumpParentId(
     conversationId: String,
     jumps: [String: String],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> String? {
     for key in snPaymentActivityPeerKeys(
         conversationId: conversationId,
         historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
         prefix: prefix
     ) {
         if let parent = jumps[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1026,12 +1030,16 @@ func snQuotedJumpParentId(
 
 /// Write the Jump parent onto every fold-family key (bare + `marmot:`).
 /// A quote tap that lands after maps were copied but before nav remount
-/// must still expand the live sibling. Compose `quotedJumpWritten`.
+/// must still expand the live sibling. Empty wake-mute persist still
+/// stamps the remount pair so a hist write is visible on live.
+/// Compose `quotedJumpWritten`.
 func snQuotedJumpWritten(
     conversationId: String,
     parentId: String,
     jumps: [String: String],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> [String: String] {
     let parent = parentId.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1040,6 +1048,8 @@ func snQuotedJumpWritten(
     for key in snPaymentActivityPeerKeys(
         conversationId: conversationId,
         historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
         prefix: prefix
     ) {
         next[key] = parent
@@ -1048,17 +1058,22 @@ func snQuotedJumpWritten(
 }
 
 /// Drop the Jump parent from every fold-family key so Leave cannot
-/// resurrect it on the live sibling. Compose `quotedJumpCleared`.
+/// resurrect it on the live sibling. Empty persist still clears the
+/// remount pair. Compose `quotedJumpCleared`.
 func snQuotedJumpCleared(
     conversationId: String,
     jumps: [String: String],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> [String: String] {
     var next = jumps
     for key in snPaymentActivityPeerKeys(
         conversationId: conversationId,
         historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
         prefix: prefix
     ) {
         next[key] = nil
@@ -2766,35 +2781,94 @@ func snComposerDraft(
     chatId: String,
     drafts: [String: String],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> String {
     if let draft = drafts[chatId], !draft.isEmpty { return draft }
-    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
-    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
-        for key in [alias, prefix + alias] where key != chatId {
-            if let draft = drafts[key], !draft.isEmpty { return draft }
-        }
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) where key != chatId {
+        if let draft = drafts[key], !draft.isEmpty { return draft }
     }
     return ""
 }
 
 /// Write the draft onto `chatId` and drop leftover family keys so a clear
-/// cannot resurrect hist text.
+/// cannot resurrect hist text. Empty wake-mute persist still clears the
+/// remount-pair live copy remount already stamped.
 func snComposerDraftsAfterEdit(
     drafts: [String: String],
     chatId: String,
     text: String,
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> [String: String] {
     var next = drafts
-    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
-    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
-        for key in [alias, prefix + alias] where key != chatId {
-            next[key] = nil
-        }
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) where key != chatId {
+        next[key] = nil
     }
     return snUpdatedComposerDrafts(drafts: next, chatId: chatId, text: text)
+}
+
+/// Read a reply chip from the open id or its remount / fold sibling.
+/// Compose `composerReplyForChat`.
+func snComposerReply<Reply>(
+    chatId: String,
+    replies: [String: Reply],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Reply? {
+    if let reply = replies[chatId] { return reply }
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) where key != chatId {
+        if let reply = replies[key] { return reply }
+    }
+    return nil
+}
+
+/// Drop the reply chip from every remount / fold sibling so send / cancel
+/// cannot leave a live leftover that persist-folds later resurrects.
+/// Compose `composerRepliesAfterClear`.
+func snComposerRepliesAfterClear<Reply>(
+    replies: [String: Reply],
+    chatId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: Reply] {
+    var next = replies
+    next[chatId] = nil
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        next[key] = nil
+    }
+    return next
 }
 
 /// Rewrite a pending-upload cache key off a hidden 0.8 group id.
@@ -4480,22 +4554,31 @@ final class SonarAppStore: ObservableObject {
 
     func composerDraft(for chatId: String) -> String {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        return snComposerDraft(chatId: chatId, drafts: composerDrafts, historicalFolds: folds)
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        return snComposerDraft(
+            chatId: chatId,
+            drafts: composerDrafts,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     static var replyUIEnabled: Bool { snReplyUIEnabled() }
 
     func composerReply(for chatId: String) -> SNReplyRef? {
         guard Self.replyUIEnabled else { return nil }
-        if let reply = composerReplyByChat[chatId] { return reply }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let bare = snBareMarmotGroupId(chatId)
-        for alias in snFoldFamilyIds(id: bare, historicalFolds: folds) {
-            for key in [alias, Self.marmotIDPrefix + alias] where key != chatId {
-                if let reply = composerReplyByChat[key] { return reply }
-            }
-        }
-        return nil
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        return snComposerReply(
+            chatId: chatId,
+            replies: composerReplyByChat,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     func beginReply(chatId: String, to message: SNMessage) {
@@ -4523,21 +4606,28 @@ final class SonarAppStore: ObservableObject {
 
     func cancelReply(chatId: String) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let bare = snBareMarmotGroupId(chatId)
-        for alias in snFoldFamilyIds(id: bare, historicalFolds: folds) {
-            composerReplyByChat[alias] = nil
-            composerReplyByChat[Self.marmotIDPrefix + alias] = nil
-        }
-        composerReplyByChat[chatId] = nil
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        composerReplyByChat = snComposerRepliesAfterClear(
+            replies: composerReplyByChat,
+            chatId: chatId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     func jumpToQuotedMessage(chatId: String, parentId: String) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
             conversationId: chatId,
             parentId: parentId,
             jumps: jumpMessageIdAtOpenByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
         // `ConversationViewState.rebuildNow` expands `visibleMessageLimit`
         // when the parent already sits in the family-unioned host cache.
@@ -4548,26 +4638,35 @@ final class SonarAppStore: ObservableObject {
     /// aliases so remount cannot hide a recovered 0.8 quote.
     func jumpMessageIdAtOpen(for conversationId: String) -> String? {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         return snQuotedJumpParentId(
             conversationId: conversationId,
             jumps: jumpMessageIdAtOpenByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 
     private func consumeComposerReply(for chatId: String) -> SNReplyRef? {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let bare = snBareMarmotGroupId(chatId)
-        let family = snFoldFamilyIds(id: bare, historicalFolds: folds)
-        let reply = composerReplyByChat[chatId]
-            ?? family.compactMap({
-                composerReplyByChat[$0] ?? composerReplyByChat[Self.marmotIDPrefix + $0]
-            }).first
-        composerReplyByChat[chatId] = nil
-        for alias in family {
-            composerReplyByChat[alias] = nil
-            composerReplyByChat[Self.marmotIDPrefix + alias] = nil
-        }
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let reply = snComposerReply(
+            chatId: chatId,
+            replies: composerReplyByChat,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        composerReplyByChat = snComposerRepliesAfterClear(
+            replies: composerReplyByChat,
+            chatId: chatId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
         return reply
     }
 
@@ -4581,19 +4680,25 @@ final class SonarAppStore: ObservableObject {
 
     func setComposerDraft(_ text: String, for chatId: String) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         var nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
-        let bare = snBareMarmotGroupId(chatId)
-        for alias in snFoldFamilyIds(id: bare, historicalFolds: folds) {
-            for key in [alias, Self.marmotIDPrefix + alias] where key != chatId {
-                nextFlags[key] = nil
-            }
+        for key in snPaymentActivityPeerKeys(
+            conversationId: chatId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) where key != chatId {
+            nextFlags[key] = nil
         }
         if nextFlags != composerDraftHasText { composerDraftHasText = nextFlags }
         let next = snComposerDraftsAfterEdit(
             drafts: composerDrafts,
             chatId: chatId,
             text: text,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
         guard next != composerDrafts else { return }
         composerDrafts = next
@@ -12739,26 +12844,36 @@ final class SonarAppStore: ObservableObject {
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         if let jump = snQuotedJumpParentId(
             conversationId: id,
             jumps: pendingJumpMessageIdByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         ) {
             pendingJumpMessageIdByDM = snQuotedJumpCleared(
                 conversationId: id,
                 jumps: pendingJumpMessageIdByDM,
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             )
             jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
                 conversationId: id,
                 parentId: jump,
                 jumps: jumpMessageIdAtOpenByDM,
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             )
         } else if snQuotedJumpParentId(
             conversationId: id,
             jumps: jumpMessageIdAtOpenByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         ) == nil {
             jumpMessageIdAtOpenByDM[id] = nil
         }

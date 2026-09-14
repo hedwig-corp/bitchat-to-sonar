@@ -2512,6 +2512,35 @@ class ConversationFoldTest {
         assertEquals("parent-08", quotedJumpParentId("group-09", histJump, folds))
         assertEquals("parent-08", quotedJumpParentId("group-08", histJump, folds))
         assertNull(quotedJumpParentId("group-09", histJump, emptyMap()))
+        assertEquals(
+            "parent-08",
+            quotedJumpParentId(
+                "group-09",
+                histJump,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        val remountWritten = quotedJumpWritten(
+            "group-08",
+            "parent-08",
+            emptyMap(),
+            emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("parent-08", remountWritten["group-08"])
+        assertEquals("parent-08", remountWritten["group-09"])
+        val remountCleared = quotedJumpCleared(
+            "group-08",
+            remountWritten,
+            emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertNull(remountCleared["group-08"])
+        assertNull(remountCleared["group-09"])
         val written = quotedJumpWritten("group-08", "parent-08", emptyMap(), folds)
         assertEquals("parent-08", written["group-08"])
         assertEquals("parent-08", written["group-09"])
@@ -2527,6 +2556,57 @@ class ConversationFoldTest {
         assertEquals("hello from 0.8", composerDraftForChat("group-09", drafts, folds))
         assertEquals("hello from 0.8", composerDraftForChat("group-08", drafts, folds))
         assertEquals("", composerDraftForChat("group-09", drafts, emptyMap()))
+        assertEquals(
+            "hello from 0.8",
+            composerDraftForChat(
+                "group-09",
+                drafts,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        val remounted = mapOf("group-08" to "hello from 0.8", "group-09" to "hello from 0.8")
+        assertEquals(
+            emptyMap<String, String>(),
+            composerDraftsAfterEdit(
+                remounted,
+                "group-08",
+                "",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "reply-08",
+            composerReplyForChat(
+                "group-09",
+                mapOf("group-08" to "reply-08"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            emptyMap<String, String>(),
+            composerRepliesAfterClear(
+                mapOf("group-08" to "reply-08", "group-09" to "reply-08"),
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertNull(
+            composerReplyForChat(
+                "group-other",
+                mapOf("group-08" to "reply-08"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertEquals(
             mapOf("group-09" to "hello from 0.8"),
             composerDraftsAfterEdit(drafts, "group-09", "hello from 0.8", folds),

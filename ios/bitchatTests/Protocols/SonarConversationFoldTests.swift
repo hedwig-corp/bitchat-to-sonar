@@ -452,6 +452,46 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == "hello from 0.8"
         )
+        #expect(
+            snComposerDraft(
+                chatId: "marmot:group-09",
+                drafts: remountedDrafts,
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "hello from 0.8"
+        )
+        #expect(
+            snComposerDraftsAfterEdit(
+                drafts: remountedDrafts,
+                chatId: "marmot:group-08",
+                text: "",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ).isEmpty
+        )
+        #expect(
+            snComposerReply(
+                chatId: "marmot:group-09",
+                replies: ["marmot:group-08": "reply-08"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "reply-08"
+        )
+        #expect(
+            snComposerRepliesAfterClear(
+                replies: [
+                    "marmot:group-08": "reply-08",
+                    "marmot:group-09": "reply-08"
+                ],
+                chatId: "marmot:group-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ).isEmpty
+        )
         // Persist-folds + `setComposerDraft("", hist)` family-clears live.
         // Remount must copy, not clear, or the iPhone hist pane loses the draft.
         #expect(
@@ -2640,6 +2680,37 @@ struct SonarConversationFoldTests {
                 jumps: ["group-08": "parent-08"],
                 historicalFolds: [:]
             ) == nil
+        )
+        #expect(
+            snQuotedJumpParentId(
+                conversationId: "marmot:group-09",
+                jumps: ["marmot:group-08": "parent-08"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "parent-08"
+        )
+        #expect(
+            snQuotedJumpWritten(
+                conversationId: "marmot:group-08",
+                parentId: "parent-08",
+                jumps: [:],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )["marmot:group-09"] == "parent-08"
+        )
+        #expect(
+            snQuotedJumpCleared(
+                conversationId: "marmot:group-08",
+                jumps: [
+                    "marmot:group-08": "parent-08",
+                    "marmot:group-09": "parent-08"
+                ],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )["marmot:group-09"] == nil
         )
         #expect(
             snQuotedJumpWritten(
