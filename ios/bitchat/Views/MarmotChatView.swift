@@ -2743,18 +2743,20 @@ final class MarmotChatModel: ObservableObject {
             guard hydrateMetadata else { return true }
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
-            let summaries = await service.conversationSummaries()
+            let summaries = try? await service.conversationSummaries()
             let listed = publishedGroups(groups)
             let activeGroupIds = Set(listed.map(\.id))
             // Re-read after `groups()` — FFI restore can publish a new bind
             // that the transcript-page snapshot above did not have.
             let latestFolds = historicalFoldsMap()
-            self.conversationSummariesByGroup = snRemountedConversationSummaries(
-                summaries: summaries,
-                activeGroupIds: activeGroupIds,
-                historicalFolds: latestFolds
-            )
-            self.publishUnread(from: summaries)
+            if SNUnreadCounts.shouldPublish(summaries), let summaries {
+                self.conversationSummariesByGroup = snRemountedConversationSummaries(
+                    summaries: summaries,
+                    activeGroupIds: activeGroupIds,
+                    historicalFolds: latestFolds
+                )
+                self.publishUnread(from: summaries)
+            }
             self.groups = listed
             dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
@@ -2983,7 +2985,7 @@ final class MarmotChatModel: ObservableObject {
     /// must not depend on it.
     func unreadCount(forGroups groupIds: [String]) async -> UInt64 {
         let wanted = Set(groupIds)
-        let summaries = await service.conversationSummaries()
+        let summaries = (try? await service.conversationSummaries()) ?? []
         return summaries
             .filter { wanted.contains($0.groupIdHex) }
             .reduce(UInt64(0)) { $0 + $1.unreadCount }
@@ -3002,15 +3004,17 @@ final class MarmotChatModel: ObservableObject {
                 groupLimit: Self.localSummaryGroupLimit,
                 pageLimit: Self.localSummaryPageLimit
             )
-            let summaries = await service.conversationSummaries()
+            let summaries = try? await service.conversationSummaries()
             let listed = publishedGroups(groups)
             let activeGroupIds = Set(listed.map(\.id))
             let folds = historicalFoldsMap()
-            self.conversationSummariesByGroup = snRemountedConversationSummaries(
-                summaries: summaries,
-                activeGroupIds: activeGroupIds,
-                historicalFolds: folds
-            )
+            if SNUnreadCounts.shouldPublish(summaries), let summaries {
+                self.conversationSummariesByGroup = snRemountedConversationSummaries(
+                    summaries: summaries,
+                    activeGroupIds: activeGroupIds,
+                    historicalFolds: folds
+                )
+            }
             // All service reads above suspend. Snapshot the live dictionary only
             // after they finish, then merge each result into that latest state in
             // one main-actor segment. A summary refresh can therefore never
@@ -3075,7 +3079,9 @@ final class MarmotChatModel: ObservableObject {
                 to: activeGroupIds,
                 liveFoldTarget: { snPersistedLiveFoldTarget(groupId: $0, historicalFolds: folds) }
             )
-            self.publishUnread(from: summaries)
+            if SNUnreadCounts.shouldPublish(summaries), let summaries {
+                self.publishUnread(from: summaries)
+            }
             self.groups = listed
             dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
@@ -3411,11 +3417,13 @@ final class MarmotChatModel: ObservableObject {
             // Viewing suppress still covers an open DM; without this release a
             // failed/raced mark could hide real unread for the rest of the process.
             for id in ids { unreadSuppressGroupIds.remove(id) }
-            // Always reconcile. `readOnlyNonThrowing` maps FFI failure to [],
-            // which clears badges until the next successful summary load — the
-            // same self-correcting window as Compose's null-vs-empty split, and
-            // required so an empty inbox still drops stale dots.
-            publishUnread(from: await service.conversationSummaries())
+            // Failed probe must not look like a successful empty inbox
+            // (Compose `shouldApplyUnreadCounts`). Empty success still
+            // drops stale dots.
+            let summaries = try? await service.conversationSummaries()
+            if SNUnreadCounts.shouldPublish(summaries), let summaries {
+                publishUnread(from: summaries)
+            }
         }
     }
 

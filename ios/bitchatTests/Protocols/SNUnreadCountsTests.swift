@@ -23,6 +23,14 @@ struct SNUnreadCountsTests {
     }
 
     @Test
+    func failedSummariesProbeDoesNotPublishUnread() {
+        let emptyInbox: [String]? = []
+        let failed: [String]? = nil
+        #expect(SNUnreadCounts.shouldPublish(emptyInbox))
+        #expect(!SNUnreadCounts.shouldPublish(failed))
+    }
+
+    @Test
     func pruneKeepsOnlyGroupsStillUnreadInCore() {
         let suppressed: Set<String> = ["g-inflight", "g-done", "g-missing"]
         let summaries: [(groupIdHex: String, unreadCount: UInt64)] = [

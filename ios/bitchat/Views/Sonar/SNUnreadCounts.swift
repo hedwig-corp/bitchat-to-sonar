@@ -10,6 +10,11 @@
 import Foundation
 
 enum SNUnreadCounts {
+    /// A failed summaries probe must not look like a successful empty inbox.
+    static func shouldPublish<T>(_ loaded: [T]?) -> Bool {
+        loaded != nil
+    }
+
     /// Build the published unread map, skipping suppressed group ids.
     static func unreadByGroup(
         from summaries: [(groupIdHex: String, unreadCount: UInt64)],

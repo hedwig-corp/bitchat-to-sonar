@@ -1346,6 +1346,15 @@ pending welcomes. Those actuals now throw; invite assign uses
 only assigns on a successful `try`. Pin:
 `ConversationFoldTest.closedNodeInviteProbeDoesNotClearCachedWelcomes`.
 
+iOS `conversationSummaries()` used `readOnlyNonThrowing` and answered
+`[]` on a closed node, so `publishUnread` wiped every badge. It now
+throws; hosts skip unread publish when the probe is nil
+(`SNUnreadCounts.shouldPublish` / Compose `shouldApplyUnreadCounts`).
+Empty success still clears stale dots. Pin:
+`ConversationFoldTest.closedNodeInviteProbeDoesNotClearCachedWelcomes`
+(`shouldApplyUnreadCounts`),
+`SNUnreadCountsTests.failedSummariesProbeDoesNotPublishUnread`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

@@ -3012,7 +3012,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             unreadSuppressGroupIds.removeAll(marked)
             // null = FFI failure — keep the current map (do not wipe every badge).
             // emptyList() is a real empty inbox and must clear badges.
-            if (summaries != null) applyUnreadCounts(summaries)
+            if (shouldApplyUnreadCounts(summaries)) {
+                applyUnreadCounts(requireNotNull(summaries))
+            }
         }
     }
 
@@ -14775,8 +14777,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun refreshUnreadCounts() {
         // null = FFI failure — keep the current map (same guard as markGroupsRead).
         val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
-            ?: return
-        applyUnreadCounts(summaries)
+        if (!shouldApplyUnreadCounts(summaries)) return
+        applyUnreadCounts(requireNotNull(summaries))
     }
 
     private fun applyUnreadCounts(summaries: List<SonarConversationSummary>) {
@@ -14899,7 +14901,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val summaryByChat = summaries.associateBy { it.groupIdHex }
         // Only publish unread on a successful probe — getOrDefault(emptyList())
         // on failure would wipe every badge until the next cycle.
-        if (summariesResult.isSuccess) applyUnreadCounts(summaries)
+        if (shouldApplyUnreadCounts(summariesResult.getOrNull())) applyUnreadCounts(summaries)
         // Incremental scan: only chats whose newest ts moved past the watermark
         // need a page fetch + ☎CALL / pay re-scan. Everything else is skipped —
         // this replaces the old O(chats) messagesPage()+re-parse every 4 s.

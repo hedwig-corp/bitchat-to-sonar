@@ -2502,6 +2502,8 @@ class ConversationFoldTest {
             emptyList(),
             pendingInvitesOrCached(loaded = emptyList(), cached = emptyList()),
         )
+        assertFalse(shouldApplyUnreadCounts(null))
+        assertTrue(shouldApplyUnreadCounts(emptyList()))
     }
 
     @Test

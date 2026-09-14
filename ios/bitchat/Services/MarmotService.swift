@@ -2215,9 +2215,9 @@ final class MarmotService: @unchecked Sendable {
 
     // MARK: - Conversation index (Signal-style summary table)
 
-    func conversationSummaries() async -> [ConversationSummary] {
-        await readOnlyNonThrowing({ node in
-            node.conversationSummaries().map {
+    func conversationSummaries() async throws -> [ConversationSummary] {
+        try await readOnly {
+            $0.conversationSummaries().map {
                 ConversationSummary(
                     groupIdHex: $0.groupIdHex,
                     name: $0.name,
@@ -2229,7 +2229,7 @@ final class MarmotService: @unchecked Sendable {
                     unreadCount: $0.unreadCount
                 )
             }
-        }, default: [])
+        }
     }
 
     func markConversationRead(groupId: String) async {

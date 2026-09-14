@@ -8,6 +8,10 @@ package chat.bitchat.sonar
  * async `markConversationRead` FFI is still in flight — that race is what made
  * the unread indicator flaky after opening a chat.
  */
+/** A failed summaries probe must not look like a successful empty inbox. */
+internal fun shouldApplyUnreadCounts(loaded: List<SonarConversationSummary>?): Boolean =
+    loaded != null
+
 internal fun unreadCountsFromSummaries(
     summaries: List<SonarConversationSummary>,
     suppressGroupIds: Set<String> = emptySet(),
