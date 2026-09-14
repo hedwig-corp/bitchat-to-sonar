@@ -1105,6 +1105,26 @@ func snRetainedTranscriptForChat<Message>(
     return []
 }
 
+/// Prefer last leave paint, then union remounted family snapshot rows so a
+/// short live leave-frame cannot hide recovered 0.8 history.
+/// Compose `firstOpenTranscriptPaintRows`.
+func snFirstOpenTranscriptPaintRows<Message>(
+    chatId: String,
+    retainedByChat: [String: [Message]],
+    snapshotPaint: [Message],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String
+) -> [Message] {
+    let retained = snRetainedTranscriptForChat(
+        chatId: chatId,
+        retainedByChat: retainedByChat,
+        historicalFolds: historicalFolds
+    )
+    if retained.isEmpty { return snapshotPaint }
+    if snapshotPaint.isEmpty { return retained }
+    return snMergedFoldedMessageLists(historical: snapshotPaint, live: retained, idOf: idOf)
+}
+
 /// Read a draft from the open id or its hidden 0.8 sibling after a fold.
 func snComposerDraft(
     chatId: String,

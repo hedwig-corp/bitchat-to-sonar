@@ -1045,7 +1045,7 @@ class ConversationFoldTest {
         assertEquals(historical, retainedTranscriptForChat("group-08", retained, folds))
         assertEquals(emptyList(), retainedTranscriptForChat("group-09", retained, emptyMap()))
         assertEquals(
-            historical,
+            listOf(historical.single(), snapshot.single()),
             firstOpenTranscriptPaintRows("group-09", retained, snapshot, folds),
         )
         assertEquals(
@@ -1055,6 +1055,18 @@ class ConversationFoldTest {
         assertEquals(
             snapshot,
             firstOpenTranscriptPaintRows("group-09", emptyMap(), snapshot, folds),
+        )
+        val liveLeave = listOf(
+            SonarMsg(id = "m-live", senderNpub = "npub1me", content = "new 0.9", mine = true, tsSecs = 3L),
+        )
+        assertEquals(
+            listOf(historical.single(), liveLeave.single()),
+            firstOpenTranscriptPaintRows(
+                "group-09",
+                mapOf("group-09" to liveLeave),
+                historical,
+                folds,
+            ),
         )
     }
 

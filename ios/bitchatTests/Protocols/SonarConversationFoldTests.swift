@@ -749,6 +749,24 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ).isEmpty
         )
+        #expect(
+            snFirstOpenTranscriptPaintRows(
+                chatId: "marmot:group-09",
+                retainedByChat: ["marmot:group-09": ["new 0.9"]],
+                snapshotPaint: ["old from 0.8"],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0 }
+            ) == ["new 0.9", "old from 0.8"]
+        )
+        #expect(
+            snFirstOpenTranscriptPaintRows(
+                chatId: "marmot:group-09",
+                retainedByChat: ["marmot:group-08": ["old from 0.8"]],
+                snapshotPaint: ["snap"],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0 }
+            ) == ["old from 0.8", "snap"]
+        )
         #expect(snPersistedLiveFoldTarget(groupId: "group-08", historicalFolds: ["group-08": "group-09"]) == "group-09")
         #expect(snPersistedLiveFoldTarget(groupId: "group-09", historicalFolds: ["group-08": "group-09"]) == nil)
         #expect(

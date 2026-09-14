@@ -1132,7 +1132,9 @@ internal fun retainedTranscriptForChat(
     return emptyList()
 }
 
-/** Prefer last leave paint (including a hidden 0.8 sibling), else snapshot. */
+/** Prefer last leave paint (including a hidden 0.8 sibling), then union any
+ *  remounted family snapshot rows so a short live leave-frame cannot hide
+ *  recovered 0.8 history. iOS `snFirstOpenTranscriptPaintRows`. */
 internal fun firstOpenTranscriptPaintRows(
     chatId: String,
     retainedByChat: Map<String, List<SonarMsg>>,
@@ -1140,7 +1142,11 @@ internal fun firstOpenTranscriptPaintRows(
     historicalFolds: Map<String, String>,
 ): List<SonarMsg> {
     val retained = retainedTranscriptForChat(chatId, retainedByChat, historicalFolds)
-    return if (retained.isNotEmpty()) retained else snapshotPaint
+    val snapshot = snapshotPaint.withoutSyntheticSummaryRows()
+    if (retained.isEmpty()) return snapshot
+    if (snapshot.isEmpty()) return retained
+    return mergedFoldedMessageLists(snapshot, retained) { it.id }
+        .sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
 }
 
 /** Read a draft from the open id or its hidden 0.8 sibling after a fold. */
@@ -7350,7 +7356,22 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (retainedTranscriptByChat[chat.id].isNullOrEmpty()) {
                 retainOpenTranscript(chat.id, retained)
             }
-            messages = retained
+            val snapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
+            val union = firstOpenTranscriptPaintRows(
+                chat.id,
+                retainedTranscriptByChat,
+                snapshot,
+                historicalFoldMap,
+            )
+            seedFoldFamilyTranscriptWindows(chat.id, union)
+            messages = visibleMessagesForChat(
+                chat.id,
+                withSendEchoes(
+                    chat.id,
+                    refreshConversationRows(union, chat.id, generation),
+                ),
+            )
+            retainOpenTranscript(chat.id, messages)
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("marmot", chat.id, "push-retained")
             push(Screen.Chat(chat.id, title))

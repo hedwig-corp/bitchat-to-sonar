@@ -960,6 +960,17 @@ at the retained window) before bounding paint. Pins:
 `ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
 `SonarConversationFoldTests` `snSeededFoldFamilyTranscriptHasMore`.
 
+Retained-reopen hole closed after this commit: Compose
+`firstOpenTranscriptPaintRows` preferred a non-empty live leave-frame
+over the remounted family snapshot, and the retained `openChat` path
+skipped window seed. Reopening a short 0.9 leave-paint hid recovered
+0.8 rows until FFI (and persist-folds-before-core-fold never brought
+them back). Leave-paint now unions snapshot extras; retained reopen
+seeds the family window like first open. iOS `rebuildNow` already
+unions via `dmMsgs`. Pins:
+`ConversationFoldTest.retainedTranscriptReadWalksFoldFamily`,
+`SonarConversationFoldTests` `snFirstOpenTranscriptPaintRows`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
