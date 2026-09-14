@@ -459,6 +459,23 @@ async fn wipe_removes_the_database() {
         db_path.with_file_name("marmot.sqlite.sonar-historical-descriptions.json.tmp");
     std::fs::write(&descriptions_path, b"{}").expect("fake recovered descriptions");
     std::fs::write(&descriptions_tmp_path, b"{}").expect("fake recovered descriptions temp");
+    // Every historical sidecar is tmp+rename. A reset that deletes only the
+    // final file leaves the previous account's members, folds, or exporter
+    // secrets in `{suffix}.tmp` for the next install on this path.
+    let leftover_historical_tmps = [
+        "marmot.sqlite.sonar-historical-groups.json.tmp",
+        "marmot.sqlite.sonar-historical-members.json.tmp",
+        "marmot.sqlite.sonar-historical-member-counts.json.tmp",
+        "marmot.sqlite.sonar-historical-exporter-secrets.json.tmp",
+        "marmot.sqlite.sonar-historical-folds.json.tmp",
+        "marmot.sqlite.sonar-transcript.json.tmp",
+        "marmot.sqlite.sonar-parked-invites.json.tmp",
+        "marmot.sqlite.sonar-dropped-groups.json.tmp",
+        "marmot.sqlite.sonar-mdk08-migrated.json.tmp",
+    ];
+    for name in leftover_historical_tmps {
+        std::fs::write(db_path.with_file_name(name), b"{}").expect("fake historical temp sidecar");
+    }
 
     MarmotEngine::wipe(&db_path).expect("wipe");
     assert!(!db_path.exists(), "db file removed by wipe");
@@ -494,6 +511,12 @@ async fn wipe_removes_the_database() {
         !descriptions_tmp_path.exists(),
         "a crashed descriptions-sidecar rename must not survive a wipe"
     );
+    for name in leftover_historical_tmps {
+        assert!(
+            !db_path.with_file_name(name).exists(),
+            "{name} must not survive a wipe"
+        );
+    }
 
     // Wipe is idempotent.
     MarmotEngine::wipe(&db_path).expect("wipe again is a no-op");

@@ -362,7 +362,6 @@ pub const KNOWN_SENDER_PENDING_INVITE_CAP: usize = 50;
 pub const SHARED_GROUP_SCAN_CAP: usize = 128;
 
 const DM_AUTOACCEPT_FILE_SUFFIX: &str = ".dm-autoaccepts.json";
-const DM_AUTOACCEPT_TMP_FILE_SUFFIX: &str = ".dm-autoaccepts.json.tmp";
 
 struct DmAutoacceptBudget {
     admits: std::collections::VecDeque<u64>,
@@ -3411,15 +3410,14 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let mut paths: Vec<PathBuf> = [
-        "",
-        "-wal",
-        "-shm",
-        "-journal",
+    // SQLite shards are not tmp+rename. Every other suffix here is written
+    // atomically; a crashed rename leaves `{suffix}.tmp` with the previous
+    // account's transcript, exporter secrets, folds, or invite state.
+    let sqlite_shards = ["", "-wal", "-shm", "-journal"];
+    let atomic_sidecars = [
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
         DM_AUTOACCEPT_FILE_SUFFIX,
-        DM_AUTOACCEPT_TMP_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
         TRANSCRIPT_FILE_SUFFIX,
         PARKED_INVITES_FILE_SUFFIX,
@@ -3432,23 +3430,15 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         crate::mdk08_migrate::HISTORICAL_EXPORTER_SECRETS_SUFFIX,
         crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
         HISTORICAL_FOLDS_FILE_SUFFIX,
-    ]
-    .iter()
-    .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
-    .collect();
-    paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
-    paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
-    paths.push(base.with_file_name(format!("{name}{KEY_PACKAGE_SLOT_FILE_SUFFIX}.tmp")));
-    paths.push(base.with_file_name(format!(
-        "{name}{}{}",
-        crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX,
-        ".tmp"
-    )));
-    paths.push(base.with_file_name(format!(
-        "{name}{}{}",
-        crate::mdk08_migrate::HISTORICAL_DESCRIPTIONS_SUFFIX,
-        ".tmp"
-    )));
+    ];
+    let mut paths = Vec::with_capacity(sqlite_shards.len() + atomic_sidecars.len() * 2);
+    for suffix in sqlite_shards {
+        paths.push(base.with_file_name(format!("{name}{suffix}")));
+    }
+    for suffix in atomic_sidecars {
+        paths.push(base.with_file_name(format!("{name}{suffix}")));
+        paths.push(base.with_file_name(format!("{name}{suffix}.tmp")));
+    }
     paths
 }
 
