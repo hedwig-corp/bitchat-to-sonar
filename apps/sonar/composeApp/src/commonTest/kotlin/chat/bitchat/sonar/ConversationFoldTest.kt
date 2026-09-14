@@ -1064,6 +1064,41 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun notificationTapJumpsWhenViewingFoldSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        // Empty blob cannot match — merge first (see shouldMerge above).
+        assertFalse(
+            notificationOpenShouldJump(
+                openId = "marmot:group-08",
+                incomingId = "marmot:group-09",
+                historicalFolds = emptyMap(),
+            ),
+        )
+        // After FFI merge, Jump instead of openChat(live) remount.
+        assertTrue(
+            notificationOpenShouldJump(
+                openId = "marmot:group-08",
+                incomingId = "marmot:group-09",
+                historicalFolds = folds,
+            ),
+        )
+        assertTrue(
+            notificationOpenShouldJump(
+                openId = "group-08",
+                incomingId = "group-09",
+                historicalFolds = folds,
+            ),
+        )
+        assertFalse(
+            notificationOpenShouldJump(
+                openId = "marmot:group-08",
+                incomingId = "marmot:other",
+                historicalFolds = folds,
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

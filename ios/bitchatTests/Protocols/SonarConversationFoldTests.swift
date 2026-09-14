@@ -1360,6 +1360,26 @@ struct SonarConversationFoldTests {
             incomingId: "marmot:other",
             persistedFolds: ["group-08": "group-09"]
         ))
+        #expect(!snNotificationOpenShouldJump(
+            openId: "marmot:group-08",
+            incomingId: "marmot:group-09",
+            historicalFolds: [:]
+        ))
+        #expect(snNotificationOpenShouldJump(
+            openId: "marmot:group-08",
+            incomingId: "marmot:group-09",
+            historicalFolds: ["group-08": "group-09"]
+        ))
+        #expect(snNotificationOpenShouldJump(
+            openId: "group-08",
+            incomingId: "group-09",
+            historicalFolds: ["group-08": "group-09"]
+        ))
+        #expect(!snNotificationOpenShouldJump(
+            openId: "marmot:group-08",
+            incomingId: "marmot:other",
+            historicalFolds: ["group-08": "group-09"]
+        ))
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

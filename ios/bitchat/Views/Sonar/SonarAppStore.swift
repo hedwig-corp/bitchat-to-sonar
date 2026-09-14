@@ -1607,6 +1607,22 @@ func snConversationOpenShouldMergeFolds(
     return snFirstOpenShouldMergeFolds(seedId: open, persistedFolds: persistedFolds)
 }
 
+/// Shade tap names the live sibling while the recovered 0.8 chat is
+/// open. After FFI merge, Jump — do not `openDM` or the already-painted
+/// transcript remounts (scroll, unread divider, composer).
+/// Compose `notificationOpenShouldJump`.
+func snNotificationOpenShouldJump(
+    openId: String,
+    incomingId: String,
+    historicalFolds: [String: String]
+) -> Bool {
+    snConversationsMatchFoldFamily(
+        left: openId,
+        right: incomingId,
+        historicalFolds: historicalFolds
+    )
+}
+
 /// Viewing the recovered 0.8 id must still mark-read a live sibling
 /// change. Empty persist-folds cannot match; merge first.
 /// Compose `viewingConversationShouldMarkRead`.
@@ -13489,14 +13505,50 @@ final class SonarAppStore: ObservableObject {
             return raw
         }()
         if isConversationOpen(id) {
-            clearNotificationsForConversation(id)
-            // Already on this DM — still apply Jump so a tap while backgrounded
-            // on the open chat scrolls to the notified message (#376 GLM Medium).
-            if let jump {
-                applyOpenConversationJump(id, parentId: jump)
-            }
+            jumpOnOpenNotificationConversation(id, jump: jump)
             return
         }
+        // Viewing recovered hist + tap live: persist-folds can still be
+        // empty, so the sync `isConversationOpen` miss would `openDM` and
+        // remount. Merge first (same gate as willPresent), then Jump.
+        if let openId = currentDMId {
+            let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if snConversationOpenShouldMergeFolds(
+                openId: openId,
+                incomingId: id,
+                persistedFolds: blob
+            ) {
+                Task { @MainActor in
+                    await self.openNotificationConversationAfterFoldMerge(id, jump: jump)
+                }
+                return
+            }
+        }
+        openResolvedNotificationConversation(id, jump: jump)
+    }
+
+    private func jumpOnOpenNotificationConversation(_ id: String, jump: String?) {
+        clearNotificationsForConversation(id)
+        // Already on this DM — still apply Jump so a tap while backgrounded
+        // on the open chat scrolls to the notified message (#376 GLM Medium).
+        if let jump {
+            applyOpenConversationJump(id, parentId: jump)
+        }
+    }
+
+    @MainActor
+    private func openNotificationConversationAfterFoldMerge(_ id: String, jump: String?) async {
+        if let openId = currentDMId {
+            _ = await adoptMergedActionFolds(for: [openId, id])
+        }
+        if isConversationOpen(id) {
+            jumpOnOpenNotificationConversation(id, jump: jump)
+            return
+        }
+        openResolvedNotificationConversation(id, jump: jump)
+    }
+
+    private func openResolvedNotificationConversation(_ id: String, jump: String?) {
         if let target = resolveNotificationConversation(id) {
             openDM(target.id, marmotGroupId: target.marmotGroupId, jumpMessageId: jump)
             if target.id != id {

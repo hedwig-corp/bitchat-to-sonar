@@ -1808,6 +1808,21 @@ internal fun conversationOpenShouldMergeFolds(
     return firstOpenShouldMergeFolds(open, persistedFolds)
 }
 
+/** Shade tap names the live sibling while the recovered 0.8 chat is
+ *  open. After FFI merge, Jump — do not [openChat] or the already-painted
+ *  transcript remounts (scroll, unread divider, composer).
+ *  iOS `snNotificationOpenShouldJump`. */
+internal fun notificationOpenShouldJump(
+    openId: String,
+    incomingId: String,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    val open = openId.removePrefix("marmot:").trim()
+    val incoming = incomingId.removePrefix("marmot:").trim()
+    if (open.isEmpty() || incoming.isEmpty()) return false
+    return conversationsMatchFoldFamily(open, incoming, historicalFolds)
+}
+
 /** Viewing the recovered 0.8 id must still mark-read a live sibling
  *  change. Empty persist-folds cannot match; merge first.
  *  iOS `snViewingConversationShouldMarkRead`. */
@@ -7818,10 +7833,41 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = foldedGroupIds,
             liveFoldTargets = liveFoldTargets,
         ) ?: return false
+        val openId = (screen as? Screen.Chat)?.id
+        // Viewing recovered hist + tap live: persist-folds can still be
+        // empty, so resolve would `openChat(live)` and remount. Merge
+        // first (same gate as willPresent), then Jump in place.
+        if (openId != null &&
+            conversationOpenShouldMergeFolds(openId, conversationId, historicalFoldMap)
+        ) {
+            val before = historicalFoldMap.toMap()
+            val folds = mergeActionHistoricalFolds(listOf(openId, conversationId))
+            adoptActionHistoricalFolds(folds)
+            if (folds != before) persistHistoricalFolds()
+        }
         when (target) {
-            is SonarNotificationOpenTarget.MeshPeer ->
+            is SonarNotificationOpenTarget.MeshPeer -> {
+                val meshId = meshChatId(target.peerId)
+                if (openId != null &&
+                    (openId == meshId || notificationOpenShouldJump(openId, meshId, historicalFoldMap))
+                ) {
+                    jumpOnOpenNotificationConversation(openId, conversationId, jumpMessageId)
+                    return true
+                }
                 openDm(target.peerId, meshPeerName(target.peerId), jumpMessageId = jumpMessageId)
+            }
             is SonarNotificationOpenTarget.Chat -> {
+                val alreadyOpen = openId != null && (
+                    notificationOpenShouldJump(openId, conversationId, historicalFoldMap) ||
+                        notificationOpenShouldJump(openId, target.chatId, historicalFoldMap)
+                    )
+                if (alreadyOpen) {
+                    jumpOnOpenNotificationConversation(openId, conversationId, jumpMessageId)
+                    if (conversationId != target.chatId) {
+                        clearNotificationsForChat(target.chatId)
+                    }
+                    return true
+                }
                 val chat = notificationOpenChat(target.chatId, chats, historicalFoldMap)
                 openChat(chat, jumpMessageId = jumpMessageId)
                 if (conversationId != target.chatId) {
@@ -7830,6 +7876,18 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         return true
+    }
+
+    private fun jumpOnOpenNotificationConversation(
+        openId: String,
+        conversationId: String,
+        jumpMessageId: String?,
+    ) {
+        clearNotificationsForChat(conversationId)
+        if (conversationId != openId) clearNotificationsForChat(openId)
+        if (!jumpMessageId.isNullOrBlank()) {
+            jumpToQuotedMessage(openId, jumpMessageId)
+        }
     }
 
     /** Notify from pages already fetched by the incremental call/pay scan.
