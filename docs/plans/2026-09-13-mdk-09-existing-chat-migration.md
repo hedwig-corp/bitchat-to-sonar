@@ -194,6 +194,7 @@ Guarded by:
 - `ConversationFoldTest.foldedHistoricalComposerReplyMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotMessagesMoveOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalCallLogsMoveOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalVerifiedBlobRecoversOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalVerifiedMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotChatDropsOnceLiveSiblingIsListed`
 - `ConversationFoldTest.foldedHistoricalScanWatermarkMovesOntoLiveSibling`

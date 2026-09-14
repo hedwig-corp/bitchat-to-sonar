@@ -649,6 +649,23 @@ internal fun <V> promotedFoldedComposerReplies(
     )
 
 /** When FFI hides a folded 0.8 row, keep its safety-number verify on the live sibling. */
+/** Recover a verify flag left on a hidden 0.8 id after resume. Blobs have no
+ *  enumeration, so probe only the hist→live pairs we already persisted. */
+internal fun recoveredVerifiedIdsFromFolds(
+    folds: Map<String, String>,
+    verifiedIds: Set<String>,
+    historicalBlobVerified: (String) -> Boolean,
+): Set<String> {
+    var next = verifiedIds
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        if (historical in next || historicalBlobVerified(historical)) {
+            next = next + historical + live
+        }
+    }
+    return next
+}
+
 internal fun promotedFoldedVerifiedIds(
     previousIds: Set<String>,
     currentIds: Set<String>,
@@ -4190,7 +4207,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .toList()
-        for (id in (listed + persisted).distinct()) {
+        val folded = historicalFoldMap.keys + historicalFoldMap.values
+        for (id in (listed + persisted + folded).distinct()) {
             if (SonarCore.loadBlob("verified.$id") == "1") verifiedChatIds += id
         }
         persistVerifiedIdList()
@@ -12415,11 +12433,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun promoteFoldedVerified(previousIds: Set<String>, currentIds: Set<String>) {
+        val recovered = recoveredVerifiedIdsFromFolds(
+            folds = historicalFoldMap.toMap(),
+            verifiedIds = verifiedChatIds.toSet(),
+            historicalBlobVerified = { id -> SonarCore.loadBlob("verified.$id") == "1" },
+        )
         val next = promotedFoldedVerifiedIds(
             previousIds = previousIds,
             currentIds = currentIds,
-            verifiedIds = verifiedChatIds.toSet(),
-            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+            verifiedIds = recovered,
+            liveFoldTarget = { id ->
+                historicalFoldMap[id]
+                    ?: runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
+            },
         )
         if (next == verifiedChatIds) return
         for (id in next - verifiedChatIds) {
@@ -12481,6 +12507,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMediaPreviews = pendingMediaPreviews.map { preview ->
                 preview.copy(chatId = remountFoldedOpenId(listOf(open.id), live, preview.chatId))
             }
+        }
+        if (open.id in hydratedTranscripts) {
+            hydratedTranscripts = hydratedTranscripts - open.id + live
         }
         openChatUnread[open.id]?.let { openChatUnread = openChatUnread - open.id + (live to it) }
         openChatUnreadAnchor[open.id]?.let { openChatUnreadAnchor = openChatUnreadAnchor - open.id + (live to it) }

@@ -691,6 +691,35 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalVerifiedBlobRecoversOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            setOf("group-08", "group-09"),
+            recoveredVerifiedIdsFromFolds(
+                folds = folds,
+                verifiedIds = emptySet(),
+                historicalBlobVerified = { it == "group-08" },
+            ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            recoveredVerifiedIdsFromFolds(
+                folds = folds,
+                verifiedIds = setOf("group-08"),
+                historicalBlobVerified = { false },
+            ),
+        )
+        assertEquals(
+            emptySet(),
+            recoveredVerifiedIdsFromFolds(
+                folds = folds,
+                verifiedIds = emptySet(),
+                historicalBlobVerified = { false },
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalVerifiedMovesOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(
