@@ -872,6 +872,40 @@ struct SonarConversationFoldTests {
         #expect(snShouldSettleQuotedJump(parentInFeed: true))
         #expect(!snShouldSettleQuotedJump(parentInFeed: false))
         #expect(
+            snQuotedJumpParentId(
+                conversationId: "marmot:group-09",
+                jumps: ["group-08": "parent-08"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "parent-08"
+        )
+        #expect(
+            snQuotedJumpParentId(
+                conversationId: "group-09",
+                jumps: ["group-08": "parent-08"],
+                historicalFolds: [:]
+            ) == nil
+        )
+        #expect(
+            snQuotedJumpWritten(
+                conversationId: "marmot:group-08",
+                parentId: "parent-08",
+                jumps: [:],
+                historicalFolds: ["group-08": "group-09"]
+            )["marmot:group-09"] == "parent-08"
+        )
+        #expect(
+            snQuotedJumpCleared(
+                conversationId: "marmot:group-09",
+                jumps: [
+                    "group-08": "parent-08",
+                    "marmot:group-08": "parent-08",
+                    "group-09": "parent-08",
+                    "marmot:group-09": "parent-08"
+                ],
+                historicalFolds: ["group-08": "group-09"]
+            )["group-08"] == nil
+        )
+        #expect(
             snFoldFamilyPagingCursor(
                 groupId: "group-09",
                 cursorsByGroup: ["group-08": "cursor-08"],

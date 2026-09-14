@@ -1476,7 +1476,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val transcriptOpenAction = TranscriptScrollPolicy.resolveOpenAction(
         unreadAnchorId = unreadAnchorId,
         unreadCountAtOpen = state.openChatUnread[screen.id],
-        jumpMessageId = state.openChatJumpMessageId[screen.id],
+        jumpMessageId = state.jumpMessageIdForChat(screen.id),
     )
     val phase2Host = SonarTranscriptPolicyHost.isEnabled()
     var isNearBottom by remember(screen.id) { mutableStateOf(true) }
@@ -1659,9 +1659,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // Quote tap after the transcript has already opened: the open-path
     // LaunchedEffect above only runs while `didInitialScroll` is false.
-    LaunchedEffect(screen.id, state.openChatJumpMessageId[screen.id], feed.size, didInitialScroll) {
+    LaunchedEffect(screen.id, state.jumpMessageIdForChat(screen.id), feed.size, didInitialScroll) {
         if (!didInitialScroll) return@LaunchedEffect
-        val jumpId = state.openChatJumpMessageId[screen.id] ?: return@LaunchedEffect
+        val jumpId = state.jumpMessageIdForChat(screen.id) ?: return@LaunchedEffect
         val jumpIdx = feed.indexOfFirst { transcriptFeedKey(it) == jumpId }
         if (jumpIdx < 0) {
             // Parent not painted yet. Pull one older local page (including

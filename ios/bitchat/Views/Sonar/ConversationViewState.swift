@@ -450,7 +450,7 @@ final class ConversationViewState: ObservableObject {
     /// Expand the painted suffix so a quote parent already in the family
     /// cache is reachable without waiting on load-older.
     private func applyQuotedMessageRevealIfNeeded(store: SonarAppStore) {
-        guard let parentId = store.jumpMessageIdAtOpenByDM[conversationId]?
+        guard let parentId = store.jumpMessageIdAtOpen(for: conversationId)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !parentId.isEmpty
         else { return }

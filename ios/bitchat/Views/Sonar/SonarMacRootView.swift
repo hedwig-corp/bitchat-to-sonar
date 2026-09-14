@@ -3896,7 +3896,7 @@ private struct MacDMTranscript: View {
                 loadNewest: { await convo.loadNewestIfNeeded() },
                 unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
-                jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
+                jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                 onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
             )
         }
@@ -3968,7 +3968,7 @@ private struct MacCollectionHostDM<Composer: View>: View {
                 loadNewest: { await convo.loadNewestIfNeeded() },
                 unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
-                jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
+                jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                 onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
                 composer: composer
             )

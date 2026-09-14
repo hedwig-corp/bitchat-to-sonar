@@ -1134,6 +1134,17 @@ class ConversationFoldTest {
         )
         assertTrue(shouldSettleQuotedJump(parentInFeed = true))
         assertFalse(shouldSettleQuotedJump(parentInFeed = false))
+        val folds = mapOf("group-08" to "group-09")
+        val histJump = mapOf("group-08" to "parent-08")
+        assertEquals("parent-08", quotedJumpParentId("group-09", histJump, folds))
+        assertEquals("parent-08", quotedJumpParentId("group-08", histJump, folds))
+        assertNull(quotedJumpParentId("group-09", histJump, emptyMap()))
+        val written = quotedJumpWritten("group-08", "parent-08", emptyMap(), folds)
+        assertEquals("parent-08", written["group-08"])
+        assertEquals("parent-08", written["group-09"])
+        val cleared = quotedJumpCleared("group-09", written, folds)
+        assertNull(cleared["group-08"])
+        assertNull(cleared["group-09"])
     }
 
     @Test

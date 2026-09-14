@@ -594,6 +594,71 @@ func snShouldSettleQuotedJump(parentInFeed: Bool) -> Bool {
     parentInFeed
 }
 
+/// Quote-jump parent stored on any fold-family key. After remount the
+/// screen may still write `peerId` (hist / mesh) while
+/// `ConversationViewState` is live-keyed — or the reverse `marmot:` /
+/// bare pair. Compose `quotedJumpParentId`.
+func snQuotedJumpParentId(
+    conversationId: String,
+    jumps: [String: String],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> String? {
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    ) {
+        if let parent = jumps[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !parent.isEmpty {
+            return parent
+        }
+    }
+    return nil
+}
+
+/// Write the Jump parent onto every fold-family key (bare + `marmot:`).
+/// A quote tap that lands after maps were copied but before nav remount
+/// must still expand the live sibling. Compose `quotedJumpWritten`.
+func snQuotedJumpWritten(
+    conversationId: String,
+    parentId: String,
+    jumps: [String: String],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> [String: String] {
+    let parent = parentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !parent.isEmpty else { return jumps }
+    var next = jumps
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    ) {
+        next[key] = parent
+    }
+    return next
+}
+
+/// Drop the Jump parent from every fold-family key so Leave cannot
+/// resurrect it on the live sibling. Compose `quotedJumpCleared`.
+func snQuotedJumpCleared(
+    conversationId: String,
+    jumps: [String: String],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> [String: String] {
+    var next = jumps
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    ) {
+        next[key] = nil
+    }
+    return next
+}
+
 /// True when any fold-family id still has an older local page, or when the
 /// unioned host cache itself overflows the painted page. Promote copies
 /// the hist flag onto live asynchronously; first paint of the live row
@@ -2766,10 +2831,27 @@ final class SonarAppStore: ObservableObject {
     }
 
     func jumpToQuotedMessage(chatId: String, parentId: String) {
-        jumpMessageIdAtOpenByDM[chatId] = parentId
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+            conversationId: chatId,
+            parentId: parentId,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds
+        )
         // `ConversationViewState.rebuildNow` expands `visibleMessageLimit`
         // when the parent already sits in the family-unioned host cache.
         objectWillChange.send()
+    }
+
+    /// Jump parent for the open transcript. Walks hist / live / `marmot:`
+    /// aliases so remount cannot hide a recovered 0.8 quote.
+    func jumpMessageIdAtOpen(for conversationId: String) -> String? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snQuotedJumpParentId(
+            conversationId: conversationId,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds
+        )
     }
 
     private func consumeComposerReply(for chatId: String) -> SNReplyRef? {
@@ -10510,9 +10592,28 @@ final class SonarAppStore: ObservableObject {
     /// the alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
-        if let jump = pendingJumpMessageIdByDM.removeValue(forKey: id) {
-            jumpMessageIdAtOpenByDM[id] = jump
-        } else {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        if let jump = snQuotedJumpParentId(
+            conversationId: id,
+            jumps: pendingJumpMessageIdByDM,
+            historicalFolds: folds
+        ) {
+            pendingJumpMessageIdByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: pendingJumpMessageIdByDM,
+                historicalFolds: folds
+            )
+            jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+                conversationId: id,
+                parentId: jump,
+                jumps: jumpMessageIdAtOpenByDM,
+                historicalFolds: folds
+            )
+        } else if snQuotedJumpParentId(
+            conversationId: id,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds
+        ) == nil {
             jumpMessageIdAtOpenByDM[id] = nil
         }
         let groupId = marmotGroupId(id)
@@ -11959,8 +12060,19 @@ final class SonarAppStore: ObservableObject {
             // Already on this DM — still apply Jump so a tap while backgrounded
             // on the open chat scrolls to the notified message (#376 GLM Medium).
             if let jump {
-                pendingJumpMessageIdByDM[id] = jump
-                jumpMessageIdAtOpenByDM[id] = jump
+                let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+                pendingJumpMessageIdByDM = snQuotedJumpWritten(
+                    conversationId: id,
+                    parentId: jump,
+                    jumps: pendingJumpMessageIdByDM,
+                    historicalFolds: folds
+                )
+                jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+                    conversationId: id,
+                    parentId: jump,
+                    jumps: jumpMessageIdAtOpenByDM,
+                    historicalFolds: folds
+                )
                 objectWillChange.send()
             }
             return
@@ -12011,8 +12123,18 @@ final class SonarAppStore: ObservableObject {
             clearNotificationsForConversation(id)
             clearNotificationsForConversation(liveId)
             if let jump {
-                pendingJumpMessageIdByDM[liveId] = jump
-                jumpMessageIdAtOpenByDM[liveId] = jump
+                pendingJumpMessageIdByDM = snQuotedJumpWritten(
+                    conversationId: liveId,
+                    parentId: jump,
+                    jumps: pendingJumpMessageIdByDM,
+                    historicalFolds: folds
+                )
+                jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+                    conversationId: liveId,
+                    parentId: jump,
+                    jumps: jumpMessageIdAtOpenByDM,
+                    historicalFolds: folds
+                )
                 objectWillChange.send()
             }
             return
@@ -12030,9 +12152,20 @@ final class SonarAppStore: ObservableObject {
     /// Drop a one-shot Jump target after the host has applied (or soft-failed)
     /// the open action so later transcript updates do not re-jump.
     func clearJumpMessageIdAtOpen(_ id: String) {
-        guard jumpMessageIdAtOpenByDM[id] != nil || pendingJumpMessageIdByDM[id] != nil else { return }
-        jumpMessageIdAtOpenByDM[id] = nil
-        pendingJumpMessageIdByDM[id] = nil
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let nextJump = snQuotedJumpCleared(
+            conversationId: id,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds
+        )
+        let nextPending = snQuotedJumpCleared(
+            conversationId: id,
+            jumps: pendingJumpMessageIdByDM,
+            historicalFolds: folds
+        )
+        guard nextJump != jumpMessageIdAtOpenByDM || nextPending != pendingJumpMessageIdByDM else { return }
+        jumpMessageIdAtOpenByDM = nextJump
+        pendingJumpMessageIdByDM = nextPending
         // Not `@Published` — nudge SwiftUI so the host stops receiving the jump.
         objectWillChange.send()
     }
@@ -12157,8 +12290,17 @@ final class SonarAppStore: ObservableObject {
         // chat retires it so a later reopen (already marked read) starts clean.
         if case .dm(let id)? = path.last {
             unreadCountAtOpenByDM[id] = nil
-            jumpMessageIdAtOpenByDM[id] = nil
-            pendingJumpMessageIdByDM[id] = nil
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            jumpMessageIdAtOpenByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: jumpMessageIdAtOpenByDM,
+                historicalFolds: folds
+            )
+            pendingJumpMessageIdByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: pendingJumpMessageIdByDM,
+                historicalFolds: folds
+            )
         }
         if !path.isEmpty { path.removeLast() }
         syncViewingUnreadGroups()

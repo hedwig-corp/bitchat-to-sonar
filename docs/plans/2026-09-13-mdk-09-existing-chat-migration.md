@@ -981,6 +981,17 @@ snapshot→async flash). iOS `loadLocalPage` already merges
 `hiddenSiblingHasRows`. Pins:
 `ConversationFoldTest.firstOpenFoldFamilySeedSurvivesLiveOnlyLocalPage`.
 
+Quote-jump key hole closed after this commit: iOS
+`applyQuotedMessageRevealIfNeeded` and the DM/Mac hosts keyed
+`jumpMessageIdAtOpenByDM[conversationId]` / `[peerId]` only. A quote
+tap after remount copied maps but before nav rewrote the route wrote
+hist; the live `ConversationViewState` never expanded. Compose remount
+moved the jump off hist, so a stale `screen.id` lookup missed. Read /
+write / clear / capture now walk the fold family (`quotedJumpParentId`
+/ `snQuotedJumpParentId`, including `marmot:` on iOS). Pins:
+`ConversationFoldTest.quotedMessageRevealExpandsPaintedPageToParent`,
+`SonarConversationFoldTests` `snQuotedJumpParentId`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

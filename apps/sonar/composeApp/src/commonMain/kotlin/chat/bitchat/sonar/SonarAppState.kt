@@ -768,6 +768,52 @@ internal fun quotedMessageRevealLimit(
  *  admit the row. iOS `snShouldSettleQuotedJump`. */
 internal fun shouldSettleQuotedJump(parentInFeed: Boolean): Boolean = parentInFeed
 
+/** Quote-jump parent stored on any fold-family key. After remount the
+ *  open screen may still look up hist / mesh while the live sibling
+ *  holds the target — or the reverse. iOS `snQuotedJumpParentId`. */
+internal fun quotedJumpParentId(
+    chatId: String,
+    jumps: Map<String, String>,
+    historicalFolds: Map<String, String>,
+): String? {
+    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+        jumps[id]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return null
+}
+
+/** Write the Jump parent onto every fold-family key so a quote tap that
+ *  lands after maps were copied but before nav remount still expands
+ *  the live sibling. iOS `snQuotedJumpWritten`. */
+internal fun quotedJumpWritten(
+    chatId: String,
+    parentId: String,
+    jumps: Map<String, String>,
+    historicalFolds: Map<String, String>,
+): Map<String, String> {
+    val parent = parentId.trim()
+    if (parent.isEmpty()) return jumps
+    var next = jumps
+    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+        next = next + (id to parent)
+    }
+    return next
+}
+
+/** Drop the Jump parent from every fold-family key so Leave cannot
+ *  resurrect it on the live sibling. iOS `snQuotedJumpCleared`. */
+internal fun quotedJumpCleared(
+    chatId: String,
+    jumps: Map<String, String>,
+    historicalFolds: Map<String, String>,
+): Map<String, String> {
+    var next = jumps
+    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+        if (id in next) next = next - id
+    }
+    return next
+}
+
 /** True when any fold-family id still has an older local page, or when the
  *  unioned host cache itself overflows the painted page. */
 internal fun hasOlderForFoldFamily(
@@ -2361,9 +2407,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         // capture has not run — hosts must not coerce that to live-edge.
         openChatUnread = openChatUnread + (chatId to unreadAtOpen)
         openChatJumpMessageId = if (jumpMessageId != null) {
-            openChatJumpMessageId + (chatId to jumpMessageId)
-        } else {
+            quotedJumpWritten(chatId, jumpMessageId, openChatJumpMessageId, historicalFoldMap)
+        } else if (quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap) == null) {
             openChatJumpMessageId - chatId
+        } else {
+            openChatJumpMessageId
         }
     }
 
@@ -2374,12 +2422,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun retireOpenChatUnread(chatId: String) {
         openChatUnread = openChatUnread + (chatId to 0L)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
-        openChatJumpMessageId = openChatJumpMessageId - chatId
+        openChatJumpMessageId = quotedJumpCleared(chatId, openChatJumpMessageId, historicalFoldMap)
     }
 
     /** Drop a one-shot Jump target after the host applied (or soft-failed) it. */
     fun clearOpenChatJump(chatId: String) {
-        openChatJumpMessageId = openChatJumpMessageId - chatId
+        openChatJumpMessageId = quotedJumpCleared(chatId, openChatJumpMessageId, historicalFoldMap)
     }
 
     /** Account wipe/erase: per-open transcript state must not outlive the
@@ -4053,8 +4101,18 @@ class SonarAppState(private val scope: CoroutineScope) {
             val bounded = refreshConversationRows(cached, sessionId, transcriptGeneration)
             setCurrentVisibleMessages(sessionId, withSendEchoes(sessionId, bounded))
         }
-        openChatJumpMessageId = openChatJumpMessageId + (chatId to trimmed)
+        openChatJumpMessageId = quotedJumpWritten(
+            chatId,
+            trimmed,
+            openChatJumpMessageId,
+            historicalFoldMap,
+        )
     }
+
+    /** Jump parent for the open transcript. Walks hist / live aliases so
+     *  remount cannot hide a recovered 0.8 quote. */
+    fun jumpMessageIdForChat(chatId: String): String? =
+        quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap)
 
     /** Host + window rows a quote-jump may expand into without a load-older. */
     private fun quotedMessageRevealCache(chatId: String): List<SonarMsg> {
@@ -7728,7 +7786,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             retainOpenTranscript(it.id, messages)
             openChatUnread = openChatUnread - it.id
             openChatUnreadAnchor = openChatUnreadAnchor - it.id
-            openChatJumpMessageId = openChatJumpMessageId - it.id
+            openChatJumpMessageId = quotedJumpCleared(it.id, openChatJumpMessageId, historicalFoldMap)
         }
         if (stack.size > 1) stack = stack.dropLast(1)
         restoreRevealedChatOrClear()
@@ -13727,9 +13785,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         openChatUnread[open.id]?.let { openChatUnread = openChatUnread - open.id + (live to it) }
         openChatUnreadAnchor[open.id]?.let { openChatUnreadAnchor = openChatUnreadAnchor - open.id + (live to it) }
-        openChatJumpMessageId[open.id]?.let {
-            openChatJumpMessageId = openChatJumpMessageId - open.id + (live to it)
-        }
+        openChatJumpMessageId = remountFoldedOpenValues(
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+            values = openChatJumpMessageId,
+        )
         val historicalDraft = composerDrafts[open.id]
         if (!historicalDraft.isNullOrEmpty() && composerDrafts[live].isNullOrEmpty()) {
             composerDrafts[live] = historicalDraft
