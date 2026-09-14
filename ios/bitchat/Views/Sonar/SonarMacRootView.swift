@@ -316,6 +316,7 @@ private struct SonarMacSidebar: View {
                             MacDMRow(
                                 row: row,
                                 selected: selection == .dm(row.id)
+                                    || store.isConversationOpen(row.id)
                             ) {
                                 store.openDM(row.id, marmotGroupId: row.marmotGroupId) {
                                     selection = .dm(row.id)

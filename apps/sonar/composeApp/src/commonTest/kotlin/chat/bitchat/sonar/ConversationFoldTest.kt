@@ -1099,6 +1099,48 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun macSplitViewUsesOpenedConversationWhenPathHasNoDm() {
+        assertEquals(
+            "marmot:group-08",
+            currentOpenConversationId(
+                pathDMId = null,
+                openedConversationId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            "marmot:group-09",
+            currentOpenConversationId(
+                pathDMId = "marmot:group-09",
+                openedConversationId = "marmot:group-08",
+            ),
+        )
+        assertNull(currentOpenConversationId(pathDMId = null, openedConversationId = null))
+        assertNull(currentOpenConversationId(pathDMId = "", openedConversationId = "  "))
+    }
+
+    @Test
+    fun foldRemountSkipsOpenedDmNewestPageHydrate() {
+        assertTrue(
+            openedDMShouldSkipHydrate(
+                openingId = "marmot:group-09",
+                suppressedIds = setOf("marmot:group-09", "group-09"),
+            ),
+        )
+        assertTrue(
+            openedDMShouldSkipHydrate(
+                openingId = "group-09",
+                suppressedIds = setOf("marmot:group-09"),
+            ),
+        )
+        assertFalse(
+            openedDMShouldSkipHydrate(
+                openingId = "marmot:other",
+                suppressedIds = setOf("marmot:group-09"),
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

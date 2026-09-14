@@ -1380,6 +1380,30 @@ struct SonarConversationFoldTests {
             incomingId: "marmot:other",
             historicalFolds: ["group-08": "group-09"]
         ))
+        #expect(snCurrentOpenConversationId(
+            pathDMId: nil,
+            openedConversationId: "marmot:group-08"
+        ) == "marmot:group-08")
+        #expect(snCurrentOpenConversationId(
+            pathDMId: "marmot:group-09",
+            openedConversationId: "marmot:group-08"
+        ) == "marmot:group-09")
+        #expect(snCurrentOpenConversationId(
+            pathDMId: nil,
+            openedConversationId: nil
+        ) == nil)
+        #expect(snOpenedDMShouldSkipHydrate(
+            openingId: "marmot:group-09",
+            suppressedIds: ["marmot:group-09", "group-09"]
+        ))
+        #expect(snOpenedDMShouldSkipHydrate(
+            openingId: "group-09",
+            suppressedIds: ["marmot:group-09"]
+        ))
+        #expect(!snOpenedDMShouldSkipHydrate(
+            openingId: "marmot:other",
+            suppressedIds: ["marmot:group-09"]
+        ))
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

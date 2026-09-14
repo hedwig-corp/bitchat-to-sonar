@@ -1823,6 +1823,34 @@ internal fun notificationOpenShouldJump(
     return conversationsMatchFoldFamily(open, incoming, historicalFolds)
 }
 
+/** Mac split-view `present:` skips `push`, so `path` has no `.dm`.
+ *  `openedDM` still ran — keep that id as the open transcript.
+ *  iOS `snCurrentOpenConversationId`. */
+internal fun currentOpenConversationId(
+    pathDMId: String?,
+    openedConversationId: String?,
+): String? {
+    val path = pathDMId?.trim().orEmpty()
+    if (path.isNotEmpty()) return path
+    val opened = openedConversationId?.trim().orEmpty()
+    return opened.takeIf { it.isNotEmpty() }
+}
+
+/** Fold remount copies the scrolled window onto live, then a host
+ *  `openChat` / `openedDM` must not newest-page hydrate.
+ *  iOS `snOpenedDMShouldSkipHydrate`. */
+internal fun openedDMShouldSkipHydrate(
+    openingId: String,
+    suppressedIds: Set<String>,
+): Boolean {
+    val opening = openingId.trim()
+    if (opening.isEmpty()) return false
+    if (opening in suppressedIds) return true
+    val bare = opening.removePrefix("marmot:")
+    if (bare.isEmpty()) return false
+    return bare in suppressedIds || "marmot:$bare" in suppressedIds
+}
+
 /** Viewing the recovered 0.8 id must still mark-read a live sibling
  *  change. Empty persist-folds cannot match; merge first.
  *  iOS `snViewingConversationShouldMarkRead`. */
@@ -7890,6 +7918,31 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** True when [chatId] is the open transcript or a fold sibling.
+     *  Desktop sidebar highlight — blob-only (do not FFI on every
+     *  recomposition). iOS `isConversationOpen`. */
+    fun isConversationOpen(chatId: String): Boolean {
+        val openId = (screen as? Screen.Chat)?.id ?: return false
+        if (openId == chatId) return true
+        return notificationOpenShouldJump(openId, chatId, historicalFoldMap)
+    }
+
+    /** Desktop sidebar / home-list can tap the listed live row while the
+     *  recovered 0.8 transcript is already open. Reuse the painted
+     *  screen — do not `openChat` remount. */
+    private fun reuseOpenFoldSibling(incomingId: String, jumpMessageId: String?): Boolean {
+        val openId = (screen as? Screen.Chat)?.id ?: return false
+        if (conversationOpenShouldMergeFolds(openId, incomingId, historicalFoldMap)) {
+            val before = historicalFoldMap.toMap()
+            val folds = mergeActionHistoricalFolds(listOf(openId, incomingId))
+            adoptActionHistoricalFolds(folds)
+            if (folds != before) persistHistoricalFolds()
+        }
+        if (!notificationOpenShouldJump(openId, incomingId, historicalFoldMap)) return false
+        jumpOnOpenNotificationConversation(openId, incomingId, jumpMessageId)
+        return true
+    }
+
     /** Notify from pages already fetched by the incremental call/pay scan.
      * Stable message IDs avoid timestamp-only false dedupe, while scanning the
      * bounded page preserves an incoming message followed by an own/blocked row. */
@@ -8727,6 +8780,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun openChat(chat: SonarChat, jumpMessageId: String? = null) {
+        if (reuseOpenFoldSibling(chat.id, jumpMessageId)) return
         // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
         // empty home leftover messages, then rebuild when the page lands.
         noteTranscriptOpen("marmot", chat.id, "begin", emptyList())
@@ -8847,6 +8901,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openDm(peerId: String, name: String, pay: Boolean = false, jumpMessageId: String? = null) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val id = meshChatId(canonicalPeerId)
+        if (reuseOpenFoldSibling(id, jumpMessageId) || reuseOpenFoldSibling(peerId, jumpMessageId)) {
+            return
+        }
         noteTranscriptOpen("mesh-folded", id, "begin", emptyList())
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         clearNotificationsForChat(id)

@@ -1623,6 +1623,33 @@ func snNotificationOpenShouldJump(
     )
 }
 
+/// Mac split-view `present:` skips `push`, so `path` has no `.dm`.
+/// `openedDM` still ran — keep that id as the open transcript.
+/// Compose desktop `Screen.Chat` is already the open id.
+func snCurrentOpenConversationId(
+    pathDMId: String?,
+    openedConversationId: String?
+) -> String? {
+    if let pathDMId, !pathDMId.isEmpty { return pathDMId }
+    if let openedConversationId, !openedConversationId.isEmpty { return openedConversationId }
+    return nil
+}
+
+/// Fold remount copies the scrolled window onto live, then SwiftUI
+/// recreates the DM screen and `onAppear` calls `openedDM`. Skip
+/// newest-page hydrate so a scrolled recovered transcript stays put.
+/// Compose remounts the nav id in place and never re-runs `openChat`.
+func snOpenedDMShouldSkipHydrate(
+    openingId: String,
+    suppressedIds: Set<String>
+) -> Bool {
+    let bare = snBareMarmotGroupId(openingId)
+    if suppressedIds.contains(openingId) { return true }
+    if !bare.isEmpty && suppressedIds.contains(bare) { return true }
+    if !bare.isEmpty && suppressedIds.contains("marmot:" + bare) { return true }
+    return false
+}
+
 /// Viewing the recovered 0.8 id must still mark-read a live sibling
 /// change. Empty persist-folds cannot match; merge first.
 /// Compose `viewingConversationShouldMarkRead`.
@@ -3963,9 +3990,20 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    /// Mac split-view (and any `present:` that skips `push`) has no `.dm`
+    /// on `path`. `openedDM` / `closedDM` still run from the pane.
+    private var openedConversationId: String?
+    /// Live ids whose `ConversationViewState` was just fold-remounted.
+    /// `onAppear` `openedDM` must not newest-page hydrate them.
+    private var suppressOpenedDMHydrateIds: Set<String> = []
+
     private var currentDMId: String? {
-        if case .dm(let id)? = path.last { return id }
-        return nil
+        let pathId: String?
+        if case .dm(let id)? = path.last { pathId = id } else { pathId = nil }
+        return snCurrentOpenConversationId(
+            pathDMId: pathId,
+            openedConversationId: openedConversationId
+        )
     }
 
     private func nextMediaPreviewGeneration() -> UInt64 {
@@ -5552,6 +5590,8 @@ final class SonarAppStore: ObservableObject {
         // replace the account, so both have to.
         defaults.removeObject(forKey: MarmotAccountBackupFlow.cellularOptInKey)
         path = []
+        openedConversationId = nil
+        suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
@@ -10152,10 +10192,15 @@ final class SonarAppStore: ObservableObject {
             path.removeLast()
             path.append(.dm(realId))
         }
+        openedConversationId = realId
+        suppressOpenedDMHydrateIds.insert(realId)
+        suppressOpenedDMHydrateIds.insert(remounted)
         // Do not call `openedDM` here: it hydrates the live id as a fresh
         // open (`loadLocalWhenConnected` newest-page) and would snap a
         // scrolled recovered transcript back to the tail. The chat is
-        // already painted; keep it open on the live sibling.
+        // already painted; keep it open on the live sibling. SwiftUI
+        // `onAppear` after the path/selection swap still calls `openedDM`
+        // — skip hydrate via `suppressOpenedDMHydrateIds`.
         conversationViewStates[openId]?.deactivate()
         conversationViewStates[groupId]?.deactivate()
         conversationViewStates[realId]?.activate()
@@ -12027,6 +12072,48 @@ final class SonarAppStore: ObservableObject {
         }
         #endif
         let presentDM = present ?? { self.push(.dm(id)) }
+        // Mac sidebar / desktop list can tap the listed live row while the
+        // recovered 0.8 transcript is already open. Presenting again
+        // recreates the pane and newest-page hydrates. Jump in place.
+        if isConversationOpen(id)
+            || (knownMarmotGroupId.map { isConversationOpen($0) } ?? false) {
+            if let jumpMessageId {
+                applyOpenConversationJump(id, parentId: jumpMessageId)
+            }
+            #if DEBUG
+            benchPresent("already-open")
+            #endif
+            return
+        }
+        if let openId = currentDMId {
+            let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if snConversationOpenShouldMergeFolds(
+                openId: openId,
+                incomingId: id,
+                persistedFolds: blob
+            ) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    _ = await self.adoptMergedActionFolds(
+                        for: [openId, id, knownMarmotGroupId].compactMap { $0 }
+                    )
+                    if self.isConversationOpen(id)
+                        || (knownMarmotGroupId.map { self.isConversationOpen($0) } ?? false) {
+                        if let jumpMessageId {
+                            self.applyOpenConversationJump(id, parentId: jumpMessageId)
+                        }
+                        return
+                    }
+                    self.openDM(
+                        id,
+                        marmotGroupId: knownMarmotGroupId,
+                        jumpMessageId: jumpMessageId,
+                        present: present
+                    )
+                }
+                return
+            }
+        }
         if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
             openedDM(id, marmotGroupId: knownMarmotGroupId)
             presentDM()
@@ -12090,7 +12177,22 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    private func consumeOpenedDMHydrateSuppression(for id: String, groupId: String?) -> Bool {
+        let skip = snOpenedDMShouldSkipHydrate(
+            openingId: id,
+            suppressedIds: suppressOpenedDMHydrateIds
+        ) || (groupId.map {
+            snOpenedDMShouldSkipHydrate(openingId: $0, suppressedIds: suppressOpenedDMHydrateIds)
+        } ?? false)
+        guard skip else { return false }
+        suppressOpenedDMHydrateIds.remove(id)
+        if let groupId { suppressOpenedDMHydrateIds.remove(groupId) }
+        suppressOpenedDMHydrateIds.remove(snBareMarmotGroupId(id))
+        return true
+    }
+
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
+        openedConversationId = id
         conversationViewStates[id]?.activate()
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
@@ -12119,6 +12221,9 @@ final class SonarAppStore: ObservableObject {
         // background; duplicate open notifications for the same id join the
         // in-flight work instead of starting another sync.
         guard hasMarmotGroup || sonarProfile != nil else { return }
+        if consumeOpenedDMHydrateSuppression(for: id, groupId: groupId) {
+            return
+        }
         marmot.connectIfNeeded()
         let warmupKey = groupId ?? id
         if let task = openingDMTasks[warmupKey], !task.isCancelled {
@@ -12243,6 +12348,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
+        if openedConversationId == id { openedConversationId = nil }
         // Keep ConversationViewState rows for Signal-style reopen paint (Compose
         // retainedTranscriptByChat), but detach from store invalidation so a
         // closed chat does not keep rebuilding on every BLE/relay/wallet tick.
@@ -14525,6 +14631,8 @@ final class SonarAppStore: ObservableObject {
         // store is erased so a late completion cannot recreate a group.
         await quiescePendingMarmotGroupSetups()
         path = []
+        openedConversationId = nil
+        suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
@@ -14613,6 +14721,8 @@ final class SonarAppStore: ObservableObject {
         marmot.stopPolling()
         await marmot.wipeDatabase()
         path = []
+        openedConversationId = nil
+        suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
