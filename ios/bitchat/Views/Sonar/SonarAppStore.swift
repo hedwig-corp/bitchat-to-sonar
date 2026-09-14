@@ -280,7 +280,10 @@ func snRemountFoldedOpenGroupId(
     liveFoldTarget: String?
 ) -> String {
     if listedGroupIds.contains(openGroupId) { return openGroupId }
-    guard let live = liveFoldTarget, listedGroupIds.contains(live) else {
+    // Same remap as `snNotificationOpenGroupId`: after FFI hides the 0.8
+    // row, waiting for the live sibling to list leaves the open transcript
+    // on a chat that is no longer in `marmot.groups`.
+    guard let live = liveFoldTarget, !live.isEmpty, live != openGroupId else {
         return openGroupId
     }
     return live

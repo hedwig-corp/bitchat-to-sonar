@@ -505,7 +505,11 @@ members / exporter secrets / folds / transcript / parked invites),
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
 (remap even when the live id is not in `knownChatIds`),
 `ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
-(`listedOrFoldedSiblingChat` is bidirectional: unlisted live inherits
+(open-transcript remount matches notification remap: a hidden 0.8 id
+moves onto `live_fold_target` even before `chats()` lists the live
+sibling; `notificationOpenChat` supplies the stub row. iOS
+`snRemountFoldedOpenGroupId` is the same),
+`listedOrFoldedSiblingChat` is bidirectional: unlisted live inherits
 the still-listed 0.8 sibling; sitting on a hidden 0.8 id inherits the
 listed live sibling. `notificationOpenChat` uses that, else a not-direct
 stub. `adoptedListedChatTitle` replaces a captured Compose

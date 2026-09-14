@@ -554,6 +554,14 @@ class ConversationFoldTest {
                 liveFoldTarget = null,
             ),
         )
+        assertEquals(
+            "group-09",
+            remountFoldedOpenChatId(
+                openChatId = "group-08",
+                listedChatIds = emptySet(),
+                liveFoldTarget = "group-09",
+            ),
+        )
         val listedLive = SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false)
         assertEquals(listedLive, notificationOpenChat("group-09", listOf(listedLive)))
         val historical = SonarChat(

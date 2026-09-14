@@ -529,8 +529,12 @@ internal fun remountFoldedOpenChatId(
     liveFoldTarget: String?,
 ): String {
     if (openChatId in listedChatIds) return openChatId
-    val live = liveFoldTarget ?: return openChatId
-    return if (live in listedChatIds) live else openChatId
+    val live = liveFoldTarget?.takeIf { it.isNotBlank() && it != openChatId } ?: return openChatId
+    // Notification taps already remap onto live before `chats()` lists it.
+    // An open recovered transcript must do the same: after FFI hides the
+    // 0.8 id, waiting for the live row leaves title / members / send
+    // chrome on a chat that is no longer listed.
+    return live
 }
 
 /** Prefer the listed row. If FFI hid a folded 0.8 id or has not painted
@@ -12774,7 +12778,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             liveFoldTarget = runCatching { SonarCore.liveFoldTarget(open.id) }.getOrNull(),
         )
         if (live == open.id) return
-        val liveChat = chats.firstOrNull { it.id == live } ?: return
+        val liveChat = chats.firstOrNull { it.id == live }
+            ?: notificationOpenChat(live, chats, historicalFoldMap)
         moveSendEchoes(open.id, live)
         trillCooldownUntilMs = remountFoldedOpenValues(
             historicalKeys = listOf(open.id),

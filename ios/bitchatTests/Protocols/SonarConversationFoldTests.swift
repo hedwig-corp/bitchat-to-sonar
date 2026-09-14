@@ -68,6 +68,13 @@ struct SonarConversationFoldTests {
             ) == "group-08"
         )
         #expect(
+            snRemountFoldedOpenGroupId(
+                openGroupId: "group-08",
+                listedGroupIds: [],
+                liveFoldTarget: "group-09"
+            ) == "group-09"
+        )
+        #expect(
             snNotificationOpenGroupId(
                 tappedGroupId: "group-08",
                 liveFoldTarget: "group-09"
