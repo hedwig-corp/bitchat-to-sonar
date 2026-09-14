@@ -2151,6 +2151,45 @@ internal fun closedDMShouldClearOpened(
         openedConversationIdMatches(closing, openedConversationPaneId)
 }
 
+/** Remount-pair live / hist while a conversation is actually open.
+ *  A leftover pending→live replacement after leave must not keep
+ *  treating hist+live as the open pair. iOS `snRemountPairOpenedPane`. */
+internal fun remountPairOpenedPane(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacementPendingId: String? = null,
+    routeReplacementRealId: String? = null,
+): Pair<String?, String?> {
+    val openedStored = openedConversationId?.trim().orEmpty()
+    val paneStored = openedConversationPaneId?.trim().orEmpty()
+    if (openedStored.isEmpty() && paneStored.isEmpty()) return null to null
+    val opened = openedStored.takeIf { it.isNotEmpty() }
+        ?: routeReplacementRealId?.trim()?.takeIf { it.isNotEmpty() }
+    val pane = paneStored.takeIf { it.isNotEmpty() }
+        ?: routeReplacementPendingId?.trim()?.takeIf { it.isNotEmpty() }
+    return opened to pane
+}
+
+/** Leave / delete that ends the remounted open must drop the leftover
+ *  route replacement. Skip-hop `closedDM(hist)` during Mac selection hop
+ *  must keep it. iOS `snClosedDMShouldClearPendingRouteReplacement`. */
+internal fun closedDMShouldClearPendingRouteReplacement(
+    closingId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacementPendingId: String?,
+    routeReplacementRealId: String?,
+): Boolean {
+    if (routeReplacementPendingId.isNullOrBlank() && routeReplacementRealId.isNullOrBlank()) {
+        return false
+    }
+    if (!closedDMShouldClearOpened(closingId, openedConversationId, openedConversationPaneId)) {
+        return false
+    }
+    return openedConversationIdMatches(closingId, routeReplacementPendingId) ||
+        openedConversationIdMatches(closingId, routeReplacementRealId)
+}
+
 /** Mac split-view keeps `.dm(hist)` after fold remount. Hop selection
  *  to live so send/call/group-info bind the remounted transcript.
  *  Compose remounts `Screen.Chat.id` in place — iOS `snMacSelectionAfterFoldRemount`. */

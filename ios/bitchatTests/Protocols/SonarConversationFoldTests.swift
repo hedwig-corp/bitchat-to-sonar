@@ -1080,6 +1080,35 @@ struct SonarConversationFoldTests {
                 openedConversationPaneId: "marmot:group-08"
             ) == ["group-other"]
         )
+        // Leftover `pendingMarmotRouteReplacement` after leave must not
+        // keep paging hist+live as the open remount pair.
+        let leftoverRemount = SNMarmotRouteReplacement(
+            pendingId: "marmot:group-08",
+            realId: "marmot:group-09"
+        )
+        let leftoverOpenedPane = snRemountPairOpenedPane(
+            openedConversationId: nil,
+            openedConversationPaneId: nil,
+            routeReplacement: leftoverRemount
+        )
+        #expect(leftoverOpenedPane.opened == nil)
+        #expect(leftoverOpenedPane.pane == nil)
+        #expect(
+            snTranscriptSourceIds(
+                groupId: "group-09",
+                listedDirectIds: [],
+                historicalFolds: [:],
+                openedConversationId: leftoverOpenedPane.opened,
+                openedConversationPaneId: leftoverOpenedPane.pane
+            ) == ["group-09"]
+        )
+        let openRemountFallback = snRemountPairOpenedPane(
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: nil,
+            routeReplacement: leftoverRemount
+        )
+        #expect(openRemountFallback.opened == "marmot:group-09")
+        #expect(openRemountFallback.pane == "marmot:group-08")
         #expect(
             snConversationReadGroupIds(
                 groupId: "group-09",
@@ -1837,6 +1866,34 @@ struct SonarConversationFoldTests {
             closingId: "marmot:group-09",
             openedConversationId: "marmot:group-09",
             openedConversationPaneId: "marmot:group-09"
+        ))
+        let leftoverRoute = SNMarmotRouteReplacement(
+            pendingId: "marmot:group-08",
+            realId: "marmot:group-09"
+        )
+        #expect(snClosedDMShouldClearPendingRouteReplacement(
+            closingId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08",
+            routeReplacement: leftoverRoute
+        ))
+        #expect(snClosedDMShouldClearPendingRouteReplacement(
+            closingId: "marmot:group-08",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08",
+            routeReplacement: leftoverRoute
+        ))
+        #expect(!snClosedDMShouldClearPendingRouteReplacement(
+            closingId: "marmot:other",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08",
+            routeReplacement: leftoverRoute
+        ))
+        #expect(!snClosedDMShouldClearPendingRouteReplacement(
+            closingId: "marmot:group-09",
+            openedConversationId: nil,
+            openedConversationPaneId: nil,
+            routeReplacement: leftoverRoute
         ))
         #expect(snMacSelectionAfterFoldRemount(
             selectionId: "marmot:group-08",

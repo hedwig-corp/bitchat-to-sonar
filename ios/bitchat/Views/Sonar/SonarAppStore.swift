@@ -2083,6 +2083,46 @@ func snClosedDMShouldClearOpened(
     return snOpenedConversationIdMatches(closingId, openedConversationPaneId)
 }
 
+/// Remount-pair live / hist while a conversation is actually open.
+/// A leftover `pendingMarmotRouteReplacement` after leave must not keep
+/// treating hist+live as the open pair. Compose `remountPairOpenedPane`.
+func snRemountPairOpenedPane(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> (opened: String?, pane: String?) {
+    let openedStored = openedConversationId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let paneStored = openedConversationPaneId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if openedStored.isEmpty && paneStored.isEmpty {
+        return (nil, nil)
+    }
+    let opened = openedStored.isEmpty ? routeReplacement?.realId : openedConversationId
+    let pane = paneStored.isEmpty ? routeReplacement?.pendingId : openedConversationPaneId
+    return (
+        opened?.isEmpty == true ? nil : opened,
+        pane?.isEmpty == true ? nil : pane
+    )
+}
+
+/// Leave / delete that ends the remounted open must drop the leftover
+/// route replacement. Skip-hop `closedDM(hist)` during Mac selection hop
+/// must keep it. Compose `closedDMShouldClearPendingRouteReplacement`.
+func snClosedDMShouldClearPendingRouteReplacement(
+    closingId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> Bool {
+    guard let replacement = routeReplacement else { return false }
+    guard snClosedDMShouldClearOpened(
+        closingId: closingId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) else { return false }
+    return snOpenedConversationIdMatches(closingId, replacement.pendingId)
+        || snOpenedConversationIdMatches(closingId, replacement.realId)
+}
+
 /// Mac split-view keeps `.dm(hist)` after fold remount copies state onto
 /// live. Hop selection to live so the pane binds the activated transcript
 /// (send / call / group-info) instead of the deactivated hist id.
@@ -4554,8 +4594,7 @@ final class SonarAppStore: ObservableObject {
 
     func composerDraft(for chatId: String) -> String {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snComposerDraft(
             chatId: chatId,
             drafts: composerDrafts,
@@ -4570,8 +4609,7 @@ final class SonarAppStore: ObservableObject {
     func composerReply(for chatId: String) -> SNReplyRef? {
         guard Self.replyUIEnabled else { return nil }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snComposerReply(
             chatId: chatId,
             replies: composerReplyByChat,
@@ -4606,8 +4644,7 @@ final class SonarAppStore: ObservableObject {
 
     func cancelReply(chatId: String) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         composerReplyByChat = snComposerRepliesAfterClear(
             replies: composerReplyByChat,
             chatId: chatId,
@@ -4619,8 +4656,7 @@ final class SonarAppStore: ObservableObject {
 
     func jumpToQuotedMessage(chatId: String, parentId: String) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
             conversationId: chatId,
             parentId: parentId,
@@ -4638,8 +4674,7 @@ final class SonarAppStore: ObservableObject {
     /// aliases so remount cannot hide a recovered 0.8 quote.
     func jumpMessageIdAtOpen(for conversationId: String) -> String? {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snQuotedJumpParentId(
             conversationId: conversationId,
             jumps: jumpMessageIdAtOpenByDM,
@@ -4651,8 +4686,7 @@ final class SonarAppStore: ObservableObject {
 
     private func consumeComposerReply(for chatId: String) -> SNReplyRef? {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         let reply = snComposerReply(
             chatId: chatId,
             replies: composerReplyByChat,
@@ -4680,8 +4714,7 @@ final class SonarAppStore: ObservableObject {
 
     func setComposerDraft(_ text: String, for chatId: String) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         var nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
         for key in snPaymentActivityPeerKeys(
             conversationId: chatId,
@@ -4717,6 +4750,16 @@ final class SonarAppStore: ObservableObject {
     /// SwiftUI pane / Mac selection id. Fold remount rewrites
     /// `openedConversationId` to live without changing `.id(hist)`.
     private var openedConversationPaneId: String?
+
+    /// Remount-pair live / hist while a conversation is actually open.
+    /// A leftover `pendingMarmotRouteReplacement` after leave is ignored.
+    private func remountOpenedAndPane() -> (opened: String?, pane: String?) {
+        snRemountPairOpenedPane(
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            routeReplacement: pendingMarmotRouteReplacement
+        )
+    }
     /// Live ids whose `ConversationViewState` was just fold-remounted.
     /// `onAppear` `openedDM` must not newest-page hydrate them.
     private var suppressOpenedDMHydrateIds: Set<String> = []
@@ -8428,8 +8471,7 @@ final class SonarAppStore: ObservableObject {
     /// painted hist pane keeps title / send / call on the listed sibling.
     private func resolvedOpenGroupId(_ groupId: String) -> String {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snResolvedOpenGroupId(
             groupId: groupId,
             listedGroupIds: Set(marmot.groups.map(\.id)),
@@ -8445,8 +8487,7 @@ final class SonarAppStore: ObservableObject {
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let listed = Set(marmot.groups.map(\.id))
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         guard let sibling = snListedOrFoldedSiblingGroupId(
             groupId: groupId,
             listedGroupIds: listed,
@@ -8512,8 +8553,7 @@ final class SonarAppStore: ObservableObject {
     private func hasUnreadMarmotMessage(in groups: [MarmotService.MarmotGroup]) -> Bool {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         guard let first = groups.first else { return false }
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snUnreadForFoldFamily(
             groupId: first.id,
             unreadByGroup: marmot.unreadByGroup,
@@ -8533,8 +8573,7 @@ final class SonarAppStore: ObservableObject {
                 ? String(key.dropFirst(Self.marmotIDPrefix.count))
                 : key
         })
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snVerifiedForFoldFamily(
             groupId: first.id,
             verifiedIds: verifiedIds,
@@ -8554,8 +8593,7 @@ final class SonarAppStore: ObservableObject {
     private func transcriptSourceIds(forGroupId groupId: String) -> [String] {
         let groups = directMarmotGroups(matchingGroupId: groupId)
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snTranscriptSourceIds(
             groupId: groupId,
             listedDirectIds: groups.map(\.id),
@@ -9006,8 +9044,7 @@ final class SonarAppStore: ObservableObject {
         // showing a second row.
         var marmotRows: [SNDMRow] = []
         let historicalFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
@@ -9350,8 +9387,7 @@ final class SonarAppStore: ObservableObject {
     /// even when persist-folds have not landed yet.
     private func paymentActivityKeys(for id: String) -> Set<String> {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snPaymentActivityPeerKeys(
             conversationId: id,
             historicalFolds: folds,
@@ -9364,8 +9400,7 @@ final class SonarAppStore: ObservableObject {
     /// Unify keys stay put.
     private func paymentConversationStoreId(for id: String) -> String {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snPaymentConversationStoreId(
             peerKey: id,
             historicalFolds: folds,
@@ -9381,8 +9416,7 @@ final class SonarAppStore: ObservableObject {
     /// Open id plus hidden 0.8 sibling — same family walk as payments.
     private func callLogsForChat(_ id: String) -> [SNCallRecord] {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snCallLogsForChat(
             conversationId: id,
             callLogs: callLogs,
@@ -9476,8 +9510,7 @@ final class SonarAppStore: ObservableObject {
         // too. Listed live-only groups miss bak remainder when core
         // `fold_family(live)` is not ready yet. Compose `transcriptGroupIds`
         // / `meshFoldTranscriptSourceIds`.
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         let ids = snMeshFoldTranscriptSourceIds(
             listedDirectIds: folded.map(\.id),
             historicalFolds: folds,
@@ -9500,8 +9533,7 @@ final class SonarAppStore: ObservableObject {
             ?? marmotGroupId(conversationId)
         guard let seed else { return 0 }
         var seen = Set<String>()
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         return snFoldFamilyCachedMessages(
             groupId: seed,
             messagesByGroup: marmot.messagesByGroup,
@@ -9655,8 +9687,7 @@ final class SonarAppStore: ObservableObject {
             // every group member on every message.
             let mentionCtx = mentionContext(forConversationId: id)
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-            let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-            let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+            let (opened, pane) = remountOpenedAndPane()
             for group in sourceGroups {
                 let groupMessages = snFoldFamilyCachedMessages(
                     groupId: group.id,
@@ -9799,10 +9830,8 @@ final class SonarAppStore: ObservableObject {
                 conversationId: id,
                 sourceGroupIds: sourceGroups.map(\.id),
                 historicalFolds: folds,
-                openedConversationId: openedConversationId
-                    ?? pendingMarmotRouteReplacement?.realId,
-                openedConversationPaneId: openedConversationPaneId
-                    ?? pendingMarmotRouteReplacement?.pendingId
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             )
             for echoId in echoIds {
                 dated += Self.transcriptSource(
@@ -9905,8 +9934,7 @@ final class SonarAppStore: ObservableObject {
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-            let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-            let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+            let (opened, pane) = remountOpenedAndPane()
             let groupMessages = snFoldFamilyCachedMessages(
                 groupId: group.id,
                 messagesByGroup: marmot.messagesByGroup,
@@ -11664,8 +11692,7 @@ final class SonarAppStore: ObservableObject {
         caption: String
     ) -> String {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         for alias in snPendingUploadLookupGroupIds(
             groupId: groupId,
             historicalFolds: folds,
@@ -11744,8 +11771,7 @@ final class SonarAppStore: ObservableObject {
         // First send after resume can mint live 0.9 before persist-folds.
         // A live-only exclude set misses recovered 0.8 blossom URLs.
         let folds = await adoptMergedActionFolds(for: [groupId])
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         let ids = snMediaFetchGroupIds(
             startGroupId: groupId,
             historicalFolds: folds,
@@ -12621,8 +12647,7 @@ final class SonarAppStore: ObservableObject {
                         throw MarmotService.ServiceError.invalidInput("attachment has no download route")
                     }
                     let folds = await self.adoptMergedActionFolds(for: [item.groupId])
-                    let opened = self.openedConversationId ?? self.pendingMarmotRouteReplacement?.realId
-                    let pane = self.openedConversationPaneId ?? self.pendingMarmotRouteReplacement?.pendingId
+                    let (opened, pane) = self.remountOpenedAndPane()
                     let groupIds = snMediaFetchGroupIds(
                         startGroupId: item.groupId,
                         historicalFolds: folds,
@@ -12844,8 +12869,7 @@ final class SonarAppStore: ObservableObject {
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         if let jump = snQuotedJumpParentId(
             conversationId: id,
             jumps: pendingJumpMessageIdByDM,
@@ -12893,8 +12917,7 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             let folds = await self.adoptMergedActionFolds(for: [id, groupId])
-            let opened = self.openedConversationId ?? self.pendingMarmotRouteReplacement?.realId
-            let pane = self.openedConversationPaneId ?? self.pendingMarmotRouteReplacement?.pendingId
+            let (opened, pane) = self.remountOpenedAndPane()
             let ids = snTranscriptSourceIds(
                 groupId: groupId,
                 listedDirectIds: self.directMarmotGroups(matchingGroupId: groupId).map(\.id),
@@ -12937,8 +12960,7 @@ final class SonarAppStore: ObservableObject {
                 summaryLatest[alias] = Int64(latest)
             }
         }
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         let secs = snExpectedNewestTsForChat(
             chatId: groupId,
             messagesByChat: messagesByChat,
@@ -13307,6 +13329,12 @@ final class SonarAppStore: ObservableObject {
             conversationViewStates[id]?.deactivate()
             return
         }
+        let clearPendingReplacement = snClosedDMShouldClearPendingRouteReplacement(
+            closingId: id,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            routeReplacement: pendingMarmotRouteReplacement
+        )
         if snClosedDMShouldClearOpened(
             closingId: id,
             openedConversationId: openedConversationId,
@@ -13314,6 +13342,9 @@ final class SonarAppStore: ObservableObject {
         ) {
             openedConversationId = nil
             openedConversationPaneId = nil
+        }
+        if clearPendingReplacement {
+            pendingMarmotRouteReplacement = nil
         }
         // Keep ConversationViewState rows for Signal-style reopen paint (Compose
         // retainedTranscriptByChat), but detach from store invalidation so a
@@ -13954,8 +13985,7 @@ final class SonarAppStore: ObservableObject {
     /// the 8-second sender cooldown).
     func canSendTrill(_ id: String) -> Bool {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         let familyUntil = snTrillCooldownUntil(
             conversationId: id,
             cooldownUntilByChat: trillCooldownUntilByChat,
@@ -14169,8 +14199,7 @@ final class SonarAppStore: ObservableObject {
             keys.insert(alias)
         }
         let folds = folds ?? (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         for alias in snMutedFoldKeys(
             groupIdHex: id,
             historicalFolds: folds,
@@ -14506,8 +14535,7 @@ final class SonarAppStore: ObservableObject {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-            let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-            let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+            let (opened, pane) = remountOpenedAndPane()
             let ids = snTranscriptSourceIds(
                 groupId: groupId,
                 listedDirectIds: groups.map(\.id),
@@ -15233,8 +15261,7 @@ final class SonarAppStore: ObservableObject {
             )
         )
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
-        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let (opened, pane) = remountOpenedAndPane()
         let storeId = snCallConversationStoreId(
             conversationId: convId,
             historicalFolds: folds,
@@ -15472,6 +15499,7 @@ final class SonarAppStore: ObservableObject {
     private func hopMacOpenConversationSelection() {
         openedConversationId = nil
         openedConversationPaneId = nil
+        pendingMarmotRouteReplacement = nil
         deletedOpenConversationTick &+= 1
     }
 

@@ -1578,6 +1578,42 @@ class ConversationFoldTest {
                 openedConversationPaneId = "marmot:group-09",
             ),
         )
+        assertTrue(
+            closedDMShouldClearPendingRouteReplacement(
+                closingId = "marmot:group-09",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
+        assertTrue(
+            closedDMShouldClearPendingRouteReplacement(
+                closingId = "marmot:group-08",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
+        assertFalse(
+            closedDMShouldClearPendingRouteReplacement(
+                closingId = "marmot:other",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
+        assertFalse(
+            closedDMShouldClearPendingRouteReplacement(
+                closingId = "marmot:group-09",
+                openedConversationId = null,
+                openedConversationPaneId = null,
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
     }
 
     @Test
@@ -3433,6 +3469,34 @@ class ConversationFoldTest {
                 emptyMap(),
                 openedConversationId = "group-09",
                 openedConversationPaneId = "group-08",
+            ),
+        )
+        // Leftover pending→live replacement after leave must not keep
+        // paging hist+live as the open remount pair.
+        val leftoverOpenedPane = remountPairOpenedPane(
+            openedConversationId = null,
+            openedConversationPaneId = null,
+            routeReplacementPendingId = "group-08",
+            routeReplacementRealId = "group-09",
+        )
+        assertEquals(null to null, leftoverOpenedPane)
+        assertEquals(
+            listOf("group-09"),
+            transcriptSourceIds(
+                "group-09",
+                emptyList(),
+                emptyMap(),
+                openedConversationId = leftoverOpenedPane.first,
+                openedConversationPaneId = leftoverOpenedPane.second,
+            ),
+        )
+        assertEquals(
+            "group-09" to "group-08",
+            remountPairOpenedPane(
+                openedConversationId = "group-09",
+                openedConversationPaneId = null,
+                routeReplacementPendingId = "group-08",
+                routeReplacementRealId = "group-09",
             ),
         )
         assertEquals(
