@@ -2677,7 +2677,7 @@ invited; the room name disappears; sends land in the wrong chat.
 
 **Guarded by:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`
 
-**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`
+**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `ConversationFoldTest.startupSnapshotRewriteDoesNotStampInventedIsDirect`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`
 
 **Not guarded:** a real 0.8 device upgrade with a pending White Noise room. Host chat-list rendering still needs a constructible store (the helper pins are the R-001 shape).
 

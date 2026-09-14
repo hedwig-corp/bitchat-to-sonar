@@ -329,7 +329,7 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** so the room stays visible on the first-upgrade paint; old DMs may show room chrome until the first persist. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
 | iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct so the room stays visible; old DMs may show room chrome until the first persist. | same | none |
 | Mesh | untouched | untouched | none |
 
@@ -379,8 +379,8 @@ snapshot pins. All green.
 | `--test failed_events` | 1 passed |
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 29 passed (includes first-paint `isDirect` pins) |
-| `scripts/check-regression-ledger.sh` | 231 citations |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 30 passed (includes first-paint `isDirect` pins) |
+| `scripts/check-regression-ledger.sh` | 232 citations |
 
 CI on `385e2b2d`: Compose JVM unit tests and TranscriptEngine SPM are green.
 Rust core, iOS app build, and Android device tests were still running when

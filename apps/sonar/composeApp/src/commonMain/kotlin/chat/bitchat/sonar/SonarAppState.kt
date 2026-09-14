@@ -976,7 +976,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     init {
         if (initialChatSnapshotBlob.isNotEmpty()) {
-            persistChatSnapshot()
+            // Strip leftover plaintext bodies from older blobs. Do not write
+            // isDirect — a missing flag must stay missing until groups()
+            // returns or invented false becomes durable across a failed connect.
+            persistChatSnapshot(includeIsDirect = false)
         }
     }
 
@@ -11898,10 +11901,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshDmRows = rowsByPeer.values.sortedByDescending { it.tsSecs }
     }
 
-    private fun persistChatSnapshot() {
+    private fun persistChatSnapshot(includeIsDirect: Boolean = true) {
         SonarCore.saveBlob(
             CHAT_SNAPSHOT_BLOB_KEY,
-            encodeChatSnapshot(chats, chatSnapshotMessagesByChat, chatSnapshotLatestByChat),
+            encodeChatSnapshot(
+                chats,
+                chatSnapshotMessagesByChat,
+                chatSnapshotLatestByChat,
+                includeIsDirect = includeIsDirect,
+            ),
         )
     }
 
@@ -12004,7 +12012,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             latestSecs = { hydration.latestByChat[it] ?: 0L },
             previousOrder = previousOrder,
         )
-        persistChatSnapshot()
+        if (localCoreReady || started || loadedChats.isNotEmpty()) {
+            persistChatSnapshot()
+        }
         refreshUnreadCounts()
         for (c in chats) {
             c.members.forEach {

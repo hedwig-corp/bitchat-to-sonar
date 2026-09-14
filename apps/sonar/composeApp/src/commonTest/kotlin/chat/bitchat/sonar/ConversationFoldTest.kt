@@ -368,6 +368,27 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun startupSnapshotRewriteDoesNotStampInventedIsDirect() {
+        val room = SonarChat(
+            id = "pending-room",
+            name = "pending room",
+            members = listOf("npub1me", "npub1bob"),
+            isDirect = false,
+        )
+        val stripped = encodeChatSnapshot(
+            listOf(room),
+            emptyMap(),
+            mapOf(room.id to 9L),
+            includeIsDirect = false,
+        ).trimEnd()
+
+        assertFalse(stripped.endsWith("\t0") || stripped.endsWith("\t1"))
+        val decoded = decodeChatSnapshot(stripped).first.single()
+        assertFalse(decoded.isDirect)
+        assertEquals(mapOf(room.id to 9L), decodeChatSnapshotLatest(stripped))
+    }
+
+    @Test
     fun directMarmotPeerKeyCanonicalizesHexAndNpub() {
         val ownRaw = ByteArray(32) { 1 }
         val peerRaw = ByteArray(32) { 2 }

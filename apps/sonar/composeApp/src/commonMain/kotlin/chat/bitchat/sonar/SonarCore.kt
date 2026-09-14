@@ -464,6 +464,7 @@ internal fun encodeChatSnapshot(
     chats: List<SonarChat>,
     messagesByChat: Map<String, List<SonarMsg>>,
     latestByChat: Map<String, Long> = emptyMap(),
+    includeIsDirect: Boolean = true,
 ): String =
     buildString {
         // Order is part of this metadata-only snapshot: it is the last locally
@@ -472,14 +473,18 @@ internal fun encodeChatSnapshot(
         // timestamp is cached for cross-transport sorting; message bodies stay
         // out of this preferences blob. The 6th field is `isDirect` so a
         // two-member recovered room does not first-paint as a DM (R-045).
+        // Omit it when rewriting a pre-isDirect blob (startup strip of old
+        // message bodies) so invented `false` is not stamped durable.
         chats.forEach { chat ->
             append("c\t")
             append(hexEnc(chat.id)).append('\t')
             append(hexEnc(chat.name)).append('\t')
             append(chat.members.joinToString(",") { hexEnc(it) }).append('\t')
             append(messagesByChat[chat.id]?.lastOrNull()?.tsSecs ?: latestByChat[chat.id] ?: 0L)
-            append('\t')
-            append(if (chat.isDirect) "1" else "0")
+            if (includeIsDirect) {
+                append('\t')
+                append(if (chat.isDirect) "1" else "0")
+            }
             append('\n')
         }
     }

@@ -307,6 +307,8 @@ struct MarmotProfileCacheTests {
         #expect(loaded.0.first?.isDirect == false)
         #expect(snDirectMarmotPeerKey(for: loaded.0[0], ownNpub: "npub1me") == nil)
         #expect(snMarmotTreatsAsGroupChat(loaded.0[0]))
+        let stored = defaults.data(forKey: "marmot.chatSnapshot.v1").flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        #expect(!stored.contains("isDirect"), "load must not stamp invented isDirect onto a pre-isDirect blob")
     }
 
     @Test

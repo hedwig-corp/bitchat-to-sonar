@@ -333,9 +333,15 @@ enum SNMarmotChatSnapshotCache {
         guard let data = defaults.data(forKey: defaultsKey),
               let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
         else { return ([], [:]) }
-        // Rewrite older snapshots that included message bodies/media outside the
-        // encrypted chat database. The startup cache is row metadata only.
-        save(groups: snapshot.groups, messagesByGroup: [:], to: defaults)
+        // Strip leftover message bodies without re-encoding groups. Going
+        // through MarmotGroup Codable would stamp invented isDirect=false onto
+        // a pre-isDirect blob before FFI groups() returns (R-045).
+        if var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           obj.removeValue(forKey: "messages") != nil
+            || obj.removeValue(forKey: "messagesByGroup") != nil,
+           let stripped = try? JSONSerialization.data(withJSONObject: obj) {
+            defaults.set(stripped, forKey: defaultsKey)
+        }
         return (snapshot.groups, [:])
     }
 
