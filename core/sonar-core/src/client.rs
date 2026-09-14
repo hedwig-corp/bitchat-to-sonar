@@ -1967,9 +1967,12 @@ impl SonarClient {
         client.materialize_index_if_empty();
         // JSON folds → index (existing installs). Index folds → JSON
         // (lost sidecar). Do this at connect so first paint does not wait
-        // on ensure_subscriptions.
+        // on ensure_subscriptions. If both sidecars are gone, re-discover
+        // by members so fold_aliases / first-open messages_page / nsec
+        // restore remount do not wait on home-list `groups()`.
         client.persist_engine_folds_into_index();
         client.restore_recorded_folds_from_index();
+        client.rediscover_unbound_historical_folds();
         Ok(client)
     }
 
@@ -3263,10 +3266,11 @@ impl SonarClient {
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
         // Persist-folds can remount while the JSON sidecar is gone. Restore
-        // the recorded index bind before capturing `fold_aliases`, or leave
-        // of the live id leaves hist on disk and the next `groups()` paints
-        // the deleted room again.
-        self.restore_recorded_folds_touching(group_id);
+        // the recorded index bind — or re-discover by members when that
+        // bind is gone too — before capturing `fold_aliases`. Leave of the
+        // live id would otherwise leave hist on disk and the next
+        // `groups()` paints the deleted room again.
+        self.restore_or_rediscover_touching(group_id);
         let leave_id = self
             .engine
             .live_fold_target(group_id)
@@ -5586,9 +5590,10 @@ impl SonarClient {
     /// key (resolved from the message's imeta tag). Returns plaintext bytes.
     pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
         // Lost JSON sidecar: restore the index bind so a hist-id fetch of a
-        // 0.9 blob can use `live_fold_target` / the live exporter. 0.8
-        // attachments are found by blossom URL either way.
-        self.restore_recorded_folds_touching(group_id);
+        // 0.9 blob can use `live_fold_target` / the live exporter. Lost
+        // index bind too: re-discover before the fetch. 0.8 attachments
+        // are found by blossom URL either way.
+        self.restore_or_rediscover_touching(group_id);
         if self.engine.recovered_08_media_unavailable(group_id, url) {
             return Err(Error::Media(
                 crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
@@ -5609,7 +5614,7 @@ impl SonarClient {
         destination: &Path,
         observer: &dyn MediaDownloadObserver,
     ) -> Result<u64> {
-        self.restore_recorded_folds_touching(group_id);
+        self.restore_or_rediscover_touching(group_id);
         if self.engine.recovered_08_media_unavailable(group_id, url) {
             return Err(Error::Media(
                 crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
@@ -6342,12 +6347,13 @@ impl SonarClient {
     }
 
     /// Map a recovered 0.8 MLS id onto the live sibling before `groups()`
-    /// lookup. Restores a recorded index bind when the JSON sidecar is gone.
+    /// lookup. Restores a recorded index bind when the JSON sidecar is gone,
+    /// or re-discovers by members when the index bind is gone too.
     fn resolve_catchup_mls_hex(&self, clean: &str) -> String {
         let Some(group_id) = decode_group_id_hex(clean) else {
             return clean.to_string();
         };
-        self.restore_recorded_folds_touching(&group_id);
+        self.restore_or_rediscover_touching(&group_id);
         match self.engine.live_fold_target(&group_id) {
             Some(live) if live != group_id => hex::encode(live.as_slice()),
             _ => clean.to_string(),
@@ -7553,9 +7559,10 @@ impl SonarClient {
     fn invite_family(&self, group_id: &GroupId) -> Vec<GroupId> {
         // Host group-info queries the listed live id. Pre-migration
         // `sinvite1` tokens and join requests still key the recovered 0.8
-        // id. Restore a recorded index bind so a lost JSON sidecar does
-        // not hide those rows until housekeeping.
-        self.restore_recorded_folds_touching(group_id);
+        // id. Restore a recorded index bind — or re-discover by members
+        // when that bind is gone too — so a lost sidecar does not hide
+        // those rows until housekeeping.
+        self.restore_or_rediscover_touching(group_id);
         self.engine.fold_aliases(group_id)
     }
 
@@ -7640,11 +7647,32 @@ impl SonarClient {
     /// `ensure_subscriptions`. If the JSON sidecar is gone, restore the
     /// recorded index bind so `messages_page(live)` unions hist instead of
     /// waiting on housekeeping. No-op when this id already has aliases.
+    ///
+    /// Must not rediscover: [`Self::group_is_direct`] sits inside
+    /// [`Self::maybe_fold_new_group`], and that would recurse. Host
+    /// remount / first-open / leave use
+    /// [`Self::restore_or_rediscover_touching`] instead.
     fn restore_recorded_folds_touching(&self, group_id: &GroupId) {
         if self.engine.fold_aliases(group_id).len() > 1 {
             return;
         }
         self.restore_recorded_folds_from_index();
+    }
+
+    /// Restore a recorded index bind, then re-discover by members when
+    /// both sidecars are gone. Host remount (`fold_aliases` after nsec
+    /// restore), first-open `messages_page`, mark-read, and leave/delete
+    /// can run before home-list `groups()`. No-op when this id already
+    /// has aliases.
+    fn restore_or_rediscover_touching(&self, group_id: &GroupId) {
+        if self.engine.fold_aliases(group_id).len() > 1 {
+            return;
+        }
+        self.restore_recorded_folds_from_index();
+        if self.engine.fold_aliases(group_id).len() > 1 {
+            return;
+        }
+        self.rediscover_unbound_historical_folds();
     }
 
     /// Re-bind recovered 0.8 rows onto an already-joined 0.9 sibling when
@@ -7753,9 +7781,10 @@ impl SonarClient {
         let bytes = hex::decode(group_id_hex).ok()?;
         let group_id = GroupId::new(bytes);
         // Persist-folds remount from FFI aliases before summaries / page.
-        // Restore a recorded index bind so the first alias query is not
-        // hist-blind after the JSON sidecar is lost.
-        self.restore_recorded_folds_touching(&group_id);
+        // Restore a recorded index bind — or re-discover by members when
+        // that bind is gone too — so the first alias query is not
+        // hist-blind after nsec restore wipes the host fold blob.
+        self.restore_or_rediscover_touching(&group_id);
         let live = self.engine.live_fold_target(&group_id)?;
         Some(hex::encode(live.as_slice()))
     }
@@ -7765,7 +7794,7 @@ impl SonarClient {
     /// siblings from a listed live id (`live_fold_target(live)` is just live).
     pub fn fold_aliases_hex(&self, group_id_hex: &str) -> Vec<String> {
         if let Ok(bytes) = hex::decode(group_id_hex) {
-            self.restore_recorded_folds_touching(&GroupId::new(bytes));
+            self.restore_or_rediscover_touching(&GroupId::new(bytes));
         }
         self.fold_index_ids(group_id_hex)
     }
@@ -7791,7 +7820,7 @@ impl SonarClient {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
-        self.restore_recorded_folds_touching(group_id);
+        self.restore_or_rediscover_touching(group_id);
         self.engine.messages(group_id).map(|msgs| {
             msgs.into_iter()
                 .map(|m| self.with_delivery_state(m))
@@ -7805,7 +7834,7 @@ impl SonarClient {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ChatMessage>> {
-        self.restore_recorded_folds_touching(group_id);
+        self.restore_or_rediscover_touching(group_id);
         self.engine
             .messages_page(group_id, limit, offset)
             .map(|msgs| {
@@ -7861,13 +7890,17 @@ impl SonarClient {
 
     /// FFI / host paint only. See [`MarmotEngine::display_members`].
     pub fn display_members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
+        // Restore only. Rediscover would bind hist onto live and paint
+        // leftover 0.8 members before idle invite (`ensure_subscriptions`).
+        // FFI `groups()` already rediscovers; leftover roster stays a
+        // post-fold display.
         self.restore_recorded_folds_touching(group_id);
         self.engine.display_members(group_id)
     }
 
     /// FFI / host paint only. See [`MarmotEngine::display_name`].
     pub fn display_name(&self, group_id: &GroupId, live_name: &str) -> String {
-        self.restore_recorded_folds_touching(group_id);
+        self.restore_or_rediscover_touching(group_id);
         self.engine.display_name(group_id, live_name)
     }
 
@@ -7878,7 +7911,7 @@ impl SonarClient {
     /// Returns after durable local purge. Live-subscription narrowing runs in
     /// the background so delete never waits on relay round-trips.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
-        self.restore_recorded_folds_touching(group_id);
+        self.restore_or_rediscover_touching(group_id);
         let family = self.engine.fold_aliases(group_id);
         self.engine.delete_group(group_id).await?;
         self.purge_conversation_ids(&family);
@@ -8044,7 +8077,7 @@ impl SonarClient {
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
         if let Some(group_id) = decode_group_id_hex(group_id_hex) {
-            self.restore_recorded_folds_touching(&group_id);
+            self.restore_or_rediscover_touching(&group_id);
         }
         let ids = self.fold_index_ids(group_id_hex);
         if let Some(ref idx) = self.conversation_index {
@@ -8066,7 +8099,7 @@ impl SonarClient {
         before_id: Option<&nostr::EventId>,
         limit: usize,
     ) -> Result<Vec<ChatMessage>> {
-        self.restore_recorded_folds_touching(group_id);
+        self.restore_or_rediscover_touching(group_id);
         self.engine
             .messages_cursor_page(group_id, before_secs, before_id, limit)
             .map(|msgs| {
@@ -12481,6 +12514,120 @@ mod tests {
             bob.groups().expect("live listing").len(),
             1,
             "groups() must not mint or split after the rebound"
+        );
+    }
+
+    /// Lost JSON + index binds must not drop recovered history on first
+    /// open, nsec-restore remount, or mark-read. Those FFI paths run
+    /// before home-list `groups()` / `conversation_summaries()`.
+    #[tokio::test]
+    async fn open_transcript_rebinds_lost_fold_without_waiting_for_home_list() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+        }
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        let live_hex = hex::encode(live.as_slice());
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "test setup: both binds must be gone"
+        );
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+        }
+        assert_eq!(
+            bob.conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            1,
+            "test setup: hist still has unread before mark_read"
+        );
+
+        // mark_read first: rediscover's copy_summary also zeros hist, so
+        // unread must still be 1 when this FFI runs.
+        bob.mark_conversation_read(&live_hex);
+        assert_eq!(
+            bob.conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            0,
+            "mark_read(live) must clear remounted hist unread without groups()"
+        );
+
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        let aliases = bob.fold_aliases_hex(&live_hex);
+        assert!(
+            aliases.iter().any(|id| id == &hist_hex),
+            "fold_aliases after nsec restore must re-discover hist without groups(): {aliases:?}"
+        );
+        assert_eq!(
+            bob.live_fold_target_hex(&hist_hex).as_deref(),
+            Some(live_hex.as_str()),
+            "live_fold_target must remount the recovered row onto live"
+        );
+
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        let from_live = bob.messages(&live).expect("union transcript");
+        assert!(
+            from_live.iter().any(|m| m.content == "keep this chat"),
+            "messages(live) must union recovered 0.8 history before home-list paint"
         );
     }
 
