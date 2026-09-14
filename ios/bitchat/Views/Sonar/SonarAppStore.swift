@@ -512,6 +512,40 @@ func snRemountFoldedOpenValues<Value>(
     return next
 }
 
+/// Copy a hist composer draft onto live without family-clearing.
+/// `setComposerDraft("", hist)` after persist-folds walks the family and
+/// wipes the live copy too. iPhone still paints `.dm(hist)`, so hist keys
+/// must stay. Compose `remountComposerDrafts`.
+func snRemountComposerDrafts(
+    drafts: [String: String],
+    historicalKeys: [String],
+    liveKeys: [String]
+) -> [String: String] {
+    let nonempty = historicalKeys.filter { !(drafts[$0] ?? "").isEmpty }
+    return snRemountFoldedOpenValues(
+        historicalKeys: nonempty,
+        liveKeys: liveKeys,
+        values: drafts,
+        preferExisting: { !$0.isEmpty }
+    )
+}
+
+/// Copy the hist "has text" chrome flag onto live. Same keep-hist rule as
+/// `snRemountComposerDrafts` — a family-clear of hist must not drop live.
+func snRemountComposerDraftHasText(
+    flags: [String: Bool],
+    historicalKeys: [String],
+    liveKeys: [String]
+) -> [String: Bool] {
+    let present = historicalKeys.filter { flags[$0] == true }
+    return snRemountFoldedOpenValues(
+        historicalKeys: present,
+        liveKeys: liveKeys,
+        values: flags,
+        preferExisting: { $0 }
+    )
+}
+
 /// Rebind one open-chat id from a hidden 0.8 row onto the live sibling.
 func snRemountFoldedOpenId(
     historicalKeys: [String],
@@ -10558,19 +10592,21 @@ final class SonarAppStore: ObservableObject {
                 )
             }
         }
-        if let draft = composerDrafts[openId], !draft.isEmpty,
-           composerDraft(for: realId).isEmpty {
-            setComposerDraft(draft, for: realId)
-        }
-        if composerDrafts[openId] != nil {
-            setComposerDraft("", for: openId)
-        }
-        if composerReplyByChat[realId] == nil,
-           let reply = composerReplyByChat[openId] ?? composerReplyByChat[groupId] {
-            composerReplyByChat[realId] = reply
-        }
-        composerReplyByChat[openId] = nil
-        composerReplyByChat[groupId] = nil
+        composerDrafts = snRemountComposerDrafts(
+            drafts: composerDrafts,
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted]
+        )
+        composerDraftHasText = snRemountComposerDraftHasText(
+            flags: composerDraftHasText,
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted]
+        )
+        composerReplyByChat = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: composerReplyByChat
+        )
         if let historical = callLogs[openId] ?? callLogs[groupId], !historical.isEmpty {
             var byId: [String: SNCallRecord] = [:]
             for record in historical { byId[record.id] = record }

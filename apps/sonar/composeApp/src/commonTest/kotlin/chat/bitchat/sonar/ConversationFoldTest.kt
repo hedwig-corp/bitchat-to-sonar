@@ -543,6 +543,39 @@ class ConversationFoldTest {
                 preferExisting = { it.isNotEmpty() },
             ),
         )
+        val remountedDrafts = remountComposerDrafts(
+            drafts = mapOf("group-08" to "hello from 0.8"),
+            historicalKeys = listOf("group-08"),
+            liveKeys = listOf("group-09"),
+        )
+        assertEquals("hello from 0.8", remountedDrafts["group-08"])
+        assertEquals("hello from 0.8", remountedDrafts["group-09"])
+        assertEquals(
+            "hello from 0.8",
+            composerDraftForChat("group-08", remountedDrafts, mapOf("group-08" to "group-09")),
+        )
+        assertEquals(
+            "hello from 0.8",
+            composerDraftForChat("group-08", remountedDrafts, emptyMap()),
+        )
+        // Persist-folds + clear-hist family-wipes live. Remount must copy.
+        assertEquals(
+            emptyMap(),
+            composerDraftsAfterEdit(
+                remountedDrafts,
+                "group-08",
+                "",
+                mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "already typing",
+            remountComposerDrafts(
+                drafts = mapOf("group-08" to "old", "group-09" to "already typing"),
+                historicalKeys = listOf("group-08"),
+                liveKeys = listOf("group-09"),
+            )["group-09"],
+        )
         assertEquals(
             listOf("already-live", "old-1", "old-2"),
             mergedFoldedMessageLists(

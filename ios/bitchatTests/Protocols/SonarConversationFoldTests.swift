@@ -395,6 +395,51 @@ struct SonarConversationFoldTests {
                 preferExisting: { !$0.isEmpty }
             )["group-09"] == ["already-live"]
         )
+        let remountedDrafts = snRemountComposerDrafts(
+            drafts: ["marmot:group-08": "hello from 0.8"],
+            historicalKeys: ["marmot:group-08", "group-08"],
+            liveKeys: ["marmot:group-09", "group-09"]
+        )
+        #expect(remountedDrafts["marmot:group-08"] == "hello from 0.8")
+        #expect(remountedDrafts["marmot:group-09"] == "hello from 0.8")
+        #expect(
+            snComposerDraft(
+                chatId: "marmot:group-08",
+                drafts: remountedDrafts,
+                historicalFolds: ["group-08": "group-09"]
+            ) == "hello from 0.8"
+        )
+        #expect(
+            snComposerDraft(
+                chatId: "marmot:group-08",
+                drafts: remountedDrafts,
+                historicalFolds: [:]
+            ) == "hello from 0.8"
+        )
+        // Persist-folds + `setComposerDraft("", hist)` family-clears live.
+        // Remount must copy, not clear, or the iPhone hist pane loses the draft.
+        #expect(
+            snComposerDraftsAfterEdit(
+                drafts: remountedDrafts,
+                chatId: "marmot:group-08",
+                text: "",
+                historicalFolds: ["group-08": "group-09"]
+            ).isEmpty
+        )
+        #expect(
+            snRemountComposerDrafts(
+                drafts: ["marmot:group-08": "old", "marmot:group-09": "already typing"],
+                historicalKeys: ["marmot:group-08"],
+                liveKeys: ["marmot:group-09"]
+            )["marmot:group-09"] == "already typing"
+        )
+        #expect(
+            snRemountComposerDraftHasText(
+                flags: ["marmot:group-08": true],
+                historicalKeys: ["marmot:group-08"],
+                liveKeys: ["marmot:group-09"]
+            )["marmot:group-09"] == true
+        )
         #expect(
             snRemountFoldedOpenId(
                 historicalKeys: ["marmot:group-08", "group-08"],

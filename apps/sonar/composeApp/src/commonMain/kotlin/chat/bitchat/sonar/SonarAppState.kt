@@ -704,6 +704,24 @@ internal fun <V> remountFoldedOpenValues(
     return next
 }
 
+/** Copy a hist composer draft onto live without family-clearing.
+ *  `composerDraftsAfterEdit("", hist)` after persist-folds wipes live too.
+ *  iPhone still paints `.dm(hist)`, so hist keys must stay.
+ *  iOS `snRemountComposerDrafts`. */
+internal fun remountComposerDrafts(
+    drafts: Map<String, String>,
+    historicalKeys: List<String>,
+    liveKeys: List<String>,
+): Map<String, String> {
+    val nonempty = historicalKeys.filter { !drafts[it].isNullOrEmpty() }
+    return remountFoldedOpenValues(
+        historicalKeys = nonempty,
+        liveKeys = liveKeys,
+        values = drafts,
+        preferExisting = { it.isNotEmpty() },
+    )
+}
+
 /** Rebind one open-chat id from a hidden 0.8 row onto the live sibling. */
 internal fun remountFoldedOpenId(
     historicalKeys: Collection<String>,
@@ -15659,15 +15677,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             liveKeys = listOf(live),
             values = openChatJumpMessageId,
         )
-        val historicalDraft = composerDrafts[open.id]
-        if (!historicalDraft.isNullOrEmpty() && composerDrafts[live].isNullOrEmpty()) {
-            composerDrafts[live] = historicalDraft
+        val remountedDrafts = remountComposerDrafts(
+            drafts = composerDrafts.toMap(),
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+        )
+        if (remountedDrafts != composerDrafts.toMap()) {
+            remountedDrafts.forEach { (id, text) -> composerDrafts[id] = text }
         }
-        composerDrafts.remove(open.id)
         composerReplyByChat[open.id]?.let { reply ->
             if (live !in composerReplyByChat) composerReplyByChat[live] = reply
         }
-        composerReplyByChat.remove(open.id)
         callLogs[open.id]?.takeIf { it.isNotEmpty() }?.let { historical ->
             val merged = dedupeCallRecordsLastWins(historical + callLogs[live].orEmpty())
             callLogs[live] = merged.toMutableList()
