@@ -465,6 +465,43 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalRoomRemountsOntoLiveSibling() {
+        val listed = setOf("group-09")
+        assertEquals(
+            "group-09",
+            remountFoldedOpenChatId(
+                openChatId = "group-08",
+                listedChatIds = listed,
+                liveFoldTarget = "group-09",
+            ),
+        )
+        assertEquals(
+            "group-09",
+            remountFoldedOpenChatId(
+                openChatId = "group-09",
+                listedChatIds = listed,
+                liveFoldTarget = "group-09",
+            ),
+        )
+        assertEquals(
+            "group-08",
+            remountFoldedOpenChatId(
+                openChatId = "group-08",
+                listedChatIds = setOf("group-08", "group-09"),
+                liveFoldTarget = "group-09",
+            ),
+        )
+        assertEquals(
+            "group-08",
+            remountFoldedOpenChatId(
+                openChatId = "group-08",
+                listedChatIds = listed,
+                liveFoldTarget = null,
+            ),
+        )
+    }
+
+    @Test
     fun recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect() {
         val ownRaw = ByteArray(32) { 1 }
         val peerRaw = ByteArray(32) { 2 }

@@ -270,6 +270,20 @@ func snMarmotSendTargetGroupId(
     } ?? openChatId
 }
 
+/// After FFI `groups()` hides a folded 0.8 room, remount the open transcript
+/// onto the live 0.9 sibling so `marmot.groups` lookups stay valid.
+func snRemountFoldedOpenGroupId(
+    openGroupId: String,
+    listedGroupIds: Set<String>,
+    liveFoldTarget: String?
+) -> String {
+    if listedGroupIds.contains(openGroupId) { return openGroupId }
+    guard let live = liveFoldTarget, listedGroupIds.contains(live) else {
+        return openGroupId
+    }
+    return live
+}
+
 func snMarmotSendNeedsPeerUpdate(_ error: String) -> Bool {
     let lower = error.lowercased()
     return lower.contains("no key package")
@@ -2217,7 +2231,12 @@ final class SonarAppStore: ObservableObject {
         }
         marmot.$groups
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.resolvePendingSecureChats() }
+            .sink { [weak self] _ in
+                self?.resolvePendingSecureChats()
+                Task { @MainActor in
+                    await self?.remountFoldedOpenChatIfNeeded()
+                }
+            }
             .store(in: &cancellables)
         marmot.$npub
             .receive(on: DispatchQueue.main)
@@ -6989,6 +7008,41 @@ final class SonarAppStore: ObservableObject {
         }
         flushPendingDirectMarmot(npub: npub, groupId: groupId, realId: realId)
         openedDM(realId, marmotGroupId: groupId)
+    }
+
+    /// FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
+    /// transcript, swap the nav id to the live 0.9 sibling.
+    @MainActor
+    private func remountFoldedOpenChatIfNeeded() async {
+        guard let openId = currentDMId, let groupId = marmotGroupId(openId) else { return }
+        let listed = Set(marmot.groups.map(\.id))
+        let live = await marmot.liveFoldTarget(groupId: groupId)
+        let remounted = snRemountFoldedOpenGroupId(
+            openGroupId: groupId,
+            listedGroupIds: listed,
+            liveFoldTarget: live
+        )
+        guard remounted != groupId else { return }
+        let realId = Self.marmotIDPrefix + remounted
+        if marmot.messagesByGroup[remounted] == nil,
+           let historical = marmot.messagesByGroup[groupId] {
+            marmot.messagesByGroup[remounted] = historical
+        }
+        if let draft = composerDrafts[openId], !draft.isEmpty {
+            setComposerDraft(draft, for: realId)
+            setComposerDraft("", for: openId)
+        }
+        if recoveredChatNeedsUpdate.contains(openId) || recoveredChatNeedsUpdate.contains(groupId) {
+            recoveredChatNeedsUpdate.remove(openId)
+            recoveredChatNeedsUpdate.remove(groupId)
+            recoveredChatNeedsUpdate.insert(realId)
+            recoveredChatNeedsUpdate.insert(remounted)
+        }
+        if case .dm(let id) = path.last, id == openId {
+            path.removeLast()
+            path.append(.dm(realId))
+        }
+        openedDM(realId, marmotGroupId: remounted)
     }
 
     private func resolvePendingSecureChats() {

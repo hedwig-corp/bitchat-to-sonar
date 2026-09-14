@@ -1671,6 +1671,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func leaveGroup(groupIdHex: String) throws
 
+    /**
+     * Live 0.9 group that replaced a recovered 0.8 row after resume-send.
+     * Local read; `None` when the id is not folded.
+     */
+    func liveFoldTarget(groupIdHex: String)  -> String?
+
     func markConversationRead(groupIdHex: String)
 
     /**
@@ -2560,6 +2566,19 @@ open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConve
         FfiConverterString.lower(groupIdHex),$0
     )
 }
+}
+
+    /**
+     * Live 0.9 group that replaced a recovered 0.8 row after resume-send.
+     * Local read; `None` when the id is not folded.
+     */
+open func liveFoldTarget(groupIdHex: String) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_live_fold_target(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+})
 }
 
 open func markConversationRead(groupIdHex: String)  {try! rustCall() {
@@ -9378,6 +9397,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_live_fold_target() != 18271) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_mark_conversation_read() != 18250) {

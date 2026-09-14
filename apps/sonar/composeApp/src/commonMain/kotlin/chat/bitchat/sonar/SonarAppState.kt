@@ -507,6 +507,18 @@ internal fun marmotSendTargetGroupId(
 ): String =
     duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
 
+/** After FFI `groups()` hides a folded 0.8 room, remount the open transcript
+ *  onto the live 0.9 sibling so lookups (`chats.firstOrNull`) stay valid. */
+internal fun remountFoldedOpenChatId(
+    openChatId: String,
+    listedChatIds: Set<String>,
+    liveFoldTarget: String?,
+): String {
+    if (openChatId in listedChatIds) return openChatId
+    val live = liveFoldTarget ?: return openChatId
+    return if (live in listedChatIds) live else openChatId
+}
+
 internal enum class RecoveredChatResumeUi { Live, WaitingForPeerUpdate }
 
 internal fun recoveredChatResumeUi(
@@ -1232,19 +1244,28 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var conversationPinnedToOlderEdge by mutableStateOf(false)
     private var transcriptGeneration = 0L
     private var activeTranscriptChatId: String? = null
+    /** Open-id aliases kept across a 0.8→0.9 remount so an in-flight send
+     *  that still holds the historical id can publish into the live session. */
+    private var transcriptSessionAliases = setOf<String>()
 
     private fun isCurrentTranscriptSession(chatId: String, generation: Long): Boolean =
         generation == transcriptGeneration &&
-            activeTranscriptChatId == chatId &&
-            (screen as? Screen.Chat)?.id == chatId
+            chatId in transcriptSessionChatIds() &&
+            (screen as? Screen.Chat)?.id in transcriptSessionChatIds()
 
     /** Session still owned while the first local page loads *before* [push]. */
     private fun isActiveTranscriptGeneration(chatId: String, generation: Long): Boolean =
-        generation == transcriptGeneration && activeTranscriptChatId == chatId
+        generation == transcriptGeneration && chatId in transcriptSessionChatIds()
+
+    private fun transcriptSessionChatIds(): Set<String> {
+        val active = activeTranscriptChatId ?: return emptySet()
+        return transcriptSessionAliases + active
+    }
 
     private fun beginTranscriptSession(chatId: String): Long {
         transcriptGeneration += 1
         activeTranscriptChatId = chatId
+        transcriptSessionAliases = setOf(chatId)
         // Reopening starts from a viewport-sized local page. Older pages are a
         // property of the live view, not an account-wide plaintext cache.
         transcriptWindows.clear()
@@ -1261,6 +1282,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun endTranscriptSession() {
         transcriptGeneration += 1
         activeTranscriptChatId = null
+        transcriptSessionAliases = emptySet()
         transcriptWindows.clear()
         freshCanonicalByGroup.clear()
         meshTranscriptRows = emptyList()
@@ -1274,8 +1296,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True when the active 500-row window has moved away from the newest edge. */
     fun canLoadNewestMessages(chatId: String): Boolean =
         conversationPinnedToOlderEdge &&
-            activeTranscriptChatId == chatId &&
-            (screen as? Screen.Chat)?.id == chatId
+            chatId in transcriptSessionChatIds() &&
+            (screen as? Screen.Chat)?.id in transcriptSessionChatIds()
 
     /**
      * Reset this live conversation to its bounded newest edge. Advancing the
@@ -2455,7 +2477,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
         // Local cursor reads race navigation. A late page from chat A must not
         // overwrite chat B's render state after the user switches screens.
-        if ((screen as? Screen.Chat)?.id != chatId || activeTranscriptChatId != chatId) return
+        if ((screen as? Screen.Chat)?.id !in transcriptSessionChatIds() ||
+            chatId !in transcriptSessionChatIds()
+        ) {
+            return
+        }
         publishOpenTranscript(chatId, visibleMessagesForChat(chatId, source), processCalls)
     }
 
@@ -2469,7 +2495,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         visible: List<SonarMsg>,
         processCalls: Boolean = false,
     ) {
-        if ((screen as? Screen.Chat)?.id != chatId || activeTranscriptChatId != chatId) return
+        if ((screen as? Screen.Chat)?.id !in transcriptSessionChatIds() ||
+            chatId !in transcriptSessionChatIds()
+        ) {
+            return
+        }
         if (!sameTranscriptPaint(messages, visible)) {
             messages = visible
         }
@@ -11061,7 +11091,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     suspend fun loadOlderMessages(chatId: String): Boolean {
         val generation = transcriptGeneration
-        if (activeTranscriptChatId != chatId || (screen as? Screen.Chat)?.id != chatId) return false
+        if (chatId !in transcriptSessionChatIds() ||
+            (screen as? Screen.Chat)?.id !in transcriptSessionChatIds()
+        ) {
+            return false
+        }
 
         val groupIds = transcriptGroupIds(chatId)
         for (groupId in groupIds) {
@@ -12023,6 +12057,46 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
         resolvePendingMarmotChats()
+        remountFoldedOpenChat()
+    }
+
+    /** FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
+     *  transcript, swap the nav id to the live 0.9 sibling so member/title
+     *  lookups keep working. In-flight send closures keep the historical id
+     *  via [transcriptSessionAliases]. */
+    private fun remountFoldedOpenChat() {
+        val open = screen as? Screen.Chat ?: return
+        val live = remountFoldedOpenChatId(
+            openChatId = open.id,
+            listedChatIds = chats.mapTo(hashSetOf()) { it.id },
+            liveFoldTarget = runCatching { SonarCore.liveFoldTarget(open.id) }.getOrNull(),
+        )
+        if (live == open.id) return
+        val liveChat = chats.firstOrNull { it.id == live } ?: return
+        moveSendEchoes(open.id, live)
+        retainedTranscriptByChat[open.id]?.let { retainedTranscriptByChat[live] = it }
+        retainedTranscriptByChat.remove(open.id)
+        openChatUnread[open.id]?.let { openChatUnread = openChatUnread - open.id + (live to it) }
+        openChatUnreadAnchor[open.id]?.let { openChatUnreadAnchor = openChatUnreadAnchor - open.id + (live to it) }
+        openChatJumpMessageId[open.id]?.let {
+            openChatJumpMessageId = openChatJumpMessageId - open.id + (live to it)
+        }
+        composerDrafts[open.id]?.let { composerDrafts[live] = it }
+        composerDrafts.remove(open.id)
+        if (open.id in recoveredChatNeedsUpdate) {
+            recoveredChatNeedsUpdate = recoveredChatNeedsUpdate - open.id + live
+        }
+        if (activeTranscriptChatId == open.id || open.id in transcriptSessionAliases) {
+            transcriptSessionAliases = transcriptSessionAliases + open.id + live
+            activeTranscriptChatId = live
+        }
+        stack = stack.map { s ->
+            if (s is Screen.Chat && s.id == open.id) {
+                s.copy(id = live, name = chatTitle(liveChat))
+            } else {
+                s
+            }
+        }
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)

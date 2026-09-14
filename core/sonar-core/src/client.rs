@@ -7216,6 +7216,16 @@ impl SonarClient {
         matches!(self.engine.live_fold_target(group_id), Some(live) if live != *group_id)
     }
 
+    /// Hex of the live 0.9 group that replaced `group_id_hex` after resume.
+    ///
+    /// `None` when the id is not folded. Hosts remount an open transcript
+    /// onto this id after `groups()` hides the recovered row.
+    pub fn live_fold_target_hex(&self, group_id_hex: &str) -> Option<String> {
+        let bytes = hex::decode(group_id_hex).ok()?;
+        let live = self.engine.live_fold_target(&GroupId::new(bytes))?;
+        Some(hex::encode(live.as_slice()))
+    }
+
     fn fold_index_ids(&self, group_id_hex: &str) -> Vec<String> {
         let Ok(bytes) = hex::decode(group_id_hex) else {
             return vec![group_id_hex.to_string()];

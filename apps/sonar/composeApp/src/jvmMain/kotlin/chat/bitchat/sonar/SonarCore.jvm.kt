@@ -194,6 +194,11 @@ actual object SonarCore {
         n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs, isDirect = it.isDirect) }
     }
 
+    actual fun liveFoldTarget(groupId: String): String? {
+        val n = node ?: return null
+        return n.liveFoldTarget(groupId)
+    }
+
     actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {
         requireNode().startDm(peer.trim(), "")
     }

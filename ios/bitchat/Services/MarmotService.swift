@@ -1289,6 +1289,11 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Live 0.9 group that replaced a recovered 0.8 row, or nil if not folded.
+    func liveFoldTarget(groupId: String) async -> String? {
+        await readOnlyNonThrowing({ $0.liveFoldTarget(groupIdHex: groupId) }, default: nil)
+    }
+
     /// Decrypted message history for a group, oldest first.
     func messages(groupId: String) async throws -> [MarmotMessage] {
         try await readOnly {

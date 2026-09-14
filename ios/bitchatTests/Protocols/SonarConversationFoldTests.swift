@@ -39,6 +39,34 @@ struct SonarConversationFoldTests {
                 latestSecs: { $0 == "group-09" ? 2 : 1 }
             ) == "group-09"
         )
+        #expect(
+            snRemountFoldedOpenGroupId(
+                openGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: "group-09"
+            ) == "group-09"
+        )
+        #expect(
+            snRemountFoldedOpenGroupId(
+                openGroupId: "group-09",
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: "group-09"
+            ) == "group-09"
+        )
+        #expect(
+            snRemountFoldedOpenGroupId(
+                openGroupId: "group-08",
+                listedGroupIds: ["group-08", "group-09"],
+                liveFoldTarget: "group-09"
+            ) == "group-08"
+        )
+        #expect(
+            snRemountFoldedOpenGroupId(
+                openGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: nil
+            ) == "group-08"
+        )
         #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))

@@ -1518,6 +1518,13 @@ async fn recovered_08_pending_room_send_creates_named_group_not_dm() {
         alice.is_folded_historical_group(&historical),
         "resumed pending room must not stay on the FFI chat list beside the live group"
     );
+    assert_eq!(
+        alice
+            .live_fold_target_hex(&hex::encode(historical.as_slice()))
+            .as_deref(),
+        Some(hex::encode(room.id.as_slice()).as_str()),
+        "hosts remount the open historical room onto the live 0.9 group"
+    );
 }
 
 fn write_mdk08_alice_bob_carol_store(
@@ -1645,6 +1652,13 @@ async fn recovered_08_group_resumes_on_a_new_09_group_through_a_relay() {
     assert!(
         !alice.is_folded_historical_group(&live[0].id),
         "the live 0.9 room is the listed chat"
+    );
+    assert_eq!(
+        alice
+            .live_fold_target_hex(&hex::encode(historical.as_slice()))
+            .as_deref(),
+        Some(hex::encode(live[0].id.as_slice()).as_str()),
+        "hosts remount the open historical room onto the live 0.9 group"
     );
 
     bob.sync().await.expect("bob syncs welcome");

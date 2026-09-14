@@ -3237,6 +3237,11 @@ final class MarmotChatModel: ObservableObject {
         await service.claimedHandle()
     }
 
+    /// Live 0.9 group that replaced a recovered 0.8 row, or nil if not folded.
+    func liveFoldTarget(groupId: String) async -> String? {
+        await service.liveFoldTarget(groupId: groupId)
+    }
+
     /// Resolve a handle (`vincenzo` / `alice@domain`) to its owner via NIP-05.
     func resolveHandle(_ input: String) async throws -> MarmotService.ResolvedHandle {
         try await service.resolveHandle(input)

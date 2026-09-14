@@ -1727,6 +1727,12 @@ impl SonarNode {
         Ok(out)
     }
 
+    /// Live 0.9 group that replaced a recovered 0.8 row after resume-send.
+    /// Local read; `None` when the id is not folded.
+    pub fn live_fold_target(&self, group_id_hex: String) -> Option<String> {
+        self.client.live_fold_target_hex(&group_id_hex)
+    }
+
     /// Decrypted message history for a group, oldest first.
     pub fn messages(&self, group_id_hex: String) -> FfiResult<Vec<MessageInfo>> {
         let group_id = parse_group_id(&group_id_hex)?;
