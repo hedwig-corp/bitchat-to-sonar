@@ -1449,6 +1449,13 @@ ahead. Cache `latest_at` from the same summaries probe and max it
 across the fold family. Pin:
 `ConversationFoldTest.expectedNewestTsUsesRemountedIndexLatestWhenSnapshotStale`.
 
+Compose `refreshTranscriptGroupWindow` then fed snapshot-only
+`localLatestTs` into `transcriptReadIsUntrusted`. iOS uses
+`max(existingLatest, family summary latestAt)`. An empty live page
+after resume was trusted and replaced the 0.8 extract. The same
+index newest now gates that keep. Pin: same
+`expectedNewestTsUsesRemountedIndexLatestWhenSnapshotStale`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

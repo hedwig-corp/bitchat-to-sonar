@@ -12930,7 +12930,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         generation: Long,
     ): List<SonarMsg> {
         val fetched = latestCursorPage(groupId)
-        val untrusted = transcriptReadIsUntrusted(fetched, started, localLatestTs(groupId))
+        val untrusted = transcriptReadIsUntrusted(
+            fetched,
+            started,
+            maxOf(
+                expectedNewestTsForOpenChat(groupId),
+                expectedNewestTsForOpenChat(sessionChatId),
+            ),
+        )
         if (!isCurrentTranscriptSession(sessionChatId, generation)) {
             return when {
                 untrusted -> snapshotMessagesForChat(groupId).takeLast(TRANSCRIPT_PAGE_SIZE)

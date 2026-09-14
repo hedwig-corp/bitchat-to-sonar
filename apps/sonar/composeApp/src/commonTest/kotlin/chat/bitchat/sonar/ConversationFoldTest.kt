@@ -2448,6 +2448,36 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        val indexNewest = expectedNewestTsForChat(
+            chatId = "group-09",
+            messagesByChat = emptyMap(),
+            latestByChat = emptyMap(),
+            summaryLatestByChat = mapOf("group-08" to 50L),
+            historicalFolds = folds,
+        )
+        assertEquals(50L, indexNewest)
+        assertTrue(
+            transcriptReadIsUntrusted(
+                emptyList(),
+                coreStarted = true,
+                knownLatestSecs = indexNewest,
+            ),
+            "empty live page must keep extract when hist index newest is ahead",
+        )
+        assertFalse(
+            transcriptReadIsUntrusted(
+                emptyList(),
+                coreStarted = true,
+                knownLatestSecs = expectedNewestTsForChat(
+                    chatId = "group-09",
+                    messagesByChat = emptyMap(),
+                    latestByChat = emptyMap(),
+                    summaryLatestByChat = emptyMap(),
+                    historicalFolds = folds,
+                ),
+            ),
+            "genuinely empty conversation stays a trusted empty page",
+        )
     }
 
     @Test
