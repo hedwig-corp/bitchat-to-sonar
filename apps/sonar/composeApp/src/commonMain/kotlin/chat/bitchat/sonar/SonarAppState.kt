@@ -422,6 +422,19 @@ internal fun homeListTitleForFoldedMeshRow(
     meshDerivedName: String,
 ): String = directMarmotTitle ?: meshDerivedName
 
+/** Search / share-to must match the painted title. Recovered 1:1s have a
+ *  blank MLS `chat.name` after hide; filtering that field hides the person.
+ *  iOS search uses `dmRows.title`. */
+internal fun conversationSearchMatches(
+    query: String,
+    storedName: String,
+    displayTitle: String,
+): Boolean {
+    val q = query.trim().lowercase()
+    if (q.isEmpty()) return true
+    return displayTitle.lowercase().contains(q) || storedName.lowercase().contains(q)
+}
+
 /** Rename-signal decision: force a kind-0 refetch only when the BLE name is
  *  real, differs from the cached profile name, and no fetch is in flight or
  *  recently done. */

@@ -10,6 +10,17 @@ import kotlin.test.assertTrue
 class HomeMessageRowsTest {
 
     @Test
+    fun searchMatchesPaintedTitleWhenStoredMlsNameIsBlank() {
+        // Recovered 1:1s keep a blank MLS name after hide. Search/share-to
+        // must match the painted title (iOS dmRows.title).
+        assertTrue(conversationSearchMatches("alice", storedName = "", displayTitle = "Alice"))
+        assertTrue(conversationSearchMatches("ali", storedName = "", displayTitle = "Alice"))
+        assertFalse(conversationSearchMatches("bob", storedName = "", displayTitle = "Alice"))
+        assertTrue(conversationSearchMatches("book", storedName = "Book club", displayTitle = "Book club"))
+        assertTrue(conversationSearchMatches("", storedName = "", displayTitle = "Alice"))
+    }
+
+    @Test
     fun unlockedAccountWaitsForCoherentLocalHomeBeforeFirstPaint() {
         assertFalse(isFirstLocalStateReady(onboarded = true, locked = false, homeMessagesHydrated = false))
         assertTrue(isFirstLocalStateReady(onboarded = true, locked = false, homeMessagesHydrated = true))

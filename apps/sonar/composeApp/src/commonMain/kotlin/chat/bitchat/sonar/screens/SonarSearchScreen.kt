@@ -35,6 +35,7 @@ import chat.bitchat.sonar.GeoChannel
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarCore
+import chat.bitchat.sonar.conversationSearchMatches
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
@@ -75,8 +76,11 @@ fun SonarSearchScreen(state: SonarAppState) {
         if (ql.isEmpty()) out
         else out.filter { it.name.lowercase().contains(ql) || it.geohash.lowercase().contains(ql) }
     }
-    val chats: List<SonarChat> = remember(state.visibleChats, query) {
-        if (ql.isEmpty()) state.visibleChats else state.visibleChats.filter { it.name.lowercase().contains(ql) }
+    val chats: List<SonarChat> = remember(state.visibleChats, query, state.profilesByNpub) {
+        if (ql.isEmpty()) state.visibleChats
+        else state.visibleChats.filter { chat ->
+            conversationSearchMatches(query, storedName = chat.name, displayTitle = state.chatTitle(chat))
+        }
     }
 
     // An invite link/token pasted (or shared) into search → request to join.
@@ -198,8 +202,8 @@ fun SonarSearchScreen(state: SonarAppState) {
                 item { chat.bitchat.sonar.ui.SNSectionLabel("Messages") }
                 items(chats, key = { "dm:" + it.id }) { chat ->
                     ResultRow(
-                        avatar = { SonarAvatar(chat.name, 44.dp, presence = false) },
-                        title = chat.name, sub = "Secure chat",
+                        avatar = { SonarAvatar(state.chatTitle(chat), 44.dp, presence = false) },
+                        title = state.chatTitle(chat), sub = "Secure chat",
                     ) { state.openChat(chat) }
                 }
             }
