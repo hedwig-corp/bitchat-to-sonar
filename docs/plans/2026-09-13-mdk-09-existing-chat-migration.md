@@ -1495,6 +1495,12 @@ after `copy_summary` live already holds the sum. Pins:
 `UnreadCountsTest.liveOnlyProbeKeepsHistUnreadWhenLiveBadgeIsZero`,
 `SNUnreadCountsTests.liveOnlyProbeKeepsHistUnreadWhenLiveBadgeIsZero`.
 
+Compose `visibleChats` memo ignored the summaries-index cache. After
+`rememberConversationSummaryIndex` filled hist `latest_at`, dedupe
+still used the snapshot-0 order until chats/snapshot identity moved.
+Bump `conversationIndexVersion` into `VisibleChatsKey`. Pin:
+`EventDrivenRefreshTest.conversationIndexVersionChangeInvalidates`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

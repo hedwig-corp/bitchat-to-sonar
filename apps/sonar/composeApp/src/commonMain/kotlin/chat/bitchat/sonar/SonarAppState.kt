@@ -2368,6 +2368,7 @@ internal data class VisibleChatsKey(
     val snapshotVersion: Int,
     val ownNpub: String,
     val holdVersion: Int,
+    val conversationIndexVersion: Int = 0,
 )
 
 internal fun decodeGroupFoldMap(blob: String): Map<String, String> =
@@ -2627,18 +2628,29 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  `expectedNewestTsForOpenChat` must not be snapshot-only — iOS reads
      *  remounted `conversationSummariesByGroup[].latestAt`. */
     private var conversationLatestAtByChat: Map<String, Long> = emptyMap()
+    /** Bumped when the summaries-index cache changes so [visibleChats]
+     *  dedupe / [marmotRow] recency re-run. Snapshot-only memo keys left a
+     *  recovered row sunk after `rememberConversationSummaryIndex`. */
+    private var conversationIndexVersion = 0
 
     private fun rememberConversationSummaryIndex(summaries: List<SonarConversationSummary>?) {
-        conversationMessageCountByChat = conversationMessageCountsFromSummaries(
+        val nextCounts = conversationMessageCountsFromSummaries(
             summaries,
             conversationMessageCountByChat,
             historicalFoldMap,
         )
-        conversationLatestAtByChat = conversationLatestAtFromSummaries(
+        val nextLatest = conversationLatestAtFromSummaries(
             summaries,
             conversationLatestAtByChat,
             historicalFoldMap,
         )
+        if (nextCounts !== conversationMessageCountByChat ||
+            nextLatest !== conversationLatestAtByChat
+        ) {
+            conversationIndexVersion++
+        }
+        conversationMessageCountByChat = nextCounts
+        conversationLatestAtByChat = nextLatest
     }
 
     private fun localLatestTs(chatId: String): Long =
@@ -3933,6 +3945,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             snapshotVersion = snapshotVersion,
             ownNpub = npub,
             holdVersion = holdInputsVersion,
+            conversationIndexVersion = conversationIndexVersion,
         )
     }
 
