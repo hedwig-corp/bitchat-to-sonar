@@ -713,7 +713,12 @@ final class MarmotChatModel: ObservableObject {
         self.profilesByNpub = SNMarmotProfileCache.load(from: defaults)
         self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.load(from: defaults)
         let cached = SNMarmotChatSnapshotCache.load(from: defaults)
-        self.groups = cached.0
+        let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+        self.groups = snCollapsedFoldedSnapshotGroups(
+            groups: cached.0,
+            id: { $0.id },
+            historicalFolds: folds
+        )
         self.messagesByGroup = cached.1
         self.conversationChangeSub = service.conversationChanged
             .receive(on: DispatchQueue.main)

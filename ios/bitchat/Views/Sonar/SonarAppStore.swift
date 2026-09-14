@@ -270,6 +270,8 @@ func snMarmotSendTargetGroupId(
     } ?? openChatId
 }
 
+let snHistoricalFoldsDefaultsKey = "sonar.historicalFolds.v1"
+
 /// After FFI `groups()` hides a folded 0.8 room, remount the open transcript
 /// onto the live 0.9 sibling so `marmot.groups` lookups stay valid.
 func snRemountFoldedOpenGroupId(
@@ -345,6 +347,41 @@ func snPromotedFoldedMessagesByGroup<Message>(
         }
     }
     return next
+}
+
+/// When FFI hides a folded 0.8 row, keep its safety-number verify on the live sibling.
+func snPromotedFoldedVerifiedIds(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    verifiedIds: Set<String>,
+    liveFoldTarget: (String) -> String?
+) -> Set<String> {
+    var next = verifiedIds
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: verifiedIds,
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs where verifiedIds.contains(pair.historical) {
+        next.insert(pair.live)
+    }
+    return next
+}
+
+/// Drop a recovered snapshot row once its live 0.9 sibling is already listed.
+func snCollapsedFoldedSnapshotGroups<Group>(
+    groups: [Group],
+    id: (Group) -> String,
+    historicalFolds: [String: String]
+) -> [Group] {
+    if historicalFolds.isEmpty { return groups }
+    let ids = Set(groups.map(id))
+    return groups.filter { group in
+        let groupId = id(group)
+        guard let live = historicalFolds[groupId] else { return true }
+        return live == groupId || !ids.contains(live)
+    }
 }
 
 /// Keep recovered call-log rows on the live sibling after FFI hides the 0.8 id.
@@ -1424,6 +1461,7 @@ final class SonarAppStore: ObservableObject {
         static let marmotConversationGroups = "sonar.marmotConversationGroups.v1"
         /// Persisted local call-log rows ([conversation id: call records] JSON).
         static let callLogs = "sonar.callLogs.v1"
+        static let historicalFolds = snHistoricalFoldsDefaultsKey
         static let notificationsEnabled = SonarNotificationPreferenceStore.enabledKey
         static let notificationShowNames = SonarNotificationPreferenceStore.showNamesKey
         static let notificationShowPreview = SonarNotificationPreferenceStore.showPreviewKey
@@ -2331,6 +2369,8 @@ final class SonarAppStore: ObservableObject {
                     await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedVerified(from: self.lastMarmotGroupIds, to: current)
+                    await self.rememberHistoricalFolds(from: self.lastMarmotGroupIds, to: current)
                     self.lastMarmotGroupIds = current
                     await self.remountFoldedOpenChatIfNeeded()
                 }
@@ -3302,6 +3342,7 @@ final class SonarAppStore: ObservableObject {
 
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
+        defaults.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
@@ -7235,6 +7276,61 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Copy a safety-number verify from a hidden 0.8 row onto the live sibling.
+    @MainActor
+    private func promoteFoldedVerified(from previous: Set<String>, to current: Set<String>) async {
+        var verifiedGroupIds = Set<String>()
+        for key in marmotVerified.keys where marmotVerified[key] == true {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                verifiedGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                verifiedGroupIds.insert(key.lowercased())
+            }
+        }
+        var targets: [String: String] = [:]
+        for historical in previous.union(verifiedGroupIds).subtracting(current) {
+            if let live = await marmot.liveFoldTarget(groupId: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedVerifiedIds(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            verifiedIds: verifiedGroupIds,
+            liveFoldTarget: { targets[$0] }
+        )
+        var changed = false
+        for groupId in next where current.contains(groupId) {
+            if marmotVerified[groupId] != true {
+                marmotVerified[groupId] = true
+                changed = true
+            }
+        }
+        if changed {
+            defaults.set(marmotVerified, forKey: Keys.marmotVerified)
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
+    }
+
+    /// Remember hist→live bindings so the next cold-start snapshot can hide
+    /// a folded 0.8 row before FFI `groups()` returns.
+    @MainActor
+    private func rememberHistoricalFolds(from previous: Set<String>, to current: Set<String>) async {
+        var map = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        var changed = false
+        for id in previous.union(current).union(Set(map.keys)) {
+            guard let live = await marmot.liveFoldTarget(groupId: id), live != id else { continue }
+            if map[id] != live {
+                map[id] = live
+                changed = true
+            }
+        }
+        if changed {
+            defaults.set(map, forKey: Keys.historicalFolds)
+        }
+    }
+
     /// Copy persisted call-log rows from a hidden 0.8 id onto the live sibling.
     @MainActor
     private func promoteFoldedCallLogs(from previous: Set<String>, to current: Set<String>) async {
@@ -7323,6 +7419,10 @@ final class SonarAppStore: ObservableObject {
             recoveredChatNeedsUpdate.remove(groupId)
             recoveredChatNeedsUpdate.insert(realId)
             recoveredChatNeedsUpdate.insert(remounted)
+        }
+        if marmotVerified[groupId] == true, marmotVerified[remounted] != true {
+            marmotVerified[remounted] = true
+            defaults.set(marmotVerified, forKey: Keys.marmotVerified)
         }
         if case .dm(let id) = path.last, id == openId {
             path.removeLast()
@@ -10934,6 +11034,7 @@ final class SonarAppStore: ObservableObject {
         localHydratingDMs = []
         clearMarmotConversationGroups()
         marmot.groups = []
+        defaults.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         applyBLEDiscoveryPolicy()
         publishedBolt12Offer = nil
@@ -11015,6 +11116,7 @@ final class SonarAppStore: ObservableObject {
         marmot.messagesByGroup = [:]
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
+        defaults.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).

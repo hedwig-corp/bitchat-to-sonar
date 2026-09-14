@@ -158,6 +158,36 @@ struct SonarConversationFoldTests {
             liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
         )
         #expect(promotedCalls["group-09"]?.map(\.id) == ["call-08", "call-09"])
+        #expect(
+            snPromotedFoldedVerifiedIds(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                verifiedIds: ["group-08"],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snPromotedFoldedVerifiedIds(
+                previousGroupIds: [],
+                currentGroupIds: ["group-09"],
+                verifiedIds: ["group-08"],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snCollapsedFoldedSnapshotGroups(
+                groups: ["group-08", "group-09"],
+                id: { $0 },
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09"]
+        )
+        #expect(
+            snCollapsedFoldedSnapshotGroups(
+                groups: ["group-08"],
+                id: { $0 },
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08"]
+        )
         #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))

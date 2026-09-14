@@ -111,6 +111,8 @@ private const val PRESENCE_BEAT_MS = 60_000L
 /** Stale kind-0 profile sweep (was `tick % 450` ≈ every 30 min). */
 private const val PROFILE_SWEEP_MS = 30 * 60_000L
 private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
+private const val HISTORICAL_FOLDS_BLOB_KEY = "sonar.historicalFolds"
+private const val VERIFIED_IDS_BLOB_KEY = "verified.ids"
 private const val NPUB_BLOB_KEY = "sonar.npub"
 private const val MESH_NAMES_BLOB_KEY = "sonar.meshNames"
 private const val FAVORITED_CONTROL = "[FAVORITED]"
@@ -622,6 +624,36 @@ internal fun <V> promotedFoldedComposerReplies(
         liveFoldTarget = liveFoldTarget,
     )
 
+/** When FFI hides a folded 0.8 row, keep its safety-number verify on the live sibling. */
+internal fun promotedFoldedVerifiedIds(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    verifiedIds: Set<String>,
+    liveFoldTarget: (String) -> String?,
+): Set<String> {
+    var next = verifiedIds
+    for (historical in previousIds + verifiedIds) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        if (historical in verifiedIds) next = next + live
+    }
+    return next
+}
+
+/** Drop a recovered snapshot row once its live 0.9 sibling is already listed. */
+internal fun collapsedFoldedSnapshotChats(
+    chats: List<SonarChat>,
+    historicalFolds: Map<String, String>,
+): List<SonarChat> {
+    if (historicalFolds.isEmpty()) return chats
+    val ids = chats.mapTo(hashSetOf()) { it.id }
+    return chats.filter { chat ->
+        val live = historicalFolds[chat.id] ?: return@filter true
+        live == chat.id || live !in ids
+    }
+}
+
 internal enum class RecoveredChatResumeUi { Live, WaitingForPeerUpdate }
 
 internal fun recoveredChatResumeUi(
@@ -988,7 +1020,10 @@ class SonarAccountRestoreException(
 
 class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
-    private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
+    private val initialHistoricalFolds = decodeGroupFoldMap(SonarCore.loadBlob(HISTORICAL_FOLDS_BLOB_KEY))
+    private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob).let { (chats, messages) ->
+        collapsedFoldedSnapshotChats(chats, initialHistoricalFolds) to messages
+    }
     private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob)
     private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
     private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
@@ -1190,10 +1225,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             MeshRadio.discardPendingDeliverySignals()
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             meshPeers = emptyList()
-            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear(); historicalFoldMap.clear()
             meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
-            persistLinks(); persistLinkCaps(); persistGroupFolds()
+            persistLinks(); persistLinkCaps(); persistGroupFolds(); persistHistoricalFolds()
             updateBleDiscoveryPolicy()
             // Bump BEFORE the suspending write: persistSonarDescriptorCacheNow()
             // suspends, and an in-flight fetch resuming in that window would
@@ -1277,8 +1312,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
             recoveredChatNeedsUpdate = emptySet()
-            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-            persistLinks(); persistLinkCaps(); persistGroupFolds()
+            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear(); historicalFoldMap.clear()
+            persistLinks(); persistLinkCaps(); persistGroupFolds(); persistHistoricalFolds()
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCacheNow()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
@@ -2242,6 +2277,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  that was folded once stays folded even when BLE is off and the live profile
      *  lookup chain fails. */
     private val groupFoldMap = initialGroupFoldMap.toMutableMap()
+    private val historicalFoldMap = initialHistoricalFolds.toMutableMap()
 
     /** Memo cache for [visibleChats]. The home LazyColumn reads the getter on
      *  every recomposition, so recomputing dedupe/fold/pending each read burned
@@ -2975,6 +3011,26 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun persistGroupFolds() {
         SonarCore.saveBlob(GROUP_FOLDS_BLOB_KEY, groupFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" })
+    }
+
+    private fun persistHistoricalFolds() {
+        SonarCore.saveBlob(
+            HISTORICAL_FOLDS_BLOB_KEY,
+            historicalFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" },
+        )
+    }
+
+    private fun rememberHistoricalFolds(previousIds: Set<String>, currentIds: Set<String>) {
+        var changed = false
+        for (id in previousIds + currentIds + historicalFoldMap.keys) {
+            val live = runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() ?: continue
+            if (live.isBlank() || live == id) continue
+            if (historicalFoldMap[id] != live) {
+                historicalFoldMap[id] = live
+                changed = true
+            }
+        }
+        if (changed) persistHistoricalFolds()
     }
 
     /** Record fingerprint→npub from a 0x53 (persisted on change). When a new
@@ -4059,12 +4115,27 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  (off the render path). Blobs have no enumeration, so we probe the ids we
      *  actually have from the restored snapshot. */
     private fun seedVerifiedChatIds() {
-        for (chat in chats) {
-            for (id in directMarmotChatIds(chat.id)) {
-                if (SonarCore.loadBlob("verified.$id") == "1") verifiedChatIds += id
-            }
+        val listed = chats.flatMap { directMarmotChatIds(it.id) }
+        val persisted = SonarCore.loadBlob(VERIFIED_IDS_BLOB_KEY)
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+        for (id in (listed + persisted).distinct()) {
+            if (SonarCore.loadBlob("verified.$id") == "1") verifiedChatIds += id
         }
+        persistVerifiedIdList()
         verifiedVersion++
+    }
+
+    private fun persistVerifiedId(id: String) {
+        SonarCore.saveBlob("verified.$id", "1")
+        verifiedChatIds += id
+        persistVerifiedIdList()
+    }
+
+    private fun persistVerifiedIdList() {
+        SonarCore.saveBlob(VERIFIED_IDS_BLOB_KEY, verifiedChatIds.sorted().joinToString("\n"))
     }
 
     fun isVerified(chatId: String): Boolean =
@@ -4072,8 +4143,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun markVerified(chatId: String) {
         for (id in directMarmotChatIds(chatId)) {
-            SonarCore.saveBlob("verified.$id", "1")
-            verifiedChatIds += id
+            persistVerifiedId(id)
         }
         verifiedVersion++
         payVersion++ // recompose verify-dependent UI
@@ -4200,8 +4270,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 pendingMarmotGroups = emptyMap()
                 recoveredChatNeedsUpdate = emptySet()
                 pendingInviteTokens.clear()
-                linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-                persistLinks(); persistLinkCaps(); persistGroupFolds()
+                linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear(); historicalFoldMap.clear()
+                persistLinks(); persistLinkCaps(); persistGroupFolds(); persistHistoricalFolds()
                 updateBleDiscoveryPolicy()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
@@ -4232,7 +4302,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 nick = ""
                 meshBroadcast = emptyList(); meshDmRows = emptyList()
                 verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
-                verifiedChatIds.clear(); verifiedVersion++
+                verifiedChatIds.clear(); SonarCore.saveBlob(VERIFIED_IDS_BLOB_KEY, ""); verifiedVersion++
                 chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear(); channelMsgs = emptyList()
                 clearChatSnapshot()
                 lastWnGroups = -1; lastWnMsgs = -1
@@ -12175,9 +12245,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             previousOrder = previousOrder,
         )
         val listedIds = chats.mapTo(hashSetOf()) { it.id }
+        rememberHistoricalFolds(previousOrder.toSet(), listedIds)
         promoteFoldedMutes(previousOrder.toSet(), listedIds)
         promoteFoldedComposerState(previousOrder.toSet(), listedIds)
         promoteFoldedCallLogs(previousOrder.toSet(), listedIds)
+        promoteFoldedVerified(previousOrder.toSet(), listedIds)
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12233,6 +12305,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun promoteFoldedVerified(previousIds: Set<String>, currentIds: Set<String>) {
+        val next = promotedFoldedVerifiedIds(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            verifiedIds = verifiedChatIds.toSet(),
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+        if (next == verifiedChatIds) return
+        for (id in next - verifiedChatIds) {
+            persistVerifiedId(id)
+        }
+        verifiedVersion++
+        payVersion++
+    }
+
     private fun promoteFoldedCallLogs(previousIds: Set<String>, currentIds: Set<String>) {
         val next = promotedFoldedCallLogs(
             previousIds = previousIds,
@@ -12285,6 +12372,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (open.id in recoveredChatNeedsUpdate) {
             recoveredChatNeedsUpdate = recoveredChatNeedsUpdate - open.id + live
+        }
+        if (open.id in verifiedChatIds && live !in verifiedChatIds) {
+            persistVerifiedId(live)
+            verifiedVersion++
+            payVersion++
         }
         if (activeTranscriptChatId == open.id || open.id in transcriptSessionAliases) {
             transcriptSessionAliases = transcriptSessionAliases + open.id + live

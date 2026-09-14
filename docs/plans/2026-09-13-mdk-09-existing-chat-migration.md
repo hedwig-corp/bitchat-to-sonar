@@ -193,6 +193,8 @@ Guarded by:
 - `ConversationFoldTest.foldedHistoricalComposerReplyMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotMessagesMoveOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalCallLogsMoveOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalVerifiedMovesOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalSnapshotChatDropsOnceLiveSiblingIsListed`
 - `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
   (also pins `live_fold_target_hex` after the home-list hide)
@@ -342,8 +344,8 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply onto the live sibling. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
-| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. Mute / draft / reply promotion and open-chat remount match Compose. | same | none |
+| Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply / verify / call logs onto the live sibling. A persisted `sonar.historicalFolds` map drops a recovered snapshot row on the next cold start once the live sibling is already listed. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. Mute / draft / reply / verify / call-log promotion and open-chat remount match Compose. Cold-start snapshot load collapses folded historical ids via `sonar.historicalFolds.v1`. | same | none |
 | Mesh | untouched | untouched | none |
 
 Resume-chat fold: recovered 0.8 rows appear in FFI `groups()` with
@@ -368,7 +370,12 @@ blank between `groups()` hide and the next bounded page. A notification
 tap whose payload still names the hidden 0.8 id remaps onto
 `live_fold_target` instead of toasting that the chat is gone. Persisted
 call-log rows on the hidden id are merged onto the live sibling so resume
-does not drop the recovered call history. Leave/delete of the live sibling
+does not drop the recovered call history. A safety-number verify on the
+hidden id is copied onto the live sibling so resume does not drop the
+checkmark. Hosts persist hist→live bindings and drop a recovered snapshot
+row on the next cold start when the live sibling is already listed, so an
+older mid-PR snapshot that still has both ids does not flash two room
+rows. Leave/delete of the live sibling
 purges the whole fold family so a later `start_dm` with the same peer cannot
 resurrect a conversation the user already removed. A recovered room with no
 live MLS group can still be deleted: Leave degrades to a local family purge. A pending welcome with

@@ -641,6 +641,74 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalVerifiedMovesOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            setOf("group-08", "group-09"),
+            promotedFoldedVerifiedIds(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                verifiedIds = setOf("group-08"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            promotedFoldedVerifiedIds(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                verifiedIds = setOf("group-08"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            setOf("group-08"),
+            promotedFoldedVerifiedIds(
+                previousIds = setOf("group-08"),
+                currentIds = setOf("group-08"),
+                verifiedIds = setOf("group-08"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            setOf("group-09"),
+            promotedFoldedVerifiedIds(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                verifiedIds = setOf("group-09"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+    }
+
+    @Test
+    fun foldedHistoricalSnapshotChatDropsOnceLiveSiblingIsListed() {
+        val historical = SonarChat(id = "group-08", name = "room", members = listOf("npub1a"), isDirect = false)
+        val live = SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false)
+        assertEquals(
+            listOf(live),
+            collapsedFoldedSnapshotChats(
+                chats = listOf(historical, live),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            listOf(historical),
+            collapsedFoldedSnapshotChats(
+                chats = listOf(historical),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            listOf(historical, live),
+            collapsedFoldedSnapshotChats(
+                chats = listOf(historical, live),
+                historicalFolds = emptyMap(),
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalComposerReplyMovesOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         val historical = SonarReplyRef(parentId = "evt-08", preview = "quote")
