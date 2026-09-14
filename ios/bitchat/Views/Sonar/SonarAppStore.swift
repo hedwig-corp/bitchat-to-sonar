@@ -1087,18 +1087,84 @@ func snPromotedFoldedVerifiedIds(
     return next
 }
 
+/// Live MLS name wins. Blank live falls back to the recovered 0.8 title
+/// so persist-folds collapse cannot turn a named room into "Group chat".
+/// Compose `collapsedFoldDisplayName` / core `display_name`.
+func snCollapsedFoldDisplayName(liveName: String, historicalName: String) -> String {
+    let live = liveName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !live.isEmpty { return live }
+    return historicalName.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Union live MLS members with the recovered 0.8 roster. Persist-folds
+/// can remount before core `fold_family`, so FFI `display_members(live)`
+/// is still live-only. Keep live order, then hist extras. Compose
+/// `collapsedFoldDisplayMembers` / core `display_members`.
+func snCollapsedFoldDisplayMembers(
+    liveMembers: [String],
+    historicalMembers: [String]
+) -> [String] {
+    var seen = Set<String>()
+    var out: [String] = []
+    for member in liveMembers + historicalMembers {
+        let trimmed = member.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        guard seen.insert(trimmed.lowercased()).inserted else { continue }
+        out.append(trimmed)
+    }
+    return out
+}
+
+/// Paint fields a remounted live row should keep from its hidden 0.8
+/// sibling. Do **not** copy `isDirect` — R-045. Compose
+/// `collapsedFoldDisplayChat`.
+func snCollapsedFoldDisplayGroup(
+    live: MarmotService.MarmotGroup,
+    historical: MarmotService.MarmotGroup
+) -> MarmotService.MarmotGroup {
+    MarmotService.MarmotGroup(
+        id: live.id,
+        name: snCollapsedFoldDisplayName(liveName: live.name, historicalName: historical.name),
+        memberNpubs: snCollapsedFoldDisplayMembers(
+            liveMembers: live.memberNpubs,
+            historicalMembers: historical.memberNpubs
+        ),
+        isDirect: live.isDirect
+    )
+}
+
 /// Drop a recovered snapshot row once its live 0.9 sibling is already listed.
+/// Persist-folds hide hist before core `fold_family`, so copy the recovered
+/// name / roster onto live when [mergeHiddenIntoLive] is supplied.
 func snCollapsedFoldedSnapshotGroups<Group>(
     groups: [Group],
     id: (Group) -> String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    mergeHiddenIntoLive: ((Group, Group) -> Group)? = nil
 ) -> [Group] {
     if historicalFolds.isEmpty { return groups }
     let ids = Set(groups.map(id))
-    return groups.filter { group in
+    var byId: [String: Group] = [:]
+    for group in groups {
+        byId[id(group)] = group
+    }
+    var mergedByLive: [String: Group] = [:]
+    if let mergeHiddenIntoLive {
+        for group in groups {
+            let groupId = id(group)
+            guard let liveId = historicalFolds[groupId],
+                  liveId != groupId,
+                  ids.contains(liveId),
+                  let current = mergedByLive[liveId] ?? byId[liveId] else { continue }
+            mergedByLive[liveId] = mergeHiddenIntoLive(current, group)
+        }
+    }
+    return groups.compactMap { group in
         let groupId = id(group)
-        guard let live = historicalFolds[groupId] else { return true }
-        return live == groupId || !ids.contains(live)
+        if let liveId = historicalFolds[groupId], liveId != groupId, ids.contains(liveId) {
+            return nil
+        }
+        return mergedByLive[groupId] ?? group
     }
 }
 

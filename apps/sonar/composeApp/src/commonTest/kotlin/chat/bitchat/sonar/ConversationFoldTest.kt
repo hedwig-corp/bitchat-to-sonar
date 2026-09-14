@@ -2155,6 +2155,47 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun persistFoldsCollapseUnionsRecoveredRosterAndTitle() {
+        assertEquals("Family", collapsedFoldDisplayName("", "Family"))
+        assertEquals("new name", collapsedFoldDisplayName("new name", "Family"))
+        assertEquals(
+            listOf("npub1alice", "npub1bob", "npub1carol"),
+            collapsedFoldDisplayMembers(
+                listOf("npub1alice", "npub1bob"),
+                listOf("npub1alice", "npub1carol"),
+            ),
+        )
+        val historical = SonarChat(
+            id = "group-08",
+            name = "Family",
+            members = listOf("npub1alice", "npub1bob", "npub1carol"),
+            isDirect = false,
+        )
+        val live = SonarChat(
+            id = "group-09",
+            name = "",
+            members = listOf("npub1alice", "npub1bob"),
+            isDirect = false,
+        )
+        val collapsed = collapsedFoldedSnapshotChats(
+            chats = listOf(historical, live),
+            historicalFolds = mapOf("group-08" to "group-09"),
+        )
+        assertEquals(listOf("group-09"), collapsed.map { it.id })
+        assertEquals("Family", collapsed.single().name)
+        assertEquals(
+            listOf("npub1alice", "npub1bob", "npub1carol"),
+            collapsed.single().members,
+        )
+        assertFalse(collapsed.single().isDirect)
+        val liveDirect = live.copy(isDirect = true)
+        assertTrue(
+            collapsedFoldDisplayChat(liveDirect, historical).isDirect,
+            "R-045: collapse must keep the live isDirect bit",
+        )
+    }
+
+    @Test
     fun notificationSuppressIdsIncludeHiddenHistoricalSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

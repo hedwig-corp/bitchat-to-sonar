@@ -507,6 +507,49 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == ["group-08"]
         )
+        #expect(snCollapsedFoldDisplayName(liveName: "", historicalName: "Family") == "Family")
+        #expect(snCollapsedFoldDisplayName(liveName: "new name", historicalName: "Family") == "new name")
+        #expect(
+            snCollapsedFoldDisplayMembers(
+                liveMembers: ["npub1alice", "npub1bob"],
+                historicalMembers: ["npub1alice", "npub1carol"]
+            ) == ["npub1alice", "npub1bob", "npub1carol"]
+        )
+        let histGroup = MarmotService.MarmotGroup(
+            id: "group-08",
+            name: "Family",
+            memberNpubs: ["npub1alice", "npub1bob", "npub1carol"],
+            isDirect: false
+        )
+        let liveGroup = MarmotService.MarmotGroup(
+            id: "group-09",
+            name: "",
+            memberNpubs: ["npub1alice", "npub1bob"],
+            isDirect: false
+        )
+        let collapsedGroups = snCollapsedFoldedSnapshotGroups(
+            groups: [histGroup, liveGroup],
+            id: { $0.id },
+            historicalFolds: ["group-08": "group-09"],
+            mergeHiddenIntoLive: { live, historical in
+                snCollapsedFoldDisplayGroup(live: live, historical: historical)
+            }
+        )
+        #expect(collapsedGroups.map(\.id) == ["group-09"])
+        #expect(collapsedGroups.first?.name == "Family")
+        #expect(collapsedGroups.first?.memberNpubs == ["npub1alice", "npub1bob", "npub1carol"])
+        #expect(collapsedGroups.first?.isDirect == false)
+        #expect(
+            snCollapsedFoldDisplayGroup(
+                live: MarmotService.MarmotGroup(
+                    id: "group-09",
+                    name: "",
+                    memberNpubs: ["npub1alice"],
+                    isDirect: true
+                ),
+                historical: histGroup
+            ).isDirect == true
+        )
         #expect(
             Set(snMutedFoldKeys(
                 groupIdHex: "group-09",

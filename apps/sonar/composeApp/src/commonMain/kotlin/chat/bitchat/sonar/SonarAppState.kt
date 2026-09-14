@@ -1303,16 +1303,69 @@ internal fun promotedFoldedVerifiedIds(
     return next
 }
 
-/** Drop a recovered snapshot row once its live 0.9 sibling is already listed. */
+/** Live MLS name wins (a later rename must stick). Blank live falls
+ *  back to the recovered 0.8 title so persist-folds collapse cannot
+ *  turn a named room into "Group chat". Core `display_name`. */
+internal fun collapsedFoldDisplayName(
+    liveName: String,
+    historicalName: String,
+): String {
+    val live = liveName.trim()
+    if (live.isNotEmpty()) return live
+    return historicalName.trim()
+}
+
+/** Union live MLS members with the recovered 0.8 roster. Persist-folds
+ *  can remount before core `fold_family`, so FFI `display_members(live)`
+ *  is still live-only. Keep live order, then hist extras. Core
+ *  `display_members`. */
+internal fun collapsedFoldDisplayMembers(
+    liveMembers: List<String>,
+    historicalMembers: List<String>,
+): List<String> {
+    val seen = linkedSetOf<String>()
+    val out = ArrayList<String>()
+    for (member in liveMembers + historicalMembers) {
+        val trimmed = member.trim()
+        if (trimmed.isEmpty()) continue
+        if (!seen.add(trimmed.lowercase())) continue
+        out += trimmed
+    }
+    return out
+}
+
+/** Paint fields a remounted live row should keep from its hidden 0.8
+ *  sibling. Do **not** copy `isDirect` — R-045. */
+internal fun collapsedFoldDisplayChat(
+    live: SonarChat,
+    historical: SonarChat,
+): SonarChat = live.copy(
+    name = collapsedFoldDisplayName(live.name, historical.name),
+    members = collapsedFoldDisplayMembers(live.members, historical.members),
+)
+
+/** Drop a recovered snapshot row once its live 0.9 sibling is already listed.
+ *  Persist-folds hide hist before core `fold_family`, so copy the recovered
+ *  name / roster onto live here — otherwise group info and mentions only
+ *  see people who already joined 0.9. */
 internal fun collapsedFoldedSnapshotChats(
     chats: List<SonarChat>,
     historicalFolds: Map<String, String>,
 ): List<SonarChat> {
     if (historicalFolds.isEmpty()) return chats
     val ids = chats.mapTo(hashSetOf()) { it.id }
-    return chats.filter { chat ->
-        val live = historicalFolds[chat.id] ?: return@filter true
-        live == chat.id || live !in ids
+    val byId = chats.associateBy { it.id }
+    val mergedByLive = HashMap<String, SonarChat>()
+    for (chat in chats) {
+        val liveId = historicalFolds[chat.id] ?: continue
+        if (liveId == chat.id || liveId !in ids) continue
+        val current = mergedByLive[liveId] ?: byId.getValue(liveId)
+        mergedByLive[liveId] = collapsedFoldDisplayChat(current, chat)
+    }
+    return chats.mapNotNull { chat ->
+        val liveId = historicalFolds[chat.id]
+        if (liveId != null && liveId != chat.id && liveId in ids) return@mapNotNull null
+        mergedByLive[chat.id] ?: chat
     }
 }
 

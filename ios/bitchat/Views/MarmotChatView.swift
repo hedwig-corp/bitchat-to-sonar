@@ -727,7 +727,10 @@ final class MarmotChatModel: ObservableObject {
         self.groups = snCollapsedFoldedSnapshotGroups(
             groups: cached.0,
             id: { $0.id },
-            historicalFolds: folds
+            historicalFolds: folds,
+            mergeHiddenIntoLive: { live, historical in
+                snCollapsedFoldDisplayGroup(live: live, historical: historical)
+            }
         )
         self.messagesByGroup = cached.1
         self.conversationChangeSub = service.conversationChanged
@@ -3114,7 +3117,10 @@ final class MarmotChatModel: ObservableObject {
         snCollapsedFoldedSnapshotGroups(
             groups: groups,
             id: { $0.id },
-            historicalFolds: historicalFoldsMap()
+            historicalFolds: historicalFoldsMap(),
+            mergeHiddenIntoLive: { live, historical in
+                snCollapsedFoldDisplayGroup(live: live, historical: historical)
+            }
         )
     }
 

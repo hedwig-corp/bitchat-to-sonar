@@ -404,7 +404,11 @@ historical sibling (same as `conversation_summaries()`) so the home list
 stays one room row — hosts paint `chats()` / `groups()`, not the index.
 Live `GroupInfo.member_npubs` comes from `display_members` (fold-family
 union of live MLS + recovered 0.8 rosters) so a remounted room still
-lists people who have not joined 0.9 yet. `members()` / `group_is_direct`
+lists people who have not joined 0.9 yet. Persist-folds can hide hist
+from the host list before core `fold_family` exists; host collapse then
+copies the recovered name / roster onto the live row
+(`collapsedFoldedSnapshotChats` / `snCollapsedFoldedSnapshotGroups`)
+without touching `isDirect` (R-045). `members()` / `group_is_direct`
 stay live-session only so leftover peers remain late-resume invites.
 If the user is sitting in that recovered transcript when resume lands,
 Compose and iOS remount the open chat id onto `live_fold_target` so
