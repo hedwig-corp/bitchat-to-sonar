@@ -7126,8 +7126,10 @@ impl SonarClient {
         }
         if self.engine.is_live_group(group_id)? {
             // Persist-folds can remount onto this live id after the core
-            // sidecar was lost. Rebuild the bind before leftover-member
-            // invite so `missing_resume_peers` sees the recovered room.
+            // sidecar was lost. Restore a recorded index bind first
+            // (empty-desc rooms cannot use topic-match). Then rebuild
+            // leftover-member invite so `missing_resume_peers` sees hist.
+            self.restore_recorded_folds_touching(group_id);
             self.maybe_fold_new_group(group_id);
             self.maybe_add_late_resume_members(group_id).await;
             return Ok(group_id.clone());
@@ -7649,11 +7651,13 @@ impl SonarClient {
 
     /// FFI / host paint only. See [`MarmotEngine::display_members`].
     pub fn display_members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
+        self.restore_recorded_folds_touching(group_id);
         self.engine.display_members(group_id)
     }
 
     /// FFI / host paint only. See [`MarmotEngine::display_name`].
     pub fn display_name(&self, group_id: &GroupId, live_name: &str) -> String {
+        self.restore_recorded_folds_touching(group_id);
         self.engine.display_name(group_id, live_name)
     }
 
@@ -7695,6 +7699,9 @@ impl SonarClient {
     }
 
     pub fn conversation_summaries(&self) -> Vec<ConversationSummary> {
+        // Lost JSON sidecar: hist summaries reappear until a page restores
+        // the bind. Home list must not split a person into two rows.
+        self.restore_recorded_folds_from_index();
         let Some(ref idx) = self.conversation_index else {
             return Vec::new();
         };

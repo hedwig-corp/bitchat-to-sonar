@@ -2193,3 +2193,71 @@ async fn persist_folds_lost_core_sidecar_messages_page_restores_index_bind() {
         "messages_page(live) must union recovered 0.8 rows after index restore"
     );
 }
+
+/// Home list paints `conversation_summaries()` without opening a chat.
+/// A lost JSON sidecar must not re-list the recovered 0.8 row as a
+/// second conversation — restore the recorded bind before filtering.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_summaries_hide_hist_from_index() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(alice.conversation_summaries().len(), 1);
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        !alice.is_folded_historical_group(&historical),
+        "engine hide is gone until the index bind is restored"
+    );
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol_identity.public_key()),
+        "group-info roster must restore the bind without opening the transcript"
+    );
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "display_members must restore the recorded bind"
+    );
+    let summaries = alice.conversation_summaries();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "hist must not reappear as a second home row"
+    );
+    let hist_hex = hex::encode(historical.as_slice());
+    assert!(
+        summaries.iter().all(|s| s.group_id_hex != hist_hex),
+        "conversation_summaries must keep hiding the recovered 0.8 id"
+    );
+}
