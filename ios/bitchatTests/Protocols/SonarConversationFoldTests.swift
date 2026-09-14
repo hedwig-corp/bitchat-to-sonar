@@ -744,6 +744,42 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == nil
         )
+        let remountedExtract = (1...80).map { "hist-\($0)" }
+        #expect(snHydrationHasRealTranscriptRows(rows: remountedExtract, idOf: { $0 }))
+        #expect(!snHydrationHasRealTranscriptRows(rows: ["summary:group-09:200:1"], idOf: { $0 }))
+        #expect(!snHydrationHasRealTranscriptRows(rows: [], idOf: { $0 }))
+        let histMsg = MarmotService.MarmotMessage(
+            id: "hist-1",
+            senderNpub: "npub1peer",
+            content: "old",
+            createdAt: Date(timeIntervalSince1970: 1),
+            isMine: false,
+            media: []
+        )
+        let liveMsg = MarmotService.MarmotMessage(
+            id: "live-1",
+            senderNpub: "npub1me",
+            content: "resumed",
+            createdAt: Date(timeIntervalSince1970: 200),
+            isMine: true,
+            media: []
+        )
+        let synthetic = MarmotService.MarmotMessage(
+            id: "summary:group-09:200:1",
+            senderNpub: "npub1me",
+            content: "resumed",
+            createdAt: Date(timeIntervalSince1970: 200),
+            isMine: true,
+            media: []
+        )
+        #expect(
+            snHydrateMergedPageRows(existing: [histMsg], incoming: [liveMsg]).map(\.id)
+                == ["hist-1", "live-1"]
+        )
+        #expect(
+            snHydrateMergedPageRows(existing: [synthetic, histMsg], incoming: [liveMsg]).map(\.id)
+                == ["hist-1", "live-1"]
+        )
         let histPreview = MarmotService.ConversationSummary(
             groupIdHex: "group-08",
             name: "",

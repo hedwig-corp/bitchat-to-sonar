@@ -1308,6 +1308,35 @@ func snHydrationTargetGroupId(
     return activeGroupIds.contains(live) ? live : nil
 }
 
+/// True when [rows] already hold real event ids. Compose
+/// `hydrationHasRealTranscriptRows` — iOS never writes `summary:` rows into
+/// `messagesByGroup` (home paint uses `snMarmotHomeRowMessage` only), so a
+/// persist-folds remount must not be treated as empty just because a
+/// conversation-index stand-in is newer.
+func snHydrationHasRealTranscriptRows<Message>(
+    rows: [Message],
+    idOf: (Message) -> String
+) -> Bool {
+    rows.contains { !idOf($0).hasPrefix("summary:") }
+}
+
+/// Merge a bounded home page into remounted / leftover rows. Compose
+/// `hydrateMergedPageRows`. iOS `loadLocalSummaries` must keep the remounted
+/// 0.8 extract when a newer live page arrives.
+func snHydrateMergedPageRows(
+    existing: [MarmotService.MarmotMessage],
+    incoming: [MarmotService.MarmotMessage]
+) -> [MarmotService.MarmotMessage] {
+    let real = existing.filter { !$0.id.hasPrefix("summary:") }
+    var byID: [String: MarmotService.MarmotMessage] = [:]
+    for message in real { byID[message.id] = message }
+    for message in incoming { byID[message.id] = message }
+    return byID.values.sorted {
+        if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+        return $0.createdAt < $1.createdAt
+    }
+}
+
 /// Remount leftover hist conversation-index rows onto the listed live sibling.
 /// Keep the newer `latestAt` when both sides still have a snapshot.
 func snRemountedConversationSummaries(

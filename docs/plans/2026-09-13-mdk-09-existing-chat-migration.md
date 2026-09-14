@@ -1092,6 +1092,20 @@ already pages the family; helpers stay in lockstep. Pins:
 `ConversationFoldTest` `conversationRefreshIds`,
 `SonarConversationFoldTests` `snConversationRefreshIds`.
 
+Compose home-hydrate wipe hole closed after this commit: persist-folds
+remount the leftover 0.8 extract onto live, then
+`hydrateLocalConversationRows` replaced it. A newer live summary used
+`lastOrNull()` (oldest on a newest-first extract) and wrote one
+`summary:` stand-in; chats outside the home page window never got the
+rows back. A newer live page then replaced the remounted extract
+entirely. Keep real rows (`hydrationHasRealTranscriptRows`) and merge
+pages (`hydrateMergedPageRows`). iOS already merges in
+`loadLocalSummaries` and never writes synthetics into
+`messagesByGroup` (home paint is `snMarmotHomeRowMessage` only). Pins:
+`HomeMessageRowsTest.remountedExtractSurvivesNewerSummaryOutsidePageWindow`,
+`HomeMessageRowsTest.remountedExtractMergesNewerLivePageInsteadOfReplacing`,
+`SonarConversationFoldTests` `snHydrateMergedPageRows`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

@@ -279,4 +279,65 @@ class HomeMessageRowsTest {
         assertEquals(80L, hydration.latestByChat["group-09"])
         assertTrue(hydration.messagesByChat["group-08"].isNullOrEmpty())
     }
+
+    @Test
+    fun remountedExtractSurvivesNewerSummaryOutsidePageWindow() {
+        // Persist-folds remount newest-first leftover extract onto live.
+        // last() is then the oldest row; a newer live summary must not wipe
+        // the extract (chats outside the home page window never get it back).
+        val folds = mapOf("group-08" to "group-09")
+        val newestFirstExtract = (80 downTo 1).map { n ->
+            SonarMsg("hist-$n", "peer", "row $n", false, n.toLong(), viaInternet = true)
+        }
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("group-09"),
+            existingMessagesByChat = mapOf("group-08" to newestFirstExtract),
+            existingLatestByChat = mapOf("group-08" to 80L),
+            summaries = listOf(
+                SonarConversationSummary("group-09", "", "just resumed", "me", 200L, true, 1L, 0L),
+            ),
+            pages = emptyList(),
+            historicalFolds = folds,
+        )
+        val kept = hydration.messagesByChat["group-09"].orEmpty()
+        assertEquals(80, kept.size)
+        assertTrue(hydrationHasRealTranscriptRows(kept))
+        assertEquals(newestFirstExtract.map { it.id }.toSet(), kept.map { it.id }.toSet())
+        assertEquals(200L, hydration.latestByChat["group-09"])
+        assertTrue(kept.none { it.id.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX) })
+        assertTrue(hydration.messagesByChat["group-08"].isNullOrEmpty())
+    }
+
+    @Test
+    fun remountedExtractMergesNewerLivePageInsteadOfReplacing() {
+        val folds = mapOf("group-08" to "group-09")
+        val histRows = (1..80).map { n ->
+            SonarMsg("hist-$n", "peer", "row $n", false, n.toLong(), viaInternet = true)
+        }
+        val liveRow = SonarMsg("live-1", "me", "resumed", true, 200L, viaInternet = true)
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("group-09"),
+            existingMessagesByChat = mapOf("group-08" to histRows),
+            existingLatestByChat = mapOf("group-08" to 80L),
+            summaries = listOf(
+                SonarConversationSummary("group-09", "", "resumed", "me", 200L, true, 1L, 0L),
+            ),
+            pages = listOf(
+                SonarRecentTranscriptPage("group-09", 200L, listOf(liveRow)),
+                SonarRecentTranscriptPage("group-08", 80L, histRows.takeLast(20)),
+            ),
+            historicalFolds = folds,
+        )
+        val kept = hydration.messagesByChat.getValue("group-09")
+        assertTrue(kept.map { it.id }.containsAll(histRows.map { it.id }))
+        assertTrue(kept.any { it.id == "live-1" })
+        assertEquals(200L, hydration.latestByChat["group-09"])
+        assertEquals(
+            listOf("hist-1", "live-1"),
+            hydrateMergedPageRows(
+                existing = listOf(histRows.first()),
+                incoming = listOf(liveRow),
+            ).map { it.id },
+        )
+    }
 }

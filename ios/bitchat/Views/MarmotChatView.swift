@@ -2942,7 +2942,7 @@ final class MarmotChatModel: ObservableObject {
                 } else {
                     freshRowsByGroup[target] = page.messages
                 }
-                let merged = Self.mergeMessages(
+                let merged = snHydrateMergedPageRows(
                     existing: byGroup[target] ?? [],
                     incoming: page.messages
                 )
