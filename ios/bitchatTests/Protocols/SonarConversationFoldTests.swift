@@ -965,6 +965,46 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snLoadOlderPageHasOlder(
+                rawPageCount: 0,
+                pageSize: 30,
+                admittedNewRows: false,
+                previousHasOlder: true
+            )
+        )
+        #expect(
+            snLoadOlderPageHasOlder(
+                rawPageCount: 5,
+                pageSize: 30,
+                admittedNewRows: false,
+                previousHasOlder: true
+            )
+        )
+        #expect(
+            !snLoadOlderPageHasOlder(
+                rawPageCount: 5,
+                pageSize: 30,
+                admittedNewRows: true,
+                previousHasOlder: true
+            )
+        )
+        #expect(
+            snLoadOlderPageHasOlder(
+                rawPageCount: 31,
+                pageSize: 30,
+                admittedNewRows: true,
+                previousHasOlder: false
+            )
+        )
+        #expect(
+            !snLoadOlderPageHasOlder(
+                rawPageCount: 0,
+                pageSize: 30,
+                admittedNewRows: false,
+                previousHasOlder: false
+            )
+        )
+        #expect(
             snQuotedMessageRevealLimit(
                 parentId: "m5",
                 cached: (1...40).map { "m\($0)" },

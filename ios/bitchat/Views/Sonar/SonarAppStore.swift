@@ -619,6 +619,21 @@ func snNewestPageFamilyHasOlder(
     )
 }
 
+/// A short/empty load-older page must not disarm a previously armed
+/// family flag. The first cursor read can land before bak remainder is
+/// copied; only a short page that admitted new rows proves this source
+/// is exhausted. Compose `loadOlderPageHasOlder`.
+func snLoadOlderPageHasOlder(
+    rawPageCount: Int,
+    pageSize: Int,
+    admittedNewRows: Bool,
+    previousHasOlder: Bool
+) -> Bool {
+    if pageSize > 0 && rawPageCount > pageSize { return true }
+    if admittedNewRows { return false }
+    return previousHasOlder
+}
+
 /// Visible-row budget that includes `parentId` when it already sits in the
 /// family-unioned host cache. Quote-jump searches the painted suffix; a
 /// parent older than `pageSize` but still in the retained window must

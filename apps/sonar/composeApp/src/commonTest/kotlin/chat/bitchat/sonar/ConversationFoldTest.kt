@@ -974,6 +974,64 @@ class ConversationFoldTest {
                 previousHasOlder = true,
             ),
         )
+        // First load-older can hit an empty/short page before bak
+        // remainder is copied. Do not disarm the newest-page arm.
+        assertTrue(
+            loadOlderPageHasOlder(
+                rawPageCount = 0,
+                pageSize = TRANSCRIPT_PAGE_SIZE,
+                admittedNewRows = false,
+                previousHasOlder = true,
+            ),
+        )
+        assertTrue(
+            loadOlderPageHasOlder(
+                rawPageCount = 5,
+                pageSize = TRANSCRIPT_PAGE_SIZE,
+                admittedNewRows = false,
+                previousHasOlder = true,
+            ),
+        )
+        assertFalse(
+            loadOlderPageHasOlder(
+                rawPageCount = 5,
+                pageSize = TRANSCRIPT_PAGE_SIZE,
+                admittedNewRows = true,
+                previousHasOlder = true,
+            ),
+        )
+        assertTrue(
+            loadOlderPageHasOlder(
+                rawPageCount = TRANSCRIPT_PAGE_SIZE + 1,
+                pageSize = TRANSCRIPT_PAGE_SIZE,
+                admittedNewRows = true,
+                previousHasOlder = false,
+            ),
+        )
+        assertFalse(
+            loadOlderPageHasOlder(
+                rawPageCount = 0,
+                pageSize = TRANSCRIPT_PAGE_SIZE,
+                admittedNewRows = false,
+                previousHasOlder = false,
+            ),
+        )
+        assertEquals(
+            "cursor-08",
+            foldFamilyPagingCursor(
+                "group-09",
+                mapOf("group-08" to "cursor-08"),
+                mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "cursor-09",
+            foldFamilyPagingCursor(
+                "group-09",
+                mapOf("group-08" to "cursor-08", "group-09" to "cursor-09"),
+                mapOf("group-08" to "group-09"),
+            ),
+        )
     }
 
     @Test

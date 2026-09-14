@@ -776,6 +776,37 @@ internal fun newestPageFamilyHasOlder(
     familyHasOlder = previousHasOlder || rawPageCount > pageSize,
 )
 
+/** A short/empty load-older page must not disarm a previously armed
+ *  family flag. The first cursor read can land before bak remainder is
+ *  copied; only a short page that admitted new rows proves this source
+ *  is exhausted. iOS `snLoadOlderPageHasOlder`. */
+internal fun loadOlderPageHasOlder(
+    rawPageCount: Int,
+    pageSize: Int,
+    admittedNewRows: Boolean,
+    previousHasOlder: Boolean,
+): Boolean {
+    if (pageSize > 0 && rawPageCount > pageSize) return true
+    if (admittedNewRows) return false
+    return previousHasOlder
+}
+
+/** Prefer this id's load-older cursor; fall back to a hidden sibling so
+ *  an unpaged live / remounted-empty hist row can still request remainder.
+ *  iOS `snFoldFamilyPagingCursor`. */
+internal fun <T> foldFamilyPagingCursor(
+    groupId: String,
+    cursorsById: Map<String, T>,
+    historicalFolds: Map<String, String>,
+): T? {
+    cursorsById[groupId]?.let { return it }
+    for (alias in foldFamilyIds(groupId, historicalFolds).sorted()) {
+        if (alias == groupId) continue
+        cursorsById[alias]?.let { return it }
+    }
+    return null
+}
+
 /** Visible-row budget that includes [parentId] when it already sits in the
  *  family-unioned host cache. Quote-jump searches the painted suffix; a
  *  parent older than [pageSize] but still in the retained window must
@@ -12630,11 +12661,19 @@ class SonarAppState(private val scope: CoroutineScope) {
             for (groupId in groupIds) {
                 if (groupId !in sourceIds) continue
                 val current = transcriptWindows[groupId] ?: continue
-                if (current.loadingOlder || !transcriptWindowHasMore(groupId) || current.rows.isEmpty()) continue
+                if (current.loadingOlder || !transcriptWindowHasMore(groupId)) continue
+                val cursor = current.rows.firstOrNull()
+                    ?: foldFamilyPagingCursor(
+                        groupId,
+                        transcriptWindows.mapNotNull { (id, window) ->
+                            window.rows.firstOrNull()?.let { id to it }
+                        }.toMap(),
+                        historicalFoldMap,
+                    )
+                    ?: continue
 
                 if (!isCurrentTranscriptSession(chatId, generation)) return false
                 transcriptWindows[groupId] = current.copy(loadingOlder = true)
-                val cursor = current.rows.first()
                 val fetched = runCatching {
                     SonarCore.messagesCursorPage(
                         chatId = groupId,
@@ -12656,12 +12695,20 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // suspended. Merge into the latest window so it cannot overwrite
                 // a new canonical row or clear the in-flight state prematurely.
                 val latest = transcriptWindows[groupId] ?: current
+                val admittedNewRows = older.any { candidate ->
+                    latest.rows.none { it.id == candidate.id }
+                }
                 val trimsNewerEdge = latest.rows.size >= TRANSCRIPT_RETAINED_ROWS &&
-                    older.any { candidate -> latest.rows.none { it.id == candidate.id } }
+                    admittedNewRows
                 val merged = prependTranscriptRows(latest.rows, older)
                 transcriptWindows[groupId] = TranscriptGroupWindow(
                     rows = merged,
-                    hasMore = fetched.size > TRANSCRIPT_PAGE_SIZE,
+                    hasMore = loadOlderPageHasOlder(
+                        rawPageCount = fetched.size,
+                        pageSize = TRANSCRIPT_PAGE_SIZE,
+                        admittedNewRows = admittedNewRows,
+                        previousHasOlder = latest.hasMore,
+                    ),
                     pinnedToOlderEdge = latest.pinnedToOlderEdge || trimsNewerEdge,
                 )
             }

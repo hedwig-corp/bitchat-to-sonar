@@ -2791,7 +2791,12 @@ final class MarmotChatModel: ObservableObject {
                 !latestIDs.contains($0.id) && retainedIDs.contains($0.id)
             }
             localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-            localTranscriptHasOlderByGroup[groupId] = rawPage.count > pageCount
+            localTranscriptHasOlderByGroup[groupId] = snLoadOlderPageHasOlder(
+                rawPageCount: rawPage.count,
+                pageSize: pageCount,
+                admittedNewRows: added,
+                previousHasOlder: localTranscriptHasOlderByGroup[groupId] == true
+            )
 
             let echoes = latestExisting.filter(Self.isLocalTranscriptEcho)
             var byGroup = messagesByGroup

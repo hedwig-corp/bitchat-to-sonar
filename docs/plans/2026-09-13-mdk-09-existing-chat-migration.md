@@ -1003,6 +1003,17 @@ rows sat on the hidden sibling. Immediate paint now uses
 `SonarConversationFoldTests` `snFirstOpenHasLocalTranscriptPaint` /
 `snDMHasLocalMarmotPaint`.
 
+Load-older overwrite hole closed after this commit: after newest-page
+armed `hasOlder` from the remounted 80-row extract, the first cursor
+page can be empty/short (bak remainder not copied yet). Both hosts
+wrote `hasOlder = rawPage.count > pageSize`, which disarmed the family
+and left remainder unreachable. `loadOlderPageHasOlder` /
+`snLoadOlderPageHasOlder` keep the previous arm unless the short page
+admitted new rows. Compose load-older also reuses a sibling cursor
+when the hist window is empty (`foldFamilyPagingCursor`). Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
+`SonarConversationFoldTests` `snLoadOlderPageHasOlder`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
