@@ -1914,6 +1914,68 @@ internal fun openedDMShouldSkipHydrate(
     return bare in suppressedIds || "marmot:$bare" in suppressedIds
 }
 
+/** Remount always stamps the live id hydrated. In-flight `openChat`
+ *  may not have called [markTranscriptHydrated] on hist yet, and
+ *  further hist hydrate is suppressed — without this,
+ *  `isTranscriptHydrated(live)` stays false and the unread divider
+ *  never settles. iOS `snRemountMarksTranscriptHydrated`. */
+internal fun remountMarksTranscriptHydrated(
+    historicalId: String,
+    liveId: String,
+    hydratedIds: Set<String>,
+): Set<String> {
+    val next = hydratedIds.toMutableSet()
+    fun drop(id: String) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) return
+        next.remove(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isEmpty()) return
+        next.remove(bare)
+        next.remove("marmot:$bare")
+    }
+    fun add(id: String) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) return
+        next.add(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isEmpty()) return
+        next.add(bare)
+        next.add("marmot:$bare")
+    }
+    drop(historicalId)
+    add(liveId)
+    return next
+}
+
+/** Keep the empty-pane spinner on live when remount cancels hist hydrate.
+ *  iOS `snRemountLocalHydratingIds`. */
+internal fun remountLocalHydratingIds(
+    historicalKeys: Collection<String>,
+    liveKeys: Collection<String>,
+    hydrating: Set<String>,
+): Set<String> {
+    val wasHydrating = historicalKeys.any { openedDMShouldSkipHydrate(it, hydrating) }
+    val next = hydrating.toMutableSet()
+    for (key in historicalKeys) {
+        val trimmed = key.trim()
+        if (trimmed.isEmpty()) continue
+        next.remove(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isNotEmpty()) {
+            next.remove(bare)
+            next.remove("marmot:$bare")
+        }
+    }
+    if (wasHydrating) {
+        for (live in liveKeys) {
+            val trimmed = live.trim()
+            if (trimmed.isNotEmpty()) next.add(trimmed)
+        }
+    }
+    return next
+}
+
 /** Warmup / pane keys whose in-flight `openChat` newest-page must stop
  *  when remount copies the window onto live. iOS
  *  `snRemountOpeningHydrateKeys`. */
@@ -3816,7 +3878,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  must not publish over it. iOS `suppressOpenedDMHydrateIds`. */
     private var suppressOpenedHydrateIds: Set<String> = emptySet()
 
-    fun isTranscriptHydrated(chatId: String): Boolean = chatId in hydratedTranscripts
+    fun isTranscriptHydrated(chatId: String): Boolean =
+        openedDMShouldSkipHydrate(chatId, hydratedTranscripts)
 
     /** Hidden 0.8 sibling exists — first Marmot paint may be live-only. */
     fun chatHasFoldFamily(chatId: String): Boolean =
@@ -15507,9 +15570,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 pendingMediaUploads[id] = rows.toMutableList()
             }
         }
-        if (open.id in hydratedTranscripts) {
-            hydratedTranscripts = hydratedTranscripts - open.id + live
-        }
+        hydratedTranscripts = remountMarksTranscriptHydrated(
+            historicalId = open.id,
+            liveId = live,
+            hydratedIds = hydratedTranscripts,
+        )
         openChatUnread[open.id]?.let { openChatUnread = openChatUnread - open.id + (live to it) }
         openChatUnreadAnchor[open.id]?.let { openChatUnreadAnchor = openChatUnreadAnchor - open.id + (live to it) }
         openChatJumpMessageId = remountFoldedOpenValues(

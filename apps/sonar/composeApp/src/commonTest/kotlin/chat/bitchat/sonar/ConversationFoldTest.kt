@@ -1212,6 +1212,55 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun remountMarksTranscriptHydratedWhenHistWasNotYetStamped() {
+        val next = remountMarksTranscriptHydrated(
+            historicalId = "marmot:group-08",
+            liveId = "marmot:group-09",
+            hydratedIds = emptySet(),
+        )
+        assertTrue(openedDMShouldSkipHydrate("marmot:group-09", next))
+        assertTrue(openedDMShouldSkipHydrate("group-09", next))
+        assertFalse(openedDMShouldSkipHydrate("marmot:group-08", next))
+        assertFalse(openedDMShouldSkipHydrate("group-08", next))
+    }
+
+    @Test
+    fun remountMarksTranscriptHydratedKeepsExistingFamilyStamps() {
+        val next = remountMarksTranscriptHydrated(
+            historicalId = "marmot:group-08",
+            liveId = "marmot:group-09",
+            hydratedIds = setOf("marmot:group-08", "other"),
+        )
+        assertTrue(openedDMShouldSkipHydrate("marmot:group-09", next))
+        assertTrue("other" in next)
+        assertFalse(openedDMShouldSkipHydrate("marmot:group-08", next))
+    }
+
+    @Test
+    fun remountLocalHydratingIdsMovesHistSpinnerOntoLive() {
+        assertEquals(
+            setOf("marmot:group-09", "group-09", "other"),
+            remountLocalHydratingIds(
+                historicalKeys = listOf("marmot:group-08", "group-08"),
+                liveKeys = listOf("marmot:group-09", "group-09"),
+                hydrating = setOf("marmot:group-08", "other"),
+            ),
+        )
+    }
+
+    @Test
+    fun remountLocalHydratingIdsStaysEmptyWhenHistWasNotHydrating() {
+        assertEquals(
+            emptySet(),
+            remountLocalHydratingIds(
+                historicalKeys = listOf("marmot:group-08", "group-08"),
+                liveKeys = listOf("marmot:group-09", "group-09"),
+                hydrating = emptySet(),
+            ),
+        )
+    }
+
+    @Test
     fun meshDeletePopsRemountedLivePane() {
         val purge = deletedMeshConversationPurgeIds(
             meshChatIds = listOf("mesh:peer"),

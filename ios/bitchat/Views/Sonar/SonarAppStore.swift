@@ -1735,6 +1735,64 @@ func snOpenedDMShouldSkipHydrate(
     return false
 }
 
+/// Remount always stamps the live id hydrated. In-flight `openedDM`
+/// may still hold the hist spinner; further hist newest-page is
+/// cancelled. Compose `remountMarksTranscriptHydrated`.
+func snRemountMarksTranscriptHydrated(
+    historicalId: String,
+    liveId: String,
+    hydratedIds: Set<String>
+) -> Set<String> {
+    var next = hydratedIds
+    func drop(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        next.remove(trimmed)
+        let bare = snBareMarmotGroupId(trimmed)
+        guard !bare.isEmpty else { return }
+        next.remove(bare)
+        next.remove("marmot:" + bare)
+    }
+    func add(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        next.insert(trimmed)
+        let bare = snBareMarmotGroupId(trimmed)
+        guard !bare.isEmpty else { return }
+        next.insert(bare)
+        next.insert("marmot:" + bare)
+    }
+    drop(historicalId)
+    add(liveId)
+    return next
+}
+
+/// Keep the empty-pane spinner on live when remount cancels hist hydrate.
+func snRemountLocalHydratingIds(
+    historicalKeys: [String],
+    liveKeys: [String],
+    hydrating: Set<String>
+) -> Set<String> {
+    let wasHydrating = historicalKeys.contains {
+        snOpenedDMShouldSkipHydrate(openingId: $0, suppressedIds: hydrating)
+    }
+    var next = hydrating
+    for key in historicalKeys {
+        next.remove(key)
+        let bare = snBareMarmotGroupId(key)
+        if !bare.isEmpty {
+            next.remove(bare)
+            next.remove("marmot:" + bare)
+        }
+    }
+    if wasHydrating {
+        for live in liveKeys where !live.isEmpty {
+            next.insert(live)
+        }
+    }
+    return next
+}
+
 /// Warmup / pane keys whose in-flight `openedDM` newest-page must stop
 /// when remount copies the window onto live. Pinned older-edge
 /// (`snNewestPageShouldMergeFamilyWindow` is false) would otherwise
@@ -10416,7 +10474,13 @@ final class SonarAppStore: ObservableObject {
         rememberMarmotGroup(remounted, forConversationId: realId)
         markMarmotGroupsRead(matchingGroupId: remounted)
         syncViewingUnreadGroups()
-        Task { await self.marmot.refreshWhenConnected(groupId: remounted, hydrateBeforeSync: false) }
+        Task {
+            await self.marmot.refreshWhenConnected(groupId: remounted, hydrateBeforeSync: false)
+            self.localHydratingDMs.remove(realId)
+            self.localHydratingDMs.remove(remounted)
+            self.localHydratingDMs.remove(openId)
+            self.localHydratingDMs.remove(groupId)
+        }
     }
 
     /// Rewrite group-info / contact-profile / call / buried DM routes after
@@ -10485,9 +10549,13 @@ final class SonarAppStore: ObservableObject {
         for key in keys {
             openingDMTasks.removeValue(forKey: key)?.cancel()
             refreshingDMTasks.removeValue(forKey: key)?.cancel()
-            localHydratingDMs.remove(key)
             suppressOpenedDMHydrateIds.insert(key)
         }
+        localHydratingDMs = snRemountLocalHydratingIds(
+            historicalKeys: [openId, groupId],
+            liveKeys: [liveId, liveGroupId],
+            hydrating: localHydratingDMs
+        )
     }
 
     /// Move in-flight send echoes off a hidden 0.8 conversation id.
@@ -12560,7 +12628,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func isLocallyHydratingDM(_ id: String) -> Bool {
-        localHydratingDMs.contains(id)
+        snOpenedDMShouldSkipHydrate(openingId: id, suppressedIds: localHydratingDMs)
     }
 
     private func refreshMarmotDMInBackground(

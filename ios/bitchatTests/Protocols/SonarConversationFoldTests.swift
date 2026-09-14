@@ -1505,6 +1505,32 @@ struct SonarConversationFoldTests {
         #expect(snOpenedDMShouldSkipHydrate(openingId: "group-08", suppressedIds: remountKeys))
         #expect(snOpenedDMShouldSkipHydrate(openingId: "marmot:group-09", suppressedIds: remountKeys))
         #expect(!snOpenedDMShouldSkipHydrate(openingId: "marmot:other", suppressedIds: remountKeys))
+        let stampedEmpty = snRemountMarksTranscriptHydrated(
+            historicalId: "marmot:group-08",
+            liveId: "marmot:group-09",
+            hydratedIds: []
+        )
+        #expect(snOpenedDMShouldSkipHydrate(openingId: "marmot:group-09", suppressedIds: stampedEmpty))
+        #expect(snOpenedDMShouldSkipHydrate(openingId: "group-09", suppressedIds: stampedEmpty))
+        #expect(!snOpenedDMShouldSkipHydrate(openingId: "marmot:group-08", suppressedIds: stampedEmpty))
+        let stampedKeep = snRemountMarksTranscriptHydrated(
+            historicalId: "marmot:group-08",
+            liveId: "marmot:group-09",
+            hydratedIds: ["marmot:group-08", "other"]
+        )
+        #expect(snOpenedDMShouldSkipHydrate(openingId: "marmot:group-09", suppressedIds: stampedKeep))
+        #expect(stampedKeep.contains("other"))
+        #expect(!snOpenedDMShouldSkipHydrate(openingId: "marmot:group-08", suppressedIds: stampedKeep))
+        #expect(snRemountLocalHydratingIds(
+            historicalKeys: ["marmot:group-08", "group-08"],
+            liveKeys: ["marmot:group-09", "group-09"],
+            hydrating: ["marmot:group-08", "other"]
+        ) == ["marmot:group-09", "group-09", "other"])
+        #expect(snRemountLocalHydratingIds(
+            historicalKeys: ["marmot:group-08", "group-08"],
+            liveKeys: ["marmot:group-09", "group-09"],
+            hydrating: []
+        ).isEmpty)
         #expect(snClosedDMShouldClearOpened(
             closingId: "marmot:group-08",
             openedConversationId: "marmot:group-09",
