@@ -7279,6 +7279,17 @@ impl SonarClient {
             self.maybe_add_late_resume_members(&live).await;
             return Ok(live);
         }
+        // A live 0.9 sibling can already exist (incoming welcome, or a
+        // start_dm with the same peer) while the JSON + index binds are
+        // gone. Idle reconcile would fold; a send must not mint a second
+        // group or fail KeyPackageNotFound for a peer who already joined.
+        if self.engine.is_historical_group(group_id)? {
+            self.maybe_fold_live_groups();
+            if let Some(live) = self.engine.live_fold_target(group_id) {
+                self.maybe_add_late_resume_members(&live).await;
+                return Ok(live);
+            }
+        }
         if !self.engine.is_historical_group(group_id)? {
             // Unknown / not-yet-created ids keep the existing send error
             // (group missing, media cap, …). Only recovered 0.8 rows resume.
@@ -7564,7 +7575,16 @@ impl SonarClient {
             }
             return Ok(live);
         }
+        // Same lost-bind window as `resolve_send_group`: a live sibling
+        // may already exist. Re-discover before refusing to mint.
         if self.engine.is_historical_group(group_id)? {
+            self.maybe_fold_live_groups();
+            if let Some(live) = self.engine.live_fold_target(group_id) {
+                if self.engine.is_dropped(&live) {
+                    return Err(Error::InvalidInput("this chat was deleted".into()));
+                }
+                return Ok(live);
+            }
             return Err(Error::InvalidInput(
                 "this recovered chat cannot invite until it is resumed".into(),
             ));
@@ -12257,6 +12277,96 @@ mod tests {
                 .unread_count,
             0,
             "second copy_summary must not double-count"
+        );
+    }
+
+    /// Lost JSON + index binds must not mint a second 0.9 DM on send, and
+    /// must not refuse invite, when a live sibling with that peer already
+    /// exists. Idle `maybe_fold_live_groups` would heal; send / invite
+    /// must re-discover first.
+    #[tokio::test]
+    async fn send_on_recovered_dm_rebinds_existing_live_after_lost_fold() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live)
+        );
+
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "test setup: both binds must be gone"
+        );
+        assert_eq!(bob.engine.groups().expect("still one live").len(), 1);
+
+        bob.send_text(&historical, "hello again")
+            .await
+            .expect("send must reuse the existing live group, not KeyPackageNotFound");
+        let live_groups = bob.engine.groups().expect("bob live groups");
+        assert_eq!(
+            live_groups.len(),
+            1,
+            "lost-bind send must not mint a second 0.9 DM: {live_groups:?}"
+        );
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "send must re-record the hist→live bind"
+        );
+        let sent = bob.messages(&live).expect("union transcript");
+        assert!(
+            sent.iter().any(|m| m.content == "hello again"),
+            "the send must land on the existing live sibling: {sent:?}"
+        );
+
+        let token = bob
+            .create_invite_link(&historical, "alice & bob")
+            .expect("invite must remint on the live sibling");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        assert_eq!(
+            decoded.group_id,
+            live.as_slice(),
+            "invite token must name the rebound live id"
         );
     }
 

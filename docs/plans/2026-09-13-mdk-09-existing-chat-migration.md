@@ -1583,6 +1583,14 @@ the live id is present and keeps hist-only recovered chats. Pins:
 `account_backup::tests::backup_stats_do_not_double_count_folded_hist`,
 `account_backup::tests::transcript_stats_union_folded_family_without_double_listing`.
 
+A send or invite aimed at a recovered 0.8 id after both fold sidecars
+were lost still minted a second 0.9 group (`KeyPackageNotFound` when
+no packages, or a new MLS id when they exist) even though a live
+sibling with that peer was already joined. Idle
+`maybe_fold_live_groups` would heal; `resolve_send_group` and
+`invite_mint_group` now re-discover before mint / refuse. Pin:
+`client::tests::send_on_recovered_dm_rebinds_existing_live_after_lost_fold`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
