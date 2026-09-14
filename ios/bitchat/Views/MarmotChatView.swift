@@ -3384,9 +3384,8 @@ final class MarmotChatModel: ObservableObject {
 
     func markConversationRead(groupId: String) {
         let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
-        let ids = snTranscriptSourceIds(
+        let ids = snConversationReadGroupIds(
             groupId: groupId,
-            listedDirectIds: [],
             historicalFolds: folds
         )
         for id in ids {
@@ -3394,7 +3393,14 @@ final class MarmotChatModel: ObservableObject {
             unreadByGroup[id] = nil
         }
         Task { @MainActor in
-            await service.markConversationRead(groupId: groupId)
+            // Persist-folds remounts before core fold_aliases exist.
+            // mark_conversation_read only walks engine aliases, so a
+            // live-only FFI call leaves unread on the hidden 0.8 id and
+            // publishUnread restores the badge. Compose markGroupsRead
+            // FFI-marks each transcriptGroupIds entry.
+            for id in ids {
+                await service.markConversationRead(groupId: id)
+            }
             // End in-flight suppress for this id, then reconcile from core.
             // Viewing suppress still covers an open DM; without this release a
             // failed/raced mark could hide real unread for the rest of the process.

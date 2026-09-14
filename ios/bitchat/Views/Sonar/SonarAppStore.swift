@@ -1285,6 +1285,22 @@ func snFoldFamilyIds(
     return family
 }
 
+/// FFI `mark_conversation_read` ids for one open/refresh. Core only
+/// walks `engine.fold_aliases`, which are empty while persist-folds
+/// remounts before the sidecar bind. Host must mark each sibling.
+/// Compose `markGroupsRead(transcriptGroupIds)`.
+func snConversationReadGroupIds(
+    groupId: String,
+    historicalFolds: [String: String]
+) -> [String] {
+    let ids = snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds
+    )
+    return ids.isEmpty ? [groupId] : ids
+}
+
 /// Marmot ids whose unread / transcript belong to the open chat after a fold.
 /// Order is stable: open id, then listed 1:1 duplicates, then sorted family extras.
 func snTranscriptSourceIds(
@@ -10136,7 +10152,7 @@ final class SonarAppStore: ObservableObject {
         let localURL: String
         let data: Data
         let startedAt: Date
-        let existingMediaURLs: Set<String>
+        var existingMediaURLs: Set<String>
         var completedOrder: Int?
     }
 
@@ -10147,6 +10163,10 @@ final class SonarAppStore: ObservableObject {
     private var pendingUploadMediaCache: [String: [PendingUploadMedia]] = [:]
     private var retryingFailedOptimisticMessageIDs: Set<String> = []
     private static let pendingMediaURLPrefix = "pending-media-"
+    /// Match Compose `BACKGROUND_TRANSCRIPT_SCAN_LIMIT` for send-time
+    /// published-URL exclusion. Newest 100 per sibling is enough to
+    /// catch remounted 0.8 attachments that share filename/mime.
+    private static let publishedMediaScanLimit: UInt32 = 100
 
     /// Map a Marmot message's attachments into UI items carrying the group id.
     static func mediaItems(_ m: MarmotService.MarmotMessage, groupId: String) -> [SNMediaItem] {
@@ -10247,6 +10267,35 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Newest-page each persist-folds sibling so a remounted 0.8 attachment
+    /// that is not yet in `messagesByGroup` still lands in the exclude set.
+    /// Compose `existingPublishedMediaUrls`.
+    private func existingPublishedMediaUrls(groupId: String) async -> Set<String> {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let ids = snMediaFetchGroupIds(
+            startGroupId: groupId,
+            historicalFolds: folds
+        )
+        let walk = ids.isEmpty ? [groupId] : ids
+        var pages: [String: [MarmotService.MarmotMessage]] = [:]
+        for id in walk {
+            let fetched = try? await marmot.messagesPage(
+                groupId: id,
+                limit: Self.publishedMediaScanLimit
+            )
+            pages[id] = fetched
+                ?? marmot.messagesByGroup[id]
+                ?? marmot.messagesByGroup[snBareMarmotGroupId(id)]
+                ?? []
+        }
+        return snPublishedMediaUrlsFromFamilyPages(
+            startGroupId: groupId,
+            historicalFolds: folds,
+            pageForId: { pages[$0] ?? [] },
+            pendingPrefix: Self.pendingMediaURLPrefix
+        )
+    }
+
     private func rememberPendingUploadMedia(
         groupId: String,
         filename: String,
@@ -10254,7 +10303,7 @@ final class SonarAppStore: ObservableObject {
         caption: String,
         localURL: String,
         data: Data
-    ) {
+    ) async {
         let key = pendingUploadMediaCacheKey(
             groupId: groupId,
             filename: filename,
@@ -10262,7 +10311,7 @@ final class SonarAppStore: ObservableObject {
             caption: caption
         )
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let existingMediaURLs = snPublishedMediaUrlsFromFamilyPages(
+        let cached = snPublishedMediaUrlsFromFamilyPages(
             startGroupId: groupId,
             historicalFolds: folds,
             pageForId: { id in
@@ -10272,6 +10321,9 @@ final class SonarAppStore: ObservableObject {
             },
             pendingPrefix: Self.pendingMediaURLPrefix
         )
+        // Page hidden siblings before sendMedia so a later remainder tick
+        // cannot present a recovered isMine URL that was missing from cache.
+        let existingMediaURLs = cached.union(await existingPublishedMediaUrls(groupId: groupId))
         pendingUploadMediaCache[key, default: []].append(
             PendingUploadMedia(
                 localURL: localURL,
@@ -10379,17 +10431,27 @@ final class SonarAppStore: ObservableObject {
         }
         guard retryingFailedOptimisticMessageIDs.insert(message.id).inserted else { return }
 
-        for payload in payloads {
-            rememberPendingUploadMedia(
-                groupId: groupId,
-                filename: payload.item.filename,
-                mime: payload.item.mime,
-                caption: message.text,
-                localURL: payload.item.url,
-                data: payload.data
-            )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for payload in payloads {
+                await self.rememberPendingUploadMedia(
+                    groupId: groupId,
+                    filename: payload.item.filename,
+                    mime: payload.item.mime,
+                    caption: message.text,
+                    localURL: payload.item.url,
+                    data: payload.data
+                )
+            }
+            self.sendRetriedMedia(payloads, message: message, groupId: groupId)
         }
+    }
 
+    private func sendRetriedMedia(
+        _ payloads: [(item: SNMediaItem, data: Data)],
+        message: SNMessage,
+        groupId: String
+    ) {
         if payloads.count == 1, let payload = payloads.first {
             marmot.sendMedia(
                 groupId: groupId,
@@ -10583,39 +10645,42 @@ final class SonarAppStore: ObservableObject {
             return
         }
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(
-            groupId: gid,
-            filename: filename,
-            mime: mime,
-            caption: "",
-            localURL: pendingURL,
-            data: data
-        )
-        marmot.sendMedia(
-            groupId: gid,
-            data: data,
-            filename: filename,
-            mime: mime,
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(
-                    groupId: gid,
-                    filename: filename,
-                    mime: mime,
-                    caption: "",
-                    localURL: pendingURL
-                )
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(
-                    groupId: gid,
-                    filename: filename,
-                    mime: mime,
-                    caption: "",
-                    localURL: pendingURL
-                )
-            }
-        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: filename,
+                mime: mime,
+                caption: "",
+                localURL: pendingURL,
+                data: data
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: data,
+                filename: filename,
+                mime: mime,
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
     }
 
     /// Send N images to one peer as ONE album message (single kind-445 with N
@@ -10664,16 +10729,7 @@ final class SonarAppStore: ObservableObject {
         var albumItems: [MarmotService.MediaAlbumItem] = []
         var pendingURLs: [String] = []
         for item in items {
-            let pendingURL = Self.pendingMediaURL()
-            pendingURLs.append(pendingURL)
-            rememberPendingUploadMedia(
-                groupId: gid,
-                filename: item.filename,
-                mime: item.mime,
-                caption: "",
-                localURL: pendingURL,
-                data: item.data
-            )
+            pendingURLs.append(Self.pendingMediaURL())
             albumItems.append(
                 MarmotService.MediaAlbumItem(data: item.data, filename: item.filename, mime: item.mime)
             )
@@ -10681,33 +10737,46 @@ final class SonarAppStore: ObservableObject {
         let pairs = zip(items.map { ($0.filename, $0.mime) }, pendingURLs).map {
             (filename: $0.0, mime: $0.1, url: $1)
         }
-        marmot.sendMediaAlbum(
-            groupId: gid,
-            items: albumItems,
-            localPreviewURLs: pendingURLs,
-            onComplete: { [weak self] in
-                for pair in pairs {
-                    self?.markPendingUploadMediaCompleted(
-                        groupId: gid,
-                        filename: pair.filename,
-                        mime: pair.mime,
-                        caption: "",
-                        localURL: pair.url
-                    )
-                }
-            },
-            onFailure: { [weak self] in
-                for pair in pairs {
-                    self?.forgetPendingUploadMedia(
-                        groupId: gid,
-                        filename: pair.filename,
-                        mime: pair.mime,
-                        caption: "",
-                        localURL: pair.url
-                    )
-                }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for (item, pendingURL) in zip(items, pendingURLs) {
+                await self.rememberPendingUploadMedia(
+                    groupId: gid,
+                    filename: item.filename,
+                    mime: item.mime,
+                    caption: "",
+                    localURL: pendingURL,
+                    data: item.data
+                )
             }
-        )
+            self.marmot.sendMediaAlbum(
+                groupId: gid,
+                items: albumItems,
+                localPreviewURLs: pendingURLs,
+                onComplete: { [weak self] in
+                    for pair in pairs {
+                        self?.markPendingUploadMediaCompleted(
+                            groupId: gid,
+                            filename: pair.filename,
+                            mime: pair.mime,
+                            caption: "",
+                            localURL: pair.url
+                        )
+                    }
+                },
+                onFailure: { [weak self] in
+                    for pair in pairs {
+                        self?.forgetPendingUploadMedia(
+                            groupId: gid,
+                            filename: pair.filename,
+                            mime: pair.mime,
+                            caption: "",
+                            localURL: pair.url
+                        )
+                    }
+                }
+            )
+        }
     }
 
     /// Send a desktop-selected attachment. White Noise can preserve the source
@@ -10740,39 +10809,42 @@ final class SonarAppStore: ObservableObject {
         guard let gid = groupId else { return false }
 
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(
-            groupId: gid,
-            filename: safeName,
-            mime: safeMime,
-            caption: "",
-            localURL: pendingURL,
-            data: data
-        )
-        marmot.sendMedia(
-            groupId: gid,
-            data: data,
-            filename: safeName,
-            mime: safeMime,
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(
-                    groupId: gid,
-                    filename: safeName,
-                    mime: safeMime,
-                    caption: "",
-                    localURL: pendingURL
-                )
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(
-                    groupId: gid,
-                    filename: safeName,
-                    mime: safeMime,
-                    caption: "",
-                    localURL: pendingURL
-                )
-            }
-        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: safeName,
+                mime: safeMime,
+                caption: "",
+                localURL: pendingURL,
+                data: data
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: data,
+                filename: safeName,
+                mime: safeMime,
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: safeName,
+                        mime: safeMime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: safeName,
+                        mime: safeMime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
         return true
     }
 
@@ -10801,39 +10873,42 @@ final class SonarAppStore: ObservableObject {
             return
         }
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(
-            groupId: gid,
-            filename: url.lastPathComponent,
-            mime: "audio/mp4",
-            caption: "",
-            localURL: pendingURL,
-            data: data
-        )
-        marmot.sendMedia(
-            groupId: gid,
-            data: data,
-            filename: url.lastPathComponent,
-            mime: "audio/mp4",
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(
-                    groupId: gid,
-                    filename: url.lastPathComponent,
-                    mime: "audio/mp4",
-                    caption: "",
-                    localURL: pendingURL
-                )
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(
-                    groupId: gid,
-                    filename: url.lastPathComponent,
-                    mime: "audio/mp4",
-                    caption: "",
-                    localURL: pendingURL
-                )
-            }
-        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: url.lastPathComponent,
+                mime: "audio/mp4",
+                caption: "",
+                localURL: pendingURL,
+                data: data
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: data,
+                filename: url.lastPathComponent,
+                mime: "audio/mp4",
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: url.lastPathComponent,
+                        mime: "audio/mp4",
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: url.lastPathComponent,
+                        mime: "audio/mp4",
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
     }
 
     /// Internet fallback for a mesh media send that found no live BLE route
@@ -10862,20 +10937,42 @@ final class SonarAppStore: ObservableObject {
         }
         guard let gid = groupId else { return false }
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL, data: packet.content)
-        marmot.sendMedia(
-            groupId: gid,
-            data: packet.content,
-            filename: filename,
-            mime: mime,
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL)
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL)
-            }
-        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: filename,
+                mime: mime,
+                caption: "",
+                localURL: pendingURL,
+                data: packet.content
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: packet.content,
+                filename: filename,
+                mime: mime,
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
         return true
     }
 

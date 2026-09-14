@@ -672,6 +672,19 @@ struct SonarConversationFoldTests {
             ) == ["group-09", "group-08"]
         )
         #expect(
+            snConversationReadGroupIds(
+                groupId: "group-09",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09", "group-08"],
+            "in-chat mark-read must FFI both siblings before core fold_aliases exist"
+        )
+        #expect(
+            snConversationReadGroupIds(
+                groupId: "group-09",
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
+        #expect(
             snMeshFoldTranscriptSourceIds(
                 listedDirectIds: ["group-09"],
                 historicalFolds: ["group-08": "group-09"]
