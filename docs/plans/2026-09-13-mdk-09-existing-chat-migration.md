@@ -928,6 +928,18 @@ listed-id only so a bak remainder cannot replay. Pins:
 `ConversationFoldTest.foldFamilyCachedMessagesUnionsHiddenSibling`,
 `SonarConversationFoldTests` `snFoldFamilyCachedMessages`.
 
+Load-older hole closed after this commit: `hasOlderLocalMessages` /
+`transcriptWindows.hasMore` keyed only the live id. After collapse the
+0.8 page still had remainder (`*.mdk08.bak` / older local rows) while
+the live flag was false, so first paint of recovered history could not
+scroll up. `snFoldFamilyHasOlder` / `hasOlderForFoldFamily` OR the
+family flags; load-older on live uses the hist cursor when the live
+row has none. Untrusted Compose snapshot fallback no longer pins
+`hasMore=false`. Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
+`SonarConversationFoldTests` `snFoldFamilyHasOlder` /
+`snFoldFamilyPagingCursor`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

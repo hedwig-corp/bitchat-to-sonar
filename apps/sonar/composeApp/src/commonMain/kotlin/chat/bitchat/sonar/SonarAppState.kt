@@ -730,6 +730,15 @@ internal fun foldedSiblingHasMore(
     liveHasMore: Boolean,
 ): Boolean = historicalHasMore || liveHasMore
 
+/** True when any fold-family id still has an older local page. */
+internal fun hasOlderForFoldFamily(
+    groupId: String,
+    hasMoreById: Map<String, Boolean>,
+    historicalFolds: Map<String, String>,
+): Boolean =
+    foldFamilyIds(groupId, historicalFolds).ifEmpty { setOf(groupId) }
+        .any { hasMoreById[it] == true }
+
 /** Promote load-older flags from a hidden 0.8 id onto the listed live sibling. */
 internal fun promotedFoldedPagingFlags(
     previousIds: Set<String>,
@@ -11939,7 +11948,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             // from a real one at the `current != null` check above, so it would
             // shadow the store on every later refresh and pin the chat black.
             if (fallback.isNotEmpty()) {
-                transcriptWindows[groupId] = TranscriptGroupWindow(fallback, hasMore = false)
+                transcriptWindows[groupId] = TranscriptGroupWindow(
+                    fallback,
+                    hasMore = true,
+                )
             }
             return fallback
         }
@@ -12174,6 +12186,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
+    private fun transcriptWindowHasMore(groupId: String): Boolean {
+        val window = transcriptWindows[groupId]
+        return (window?.hasMore == true) ||
+            hasOlderForFoldFamily(
+                groupId,
+                transcriptWindows.mapValues { it.value.hasMore },
+                historicalFoldMap,
+            )
+    }
+
     private fun transcriptGroupIds(chatId: String): List<String> {
         if (!isMeshChat(chatId)) {
             return transcriptSourceIds(
@@ -12282,7 +12304,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 for (groupId in groupIds) {
                     val window = transcriptWindows[groupId] ?: continue
-                    add(TranscriptSourceWindow(groupId, window.rows, window.hasMore))
+                    add(TranscriptSourceWindow(groupId, window.rows, transcriptWindowHasMore(groupId)))
                 }
             }
             val sourceIds = transcriptSourceIdsNeedingExpansion(sources, oldestVisible)
@@ -12297,7 +12319,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             for (groupId in groupIds) {
                 if (groupId !in sourceIds) continue
                 val current = transcriptWindows[groupId] ?: continue
-                if (current.loadingOlder || !current.hasMore || current.rows.isEmpty()) continue
+                if (current.loadingOlder || !transcriptWindowHasMore(groupId) || current.rows.isEmpty()) continue
 
                 if (!isCurrentTranscriptSession(chatId, generation)) return false
                 transcriptWindows[groupId] = current.copy(loadingOlder = true)
@@ -12341,7 +12363,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 for (groupId in groupIds) {
                     val window = transcriptWindows[groupId] ?: continue
-                    add(TranscriptSourceWindow(groupId, window.rows, window.hasMore))
+                    add(TranscriptSourceWindow(groupId, window.rows, transcriptWindowHasMore(groupId)))
                 }
             }
             if (transcriptSourceIdsNeedingExpansion(sources, oldestVisible).isNotEmpty()) return false

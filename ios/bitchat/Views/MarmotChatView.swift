@@ -2679,8 +2679,17 @@ final class MarmotChatModel: ObservableObject {
     /// Page the next local database window before the oldest retained canonical
     /// row. Returns true only when at least one new row was prepended.
     func loadOlderLocalPage(groupId: String) async -> Bool {
-        guard localTranscriptHasOlderByGroup[groupId] == true,
-              let cursor = localTranscriptCursorByGroup[groupId],
+        let folds = historicalFoldsMap()
+        guard snFoldFamilyHasOlder(
+                groupId: groupId,
+                hasOlderByGroup: localTranscriptHasOlderByGroup,
+                historicalFolds: folds
+              ),
+              let cursor = snFoldFamilyPagingCursor(
+                groupId: groupId,
+                cursorsByGroup: localTranscriptCursorByGroup,
+                historicalFolds: folds
+              ),
               localTranscriptLoadingGroups.insert(groupId).inserted else {
             return false
         }
@@ -2773,7 +2782,11 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func hasOlderLocalMessages(groupId: String) -> Bool {
-        localTranscriptHasOlderByGroup[groupId] == true
+        snFoldFamilyHasOlder(
+            groupId: groupId,
+            hasOlderByGroup: localTranscriptHasOlderByGroup,
+            historicalFolds: historicalFoldsMap()
+        )
     }
 
     func localTranscriptCanonicalMessageIDs(groupId: String) -> Set<String> {

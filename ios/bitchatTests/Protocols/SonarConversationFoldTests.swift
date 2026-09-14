@@ -797,6 +797,34 @@ struct SonarConversationFoldTests {
         #expect(snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: true))
         #expect(!snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: false))
         #expect(
+            snFoldFamilyHasOlder(
+                groupId: "group-09",
+                hasOlderByGroup: ["group-08": true],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snFoldFamilyHasOlder(
+                groupId: "group-09",
+                hasOlderByGroup: ["group-08": true],
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snFoldFamilyPagingCursor(
+                groupId: "group-09",
+                cursorsByGroup: ["group-08": "cursor-08"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "cursor-08"
+        )
+        #expect(
+            snFoldFamilyPagingCursor(
+                groupId: "group-09",
+                cursorsByGroup: ["group-08": "cursor-08", "group-09": "cursor-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "cursor-09"
+        )
+        #expect(
             snPromotedFoldedPagingFlags(
                 previousGroupIds: ["group-08", "group-09"],
                 currentGroupIds: ["group-09"],

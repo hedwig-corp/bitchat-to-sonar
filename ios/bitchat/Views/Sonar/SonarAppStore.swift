@@ -550,6 +550,33 @@ func snFoldedSiblingHasMore(historicalHasMore: Bool, liveHasMore: Bool) -> Bool 
     historicalHasMore || liveHasMore
 }
 
+/// True when any fold-family id still has an older local page. Promote
+/// copies the hist flag onto live asynchronously; first paint of the live
+/// row must still offer load-older for leftover 0.8 remainder.
+func snFoldFamilyHasOlder(
+    groupId: String,
+    hasOlderByGroup: [String: Bool],
+    historicalFolds: [String: String]
+) -> Bool {
+    let ids = [groupId] + snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
+    return ids.contains { hasOlderByGroup[$0] == true }
+}
+
+/// Prefer this id's load-older cursor; fall back to a hidden sibling so
+/// an unpaged live row can still request the family remainder.
+func snFoldFamilyPagingCursor<Cursor>(
+    groupId: String,
+    cursorsByGroup: [String: Cursor],
+    historicalFolds: [String: String]
+) -> Cursor? {
+    if let cursor = cursorsByGroup[groupId] { return cursor }
+    for alias in snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds).sorted()
+    where alias != groupId {
+        if let cursor = cursorsByGroup[alias] { return cursor }
+    }
+    return nil
+}
+
 /// Promote load-older flags from a hidden 0.8 id onto the listed live sibling.
 func snPromotedFoldedPagingFlags(
     previousGroupIds: Set<String>,

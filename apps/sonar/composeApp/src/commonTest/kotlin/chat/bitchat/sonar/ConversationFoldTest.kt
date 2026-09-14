@@ -901,6 +901,15 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun hasOlderForFoldFamilyReadsHiddenSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertTrue(hasOlderForFoldFamily("group-09", mapOf("group-08" to true), folds))
+        assertTrue(hasOlderForFoldFamily("group-09", mapOf("group-09" to true), folds))
+        assertFalse(hasOlderForFoldFamily("group-09", mapOf("group-08" to false, "group-09" to false), folds))
+        assertFalse(hasOlderForFoldFamily("group-09", mapOf("group-08" to true), emptyMap()))
+    }
+
+    @Test
     fun foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling() {
         assertEquals(
             mapOf("group-09" to listOf("uploading")),
