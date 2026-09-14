@@ -3535,6 +3535,11 @@ impl SonarClient {
         // fold a recovered 0.8 DM onto this live id so history is not a
         // second row and a later send on the 0.8 id cannot mint a third.
         self.maybe_fold_new_group(&group_id);
+        // Immediate `backfill_group` above can fail (timeout, no quorum).
+        // After the one-shot empty-transcript scan, idle short-circuit
+        // sync never re-lists this room — enqueue the same empty-live
+        // retry auto-joined DMs use. Folded hist does not count.
+        self.enqueue_empty_live_transcript_backfill(&group_id);
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
@@ -11475,6 +11480,71 @@ mod tests {
         assert!(
             queued.iter().any(|id| id == &h),
             "drain welcome must re-queue the empty live group after the one-shot scan: {queued:?}"
+        );
+    }
+
+    /// Rooms stay `GroupInvitePending` until Accept. That must not enqueue
+    /// a backfill (not joined yet). After Accept, the same one-shot-scan
+    /// miss as auto-joined DMs applies — idle sync never full-backfills
+    /// unless Accept re-queues the empty live sibling.
+    #[tokio::test]
+    async fn accept_09_room_enqueues_empty_live_after_oneshot_scan() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        bob.populate_empty_transcript_backfills_once();
+        assert!(
+            bob.take_initial_empty_transcript_backfills().is_empty(),
+            "one-shot scan before the invite must not see a live 0.9 group"
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice creates room");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 room")
+            .await;
+        assert!(
+            bob.take_initial_empty_transcript_backfills().is_empty(),
+            "pending room invite must not enqueue a backfill before Accept"
+        );
+
+        let invite = bob
+            .pending_group_invites()
+            .expect("parked 3-member welcome")
+            .remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts the room");
+
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        let h = bob
+            .engine
+            .nostr_h_tag_hex(&live)
+            .expect("routing")
+            .expect("founding group has nostr routing");
+        let queued = bob.take_initial_empty_transcript_backfills();
+        assert!(
+            queued.iter().any(|id| id == &h),
+            "accept must re-queue the empty live room after the one-shot scan: {queued:?}"
         );
     }
 
