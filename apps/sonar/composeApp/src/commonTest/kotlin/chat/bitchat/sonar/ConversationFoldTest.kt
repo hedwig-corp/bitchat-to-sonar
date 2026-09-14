@@ -1125,6 +1125,46 @@ class ConversationFoldTest {
         assertEquals(dm.id, directMarmotChatIdForPeer(listOf(pendingRoom, dm), ownNpub, peerNpub))
         assertEquals("pending room", marmotNotificationGroupName(pendingRoom))
         assertEquals(null, marmotNotificationGroupName(dm))
+        assertEquals(
+            "pending room",
+            marmotChatDisplayTitle(
+                isDirect = false,
+                name = "pending room",
+                otherMemberCount = 1,
+                profileName = "Bob",
+                npubFallback = "npub1bob…",
+            ),
+        )
+        assertEquals(
+            "Bob",
+            marmotChatDisplayTitle(
+                isDirect = true,
+                name = "bob dm",
+                otherMemberCount = 1,
+                profileName = "Bob",
+                npubFallback = "npub1bob…",
+            ),
+        )
+        assertEquals(
+            "standup",
+            marmotChatDisplayTitle(
+                isDirect = false,
+                name = "standup",
+                otherMemberCount = 1,
+                profileName = "Bob",
+                npubFallback = "npub1bob…",
+            ),
+        )
+        assertEquals(
+            "Group chat",
+            marmotChatDisplayTitle(
+                isDirect = false,
+                name = "",
+                otherMemberCount = 2,
+                profileName = "Bob",
+                npubFallback = "npub1bob…",
+            ),
+        )
     }
 
     @Test

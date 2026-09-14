@@ -222,6 +222,15 @@ struct MarmotProfileCacheTests {
         #expect(grouped[peerNpub]?.map(\.id) == ["bob-dm"])
         #expect(snMarmotTreatsAsGroupChat(pendingRoom))
         #expect(!snMarmotTreatsAsGroupChat(dm))
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: pendingRoom.isDirect,
+                name: pendingRoom.name,
+                otherMemberCount: 1,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "pending room"
+        )
     }
 
     @Test

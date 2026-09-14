@@ -5254,15 +5254,23 @@ final class MarmotChatModel: ObservableObject {
     /// Short label for a 1:1 group: the other member's npub prefix.
     func title(for group: MarmotService.MarmotGroup) -> String {
         let others = otherMembers(in: group)
-        guard others.count == 1, let other = others.first else {
-            return group.name.isEmpty ? "Group chat" : group.name
-        }
+        let other = others.count == 1 ? others.first : nil
         // A 1:1 group is titled by the counterpart's LIVE kind-0 profile name.
         // The MLS group name is a creation-time snapshot (e.g. sonar-cli
         // --group-name) and must not freeze the row or shadow a rename.
-        if let name = displayName(forNpub: other) { return name }
-        ensureProfile(other)
-        return group.name.isEmpty ? String(other.prefix(12)) + "…" : group.name
+        // Recovered rooms (`isDirect == false`) keep the room name even when
+        // only one peer has updated — otherwise the home list looks like a
+        // second 1:1 with the welcomer (R-045).
+        if group.isDirect, let other, displayName(forNpub: other) == nil {
+            ensureProfile(other)
+        }
+        return snMarmotChatDisplayTitle(
+            isDirect: group.isDirect,
+            name: group.name,
+            otherMemberCount: others.count,
+            profileName: other.flatMap { displayName(forNpub: $0) },
+            npubFallback: other.map { String($0.prefix(12)) + "…" } ?? ""
+        )
     }
 
     func otherMembers(in group: MarmotService.MarmotGroup) -> [String] {

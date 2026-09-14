@@ -257,6 +257,22 @@ func snFoldedDirectMarmotHomeTitle(
     isDirectGroup ? marmotProfileTitle : peerDerivedTitle
 }
 
+/// Home / header title. Recovered rooms keep their name even when only one
+/// peer is listed; the 1:1 profile path is only for `isDirect` chats.
+func snMarmotChatDisplayTitle(
+    isDirect: Bool,
+    name: String,
+    otherMemberCount: Int,
+    profileName: String?,
+    npubFallback: String
+) -> String {
+    if !isDirect || otherMemberCount != 1 {
+        return name.isEmpty ? "Group chat" : name
+    }
+    if let profileName, !profileName.isEmpty { return profileName }
+    return name.isEmpty ? npubFallback : name
+}
+
 func snMarmotSendTargetGroupId(
     openChatId: String,
     duplicateGroupIds: [String],

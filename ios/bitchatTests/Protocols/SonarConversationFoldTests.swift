@@ -31,6 +31,46 @@ struct SonarConversationFoldTests {
     }
 
     @Test
+    func recoveredRoomTitleKeepsRoomNameWhenOnlyOnePeerIsListed() {
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: false,
+                name: "pending room",
+                otherMemberCount: 1,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "pending room"
+        )
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: true,
+                name: "bob dm",
+                otherMemberCount: 1,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "Bob"
+        )
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: false,
+                name: "standup",
+                otherMemberCount: 1,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "standup"
+        )
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: false,
+                name: "",
+                otherMemberCount: 2,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "Group chat"
+        )
+    }
+
+    @Test
     func recoveredAndResumedDirectChatsPreferLiveSendTarget() {
         #expect(
             snMarmotSendTargetGroupId(

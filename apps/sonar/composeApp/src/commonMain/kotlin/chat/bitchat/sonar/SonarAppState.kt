@@ -434,6 +434,19 @@ internal fun shouldForceProfileRefetch(cachedName: String?, liveName: String?, f
 internal fun directChatRowTitle(profileName: String?, groupName: String, npubFallback: String): String =
     profileName?.takeIf { it.isNotBlank() } ?: groupName.ifBlank { npubFallback }
 
+/** Home / header title. Recovered rooms keep their name even when only one
+ *  peer is listed; the 1:1 profile path is only for `isDirect` chats. */
+internal fun marmotChatDisplayTitle(
+    isDirect: Boolean,
+    name: String,
+    otherMemberCount: Int,
+    profileName: String?,
+    npubFallback: String,
+): String {
+    if (!isDirect || otherMemberCount != 1) return name.ifBlank { "Group chat" }
+    return directChatRowTitle(profileName, name, npubFallback)
+}
+
 /** Fold only when both transports identify the same cryptographic account. */
 internal fun peerNpubHexMatchesLinkedPeer(
     groupCounterpartyNpubHex: String,
@@ -6384,17 +6397,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         pendingMarmotGroups[chat.id]?.let { return it.name }
         val others = otherMembers(chat)
-        if (others.size != 1) return chat.name.ifBlank { "Group chat" }
-        val other = others.first()
+        val other = others.singleOrNull()
         // A 1:1 chat is titled by the counterpart's LIVE kind-0 profile name.
         // The MLS group name is a creation-time snapshot (hosts may pass one,
         // e.g. sonar-cli --group-name) and must not freeze the row, shadow a
         // rename, or make two different contacts share one titled row.
-        return directChatRowTitle(
-            profileName = profilesByNpub[canonicalProfileKey(other)]?.bestName,
-            groupName = chat.name,
-            npubFallback = shortNpub(other),
-        ).also { if (profilesByNpub[canonicalProfileKey(other)] == null) ensureProfile(other) }
+        // Recovered rooms (`isDirect == false`) keep the room name even when
+        // only one peer has updated — otherwise the home list looks like a
+        // second 1:1 with the welcomer (R-045).
+        return marmotChatDisplayTitle(
+            isDirect = chat.isDirect,
+            name = chat.name,
+            otherMemberCount = others.size,
+            profileName = other?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName },
+            npubFallback = other?.let(::shortNpub).orEmpty(),
+        ).also {
+            if (chat.isDirect && other != null && profilesByNpub[canonicalProfileKey(other)] == null) {
+                ensureProfile(other)
+            }
+        }
     }
 
     private fun shortNpub(value: String): String = shortNpubLabel(value)
