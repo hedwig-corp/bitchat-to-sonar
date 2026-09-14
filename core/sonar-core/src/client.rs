@@ -3271,6 +3271,11 @@ impl SonarClient {
     /// create the leave proposal (MIP-03).
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
+        // Persist-folds can remount while the JSON sidecar is gone. Restore
+        // the recorded index bind before capturing `fold_aliases`, or leave
+        // of the live id leaves hist on disk and the next `groups()` paints
+        // the deleted room again.
+        self.restore_recorded_folds_touching(group_id);
         let leave_id = self
             .engine
             .live_fold_target(group_id)
@@ -7680,6 +7685,7 @@ impl SonarClient {
     /// Returns after durable local purge. Live-subscription narrowing runs in
     /// the background so delete never waits on relay round-trips.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
+        self.restore_recorded_folds_touching(group_id);
         let family = self.engine.fold_aliases(group_id);
         self.engine.delete_group(group_id).await?;
         self.purge_conversation_ids(&family);

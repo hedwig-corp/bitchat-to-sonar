@@ -2334,3 +2334,67 @@ async fn persist_folds_lost_core_sidecar_groups_and_aliases_restore_index_bind()
         "groups() must hide hist on the first home-list paint"
     );
 }
+
+/// Host persist-folds may be gone (nsec restore wiped the blob) while the
+/// conversation-index still records hist→live. Leave/delete must restore
+/// that bind before capturing `fold_aliases`, or hist stays on disk and
+/// the next `groups()` resurrects a chat the user already deleted.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_delete_live_purges_hist_from_index() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    alice
+        .delete_group(&live)
+        .await
+        .expect("delete live restores the bind and purges hist");
+    assert!(
+        alice
+            .historical_groups()
+            .expect("historical")
+            .iter()
+            .all(|g| g.id != historical),
+        "hist must not remain a recoverable conversation"
+    );
+    assert!(
+        alice.groups().expect("groups").is_empty(),
+        "deleted room must not reappear on the next home-list paint"
+    );
+}
