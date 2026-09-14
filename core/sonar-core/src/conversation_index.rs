@@ -271,8 +271,9 @@ impl ConversationIndex {
     }
 
     /// Copy a recovered-chat summary onto its live 0.9 sibling without
-    /// incrementing counts. Used when a fold is recorded so home-list /
-    /// unread / backup see one row immediately.
+    /// incrementing message counts. Unread is **added** onto the live row
+    /// (an incoming 0.9 DM can already have a badge) and then zeroed on
+    /// the historical id so a second copy cannot double-count.
     pub fn copy_summary(&self, from_hex: &str, to_hex: &str) -> Result<()> {
         if from_hex == to_hex {
             return Ok(());
@@ -280,9 +281,12 @@ impl ConversationIndex {
         let Some(src) = self.summary(from_hex)? else {
             return Ok(());
         };
-        self.db
-            .execute(
-                "INSERT INTO conversation_summary
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Storage(format!("index copy_summary begin: {e}")))?;
+        tx.execute(
+            "INSERT INTO conversation_summary
                     (group_id_hex, name, latest_content, latest_sender, latest_at_secs,
                      latest_mine, message_count, unread_count, version)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -300,23 +304,30 @@ impl ConversationIndex {
                     latest_mine = CASE
                         WHEN excluded.latest_at_secs >= latest_at_secs
                         THEN excluded.latest_mine ELSE latest_mine END,
-                    unread_count = CASE
-                        WHEN unread_count = 0 THEN excluded.unread_count
-                        ELSE unread_count END,
+                    unread_count = unread_count + excluded.unread_count,
                     version = version + 1",
-                params![
-                    to_hex,
-                    src.name,
-                    src.latest_content,
-                    src.latest_sender,
-                    src.latest_at_secs as i64,
-                    src.latest_mine as i32,
-                    src.message_count as i64,
-                    src.unread_count as i64,
-                    src.version as i64,
-                ],
-            )
-            .map_err(|e| crate::Error::Storage(format!("index copy_summary: {e}")))?;
+            params![
+                to_hex,
+                src.name,
+                src.latest_content,
+                src.latest_sender,
+                src.latest_at_secs as i64,
+                src.latest_mine as i32,
+                src.message_count as i64,
+                src.unread_count as i64,
+                src.version as i64,
+            ],
+        )
+        .map_err(|e| crate::Error::Storage(format!("index copy_summary: {e}")))?;
+        tx.execute(
+            "UPDATE conversation_summary
+                    SET unread_count = 0, version = version + 1
+                    WHERE group_id_hex = ?1 AND unread_count != 0",
+            params![from_hex],
+        )
+        .map_err(|e| crate::Error::Storage(format!("index copy_summary zero hist: {e}")))?;
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index copy_summary commit: {e}")))?;
         Ok(())
     }
 
@@ -651,6 +662,33 @@ mod tests {
         assert_eq!(
             idx.summary("hist").unwrap().unwrap().latest_content,
             "keep this chat"
+        );
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 0);
+    }
+
+    #[test]
+    fn copy_summary_adds_historical_unread_onto_live_that_already_has_unread() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("hist", "alice", "old 1", "bob", 100, false, true)
+            .unwrap();
+        idx.upsert_summary("hist", "alice", "old 2", "bob", 110, false, true)
+            .unwrap();
+        idx.upsert_summary("hist", "alice", "old 3", "bob", 120, false, true)
+            .unwrap();
+        idx.upsert_summary("live", "alice", "new 0.9", "bob", 200, false, true)
+            .unwrap();
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 3);
+        assert_eq!(idx.summary("live").unwrap().unwrap().unread_count, 1);
+
+        idx.copy_summary("hist", "live").unwrap();
+        assert_eq!(idx.summary("live").unwrap().unwrap().unread_count, 4);
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 0);
+
+        idx.copy_summary("hist", "live").unwrap();
+        assert_eq!(
+            idx.summary("live").unwrap().unwrap().unread_count,
+            4,
+            "second copy must not double-count after historical unread is zeroed"
         );
     }
 

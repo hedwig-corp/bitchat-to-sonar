@@ -156,6 +156,11 @@ Guarded by:
   (pins `fetch_media` + iOS `fetch_media_to_file` after a labeled secret is stored)
 - `e2e::recovered_08_outbound_only_chat_resumes_from_admin_pubkeys`
 - `conversation_index::copy_summary_promotes_recovered_row_onto_live_id`
+- `conversation_index::copy_summary_adds_historical_unread_onto_live_that_already_has_unread`
+  (`maybe_fold_new_group` can land on a live 0.9 DM that already has a
+  badge; `conversation_summaries()` hides the historical sibling, so
+  unread must be **added** onto live and then zeroed on hist or the
+  host divider undercounts recovered missed messages)
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
 - `account_backup::decode_v1_package_has_empty_sidecars`
@@ -358,7 +363,7 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | Surface | History | Live 0.9 send | Gap |
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
-| Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
+| Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id and **adds** historical unread onto live (then zeros hist so a second copy cannot double-count); `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
 | Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. Live `member_npubs` unions the recovered roster (`display_members`) so the member sheet / mentions stay populated after remount. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`) and keeps the room title (`marmotChatDisplayTitle` / `snMarmotChatDisplayTitle` — the 1:1 profile path is `isDirect` only). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply / verify / call logs / unread-at-open / transcript window / in-flight send echoes onto the live sibling. FFI `fold_aliases` lets a listed live id name its hidden 0.8 siblings so the host fold map hydrates on first launch without a leftover snapshot row. A persisted `sonar.historicalFolds` map drops a recovered snapshot row on the next cold start once the live sibling is already listed. After a KeyPackage miss, `recoveredChatHasLiveFoldSibling` treats a hist→live binding as the live sibling even when FFI has hidden the 0.8 id (listed duplicates go back to 1; rooms never have listed 1:1 duplicates). Remount **drops** the waiting-banner flag instead of copying it onto the live id. Shade taps inherit the still-listed 0.8 sibling's name/members, then `adoptedListedChatTitle` replaces a captured "Group chat" stub once the live row lists. | send prefers newest duplicate; toast/banner if KeyPackage missing — cleared once a live sibling exists; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
 | iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot; live `memberNpubs` from `display_members`). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. Mute / draft / reply / verify / call-log / unread-at-open / transcript-window / in-flight send-echo promotion and open-chat remount match Compose. Cold-start snapshot load collapses folded historical ids via `sonar.historicalFolds.v1`. `snRecoveredChatHasLiveFoldSibling` + remount-drop of `recoveredChatNeedsUpdate` match Compose so a successful resume clears “Waiting for them to update Sonar”. Title is derived each render (`marmot.title(for:)`); `marmotGroup(byId:)` walks `snListedOrFoldedSiblingGroupId` so a hidden 0.8 id still resolves the listed sibling. | same | none |
 | Mesh | untouched | untouched | none |
@@ -631,6 +636,15 @@ only one known peer no longer resumes as `start_dm`. Extract copies
 `historical_resume_is_direct` matches live `group_is_direct`. Early
 `metadata_backfill=complete` markers re-run as `v2` so already-quarantined
 baks pick up the new sidecars.
+
+Incoming-DM unread hole closed after this commit: `copy_summary` used to
+keep live unread when the live 0.9 row already had a badge
+(`CASE WHEN unread_count = 0 THEN excluded ELSE unread_count`). Local-send
+resume (live unread 0) copied recovered unread; incoming `maybe_fold_new_group`
+did not. Hosts place the unread divider by walking `unread_count` visible
+incoming rows, and `conversation_summaries()` hides the historical sibling,
+so recovered missed messages lost their divider. Pins:
+`conversation_index::copy_summary_adds_historical_unread_onto_live_that_already_has_unread`.
 
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
