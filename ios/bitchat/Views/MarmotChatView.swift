@@ -4252,10 +4252,43 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId, default: []].append(echo)
     }
 
+    private func pendingOptimisticIdsByGroup() -> [String: [String]] {
+        Dictionary(uniqueKeysWithValues: pendingOptimistic.map { ($0.key, $0.value.map(\.id)) })
+    }
+
     private func discardOptimistic(id: String, from groupId: String) {
         preexistingCanonicalMessageIDsByOptimisticID[id] = nil
-        pendingOptimistic[groupId]?.removeAll { $0.id == id }
-        messagesByGroup[groupId, default: []].removeAll { $0.id == id }
+        // Remount moves the echo onto live while the send closure still
+        // names hist. Compose `removePendingMessagesForChat` walks family.
+        let keys = snOptimisticPendingLookupIds(
+            sendGroupId: groupId,
+            echoId: id,
+            pendingByGroup: pendingOptimisticIdsByGroup(),
+            historicalFolds: historicalFoldsMap()
+        )
+        for key in keys {
+            pendingOptimistic[key]?.removeAll { $0.id == id }
+            if pendingOptimistic[key]?.isEmpty == true {
+                pendingOptimistic[key] = nil
+            }
+            messagesByGroup[key, default: []].removeAll { $0.id == id }
+        }
+    }
+
+    /// Failed local echo after remount must land on the live sibling, not hist.
+    private func appendFailedOptimistic(
+        _ failed: MarmotService.MarmotMessage,
+        replacing echoId: String,
+        sendGroupId: String
+    ) {
+        let storeId = snOptimisticPendingStoreId(
+            sendGroupId: sendGroupId,
+            echoId: echoId,
+            pendingByGroup: pendingOptimisticIdsByGroup(),
+            historicalFolds: historicalFoldsMap()
+        )
+        pendingOptimistic[storeId, default: []].append(failed)
+        messagesByGroup[storeId, default: []].append(failed)
     }
 
     private func discardOptimistic(for groupId: String) {
@@ -4589,8 +4622,19 @@ final class MarmotChatModel: ObservableObject {
     /// echo is visible, so retry never leaves a gap in the transcript.
     func removeFailedOptimisticMessage(groupId: String, messageId: String) {
         guard Self.isFailedOptimisticMessageId(messageId) else { return }
-        pendingOptimistic[groupId]?.removeAll { $0.id == messageId }
-        messagesByGroup[groupId, default: []].removeAll { $0.id == messageId }
+        let keys = snOptimisticPendingLookupIds(
+            sendGroupId: groupId,
+            echoId: messageId,
+            pendingByGroup: pendingOptimisticIdsByGroup(),
+            historicalFolds: historicalFoldsMap()
+        )
+        for key in keys {
+            pendingOptimistic[key]?.removeAll { $0.id == messageId }
+            if pendingOptimistic[key]?.isEmpty == true {
+                pendingOptimistic[key] = nil
+            }
+            messagesByGroup[key, default: []].removeAll { $0.id == messageId }
+        }
     }
 
     /// Send a media attachment (encrypt with the group key, upload the ciphertext
@@ -4690,6 +4734,12 @@ final class MarmotChatModel: ObservableObject {
                 // moved on; only the user-visible failure row and errorText are
                 // skipped for retired work.
                 model.clearMediaUploadListener(echo.id)
+                let failedStoreId = snOptimisticPendingStoreId(
+                    sendGroupId: groupId,
+                    echoId: echo.id,
+                    pendingByGroup: model.pendingOptimisticIdsByGroup(),
+                    historicalFolds: model.historicalFoldsMap()
+                )
                 model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
                     return
@@ -4704,8 +4754,8 @@ final class MarmotChatModel: ObservableObject {
                         isMine: true,
                         media: echo.media
                     )
-                    model.pendingOptimistic[groupId, default: []].append(failed)
-                    model.messagesByGroup[groupId, default: []].append(failed)
+                    model.pendingOptimistic[failedStoreId, default: []].append(failed)
+                    model.messagesByGroup[failedStoreId, default: []].append(failed)
                 }
                 onFailure?()
                 model.errorText = Self.describe(error)
@@ -4807,6 +4857,12 @@ final class MarmotChatModel: ObservableObject {
                 // moved on; only the user-visible failure row and errorText are
                 // skipped for retired work.
                 model.clearMediaUploadListener(echo.id)
+                let failedStoreId = snOptimisticPendingStoreId(
+                    sendGroupId: groupId,
+                    echoId: echo.id,
+                    pendingByGroup: model.pendingOptimisticIdsByGroup(),
+                    historicalFolds: model.historicalFoldsMap()
+                )
                 model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
                     return
@@ -4821,8 +4877,8 @@ final class MarmotChatModel: ObservableObject {
                         isMine: true,
                         media: echo.media
                     )
-                    model.pendingOptimistic[groupId, default: []].append(failed)
-                    model.messagesByGroup[groupId, default: []].append(failed)
+                    model.pendingOptimistic[failedStoreId, default: []].append(failed)
+                    model.messagesByGroup[failedStoreId, default: []].append(failed)
                 }
                 onFailure?()
                 model.errorText = Self.describe(error)
@@ -4878,19 +4934,20 @@ final class MarmotChatModel: ObservableObject {
                 )
                 onComplete?()
             } catch {
-                self.pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
-                self.messagesByGroup[groupId, default: []].removeAll { $0.id == echo.id }
-                let failed = MarmotService.MarmotMessage(
-                    id: Self.failedOptimisticIDPrefix + UUID().uuidString,
-                    senderNpub: echo.senderNpub,
-                    content: echo.content,
-                    createdAt: echo.createdAt,
-                    isMine: true,
-                    media: [],
-                    stickerRef: echo.stickerRef
+                self.appendFailedOptimistic(
+                    MarmotService.MarmotMessage(
+                        id: Self.failedOptimisticIDPrefix + UUID().uuidString,
+                        senderNpub: echo.senderNpub,
+                        content: echo.content,
+                        createdAt: echo.createdAt,
+                        isMine: true,
+                        media: [],
+                        stickerRef: echo.stickerRef
+                    ),
+                    replacing: echo.id,
+                    sendGroupId: groupId
                 )
-                self.pendingOptimistic[groupId, default: []].append(failed)
-                self.messagesByGroup[groupId, default: []].append(failed)
+                self.discardOptimistic(id: echo.id, from: groupId)
                 onFailure?()
                 self.errorText = Self.describe(error)
                 return

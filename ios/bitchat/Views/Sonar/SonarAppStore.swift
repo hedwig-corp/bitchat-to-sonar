@@ -1984,6 +1984,48 @@ func snRemountedOptimisticPending<Message>(
     return next
 }
 
+/// Keys that may hold an in-flight echo after persist-folds remounts hist→live.
+/// Discard/fail must walk these or a remounted Sending bubble stays forever.
+/// Compose `optimisticPendingLookupIds`.
+func snOptimisticPendingLookupIds(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: [String: [String]],
+    historicalFolds: [String: String]
+) -> Set<String> {
+    var out = Set<String>()
+    if !sendGroupId.isEmpty { out.insert(sendGroupId) }
+    out.formUnion(snFoldFamilyIds(id: sendGroupId, historicalFolds: historicalFolds))
+    if !echoId.isEmpty {
+        for (key, ids) in pendingByGroup where ids.contains(echoId) {
+            out.insert(key)
+        }
+    }
+    return out.filter { !$0.isEmpty }
+}
+
+/// Where to write the failed echo after remount. Prefer the live sibling
+/// (persist-folds or the key that already holds the echo).
+/// Compose `optimisticPendingStoreId`.
+func snOptimisticPendingStoreId(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: [String: [String]],
+    historicalFolds: [String: String]
+) -> String {
+    if let live = historicalFolds[sendGroupId], !live.isEmpty, live != sendGroupId {
+        return live
+    }
+    if !echoId.isEmpty {
+        for (key, ids) in pendingByGroup where key != sendGroupId && ids.contains(echoId) {
+            return key
+        }
+    }
+    return snFoldFamilyIds(id: sendGroupId, historicalFolds: historicalFolds)
+        .first(where: { $0 != sendGroupId })
+        ?? sendGroupId
+}
+
 /// Family-union event ids. `loadOlderDM` must compare this, not
 /// `messagesByGroup[live]` only — persist-folds older-pages hist.
 func snFoldFamilyCanonicalMessageIDs<Message>(

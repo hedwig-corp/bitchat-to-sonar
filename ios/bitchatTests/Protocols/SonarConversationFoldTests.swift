@@ -1299,6 +1299,47 @@ struct SonarConversationFoldTests {
                 idOf: { $0 }
             ) == ["group-09": ["optimistic-1"]]
         )
+        // Remount moved the echo to live; send closure still names hist.
+        #expect(
+            snOptimisticPendingLookupIds(
+                sendGroupId: "group-08",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-09": ["optimistic-1"]],
+                historicalFolds: ["group-08": "group-09"]
+            ) == Set(["group-08", "group-09"])
+        )
+        #expect(
+            snOptimisticPendingStoreId(
+                sendGroupId: "group-08",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-09": ["optimistic-1"]],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            snOptimisticPendingLookupIds(
+                sendGroupId: "group-08",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-09": ["optimistic-1"]],
+                historicalFolds: [:]
+            ) == Set(["group-08", "group-09"])
+        )
+        #expect(
+            snOptimisticPendingStoreId(
+                sendGroupId: "group-08",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-09": ["optimistic-1"]],
+                historicalFolds: [:]
+            ) == "group-09"
+        )
+        #expect(
+            snOptimisticPendingStoreId(
+                sendGroupId: "group-08",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-08": ["optimistic-1"]],
+                historicalFolds: [:]
+            ) == "group-08"
+        )
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

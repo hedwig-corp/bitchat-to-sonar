@@ -2357,6 +2357,41 @@ internal fun <V> remountedOptimisticPending(
     return next
 }
 
+/** Keys that may hold an in-flight echo after persist-folds remounts hist→live.
+ *  Discard/fail must walk these or a remounted Sending bubble stays forever.
+ *  iOS `snOptimisticPendingLookupIds`. */
+internal fun optimisticPendingLookupIds(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: Map<String, Collection<String>>,
+    historicalFolds: Map<String, String>,
+): Set<String> {
+    val out = linkedSetOf<String>()
+    if (sendGroupId.isNotBlank()) out += sendGroupId
+    out.addAll(foldFamilyIds(sendGroupId, historicalFolds))
+    for ((key, ids) in pendingByGroup) {
+        if (echoId.isNotBlank() && echoId in ids) out += key
+    }
+    return out.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
+/** Where to write the failed echo after remount. Prefer the live sibling
+ *  (persist-folds or the key that already holds the echo).
+ *  iOS `snOptimisticPendingStoreId`. */
+internal fun optimisticPendingStoreId(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: Map<String, Collection<String>>,
+    historicalFolds: Map<String, String>,
+): String {
+    historicalFolds[sendGroupId]?.takeIf { it.isNotBlank() && it != sendGroupId }?.let { return it }
+    for ((key, ids) in pendingByGroup) {
+        if (key != sendGroupId && echoId.isNotBlank() && echoId in ids) return key
+    }
+    return foldFamilyIds(sendGroupId, historicalFolds).firstOrNull { it != sendGroupId }
+        ?: sendGroupId
+}
+
 /** Rewrite matching echoes on every fold-family key. */
 internal fun <V> updatePendingMessagesForChat(
     chatId: String,

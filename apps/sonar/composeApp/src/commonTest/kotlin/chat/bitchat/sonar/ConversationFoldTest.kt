@@ -967,6 +967,68 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun firstResumeFailLooksUpRemountedEcho() {
+        val folds = mapOf("group-08" to "group-09")
+        val remounted = mapOf("group-09" to listOf("optimistic-1"))
+        // Remount moved the echo to live; send closure still names hist.
+        assertEquals(
+            setOf("group-08", "group-09"),
+            optimisticPendingLookupIds(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = remounted,
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            "group-09",
+            optimisticPendingStoreId(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = remounted,
+                historicalFolds = folds,
+            ),
+        )
+        // FFI remount before persist-folds: still find the live key by echo id.
+        assertEquals(
+            setOf("group-08", "group-09"),
+            optimisticPendingLookupIds(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = remounted,
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            "group-09",
+            optimisticPendingStoreId(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = remounted,
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            setOf("group-08"),
+            optimisticPendingLookupIds(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = mapOf("group-08" to listOf("optimistic-1")),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            "group-08",
+            optimisticPendingStoreId(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = mapOf("group-08" to listOf("optimistic-1")),
+                historicalFolds = emptyMap(),
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(
