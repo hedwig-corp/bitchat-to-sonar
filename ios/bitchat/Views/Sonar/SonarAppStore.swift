@@ -691,6 +691,24 @@ func snTranscriptSourceIds(
     return out
 }
 
+/// Ids whose local transcript window must reload for one `conversationChanged`.
+/// A bak remainder / fold-alias tick names the hidden 0.8 id; FFI
+/// `messages()` unions the family, so refresh the listed sibling instead of
+/// treating an unlisted hist id as a brand-new group.
+func snConversationRefreshIds(
+    changedGroupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String]
+) -> [String] {
+    guard !changedGroupId.isEmpty else { return [] }
+    let listedFamily = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
+        .filter { listedGroupIds.contains($0) }
+    if listedFamily.isEmpty {
+        return [changedGroupId]
+    }
+    return listedFamily.sorted()
+}
+
 /// Conversation keys a chat-scoped payment read must check after a fold.
 /// Includes both bare MLS ids and `marmot:` conversation ids.
 func snPaymentActivityPeerKeys(

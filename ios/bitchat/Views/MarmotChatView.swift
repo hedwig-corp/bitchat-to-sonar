@@ -2490,27 +2490,42 @@ final class MarmotChatModel: ObservableObject {
                 let groups = self.pendingConversationRefreshGroups
                 self.pendingConversationRefreshGroups.removeAll(keepingCapacity: true)
                 var deferredBusyGroup = false
+                let folds = (self.defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+                let listed = Set(self.groups.map(\.id))
                 for changedGroupId in groups {
-                    if self.localTranscriptLoadingGroups.contains(changedGroupId) {
+                    let refreshIds = snConversationRefreshIds(
+                        changedGroupId: changedGroupId,
+                        listedGroupIds: listed,
+                        historicalFolds: folds
+                    )
+                    var deferredChanged = false
+                    for refreshId in refreshIds {
+                        if self.localTranscriptLoadingGroups.contains(refreshId) {
+                            deferredChanged = true
+                            continue
+                        }
+                        if self.groups.contains(where: { $0.id == refreshId })
+                            || self.messagesByGroup[refreshId] != nil {
+                            _ = await self.loadLocalPage(
+                                groupId: refreshId,
+                                mode: .preserveHistoricalWindow
+                            )
+                        } else {
+                            // A newly-created/received group is not in the host cache
+                            // yet, so only that case needs the wider summary hydrate.
+                            await self.loadLocalSummaries(resolveMembers: false)
+                        }
+                        // Viewing this chat: zero unread so the badge cannot stick
+                        // after the user already read the new arrival. Fold-family
+                        // viewing ids include the hidden sibling.
+                        if self.viewingUnreadGroupIds.contains(refreshId)
+                            || self.viewingUnreadGroupIds.contains(changedGroupId) {
+                            self.markConversationRead(groupId: refreshId)
+                        }
+                    }
+                    if deferredChanged {
                         self.pendingConversationRefreshGroups.insert(changedGroupId)
                         deferredBusyGroup = true
-                        continue
-                    }
-                    if self.groups.contains(where: { $0.id == changedGroupId })
-                        || self.messagesByGroup[changedGroupId] != nil {
-                        _ = await self.loadLocalPage(
-                            groupId: changedGroupId,
-                            mode: .preserveHistoricalWindow
-                        )
-                    } else {
-                        // A newly-created/received group is not in the host cache
-                        // yet, so only that case needs the wider summary hydrate.
-                        await self.loadLocalSummaries(resolveMembers: false)
-                    }
-                    // Viewing this chat: zero unread so the badge cannot stick
-                    // after the user already read the new arrival.
-                    if self.viewingUnreadGroupIds.contains(changedGroupId) {
-                        self.markConversationRead(groupId: changedGroupId)
                     }
                 }
                 if deferredBusyGroup {

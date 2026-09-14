@@ -743,6 +743,15 @@ family, so iOS transcript hydration still pages listed groups only.
 Pins: `ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
 `SonarConversationFoldTests` `snTranscriptSourceIds`.
 
+iOS remainder-refresh hole closed after this commit: `conversationChanged`
+can name the hidden 0.8 id (`notify_fold_aliases` / bak remainder).
+Compose already remaps via `conversationsMatchFoldFamily` and reloads
+the open live page. iOS `scheduleConversationRefresh` treated an
+unlisted hist id as a brand-new group (`loadLocalSummaries`) and left
+the remounted live window stale. `snConversationRefreshIds` reloads
+listed fold siblings. Pin: `SonarConversationFoldTests`
+`snConversationRefreshIds`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
