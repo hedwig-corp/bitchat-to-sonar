@@ -1432,11 +1432,11 @@ impl MarmotEngine {
     /// 0.8 `encrypted-media` exporter secret was copied onto the sidecar.
     pub fn recovered_08_media_unavailable(&self, group_id: &GroupId, url: &str) -> bool {
         self.is_recovered_08_attachment(group_id, url)
-            && self.historical_media_secrets_for(group_id).is_empty()
+            && self.historical_media_secrets_for(group_id, url).is_empty()
     }
 
     fn is_recovered_08_attachment(&self, group_id: &GroupId, url: &str) -> bool {
-        let msgs = self.transcript_for_family(group_id);
+        let msgs = self.messages_for_media_url(group_id, url);
         let Ok(historical) = self.historical_groups() else {
             return false;
         };
@@ -1459,13 +1459,53 @@ impl MarmotEngine {
         false
     }
 
-    fn historical_media_secrets_for(&self, group_id: &GroupId) -> Vec<Vec<u8>> {
+    /// Recovered 0.8 groups whose transcript still names this blossom URL.
+    /// Persist-folds can remount the bubble onto live before core
+    /// `fold_family` exists — look the blob up by URL instead of inventing
+    /// a fold (R-045).
+    fn historical_ids_owning_media_url(&self, url: &str) -> Vec<GroupId> {
+        let Ok(historical) = self.historical_groups() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for group in historical {
+            if self
+                .transcript_for(&group.id)
+                .iter()
+                .any(|msg| msg.media.iter().any(|media| media.url == url))
+            {
+                out.push(group.id);
+            }
+        }
+        out
+    }
+
+    fn messages_for_media_url(&self, group_id: &GroupId, url: &str) -> Vec<ChatMessage> {
+        let mut msgs = self.transcript_for_family(group_id);
+        let mut seen: HashSet<EventId> = msgs.iter().map(|msg| msg.id).collect();
+        for hist_id in self.historical_ids_owning_media_url(url) {
+            for msg in self.transcript_for(&hist_id) {
+                if seen.insert(msg.id) {
+                    msgs.push(msg);
+                }
+            }
+        }
+        msgs
+    }
+
+    fn historical_media_secrets_for(&self, group_id: &GroupId, url: &str) -> Vec<Vec<u8>> {
         let map = self
             .historical_media_secrets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ids = self.fold_family(group_id);
+        for id in self.historical_ids_owning_media_url(url) {
+            if !ids.iter().any(|existing| existing == &id) {
+                ids.push(id);
+            }
+        }
         let mut out = Vec::new();
-        for id in self.fold_family(group_id) {
+        for id in ids {
             if let Some(secrets) = map.get(&id) {
                 for secret in secrets {
                     if !out.iter().any(|existing| existing == secret) {
@@ -2293,7 +2333,7 @@ impl MarmotEngine {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>> {
         if self.is_recovered_08_attachment(group_id, url) {
-            let secrets = self.historical_media_secrets_for(group_id);
+            let secrets = self.historical_media_secrets_for(group_id, url);
             if secrets.is_empty() {
                 return Err(Error::Media(RECOVERED_08_MEDIA_UNAVAILABLE.to_owned()));
             }
@@ -2324,7 +2364,7 @@ impl MarmotEngine {
         ciphertext: &[u8],
         secret: &[u8],
     ) -> Result<Vec<u8>> {
-        let msgs = self.mapped_transcript(group_id)?;
+        let msgs = self.messages_for_media_url(group_id, url);
         for m in msgs {
             for media in &m.media {
                 if media.url != url {
@@ -4640,5 +4680,74 @@ mod historical_fold_tests {
             .decrypt_media_by_url(&live, url, &upload.encrypted_data)
             .expect("remounted live id must still open the recovered blob");
         assert_eq!(remounted, b"photo-bytes");
+    }
+
+    #[test]
+    fn persist_folds_live_id_decrypts_recovered_08_media_without_core_fold() {
+        // Host sidecar can remount the bubble onto live before
+        // record_historical_fold. Looking the blob up by URL must not
+        // invent a fold (R-045).
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        let url = "https://blossom.example/old.bin";
+        let secret = vec![0xABu8; 32];
+        let upload = crate::media_crypto::encrypt_for_upload(
+            &secret,
+            b"photo-bytes",
+            "image/jpeg",
+            "old.jpg",
+        )
+        .expect("encrypt with stored 0.8 exporter");
+        engine.push_transcript_message(chat_with_media(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            url,
+            Some(upload.original_hash),
+            Some(upload.nonce),
+        ));
+        engine.add_historical_media_secret(historical.clone(), secret);
+        assert!(
+            engine.live_fold_target(&historical).is_none(),
+            "this window has no core fold"
+        );
+        assert!(!engine.recovered_08_media_unavailable(&live, url));
+        let remounted = engine
+            .decrypt_media_by_url(&live, url, &upload.encrypted_data)
+            .expect("live id must open the hist blob without a core fold");
+        assert_eq!(remounted, b"photo-bytes");
+        assert!(
+            !engine.recovered_08_media_unavailable(&live, "https://blossom.example/unrelated.bin",)
+        );
+    }
+
+    #[test]
+    fn persist_folds_live_id_marks_recovered_08_media_unavailable_without_secret() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        let url = "https://blossom.example/old.bin";
+        engine.push_transcript_message(chat_with_media(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            url,
+            Some([1u8; 32]),
+            Some([2u8; 12]),
+        ));
+        assert!(engine.recovered_08_media_unavailable(&historical, url));
+        assert!(engine.recovered_08_media_unavailable(&live, url));
+        let err = engine
+            .decrypt_media_by_url(&live, url, b"cipher")
+            .expect_err("live id must not try the 0.9 exporter for a hist blob");
+        assert!(
+            err.to_string().contains(RECOVERED_08_MEDIA_UNAVAILABLE),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -9967,6 +9967,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persist_folds_live_id_fetch_media_uses_hist_exporter_without_core_fold() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        let url = "https://127.0.0.1:1/old.bin";
+        client.engine().push_transcript_message(ChatMessage {
+            id: EventId::from_slice(&[1u8; 32]).expect("event id"),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: true,
+            delivery_state: DeliveryState::Sent,
+            media: vec![crate::marmot::MediaRef {
+                url: url.to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                filename: "old.jpg".to_owned(),
+                width: Some(100),
+                height: Some(80),
+                duration_ms: None,
+                original_hash: Some([1u8; 32]),
+                nonce: Some([2u8; 12]),
+            }],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+            reply: None,
+        });
+        client
+            .engine()
+            .add_historical_media_secret(historical.clone(), vec![0xABu8; 32]);
+        assert!(
+            client.engine().live_fold_target(&historical).is_none(),
+            "persist-folds window has no core fold"
+        );
+        let live_err = client
+            .fetch_media(&live, url)
+            .await
+            .expect_err("loopback download should fail after the unavailable gate");
+        assert!(
+            !live_err
+                .to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "live id must still attempt download when hist owns the URL: {live_err}"
+        );
+        assert!(client.engine().recovered_08_media_unavailable(&live, url) == false);
+    }
+
+    #[tokio::test]
     async fn send_text_on_unknown_group_is_not_a_recovered_chat_error() {
         let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await

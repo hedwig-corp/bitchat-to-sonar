@@ -1106,6 +1106,17 @@ pages (`hydrateMergedPageRows`). iOS already merges in
 `HomeMessageRowsTest.remountedExtractMergesNewerLivePageInsteadOfReplacing`,
 `SonarConversationFoldTests` `snHydrateMergedPageRows`.
 
+Core persist-folds media hole closed after this commit: a live-id
+`decrypt_media_by_url` / `recovered_08_media_unavailable` only searched
+`transcript_for_family`. Host sidecar can remount the bubble onto live
+before `record_historical_fold`, so a live-only fetch missed hist
+imeta and exporter secrets. Look the blob up by blossom URL across
+historical transcripts — do not invent a fold (R-045). Hosts still
+retry `mediaFetchGroupIds`. Pins:
+`persist_folds_live_id_decrypts_recovered_08_media_without_core_fold`,
+`persist_folds_live_id_marks_recovered_08_media_unavailable_without_secret`,
+`persist_folds_live_id_fetch_media_uses_hist_exporter_without_core_fold`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
