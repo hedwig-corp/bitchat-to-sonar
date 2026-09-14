@@ -1225,6 +1225,39 @@ struct SonarConversationFoldTests {
         )
         #expect(
             snConversationRefreshIds(
+                changedGroupId: "group-09",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
+        #expect(snConversationRefreshShouldMergeFolds(
+            changedGroupIds: ["group-09"],
+            persistedFolds: [:]
+        ))
+        #expect(!snConversationRefreshShouldMergeFolds(
+            changedGroupIds: ["group-09"],
+            persistedFolds: ["group-08": "group-09"]
+        ))
+        #expect(!snViewingConversationShouldMarkRead(
+            viewingGroupIds: ["group-08"],
+            changedGroupId: "group-09",
+            refreshId: "group-09",
+            historicalFolds: [:]
+        ))
+        #expect(snViewingConversationShouldMarkRead(
+            viewingGroupIds: ["group-08"],
+            changedGroupId: "group-09",
+            refreshId: "group-09",
+            historicalFolds: ["group-08": "group-09"]
+        ))
+        #expect(snViewingConversationShouldMarkRead(
+            viewingGroupIds: ["group-09"],
+            changedGroupId: "group-09",
+            refreshId: "group-09",
+            historicalFolds: [:]
+        ))
+        #expect(
+            snConversationRefreshIds(
                 changedGroupId: "group-08",
                 listedGroupIds: [],
                 historicalFolds: ["group-08": "group-09"]

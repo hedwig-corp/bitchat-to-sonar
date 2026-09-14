@@ -1328,6 +1328,41 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        // First 0.9 send names live while persist-folds is empty.
+        assertEquals(
+            listOf("group-09"),
+            conversationRefreshIds(
+                changedId = "group-09",
+                listedIds = setOf("group-09"),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(conversationRefreshShouldMergeFolds(listOf("group-09"), emptyMap()))
+        assertFalse(conversationRefreshShouldMergeFolds(listOf("group-09"), folds))
+        assertFalse(
+            viewingConversationShouldMarkRead(
+                viewingGroupIds = setOf("group-08"),
+                changedId = "group-09",
+                refreshId = "group-09",
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(
+            viewingConversationShouldMarkRead(
+                viewingGroupIds = setOf("group-08"),
+                changedId = "group-09",
+                refreshId = "group-09",
+                historicalFolds = folds,
+            ),
+        )
+        assertTrue(
+            viewingConversationShouldMarkRead(
+                viewingGroupIds = setOf("group-09"),
+                changedId = "group-09",
+                refreshId = "group-09",
+                historicalFolds = emptyMap(),
+            ),
+        )
         assertTrue(
             conversationRefreshShouldLoadPage(
                 refreshId = "group-08",

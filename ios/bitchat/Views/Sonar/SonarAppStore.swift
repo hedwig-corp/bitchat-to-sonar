@@ -1579,6 +1579,35 @@ func snVerifiedForFoldFamily(
 /// before core `fold_family`, so FFI `messages(live)` does not union hist
 /// yet — refresh the listed sibling **and** the changed hidden id. Compose
 /// `conversationRefreshIds`.
+/// First 0.9 send names the live id while persist-folds is still empty.
+/// Merge FFI before `snConversationRefreshIds` or the open hist
+/// transcript never reloads. Compose `conversationRefreshShouldMergeFolds`.
+func snConversationRefreshShouldMergeFolds(
+    changedGroupIds: [String],
+    persistedFolds: [String: String]
+) -> Bool {
+    changedGroupIds.contains { snFirstOpenShouldMergeFolds(seedId: $0, persistedFolds: persistedFolds) }
+}
+
+/// Viewing the recovered 0.8 id must still mark-read a live sibling
+/// change. Empty persist-folds cannot match; merge first.
+/// Compose `viewingConversationShouldMarkRead`.
+func snViewingConversationShouldMarkRead(
+    viewingGroupIds: Set<String>,
+    changedGroupId: String,
+    refreshId: String,
+    historicalFolds: [String: String]
+) -> Bool {
+    if changedGroupId.isEmpty && refreshId.isEmpty { return false }
+    if !refreshId.isEmpty && viewingGroupIds.contains(refreshId) { return true }
+    if !changedGroupId.isEmpty && viewingGroupIds.contains(changedGroupId) { return true }
+    let seed = changedGroupId.isEmpty ? refreshId : changedGroupId
+    let family = snFoldFamilyIds(id: seed, historicalFolds: historicalFolds)
+    return viewingGroupIds.contains(where: { family.contains($0) })
+}
+
+/// Ids whose local transcript window must reload for one `conversationChanged`.
+/// Compose `conversationRefreshIds`.
 func snConversationRefreshIds(
     changedGroupId: String,
     listedGroupIds: Set<String>,

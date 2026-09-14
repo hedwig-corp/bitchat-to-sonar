@@ -1784,6 +1784,33 @@ internal fun foldFamilyIds(
  *  can land before core `fold_family`, so FFI `messages(live)` does not
  *  union hist yet — refresh the listed sibling **and** the changed
  *  hidden id. iOS `snConversationRefreshIds`. */
+/** First 0.9 send names the live id while persist-folds is still empty.
+ *  Merge FFI before [conversationRefreshIds] or the open hist transcript
+ *  never reloads. iOS `snConversationRefreshShouldMergeFolds`. */
+internal fun conversationRefreshShouldMergeFolds(
+    changedIds: Collection<String>,
+    persistedFolds: Map<String, String>,
+): Boolean = changedIds.any { firstOpenShouldMergeFolds(it, persistedFolds) }
+
+/** Viewing the recovered 0.8 id must still mark-read a live sibling
+ *  change. Empty persist-folds cannot match; merge first.
+ *  iOS `snViewingConversationShouldMarkRead`. */
+internal fun viewingConversationShouldMarkRead(
+    viewingGroupIds: Set<String>,
+    changedId: String,
+    refreshId: String,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    if (changedId.isBlank() && refreshId.isBlank()) return false
+    if (refreshId.isNotBlank() && refreshId in viewingGroupIds) return true
+    if (changedId.isNotBlank() && changedId in viewingGroupIds) return true
+    val family = foldFamilyIds(
+        changedId.ifBlank { refreshId },
+        historicalFolds,
+    )
+    return viewingGroupIds.any { it in family }
+}
+
 internal fun conversationRefreshIds(
     changedId: String,
     listedIds: Set<String>,

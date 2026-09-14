@@ -2579,7 +2579,18 @@ final class MarmotChatModel: ObservableObject {
                 let groups = self.pendingConversationRefreshGroups
                 self.pendingConversationRefreshGroups.removeAll(keepingCapacity: true)
                 var deferredBusyGroup = false
-                let folds = (self.defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+                let blobFolds = self.historicalFoldsMap()
+                // First 0.9 send names the live id while persist-folds is
+                // empty. Compose `refreshChats` merges before
+                // `conversationRefreshIds`; without that the open hist
+                // transcript never reloads.
+                let changedList = Array(groups)
+                let folds = snConversationRefreshShouldMergeFolds(
+                    changedGroupIds: changedList,
+                    persistedFolds: blobFolds
+                )
+                    ? await self.mergedConversationRefreshFolds(for: changedList)
+                    : blobFolds
                 let listed = Set(self.groups.map(\.id))
                 for changedGroupId in groups {
                     let refreshIds = snConversationRefreshIds(
@@ -2612,9 +2623,14 @@ final class MarmotChatModel: ObservableObject {
                         }
                         // Viewing this chat: zero unread so the badge cannot stick
                         // after the user already read the new arrival. Fold-family
-                        // viewing ids include the hidden sibling.
-                        if self.viewingUnreadGroupIds.contains(refreshId)
-                            || self.viewingUnreadGroupIds.contains(changedGroupId) {
+                        // viewing ids include the hidden sibling. A live
+                        // change while sitting on hist must still match.
+                        if snViewingConversationShouldMarkRead(
+                            viewingGroupIds: self.viewingUnreadGroupIds,
+                            changedGroupId: changedGroupId,
+                            refreshId: refreshId,
+                            historicalFolds: folds
+                        ) {
                             self.markConversationRead(groupId: refreshId)
                         }
                     }
@@ -3179,6 +3195,38 @@ final class MarmotChatModel: ObservableObject {
 
     private func historicalFoldsMap() -> [String: String] {
         (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+    }
+
+    /// Host blob plus FFI `fold_aliases` for a conversationChanged batch.
+    /// Same merge as mark-read / unmute so a first 0.9 send is visible
+    /// on the open recovered 0.8 transcript.
+    private func mergedConversationRefreshFolds(for ids: [String]) async -> [String: String] {
+        let persisted = historicalFoldsMap()
+        var listed: [String] = []
+        var seen = Set<String>()
+        for id in ids {
+            for part in [snBareMarmotGroupId(id), id] where !part.isEmpty && seen.insert(part).inserted {
+                listed.append(part)
+            }
+        }
+        var aliasesById: [String: [String]] = [:]
+        var liveById: [String: String] = [:]
+        for actionId in listed {
+            aliasesById[actionId] = await foldAliases(groupId: actionId)
+            if let live = await liveFoldTarget(groupId: actionId) {
+                liveById[actionId] = live
+            }
+        }
+        let folds = snWakeMuteHistoricalFolds(
+            persisted: persisted,
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
+        if folds != persisted {
+            snPersistHistoricalFolds(folds, to: defaults)
+        }
+        return folds
     }
 
     private func publishedGroups(_ groups: [MarmotService.MarmotGroup]) -> [MarmotService.MarmotGroup] {
