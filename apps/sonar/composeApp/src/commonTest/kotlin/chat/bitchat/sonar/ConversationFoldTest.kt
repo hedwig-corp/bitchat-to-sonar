@@ -881,6 +881,26 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldFamilyCachedMessagesUnionsHiddenSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = SonarMsg(id = "m-08", senderNpub = "peer", content = "keep this chat", mine = false, tsSecs = 1L)
+        val live = SonarMsg(id = "m-09", senderNpub = "me", content = "already on live", mine = true, tsSecs = 2L)
+        val byChat = mapOf("group-08" to listOf(historical), "group-09" to listOf(live))
+        assertEquals(
+            listOf("m-09", "m-08"),
+            foldFamilyCachedMessages("group-09", byChat, folds) { it.id }.map { it.id },
+        )
+        assertEquals(
+            listOf(historical),
+            foldFamilyCachedMessages("group-09", mapOf("group-08" to listOf(historical)), folds) { it.id },
+        )
+        assertEquals(
+            listOf(live),
+            foldFamilyCachedMessages("group-09", byChat, emptyMap()) { it.id },
+        )
+    }
+
+    @Test
     fun foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling() {
         assertEquals(
             mapOf("group-09" to listOf("uploading")),

@@ -918,6 +918,16 @@ cleared catch-up instead of kicking the 0.9 group. `resolvedOpenGroupId`
 `ConversationFoldTest.resolvedOpenGroupIdRemapsStaleHistOntoListedLive`,
 `SonarConversationFoldTests` `snResolvedOpenGroupId`.
 
+Transcript-cache hole closed after this commit: iOS `dmMsgs` and Compose
+snapshot paint keyed only the open / listed id. Home already walked
+`snFoldFamilyCachedMessages` / remounted pages, but the live transcript
+first frame could miss leftover 0.8 rows until async remount or FFI
+family union. `dmMsgs` and `snapshotMessagesForChat` now union the host
+cache (sorted before the page suffix). Background notify scan stays
+listed-id only so a bak remainder cannot replay. Pins:
+`ConversationFoldTest.foldFamilyCachedMessagesUnionsHiddenSibling`,
+`SonarConversationFoldTests` `snFoldFamilyCachedMessages`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

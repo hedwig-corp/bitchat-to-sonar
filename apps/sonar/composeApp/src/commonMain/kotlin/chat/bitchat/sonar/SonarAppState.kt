@@ -858,6 +858,25 @@ internal fun <V> promotedFoldedPendingMessages(
     return next
 }
 
+/** Union leftover hist pages onto the listed live id so first paint / open
+ *  does not read an empty host cache while recovered rows still sit on the
+ *  hidden 0.8 key (iOS `snFoldFamilyCachedMessages`). */
+internal fun <V> foldFamilyCachedMessages(
+    groupId: String,
+    messagesByChat: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    idOf: (V) -> String,
+): List<V> {
+    var out = messagesByChat[groupId].orEmpty()
+    for (alias in foldFamilyIds(groupId, historicalFolds).sorted()) {
+        if (alias == groupId) continue
+        val incoming = messagesByChat[alias].orEmpty()
+        if (incoming.isEmpty()) continue
+        out = mergedFoldedMessageLists(incoming, out, idOf)
+    }
+    return out
+}
+
 /** Merge recovered transcript rows onto the live sibling after FFI hides the 0.8 id. */
 internal fun <V> mergedFoldedMessageLists(
     historical: List<V>,
@@ -2198,7 +2217,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val snapshot = if (isMeshChat(chatId)) {
             refreshMeshTranscriptWindow(meshPeerId(chatId))
         } else {
-            chatSnapshotMessagesByChat[chatId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+            snapshotMessagesForChat(chatId).takeLast(TRANSCRIPT_PAGE_SIZE)
         }
         val immediate = refreshConversationRows(snapshot, chatId, generation)
         setCurrentVisibleMessages(
@@ -3366,6 +3385,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun visibleMessagesForChat(chatId: String, source: List<SonarMsg>): List<SonarMsg> =
         if (isMeshChat(chatId) && isMeshContactBlocked(meshPeerId(chatId))) emptyList()
         else source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
+
+    /** Host snapshot rows for the open id plus its hidden 0.8 sibling. */
+    private fun snapshotMessagesForChat(chatId: String): List<SonarMsg> =
+        foldFamilyCachedMessages(chatId, chatSnapshotMessagesByChat, historicalFoldMap) { it.id }
+            .sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
 
     private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
         // Local cursor reads race navigation. A late page from chat A must not
@@ -5868,7 +5892,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun chatRowMeta(chatId: String): Pair<String, Long>? =
         directMarmotChatIds(chatId)
             .mapNotNull { id ->
-                visibleMessagesForChat(id, chatSnapshotMessagesByChat[id].orEmpty()).lastOrNull()
+                visibleMessagesForChat(id, snapshotMessagesForChat(id)).lastOrNull()
             }
             .maxByOrNull { it.tsSecs }
             ?.let { messagePreview(it.content, it.stickerRef, it.media) to it.tsSecs }
@@ -5914,7 +5938,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)
             val unreadIds = transcriptSourceIds(chat.id, ids, historicalFoldMap)
             val newest = if (pending) null else ids
-                .mapNotNull { visibleMessagesForChat(it, chatSnapshotMessagesByChat[it].orEmpty()).lastOrNull() }
+                .mapNotNull { visibleMessagesForChat(it, snapshotMessagesForChat(it)).lastOrNull() }
                 .maxByOrNull { it.tsSecs }
             chat.id to MarmotRowModel(
                 id = chat.id,
@@ -7479,7 +7503,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             withSendEchoes(
                 chat.id,
                 boundedTranscriptRows(
-                    chatSnapshotMessagesByChat[chat.id].orEmpty(),
+                    snapshotMessagesForChat(chat.id),
                     TRANSCRIPT_PAGE_SIZE,
                     pinnedToOlderEdge = false,
                 ),
@@ -11900,7 +11924,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val untrusted = transcriptReadIsUntrusted(fetched, started, localLatestTs(groupId))
         if (!isCurrentTranscriptSession(sessionChatId, generation)) {
             return when {
-                untrusted -> chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+                untrusted -> snapshotMessagesForChat(groupId).takeLast(TRANSCRIPT_PAGE_SIZE)
                 else -> visibleTranscriptPage(fetched.orEmpty())
             }
         }
@@ -11910,7 +11934,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Keep whatever is already painted; only fall through to the
             // snapshot when there is nothing to keep.
             if (current != null && current.rows.isNotEmpty()) return current.rows
-            val fallback = chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+            val fallback = snapshotMessagesForChat(groupId).takeLast(TRANSCRIPT_PAGE_SIZE)
             // Never cache an empty window. A cached blank is indistinguishable
             // from a real one at the `current != null` check above, so it would
             // shadow the store on every later refresh and pin the chat black.
@@ -12343,7 +12367,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = chatSnapshotMessagesByChat[group.id]?.lastOrNull()
+            val msg = snapshotMessagesForChat(group.id).lastOrNull()
             val current = latest
             if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
         }

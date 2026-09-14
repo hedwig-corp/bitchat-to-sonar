@@ -7446,8 +7446,17 @@ final class SonarAppStore: ObservableObject {
             // Built once per page: per-row it would repeat a bech32 decode for
             // every group member on every message.
             let mentionCtx = mentionContext(forConversationId: id)
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             for group in sourceGroups {
-                let groupMessages = marmot.messagesByGroup[group.id] ?? []
+                let groupMessages = snFoldFamilyCachedMessages(
+                    groupId: group.id,
+                    messagesByGroup: marmot.messagesByGroup,
+                    historicalFolds: folds,
+                    idOf: { $0.id }
+                ).sorted {
+                    if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+                    return $0.createdAt < $1.createdAt
+                }
                 let parentAuthorById = snReplyParentAuthorsById(
                     groupMessages.map {
                         (
@@ -7574,7 +7583,6 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
-            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             let echoIds = snPendingMessageKeys(
                 conversationId: id,
                 sourceGroupIds: sourceGroups.map(\.id),
@@ -7680,8 +7688,18 @@ final class SonarAppStore: ObservableObject {
         // stores but RENDERS them as one, merged chronologically; the
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let groupMessages = snFoldFamilyCachedMessages(
+                groupId: group.id,
+                messagesByGroup: marmot.messagesByGroup,
+                historicalFolds: folds,
+                idOf: { $0.id }
+            ).sorted {
+                if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+                return $0.createdAt < $1.createdAt
+            }
             dated += Self.transcriptSource(
-                marmot.messagesByGroup[group.id] ?? [],
+                groupMessages,
                 limit: limit
             ).compactMap { m in
                 // Drop a blocked person's messages from the transcript, the
