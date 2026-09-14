@@ -565,6 +565,46 @@ func snRemountFoldedPath(
     }
 }
 
+/// Wake mute / gap-recovery banners: FFI `fold_aliases` over a stale
+/// or empty host blob. Compose `wakeMuteHistoricalFolds`.
+func snWakeMuteHistoricalFolds(
+    persisted: [String: String],
+    listedIds: [String],
+    foldAliases: (String) -> [String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    SonarNSEDecoratePolicy.mergeWakeMuteFolds(
+        persisted: persisted,
+        listedIds: listedIds,
+        foldAliases: foldAliases,
+        liveFoldTarget: liveFoldTarget
+    )
+}
+
+/// Copy a mute stored on a hidden 0.8 id onto its live sibling so the
+/// next blob-only wake gate matches without another FFI lookup.
+@discardableResult
+func snPromoteMutedFoldSiblings(
+    folds: [String: String],
+    prefix: String = "marmot:"
+) -> Bool {
+    var changed = false
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        let historicalKeys = [historical, prefix + historical]
+        guard let until = SonarChatMuteStore.shared.muteEnd(anyOf: historicalKeys) else {
+            continue
+        }
+        let liveKeys = [live, prefix + live]
+        let liveUntil = SonarChatMuteStore.shared.muteEnd(anyOf: liveKeys)
+        if liveUntil == nil || liveUntil! < until {
+            SonarChatMuteStore.shared.mute(keys: liveKeys, until: until)
+            changed = true
+        }
+    }
+    return changed
+}
+
 /// Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`.
 func snHistoricalFoldsFromAliases(
     listedIds: [String],

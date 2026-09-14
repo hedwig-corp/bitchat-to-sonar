@@ -451,9 +451,15 @@ enum SonarPushProcessor {
         // Prefer drain metadata, then also run unread-delta so rows that land
         // via gap recovery after the returned drain list are not dropped.
         // Delta skips message tips already bannered from the drain list.
+        let muteFolds = await wakeMuteHistoricalFolds(marmot: marmot)
         var notified = 0
         if !drained.isEmpty {
-            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
+            notified = await notifyDrained(
+                drained,
+                marmot: marmot,
+                prefs: prefs,
+                historicalFolds: muteFolds
+            )
         }
         // Reload summaries so delta sees gap-recovery advances during name resolve.
         _ = await marmot.loadLocalSummaries()
@@ -461,7 +467,8 @@ enum SonarPushProcessor {
             before: beforeUnread,
             baselineHydrated: baselineHydrated,
             marmot: marmot,
-            prefs: prefs
+            prefs: prefs,
+            historicalFolds: muteFolds
         )
 
         switch (notified > 0, synced) {
@@ -507,11 +514,43 @@ enum SonarPushProcessor {
         return SonarPushUnreadDelta.collapseFingerprints(raw, historicalFolds: folds)
     }
 
+    /// FFI `fold_aliases` over a stale App Group blob so a mute stored
+    /// on the recovered 0.8 id still silences the first live 0.9 push.
+    @MainActor
+    private static func wakeMuteHistoricalFolds(
+        marmot: MarmotChatModel
+    ) async -> [String: String] {
+        let persisted = SonarNSEDecoratePolicy.decodeHistoricalFolds(
+            UserDefaults(suiteName: SonarChatMuteStore.appGroupId)
+        )
+        let listed = Array(marmot.conversationSummariesByGroup.keys)
+        var aliasesById: [String: [String]] = [:]
+        var liveById: [String: String] = [:]
+        for id in listed {
+            aliasesById[id] = await marmot.foldAliases(groupId: id)
+            if let live = await marmot.liveFoldTarget(groupId: id) {
+                liveById[id] = live
+            }
+        }
+        let merged = snWakeMuteHistoricalFolds(
+            persisted: persisted,
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
+        if merged != persisted {
+            snPersistHistoricalFolds(merged, to: UserDefaults.standard)
+        }
+        _ = snPromoteMutedFoldSiblings(folds: merged)
+        return merged
+    }
+
     @MainActor
     private static func notifyDrained(
         _ drained: [DrainNotificationInfo],
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        historicalFolds: [String: String]
     ) async -> Int {
         var notified = 0
         for notif in drained {
@@ -524,23 +563,20 @@ enum SonarPushProcessor {
                 }
             }()
             if kind == .call { continue }
-            // Per-chat mute, DM fast path only: a DM row has no meaningful
-            // group name, so match it by sender npub and skip the name
-            // resolution below. Muted GROUPS are not handled here — they are
-            // stopped by the central gate in
-            // NotificationService.sendLocalNotification, which reads the
-            // marmot:<groupId> conversation id this loop puts in userInfo.
-            // (Drained rows DO carry a group id; core sets group_id_hex on
-            // every DrainNotification.)
-            // Directness decided by the SAME helper the NSE uses. Testing
-            // `groupName.isEmpty` here while the NSE also treats the local
-            // placeholder as direct made the two disagree: a drained direct row
-            // carrying that placeholder took the DM branch in the NSE but not in
-            // this backstop, so when the NSE's mirror was stale or missing the
-            // host posted exactly the banner this backstop exists to suppress.
-            if SonarNSEDecoratePolicy.meaningfulGroupName(notif.groupName) == nil,
-               !notif.senderNpub.isEmpty,
-               SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
+            // Per-chat mute: fold family first so a mute stored on the
+            // recovered 0.8 id silences a live 0.9 drain before the host
+            // blob is rewritten. Direct chats also match the sender npub
+            // (same helper the NSE uses for the "Sonar agent DM" placeholder).
+            if SonarChatMuteStore.shared.isMuted(
+                anyOf: snMutedFoldKeys(
+                    groupIdHex: notif.groupIdHex,
+                    historicalFolds: historicalFolds
+                )
+            ) || (
+                SonarNSEDecoratePolicy.meaningfulGroupName(notif.groupName) == nil
+                && !notif.senderNpub.isEmpty
+                && SonarChatMuteStore.shared.isMuted(notif.senderNpub)
+            ) {
                 // The NSE suppresses muted chats itself, but it fails open when
                 // the App Group mute mirror is missing (app updated and never
                 // launched) or undecodable. The host is the backstop: drop the
@@ -634,9 +670,9 @@ enum SonarPushProcessor {
         before: [String: SonarPushUnreadDelta.Fingerprint],
         baselineHydrated: Bool,
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        historicalFolds folds: [String: String]
     ) async -> Int {
-        let folds = (UserDefaults.standard.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
         var afterByGroup: [String: SonarPushUnreadDelta.Fingerprint] = [:]
         for summary in marmot.conversationSummariesByGroup.values {
             afterByGroup[summary.groupIdHex] = SonarPushUnreadDelta.Fingerprint(
@@ -686,13 +722,10 @@ enum SonarPushProcessor {
             if kind == .call { continue }
             // Per-chat mute: unread still accrues, no banner. Same NSE
             // fail-open backstop as the drain path above.
-            let muteFolds = SonarNSEDecoratePolicy.decodeHistoricalFolds(
-                UserDefaults(suiteName: SonarChatMuteStore.appGroupId)
-            )
             if SonarChatMuteStore.shared.isMuted(
                 anyOf: snMutedFoldKeys(
                     groupIdHex: liveId,
-                    historicalFolds: muteFolds
+                    historicalFolds: folds
                 )
             ) {
                 await removeDeliveredNSEOwnedBanners(

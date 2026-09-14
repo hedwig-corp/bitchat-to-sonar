@@ -4,7 +4,11 @@ import chat.bitchat.sonar.HISTORICAL_FOLDS_BLOB_KEY
 import chat.bitchat.sonar.MUTE_BLOB_KEY
 import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.decodeGroupFoldMap
+import chat.bitchat.sonar.encodeGroupFoldMap
+import chat.bitchat.sonar.encodeMuteMap
 import chat.bitchat.sonar.foldFamilyIds
+import chat.bitchat.sonar.promotedFoldedMutesFromFolds
+import chat.bitchat.sonar.wakeMuteHistoricalFolds
 import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
@@ -74,14 +78,28 @@ internal object SonarWakeNotifications {
         // hist→live blob: walk that family so a killed-app drain on the live
         // id stays silent.
         val mutes = decodeMuteMap(SonarCore.loadBlob(MUTE_BLOB_KEY))
-        val folds = decodeGroupFoldMap(SonarCore.loadBlob(HISTORICAL_FOLDS_BLOB_KEY))
+        val persistedFolds = decodeGroupFoldMap(SonarCore.loadBlob(HISTORICAL_FOLDS_BLOB_KEY))
+        val listedIds = unread.map { it.groupIdHex }.filter { it.isNotBlank() }
+        val folds = wakeMuteHistoricalFolds(
+            persisted = persistedFolds,
+            listedIds = listedIds,
+            foldAliases = { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+        if (folds != persistedFolds) {
+            SonarCore.saveBlob(HISTORICAL_FOLDS_BLOB_KEY, encodeGroupFoldMap(folds))
+        }
+        val promotedMutes = promotedFoldedMutesFromFolds(mutes, folds)
+        if (promotedMutes != mutes) {
+            SonarCore.saveBlob(MUTE_BLOB_KEY, encodeMuteMap(promotedMutes))
+        }
         val nowSecs = System.currentTimeMillis() / 1000
 
         var notified = 0
         for (summary in unread) {
             val muted = foldFamilyIds(summary.groupIdHex, folds)
                 .plus(summary.groupIdHex)
-                .any { isMutedAt(mutes[it], nowSecs) }
+                .any { isMutedAt(promotedMutes[it], nowSecs) }
             if (muted) continue
             val kind = SonarNotificationRouter.classifyContent(
                 summary.latestContent,

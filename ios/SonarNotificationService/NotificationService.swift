@@ -159,13 +159,17 @@ class NotificationService: SDKNotificationService {
                 return
             }
             do {
-                let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
-                    guard let self else { return [DrainNotificationInfo]() }
+                let hydrate = try await Task.detached(priority: .userInitiated) { [weak self] in
+                    guard let self else {
+                        return MarmotWakeHydrate(notifications: [], historicalFolds: [:])
+                    }
                     return try self.collectMarmotNotificationsAfterWake(
                         hintGroupIdHex: hintGroupId,
                         hydrateAttempt: attempt
                     )
                 }.value
+                let notifications = hydrate.notifications
+                let folds = hydrate.historicalFolds
                 #if DEBUG
                 Self.logResidentMemory("after-wake")
                 #endif
@@ -194,7 +198,6 @@ class NotificationService: SDKNotificationService {
                 let mutes = SonarNSEDecoratePolicy.decodeMutes(
                     sharedDefaults?.data(forKey: SonarNSEDecoratePolicy.mutesUserDefaultsKey)
                 )
-                let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(sharedDefaults)
                 let unmuted = notifications.filter {
                     !SonarNSEDecoratePolicy.isMuted(
                         groupIdHex: $0.groupIdHex,
@@ -293,13 +296,18 @@ class NotificationService: SDKNotificationService {
         finish(with: content)
     }
 
+    private struct MarmotWakeHydrate {
+        var notifications: [DrainNotificationInfo]
+        var historicalFolds: [String: String]
+    }
+
     /// Blocking UniFFI work — always call off the main actor.
     /// Main app owns App Group migration; NSE never creates an empty SQLCipher DB.
     /// Skips when the main app holds `MarmotStoreLock` (no concurrent writers).
     private func collectMarmotNotificationsAfterWake(
         hintGroupIdHex: String?,
         hydrateAttempt: Int = 1
-    ) throws -> [DrainNotificationInfo] {
+    ) throws -> MarmotWakeHydrate {
         let nsec = Self.readKeychainString(account: Self.nsecKeychainKey)
         let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey)
         guard let nsec, let dbKeyHex, !nsec.isEmpty, dbKeyHex.count == 64 else {
@@ -337,6 +345,12 @@ class NotificationService: SDKNotificationService {
         // Always close node before unlocking — never unlock under an open handle.
         defer { releaseMarmotWakeNode() }
         var drained = try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
+        // Core may have minted the live 0.9 sibling during this wake while
+        // the App Group fold blob still only knows the muted 0.8 id. Merge
+        // FFI aliases before the node closes so mute / unread fallback /
+        // preview enrich see the same family.
+        let extraIds = drained.map(\.groupIdHex) + [hintGroupIdHex].compactMap { $0 }
+        let folds = Self.wakeMuteHistoricalFolds(node: node, extraIds: extraIds)
         // Mirror SonarPushProcessor unread-delta: drain can be empty when the
         // row was already local, the concurrent app wake consumed the pending
         // list first, or sync only advanced summaries. Prefer the newest
@@ -346,7 +360,8 @@ class NotificationService: SDKNotificationService {
         if drained.isEmpty {
             let fromUnread = Self.drainNotificationsFromUnreadSummaries(
                 node,
-                hintGroupIdHex: hintGroupIdHex
+                hintGroupIdHex: hintGroupIdHex,
+                historicalFolds: folds
             )
             if !fromUnread.isEmpty {
                 Self.recordDiagnostic(
@@ -355,20 +370,49 @@ class NotificationService: SDKNotificationService {
                 drained = fromUnread
             }
         }
-        return Self.enrichEmptyContentPreviews(drained, node: node)
+        return MarmotWakeHydrate(
+            notifications: Self.enrichEmptyContentPreviews(
+                drained,
+                node: node,
+                historicalFolds: folds
+            ),
+            historicalFolds: folds
+        )
+    }
+
+    /// App Group blob plus FFI `fold_aliases` on the open wake node.
+    private static func wakeMuteHistoricalFolds(
+        node: SonarNode,
+        extraIds: [String]
+    ) -> [String: String] {
+        let defaults = UserDefaults(suiteName: appGroupId)
+        let persisted = SonarNSEDecoratePolicy.decodeHistoricalFolds(defaults)
+        var listed = Set(extraIds.filter { !$0.isEmpty })
+        for summary in node.conversationSummaries() {
+            let id = summary.groupIdHex
+            if !id.isEmpty { listed.insert(id) }
+        }
+        let merged = SonarNSEDecoratePolicy.mergeWakeMuteFolds(
+            persisted: persisted,
+            listedIds: Array(listed),
+            foldAliases: { node.foldAliases(groupIdHex: $0) },
+            liveFoldTarget: { node.liveFoldTarget(groupIdHex: $0) }
+        )
+        if merged != persisted {
+            SonarNSEDecoratePolicy.persistHistoricalFolds(merged, to: defaults)
+        }
+        return merged
     }
 
     /// Build banner rows from local unread conversation summaries (newest tip only).
     private static func drainNotificationsFromUnreadSummaries(
         _ node: SonarNode,
-        hintGroupIdHex: String?
+        hintGroupIdHex: String?,
+        historicalFolds folds: [String: String]
     ) -> [DrainNotificationInfo] {
         let unread = node.conversationSummaries()
             .filter { $0.unreadCount > 0 && !$0.latestMine }
             .sorted { $0.latestAtSecs > $1.latestAtSecs }
-        let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(
-            UserDefaults(suiteName: Self.appGroupId)
-        )
         let allowedIds = SonarNSEDecoratePolicy.filterUnreadTips(
             groupIdHexes: unread.map(\.groupIdHex),
             hintGroupIdHex: hintGroupIdHex,
@@ -404,12 +448,10 @@ class NotificationService: SDKNotificationService {
     /// summary for the same group so showPreview banners are not generic.
     private static func enrichEmptyContentPreviews(
         _ notifications: [DrainNotificationInfo],
-        node: SonarNode
+        node: SonarNode,
+        historicalFolds folds: [String: String]
     ) -> [DrainNotificationInfo] {
         let summaries = node.conversationSummaries()
-        let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(
-            UserDefaults(suiteName: Self.appGroupId)
-        )
         return notifications.map { note in
             let trimmed = note.contentPreview.trimmingCharacters(in: .whitespacesAndNewlines)
             guard trimmed.isEmpty else { return note }

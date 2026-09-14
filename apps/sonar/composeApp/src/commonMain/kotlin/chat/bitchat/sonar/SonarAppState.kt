@@ -739,6 +739,27 @@ internal fun remountFoldedNavStack(
     }
 }
 
+/**
+ * Wake mute / FGS banners: merge the host fold blob with FFI
+ * `fold_aliases`. FFI wins per historical id — same shape as
+ * notification tap (`notificationLiveFoldTargets`). A first-resume
+ * live sibling can exist in core before the host fold blob is rewritten.
+ */
+internal fun wakeMuteHistoricalFolds(
+    persisted: Map<String, String>,
+    listedIds: Collection<String>,
+    foldAliases: (String) -> List<String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> {
+    val ffi = historicalFoldsFromAliases(listedIds, foldAliases, liveFoldTarget)
+    if (ffi.isEmpty()) return persisted
+    if (persisted.isEmpty()) return ffi
+    return persisted + ffi
+}
+
+internal fun encodeGroupFoldMap(map: Map<String, String>): String =
+    map.entries.joinToString("\n") { "${it.key}=${it.value}" }
+
 /** Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`. */
 internal fun historicalFoldsFromAliases(
     listedIds: Collection<String>,
@@ -4857,7 +4878,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun persistHistoricalFolds() {
         SonarCore.saveBlob(
             HISTORICAL_FOLDS_BLOB_KEY,
-            historicalFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" },
+            encodeGroupFoldMap(historicalFoldMap),
         )
         val next = promotedFoldedMutesFromFolds(mutedUntilByChat, historicalFoldMap)
         if (next != mutedUntilByChat) {

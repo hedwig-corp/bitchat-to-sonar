@@ -1986,6 +1986,52 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun wakeMuteHonorsHistMuteWhenFfiFoldBlobIsEmpty() {
+        val aliases = { id: String ->
+            if (id == "group-09" || id == "group-08") listOf("group-09", "group-08") else listOf(id)
+        }
+        val live = { id: String -> if (id == "group-08" || id == "group-09") "group-09" else null }
+        val folds = wakeMuteHistoricalFolds(
+            persisted = emptyMap(),
+            listedIds = listOf("group-09"),
+            foldAliases = aliases,
+            liveFoldTarget = live,
+        )
+        assertEquals(mapOf("group-08" to "group-09"), folds)
+        assertEquals(folds, decodeGroupFoldMap(encodeGroupFoldMap(folds)))
+        val mutes = mapOf("group-08" to 9_999L)
+        assertTrue(foldFamilyIds("group-09", folds).any { isMutedAt(mutes[it], 1L) })
+        assertFalse(foldFamilyIds("group-09", emptyMap()).any { isMutedAt(mutes[it], 1L) })
+        assertEquals(
+            mapOf("stale-08" to "stale-09", "group-08" to "group-09"),
+            wakeMuteHistoricalFolds(
+                persisted = mapOf("stale-08" to "stale-09"),
+                listedIds = listOf("group-09"),
+                foldAliases = aliases,
+                liveFoldTarget = live,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to "group-09"),
+            wakeMuteHistoricalFolds(
+                persisted = mapOf("group-08" to "stale-09"),
+                listedIds = listOf("group-09"),
+                foldAliases = aliases,
+                liveFoldTarget = live,
+            ),
+        )
+        assertEquals(
+            emptyMap(),
+            wakeMuteHistoricalFolds(
+                persisted = emptyMap(),
+                listedIds = listOf("group-09"),
+                foldAliases = { listOf(it) },
+                liveFoldTarget = { null },
+            ),
+        )
+    }
+
+    @Test
     fun accountRestoreHostFoldsComeFromLiveSiblingNotPreviousAccount() {
         val previousAccount = mapOf("other-08" to "other-09", "group-08" to "stale-09")
         val aliases = { id: String ->

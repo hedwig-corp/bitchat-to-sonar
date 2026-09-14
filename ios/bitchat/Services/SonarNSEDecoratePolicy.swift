@@ -158,6 +158,31 @@ enum SonarNSEDecoratePolicy {
         (defaults?.dictionary(forKey: historicalFoldsUserDefaultsKey) as? [String: String]) ?? [:]
     }
 
+    /// Merge the App Group hist→live blob with FFI `fold_aliases`.
+    /// FFI wins per historical id — same shape as notification tap
+    /// (`snNotificationLiveFoldTarget`). A first-resume live sibling can
+    /// exist in core before the host blob is rewritten; wake mute must
+    /// still see the recovered 0.8 mute key.
+    static func mergeWakeMuteFolds(
+        persisted: [String: String],
+        listedIds: [String],
+        foldAliases: (String) -> [String],
+        liveFoldTarget: (String) -> String?
+    ) -> [String: String] {
+        var merged = persisted
+        for id in listedIds {
+            guard let live = liveFoldTarget(id), !live.isEmpty else { continue }
+            for alias in foldAliases(id) where !alias.isEmpty && alias != live {
+                merged[alias] = live
+            }
+        }
+        return merged
+    }
+
+    static func persistHistoricalFolds(_ map: [String: String], to defaults: UserDefaults?) {
+        defaults?.set(map, forKey: historicalFoldsUserDefaultsKey)
+    }
+
     static func mutedLookupCandidates(
         groupIdHex: String,
         senderNpub: String,

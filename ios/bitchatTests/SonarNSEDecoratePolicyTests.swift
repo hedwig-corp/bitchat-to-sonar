@@ -290,6 +290,30 @@ struct SonarNSEDecoratePolicyTests {
             mutesJSON: byHistorical,
             now: now
         ))
+        // First-resume live sibling: blob empty, FFI already knows hist→live.
+        let ffiFolds = SonarNSEDecoratePolicy.mergeWakeMuteFolds(
+            persisted: [:],
+            listedIds: [live],
+            foldAliases: { $0 == live || $0 == historical ? [live, historical] : [$0] },
+            liveFoldTarget: { $0 == live || $0 == historical ? live : nil }
+        )
+        #expect(ffiFolds == [historical: live])
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: live,
+            senderNpub: "",
+            groupName: "standup",
+            mutesJSON: byHistorical,
+            now: now,
+            historicalFolds: ffiFolds
+        ))
+        #expect(
+            SonarNSEDecoratePolicy.mergeWakeMuteFolds(
+                persisted: [historical: "stale-live"],
+                listedIds: [live],
+                foldAliases: { $0 == live || $0 == historical ? [live, historical] : [$0] },
+                liveFoldTarget: { $0 == live || $0 == historical ? live : nil }
+            ) == [historical: live]
+        )
         // 16-hex short-form store key matches too.
         let byShortForm = try JSONEncoder().encode([String(gid.prefix(16)): active])
         #expect(SonarNSEDecoratePolicy.isMuted(

@@ -623,6 +623,24 @@ struct SonarConversationFoldTests {
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-08", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])
+        let wakeFolds = snWakeMuteHistoricalFolds(
+            persisted: [:],
+            listedIds: ["group-09"],
+            foldAliases: { $0 == "group-09" || $0 == "group-08" ? ["group-09", "group-08"] : [$0] },
+            liveFoldTarget: { $0 == "group-08" || $0 == "group-09" ? "group-09" : nil }
+        )
+        #expect(wakeFolds == ["group-08": "group-09"])
+        #expect(
+            Set(snMutedFoldKeys(groupIdHex: "group-09", historicalFolds: wakeFolds)) == [
+                "group-08", "marmot:group-08",
+                "group-09", "marmot:group-09",
+            ]
+        )
+        #expect(
+            Set(snMutedFoldKeys(groupIdHex: "group-09", historicalFolds: [:])) == [
+                "group-09", "marmot:group-09",
+            ]
+        )
         #expect(SonarNSEDecoratePolicy.historicalFoldsUserDefaultsKey == snHistoricalFoldsDefaultsKey)
         #expect(
             Set(snMeshNotificationSuppressIds(
