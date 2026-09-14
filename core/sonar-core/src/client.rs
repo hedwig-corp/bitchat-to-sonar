@@ -7262,12 +7262,12 @@ impl SonarClient {
         };
         let live_direct = self.group_is_direct(live_id);
         let live_count = live_others.len() as u32 + 1;
-        let live_name = self
+        let (live_name, live_desc) = self
             .engine
             .groups()
             .ok()
             .and_then(|groups| groups.into_iter().find(|g| g.id == *live_id))
-            .map(|g| g.name)
+            .map(|g| (g.name, g.description))
             .unwrap_or_default();
         let mut room_candidates: Vec<(GroupId, String, Vec<PublicKey>)> = Vec::new();
         for group in historical {
@@ -7306,15 +7306,24 @@ impl SonarClient {
                 room_candidates.push((group.id, group.name, hist_others));
                 continue;
             }
-            // Mixed resume: a named 2-person live room (not a DM) that is
-            // a unique subset of one recovered 3+ room. `resolve_send_group`
-            // records that bind when minting; persist-folds can lose the
-            // sidecar. Idle reconcile / a later live send must rebuild it.
-            // A 1:1 (`live_direct`) must not absorb that room (R-045).
+            // Mixed resume after a lost core sidecar: `resolve_send_group`
+            // copied the 0.8 name *and* topic onto the 2-person live room.
+            // Require that non-empty topic match so an incoming 2-person
+            // "standup" (empty desc, `create_group`) cannot absorb a
+            // recovered 3-person standup (R-045).
+            let hist_desc = self
+                .engine
+                .historical_group_description(&group.id)
+                .unwrap_or_default();
             if !live_direct
                 && live_count == 2
                 && hist_count >= 3
                 && live_others.iter().all(|pk| hist_others.contains(pk))
+                && !live_name.is_empty()
+                && group.name == live_name
+                && !live_desc.is_empty()
+                && live_desc != SONAR_DIRECT_DM_DESCRIPTION
+                && hist_desc == live_desc
             {
                 room_candidates.push((group.id, group.name, hist_others));
                 continue;
@@ -12138,6 +12147,11 @@ mod tests {
             .await;
 
         let live = bob.engine.groups().expect("live")[0].id.clone();
+        // Idle reconcile uses the same matcher as GroupUpdated. A lost-sidecar
+        // heal must not start absorbing 3-person rooms onto 2-person standups.
+        bob.ensure_subscriptions()
+            .await
+            .expect("idle reconcile after incoming named pair");
         assert!(
             bob.engine.live_fold_target(&historical).is_none(),
             "3-person recovered standup must not fold onto a 2-person live standup"

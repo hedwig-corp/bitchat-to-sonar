@@ -1255,9 +1255,12 @@ got `record_historical_fold` at mint time. Host persist-folds can keep
 that remount after the core sidecar is gone; `maybe_fold_new_group`
 skipped `live_count < 3` (R-045 guard for DMs). Idle
 `ensure_subscriptions` and a later send on the listed live id now
-rebuild a unique non-DM subset bind and invite leftover members.
-A 1:1 still must not absorb a 3-member room. Pins:
+rebuild that bind only when the live room still carries the recovered
+non-empty 0.8 topic (name + description). An incoming 2-person
+`create_group("standup")` (empty desc) must not absorb a recovered
+3-person standup. Pins:
 `persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscriptions`,
+`incoming_09_named_pair_welcome_does_not_fold_three_member_room`,
 `recovered_08_pending_room_send_creates_named_group_not_dm`
 (`ensure_subscriptions` after `start_dm`).
 
