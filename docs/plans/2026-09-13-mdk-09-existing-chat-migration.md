@@ -191,6 +191,7 @@ Guarded by:
 - `ConversationFoldTest.foldedHistoricalComposerDraftMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalComposerReplyMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotMessagesMoveOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalCallLogsMoveOntoLiveSibling`
 - `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
   (also pins `live_fold_target_hex` after the home-list hide)
@@ -364,7 +365,9 @@ non-empty live draft. Host snapshot / in-memory transcript rows on the
 hidden id are copied onto the live sibling so home preview does not go
 blank between `groups()` hide and the next bounded page. A notification
 tap whose payload still names the hidden 0.8 id remaps onto
-`live_fold_target` instead of toasting that the chat is gone. A pending welcome with
+`live_fold_target` instead of toasting that the chat is gone. Persisted
+call-log rows on the hidden id are merged onto the live sibling so resume
+does not drop the recovered call history. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
 (new DM with the same known peer) is the same hazard and must skip
@@ -406,7 +409,7 @@ Re-run on this cloud agent after the joined-room `is_direct` pin. All green.
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 36 passed (includes remount / mute / draft / snapshot-fold pins) |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 37 passed (includes remount / mute / draft / snapshot / call-log fold pins) |
 | `scripts/check-regression-ledger.sh` | 236 citations |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with

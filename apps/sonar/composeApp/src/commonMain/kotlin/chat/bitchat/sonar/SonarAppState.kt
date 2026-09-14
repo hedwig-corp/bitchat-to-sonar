@@ -589,6 +589,25 @@ internal fun promotedFoldedSnapshotMessages(
         preferExisting = { it.isNotEmpty() },
     )
 
+/** Keep recovered call-log rows on the live sibling after FFI hides the 0.8 id. */
+internal fun promotedFoldedCallLogs(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    callLogs: Map<String, List<CallRecord>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, List<CallRecord>> {
+    var next = callLogs
+    for (historical in previousIds + callLogs.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = callLogs[historical].orEmpty()
+        if (incoming.isEmpty()) continue
+        next = next + (live to dedupeCallRecordsLastWins(incoming + next[live].orEmpty()))
+    }
+    return next
+}
+
 /** When FFI hides a folded 0.8 row, keep its reply target on the live sibling. */
 internal fun <V> promotedFoldedComposerReplies(
     previousIds: Set<String>,
@@ -12158,6 +12177,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val listedIds = chats.mapTo(hashSetOf()) { it.id }
         promoteFoldedMutes(previousOrder.toSet(), listedIds)
         promoteFoldedComposerState(previousOrder.toSet(), listedIds)
+        promoteFoldedCallLogs(previousOrder.toSet(), listedIds)
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12213,6 +12233,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun promoteFoldedCallLogs(previousIds: Set<String>, currentIds: Set<String>) {
+        val next = promotedFoldedCallLogs(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            callLogs = callLogs.mapValues { it.value.toList() },
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+        if (next == callLogs.mapValues { it.value.toList() }) return
+        for ((id, records) in next) {
+            callLogs[id] = records.toMutableList()
+        }
+        callVersion++
+    }
+
     /** FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
      *  transcript, swap the nav id to the live 0.9 sibling so member/title
      *  lookups keep working. In-flight send closures keep the historical id
@@ -12243,6 +12277,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (live !in composerReplyByChat) composerReplyByChat[live] = reply
         }
         composerReplyByChat.remove(open.id)
+        callLogs[open.id]?.takeIf { it.isNotEmpty() }?.let { historical ->
+            val merged = dedupeCallRecordsLastWins(historical + callLogs[live].orEmpty())
+            callLogs[live] = merged.toMutableList()
+            callLogs.remove(open.id)
+            callVersion++
+        }
         if (open.id in recoveredChatNeedsUpdate) {
             recoveredChatNeedsUpdate = recoveredChatNeedsUpdate - open.id + live
         }

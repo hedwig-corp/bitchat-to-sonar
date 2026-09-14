@@ -347,6 +347,31 @@ func snPromotedFoldedMessagesByGroup<Message>(
     return next
 }
 
+/// Keep recovered call-log rows on the live sibling after FFI hides the 0.8 id.
+func snPromotedFoldedCallLogs(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    callLogs: [String: [SNCallRecord]],
+    liveFoldTarget: (String) -> String?,
+    maxPerConversation: Int = 100
+) -> [String: [SNCallRecord]] {
+    var next = callLogs.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let incoming = next[pair.historical], !incoming.isEmpty else { continue }
+        var byId: [String: SNCallRecord] = [:]
+        for record in incoming { byId[record.id] = record }
+        for record in next[pair.live] ?? [] { byId[record.id] = record }
+        next[pair.live] = Array(byId.values.sorted { $0.date < $1.date }.suffix(maxPerConversation))
+    }
+    return next
+}
+
 func snMarmotSendNeedsPeerUpdate(_ error: String) -> Bool {
     let lower = error.lowercased()
     return lower.contains("no key package")
@@ -2305,6 +2330,7 @@ final class SonarAppStore: ObservableObject {
                     await self.promoteFoldedMutes(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
                     self.lastMarmotGroupIds = current
                     await self.remountFoldedOpenChatIfNeeded()
                 }
@@ -7209,6 +7235,49 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Copy persisted call-log rows from a hidden 0.8 id onto the live sibling.
+    @MainActor
+    private func promoteFoldedCallLogs(from previous: Set<String>, to current: Set<String>) async {
+        var logsByGroup: [String: [SNCallRecord]] = [:]
+        var extra = Set<String>()
+        for (key, records) in callLogs {
+            guard !records.isEmpty else { continue }
+            let groupId: String
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                groupId = String(key.dropFirst(Self.marmotIDPrefix.count))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                groupId = key.lowercased()
+            } else {
+                continue
+            }
+            extra.insert(groupId)
+            logsByGroup[groupId] = records
+        }
+        var targets: [String: String] = [:]
+        for historical in previous.union(extra).subtracting(current) {
+            if let live = await marmot.liveFoldTarget(groupId: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedCallLogs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            callLogs: logsByGroup,
+            liveFoldTarget: { targets[$0] }
+        )
+        var changed = false
+        for (groupId, records) in next where current.contains(groupId) {
+            let liveId = Self.marmotIDPrefix + groupId
+            if callLogs[liveId] != records {
+                callLogs[liveId] = records
+                changed = true
+            }
+        }
+        if changed {
+            persistCallLogs()
+        }
+    }
+
     /// FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
     /// transcript, swap the nav id to the live 0.9 sibling.
     @MainActor
@@ -7240,6 +7309,15 @@ final class SonarAppStore: ObservableObject {
         }
         composerReplyByChat[openId] = nil
         composerReplyByChat[groupId] = nil
+        if let historical = callLogs[openId] ?? callLogs[groupId], !historical.isEmpty {
+            var byId: [String: SNCallRecord] = [:]
+            for record in historical { byId[record.id] = record }
+            for record in callLogs[realId] ?? [] { byId[record.id] = record }
+            callLogs[realId] = Array(
+                byId.values.sorted { $0.date < $1.date }.suffix(Self.maxStoredCallsPerConversation)
+            )
+            persistCallLogs()
+        }
         if recoveredChatNeedsUpdate.contains(openId) || recoveredChatNeedsUpdate.contains(groupId) {
             recoveredChatNeedsUpdate.remove(openId)
             recoveredChatNeedsUpdate.remove(groupId)
