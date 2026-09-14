@@ -2609,6 +2609,18 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ).contains("marmot:group-08")
         )
+        #expect(
+            Set(snPendingMessageKeys(
+                conversationId: "marmot:group-08",
+                sourceGroupIds: ["group-08"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )).isSuperset(of: [
+                "marmot:group-08", "group-08",
+                "marmot:group-09", "group-09",
+            ])
+        )
         let histTrill = Date(timeIntervalSince1970: 80)
         let liveTrill = Date(timeIntervalSince1970: 90)
         #expect(

@@ -2815,6 +2815,8 @@ func snPendingMessageKeys(
     conversationId: String,
     sourceGroupIds: [String],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> [String] {
     var seen = Set<String>()
@@ -2833,6 +2835,8 @@ func snPendingMessageKeys(
     for key in snPaymentActivityPeerKeys(
         conversationId: conversationId,
         historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
         prefix: prefix
     ).sorted() {
         append(key)
@@ -9448,7 +9452,11 @@ final class SonarAppStore: ObservableObject {
             let echoIds = snPendingMessageKeys(
                 conversationId: id,
                 sourceGroupIds: sourceGroups.map(\.id),
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: openedConversationId
+                    ?? pendingMarmotRouteReplacement?.realId,
+                openedConversationPaneId: openedConversationPaneId
+                    ?? pendingMarmotRouteReplacement?.pendingId
             )
             for echoId in echoIds {
                 dated += Self.transcriptSource(

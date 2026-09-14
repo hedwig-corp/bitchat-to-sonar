@@ -2652,7 +2652,15 @@ internal fun <V> pendingMessagesForChat(
     chatId: String,
     messagesByChat: Map<String, List<V>>,
     historicalFolds: Map<String, String>,
-): List<V> = callRecordsForChat(chatId, messagesByChat, historicalFolds)
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<V> = callRecordsForChat(
+    chatId,
+    messagesByChat,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+)
 
 /** Drop matching echoes from every fold-family key, not only the open id. */
 internal fun <V> removePendingMessagesForChat(
@@ -2660,8 +2668,15 @@ internal fun <V> removePendingMessagesForChat(
     messagesByChat: MutableMap<String, MutableList<V>>,
     historicalFolds: Map<String, String>,
     shouldRemove: (V) -> Boolean,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ) {
-    for (key in paymentActivityPeerKeys(chatId, historicalFolds)) {
+    for (key in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
         val list = messagesByChat[key] ?: continue
         list.removeAll(shouldRemove)
         if (list.isEmpty()) messagesByChat.remove(key)
@@ -2793,9 +2808,16 @@ internal fun <V> updatePendingMessagesForChat(
     historicalFolds: Map<String, String>,
     matches: (V) -> Boolean,
     update: (V) -> V,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     var found = false
-    for (key in paymentActivityPeerKeys(chatId, historicalFolds)) {
+    for (key in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
         val list = messagesByChat[key] ?: continue
         for (index in list.indices) {
             if (!matches(list[index])) continue
@@ -10721,7 +10743,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun clearSendEcho(chatId: String, echoId: String) {
         previouslyPublishedMessageIdsByEcho.remove(echoId)
-        removePendingMessagesForChat(chatId, pendingSendEchoes, historicalFoldMap) { it.id == echoId }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        removePendingMessagesForChat(
+            chatId,
+            pendingSendEchoes,
+            historicalFoldMap,
+            shouldRemove = { it.id == echoId },
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         val openId = (screen as? Screen.Chat)?.id
         if (openId != null && conversationsMatchFoldFamily(openId, chatId, historicalFoldMap)) {
             messages = messages.filterNot { it.id == echoId }
@@ -10729,12 +10759,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun markSendEchoAccepted(chatId: String, echoId: String) {
+        val (opened, pane) = remountPairForOpenChat(chatId)
         if (!updatePendingMessagesForChat(
                 chatId,
                 pendingSendEchoes,
                 historicalFoldMap,
                 matches = { it.id == echoId },
                 update = { it.copy(state = "Accepted") },
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
         ) {
             return
@@ -10760,7 +10793,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         ).mapTo(mutableSetOf()) { it.id }
         if (canonicalIds.isEmpty()) return false
 
-        pendingMessagesForChat(chatId, pendingSendEchoes, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        pendingMessagesForChat(
+            chatId,
+            pendingSendEchoes,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
             .asSequence()
             .filter {
                 it.id != succeededEcho.id &&
@@ -10777,12 +10817,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun failSendEcho(chatId: String, echoId: String) {
         previouslyPublishedMessageIdsByEcho.remove(echoId)
+        val (opened, pane) = remountPairForOpenChat(chatId)
         if (!updatePendingMessagesForChat(
                 chatId,
                 pendingSendEchoes,
                 historicalFoldMap,
                 matches = { it.id == echoId },
                 update = { it.copy(state = "Couldn't send") },
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
         ) {
             return
@@ -10801,7 +10844,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
-        val familyEchoes = pendingMessagesForChat(chatId, pendingSendEchoes, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val familyEchoes = pendingMessagesForChat(
+            chatId,
+            pendingSendEchoes,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         if (familyEchoes.isEmpty()) return published
         val plan = planSendEchoDisplay(
             familyEchoes,
@@ -10810,9 +10860,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             freshCanonicalForChat(chatId),
         )
         if (plan.terminalAcceptedEchoIds.isNotEmpty()) {
-            removePendingMessagesForChat(chatId, pendingSendEchoes, historicalFoldMap) {
-                it.id in plan.terminalAcceptedEchoIds
-            }
+            removePendingMessagesForChat(
+                chatId,
+                pendingSendEchoes,
+                historicalFoldMap,
+                shouldRemove = { it.id in plan.terminalAcceptedEchoIds },
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
             plan.terminalAcceptedEchoIds.forEach(previouslyPublishedMessageIdsByEcho::remove)
         }
         // A canonical row can suppress a duplicate bubble before the send

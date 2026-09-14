@@ -1000,6 +1000,16 @@ class ConversationFoldTest {
             pendingMessagesForChat("group-08", byChat, folds).map { it.id }.toSet(),
         )
         assertEquals(live, pendingMessagesForChat("group-09", byChat, emptyMap()))
+        assertEquals(
+            setOf("echo-09"),
+            pendingMessagesForChat(
+                "group-08",
+                mapOf("group-09" to live),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ).map { it.id }.toSet(),
+        )
     }
 
     @Test
