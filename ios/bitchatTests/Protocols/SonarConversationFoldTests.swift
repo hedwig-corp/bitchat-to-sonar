@@ -1026,6 +1026,22 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == 0
         )
+        #expect(
+            snLocalLatestTsForChat(
+                chatId: "group-09",
+                messagesByChat: ["group-09": Array((1...80).reversed().map(Int64.init))],
+                latestByChat: [:],
+                historicalFolds: ["group-08": "group-09"]
+            ) == 80
+        )
+        #expect(
+            snLocalLatestTsForChat(
+                chatId: "group-09",
+                messagesByChat: ["group-09": Array((1...80).reversed().map(Int64.init))],
+                latestByChat: ["group-09": 200],
+                historicalFolds: ["group-08": "group-09"]
+            ) == 200
+        )
         #expect(snFoldedSiblingHasMore(historicalHasMore: true, liveHasMore: false))
         #expect(snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: true))
         #expect(!snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: false))

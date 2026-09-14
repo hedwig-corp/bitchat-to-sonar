@@ -1117,6 +1117,15 @@ retry `mediaFetchGroupIds`. Pins:
 `persist_folds_live_id_marks_recovered_08_media_unavailable_without_secret`,
 `persist_folds_live_id_fetch_media_uses_hist_exporter_without_core_fold`.
 
+Newest-first remount recency hole closed after this commit:
+`localLatestTsForChat` used `lastOrNull()` on an unsorted fold merge.
+A remounted 0.8 extract then looked older than a newer empty live
+sibling, so `dedupeDirectMarmotChats` hid the row that still held
+recovered history. Take `max(tsSecs)` and `latestByChat`. iOS
+`snLocalLatestTsForChat` / `latestMarmotMessage` stay in lockstep.
+Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
+`SonarConversationFoldTests` `snLocalLatestTsForChat`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

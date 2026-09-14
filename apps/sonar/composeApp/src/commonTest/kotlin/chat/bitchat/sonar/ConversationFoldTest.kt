@@ -1520,6 +1520,50 @@ class ConversationFoldTest {
                 historicalFolds = emptyMap(),
             ),
         )
+        val newestFirstExtract = (80 downTo 1).map { n ->
+            SonarMsg("hist-$n", "npub1peer", "row $n", false, n.toLong())
+        }
+        assertEquals(
+            80L,
+            localLatestTsForChat(
+                chatId = "group-09",
+                messagesByChat = mapOf("group-09" to newestFirstExtract),
+                latestByChat = emptyMap(),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            200L,
+            localLatestTsForChat(
+                chatId = "group-09",
+                messagesByChat = mapOf("group-09" to newestFirstExtract),
+                latestByChat = mapOf("group-09" to 200L),
+                historicalFolds = folds,
+            ),
+        )
+        val ownNpub = "npub1me"
+        val peerNpub = "npub1peer"
+        val remounted = SonarChat(id = "group-09", name = "", members = listOf(ownNpub, peerNpub))
+        val otherLive = SonarChat(id = "group-10", name = "", members = listOf(ownNpub, peerNpub))
+        val latest = { id: String ->
+            localLatestTsForChat(
+                chatId = id,
+                messagesByChat = mapOf(
+                    "group-09" to newestFirstExtract,
+                    "group-10" to listOf(SonarMsg("live-1", ownNpub, "hi", true, 10L)),
+                ),
+                latestByChat = emptyMap(),
+                historicalFolds = folds,
+            )
+        }
+        assertEquals(
+            listOf(remounted),
+            dedupeDirectMarmotChats(
+                chats = listOf(remounted, otherLive),
+                ownNpub = ownNpub,
+                latestSecs = latest,
+            ),
+        )
     }
 
     @Test

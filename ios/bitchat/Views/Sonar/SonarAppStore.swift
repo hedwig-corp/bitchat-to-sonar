@@ -1053,7 +1053,11 @@ func snLocalLatestTsForChat(
     let ids = snFoldFamilyIds(id: chatId, historicalFolds: historicalFolds)
     var latest: Int64 = 0
     for id in ids {
-        let ts = messagesByChat[id]?.last ?? latestByChat[id] ?? 0
+        // Fold merge does not sort. `last` can be the oldest remounted 0.8
+        // row; take the max so dedupe cannot hide the recovered transcript.
+        // Compose `localLatestTsForChat`.
+        let messageTs = messagesByChat[id]?.max() ?? 0
+        let ts = max(messageTs, latestByChat[id] ?? 0)
         if ts > latest { latest = ts }
     }
     return latest
@@ -6837,7 +6841,10 @@ final class SonarAppStore: ObservableObject {
         for group in groups {
             for alias in snFoldFamilyIds(id: group.id, historicalFolds: folds) {
                 guard let message = snMarmotHomeRowMessage(
-                    loaded: marmot.messagesByGroup[alias]?.last,
+                    loaded: marmot.messagesByGroup[alias]?.max(by: {
+                        if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+                        return $0.createdAt < $1.createdAt
+                    }),
                     summary: marmot.conversationSummariesByGroup[alias]
                         ?? marmot.conversationSummariesByGroup[group.id]
                 ) else { continue }

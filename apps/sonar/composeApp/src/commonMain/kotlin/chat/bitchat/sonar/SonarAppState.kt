@@ -1220,7 +1220,10 @@ internal fun snapshotLatestAfterHistoricalFolds(
     return next
 }
 
-/** Newest local timestamp across the fold family (hidden 0.8 sibling included). */
+/** Newest local timestamp across the fold family (hidden 0.8 sibling included).
+ *  Fold merge does not sort, so `lastOrNull()` can be the oldest remounted
+ *  0.8 row. Dedupe / send-target then prefer a newer empty live sibling and
+ *  hide the row that still holds recovered history. iOS `snLocalLatestTsForChat`. */
 internal fun localLatestTsForChat(
     chatId: String,
     messagesByChat: Map<String, List<SonarMsg>>,
@@ -1230,9 +1233,8 @@ internal fun localLatestTsForChat(
     var latest = 0L
     val ids = foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }
     for (id in ids) {
-        val ts = messagesByChat[id]?.lastOrNull()?.tsSecs
-            ?: latestByChat[id]
-            ?: 0L
+        val messageTs = messagesByChat[id]?.maxOfOrNull { it.tsSecs } ?: 0L
+        val ts = maxOf(messageTs, latestByChat[id] ?: 0L)
         if (ts > latest) latest = ts
     }
     return latest
