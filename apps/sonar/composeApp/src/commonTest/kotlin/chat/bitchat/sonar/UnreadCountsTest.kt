@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class UnreadCountsTest {
@@ -87,6 +88,102 @@ class UnreadCountsTest {
         assertEquals(
             emptySet(),
             pruneConfirmedUnreadSuppressions(inFlightAfterMarkRelease, summaries),
+        )
+    }
+
+    @Test
+    fun failedSummariesProbeDoesNotSettleOpenUnread() {
+        assertNull(
+            openChatUnreadFromCache(listOf("group-08", "group-09"), emptyMap()),
+            "empty unread cache must not look like a fully-read 0",
+        )
+        assertEquals(
+            3L,
+            openChatUnreadFromCache(
+                listOf("group-08", "group-09"),
+                mapOf("group-08" to 3L),
+            ),
+        )
+        assertEquals(
+            4L,
+            openChatUnreadFromCache(
+                listOf("group-08", "group-09"),
+                mapOf("group-08" to 3L, "group-09" to 1L),
+            ),
+        )
+        assertNull(
+            openChatUnreadFromCache(listOf("group-09"), mapOf("other" to 5L)),
+            "another chat's badge is not a hit for this family",
+        )
+        assertEquals(
+            0L,
+            openChatUnreadFromCache(listOf("group-08"), mapOf("group-08" to 0L)),
+        )
+
+        val unread = listOf(summary("group-08", 4), summary("other", 1))
+        assertEquals(4L, openChatUnreadFromSummaries(unread, listOf("group-08")))
+        assertEquals(0L, openChatUnreadFromSummaries(emptyList(), listOf("group-08")))
+        assertNull(openChatUnreadFromSummaries(null, listOf("group-08")))
+
+        assertEquals(
+            3L,
+            capturedOpenChatUnread(
+                ids = listOf("group-08", "group-09"),
+                unreadByChat = mapOf("group-08" to 3L),
+                summaries = null,
+            ),
+            "cache hit must win even when the index probe failed",
+        )
+        assertNull(
+            capturedOpenChatUnread(
+                ids = listOf("group-08", "group-09"),
+                unreadByChat = emptyMap(),
+                summaries = null,
+            ),
+            "empty cache + failed probe must leave open unread unset",
+        )
+        assertEquals(
+            0L,
+            capturedOpenChatUnread(
+                ids = listOf("group-08"),
+                unreadByChat = emptyMap(),
+                summaries = emptyList(),
+            ),
+            "empty successful probe still settles 0",
+        )
+        assertEquals(
+            0L,
+            capturedOpenChatUnread(
+                ids = emptyList(),
+                unreadByChat = emptyMap(),
+                summaries = null,
+            ),
+            "mesh with no White Noise group id settles 0",
+        )
+        assertEquals(
+            "group-09",
+            openChatUnreadPublishId(
+                capturedFor = "group-08",
+                stackChatIds = listOf("group-09"),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "group-08",
+            openChatUnreadPublishId(
+                capturedFor = "group-08",
+                stackChatIds = emptyList(),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+            "probe before push must still settle on the captured id",
+        )
+        assertNull(
+            openChatUnreadPublishId(
+                capturedFor = "group-08",
+                stackChatIds = listOf("other"),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+            "popped / other-room probe must not publish",
         )
     }
 }

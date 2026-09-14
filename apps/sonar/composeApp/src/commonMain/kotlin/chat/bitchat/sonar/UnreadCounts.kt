@@ -12,6 +12,73 @@ package chat.bitchat.sonar
 internal fun shouldApplyUnreadCounts(loaded: List<SonarConversationSummary>?): Boolean =
     loaded != null
 
+/**
+ * Open-time unread from the published host cache. `unreadByChat` only stores
+ * groups with unread > 0, so a missing family key is ambiguous: either this
+ * chat is fully read, or summaries have never applied (cold start / closed
+ * node). Only a cache hit may settle. An empty cache must not look like 0
+ * (fully-read / jump-to-tail) — that hid the divider on recovered 0.8 chats.
+ *
+ * Mirrors iOS `SonarAppStore.captureUnreadAtOpen` cache check.
+ */
+internal fun openChatUnreadFromCache(
+    ids: Collection<String>,
+    unreadByChat: Map<String, Long>,
+): Long? {
+    val hasCachedEntry = ids.any { it in unreadByChat }
+    val cached = ids.sumOf { unreadByChat[it] ?: 0L }
+    if (hasCachedEntry || cached > 0L) return cached
+    return null
+}
+
+/**
+ * Open-time unread from a `conversationSummaries()` probe.
+ * `null` summaries must not settle as `0`. Empty success is 0.
+ * Mirrors iOS `SNUnreadCounts.openCount`.
+ */
+internal fun openChatUnreadFromSummaries(
+    summaries: List<SonarConversationSummary>?,
+    wanted: Collection<String>,
+): Long? {
+    if (summaries == null) return null
+    val wantedSet = wanted.toSet()
+    return summaries
+        .asSequence()
+        .filter { it.groupIdHex in wantedSet }
+        .sumOf { it.unreadCount }
+}
+
+/**
+ * Capture policy: cache hit wins; otherwise a successful index probe.
+ * Empty group ids settle 0 (mesh with no White Noise leg yet).
+ * Failed / missing probe stays unset (`null`).
+ */
+internal fun capturedOpenChatUnread(
+    ids: Collection<String>,
+    unreadByChat: Map<String, Long>,
+    summaries: List<SonarConversationSummary>?,
+): Long? {
+    openChatUnreadFromCache(ids, unreadByChat)?.let { return it }
+    if (ids.isEmpty()) return 0L
+    return openChatUnreadFromSummaries(summaries, ids)
+}
+
+/**
+ * After persist-folds remounts hist→live, publish onto the still-open id.
+ * Empty stack (probe finished before `push`) keeps [capturedFor] so first
+ * paint can still settle. A different room on the stack drops the probe.
+ */
+internal fun openChatUnreadPublishId(
+    capturedFor: String,
+    stackChatIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+): String? {
+    stackChatIds.firstOrNull { id ->
+        conversationsMatchFoldFamily(id, capturedFor, historicalFolds)
+    }?.let { return it }
+    return capturedFor.takeIf { stackChatIds.isEmpty() }
+}
+
 internal fun unreadCountsFromSummaries(
     summaries: List<SonarConversationSummary>,
     suppressGroupIds: Set<String> = emptySet(),

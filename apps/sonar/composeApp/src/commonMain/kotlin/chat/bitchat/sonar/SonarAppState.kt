@@ -2977,13 +2977,16 @@ class SonarAppState(private val scope: CoroutineScope) {
      * read 0, leaving radar/BLE-folded conversations with no divider while
      * plain Marmot chats got one. That resolver is also what the read-marking
      * paths use, so capture and clear always cover the same groups.
+     *
+     * A cache miss must not publish `0`. Missing key means capture has not
+     * settled — hosts treat that as provisional live edge, not fully-read.
+     * On miss, probe the conversation index *before* [markGroupsRead] can
+     * zero it (Compose marks on open; iOS waits for hydrate). Failed probe
+     * leaves the key unset. Empty success settles 0.
      */
     private fun captureOpenChatUnread(chatId: String, jumpMessageId: String? = null) {
-        val unreadAtOpen = transcriptGroupIds(chatId).sumOf { unreadByChat[it] ?: 0L }
+        val ids = transcriptGroupIds(chatId)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
-        // Always publish a settled value (including 0). Missing key means
-        // capture has not run — hosts must not coerce that to live-edge.
-        openChatUnread = openChatUnread + (chatId to unreadAtOpen)
         openChatJumpMessageId = if (jumpMessageId != null) {
             quotedJumpWritten(chatId, jumpMessageId, openChatJumpMessageId, historicalFoldMap)
         } else if (quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap) == null) {
@@ -2991,6 +2994,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         } else {
             openChatJumpMessageId
         }
+        val cached = openChatUnreadFromCache(ids, unreadByChat)
+        if (cached != null || ids.isEmpty()) {
+            openChatUnread = openChatUnread + (chatId to (cached ?: 0L))
+            markGroupsRead(ids)
+            return
+        }
+        // Leave unset until the index probe settles.
+        openChatUnread = openChatUnread - chatId
+        scope.launch {
+            val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
+            val unread = openChatUnreadFromSummaries(summaries, ids)
+            if (unread != null) publishCapturedOpenUnread(chatId, unread)
+            // Mark after capture so the probe still sees pre-open unread.
+            markGroupsRead(ids)
+        }
+    }
+
+    private fun publishCapturedOpenUnread(capturedFor: String, unread: Long) {
+        val stackChatIds = stack.mapNotNull { (it as? Screen.Chat)?.id }
+        val key = openChatUnreadPublishId(
+            capturedFor = capturedFor,
+            stackChatIds = stackChatIds,
+            historicalFolds = historicalFoldMap,
+        ) ?: return
+        if (openChatUnread[key] != null) return
+        openChatUnread = openChatUnread + (key to unread)
     }
 
     /** Give up on a pending unread divider for this open: the transcript is
@@ -8073,11 +8102,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         captureOpenChatUnread(chat.id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(chat.id)
-        // Mark read immediately — do not wait for the local page. Housekeeping
-        // can otherwise restore unreadByChat from still-nonzero summaries.
-        // Same family set as openDm / unread-at-open so a leftover hist
-        // unread cannot re-badge the live row after our home-row walk.
-        markGroupsRead(transcriptGroupIds(chat.id))
+        // Mark-read is inside captureOpenChatUnread: immediately on a cache
+        // hit, after the index probe on a miss, so a leftover hist unread
+        // cannot re-badge the live row and a failed probe cannot settle 0.
         val title = chatTitle(chat)
 
         // Reopen *or* first open with a remounted 0.8 snapshot: push now.
@@ -8175,8 +8202,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         clearNotificationsForChat(id)
         captureOpenChatUnread(id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(id)
-        // Mesh route ids are not group keys — resolve before clearing badges.
-        markGroupsRead(transcriptGroupIds(id))
+        // Mark-read is inside captureOpenChatUnread (cache hit now; miss
+        // probes first). Mesh route ids are resolved via transcriptGroupIds.
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }

@@ -2414,6 +2414,29 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        assertNull(
+            openChatUnreadFromCache(listOf("group-09", "group-08"), emptyMap()),
+            "empty unread cache must not settle open-time unread as 0",
+        )
+        assertEquals(
+            3L,
+            openChatUnreadFromCache(listOf("group-09", "group-08"), unreadOnHist),
+        )
+        assertNull(
+            capturedOpenChatUnread(
+                ids = listOf("group-09", "group-08"),
+                unreadByChat = emptyMap(),
+                summaries = null,
+            ),
+        )
+        assertEquals(
+            "group-09",
+            openChatUnreadPublishId(
+                capturedFor = "group-08",
+                stackChatIds = listOf("group-09"),
+                historicalFolds = folds,
+            ),
+        )
     }
 
     @Test

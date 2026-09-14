@@ -1500,7 +1500,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Freeze the unread anchor on the first CAUGHT-UP feed that can resolve
     // it, and re-resolve only if its row vanishes (a snapshot row replaced by
     // the canonical DB page) before the user scrolls.
-    LaunchedEffect(screen.id, feed) {
+    LaunchedEffect(screen.id, feed, state.openChatUnread[screen.id]) {
         val unreadAtOpen = state.openChatUnread[screen.id] ?: 0L
         if (unreadAtOpen <= 0L || feed.isEmpty()) return@LaunchedEffect
         val current = unreadAnchorId

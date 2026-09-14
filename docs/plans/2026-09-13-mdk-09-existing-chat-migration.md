@@ -1396,6 +1396,16 @@ index unread never loaded. Failed probes now leave the key unset.
 Empty success still settles 0. Pin:
 `SNUnreadCountsTests.failedSummariesProbeDoesNotPublishUnread`.
 
+Compose `captureOpenChatUnread` used to `sumOf { unreadByChat[it] ?: 0L }`
+and always publish, including `0` when the host cache was empty (cold
+start / closed node never applied summaries). `App.kt` then treated
+that as fully-read (`?: 0L` / `unreadAtOpen <= 0`) and jumped to the
+tail. Cache miss now leaves the key unset and probes the index
+*before* `markGroupsRead` so mark-read cannot zero the count the
+divider needs. Failed probe stays unset. Empty success settles 0.
+Pin: `UnreadCountsTest.failedSummariesProbeDoesNotSettleOpenUnread`,
+`ConversationFoldTest.homeRowUnreadFollowsPersistedFoldOntoLiveSibling`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot
