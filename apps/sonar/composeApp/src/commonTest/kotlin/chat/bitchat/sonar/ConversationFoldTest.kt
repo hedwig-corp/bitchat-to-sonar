@@ -918,6 +918,51 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun deleteAfterFoldDropsTheHiddenHistoricalSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-09", folds))
+        assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-08", folds))
+        assertEquals(setOf("group-09"), foldFamilyIds("group-09", emptyMap()))
+        assertEquals(emptyMap(), purgedHistoricalFolds(folds, setOf("group-09")))
+        assertEquals(folds, purgedHistoricalFolds(folds, setOf("unrelated")))
+        assertEquals(
+            emptyMap(),
+            prunedOrphanedHistoricalFolds(
+                folds = folds,
+                listedIds = setOf("other-room"),
+                listedAuthoritative = true,
+            ),
+        )
+        assertEquals(
+            folds,
+            prunedOrphanedHistoricalFolds(
+                folds = folds,
+                listedIds = setOf("group-09"),
+                listedAuthoritative = true,
+            ),
+        )
+        assertEquals(
+            folds,
+            prunedOrphanedHistoricalFolds(
+                folds = folds,
+                listedIds = emptySet(),
+                listedAuthoritative = false,
+            ),
+        )
+        val historical = SonarChat(id = "group-08", name = "room", members = listOf("npub1a"), isDirect = false)
+        val live = SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false)
+        val leftover = listOf(historical, live).filterNot { it.id in foldFamilyIds("group-09", folds) }
+        assertEquals(emptyList(), leftover)
+        assertEquals(
+            listOf(historical),
+            collapsedFoldedSnapshotChats(
+                chats = listOf(historical),
+                historicalFolds = purgedHistoricalFolds(folds, setOf("group-09")),
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalComposerReplyMovesOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         val historical = SonarReplyRef(parentId = "evt-08", preview = "quote")

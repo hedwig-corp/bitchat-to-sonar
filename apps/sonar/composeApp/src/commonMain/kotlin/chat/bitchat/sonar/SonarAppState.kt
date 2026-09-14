@@ -751,6 +751,51 @@ internal fun collapsedFoldedSnapshotChats(
     }
 }
 
+/** Every recovered sibling that must leave with [id] on delete / leave. */
+internal fun foldFamilyIds(
+    id: String,
+    historicalFolds: Map<String, String>,
+): Set<String> {
+    if (id.isBlank()) return emptySet()
+    val live = historicalFolds[id]
+        ?: historicalFolds.entries.firstOrNull { it.value == id }?.value
+        ?: id
+    val family = linkedSetOf(id, live)
+    for ((historical, target) in historicalFolds) {
+        if (historical == id || target == id || historical == live || target == live) {
+            family += historical
+            family += target
+        }
+    }
+    return family.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
+/** Drop host fold bindings whose historical or live id was just deleted. */
+internal fun purgedHistoricalFolds(
+    folds: Map<String, String>,
+    deletedIds: Set<String>,
+): Map<String, String> =
+    folds.filterNot { (historical, live) ->
+        historical in deletedIds || live in deletedIds
+    }
+
+/**
+ * After an authoritative `groups()` / `chats()` listing, drop hist→live
+ * bindings whose whole family is gone. First-paint / core-not-ready listings
+ * must pass [listedAuthoritative] = false so a recovered 0.8 row is not
+ * forgotten before the live sibling appears.
+ */
+internal fun prunedOrphanedHistoricalFolds(
+    folds: Map<String, String>,
+    listedIds: Set<String>,
+    listedAuthoritative: Boolean,
+): Map<String, String> {
+    if (!listedAuthoritative) return folds
+    return folds.filter { (historical, live) ->
+        live == historical || live in listedIds || historical in listedIds
+    }
+}
+
 /** Keep call/pay/notification watermarks on the live sibling after FFI hide. */
 internal fun promotedFoldedScanMarks(
     previousIds: Set<String>,
@@ -3162,6 +3207,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
     }
 
+    private fun forgetHistoricalFolds(deletedIds: Set<String>) {
+        if (deletedIds.isEmpty()) return
+        val next = purgedHistoricalFolds(historicalFoldMap, deletedIds)
+        if (next.size == historicalFoldMap.size && next == historicalFoldMap) return
+        historicalFoldMap.clear()
+        historicalFoldMap.putAll(next)
+        persistHistoricalFolds()
+    }
+
     private fun rememberHistoricalFolds(previousIds: Set<String>, currentIds: Set<String>) {
         var changed = false
         val listed = previousIds + currentIds + historicalFoldMap.keys + historicalFoldMap.values
@@ -3183,6 +3237,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 historicalFoldMap[id] = live
                 changed = true
             }
+        }
+        val listedAuthoritative = localCoreReady || started || currentIds.isNotEmpty()
+        val pruned = prunedOrphanedHistoricalFolds(
+            folds = historicalFoldMap,
+            listedIds = currentIds,
+            listedAuthoritative = listedAuthoritative,
+        )
+        if (pruned != historicalFoldMap) {
+            historicalFoldMap.clear()
+            historicalFoldMap.putAll(pruned)
+            changed = true
         }
         if (changed) persistHistoricalFolds()
     }
@@ -6821,9 +6886,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         // A deduped direct row can represent several duplicate Marmot groups for
         // the same peer; delete the whole set so hidden duplicates don't resurface.
-        val deleteIds = if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
+        // After an MDK 0.8→0.9 resume the hidden 0.8 sibling must leave too,
+        // or the next cold-start snapshot can resurrect a deleted room.
+        val deleteIds = (
+            if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
+            ) + foldFamilyIds(chatId, historicalFoldMap)
         val deleteIdSet = deleteIds.toSet()
+        forgetHistoricalFolds(deleteIdSet)
         chats = chats.filterNot { it.id in deleteIdSet }
+        chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it !in deleteIdSet }
+        chatSnapshotLatestByChat = chatSnapshotLatestByChat.filterKeys { it !in deleteIdSet }
         for (id in deleteIds) {
             notificationSeenMessageIds.remove(id)
             notificationLatestSecs.remove(id)
@@ -6839,6 +6911,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 previouslyPublishedMessageIdsByEcho.remove(echo.id)
             }
         }
+        persistChatSnapshot()
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
             stack = stack.dropLast(1) // pop WITHOUT refresh
@@ -6871,7 +6944,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                         peerIdForMarmotGroup(group)?.let { it in aliases } == true
                 }
             ).distinctBy { it.id }
-        val foldedGroupIdsToDelete = foldedGroups.mapTo(hashSetOf()) { it.id }
+        val foldedGroupIdsToDelete = foldedGroups.flatMapTo(hashSetOf()) { group ->
+            foldFamilyIds(group.id, historicalFoldMap) + group.id
+        }
         aliases.forEach { alias ->
             meshChats.remove(alias)
             meshChatNames.remove(alias)
@@ -6880,6 +6955,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         discardRetainedTranscript(chatId)
         meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
         if (foldedGroupIdsToDelete.isNotEmpty()) {
+            forgetHistoricalFolds(foldedGroupIdsToDelete)
             chats = chats.filterNot { it.id in foldedGroupIdsToDelete }
             foldedGroupIds = foldedGroupIds - foldedGroupIdsToDelete
             foldedGroupPeerIds = foldedGroupPeerIds.filterKeys { it !in foldedGroupIdsToDelete }

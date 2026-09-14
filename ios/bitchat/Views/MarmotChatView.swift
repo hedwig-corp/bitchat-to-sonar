@@ -5002,18 +5002,28 @@ final class MarmotChatModel: ObservableObject {
 
     /// Drop one group from in-memory home/transcript state immediately so Delete
     /// / Leave paint like Compose (filter chats first) instead of waiting on FFI.
+    /// After an MDK 0.8→0.9 resume the hidden 0.8 sibling must leave too, or
+    /// the next cold-start snapshot can resurrect a deleted room.
     func dropGroupFromLocalState(_ groupId: String) {
-        groups.removeAll { $0.id == groupId }
-        messagesByGroup[groupId] = nil
-        cancelBlankTranscriptRecovery(groupId: groupId)
-        conversationSummariesByGroup[groupId] = nil
-        discardOptimistic(for: groupId)
-        localTranscriptCursorByGroup[groupId] = nil
-        localTranscriptHasOlderByGroup[groupId] = nil
-        localTranscriptLoadingGroups.remove(groupId)
-        localTranscriptPreservesOlderEdgeGroups.remove(groupId)
-        unreadByGroup[groupId] = nil
+        let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+        let family = snFoldFamilyIds(id: groupId, historicalFolds: folds)
+        groups.removeAll { family.contains($0.id) }
+        for id in family {
+            messagesByGroup[id] = nil
+            cancelBlankTranscriptRecovery(groupId: id)
+            conversationSummariesByGroup[id] = nil
+            discardOptimistic(for: id)
+            localTranscriptCursorByGroup[id] = nil
+            localTranscriptHasOlderByGroup[id] = nil
+            localTranscriptLoadingGroups.remove(id)
+            localTranscriptPreservesOlderEdgeGroups.remove(id)
+            unreadByGroup[id] = nil
+        }
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
+        let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: family)
+        if nextFolds != folds {
+            defaults.set(nextFolds, forKey: snHistoricalFoldsDefaultsKey)
+        }
     }
 
     /// Delete ONE White Noise / Marmot chat locally (messages + MLS keys), then

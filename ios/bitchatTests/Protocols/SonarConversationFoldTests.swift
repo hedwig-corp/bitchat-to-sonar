@@ -282,6 +282,35 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == ["group-08"]
         )
+        #expect(snFoldFamilyIds(id: "group-09", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
+        #expect(snFoldFamilyIds(id: "group-08", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
+        #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])
+        #expect(snPurgedHistoricalFolds(["group-08": "group-09"], deletedIds: ["group-09"]).isEmpty)
+        #expect(
+            snPurgedHistoricalFolds(["group-08": "group-09"], deletedIds: ["unrelated"])
+                == ["group-08": "group-09"]
+        )
+        #expect(
+            snPrunedOrphanedHistoricalFolds(
+                ["group-08": "group-09"],
+                listedIds: ["other-room"],
+                listedAuthoritative: true
+            ).isEmpty
+        )
+        #expect(
+            snPrunedOrphanedHistoricalFolds(
+                ["group-08": "group-09"],
+                listedIds: ["group-09"],
+                listedAuthoritative: true
+            ) == ["group-08": "group-09"]
+        )
+        #expect(
+            snPrunedOrphanedHistoricalFolds(
+                ["group-08": "group-09"],
+                listedIds: [],
+                listedAuthoritative: false
+            ) == ["group-08": "group-09"]
+        )
         let historicalMark = SNScanMark(secs: 50, count: 12)
         let promotedMarks = snPromotedFoldedScanMarks(
             previousGroupIds: ["group-08", "group-09"],

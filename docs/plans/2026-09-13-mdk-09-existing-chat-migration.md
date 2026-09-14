@@ -405,7 +405,13 @@ row on the next cold start when the live sibling is already listed, so an
 older mid-PR snapshot that still has both ids does not flash two room
 rows. Leave/delete of the live sibling
 purges the whole fold family so a later `start_dm` with the same peer cannot
-resurrect a conversation the user already removed. A recovered room with no
+resurrect a conversation the user already removed. Hosts also drop the
+hist→live blob (`sonar.historicalFolds` / `sonar.historicalFolds.v1`) and
+persist the chat snapshot without the family immediately, so a mid-session
+delete cannot leave a recovered 0.8 row for the next first paint. Pins:
+`ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
+`SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
+`snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no
 live MLS group can still be deleted: Leave degrades to a local family purge. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
@@ -436,19 +442,18 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after the in-flight send-echo remount pin. Rust
-filters last verified on `ba346336`; Compose remount pin on this commit.
+Re-run on this cloud agent after the delete-after-fold host snapshot purge.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 167 passed (`ba346336`) |
-| `--test persistence` | 29 passed (`ba346336`) |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 167 passed |
+| `--test persistence` | 29 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 44 passed (includes pending-echo remount + merged recovered transcript) |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 45 passed (includes delete-after-fold family purge) |
 | `scripts/check-regression-ledger.sh` | 236 citations |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with

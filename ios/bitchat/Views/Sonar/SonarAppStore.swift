@@ -476,6 +476,51 @@ func snCollapsedFoldedSnapshotGroups<Group>(
     }
 }
 
+/// Every recovered sibling that must leave with `id` on delete / leave.
+func snFoldFamilyIds(
+    id: String,
+    historicalFolds: [String: String]
+) -> Set<String> {
+    guard !id.isEmpty else { return [] }
+    let live = historicalFolds[id]
+        ?? historicalFolds.first(where: { $0.value == id })?.value
+        ?? id
+    var family: Set<String> = [id, live]
+    for (historical, target) in historicalFolds {
+        if historical == id || target == id || historical == live || target == live {
+            family.insert(historical)
+            family.insert(target)
+        }
+    }
+    family = family.filter { !$0.isEmpty }
+    return family
+}
+
+/// Drop host fold bindings whose historical or live id was just deleted.
+func snPurgedHistoricalFolds(
+    _ folds: [String: String],
+    deletedIds: Set<String>
+) -> [String: String] {
+    folds.filter { historical, live in
+        !deletedIds.contains(historical) && !deletedIds.contains(live)
+    }
+}
+
+/// After an authoritative `groups()` listing, drop hist→live bindings whose
+/// whole family is gone. First-paint / empty startup listings must pass
+/// `listedAuthoritative == false` so a recovered 0.8 row is not forgotten
+/// before the live sibling appears.
+func snPrunedOrphanedHistoricalFolds(
+    _ folds: [String: String],
+    listedIds: Set<String>,
+    listedAuthoritative: Bool
+) -> [String: String] {
+    guard listedAuthoritative else { return folds }
+    return folds.filter { historical, live in
+        live == historical || listedIds.contains(live) || listedIds.contains(historical)
+    }
+}
+
 /// Keep recovered call-log rows on the live sibling after FFI hides the 0.8 id.
 func snPromotedFoldedCallLogs(
     previousGroupIds: Set<String>,
@@ -7570,6 +7615,16 @@ final class SonarAppStore: ObservableObject {
                 changed = true
             }
         }
+        let listedAuthoritative = !current.isEmpty || !previous.isEmpty
+        let pruned = snPrunedOrphanedHistoricalFolds(
+            map,
+            listedIds: current,
+            listedAuthoritative: listedAuthoritative
+        )
+        if pruned != map {
+            map = pruned
+            changed = true
+        }
         if changed {
             defaults.set(map, forKey: Keys.historicalFolds)
         }
@@ -11256,9 +11311,17 @@ final class SonarAppStore: ObservableObject {
             let shouldLeave = isMultiMemberMarmotGroupId(id)
             // A deduped direct row can represent several duplicate Marmot groups
             // for the same peer; delete the whole set so hidden duplicates don't
-            // resurface after the next refresh.
+            // resurface after the next refresh. After an MDK 0.8→0.9 resume the
+            // hidden 0.8 sibling must leave too, or the next cold-start snapshot
+            // can resurrect a deleted room.
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
-            let groupIds = matching.isEmpty ? [groupId] : matching
+            let family = snFoldFamilyIds(id: groupId, historicalFolds: folds)
+            let groupIds = Array(Set((matching.isEmpty ? [groupId] : matching) + family))
+            let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: Set(groupIds))
+            if nextFolds != folds {
+                defaults.set(nextFolds, forKey: Keys.historicalFolds)
+            }
             for gid in groupIds {
                 discardRetainedConversation(gid)
                 forgetMarmotGroupMappings(forGroupId: gid)
