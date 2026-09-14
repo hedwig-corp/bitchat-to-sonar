@@ -687,6 +687,25 @@ class ConversationFoldTest {
             "npub1bob",
             directMarmotPeerKey(hiddenDm!!, "npub1me"),
         )
+        val remountedLive = listedOrFoldedSiblingChat(
+            chatId = "group-08",
+            listedChats = listOf(listedLive),
+            historicalFolds = emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("group-08", remountedLive?.id)
+        assertEquals("room", remountedLive?.name)
+        assertEquals(
+            null,
+            listedOrFoldedSiblingChat(
+                chatId = "group-other",
+                listedChats = listOf(listedLive),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertEquals(
             listOf(
                 Screen.Chat("group-09", "standup"),
@@ -964,6 +983,25 @@ class ConversationFoldTest {
                 openedConversationId = "group-09",
                 openedConversationPaneId = "group-08",
             ).map { it.id }.toSet(),
+        )
+        assertEquals(
+            "group-09",
+            callConversationStoreId(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals("group-09", callConversationStoreId("group-08", folds))
+        assertEquals(
+            "group-other",
+            callConversationStoreId(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
         )
         val updatedLive = live.copy(durSecs = 40)
         assertEquals(

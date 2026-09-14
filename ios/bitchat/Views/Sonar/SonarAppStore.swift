@@ -345,7 +345,9 @@ func snNotificationOpenIsReady(
 func snListedOrFoldedSiblingGroupId(
     groupId: String,
     listedGroupIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String? {
     if listedGroupIds.contains(groupId) { return groupId }
     if let historical = historicalFolds.first(where: { $0.value == groupId && $0.key != groupId })?.key,
@@ -354,6 +356,15 @@ func snListedOrFoldedSiblingGroupId(
     }
     if let live = historicalFolds[groupId], live != groupId, listedGroupIds.contains(live) {
         return live
+    }
+    for id in snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id)
+        if listedGroupIds.contains(bare) { return bare }
+        if listedGroupIds.contains(id) { return id }
     }
     return nil
 }
@@ -370,17 +381,11 @@ func snResolvedOpenGroupId(
     if let listed = snListedOrFoldedSiblingGroupId(
         groupId: groupId,
         listedGroupIds: listedGroupIds,
-        historicalFolds: historicalFolds
-    ) {
-        return listed
-    }
-    for id in snRemountPairConversationIds(
-        conversationId: groupId,
+        historicalFolds: historicalFolds,
         openedConversationId: openedConversationId,
         openedConversationPaneId: openedConversationPaneId
     ) {
-        let bare = snBareMarmotGroupId(id)
-        if listedGroupIds.contains(bare) { return bare }
+        return listed
     }
     return groupId
 }
@@ -2769,6 +2774,34 @@ func snRemountPairConversationIds(
         add(openedConversationPaneId)
     }
     return ids
+}
+
+/// Key new call-log rows on the remounted live sibling. Remount already
+/// moved hist rows onto live; a call placed from the painted hist pane
+/// must not write a second hist bucket that home-row counts miss while
+/// persist-folds are still empty. Keep `activeCall.convId` on hist so
+/// BLE signaling still resolves. Compose `callConversationStoreId`.
+func snCallConversationStoreId(
+    conversationId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    let pair = snRemountPairConversationIds(
+        conversationId: conversationId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if pair.count > 1, let opened = openedConversationId, !opened.isEmpty {
+        return opened
+    }
+    let bare = snBareMarmotGroupId(conversationId, prefix: prefix)
+    if let live = historicalFolds[bare] ?? historicalFolds[conversationId],
+       !live.isEmpty, live != bare, live != conversationId {
+        return conversationId.hasPrefix(prefix) ? prefix + snBareMarmotGroupId(live, prefix: prefix) : live
+    }
+    return conversationId
 }
 
 /// Conversation keys a chat-scoped payment read must check after a fold.
@@ -8209,10 +8242,14 @@ final class SonarAppStore: ObservableObject {
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let listed = Set(marmot.groups.map(\.id))
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         guard let sibling = snListedOrFoldedSiblingGroupId(
             groupId: groupId,
             listedGroupIds: listed,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         ) else { return nil }
         return marmot.groups.first { $0.id == sibling }
     }
@@ -14911,9 +14948,18 @@ final class SonarAppStore: ObservableObject {
                 )
             )
         )
-        var records = callLogs[convId, default: []]
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        let storeId = snCallConversationStoreId(
+            conversationId: convId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        var records = callLogs[storeId, default: []]
         records.append(record)
-        callLogs[convId] = Array(records.suffix(Self.maxStoredCallsPerConversation))
+        callLogs[storeId] = Array(records.suffix(Self.maxStoredCallsPerConversation))
         persistCallLogs()
     }
 

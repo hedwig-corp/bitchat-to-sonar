@@ -658,6 +658,8 @@ internal fun listedOrFoldedSiblingChat(
     chatId: String,
     listedChats: List<SonarChat>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): SonarChat? {
     listedChats.firstOrNull { it.id == chatId }?.let { return it }
     val historicalId = historicalFolds.entries
@@ -665,7 +667,16 @@ internal fun listedOrFoldedSiblingChat(
         ?.key
     listedChats.firstOrNull { it.id == historicalId }?.let { return it.copy(id = chatId) }
     val liveId = historicalFolds[chatId]?.takeIf { it != chatId }
-    return listedChats.firstOrNull { it.id == liveId }?.copy(id = chatId)
+    listedChats.firstOrNull { it.id == liveId }?.let { return it.copy(id = chatId) }
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        listedChats.firstOrNull { it.id == id || it.id == bare }?.let { return it.copy(id = chatId) }
+    }
+    return null
 }
 
 /** Shade taps remapped onto a live sibling must open even before `chats()`
@@ -2644,6 +2655,30 @@ internal fun remountPairConversationIds(
     return ids
 }
 
+/** Key new call-log rows on the remounted live sibling. Remount already
+ *  moved hist rows onto live; a call placed from a still-hist id must
+ *  not write a second hist bucket that home-row counts miss while
+ *  persist-folds are empty. Keep [ActiveCall.chatId] on hist so BLE
+ *  signaling still resolves. iOS `snCallConversationStoreId`. */
+internal fun callConversationStoreId(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    val pair = remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (pair.size > 1) {
+        openedConversationId?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+    }
+    val live = historicalFolds[chatId]
+    if (!live.isNullOrBlank() && live != chatId) return live
+    return chatId
+}
+
 /** Conversation keys a chat-scoped payment read must check after a fold.
  *  Empty persist-folds still union the remount pair so a moved live row
  *  stays visible on the painted hist pane. */
@@ -4158,7 +4193,14 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Insert or replace by call id — hangup/decline and finalize share one id. */
     private fun upsertCallRecord(chatId: String, record: CallRecord) {
-        val list = callLogs.getOrPut(chatId) { mutableListOf() }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val storeId = callConversationStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        val list = callLogs.getOrPut(storeId) { mutableListOf() }
         upsertCallRecordList(list, record)
         callVersion++
     }
@@ -5308,8 +5350,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    internal fun listedChat(chatId: String): SonarChat? =
-        listedOrFoldedSiblingChat(chatId, chats, historicalFoldMap)
+    internal fun listedChat(chatId: String): SonarChat? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return listedOrFoldedSiblingChat(
+            chatId,
+            chats,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     fun isMultiMemberChat(chatId: String): Boolean =
         if (isPendingMarmotChat(chatId)) false

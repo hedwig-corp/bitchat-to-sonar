@@ -276,6 +276,24 @@ struct SonarConversationFoldTests {
             ) == nil
         )
         #expect(
+            snListedOrFoldedSiblingGroupId(
+                groupId: "group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snListedOrFoldedSiblingGroupId(
+                groupId: "group-other",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == nil
+        )
+        #expect(
             snResolvedOpenGroupId(
                 groupId: "group-08",
                 listedGroupIds: ["group-09"],
@@ -2748,6 +2766,28 @@ struct SonarConversationFoldTests {
                 openedConversationId: "marmot:group-09",
                 openedConversationPaneId: "marmot:group-08"
             ).map(\.id) == ["call-09"]
+        )
+        #expect(
+            snCallConversationStoreId(
+                conversationId: "marmot:group-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snCallConversationStoreId(
+                conversationId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            snCallConversationStoreId(
+                conversationId: "marmot:other",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "marmot:other"
         )
         #expect(
             snRemountedPaymentPeerKey(
