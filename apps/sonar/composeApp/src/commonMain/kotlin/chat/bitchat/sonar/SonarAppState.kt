@@ -2371,9 +2371,16 @@ internal fun trillCooldownUntilMsForChat(
     chatId: String,
     cooldownUntilMs: Map<String, Long>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Long {
     var latest = 0L
-    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
         latest = maxOf(latest, cooldownUntilMs[id] ?: 0L)
     }
     return latest
@@ -2566,13 +2573,50 @@ internal fun groupInfoShouldReloadPending(
     return conversationsMatchFoldFamily(open, changedId, historicalFolds)
 }
 
-/** Conversation keys a chat-scoped payment read must check after a fold. */
+/** Painted hist id plus remounted live id. Wake-mute persist only writes
+ *  `fold_aliases`, so remount can move payment / call rows onto live while
+ *  persist-folds are still empty. iPhone still paints `.dm(hist)`.
+ *  iOS `snRemountPairConversationIds`. */
+internal fun remountPairConversationIds(
+    conversationId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+): List<String> {
+    val ids = ArrayList<String>()
+    fun add(raw: String?) {
+        val id = raw?.trim().orEmpty()
+        if (id.isEmpty()) return
+        if (ids.any { openedConversationIdMatches(it, id) }) return
+        ids += id
+    }
+    add(conversationId)
+    val inPair = openedConversationIdMatches(conversationId, openedConversationId) ||
+        openedConversationIdMatches(conversationId, openedConversationPaneId)
+    if (inPair) {
+        add(openedConversationId)
+        add(openedConversationPaneId)
+    }
+    return ids
+}
+
+/** Conversation keys a chat-scoped payment read must check after a fold.
+ *  Empty persist-folds still union the remount pair so a moved live row
+ *  stays visible on the painted hist pane. */
 internal fun paymentActivityPeerKeys(
     chatId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Set<String> {
-    val keys = linkedSetOf(chatId)
-    keys.addAll(foldFamilyIds(chatId, historicalFolds))
+    val keys = linkedSetOf<String>()
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        keys += id
+        keys.addAll(foldFamilyIds(id, historicalFolds))
+    }
     return keys.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
@@ -2585,8 +2629,15 @@ internal fun <V> callRecordsForChat(
     chatId: String,
     callLogs: Map<String, List<V>>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<V> {
-    val keys = paymentActivityPeerKeys(chatId, historicalFolds)
+    val keys = paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     if (keys.size <= 1) return callLogs[chatId].orEmpty()
     val rows = ArrayList<V>()
     for (id in keys) {
@@ -4015,10 +4066,28 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Call-log records for [chatId] (oldest first). Deduped last-wins so a
      *  hangup-then-finalize race never feeds duplicate LazyColumn keys. */
-    fun callRecords(chatId: String): List<CallRecord> =
-        dedupeCallRecordsLastWins(
-            callRecordsForChat(chatId, callLogs, historicalFoldMap),
+    fun callRecords(chatId: String): List<CallRecord> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return dedupeCallRecordsLastWins(
+            callRecordsForChat(
+                chatId,
+                callLogs,
+                historicalFoldMap,
+                opened,
+                pane,
+            ),
         )
+    }
+
+    /** Live / hist remount pair while this chat is the open transcript. */
+    private fun remountPairForOpenChat(chatId: String): Pair<String?, String?> {
+        val live = activeTranscriptChatId?.takeIf { it.isNotBlank() } ?: return null to null
+        if (!openedConversationIdMatches(chatId, live) && chatId !in transcriptSessionAliases) {
+            return null to null
+        }
+        val hist = transcriptSessionAliases.firstOrNull { !openedConversationIdMatches(it, live) }
+        return live to (hist ?: chatId)
+    }
 
     /** Insert or replace by call id — hangup/decline and finalize share one id. */
     private fun upsertCallRecord(chatId: String, record: CallRecord) {
@@ -7939,12 +8008,16 @@ class SonarAppState(private val scope: CoroutineScope) {
     // Receiver alert throttle: one buzz/notification per chat per 8 s window.
     private val trillAlertThrottle = TrillAlertThrottle()
 
-    fun canSendTrill(chatId: String): Boolean =
-        SonarClock.monotonicMillis() >= trillCooldownUntilMsForChat(
+    fun canSendTrill(chatId: String): Boolean {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return SonarClock.monotonicMillis() >= trillCooldownUntilMsForChat(
             chatId,
             trillCooldownUntilMs,
             historicalFoldMap,
+            opened,
+            pane,
         )
+    }
 
     /** Send a nudge through the exact same path a text message takes (local
      *  echo, transport auto-pick, outbox). The sender's own send also triggers

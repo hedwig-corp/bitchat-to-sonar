@@ -2690,19 +2690,56 @@ func snRemountedPendingUploadMediaKey(
     return live + "\u{1f}" + String(parts[1])
 }
 
+/// Painted hist id plus remounted live id. Wake-mute persist only writes
+/// `fold_aliases`, so FFI `liveFoldTarget` remount can move payment / call
+/// rows onto live while persist-folds are still empty. iPhone still paints
+/// `.dm(hist)`. Compose `remountPairConversationIds`.
+func snRemountPairConversationIds(
+    conversationId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?
+) -> [String] {
+    var ids: [String] = []
+    func add(_ raw: String?) {
+        guard let raw, !raw.isEmpty else { return }
+        if ids.contains(where: { snOpenedConversationIdMatches($0, raw) }) { return }
+        ids.append(raw)
+    }
+    add(conversationId)
+    let inPair = snOpenedConversationIdMatches(conversationId, openedConversationId)
+        || snOpenedConversationIdMatches(conversationId, openedConversationPaneId)
+    if inPair {
+        add(openedConversationId)
+        add(openedConversationPaneId)
+    }
+    return ids
+}
+
 /// Conversation keys a chat-scoped payment read must check after a fold.
-/// Includes both bare MLS ids and `marmot:` conversation ids.
+/// Includes both bare MLS ids and `marmot:` conversation ids. Empty
+/// persist-folds still union the remount pair so a moved live row stays
+/// visible on the painted hist pane.
 func snPaymentActivityPeerKeys(
     conversationId: String,
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> Set<String> {
-    let bare = snBareMarmotGroupId(conversationId, prefix: prefix)
-    var keys: Set<String> = [conversationId, bare]
-    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
-        keys.insert(alias)
-        if !alias.hasPrefix(prefix) {
-            keys.insert(prefix + alias)
+    var keys: Set<String> = []
+    for id in snRemountPairConversationIds(
+        conversationId: conversationId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id, prefix: prefix)
+        keys.insert(id)
+        keys.insert(bare)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+            keys.insert(alias)
+            if !alias.hasPrefix(prefix) {
+                keys.insert(prefix + alias)
+            }
         }
     }
     return keys.filter { !$0.isEmpty }
@@ -2714,12 +2751,16 @@ func snTrillCooldownUntil(
     conversationId: String,
     cooldownUntilByChat: [String: Date],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> Date? {
     var latest: Date?
     for key in snPaymentActivityPeerKeys(
         conversationId: conversationId,
         historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
         prefix: prefix
     ) {
         guard let until = cooldownUntilByChat[key] else { continue }
@@ -2738,11 +2779,15 @@ func snCallLogsForChat<Record>(
     callLogs: [String: [Record]],
     historicalFolds: [String: String],
     idOf: (Record) -> String,
-    dateOf: (Record) -> Date
+    dateOf: (Record) -> Date,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [Record] {
     let keys = snPaymentActivityPeerKeys(
         conversationId: conversationId,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     )
     if keys.isEmpty { return callLogs[conversationId] ?? [] }
     let bare = snBareMarmotGroupId(conversationId)
@@ -8977,9 +9022,18 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Bare + `marmot:` ids for this conversation and its recovered siblings.
+    /// After remount, iPhone still paints hist — include the live sibling
+    /// even when persist-folds have not landed yet.
     private func paymentActivityKeys(for id: String) -> Set<String> {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        return snPaymentActivityPeerKeys(conversationId: id, historicalFolds: folds)
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        return snPaymentActivityPeerKeys(
+            conversationId: id,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     func cachedCallRecordCount(_ id: String) -> Int {
@@ -8989,12 +9043,16 @@ final class SonarAppStore: ObservableObject {
     /// Open id plus hidden 0.8 sibling — same family walk as payments.
     private func callLogsForChat(_ id: String) -> [SNCallRecord] {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         return snCallLogsForChat(
             conversationId: id,
             callLogs: callLogs,
             historicalFolds: folds,
             idOf: { $0.id },
-            dateOf: { $0.date }
+            dateOf: { $0.date },
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 
@@ -13502,10 +13560,14 @@ final class SonarAppStore: ObservableObject {
     /// the 8-second sender cooldown).
     func canSendTrill(_ id: String) -> Bool {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         let familyUntil = snTrillCooldownUntil(
             conversationId: id,
             cooldownUntilByChat: trillCooldownUntilByChat,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
         let alertUntil = trillCooldownUntilByChat[chatAlertKey(id)]
         let until: Date?

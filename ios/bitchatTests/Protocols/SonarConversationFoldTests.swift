@@ -2645,6 +2645,43 @@ struct SonarConversationFoldTests {
             ]
         )
         #expect(
+            snRemountPairConversationIds(
+                conversationId: "marmot:group-08",
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["marmot:group-08", "marmot:group-09"]
+        )
+        #expect(
+            snPaymentActivityPeerKeys(
+                conversationId: "marmot:group-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ).isSuperset(of: [
+                "marmot:group-08", "group-08",
+                "marmot:group-09", "group-09",
+            ])
+        )
+        #expect(
+            !snPaymentActivityPeerKeys(
+                conversationId: "marmot:other",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ).contains("marmot:group-09")
+        )
+        #expect(
+            snCallLogsForChat(
+                conversationId: "marmot:group-08",
+                callLogs: ["marmot:group-09": [liveCall]],
+                historicalFolds: [:],
+                idOf: { $0.id },
+                dateOf: { $0.date },
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ).map(\.id) == ["call-09"]
+        )
+        #expect(
             snRemountedPaymentPeerKey(
                 peerKey: "marmot:group-08",
                 historicalKeys: ["marmot:group-08", "group-08"],

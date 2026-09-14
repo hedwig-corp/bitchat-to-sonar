@@ -894,6 +894,32 @@ class ConversationFoldTest {
             paymentActivityPeerKeys("group-08", mapOf("group-08" to "group-09")),
         )
         assertEquals(setOf("group-09"), paymentActivityPeerKeys("group-09", emptyMap()))
+        assertEquals(
+            setOf("group-08", "group-09"),
+            remountPairConversationIds(
+                conversationId = "group-08",
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ).toSet(),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            paymentActivityPeerKeys(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-other"),
+            paymentActivityPeerKeys(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test
@@ -928,6 +954,16 @@ class ConversationFoldTest {
         assertEquals(
             listOf(live),
             callRecordsForChat("group-09", logs, emptyMap()),
+        )
+        assertEquals(
+            setOf("call-09"),
+            callRecordsForChat(
+                "group-08",
+                mapOf("group-09" to listOf(live)),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ).map { it.id }.toSet(),
         )
         val updatedLive = live.copy(durSecs = 40)
         assertEquals(
@@ -2359,6 +2395,16 @@ class ConversationFoldTest {
                 "group-09",
                 mapOf("group-08" to 80L, "group-09" to 90L),
                 folds,
+            ),
+        )
+        assertEquals(
+            90L,
+            trillCooldownUntilMsForChat(
+                "group-08",
+                mapOf("group-09" to 90L),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ),
         )
     }
