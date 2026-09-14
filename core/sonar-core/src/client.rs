@@ -4756,16 +4756,14 @@ impl SonarClient {
         if self.relays.is_empty() {
             return;
         }
-        let active_group_ids = match self.engine.groups() {
-            Ok(groups) => groups
-                .into_iter()
-                .map(|group| hex::encode(group.id.as_slice()))
-                .collect::<HashSet<_>>(),
-            Err(err) => {
-                tracing::debug!(%err, "failed to load active Marmot groups for outbox retry");
-                return;
-            }
-        };
+        // `retryable_events` deletes rows whose group is not in this set.
+        // Live MLS ids alone drop recovered 0.8 pending sends on the first
+        // 0.9 connect; hosts then paint those mine rows as Sent.
+        self.restore_recorded_folds_from_index();
+        let active_group_ids = self.outbox_active_group_ids();
+        if active_group_ids.is_empty() {
+            return;
+        }
         let retryable = {
             let mut outbox = self.outbox_state.lock().unwrap();
             match outbox.retryable_events(Timestamp::now().as_secs(), &active_group_ids) {
@@ -4777,10 +4775,51 @@ impl SonarClient {
             }
         };
         for (message_id_hex, group_id_hex, event) in retryable {
+            let Some(group_id) = decode_group_id_hex(&group_id_hex) else {
+                continue;
+            };
+            // 0.8 ciphertext cannot be decrypted by a 0.9 peer. Keep the
+            // row so the transcript stays Pending/Failed, but do not
+            // republish it on the new wire.
+            if !self.engine.is_live_group(&group_id).unwrap_or(false) {
+                continue;
+            }
             // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
+    }
+
+    /// Groups whose outbox rows must survive idle retry. Live 0.9 ids plus
+    /// recovered 0.8 siblings (and their fold aliases) so an upgrade connect
+    /// cannot purge a pending send and lie that it was delivered.
+    fn outbox_active_group_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        match self.engine.groups() {
+            Ok(groups) => {
+                for group in groups {
+                    for alias in self.engine.fold_aliases(&group.id) {
+                        ids.insert(hex::encode(alias.as_slice()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(%err, "failed to load live groups for outbox retry");
+            }
+        }
+        match self.engine.historical_groups() {
+            Ok(historical) => {
+                for group in historical {
+                    for alias in self.engine.fold_aliases(&group.id) {
+                        ids.insert(hex::encode(alias.as_slice()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(%err, "failed to load recovered groups for outbox retry");
+            }
+        }
+        ids
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {

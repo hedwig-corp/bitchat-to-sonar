@@ -1305,6 +1305,13 @@ path. Pins:
 `ConversationFoldTest.publishedMediaUrlsIncludeHiddenHistoricalSibling`,
 `ConversationFoldTest.conversationChangeTargetPrefersListedLiveSibling`.
 
+Pending 0.8 outbox hole closed after this commit: first 0.9
+`retry_outbox` used only live MLS ids, so `retryable_events` deleted a
+recovered-id pending row and `messages()` painted the mine bubble Sent.
+Active ids now include recovered 0.8 groups and fold aliases. Historical
+ciphertext is not republished on the 0.9 wire. Pin:
+`e2e.rs::recovered_08_pending_outbox_survives_upgrade_connect`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

@@ -1346,6 +1346,53 @@ async fn recovered_08_outbound_only_chat_resumes_from_admin_pubkeys() {
     assert_eq!(alice.conversation_summaries().len(), 1);
 }
 
+/// A pending 0.8 send lives in `.sonar-outbox.json` keyed by the recovered
+/// MLS id. First 0.9 connect used to treat only live MLS ids as active, so
+/// `retryable_events` deleted that row and `messages()` painted the mine
+/// bubble as Sent.
+#[tokio::test]
+async fn recovered_08_pending_outbox_survives_upgrade_connect() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_outbound_store(
+        &db_path,
+        alice_identity.public_key(),
+        bob_identity.public_key(),
+        "still on the wire",
+    );
+    let message_id = EventId::from_slice(&[0xABu8; 32]).expect("event id");
+    let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
+    std::fs::write(
+        &outbox_path,
+        format!(
+            r#"{{"version":1,"entries":[{{"group_id_hex":"{}","message_id_hex":"{}","wrapper_event_id_hex":"{}","event_json":"{{}}","created_at_secs":1,"updated_at_secs":1,"attempts":0,"state":"pending","last_error":null}}]}}"#,
+            hex::encode(historical.as_slice()),
+            message_id.to_hex(),
+            message_id.to_hex(),
+        ),
+    )
+    .expect("write pending 0.8 outbox");
+
+    let alice = SonarClient::connect(alice_identity, vec![relay_url], &db_path, MDK08_DB_KEY)
+        .await
+        .expect("alice migrates");
+
+    assert_eq!(alice.groups().expect("no live 0.9 yet").len(), 0);
+    let recovered = alice.messages(&historical).expect("recovered transcript");
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].mine, "outbound 0.8 row must stay mine");
+    assert_eq!(
+        recovered[0].delivery_state,
+        sonar_core::marmot::DeliveryState::Pending,
+        "upgrade connect must not purge the 0.8 outbox row and lie that it sent"
+    );
+}
+
 /// Pending 0.8 welcome, 3 members, no kind-9 rows. Used to pin resume at
 /// `send_text` → `resolve_send_group` (not just `historical_resume_is_direct`).
 fn write_mdk08_pending_room_welcome(
