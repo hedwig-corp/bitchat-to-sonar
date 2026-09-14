@@ -136,7 +136,10 @@ struct SonarMacRootView: View {
                 SonarCallScreen(peerId: call.convId, video: call.video)
             }
         }
-        .onChange(of: selection) { _ in
+        .onChange(of: selection) { newSelection in
+            let nextId: String?
+            if case .dm(let id) = newSelection { nextId = id } else { nextId = nil }
+            guard store.macSelectionChangeShouldClearPath(nextConversationId: nextId) else { return }
             store.path.removeAll()
         }
         .onChange(of: store.path) { newPath in

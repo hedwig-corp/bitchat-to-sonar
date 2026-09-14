@@ -1439,6 +1439,26 @@ struct SonarConversationFoldTests {
             openId: "marmot:group-08",
             realId: "marmot:group-09"
         ) == "marmot:other")
+        #expect(!snMacSelectionChangeShouldClearPath(
+            nextId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ))
+        #expect(!snMacSelectionChangeShouldClearPath(
+            nextId: "group-09",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ))
+        #expect(snMacSelectionChangeShouldClearPath(
+            nextId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-09"
+        ))
+        #expect(snMacSelectionChangeShouldClearPath(
+            nextId: "marmot:other",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ))
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

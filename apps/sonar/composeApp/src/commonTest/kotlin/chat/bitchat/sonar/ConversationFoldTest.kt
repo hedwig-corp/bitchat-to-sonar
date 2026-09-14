@@ -1201,6 +1201,38 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun macFoldRemountKeepsPushedGroupInfoPath() {
+        assertFalse(
+            macSelectionChangeShouldClearPath(
+                nextId = "marmot:group-09",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertFalse(
+            macSelectionChangeShouldClearPath(
+                nextId = "group-09",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertTrue(
+            macSelectionChangeShouldClearPath(
+                nextId = "marmot:group-09",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-09",
+            ),
+        )
+        assertTrue(
+            macSelectionChangeShouldClearPath(
+                nextId = "marmot:other",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

@@ -1888,6 +1888,22 @@ internal fun macSelectionAfterFoldRemount(
     return if (openedConversationIdMatches(selectionId, openId)) live else selectionId
 }
 
+/** Fold remount hops Mac `.dm(hist)` → `.dm(live)` while the pane is
+ *  still hist. Do not clear pushed group-info / profile.
+ *  iOS `snMacSelectionChangeShouldClearPath`. */
+internal fun macSelectionChangeShouldClearPath(
+    nextId: String?,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+): Boolean {
+    val next = nextId?.trim().orEmpty()
+    if (next.isEmpty()) return true
+    if (!openedConversationIdMatches(next, openedConversationId)) return true
+    val pane = openedConversationPaneId?.trim().orEmpty()
+    if (pane.isEmpty()) return true
+    return openedConversationIdMatches(next, pane)
+}
+
 /** Viewing the recovered 0.8 id must still mark-read a live sibling
  *  change. Empty persist-folds cannot match; merge first.
  *  iOS `snViewingConversationShouldMarkRead`. */

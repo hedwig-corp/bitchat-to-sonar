@@ -1687,6 +1687,24 @@ func snMacSelectionAfterFoldRemount(
     return selectionId
 }
 
+/// Fold remount hops Mac `.dm(hist)` → `.dm(live)` while the pane id
+/// is still hist. `onChange(of: selection)` must not `path.removeAll()`
+/// — group-info / contact-profile stay up for `remountFoldedNavigationPath`.
+/// A real chat switch has already set pane == next. Compose rewrites the
+/// nav stack in place.
+func snMacSelectionChangeShouldClearPath(
+    nextId: String?,
+    openedConversationId: String?,
+    openedConversationPaneId: String?
+) -> Bool {
+    guard let nextId, !nextId.isEmpty else { return true }
+    guard snOpenedConversationIdMatches(nextId, openedConversationId),
+          let pane = openedConversationPaneId, !pane.isEmpty,
+          !snOpenedConversationIdMatches(nextId, pane)
+    else { return true }
+    return false
+}
+
 /// Viewing the recovered 0.8 id must still mark-read a live sibling
 /// change. Empty persist-folds cannot match; merge first.
 /// Compose `viewingConversationShouldMarkRead`.
@@ -13632,6 +13650,16 @@ final class SonarAppStore: ObservableObject {
     func isConversationOpen(_ conversationId: String) -> Bool {
         guard let openId = currentDMId else { return false }
         return conversationsMatchForNotification(openId, conversationId)
+    }
+
+    /// Mac `onChange(of: selection)` — keep pushed group-info when fold
+    /// remount hops hist → live before `openedDM(live)` refreshes the pane id.
+    func macSelectionChangeShouldClearPath(nextConversationId: String?) -> Bool {
+        snMacSelectionChangeShouldClearPath(
+            nextId: nextConversationId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
     }
 
     /// `willPresent` is already async. Merge FFI when the open recovered
