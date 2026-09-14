@@ -187,6 +187,21 @@ struct SonarConversationFoldTests {
                 }
             ) == [.groupInfo("marmot:group-09")]
         )
+        #expect(snDeletedConversationClearsOpen(
+            openId: "marmot:group-08",
+            deletedId: "marmot:group-09",
+            purgeIds: ["group-08", "group-09"]
+        ))
+        #expect(snDeletedConversationShouldClearRoute(
+            .groupInfo("marmot:group-08"),
+            deletedId: "marmot:group-09",
+            purgeIds: ["group-08", "group-09"]
+        ))
+        #expect(!snDeletedConversationShouldClearRoute(
+            .groupInfo("marmot:other"),
+            deletedId: "marmot:group-09",
+            purgeIds: ["group-09"]
+        ))
         #expect(
             snNotificationOpenGroupId(
                 tappedGroupId: "group-08",

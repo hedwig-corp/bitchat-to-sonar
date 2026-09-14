@@ -710,6 +710,27 @@ class ConversationFoldTest {
                 ) ?: id
             },
         )
+        assertTrue(
+            deletedConversationClearsOpen(
+                openId = "marmot:group-08",
+                deletedId = "marmot:group-09",
+                purgeIds = setOf("group-08", "group-09"),
+            ),
+        )
+        assertTrue(
+            deletedConversationShouldClearScreen(
+                Screen.GroupInfo("marmot:group-08"),
+                deletedId = "marmot:group-09",
+                purgeIds = setOf("group-08", "group-09"),
+            ),
+        )
+        assertFalse(
+            deletedConversationShouldClearScreen(
+                Screen.GroupInfo("marmot:other"),
+                deletedId = "marmot:group-09",
+                purgeIds = setOf("group-09"),
+            ),
+        )
         val stub = notificationOpenChat("group-09", emptyList())
         assertEquals("group-09", stub.id)
         assertEquals("", stub.name)

@@ -759,6 +759,41 @@ internal fun pathRemountShouldMergeFolds(
     persistedFolds: Map<String, String>,
 ): Boolean = pathIds.any { firstOpenShouldMergeFolds(it, persistedFolds) }
 
+/** Delete/leave of the listed live row must also pop group-info / call
+ *  / a remounted hist pane. iOS `snDeletedConversationClearsOpen`. */
+internal fun deletedConversationIdInPurge(id: String, purgeIds: Set<String>): Boolean {
+    if (id in purgeIds) return true
+    val bare = id.removePrefix("marmot:")
+    return bare.isNotEmpty() && (bare in purgeIds || "marmot:$bare" in purgeIds)
+}
+
+internal fun deletedConversationClearsOpen(
+    openId: String?,
+    deletedId: String,
+    purgeIds: Set<String>,
+): Boolean {
+    val open = openId?.trim().orEmpty()
+    if (open.isEmpty()) return false
+    if (openedConversationIdMatches(open, deletedId)) return true
+    return deletedConversationIdInPurge(open, purgeIds)
+}
+
+internal fun deletedConversationShouldClearScreen(
+    screen: Screen,
+    deletedId: String,
+    purgeIds: Set<String>,
+): Boolean {
+    val id = when (screen) {
+        is Screen.Chat -> screen.id
+        is Screen.GroupInfo -> screen.chatId
+        is Screen.ContactProfile -> screen.chatId
+        is Screen.Call -> screen.peerId
+        else -> return false
+    }
+    return openedConversationIdMatches(id, deletedId) ||
+        deletedConversationIdInPurge(id, purgeIds)
+}
+
 /**
  * Wake mute / FGS banners: merge the host fold blob with FFI
  * `fold_aliases`. FFI wins per historical id — same shape as
@@ -9245,7 +9280,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Group is still setting up."
             return
         }
-        val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val isGroup = listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
         // A deduped direct row can represent several duplicate Marmot groups for
         // the same peer; delete the whole set so hidden duplicates don't resurface.
@@ -9259,6 +9293,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
             ) + foldFamilyIds(chatId, folds)
         val deleteIdSet = deleteIds.toSet()
+        val wasOpen = stack.any { screen ->
+            deletedConversationShouldClearScreen(screen, chatId, deleteIdSet)
+        }
         // Capture before forget: persist-folds sidecar is the only name
         // core leave has for the hidden 0.8 sibling.
         val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, folds)
@@ -9284,7 +9321,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         persistChatSnapshot()
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
-            stack = stack.dropLast(1) // pop WITHOUT refresh
+            while (stack.size > 1 && stack.lastOrNull()?.let {
+                    deletedConversationShouldClearScreen(it, chatId, deleteIdSet)
+                } == true) {
+                stack = stack.dropLast(1)
+            }
             restoreRevealedChatOrClear()
         }
         scope.launch {

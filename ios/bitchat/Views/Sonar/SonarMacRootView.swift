@@ -160,6 +160,9 @@ struct SonarMacRootView: View {
             selection = .radar
             store.path.removeAll()
         }
+        .onChange(of: store.deletedOpenConversationTick) { _ in
+            if case .dm = selection { selection = .radar }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .sonarMacOpenSearch)) { _ in
             searchOpen = true
         }
@@ -350,8 +353,9 @@ private struct SonarMacSidebar: View {
             presenting: pendingDelete
         ) { row in
             Button(store.isMultiMemberMarmotGroupId(row.id) ? "Leave \(row.title)" : "Delete \(row.title)", role: .destructive) {
+                let leaveOpen = selection == .dm(row.id) || store.isConversationOpen(row.id)
                 store.deleteChat(row.id)
-                if selection == .dm(row.id) { selection = .radar }
+                if leaveOpen { selection = .radar }
             }
             Button("Cancel", role: .cancel) {}
         } message: { row in

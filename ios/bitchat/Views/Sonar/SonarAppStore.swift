@@ -600,6 +600,46 @@ func snPathRemountShouldMergeFolds(
     pathIds.contains { snFirstOpenShouldMergeFolds(seedId: $0, persistedFolds: persistedFolds) }
 }
 
+/// Delete/leave of the listed live row must also pop group-info / call
+/// / a remounted hist pane. `marmot:` vs bare, plus purge family ids.
+/// Compose `deletedConversationClearsOpen` / `deletedConversationShouldClearScreen`.
+func snDeletedConversationIdInPurge(_ id: String, purgeIds: Set<String>) -> Bool {
+    if purgeIds.contains(id) { return true }
+    let bare = snBareMarmotGroupId(id)
+    if !bare.isEmpty && (purgeIds.contains(bare) || purgeIds.contains("marmot:" + bare)) {
+        return true
+    }
+    return false
+}
+
+func snDeletedConversationClearsOpen(
+    openId: String?,
+    deletedId: String,
+    purgeIds: Set<String>
+) -> Bool {
+    guard let openId, !openId.isEmpty else { return false }
+    if snOpenedConversationIdMatches(openId, deletedId) { return true }
+    return snDeletedConversationIdInPurge(openId, purgeIds: purgeIds)
+}
+
+func snDeletedConversationShouldClearRoute(
+    _ route: SonarRoute,
+    deletedId: String,
+    purgeIds: Set<String>
+) -> Bool {
+    let id: String
+    switch route {
+    case .dm(let rid), .groupInfo(let rid), .call(let rid, _):
+        id = rid
+    case .contactProfile(let rid, _):
+        id = rid
+    default:
+        return false
+    }
+    if snOpenedConversationIdMatches(id, deletedId) { return true }
+    return snDeletedConversationIdInPurge(id, purgeIds: purgeIds)
+}
+
 /// Wake mute / gap-recovery banners: FFI `fold_aliases` over a stale
 /// or empty host blob. Compose `wakeMuteHistoricalFolds`.
 func snWakeMuteHistoricalFolds(
@@ -4466,6 +4506,9 @@ final class SonarAppStore: ObservableObject {
     @Published private var pendingMarmotMessagesByChat: [String: [SNMessage]] = [:]
     @Published private(set) var pendingMarmotRouteReplacement: SNMarmotRouteReplacement?
     @Published private(set) var pendingMarmotRouteFailure: SNMarmotRouteFailure?
+    /// Mac split-view selection is not on `path`. Increment when delete/leave
+    /// removes the open transcript so the pane hops to radar.
+    @Published private(set) var deletedOpenConversationTick: UInt64 = 0
     private var pendingDirectMarmotSends: [String: [SNPendingMarmotSend]] = [:]
     private var pendingMarmotGroupSends: [String: [SNPendingMarmotGroupSend]] = [:]
     private var startingMarmotChats = Set<String>()
@@ -14606,6 +14649,17 @@ final class SonarAppStore: ObservableObject {
     ///
     /// Optimistic: hide the row immediately (Compose filters `chats` first), then
     /// await durable MLS purge so a stuck relay cannot keep the chat visible.
+    private func noteDeletedOpenConversation(deletedId: String, purgeIds: Set<String>) {
+        guard snDeletedConversationClearsOpen(
+            openId: currentDMId,
+            deletedId: deletedId,
+            purgeIds: purgeIds
+        ) else { return }
+        openedConversationId = nil
+        openedConversationPaneId = nil
+        deletedOpenConversationTick &+= 1
+    }
+
     func deleteChat(_ id: String) {
         discardRetainedConversation(id)
         if isPendingSecureChat(id) {
@@ -14618,10 +14672,10 @@ final class SonarAppStore: ObservableObject {
                 pendingDirectMarmotSends[pendingNpub] = nil
                 cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
             }
-            path.removeAll { route in
-                if case .dm(let rid) = route { return rid == id }
-                return false
+            path.removeAll {
+                snDeletedConversationShouldClearRoute($0, deletedId: id, purgeIds: [id])
             }
+            noteDeletedOpenConversation(deletedId: id, purgeIds: [id])
             objectWillChange.send()
             return
         }
@@ -14646,10 +14700,14 @@ final class SonarAppStore: ObservableObject {
                 forgetMarmotGroupMappings(forGroupId: gid)
                 marmot.dropGroupFromLocalState(gid)
             }
-            path.removeAll { route in
-                if case .dm(let rid) = route { return rid == id || groupIds.contains(rid) }
-                return false
+            path.removeAll {
+                snDeletedConversationShouldClearRoute(
+                    $0,
+                    deletedId: id,
+                    purgeIds: Set(groupIds)
+                )
             }
+            noteDeletedOpenConversation(deletedId: id, purgeIds: Set(groupIds))
             objectWillChange.send()
             Task { @MainActor in
                 let folds = await mergedActionHistoricalFolds(for: groupId)
@@ -14717,13 +14775,15 @@ final class SonarAppStore: ObservableObject {
             foldedGroups = []
             meshPurgeIds = []
         }
-        path.removeAll { route in
-            if case .dm(let rid) = route {
-                return rid == id || meshPurgeIds.contains(rid) ||
-                    foldedGroups.contains(where: { $0.id == rid })
-            }
-            return false
+        let meshRoutePurge = Set(meshPurgeIds + foldedGroups.map(\.id))
+        path.removeAll {
+            snDeletedConversationShouldClearRoute(
+                $0,
+                deletedId: id,
+                purgeIds: meshRoutePurge
+            )
         }
+        noteDeletedOpenConversation(deletedId: id, purgeIds: meshRoutePurge)
         objectWillChange.send()
         if !meshPurgeIds.isEmpty || !foldedGroups.isEmpty {
             Task { @MainActor in
