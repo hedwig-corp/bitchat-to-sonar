@@ -1148,6 +1148,28 @@ func snPaymentActivityPeerKeys(
     return keys.filter { !$0.isEmpty }
 }
 
+/// Latest sender cooldown across the fold family (Compose
+/// `trillCooldownUntilMsForChat`).
+func snTrillCooldownUntil(
+    conversationId: String,
+    cooldownUntilByChat: [String: Date],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> Date? {
+    var latest: Date?
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    ) {
+        guard let until = cooldownUntilByChat[key] else { continue }
+        if latest == nil || until > latest! {
+            latest = until
+        }
+    }
+    return latest
+}
+
 /// Call-log rows for the open id plus its hidden 0.8 sibling. Promote copies
 /// hist onto live asynchronously; first paint of the live transcript must
 /// still show recovered calls before that rewrite lands.
@@ -11321,7 +11343,20 @@ final class SonarAppStore: ObservableObject {
     /// True when the nudge action for this chat is currently allowed (outside
     /// the 8-second sender cooldown).
     func canSendTrill(_ id: String) -> Bool {
-        SonarTrillPolicy.cooldownRemaining(until: trillCooldownUntilByChat[chatAlertKey(id)]) == nil
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let familyUntil = snTrillCooldownUntil(
+            conversationId: id,
+            cooldownUntilByChat: trillCooldownUntilByChat,
+            historicalFolds: folds
+        )
+        let alertUntil = trillCooldownUntilByChat[chatAlertKey(id)]
+        let until: Date?
+        if let familyUntil, let alertUntil {
+            until = familyUntil > alertUntil ? familyUntil : alertUntil
+        } else {
+            until = familyUntil ?? alertUntil
+        }
+        return SonarTrillPolicy.cooldownRemaining(until: until) == nil
     }
 
     /// Sends an MSN-style nudge through the exact same path a text message
