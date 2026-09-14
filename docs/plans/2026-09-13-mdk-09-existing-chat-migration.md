@@ -426,11 +426,14 @@ those rows back. `recovered_group_ids` / `seed_missing_recovered` skip dropped
 ids so a leftover in-memory title cannot recreate the chat-list row on the
 next `connectLocal`. Bak metadata backfill (`metadata_backfill=v2` for older
 markers) also omits dropped ids so a later open cannot restore forgotten
-names/members/secrets. Pins:
+names/members/secrets. `conversation_summaries` omits dropped ids and heals
+a leftover index row (crash between core purge and index remove) so unread
+probes cannot keep a deleted recovered chat. Pins:
 `mdk08_migrate::remainder_page_skips_omitted_groups`,
 `mdk08_migrate::backfill_skips_dropped_groups`,
 `persistence::delete_then_remainder_does_not_restore_transcript`,
 `marmot::historical_fold_tests::delete_live_group_forgets_historical_name_sidecar`,
+`client::tests::conversation_summaries_omit_and_heal_dropped_groups`,
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
 `snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no

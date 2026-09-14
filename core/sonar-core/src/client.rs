@@ -7228,6 +7228,13 @@ impl SonarClient {
         self.is_folded_historical_group(&GroupId::new(bytes))
     }
 
+    fn is_dropped_summary(&self, group_id_hex: &str) -> bool {
+        let Ok(bytes) = hex::decode(group_id_hex) else {
+            return false;
+        };
+        self.engine.is_dropped(&GroupId::new(bytes))
+    }
+
     /// True when `group_id` is a recovered 0.8 row that already has a live
     /// 0.9 fold sibling. Hosts must not paint that id as a second chat.
     pub fn is_folded_historical_group(&self, group_id: &GroupId) -> bool {
@@ -7378,11 +7385,32 @@ impl SonarClient {
             return Vec::new();
         };
         let mut summaries = idx.lock().unwrap().summaries_ordered().unwrap_or_default();
-        summaries.retain(|s| !self.is_folded_historical_summary(&s.group_id_hex));
+        let mut stale = Vec::new();
+        summaries.retain(|s| {
+            if self.is_folded_historical_summary(&s.group_id_hex) {
+                return false;
+            }
+            if self.is_dropped_summary(&s.group_id_hex) {
+                stale.push(s.group_id_hex.clone());
+                return false;
+            }
+            true
+        });
+        if !stale.is_empty() {
+            let idx = idx.lock().unwrap();
+            for hex in stale {
+                if let Err(e) = idx.remove_group(&hex) {
+                    tracing::warn!(%e, "index heal dropped group failed");
+                }
+            }
+        }
         summaries
     }
 
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
+        if self.is_dropped_summary(group_id_hex) {
+            return None;
+        }
         let idx = self.conversation_index.as_ref()?;
         idx.lock().unwrap().summary(group_id_hex).ok().flatten()
     }
@@ -8750,6 +8778,65 @@ mod tests {
                 .expect("summary exists")
                 .unread_count,
             2
+        );
+    }
+
+    /// Leave/delete marks the fold family dropped and removes the index row.
+    /// A crash between those two steps (or a host that only purged core) must
+    /// not keep the recovered chat in `conversation_summaries` unread/home
+    /// probes. Heal the leftover index row on the next read.
+    #[tokio::test]
+    async fn conversation_summaries_omit_and_heal_dropped_groups() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let group_id = GroupId::new([0x11u8; 16]);
+        let group_hex = hex::encode(group_id.as_slice());
+        let peer = Keys::generate().public_key();
+        client.upsert_index_for_message(
+            &ChatMessage {
+                id: test_event_id(1),
+                group_id: group_id.clone(),
+                sender: peer,
+                content: "old hello".into(),
+                created_at: Timestamp::from_secs(100),
+                mine: false,
+                delivery_state: crate::marmot::DeliveryState::Received,
+                media: vec![],
+                sticker_ref: None,
+                classification: crate::marmot::MessageClassification::of("old hello"),
+                reply: None,
+            },
+            Some("standup"),
+        );
+        assert!(client.conversation_summary(&group_hex).is_some());
+        client.engine.purge_fold_family(&group_id);
+
+        assert!(
+            client.conversation_summary(&group_hex).is_none(),
+            "dropped recovered chat must not stay readable as a summary"
+        );
+        assert!(
+            client
+                .conversation_summaries()
+                .iter()
+                .all(|s| s.group_id_hex != group_hex),
+            "home-list unread probe must omit a chat the user already left"
+        );
+        let leftover = client
+            .conversation_index
+            .as_ref()
+            .expect("index")
+            .lock()
+            .unwrap()
+            .summary(&group_hex)
+            .expect("lookup");
+        assert!(
+            leftover.is_none(),
+            "listing must heal the leftover index row so the next cold start stays clean"
         );
     }
 
