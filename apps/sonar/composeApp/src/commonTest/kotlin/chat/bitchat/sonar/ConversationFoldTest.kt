@@ -1275,6 +1275,27 @@ class ConversationFoldTest {
                 liveFoldTarget = folds::get,
             ),
         )
+        assertTrue(
+            verifiedForFoldFamily(
+                chatId = "group-09",
+                verifiedIds = setOf("group-08"),
+                historicalFolds = folds,
+            ),
+        )
+        assertFalse(
+            verifiedForFoldFamily(
+                chatId = "group-09",
+                verifiedIds = setOf("group-08"),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(
+            verifiedForFoldFamily(
+                chatId = "group-09",
+                verifiedIds = setOf("group-09"),
+                historicalFolds = folds,
+            ),
+        )
     }
 
     @Test

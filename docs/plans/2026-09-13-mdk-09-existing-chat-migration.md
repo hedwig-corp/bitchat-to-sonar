@@ -859,6 +859,12 @@ live row opened. `notificationClearIds` / `snNotificationClearIds`
 expand the fold family (and `marmot:` aliases on iOS). Mute lookup
 walks family of transcript ids the same way.
 
+Verified-row hole: promote already copies a 0.8 safety-number flag onto
+live, but `isVerified` / home-row checkmarks still keyed listed ids
+only. After collapse the hist key stayed in `verifiedChatIds` while the
+visible 0.9 DM looked unverified until remount. `verifiedForFoldFamily`
+/ `snVerifiedForFoldFamily` reuse the transcript-source set.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

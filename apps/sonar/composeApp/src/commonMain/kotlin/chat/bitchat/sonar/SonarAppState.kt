@@ -1185,6 +1185,15 @@ internal fun unreadForFoldFamily(
 ): Long = transcriptSourceIds(chatId, listedDuplicateIds, historicalFolds)
     .sumOf { unreadByChat[it] ?: 0L }
 
+/** Safety-number verify across the fold family (hidden 0.8 sibling included). */
+internal fun verifiedForFoldFamily(
+    chatId: String,
+    verifiedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    listedDuplicateIds: Collection<String> = emptyList(),
+): Boolean = transcriptSourceIds(chatId, listedDuplicateIds, historicalFolds)
+    .any { it in verifiedIds }
+
 /** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
 internal fun conversationsMatchFoldFamily(
     left: String,
@@ -4896,10 +4905,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun isVerified(chatId: String): Boolean =
-        directMarmotChatIds(chatId).any { it in verifiedChatIds }
+        verifiedForFoldFamily(
+            chatId = chatId,
+            verifiedIds = verifiedChatIds,
+            historicalFolds = historicalFoldMap,
+            listedDuplicateIds = directMarmotChatIds(chatId),
+        )
 
     fun markVerified(chatId: String) {
-        for (id in directMarmotChatIds(chatId)) {
+        for (id in transcriptSourceIds(chatId, directMarmotChatIds(chatId), historicalFoldMap)) {
             persistVerifiedId(id)
         }
         verifiedVersion++
@@ -5833,7 +5847,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Pending rows use creation time so recency merge does not sink
                 // a freshly-started chat under older history (iOS dmRows parity).
                 tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
-                verified = ids.any { it in verifiedChatIds },
+                verified = unreadIds.any { it in verifiedChatIds },
                 unread = unreadIds.sumOf { unreadByChat[it] ?: 0L } > 0,
                 pending = pending,
                 multiMember = isMultiMemberChat(chat.id),

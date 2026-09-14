@@ -851,6 +851,20 @@ func snUnreadForFoldFamily(
     ).reduce(UInt64(0)) { $0 + (unreadByGroup[$1] ?? 0) }
 }
 
+/// Safety-number verify across listed 1:1 duplicates plus the hidden 0.8 sibling.
+func snVerifiedForFoldFamily(
+    groupId: String,
+    verifiedIds: Set<String>,
+    historicalFolds: [String: String],
+    listedDuplicateIds: [String] = []
+) -> Bool {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: listedDuplicateIds,
+        historicalFolds: historicalFolds
+    ).contains { verifiedIds.contains($0) }
+}
+
 /// Ids whose local transcript window must reload for one `conversationChanged`.
 /// A bak remainder / fold-alias tick names the hidden 0.8 id; FFI
 /// `messages()` unions the family, so refresh the listed sibling instead of
@@ -6239,7 +6253,20 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func hasVerifiedMarmotGroup(in groups: [MarmotService.MarmotGroup]) -> Bool {
-        groups.contains { marmotVerified[$0.id] ?? false }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        guard let first = groups.first else { return false }
+        let verifiedIds = Set(marmotVerified.compactMap { key, value -> String? in
+            guard value else { return nil }
+            return key.hasPrefix(Self.marmotIDPrefix)
+                ? String(key.dropFirst(Self.marmotIDPrefix.count))
+                : key
+        })
+        return snVerifiedForFoldFamily(
+            groupId: first.id,
+            verifiedIds: verifiedIds,
+            historicalFolds: folds,
+            listedDuplicateIds: groups.map(\.id)
+        )
     }
 
     /// Listed 1:1 duplicates plus the hidden 0.8 sibling. Used for unread
@@ -11512,7 +11539,20 @@ final class SonarAppStore: ObservableObject {
     func isVerified(_ id: String) -> Bool {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
-            if groups.isEmpty { return marmotVerified[groupId] ?? false }
+            if groups.isEmpty {
+                let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+                let verifiedIds = Set(marmotVerified.compactMap { key, value -> String? in
+                    guard value else { return nil }
+                    return key.hasPrefix(Self.marmotIDPrefix)
+                        ? String(key.dropFirst(Self.marmotIDPrefix.count))
+                        : key
+                })
+                return snVerifiedForFoldFamily(
+                    groupId: groupId,
+                    verifiedIds: verifiedIds,
+                    historicalFolds: folds
+                )
+            }
             return hasVerifiedMarmotGroup(in: groups)
         }
         guard let fingerprint = chatViewModel.getFingerprint(for: PeerID(str: id)) else { return false }
@@ -11522,10 +11562,15 @@ final class SonarAppStore: ObservableObject {
     func markVerified(_ id: String) {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
-            if groups.isEmpty {
-                marmotVerified[groupId] = true
-            } else {
-                for group in groups { marmotVerified[group.id] = true }
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let ids = snTranscriptSourceIds(
+                groupId: groupId,
+                listedDirectIds: groups.map(\.id),
+                historicalFolds: folds
+            )
+            for stamped in ids {
+                marmotVerified[stamped] = true
+                marmotVerified[Self.marmotIDPrefix + stamped] = true
             }
             defaults.set(marmotVerified, forKey: Keys.marmotVerified)
         } else {

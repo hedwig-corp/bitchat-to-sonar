@@ -589,6 +589,20 @@ struct SonarConversationFoldTests {
             ) == 0
         )
         #expect(
+            snVerifiedForFoldFamily(
+                groupId: "group-09",
+                verifiedIds: Set(["group-08"]),
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snVerifiedForFoldFamily(
+                groupId: "group-09",
+                verifiedIds: Set(["group-08"]),
+                historicalFolds: [:]
+            )
+        )
+        #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",
                 listedGroupIds: ["group-09"],
