@@ -2985,6 +2985,23 @@ impl MarmotEngine {
         Ok(self.historical_members(group_id))
     }
 
+    /// Roster hosts should paint for this conversation.
+    ///
+    /// Unions live MLS members with recovered 0.8 fold-family rosters so a
+    /// remounted room still lists people who have not joined the 0.9 group
+    /// yet. Do **not** use this for resume / `missing_resume_peers`: that
+    /// path must keep [`Self::members`] as the live session only, or leftover
+    /// peers look already invited and are never added.
+    pub fn display_members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
+        let mut members = Vec::new();
+        for alias in self.fold_family(group_id) {
+            members.extend(self.members(&alias)?);
+        }
+        members.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        members.dedup();
+        Ok(members)
+    }
+
     pub fn latest_message_secs(&self) -> u64 {
         self.transcript
             .lock()
@@ -4086,6 +4103,53 @@ mod historical_fold_tests {
         );
         assert_eq!(pages[0].group_id, live);
         assert_eq!(pages[0].messages.len(), 2);
+    }
+
+    #[test]
+    fn display_members_unions_folded_historical_roster() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let carol = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        engine.push_transcript_message(chat(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            "old hello",
+            false,
+        ));
+        engine
+            .historical_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                historical.clone(),
+                vec![bob.public_key(), carol.public_key()],
+            );
+        engine.record_historical_fold(&historical, &live);
+
+        let live_only = engine.members(&live).expect("live members stay single-id");
+        assert!(
+            !live_only.contains(&bob.public_key()),
+            "members(live) must not union the recovered roster or late-resume skips leftover peers"
+        );
+        assert!(
+            !live_only.contains(&carol.public_key()),
+            "members(live) must not union sidecar-only leftover members"
+        );
+        assert_eq!(live_only, vec![alice.public_key()]);
+
+        let display = engine
+            .display_members(&live)
+            .expect("display members union the fold family");
+        assert!(display.contains(&alice.public_key()));
+        assert!(display.contains(&bob.public_key()));
+        assert!(
+            display.contains(&carol.public_key()),
+            "remounted room must still list people who have not joined 0.9 yet"
+        );
     }
 
     #[test]

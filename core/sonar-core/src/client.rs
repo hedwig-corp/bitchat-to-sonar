@@ -7416,6 +7416,11 @@ impl SonarClient {
         self.engine.members(group_id)
     }
 
+    /// FFI / host paint only. See [`MarmotEngine::display_members`].
+    pub fn display_members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
+        self.engine.display_members(group_id)
+    }
+
     /// Delete a single Marmot chat's local state (see
     /// [`MarmotEngine::delete_group`]) and narrow the live 445 subscription so we
     /// stop receiving its messages. Local-only; the peer is not notified.

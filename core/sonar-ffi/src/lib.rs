@@ -1691,7 +1691,7 @@ impl SonarNode {
             seen.insert(id_hex.clone());
             let members = self
                 .client
-                .members(&g.id)?
+                .display_members(&g.id)?
                 .into_iter()
                 .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
                 .collect();
