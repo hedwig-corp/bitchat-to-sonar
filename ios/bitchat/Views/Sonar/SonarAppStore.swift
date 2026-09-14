@@ -371,6 +371,34 @@ func snPromotedFoldedComposerDrafts(
     return next
 }
 
+/// Merge in-flight send echoes from a hidden 0.8 id onto the live sibling.
+func snPromotedFoldedPendingMessages<Message>(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    messagesByChat: [String: [Message]],
+    liveFoldTarget: (String) -> String?,
+    idOf: (Message) -> String
+) -> [String: [Message]] {
+    var next = messagesByChat.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let incoming = next[pair.historical], !incoming.isEmpty else { continue }
+        let existing = next[pair.live] ?? []
+        var seen = Set(existing.map(idOf))
+        var merged = existing
+        for message in incoming where seen.insert(idOf(message)).inserted {
+            merged.append(message)
+        }
+        next[pair.live] = merged
+    }
+    return next
+}
+
 /// Keep a recovered in-memory transcript window on the live sibling.
 func snPromotedFoldedMessagesByGroup<Message>(
     previousGroupIds: Set<String>,
@@ -2443,6 +2471,7 @@ final class SonarAppStore: ObservableObject {
                     await self.promoteFoldedMutes(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedPendingEchoes(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedVerified(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedScanWatermarks(from: self.lastMarmotGroupIds, to: current)
@@ -7352,6 +7381,82 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Keep an in-flight send echo on the live sibling after FFI hides the 0.8 id.
+    @MainActor
+    private func promoteFoldedPendingEchoes(from previous: Set<String>, to current: Set<String>) async {
+        var extraGroupIds = Set<String>()
+        for key in pendingMarmotMessagesByChat.keys {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                extraGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                extraGroupIds.insert(key.lowercased())
+            }
+        }
+        extraGroupIds.formUnion(previous)
+        extraGroupIds.subtract(current)
+        var targets: [String: String] = [:]
+        for historical in extraGroupIds {
+            if let live = await marmot.liveFoldTarget(groupId: historical) {
+                targets[historical] = live
+            }
+        }
+        var byGroup: [String: [SNMessage]] = [:]
+        for (key, rows) in pendingMarmotMessagesByChat {
+            let groupId: String
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                groupId = String(key.dropFirst(Self.marmotIDPrefix.count))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                groupId = key.lowercased()
+            } else {
+                continue
+            }
+            byGroup[groupId, default: []].append(contentsOf: rows)
+        }
+        let next = snPromotedFoldedPendingMessages(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            messagesByChat: byGroup,
+            liveFoldTarget: { targets[$0] },
+            idOf: { $0.id }
+        )
+        for (groupId, rows) in next where current.contains(groupId) {
+            let liveId = Self.marmotIDPrefix + groupId
+            let existing = pendingMarmotMessagesByChat[liveId] ?? []
+            var seen = Set(existing.map(\.id))
+            var merged = existing
+            for row in rows where seen.insert(row.id).inserted {
+                merged.append(row)
+            }
+            if merged.isEmpty {
+                pendingMarmotMessagesByChat[liveId] = nil
+            } else {
+                pendingMarmotMessagesByChat[liveId] = merged
+            }
+        }
+        let pairs = snPromotedFoldedMutePairs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            muteKeys: extraGroupIds,
+            liveFoldTarget: { targets[$0] }
+        )
+        for pair in pairs {
+            remountFoldedPendingSendQueues(
+                from: [pair.historical, Self.marmotIDPrefix + pair.historical],
+                onto: Self.marmotIDPrefix + pair.live
+            )
+            if let until = trillCooldownUntilByChat[pair.historical]
+                ?? trillCooldownUntilByChat[Self.marmotIDPrefix + pair.historical] {
+                let liveId = Self.marmotIDPrefix + pair.live
+                if trillCooldownUntilByChat[liveId] == nil {
+                    trillCooldownUntilByChat[liveId] = until
+                }
+                if trillCooldownUntilByChat[pair.live] == nil {
+                    trillCooldownUntilByChat[pair.live] = until
+                }
+            }
+        }
+    }
+
     /// Copy a safety-number verify from a hidden 0.8 row onto the live sibling.
     @MainActor
     private func promoteFoldedVerified(from previous: Set<String>, to current: Set<String>) async {
@@ -7508,6 +7613,13 @@ final class SonarAppStore: ObservableObject {
         guard remounted != groupId else { return }
         let realId = Self.marmotIDPrefix + remounted
         marmot.remountFoldedLocalTranscriptWindow(from: groupId, onto: remounted)
+        remountFoldedPendingEchoes(from: [openId, groupId], onto: realId)
+        remountFoldedPendingSendQueues(from: [openId, groupId], onto: realId)
+        trillCooldownUntilByChat = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: trillCooldownUntilByChat
+        )
         unreadCountAtOpenByDM = snRemountFoldedOpenValues(
             historicalKeys: [openId, groupId],
             liveKeys: [realId, remounted],
@@ -7586,6 +7698,46 @@ final class SonarAppStore: ObservableObject {
         markMarmotGroupsRead(matchingGroupId: remounted)
         syncViewingUnreadGroups()
         Task { await self.marmot.refreshWhenConnected(groupId: remounted, hydrateBeforeSync: false) }
+    }
+
+    /// Move in-flight send echoes off a hidden 0.8 conversation id.
+    private func remountFoldedPendingEchoes(from historicalIds: [String], onto liveId: String) {
+        var moved = pendingMarmotMessagesByChat[liveId] ?? []
+        var seen = Set(moved.map(\.id))
+        for historical in historicalIds {
+            guard let incoming = pendingMarmotMessagesByChat.removeValue(forKey: historical) else {
+                continue
+            }
+            for echo in incoming where seen.insert(echo.id).inserted {
+                moved.append(echo)
+            }
+        }
+        if moved.isEmpty {
+            pendingMarmotMessagesByChat[liveId] = nil
+        } else {
+            pendingMarmotMessagesByChat[liveId] = moved
+        }
+    }
+
+    /// Keep queued recovered sends pointed at the live conversation id so
+    /// fail/clear still finds the echo after remount.
+    private func remountFoldedPendingSendQueues(from historicalIds: [String], onto liveId: String) {
+        for historical in historicalIds {
+            if let queue = pendingDirectMarmotSends.removeValue(forKey: historical) {
+                let remounted = queue.map {
+                    SNPendingMarmotSend(
+                        chatId: liveId,
+                        text: $0.text,
+                        messageId: $0.messageId,
+                        reply: $0.reply
+                    )
+                }
+                pendingDirectMarmotSends[liveId, default: []].append(contentsOf: remounted)
+            }
+            if let queue = pendingMarmotGroupSends.removeValue(forKey: historical) {
+                pendingMarmotGroupSends[liveId, default: []].append(contentsOf: queue)
+            }
+        }
     }
 
     /// `ConversationViewState.conversationId` is immutable, so remount creates

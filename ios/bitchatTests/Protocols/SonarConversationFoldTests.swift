@@ -197,6 +197,33 @@ struct SonarConversationFoldTests {
                 liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
             )["group-09"] == ["already live"]
         )
+        #expect(
+            snPromotedFoldedPendingMessages(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                messagesByChat: ["group-08": ["echo-08"]],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil },
+                idOf: { $0 }
+            )["group-09"] == ["echo-08"]
+        )
+        #expect(
+            snPromotedFoldedPendingMessages(
+                previousGroupIds: [],
+                currentGroupIds: ["group-09"],
+                messagesByChat: ["group-08": ["echo-08"], "group-09": ["echo-09"]],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil },
+                idOf: { $0 }
+            )["group-09"] == ["echo-09", "echo-08"]
+        )
+        #expect(
+            snPromotedFoldedPendingMessages(
+                previousGroupIds: [],
+                currentGroupIds: ["group-09"],
+                messagesByChat: ["group-08": ["echo-08"], "group-09": ["echo-08"]],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil },
+                idOf: { $0 }
+            )["group-09"] == ["echo-08"]
+        )
         let older = Date(timeIntervalSince1970: 1)
         let newer = Date(timeIntervalSince1970: 2)
         let historicalCall = SNCallRecord(

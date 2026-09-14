@@ -663,6 +663,50 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalPendingEchoesMoveOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = listOf(
+            SonarMsg(id = "echo-08", senderNpub = "npub1me", content = "sending", mine = true, tsSecs = 1L),
+        )
+        val live = listOf(
+            SonarMsg(id = "echo-09", senderNpub = "npub1me", content = "already", mine = true, tsSecs = 2L),
+        )
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to historical),
+            promotedFoldedPendingMessages(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                messagesByChat = mapOf("group-08" to historical),
+                liveFoldTarget = folds::get,
+                idOf = { it.id },
+            ),
+        )
+        assertEquals(
+            mapOf(
+                "group-08" to historical,
+                "group-09" to live + historical,
+            ),
+            promotedFoldedPendingMessages(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                messagesByChat = mapOf("group-08" to historical, "group-09" to live),
+                liveFoldTarget = folds::get,
+                idOf = { it.id },
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to historical),
+            promotedFoldedPendingMessages(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                messagesByChat = mapOf("group-08" to historical, "group-09" to historical),
+                liveFoldTarget = folds::get,
+                idOf = { it.id },
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalCallLogsMoveOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         val historical = CallRecord(id = "call-08", video = false, mine = true, durSecs = 12, tsSecs = 1L)

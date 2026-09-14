@@ -618,6 +618,28 @@ internal fun promotedFoldedComposerDrafts(
         preferExisting = { it.isNotEmpty() },
     )
 
+/** Merge in-flight send echoes from a hidden 0.8 id onto the live sibling. */
+internal fun <V> promotedFoldedPendingMessages(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    messagesByChat: Map<String, List<V>>,
+    liveFoldTarget: (String) -> String?,
+    idOf: (V) -> String,
+): Map<String, List<V>> {
+    var next = messagesByChat
+    for (historical in previousIds + messagesByChat.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = messagesByChat[historical].orEmpty()
+        if (incoming.isEmpty()) continue
+        val existing = next[live].orEmpty()
+        val existingIds = existing.mapTo(hashSetOf(), idOf)
+        next = next + (live to existing + incoming.filter { idOf(it) !in existingIds })
+    }
+    return next
+}
+
 /** Keep a recovered transcript window on the live sibling after FFI hides the 0.8 id. */
 internal fun promotedFoldedSnapshotMessages(
     previousIds: Set<String>,
@@ -7975,7 +7997,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun moveSendEchoes(fromChatId: String, toChatId: String) {
         val moving = pendingSendEchoes.remove(fromChatId).orEmpty()
         if (moving.isEmpty()) return
-        pendingSendEchoes.getOrPut(toChatId) { mutableListOf() }.addAll(moving)
+        val dest = pendingSendEchoes.getOrPut(toChatId) { mutableListOf() }
+        val seen = dest.mapTo(hashSetOf()) { it.id }
+        for (echo in moving) {
+            if (seen.add(echo.id)) dest.add(echo)
+        }
     }
 
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
@@ -12368,6 +12394,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         promoteFoldedCallLogs(previousOrder.toSet(), listedIds)
         promoteFoldedVerified(previousOrder.toSet(), listedIds)
         promoteFoldedScanState(previousOrder.toSet(), listedIds)
+        promoteFoldedPendingEchoes(previousOrder.toSet(), listedIds)
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12499,6 +12526,30 @@ class SonarAppState(private val scope: CoroutineScope) {
         callVersion++
     }
 
+    private fun promoteFoldedPendingEchoes(previousIds: Set<String>, currentIds: Set<String>) {
+        val next = promotedFoldedPendingMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = pendingSendEchoes.mapValues { it.value.toList() },
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+            idOf = { it.id },
+        )
+        if (next == pendingSendEchoes.mapValues { it.value.toList() }) return
+        pendingSendEchoes.clear()
+        for ((id, echoes) in next) {
+            if (echoes.isNotEmpty()) pendingSendEchoes[id] = echoes.toMutableList()
+        }
+        val nextTrill = promotedFoldedValues(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            values = trillCooldownUntilMs,
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+        if (nextTrill != trillCooldownUntilMs) {
+            trillCooldownUntilMs = nextTrill
+        }
+    }
+
     /** FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
      *  transcript, swap the nav id to the live 0.9 sibling so member/title
      *  lookups keep working. In-flight send closures keep the historical id
@@ -12513,6 +12564,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (live == open.id) return
         val liveChat = chats.firstOrNull { it.id == live } ?: return
         moveSendEchoes(open.id, live)
+        trillCooldownUntilMs = remountFoldedOpenValues(
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+            values = trillCooldownUntilMs,
+        )
         retainedTranscriptByChat[open.id]?.let { retainedTranscriptByChat[live] = it }
         retainedTranscriptByChat.remove(open.id)
         remountFoldedOpenValues(
