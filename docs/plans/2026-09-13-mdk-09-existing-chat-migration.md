@@ -1274,13 +1274,16 @@ unique subset (R-045). Restore also runs on `groups()`,
 `display_members` / `display_name`, `live_fold_target_hex` /
 `fold_aliases_hex`, `leave_group` / `delete_group`,
 `maybe_fold_new_group`, `resolve_send_group` (hist mint path),
-`invite_family` / `invite_mint_group`, and a successful
-`store_join_request` notifies every family id so live group-info
-wakes. Do not restore inside `is_folded_historical_group` itself.
+`invite_family` / `invite_mint_group`, `group_is_direct` (a 2-person
+live sibling of an empty-topic room must not paint as a DM), and a
+successful `store_join_request` notifies every family id so live
+group-info wakes. Do not restore inside `is_folded_historical_group`
+itself.
 Pins:
 `persist_folds_lost_core_sidecar_refolds_empty_desc_room_from_index`,
 `persist_folds_lost_core_sidecar_invite_family_sees_hist_requests`,
 `persist_folds_lost_core_sidecar_send_on_hist_reuses_live`,
+`persist_folds_empty_topic_room_live_is_not_direct`,
 `persist_folds_lost_core_sidecar_second_dm_does_not_steal_hist`,
 `persist_folds_lost_core_sidecar_delete_live_purges_hist_from_index`,
 `conversation_index::record_fold_roundtrips_and_remove_group_forgets_bind`,

@@ -3101,25 +3101,16 @@ impl SonarClient {
         let me = self.identity().public_key();
         for group in groups {
             let members = self.engine.members(&group.id)?;
-            if Self::is_reusable_dm_group(&group, &members, &me, peer) {
+            if members.len() != 2 || !members.contains(peer) || !members.contains(&me) {
+                continue;
+            }
+            // `group_is_direct` keeps a remounted empty-topic room off this
+            // path (R-045). Do not reuse session name/desc alone.
+            if self.group_is_direct(&group.id) {
                 return Ok(Some(group.id));
             }
         }
         Ok(None)
-    }
-
-    fn is_reusable_dm_group(
-        group: &cgka_traits::group::Group,
-        members: &[PublicKey],
-        me: &PublicKey,
-        peer: &PublicKey,
-    ) -> bool {
-        if members.len() != 2 || !members.contains(peer) || !members.contains(me) {
-            return false;
-        }
-
-        group.description == SONAR_DIRECT_DM_DESCRIPTION
-            || (group.description.is_empty() && group.name.is_empty())
     }
 
     async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
@@ -7114,8 +7105,25 @@ impl SonarClient {
     /// Hosts fold 1:1s by the single other npub. A recovered or live room
     /// that currently lists only one reachable peer must not ride that path.
     pub fn group_is_direct(&self, group_id: &GroupId) -> bool {
+        // Persist-folds remounts a 2-person live sibling before leftover
+        // members join 0.9. Restore the recorded bind so an empty-topic
+        // room is not painted as a DM (R-045) after the JSON sidecar is lost.
+        self.restore_recorded_folds_touching(group_id);
         if self.engine.is_historical_group(group_id).unwrap_or(false) {
             return self.engine.historical_resume_is_direct(group_id);
+        }
+        // Live id of a recovered room: hosts fold 1:1s by `is_direct`.
+        // Partial resume copies empty name+desc onto a 2-person MLS
+        // group, which would otherwise match the live DM rule.
+        for alias in self.engine.fold_aliases(group_id) {
+            if alias == *group_id {
+                continue;
+            }
+            if self.engine.is_historical_group(&alias).unwrap_or(false)
+                && !self.engine.historical_resume_is_direct(&alias)
+            {
+                return false;
+            }
         }
         let Ok(groups) = self.engine.groups() else {
             return false;

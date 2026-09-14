@@ -2676,3 +2676,81 @@ async fn persist_folds_lost_core_sidecar_send_on_hist_reuses_live() {
         "the send must land on the existing live sibling"
     );
 }
+
+/// Empty name+desc 3-person room: partial resume mints a 2-person live
+/// group with the same empty topic. Live `group_is_direct` used to treat
+/// that as a DM, so hosts folded it onto the welcomer 1:1 (R-045).
+#[tokio::test]
+async fn persist_folds_empty_topic_room_live_is_not_direct() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    assert!(
+        !alice.engine().historical_resume_is_direct(&historical),
+        "three recovered senders must keep the room off the DM resume path"
+    );
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "partial resume")
+        .await
+        .expect("resume with bob");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert!(
+        !alice.group_is_direct(&historical),
+        "recovered empty-topic room must stay a room"
+    );
+    assert!(
+        !alice.group_is_direct(&live),
+        "the 2-person live sibling must not paint as a DM"
+    );
+
+    let bob_dm = alice
+        .start_dm(bob.identity().public_key(), "bob dm")
+        .await
+        .expect("real 1:1 with bob");
+    assert_ne!(bob_dm, live, "room must not reuse the welcomer DM");
+    assert!(
+        alice.group_is_direct(&bob_dm),
+        "the real 1:1 must still fold by npub"
+    );
+    assert_eq!(
+        alice.groups().expect("room + dm").len(),
+        2,
+        "empty-topic room and the welcomer DM are two live groups"
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    assert!(
+        !alice.group_is_direct(&live),
+        "lost sidecar must not reclassify the remounted room as a DM"
+    );
+}
