@@ -992,6 +992,17 @@ write / clear / capture now walk the fold family (`quotedJumpParentId`
 `ConversationFoldTest.quotedMessageRevealExpandsPaintedPageToParent`,
 `SonarConversationFoldTests` `snQuotedJumpParentId`.
 
+First-open gate hole closed after this commit: Compose `openChat` /
+`openDm` only immediate-pushed a retained leave-frame, so a remounted
+0.8 snapshot still waited on `messages(live)` before Chat mounted.
+iOS `dmHasLocalTranscriptPaint` checked listed `messagesByGroup[live]`
+only, so `openDM` waited on `loadLocalWhenConnected` while recovered
+rows sat on the hidden sibling. Immediate paint now uses
+`firstOpenHasLocalTranscriptPaint` / `snDMHasLocalMarmotPaint`. Pins:
+`ConversationFoldTest.retainedTranscriptReadWalksFoldFamily`,
+`SonarConversationFoldTests` `snFirstOpenHasLocalTranscriptPaint` /
+`snDMHasLocalMarmotPaint`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

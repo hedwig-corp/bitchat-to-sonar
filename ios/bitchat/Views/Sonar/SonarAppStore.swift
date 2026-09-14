@@ -1214,6 +1214,36 @@ func snFirstOpenTranscriptPaintRows<Message>(
     return snMergedFoldedMessageLists(historical: snapshotPaint, live: retained, idOf: idOf)
 }
 
+/// First open may paint immediately from a remounted 0.8 host cache, not
+/// only a leave-frame. Waiting on `loadLocalWhenConnected` hid recovered
+/// history until the live page returned. Compose `firstOpenHasLocalTranscriptPaint`.
+func snFirstOpenHasLocalTranscriptPaint<Message>(
+    retained: [Message],
+    familyCached: [Message]
+) -> Bool {
+    !retained.isEmpty || !familyCached.isEmpty
+}
+
+/// Listed live pages plus leftover hist cache. After collapse
+/// `messagesByGroup[live]` can be empty while recovered 0.8 rows still
+/// sit on the hidden sibling.
+func snDMHasLocalMarmotPaint<Message>(
+    groupId: String,
+    listedGroupIds: [String],
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String
+) -> Bool {
+    let ids = listedGroupIds.isEmpty ? [groupId] : listedGroupIds
+    if ids.contains(where: { !(messagesByGroup[$0] ?? []).isEmpty }) { return true }
+    return !snFoldFamilyCachedMessages(
+        groupId: groupId,
+        messagesByGroup: messagesByGroup,
+        historicalFolds: historicalFolds,
+        idOf: idOf
+    ).isEmpty
+}
+
 /// Read a draft from the open id or its hidden 0.8 sibling after a fold.
 func snComposerDraft(
     chatId: String,
@@ -10674,13 +10704,19 @@ final class SonarAppStore: ObservableObject {
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else { return false }
         let groups = directMarmotGroups(matchingGroupId: groupId)
-        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
-        return ids.contains { !(marmot.messagesByGroup[$0] ?? []).isEmpty }
+        return snDMHasLocalMarmotPaint(
+            groupId: groupId,
+            listedGroupIds: groups.map(\.id),
+            messagesByGroup: marmot.messagesByGroup,
+            historicalFolds: folds,
+            idOf: { $0.id }
+        )
     }
 
-    /// Navigate into a DM after the local newest page is ready (Compose
-    /// `openChat` parity). First open awaits `loadLocalWhenConnected` before
-    /// present; reopen uses retained leave paint and hydrates in the background.
+    /// Navigate into a DM when local paint is ready (Compose `openChat`
+    /// parity). A remounted 0.8 family cache or retained leave paint
+    /// presents immediately; otherwise first open awaits
+    /// `loadLocalWhenConnected` before present.
     /// Pass `present` on Mac (selection) instead of the default `push(.dm)`.
     func openDM(
         _ id: String,

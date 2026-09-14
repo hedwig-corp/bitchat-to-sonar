@@ -767,6 +767,27 @@ struct SonarConversationFoldTests {
                 idOf: { $0 }
             ) == ["old from 0.8", "snap"]
         )
+        #expect(snFirstOpenHasLocalTranscriptPaint(retained: [String](), familyCached: ["old from 0.8"]))
+        #expect(snFirstOpenHasLocalTranscriptPaint(retained: ["leave"], familyCached: [String]()))
+        #expect(!snFirstOpenHasLocalTranscriptPaint(retained: [String](), familyCached: [String]()))
+        #expect(
+            snDMHasLocalMarmotPaint(
+                groupId: "group-09",
+                listedGroupIds: ["group-09"],
+                messagesByGroup: ["group-08": ["keep this chat"]],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0 }
+            )
+        )
+        #expect(
+            !snDMHasLocalMarmotPaint(
+                groupId: "group-09",
+                listedGroupIds: ["group-09"],
+                messagesByGroup: ["group-08": ["keep this chat"]],
+                historicalFolds: [:],
+                idOf: { $0 }
+            )
+        )
         #expect(snPersistedLiveFoldTarget(groupId: "group-08", historicalFolds: ["group-08": "group-09"]) == "group-09")
         #expect(snPersistedLiveFoldTarget(groupId: "group-09", historicalFolds: ["group-08": "group-09"]) == nil)
         #expect(

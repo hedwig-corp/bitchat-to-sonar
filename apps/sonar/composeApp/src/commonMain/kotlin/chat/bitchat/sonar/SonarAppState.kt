@@ -1224,6 +1224,14 @@ internal fun firstOpenTranscriptPaintRows(
         .sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
 }
 
+/** First open may paint immediately from a remounted 0.8 snapshot, not
+ *  only a leave-frame. Waiting on the FFI local page hid recovered
+ *  history until `messages(live)` returned. iOS `snFirstOpenHasLocalTranscriptPaint`. */
+internal fun firstOpenHasLocalTranscriptPaint(
+    retained: List<SonarMsg>,
+    snapshot: List<SonarMsg>,
+): Boolean = retained.isNotEmpty() || snapshot.withoutSyntheticSummaryRows().isNotEmpty()
+
 /** Read a draft from the open id or its hidden 0.8 sibling after a fold. */
 internal fun composerDraftForChat(
     chatId: String,
@@ -7466,29 +7474,33 @@ class SonarAppState(private val scope: CoroutineScope) {
         markGroupsRead(transcriptGroupIds(chat.id))
         val title = chatTitle(chat)
 
-        // Reopen: retained paint is already the last leave frame — push now.
-        // After an MDK 0.8→0.9 fold the leave frame may still be keyed on
-        // the hidden historical id; walk the family so first paint is not empty.
-        retainedTranscriptForChat(chat.id, retainedTranscriptByChat, historicalFoldMap)
-            .takeIf { it.isNotEmpty() }
-            ?.let { retained ->
-            if (retainedTranscriptByChat[chat.id].isNullOrEmpty()) {
-                retainOpenTranscript(chat.id, retained)
-            }
-            val snapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
-            val union = firstOpenTranscriptPaintRows(
-                chat.id,
-                retainedTranscriptByChat,
-                snapshot,
-                historicalFoldMap,
+        // Reopen *or* first open with a remounted 0.8 snapshot: push now.
+        // Waiting on `messages(live)` hid recovered history when there was
+        // no leave-frame. After a fold the leave frame may still be keyed
+        // on the hidden historical id; walk the family so first paint is
+        // not empty.
+        val openSnapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
+        val openUnion = firstOpenTranscriptPaintRows(
+            chat.id,
+            retainedTranscriptByChat,
+            openSnapshot,
+            historicalFoldMap,
+        )
+        if (firstOpenHasLocalTranscriptPaint(
+                retainedTranscriptForChat(chat.id, retainedTranscriptByChat, historicalFoldMap),
+                openSnapshot,
             )
-            seedFoldFamilyTranscriptWindows(chat.id, union)
-            applyQuotedMessageReveal(jumpMessageId.orEmpty(), union)
+        ) {
+            if (retainedTranscriptByChat[chat.id].isNullOrEmpty()) {
+                retainOpenTranscript(chat.id, openUnion)
+            }
+            seedFoldFamilyTranscriptWindows(chat.id, openUnion)
+            applyQuotedMessageReveal(jumpMessageId.orEmpty(), openUnion)
             messages = visibleMessagesForChat(
                 chat.id,
                 withSendEchoes(
                     chat.id,
-                    refreshConversationRows(union, chat.id, generation),
+                    refreshConversationRows(openUnion, chat.id, generation),
                 ),
             )
             retainOpenTranscript(chat.id, messages)
@@ -7564,36 +7576,38 @@ class SonarAppState(private val scope: CoroutineScope) {
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
         }
 
-        // Reopen: retained leave paint → push now; hydrate quietly.
+        // Reopen *or* first open with remounted WN / mesh snapshot: push now.
         // After an MDK 0.8→0.9 fold the leave frame may be a short live
         // 0.9 + mesh tail; union remounted WN family rows so first paint
         // cannot hide recovered 0.8 history. iOS `rebuildNow` already
         // unions via `dmMsgs`.
-        retainedTranscriptForChat(id, retainedTranscriptByChat, historicalFoldMap)
-            .takeIf { it.isNotEmpty() }
-            ?.let {
-            if (retainedTranscriptByChat[id].isNullOrEmpty()) {
-                retainOpenTranscript(id, it)
-            }
-            val familySnapshot = mergeAllTranscriptRows(
-                meshWhiteNoiseSeed(id) + snapshotMessagesForChat(id),
-            )
-            val union = firstOpenTranscriptPaintRows(
-                id,
-                retainedTranscriptByChat,
+        val familySnapshot = mergeAllTranscriptRows(
+            meshWhiteNoiseSeed(id) + snapshotMessagesForChat(id),
+        )
+        val openUnion = firstOpenTranscriptPaintRows(
+            id,
+            retainedTranscriptByChat,
+            familySnapshot,
+            historicalFoldMap,
+        )
+        if (firstOpenHasLocalTranscriptPaint(
+                retainedTranscriptForChat(id, retainedTranscriptByChat, historicalFoldMap),
                 familySnapshot,
-                historicalFoldMap,
             )
+        ) {
+            if (retainedTranscriptByChat[id].isNullOrEmpty()) {
+                retainOpenTranscript(id, openUnion)
+            }
             for (groupId in transcriptGroupIds(id)) {
                 seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
             }
-            seedFoldFamilyTranscriptWindows(id, union)
-            applyQuotedMessageReveal(jumpMessageId.orEmpty(), union)
+            seedFoldFamilyTranscriptWindows(id, openUnion)
+            applyQuotedMessageReveal(jumpMessageId.orEmpty(), openUnion)
             messages = visibleMessagesForChat(
                 id,
                 withSendEchoes(
                     id,
-                    refreshConversationRows(union, id, generation),
+                    refreshConversationRows(openUnion, id, generation),
                 ),
             )
             retainOpenTranscript(id, messages)

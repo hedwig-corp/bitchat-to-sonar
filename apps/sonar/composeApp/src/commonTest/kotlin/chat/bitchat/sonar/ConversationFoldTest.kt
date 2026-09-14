@@ -1068,6 +1068,23 @@ class ConversationFoldTest {
                 folds,
             ),
         )
+        assertTrue(firstOpenHasLocalTranscriptPaint(emptyList(), snapshot))
+        assertTrue(firstOpenHasLocalTranscriptPaint(historical, emptyList()))
+        assertFalse(firstOpenHasLocalTranscriptPaint(emptyList(), emptyList()))
+        assertFalse(
+            firstOpenHasLocalTranscriptPaint(
+                emptyList(),
+                listOf(
+                    SonarMsg(
+                        id = "${SYNTHETIC_SUMMARY_ID_PREFIX}group-09:1:1",
+                        senderNpub = "npub1peer",
+                        content = "preview",
+                        mine = false,
+                        tsSecs = 1L,
+                    ),
+                ),
+            ),
+        )
     }
 
     @Test
