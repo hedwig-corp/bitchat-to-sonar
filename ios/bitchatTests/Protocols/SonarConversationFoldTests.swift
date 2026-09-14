@@ -1019,6 +1019,65 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == ["group-09"]
         )
+        // Remount remaps hist→live before persist-folds exist. Empty
+        // persist must still page hidden hist so unread / load-older
+        // do not retire on a short live page.
+        #expect(
+            snTranscriptSourceIds(
+                groupId: "group-09",
+                listedDirectIds: [],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snTranscriptSourceIds(
+                groupId: "group-other",
+                listedDirectIds: [],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-other"]
+        )
+        #expect(
+            snConversationReadGroupIds(
+                groupId: "group-09",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snMeshFoldTranscriptSourceIds(
+                listedDirectIds: ["group-09"],
+                historicalFolds: [:],
+                resolvedGroupId: "group-09",
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snExpectedNewestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-09": 10],
+                summaryLatestByChat: ["group-08": 50],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == 50
+        )
+        #expect(
+            snExpectedNewestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-09": 10],
+                summaryLatestByChat: ["group-08": 50],
+                historicalFolds: [:]
+            ) == 10,
+            "home-row / NSE stay persist-only without a remount pair"
+        )
         #expect(
             snMeshFoldTranscriptSourceIds(
                 listedDirectIds: ["group-09"],

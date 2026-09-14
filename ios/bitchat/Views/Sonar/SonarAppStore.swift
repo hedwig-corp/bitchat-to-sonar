@@ -1545,20 +1545,31 @@ func snExpectedNewestTsForChat(
     messagesByChat: [String: [Int64]],
     latestByChat: [String: Int64],
     summaryLatestByChat: [String: Int64],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Int64 {
-    let snapshot = snLocalLatestTsForChat(
+    let ids = snTranscriptSourceIds(
+        groupId: chatId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    var snapshot: Int64 = 0
+    for id in ids {
+        let messageTs = messagesByChat[id]?.max() ?? 0
+        let ts = max(messageTs, latestByChat[id] ?? 0)
+        if ts > snapshot { snapshot = ts }
+    }
+    let persistSnapshot = snLocalLatestTsForChat(
         chatId: chatId,
         messagesByChat: messagesByChat,
         latestByChat: latestByChat,
         historicalFolds: historicalFolds
     )
-    let index = snTranscriptSourceIds(
-        groupId: chatId,
-        listedDirectIds: [],
-        historicalFolds: historicalFolds
-    ).map { summaryLatestByChat[$0] ?? 0 }.max() ?? 0
-    return max(snapshot, index)
+    let index = ids.map { summaryLatestByChat[$0] ?? 0 }.max() ?? 0
+    return max(snapshot, persistSnapshot, index)
 }
 
 /// Every recovered sibling that must leave with `id` on delete / leave.
@@ -1587,22 +1598,31 @@ func snFoldFamilyIds(
 /// Compose `markGroupsRead(transcriptGroupIds)`.
 func snConversationReadGroupIds(
     groupId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     let ids = snTranscriptSourceIds(
         groupId: groupId,
         listedDirectIds: [],
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     )
     return ids.isEmpty ? [groupId] : ids
 }
 
 /// Marmot ids whose unread / transcript belong to the open chat after a fold.
-/// Order is stable: open id, then listed 1:1 duplicates, then sorted family extras.
+/// Order is stable: open id, then listed 1:1 duplicates, then remount-pair
+/// extras, then sorted family extras. Empty wake-mute persist still unions
+/// the remount pair so `marmotGroupId(hist)` → live does not drop hidden
+/// hist cache / bak unread. Compose `transcriptSourceIds`.
 func snTranscriptSourceIds(
     groupId: String,
     listedDirectIds: [String],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     var seen = Set<String>()
     var out: [String] = []
@@ -1612,7 +1632,19 @@ func snTranscriptSourceIds(
     }
     append(groupId)
     for id in listedDirectIds { append(id) }
-    for id in snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds).sorted() {
+    let remount = snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for id in remount {
+        append(snBareMarmotGroupId(id))
+    }
+    var family = snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
+    for id in remount {
+        family.formUnion(snFoldFamilyIds(id: snBareMarmotGroupId(id), historicalFolds: historicalFolds))
+    }
+    for id in family.sorted() {
         append(id)
     }
     return out
@@ -1624,7 +1656,9 @@ func snTranscriptSourceIds(
 /// Compose `mediaFetchGroupIds`.
 func snMediaFetchGroupIds(
     startGroupId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     let start = startGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !start.isEmpty else { return [] }
@@ -1633,7 +1667,9 @@ func snMediaFetchGroupIds(
     for id in [start] + snTranscriptSourceIds(
         groupId: start,
         listedDirectIds: [],
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ) where seen.insert(id).inserted {
         out.append(id)
     }
@@ -1676,11 +1712,15 @@ func snPublishedMediaUrlsFromFamilyPages(
     startGroupId: String,
     historicalFolds: [String: String],
     pageForId: (String) -> [MarmotService.MarmotMessage],
-    pendingPrefix: String = "pending-media-"
+    pendingPrefix: String = "pending-media-",
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Set<String> {
     let ids = snMediaFetchGroupIds(
         startGroupId: startGroupId,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     )
     let walk = ids.isEmpty ? [startGroupId] : ids
     var urls = Set<String>()
@@ -1699,7 +1739,9 @@ func snPublishedMediaUrlsFromFamilyPages(
 func snMeshFoldTranscriptSourceIds(
     listedDirectIds: [String],
     historicalFolds: [String: String],
-    resolvedGroupId: String? = nil
+    resolvedGroupId: String? = nil,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     var seeds: [String] = []
     var seen = Set<String>()
@@ -1715,7 +1757,9 @@ func snMeshFoldTranscriptSourceIds(
         for source in snTranscriptSourceIds(
             groupId: id,
             listedDirectIds: listedDirectIds,
-            historicalFolds: historicalFolds
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
         ) where outSeen.insert(source).inserted {
             out.append(source)
         }
@@ -1729,12 +1773,16 @@ func snUnreadForFoldFamily(
     groupId: String,
     unreadByGroup: [String: UInt64],
     historicalFolds: [String: String],
-    listedDuplicateIds: [String] = []
+    listedDuplicateIds: [String] = [],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> UInt64 {
     snTranscriptSourceIds(
         groupId: groupId,
         listedDirectIds: listedDuplicateIds,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ).reduce(UInt64(0)) { $0 + (unreadByGroup[$1] ?? 0) }
 }
 
@@ -1743,12 +1791,16 @@ func snVerifiedForFoldFamily(
     groupId: String,
     verifiedIds: Set<String>,
     historicalFolds: [String: String],
-    listedDuplicateIds: [String] = []
+    listedDuplicateIds: [String] = [],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     snTranscriptSourceIds(
         groupId: groupId,
         listedDirectIds: listedDuplicateIds,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ).contains { verifiedIds.contains($0) }
 }
 
@@ -2383,10 +2435,19 @@ func snFoldFamilyCachedMessages<Message>(
     groupId: String,
     messagesByGroup: [String: [Message]],
     historicalFolds: [String: String],
-    idOf: (Message) -> String
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [Message] {
     var out = messagesByGroup[groupId] ?? []
-    for alias in snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds).sorted() {
+    let aliases = snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for alias in aliases {
         guard alias != groupId, let incoming = messagesByGroup[alias], !incoming.isEmpty else {
             continue
         }
@@ -8346,11 +8407,15 @@ final class SonarAppStore: ObservableObject {
     private func hasUnreadMarmotMessage(in groups: [MarmotService.MarmotGroup]) -> Bool {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         guard let first = groups.first else { return false }
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         return snUnreadForFoldFamily(
             groupId: first.id,
             unreadByGroup: marmot.unreadByGroup,
             historicalFolds: folds,
-            listedDuplicateIds: groups.map(\.id)
+            listedDuplicateIds: groups.map(\.id),
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         ) > 0
     }
 
@@ -8363,25 +8428,35 @@ final class SonarAppStore: ObservableObject {
                 ? String(key.dropFirst(Self.marmotIDPrefix.count))
                 : key
         })
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         return snVerifiedForFoldFamily(
             groupId: first.id,
             verifiedIds: verifiedIds,
             historicalFolds: folds,
-            listedDuplicateIds: groups.map(\.id)
+            listedDuplicateIds: groups.map(\.id),
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 
     /// Listed 1:1 duplicates plus the hidden 0.8 sibling. Unread / mark-read
     /// walk this set. First-open hydrate and load-older also page it: core
     /// `fold_family(live)` may not exist yet after persist-folds, so a
-    /// live-only `messages_cursor_page` misses bak remainder.
+    /// live-only `messages_cursor_page` misses bak remainder. Empty
+    /// wake-mute persist still unions the remount pair so a remapped
+    /// live seed does not drop hidden hist.
     private func transcriptSourceIds(forGroupId groupId: String) -> [String] {
         let groups = directMarmotGroups(matchingGroupId: groupId)
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         return snTranscriptSourceIds(
             groupId: groupId,
             listedDirectIds: groups.map(\.id),
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 
@@ -8826,6 +8901,8 @@ final class SonarAppStore: ObservableObject {
         // showing a second row.
         var marmotRows: [SNDMRow] = []
         let historicalFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
@@ -8839,7 +8916,9 @@ final class SonarAppStore: ObservableObject {
                     unread: snUnreadForFoldFamily(
                         groupId: group.id,
                         unreadByGroup: marmot.unreadByGroup,
-                        historicalFolds: historicalFolds
+                        historicalFolds: historicalFolds,
+                        openedConversationId: opened,
+                        openedConversationPaneId: pane
                     ) > 0,
                     presence: false,
                     verified: false,
@@ -9292,10 +9371,14 @@ final class SonarAppStore: ObservableObject {
         // too. Listed live-only groups miss bak remainder when core
         // `fold_family(live)` is not ready yet. Compose `transcriptGroupIds`
         // / `meshFoldTranscriptSourceIds`.
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         let ids = snMeshFoldTranscriptSourceIds(
             listedDirectIds: folded.map(\.id),
             historicalFolds: folds,
-            resolvedGroupId: groupId
+            resolvedGroupId: groupId,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
         let byId = Dictionary(uniqueKeysWithValues: folded.map { ($0.id, $0) })
         return ids.map { pagingId in
@@ -9312,11 +9395,15 @@ final class SonarAppStore: ObservableObject {
             ?? marmotGroupId(conversationId)
         guard let seed else { return 0 }
         var seen = Set<String>()
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         return snFoldFamilyCachedMessages(
             groupId: seed,
             messagesByGroup: marmot.messagesByGroup,
             historicalFolds: folds,
-            idOf: { $0.id }
+            idOf: { $0.id },
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         ).filter { seen.insert($0.id).inserted }.count
     }
 
@@ -9463,12 +9550,16 @@ final class SonarAppStore: ObservableObject {
             // every group member on every message.
             let mentionCtx = mentionContext(forConversationId: id)
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+            let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
             for group in sourceGroups {
                 let groupMessages = snFoldFamilyCachedMessages(
                     groupId: group.id,
                     messagesByGroup: marmot.messagesByGroup,
                     historicalFolds: folds,
-                    idOf: { $0.id }
+                    idOf: { $0.id },
+                    openedConversationId: opened,
+                    openedConversationPaneId: pane
                 ).sorted {
                     if $0.createdAt == $1.createdAt { return $0.id < $1.id }
                     return $0.createdAt < $1.createdAt
@@ -9709,11 +9800,15 @@ final class SonarAppStore: ObservableObject {
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+            let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
             let groupMessages = snFoldFamilyCachedMessages(
                 groupId: group.id,
                 messagesByGroup: marmot.messagesByGroup,
                 historicalFolds: folds,
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             ).sorted {
                 if $0.createdAt == $1.createdAt { return $0.id < $1.id }
                 return $0.createdAt < $1.createdAt
@@ -11544,9 +11639,13 @@ final class SonarAppStore: ObservableObject {
         // First send after resume can mint live 0.9 before persist-folds.
         // A live-only exclude set misses recovered 0.8 blossom URLs.
         let folds = await adoptMergedActionFolds(for: [groupId])
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         let ids = snMediaFetchGroupIds(
             startGroupId: groupId,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
         let walk = ids.isEmpty ? [groupId] : ids
         var pages: [String: [MarmotService.MarmotMessage]] = [:]
@@ -12417,9 +12516,13 @@ final class SonarAppStore: ObservableObject {
                         throw MarmotService.ServiceError.invalidInput("attachment has no download route")
                     }
                     let folds = await self.adoptMergedActionFolds(for: [item.groupId])
+                    let opened = self.openedConversationId ?? self.pendingMarmotRouteReplacement?.realId
+                    let pane = self.openedConversationPaneId ?? self.pendingMarmotRouteReplacement?.pendingId
                     let groupIds = snMediaFetchGroupIds(
                         startGroupId: item.groupId,
-                        historicalFolds: folds
+                        historicalFolds: folds,
+                        openedConversationId: opened,
+                        openedConversationPaneId: pane
                     )
                     var lastError: Error?
                     for groupId in groupIds {
@@ -12675,10 +12778,14 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             let folds = await self.adoptMergedActionFolds(for: [id, groupId])
+            let opened = self.openedConversationId ?? self.pendingMarmotRouteReplacement?.realId
+            let pane = self.openedConversationPaneId ?? self.pendingMarmotRouteReplacement?.pendingId
             let ids = snTranscriptSourceIds(
                 groupId: groupId,
                 listedDirectIds: self.directMarmotGroups(matchingGroupId: groupId).map(\.id),
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             )
             let familyHit = ids.contains { self.marmot.unreadByGroup[$0] != nil }
             let familyCached = ids.reduce(UInt64(0)) { $0 + (self.marmot.unreadByGroup[$1] ?? 0) }
@@ -12715,12 +12822,16 @@ final class SonarAppStore: ObservableObject {
                 summaryLatest[alias] = Int64(latest)
             }
         }
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         let secs = snExpectedNewestTsForChat(
             chatId: groupId,
             messagesByChat: messagesByChat,
             latestByChat: [:],
             summaryLatestByChat: summaryLatest,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
         guard secs > 0 else { return nil }
         return Date(timeIntervalSince1970: TimeInterval(secs))
@@ -14280,10 +14391,14 @@ final class SonarAppStore: ObservableObject {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+            let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
             let ids = snTranscriptSourceIds(
                 groupId: groupId,
                 listedDirectIds: groups.map(\.id),
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             )
             for stamped in ids {
                 marmotVerified[stamped] = true

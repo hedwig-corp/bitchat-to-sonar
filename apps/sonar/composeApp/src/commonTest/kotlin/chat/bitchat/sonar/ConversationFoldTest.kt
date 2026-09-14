@@ -3322,6 +3322,72 @@ class ConversationFoldTest {
             listOf("group-09", "group-08"),
             transcriptSourceIds("group-09", emptyList(), folds),
         )
+        // Remount remaps hist→live before persist-folds exist. Empty
+        // persist must still page hidden hist so unread / load-older
+        // do not retire on a short live page.
+        assertEquals(
+            listOf("group-09", "group-08"),
+            transcriptSourceIds(
+                "group-09",
+                emptyList(),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-09", "group-08"),
+            transcriptSourceIds(
+                "group-09",
+                emptyList(),
+                emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-other"),
+            transcriptSourceIds(
+                "group-other",
+                emptyList(),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-09", "group-08"),
+            meshFoldTranscriptSourceIds(
+                listOf("group-09"),
+                emptyMap(),
+                resolvedGroupId = "group-09",
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            50L,
+            expectedNewestTsForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-09" to 10L),
+                summaryLatestByChat = mapOf("group-08" to 50L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            10L,
+            expectedNewestTsForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-09" to 10L),
+                summaryLatestByChat = mapOf("group-08" to 50L),
+                historicalFolds = emptyMap(),
+            ),
+            "home-row / NSE stay persist-only without a remount pair",
+        )
         // Mesh-folded openDm / load-older used listed live ids only.
         assertEquals(
             listOf("group-09", "group-08"),
@@ -3677,6 +3743,16 @@ class ConversationFoldTest {
                 chatId = "group-09",
                 unreadByChat = unreadOnHist,
                 historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            3L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = unreadOnHist,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ),
         )
         assertEquals(
