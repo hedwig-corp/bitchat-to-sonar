@@ -28,6 +28,13 @@ struct SNUnreadCountsTests {
         let failed: [String]? = nil
         #expect(SNUnreadCounts.shouldPublish(emptyInbox))
         #expect(!SNUnreadCounts.shouldPublish(failed))
+        let unread: [(groupIdHex: String, unreadCount: UInt64)] = [
+            ("group-08", 4),
+            ("other", 1),
+        ]
+        #expect(SNUnreadCounts.openCount(from: unread, wanted: ["group-08"]) == 4)
+        #expect(SNUnreadCounts.openCount(from: [], wanted: ["group-08"]) == 0)
+        #expect(SNUnreadCounts.openCount(from: nil, wanted: ["group-08"]) == nil)
     }
 
     @Test

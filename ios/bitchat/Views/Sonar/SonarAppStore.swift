@@ -11457,9 +11457,10 @@ final class SonarAppStore: ObservableObject {
     /// read races openedDM's read-marking, but read-marking only runs after
     /// the local hydrate completes, so the summaries read lands first.
     ///
-    /// Always publishes a settled value (including `0`). While the key is
-    /// absent, `SNMsgList` must not treat the open as fully-read (`?? 0` was
-    /// the alpha.11 unread→tail flash race).
+    /// Publishes a settled value (including `0`) only after a successful
+    /// probe. A failed summaries read must leave the key `nil` so
+    /// `SNMsgList` keeps the provisional live edge (`?? 0` was the
+    /// alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
@@ -11501,8 +11502,9 @@ final class SonarAppStore: ObservableObject {
         }
         Task { [weak self] in
             guard let self else { return }
-            let unread = await self.marmot.unreadCount(forGroups: ids)
-            self.unreadCountAtOpenByDM[id] = unread
+            if let unread = await self.marmot.unreadCount(forGroups: ids) {
+                self.unreadCountAtOpenByDM[id] = unread
+            }
         }
     }
 

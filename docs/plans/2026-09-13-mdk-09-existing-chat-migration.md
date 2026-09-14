@@ -1389,6 +1389,13 @@ without folds). Compose already keeps that window via
 `transcriptReadIsUntrusted`. iOS now uses the same helper. Pin:
 `SonarConversationFoldTests` `snTranscriptReadIsUntrusted`.
 
+iOS `unreadCount(forGroups:)` treated a failed summaries probe as
+`[]` and `captureUnreadAtOpen` published `0`. `SNMsgList` then
+jumped to the tail (fully-read) on a recovered 0.8 chat whose
+index unread never loaded. Failed probes now leave the key unset.
+Empty success still settles 0. Pin:
+`SNUnreadCountsTests.failedSummariesProbeDoesNotPublishUnread`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

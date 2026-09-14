@@ -3001,12 +3001,13 @@ final class MarmotChatModel: ObservableObject {
     /// conversation index. The published `unreadByGroup` map lags a cold
     /// launch (it fills on the next summaries refresh), so open-time captures
     /// must not depend on it.
-    func unreadCount(forGroups groupIds: [String]) async -> UInt64 {
+    func unreadCount(forGroups groupIds: [String]) async -> UInt64? {
         let wanted = Set(groupIds)
-        let summaries = (try? await service.conversationSummaries()) ?? []
-        return summaries
-            .filter { wanted.contains($0.groupIdHex) }
-            .reduce(UInt64(0)) { $0 + $1.unreadCount }
+        let summaries = try? await service.conversationSummaries()
+        return SNUnreadCounts.openCount(
+            from: summaries?.map { ($0.groupIdHex, $0.unreadCount) },
+            wanted: wanted
+        )
     }
 
     /// Bounded newest page for one group. Hosts scan published media URLs

@@ -15,6 +15,18 @@ enum SNUnreadCounts {
         loaded != nil
     }
 
+    /// Open-time unread from the conversation index. `nil` summaries must
+    /// not settle as `0` (fully-read / jump-to-tail). Empty success is 0.
+    static func openCount(
+        from summaries: [(groupIdHex: String, unreadCount: UInt64)]?,
+        wanted: Set<String>
+    ) -> UInt64? {
+        guard let summaries else { return nil }
+        return summaries
+            .filter { wanted.contains($0.groupIdHex) }
+            .reduce(UInt64(0)) { $0 + $1.unreadCount }
+    }
+
     /// Build the published unread map, skipping suppressed group ids.
     static func unreadByGroup(
         from summaries: [(groupIdHex: String, unreadCount: UInt64)],
