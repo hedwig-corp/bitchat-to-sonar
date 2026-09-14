@@ -1348,6 +1348,60 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == 80
         )
+        let folds = ["group-08": "group-09"]
+        #expect(
+            snExpectedNewestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-09": 10],
+                summaryLatestByChat: ["group-08": 50],
+                historicalFolds: folds
+            ) == 50
+        )
+        #expect(
+            snExpectedNewestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-09": 10],
+                summaryLatestByChat: [:],
+                historicalFolds: folds
+            ) == 10
+        )
+        #expect(
+            snExpectedNewestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: [:],
+                summaryLatestByChat: ["group-08": 50],
+                historicalFolds: folds
+            ) == 50
+        )
+        #expect(
+            snExpectedNewestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: [:],
+                summaryLatestByChat: [:],
+                historicalFolds: folds
+            ) == 0
+        )
+        #expect(
+            !SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: 4,
+                anchorFound: false,
+                feedNewest: Date(timeIntervalSince1970: 10),
+                expectedNewest: Date(timeIntervalSince1970: TimeInterval(
+                    snExpectedNewestTsForChat(
+                        chatId: "group-09",
+                        messagesByChat: [:],
+                        latestByChat: [:],
+                        summaryLatestByChat: ["group-08": 50],
+                        historicalFolds: folds
+                    )
+                )),
+                familyHasOlder: false
+            )
+        )
         #expect(snFoldedSiblingHasMore(historicalHasMore: true, liveHasMore: false))
         #expect(snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: true))
         #expect(!snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: false))

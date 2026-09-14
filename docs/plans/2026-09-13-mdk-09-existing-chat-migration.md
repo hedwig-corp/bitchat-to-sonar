@@ -1473,6 +1473,13 @@ and send-target stay snapshot-only. Pins: same
 `expectedNewestTsUsesRemountedIndexLatestWhenSnapshotStale`,
 `HomeMessageRowsTest.remountedIndexLatestKeepsRecoveredChatAboveNewerSnapshotRows`.
 
+iOS `expectedNewestMessageDate` was index-only. A nil / epoch
+`latestAt` skipped the unread-retire gate (only `familyHasOlder`
+saved it) — the same class as Compose `expectedNewestTsSecs == 0`.
+Max remounted snapshot timestamps with index `latestAt` via
+`snExpectedNewestTsForChat`. Pin:
+`SonarConversationFoldTests` (`snExpectedNewestTsForChat` + retire).
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

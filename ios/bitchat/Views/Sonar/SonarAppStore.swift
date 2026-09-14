@@ -1318,6 +1318,31 @@ func snLocalLatestTsForChat(
     return latest
 }
 
+/// Newest known timestamp across snapshot + remounted index latest.
+/// Snapshot-only / index-only understates a recovered 0.8 hist `latestAt`
+/// when the first live page is still short — unread retire then jumps to
+/// tail. Compose `expectedNewestTsForChat`.
+func snExpectedNewestTsForChat(
+    chatId: String,
+    messagesByChat: [String: [Int64]],
+    latestByChat: [String: Int64],
+    summaryLatestByChat: [String: Int64],
+    historicalFolds: [String: String]
+) -> Int64 {
+    let snapshot = snLocalLatestTsForChat(
+        chatId: chatId,
+        messagesByChat: messagesByChat,
+        latestByChat: latestByChat,
+        historicalFolds: historicalFolds
+    )
+    let index = snTranscriptSourceIds(
+        groupId: chatId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds
+    ).map { summaryLatestByChat[$0] ?? 0 }.max() ?? 0
+    return max(snapshot, index)
+}
+
 /// Every recovered sibling that must leave with `id` on delete / leave.
 func snFoldFamilyIds(
     id: String,
@@ -11523,17 +11548,38 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// Newest known message date across the DM's folded groups, from the
-    /// core conversation index. The transcript must not freeze its unread
+    /// Newest known message date across the DM's folded groups (index +
+    /// remounted snapshot). The transcript must not freeze its unread
     /// divider before the visible rows have caught up to this — hydration can
     /// publish one leg before the folded White Noise groups merge in, and the
     /// rows still missing are exactly the unread ones.
+    /// Compose `expectedNewestTsForOpenChat`.
     func expectedNewestMessageDate(_ id: String) -> Date? {
         let groupId = marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else { return nil }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let ids = transcriptSourceIds(forGroupId: groupId)
-        return ids.compactMap { marmot.conversationSummariesByGroup[$0]?.latestAt }.max()
+        var messagesByChat: [String: [Int64]] = [:]
+        var summaryLatest: [String: Int64] = [:]
+        for alias in ids {
+            if let rows = marmot.messagesByGroup[alias], !rows.isEmpty {
+                messagesByChat[alias] = rows.map { Int64($0.createdAt.timeIntervalSince1970) }
+            }
+            let latest = marmot.conversationSummariesByGroup[alias]?.latestAt.timeIntervalSince1970 ?? 0
+            if latest > 0 {
+                summaryLatest[alias] = Int64(latest)
+            }
+        }
+        let secs = snExpectedNewestTsForChat(
+            chatId: groupId,
+            messagesByChat: messagesByChat,
+            latestByChat: [:],
+            summaryLatestByChat: summaryLatest,
+            historicalFolds: folds
+        )
+        guard secs > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(secs))
     }
 
     /// Generations cancel a superseded first-open Task when the user taps another chat.
