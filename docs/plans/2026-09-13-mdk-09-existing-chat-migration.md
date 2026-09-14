@@ -766,6 +766,12 @@ lists. iOS remount already `refreshWhenConnected` the live sibling.
 Remount now catch-up-prioritizes the live 0.9 id. Trill cooldown
 promotion no longer returns early when there are no in-flight echoes.
 
+iOS Leave/delete hole closed after this commit: standard defaults
+dropped the hist→live blob but the App Group mute mirror did not.
+NSE could keep treating a deleted recovered room as folded. Compose
+already persists the purged blob (`forgetHistoricalFolds`).
+`snPersistHistoricalFolds` writes both stores.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

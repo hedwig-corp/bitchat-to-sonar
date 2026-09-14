@@ -5037,7 +5037,7 @@ final class MarmotChatModel: ObservableObject {
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
         let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: family)
         if nextFolds != folds {
-            defaults.set(nextFolds, forKey: snHistoricalFoldsDefaultsKey)
+            snPersistHistoricalFolds(nextFolds, to: defaults)
         }
     }
 

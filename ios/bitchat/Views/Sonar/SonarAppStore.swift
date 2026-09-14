@@ -288,6 +288,15 @@ func snMarmotSendTargetGroupId(
 
 let snHistoricalFoldsDefaultsKey = "sonar.historicalFolds.v1"
 
+/// Write hist→live bindings to the host defaults AND the App Group mute
+/// mirror. Leave/delete must use this so NSE cannot keep a fold the user
+/// already removed.
+func snPersistHistoricalFolds(_ map: [String: String], to defaults: UserDefaults) {
+    defaults.set(map, forKey: snHistoricalFoldsDefaultsKey)
+    UserDefaults(suiteName: SonarChatMuteStore.appGroupId)?
+        .set(map, forKey: snHistoricalFoldsDefaultsKey)
+}
+
 /// After FFI `groups()` hides a folded 0.8 room, remount the open transcript
 /// onto the live 0.9 sibling so `marmot.groups` lookups stay valid.
 func snRemountFoldedOpenGroupId(
@@ -7984,9 +7993,10 @@ final class SonarAppStore: ObservableObject {
             changed = true
         }
         if changed {
-            defaults.set(map, forKey: Keys.historicalFolds)
-        }
-        if let shared = UserDefaults(suiteName: Self.appGroupId) {
+            snPersistHistoricalFolds(map, to: defaults)
+        } else if let shared = UserDefaults(suiteName: Self.appGroupId),
+                  (shared.dictionary(forKey: Keys.historicalFolds) as? [String: String]) != map {
+            // Heal an App Group mirror that missed a mid-session delete.
             shared.set(map, forKey: Keys.historicalFolds)
         }
         promoteMutesFromHistoricalFolds(map)
@@ -11810,7 +11820,7 @@ final class SonarAppStore: ObservableObject {
             let groupIds = Array(Set((matching.isEmpty ? [groupId] : matching) + family))
             let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: Set(groupIds))
             if nextFolds != folds {
-                defaults.set(nextFolds, forKey: Keys.historicalFolds)
+                snPersistHistoricalFolds(nextFolds, to: defaults)
             }
             for gid in groupIds {
                 discardRetainedConversation(gid)
