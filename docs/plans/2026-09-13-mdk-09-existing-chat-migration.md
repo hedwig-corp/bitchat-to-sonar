@@ -420,7 +420,7 @@ Re-run on this cloud agent after the joined-room `is_direct` pin. All green.
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 37 passed (includes remount / mute / draft / snapshot / call-log fold pins) |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 39 passed (includes remount / mute / draft / snapshot / call-log / verify / first-paint collapse pins; re-verified on `68c444e4`) |
 | `scripts/check-regression-ledger.sh` | 236 citations |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with
