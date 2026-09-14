@@ -1447,13 +1447,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // a beat later, which can add OLDER rows — shifting every index and moving
     // the tail. A timestamp comparison cannot detect this (a nearby peer's BLE
     // rows are newer than anything in the White-Noise-only index), so ask the
-    // store whether hydration actually finished. A pure Marmot open needs no
-    // gate: its first paint is the complete snapshot, and waiting for the
-    // async page would turn the instant unread anchor into a visible
-    // tail-then-divider snap.
+    // store whether hydration actually finished. A folded Marmot open is the
+    // same shape: first paint can be a short live 0.9 page while recovered
+    // 0.8 unread still sits on the hidden sibling. Waiting for hydrate there
+    // avoids retiring the divider on an incomplete snapshot.
     fun feedCaughtUp(rows: List<Any>): Boolean =
         rows.isNotEmpty() &&
-            (!screen.id.startsWith("mesh:") || state.isTranscriptHydrated(screen.id))
+            (
+                (!screen.id.startsWith("mesh:") && !state.chatHasFoldFamily(screen.id)) ||
+                    state.isTranscriptHydrated(screen.id)
+            )
     // Open pinned at the first unread row, or at the newest row for a read
     // chat (Signal parity): start the list state there so the first frame
     // never shows the wrong page and then visibly jumps.
@@ -1509,10 +1512,20 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         if (!feedCaughtUp(feed)) return@LaunchedEffect
         val anchor = firstUnreadTranscriptIndex(feed, unreadAtOpen)
         if (anchor < 0) {
-            // The caught-up feed cannot place a divider (e.g. every unread
-            // event is a filtered ☎CALL/⚡PAY control line). Retire the pending
-            // unread state, or unreadAnchorPending() would suppress tail
-            // following for the rest of this open.
+            // Control-only unread can retire once the fold family is truly
+            // caught up. A short live 0.9 page must not settle 0 while bak /
+            // hidden 0.8 rows (or a newer index timestamp) are still missing.
+            // iOS waits on `expectedNewestDate` before abandoning.
+            if (!shouldRetireOpenChatUnread(
+                    unreadAtOpen = unreadAtOpen,
+                    anchorIndex = anchor,
+                    feedNewestTsSecs = feedNewestTsSecs(feed),
+                    expectedNewestTsSecs = state.expectedNewestTsForOpenChat(screen.id),
+                    familyHasOlder = state.familyHasOlderForOpenChat(screen.id),
+                )
+            ) {
+                return@LaunchedEffect
+            }
             state.retireOpenChatUnread(screen.id)
             return@LaunchedEffect
         }

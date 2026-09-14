@@ -3097,6 +3097,20 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun isTranscriptHydrated(chatId: String): Boolean = chatId in hydratedTranscripts
 
+    /** Hidden 0.8 sibling exists — first Marmot paint may be live-only. */
+    fun chatHasFoldFamily(chatId: String): Boolean =
+        foldFamilyIds(chatId, historicalFoldMap).size > 1
+
+    /** Newest known local timestamp across the fold family (index + snapshot). */
+    fun expectedNewestTsForOpenChat(chatId: String): Long = localLatestTs(chatId)
+
+    /** True when bak / hidden hist / overflow cache may still hold unread rows. */
+    fun familyHasOlderForOpenChat(chatId: String): Boolean {
+        val ids = transcriptGroupIds(chatId)
+        if (ids.isEmpty()) return false
+        return ids.any { transcriptWindowHasMore(it) }
+    }
+
     private fun markTranscriptHydrated(chatId: String) {
         if (chatId in hydratedTranscripts) return
         hydratedTranscripts = hydratedTranscripts + chatId

@@ -1406,6 +1406,16 @@ divider needs. Failed probe stays unset. Empty success settles 0.
 Pin: `UnreadCountsTest.failedSummariesProbeDoesNotSettleOpenUnread`,
 `ConversationFoldTest.homeRowUnreadFollowsPersistedFoldOntoLiveSibling`.
 
+Compose then retired that captured unread on the first non-empty live
+page: `feedCaughtUp` treated a pure Marmot open as a complete snapshot,
+`firstUnreadTranscriptIndex` missed hist incoming rows, and
+`retireOpenChatUnread` settled `0` (jump-to-tail) plus cleared quote
+jump. iOS waits until visible rows catch `expectedNewestDate` across
+the fold family. Compose now uses `shouldRetireOpenChatUnread` (index
+newest + family has-older) and also waits for hydrate on a fold
+family. Pin:
+`UnreadCountsTest.recoveredFoldUnreadDoesNotRetireBeforeIndexNewest`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

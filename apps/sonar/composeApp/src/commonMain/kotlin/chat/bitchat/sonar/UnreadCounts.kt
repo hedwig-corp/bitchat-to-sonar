@@ -79,6 +79,30 @@ internal fun openChatUnreadPublishId(
     return capturedFor.takeIf { stackChatIds.isEmpty() }
 }
 
+/** Newest visible `SonarMsg` timestamp in a transcript feed. */
+internal fun feedNewestTsSecs(rows: List<Any?>): Long =
+    rows.maxOfOrNull { (it as? SonarMsg)?.tsSecs ?: 0L } ?: 0L
+
+/**
+ * Do not retire an unread divider while the painted feed is still short of
+ * the fold-family index newest, or while bak / hidden 0.8 rows may still
+ * carry the unread incoming messages. iOS `expectedNewestDate` gate in
+ * `resolveUnreadAnchor` — Compose used to settle `0` on the first non-empty
+ * live page (treated as a complete Marmot snapshot).
+ */
+internal fun shouldRetireOpenChatUnread(
+    unreadAtOpen: Long,
+    anchorIndex: Int,
+    feedNewestTsSecs: Long,
+    expectedNewestTsSecs: Long,
+    familyHasOlder: Boolean,
+): Boolean {
+    if (unreadAtOpen <= 0L || anchorIndex >= 0) return false
+    if (familyHasOlder) return false
+    if (expectedNewestTsSecs > 0L && feedNewestTsSecs < expectedNewestTsSecs) return false
+    return true
+}
+
 internal fun unreadCountsFromSummaries(
     summaries: List<SonarConversationSummary>,
     suppressGroupIds: Set<String> = emptySet(),

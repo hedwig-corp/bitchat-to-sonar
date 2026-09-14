@@ -2437,6 +2437,26 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        assertFalse(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 3L,
+                anchorIndex = -1,
+                feedNewestTsSecs = 1L,
+                expectedNewestTsSecs = 100L,
+                familyHasOlder = false,
+            ),
+            "live-only 0.9 page must not retire while hist latest is newer",
+        )
+        assertFalse(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 3L,
+                anchorIndex = -1,
+                feedNewestTsSecs = 200L,
+                expectedNewestTsSecs = 100L,
+                familyHasOlder = true,
+            ),
+            "unpaged hidden 0.8 sibling still owns unread rows",
+        )
     }
 
     @Test

@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -185,5 +186,74 @@ class UnreadCountsTest {
             ),
             "popped / other-room probe must not publish",
         )
+    }
+
+    @Test
+    fun recoveredFoldUnreadDoesNotRetireBeforeIndexNewest() {
+        assertFalse(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 4L,
+                anchorIndex = -1,
+                feedNewestTsSecs = 10L,
+                expectedNewestTsSecs = 50L,
+                familyHasOlder = false,
+            ),
+            "short live page newer than nothing but older than hist latest must wait",
+        )
+        assertFalse(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 4L,
+                anchorIndex = -1,
+                feedNewestTsSecs = 80L,
+                expectedNewestTsSecs = 50L,
+                familyHasOlder = true,
+            ),
+            "hidden 0.8 / bak remainder may still hold the unread incoming rows",
+        )
+        assertTrue(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 4L,
+                anchorIndex = -1,
+                feedNewestTsSecs = 80L,
+                expectedNewestTsSecs = 50L,
+                familyHasOlder = false,
+            ),
+            "caught-up feed with no older family: control-only unread may retire",
+        )
+        assertFalse(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 4L,
+                anchorIndex = 2,
+                feedNewestTsSecs = 10L,
+                expectedNewestTsSecs = 50L,
+                familyHasOlder = false,
+            ),
+        )
+        assertFalse(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 0L,
+                anchorIndex = -1,
+                feedNewestTsSecs = 10L,
+                expectedNewestTsSecs = 50L,
+                familyHasOlder = false,
+            ),
+        )
+        val hist = SonarMsg(
+            id = "h1",
+            senderNpub = "npub1peer",
+            content = "old",
+            mine = false,
+            tsSecs = 50L,
+        )
+        val live = SonarMsg(
+            id = "l1",
+            senderNpub = "npub1me",
+            content = "new",
+            mine = true,
+            tsSecs = 10L,
+        )
+        assertEquals(50L, feedNewestTsSecs(listOf(live, hist)))
+        assertEquals(10L, feedNewestTsSecs(listOf(live)))
+        assertEquals(0L, feedNewestTsSecs(emptyList()))
     }
 }
