@@ -2310,31 +2310,53 @@ final class MarmotChatModel: ObservableObject {
 
     /// Record that push wake bannered the latest unread advance for a group.
     func notePushWakeNotified(groupIdHex: String, content: String) {
-        pushWakeNotifiedGroupIds.insert(groupIdHex)
-        guard let messages = messagesByGroup[groupIdHex] else { return }
-        if let match = messages.last(where: {
-            !$0.isMine && SonarPushWakeDedup.matchesPreview(fullContent: $0.content, preview: content)
-        }) {
-            pushWakeNotifiedMessageIDs.insert(match.id)
-            return
+        let folds = historicalFoldsMap()
+        snFoldFamilyIds(id: groupIdHex, historicalFolds: folds).forEach {
+            pushWakeNotifiedGroupIds.insert($0)
         }
-        if let latest = messages.last(where: { !$0.isMine }) {
-            pushWakeNotifiedMessageIDs.insert(latest.id)
+        if let match = Self.pushWakeLatestIncoming(
+            in: snFoldFamilyCachedMessages(
+                groupId: groupIdHex,
+                messagesByGroup: messagesByGroup,
+                historicalFolds: folds,
+                idOf: { $0.id }
+            ),
+            matchingPreview: content
+        ) {
+            pushWakeNotifiedMessageIDs.insert(match.id)
         }
     }
 
     /// True when push wake already bannered the current unread tip for this group.
     func pushWakeAlreadyNotifiedLatest(groupIdHex: String, content: String) -> Bool {
-        guard let messages = messagesByGroup[groupIdHex] else { return false }
-        if let match = messages.last(where: {
-            !$0.isMine && SonarPushWakeDedup.matchesPreview(fullContent: $0.content, preview: content)
-        }) {
-            return pushWakeNotifiedMessageIDs.contains(match.id)
+        let folds = historicalFoldsMap()
+        guard let match = Self.pushWakeLatestIncoming(
+            in: snFoldFamilyCachedMessages(
+                groupId: groupIdHex,
+                messagesByGroup: messagesByGroup,
+                historicalFolds: folds,
+                idOf: { $0.id }
+            ),
+            matchingPreview: content
+        ) else { return false }
+        return pushWakeNotifiedMessageIDs.contains(match.id)
+    }
+
+    private static func pushWakeLatestIncoming(
+        in messages: [MarmotService.MarmotMessage],
+        matchingPreview content: String
+    ) -> MarmotService.MarmotMessage? {
+        let incoming = messages.filter { !$0.isMine }
+        let newest: (MarmotService.MarmotMessage, MarmotService.MarmotMessage) -> Bool = { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+            return lhs.id < rhs.id
         }
-        if let latest = messages.last(where: { !$0.isMine }) {
-            return pushWakeNotifiedMessageIDs.contains(latest.id)
+        if let match = incoming.filter({
+            SonarPushWakeDedup.matchesPreview(fullContent: $0.content, preview: content)
+        }).max(by: newest) {
+            return match
         }
-        return false
+        return incoming.max(by: newest)
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for

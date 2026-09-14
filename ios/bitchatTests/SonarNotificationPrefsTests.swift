@@ -247,6 +247,69 @@ struct SonarNotificationPrefsTests {
         )
     }
 
+    @Test("host wake collapses hist+live unread to one live fingerprint")
+    func unreadFingerprintCollapsesFoldFamilyToLive() {
+        let folds = ["group-08": "group-09"]
+        let hist = SonarPushUnreadDelta.Fingerprint(
+            unread: 4,
+            latestAt: Date(timeIntervalSince1970: 50),
+            content: "keep this chat"
+        )
+        let liveEmpty = SonarPushUnreadDelta.Fingerprint(
+            unread: 0,
+            latestAt: Date(timeIntervalSince1970: 0),
+            content: ""
+        )
+        let collapsed = SonarPushUnreadDelta.collapseFingerprints(
+            ["group-08": hist, "group-09": liveEmpty],
+            historicalFolds: folds
+        )
+        #expect(collapsed.keys.sorted() == ["group-09"])
+        #expect(collapsed["group-09"]?.unread == 4)
+        #expect(collapsed["group-09"]?.content == "keep this chat")
+        #expect(SonarPushUnreadDelta.liveGroupId(id: "group-08", historicalFolds: folds) == "group-09")
+        #expect(
+            SonarPushUnreadDelta.newlyUnreadLiveGroupIds(
+                afterByGroup: ["group-08": hist, "group-09": hist],
+                before: [:],
+                baselineHydrated: true,
+                historicalFolds: folds
+            ) == ["group-09"],
+            "empty-before fan-out must not emit a hist-keyed tip"
+        )
+        #expect(
+            SonarPushUnreadDelta.newlyUnreadLiveGroupIds(
+                afterByGroup: ["group-08": hist, "group-09": hist],
+                before: ["group-08": hist],
+                baselineHydrated: true,
+                historicalFolds: folds
+            ).isEmpty,
+            "remounting the same hist tip onto live is not a new wake"
+        )
+        let advanced = SonarPushUnreadDelta.Fingerprint(
+            unread: 5,
+            latestAt: Date(timeIntervalSince1970: 200),
+            content: "new 0.9"
+        )
+        #expect(
+            SonarPushUnreadDelta.newlyUnreadLiveGroupIds(
+                afterByGroup: ["group-08": hist, "group-09": advanced],
+                before: ["group-08": hist],
+                baselineHydrated: true,
+                historicalFolds: folds
+            ) == ["group-09"]
+        )
+        #expect(
+            SonarPushUnreadDelta.newlyUnreadLiveGroupIds(
+                afterByGroup: ["g1": advanced],
+                before: [:],
+                baselineHydrated: true,
+                historicalFolds: [:]
+            ) == ["g1"],
+            "unrelated chats still notify under their own id"
+        )
+    }
+
     #if os(iOS)
     @Test("app-generated Marmot notifications retain forced catch-up identity")
     func localMarmotWakeMarkerSurvivesRouting() {
