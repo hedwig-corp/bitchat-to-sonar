@@ -900,6 +900,73 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun firstResumeEchoMatchesLiveSiblingCanonicalRow() {
+        val folds = mapOf("group-08" to "group-09")
+        val echo = SonarMsg(
+            id = "optimistic-1",
+            senderNpub = "me",
+            content = "hello from 0.8",
+            mine = true,
+            tsSecs = 100L,
+            state = "Sending",
+        )
+        val live = SonarMsg(
+            id = "canonical-09",
+            senderNpub = "me",
+            content = "hello from 0.8",
+            mine = true,
+            tsSecs = 101L,
+        )
+        val isEcho = { row: SonarMsg -> row.id.startsWith("optimistic-") }
+        // conversationChanged names live; persist-folds empty ⇒ no family.
+        assertEquals(
+            emptyList(),
+            optimisticFreshCanonicalRows(
+                echoGroupId = "group-08",
+                freshRowsByGroup = mapOf("group-09" to listOf(live)),
+                cachedRowsByGroup = mapOf("group-08" to listOf(echo)),
+                historicalFolds = emptyMap(),
+                isLocalEcho = isEcho,
+                idOf = { it.id },
+            ),
+        )
+        assertEquals(
+            listOf("canonical-09"),
+            optimisticFreshCanonicalRows(
+                echoGroupId = "group-08",
+                freshRowsByGroup = mapOf("group-09" to listOf(live)),
+                cachedRowsByGroup = mapOf("group-08" to listOf(echo)),
+                historicalFolds = folds,
+                isLocalEcho = isEcho,
+                idOf = { it.id },
+            ).map { it.id },
+        )
+        val stripped = transcriptsAfterOptimisticReconcile(
+            echoGroupId = "group-08",
+            messagesByGroup = mapOf(
+                "group-08" to listOf(echo),
+                "group-09" to listOf(live, echo),
+            ),
+            pendingIds = listOf(echo.id),
+            survivorIds = emptyList(),
+            visible = listOf(live),
+            historicalFolds = folds,
+            idOf = { it.id },
+        )
+        assertEquals(listOf("canonical-09"), stripped["group-08"]!!.map { it.id })
+        assertEquals(listOf("canonical-09"), stripped["group-09"]!!.map { it.id })
+        assertEquals(
+            mapOf("group-09" to listOf(echo)),
+            remountedOptimisticPending(
+                pendingByGroup = mapOf("group-08" to listOf(echo)),
+                historicalGroupId = "group-08",
+                liveGroupId = "group-09",
+                idOf = { it.id },
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

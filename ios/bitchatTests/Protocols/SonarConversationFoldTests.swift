@@ -1256,6 +1256,49 @@ struct SonarConversationFoldTests {
             refreshId: "group-09",
             historicalFolds: [:]
         ))
+        // First-resume send echoes on hist; the relay copy lands on live.
+        #expect(
+            snOptimisticFreshCanonicalRows(
+                echoGroupId: "group-08",
+                freshRowsByGroup: ["group-09": ["canonical-09"]],
+                cachedRowsByGroup: ["group-08": ["optimistic-1"]],
+                historicalFolds: [:],
+                isLocalEcho: { $0.hasPrefix("optimistic-") },
+                idOf: { $0 }
+            ).isEmpty
+        )
+        #expect(
+            snOptimisticFreshCanonicalRows(
+                echoGroupId: "group-08",
+                freshRowsByGroup: ["group-09": ["canonical-09"]],
+                cachedRowsByGroup: ["group-08": ["optimistic-1"]],
+                historicalFolds: ["group-08": "group-09"],
+                isLocalEcho: { $0.hasPrefix("optimistic-") },
+                idOf: { $0 }
+            ) == ["canonical-09"]
+        )
+        let stripped = snTranscriptsAfterOptimisticReconcile(
+            echoGroupId: "group-08",
+            messagesByGroup: [
+                "group-08": ["optimistic-1"],
+                "group-09": ["canonical-09", "optimistic-1"]
+            ],
+            pendingIds: ["optimistic-1"],
+            survivorIds: [],
+            visible: ["canonical-09"],
+            historicalFolds: ["group-08": "group-09"],
+            idOf: { $0 }
+        )
+        #expect(stripped["group-08"] == ["canonical-09"])
+        #expect(stripped["group-09"] == ["canonical-09"])
+        #expect(
+            snRemountedOptimisticPending(
+                pendingByGroup: ["group-08": ["optimistic-1"]],
+                historicalGroupId: "group-08",
+                liveGroupId: "group-09",
+                idOf: { $0 }
+            ) == ["group-09": ["optimistic-1"]]
+        )
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

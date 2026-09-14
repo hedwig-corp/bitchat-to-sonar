@@ -2274,6 +2274,89 @@ internal fun <V> removePendingMessagesForChat(
     }
 }
 
+/** Fresh canonical rows that can fulfill an in-flight send echo.
+ *  First-resume send echoes on the recovered 0.8 id; the relay copy
+ *  lands on the live 0.9 sibling. Walk the fold family or the echo
+ *  stays "Sending" forever beside the real row.
+ *  iOS `snOptimisticFreshCanonicalRows`. */
+internal fun <V> optimisticFreshCanonicalRows(
+    echoGroupId: String,
+    freshRowsByGroup: Map<String, List<V>>,
+    cachedRowsByGroup: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    isLocalEcho: (V) -> Boolean,
+    idOf: (V) -> String,
+): List<V> {
+    val family = foldFamilyIds(echoGroupId, historicalFolds).ifEmpty { setOf(echoGroupId) }
+    val seen = linkedSetOf<String>()
+    val out = ArrayList<V>()
+    fun addAll(rows: List<V>) {
+        for (row in rows) {
+            if (isLocalEcho(row)) continue
+            if (seen.add(idOf(row))) out += row
+        }
+    }
+    for (id in family) {
+        addAll(freshRowsByGroup[id].orEmpty())
+        addAll(cachedRowsByGroup[id].orEmpty())
+    }
+    return out
+}
+
+/** After a hist echo is fulfilled by a live sibling, drop that echo from
+ *  every family transcript so `dmMsgs` does not show Sending + Sent.
+ *  iOS `snTranscriptsAfterOptimisticReconcile`. */
+internal fun <V> transcriptsAfterOptimisticReconcile(
+    echoGroupId: String,
+    messagesByGroup: Map<String, List<V>>,
+    pendingIds: Collection<String>,
+    survivorIds: Collection<String>,
+    visible: List<V>,
+    historicalFolds: Map<String, String>,
+    idOf: (V) -> String,
+): Map<String, List<V>> {
+    val survivors = survivorIds.toSet()
+    val fulfilled = pendingIds.filterNot { it in survivors }.toSet()
+    val next = messagesByGroup.toMutableMap()
+    next[echoGroupId] = visible
+    if (fulfilled.isEmpty()) return next
+    val family = foldFamilyIds(echoGroupId, historicalFolds).ifEmpty { setOf(echoGroupId) }
+    for (sibling in family) {
+        if (sibling == echoGroupId) continue
+        val rows = next[sibling] ?: continue
+        val stripped = rows.filterNot { idOf(it) in fulfilled }
+        if (stripped.isEmpty()) next.remove(sibling)
+        else next[sibling] = stripped
+    }
+    return next
+}
+
+/** Move in-flight echoes off a hidden 0.8 id onto the live sibling.
+ *  iOS `snRemountedOptimisticPending`. */
+internal fun <V> remountedOptimisticPending(
+    pendingByGroup: Map<String, List<V>>,
+    historicalGroupId: String,
+    liveGroupId: String,
+    idOf: (V) -> String,
+): Map<String, List<V>> {
+    if (historicalGroupId.isBlank() || liveGroupId.isBlank() || historicalGroupId == liveGroupId) {
+        return pendingByGroup
+    }
+    val historical = pendingByGroup[historicalGroupId].orEmpty()
+    if (historical.isEmpty()) return pendingByGroup
+    val next = pendingByGroup.toMutableMap()
+    next.remove(historicalGroupId)
+    val existing = next[liveGroupId].orEmpty()
+    val seen = existing.map(idOf).toMutableSet()
+    val merged = existing.toMutableList()
+    for (echo in historical) {
+        if (seen.add(idOf(echo))) merged += echo
+    }
+    if (merged.isEmpty()) next.remove(liveGroupId)
+    else next[liveGroupId] = merged
+    return next
+}
+
 /** Rewrite matching echoes on every fold-family key. */
 internal fun <V> updatePendingMessagesForChat(
     chatId: String,

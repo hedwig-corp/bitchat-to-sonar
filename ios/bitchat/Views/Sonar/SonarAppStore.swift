@@ -1893,6 +1893,97 @@ func snFoldFamilyCachedMessages<Message>(
     return out
 }
 
+/// Fresh canonical rows that can fulfill an in-flight send echo.
+/// First-resume send echoes on the recovered 0.8 id; the relay copy
+/// lands on the live 0.9 sibling. Walk the fold family or the echo
+/// stays "Sending" forever beside the real row.
+/// Compose `optimisticFreshCanonicalRows`.
+func snOptimisticFreshCanonicalRows<Message>(
+    echoGroupId: String,
+    freshRowsByGroup: [String: [Message]],
+    cachedRowsByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    isLocalEcho: (Message) -> Bool,
+    idOf: (Message) -> String
+) -> [Message] {
+    let family = snFoldFamilyIds(id: echoGroupId, historicalFolds: historicalFolds)
+    let ids = family.isEmpty ? [echoGroupId] : family.sorted()
+    var seen = Set<String>()
+    var out: [Message] = []
+    func addAll(_ rows: [Message]) {
+        for row in rows {
+            guard !isLocalEcho(row) else { continue }
+            guard seen.insert(idOf(row)).inserted else { continue }
+            out.append(row)
+        }
+    }
+    for id in ids {
+        addAll(freshRowsByGroup[id] ?? [])
+        addAll(cachedRowsByGroup[id] ?? [])
+    }
+    return out
+}
+
+/// After a hist echo is fulfilled by a live sibling, drop that echo from
+/// every family transcript so `dmMsgs` does not show Sending + Sent.
+/// Compose `transcriptsAfterOptimisticReconcile`.
+func snTranscriptsAfterOptimisticReconcile<Message>(
+    echoGroupId: String,
+    messagesByGroup: [String: [Message]],
+    pendingIds: [String],
+    survivorIds: [String],
+    visible: [Message],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String
+) -> [String: [Message]] {
+    let survivors = Set(survivorIds)
+    let fulfilled = Set(pendingIds.filter { !survivors.contains($0) })
+    var next = messagesByGroup
+    next[echoGroupId] = visible
+    guard !fulfilled.isEmpty else { return next }
+    let family = snFoldFamilyIds(id: echoGroupId, historicalFolds: historicalFolds)
+    for sibling in family where sibling != echoGroupId {
+        guard let rows = next[sibling] else { continue }
+        let stripped = rows.filter { !fulfilled.contains(idOf($0)) }
+        if stripped.isEmpty {
+            next.removeValue(forKey: sibling)
+        } else {
+            next[sibling] = stripped
+        }
+    }
+    return next
+}
+
+/// Move in-flight echoes off a hidden 0.8 id onto the live sibling.
+/// Compose `remountedOptimisticPending`.
+func snRemountedOptimisticPending<Message>(
+    pendingByGroup: [String: [Message]],
+    historicalGroupId: String,
+    liveGroupId: String,
+    idOf: (Message) -> String
+) -> [String: [Message]] {
+    guard !historicalGroupId.isEmpty,
+          !liveGroupId.isEmpty,
+          historicalGroupId != liveGroupId,
+          let historical = pendingByGroup[historicalGroupId],
+          !historical.isEmpty
+    else { return pendingByGroup }
+    var next = pendingByGroup
+    next.removeValue(forKey: historicalGroupId)
+    let existing = next[liveGroupId] ?? []
+    var seen = Set(existing.map(idOf))
+    var merged = existing
+    for echo in historical where seen.insert(idOf(echo)).inserted {
+        merged.append(echo)
+    }
+    if merged.isEmpty {
+        next.removeValue(forKey: liveGroupId)
+    } else {
+        next[liveGroupId] = merged
+    }
+    return next
+}
+
 /// Family-union event ids. `loadOlderDM` must compare this, not
 /// `messagesByGroup[live]` only — persist-folds older-pages hist.
 func snFoldFamilyCanonicalMessageIDs<Message>(

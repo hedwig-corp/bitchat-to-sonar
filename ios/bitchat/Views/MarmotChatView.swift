@@ -3323,6 +3323,20 @@ final class MarmotChatModel: ObservableObject {
             verifiedIds: localTranscriptPreservesOlderEdgeGroups,
             liveFoldTarget: liveFoldTarget
         )
+        let pairs = snPromotedFoldedMutePairs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            muteKeys: Set(pendingOptimistic.keys),
+            liveFoldTarget: liveFoldTarget
+        )
+        for pair in pairs {
+            pendingOptimistic = snRemountedOptimisticPending(
+                pendingByGroup: pendingOptimistic,
+                historicalGroupId: pair.historical,
+                liveGroupId: pair.live,
+                idOf: { $0.id }
+            )
+        }
     }
 
     /// After FFI hides a folded 0.8 room, keep the in-memory page, older-edge
@@ -3348,6 +3362,12 @@ final class MarmotChatModel: ObservableObject {
         if localTranscriptPreservesOlderEdgeGroups.contains(historicalGroupId) {
             localTranscriptPreservesOlderEdgeGroups.insert(liveGroupId)
         }
+        pendingOptimistic = snRemountedOptimisticPending(
+            pendingByGroup: pendingOptimistic,
+            historicalGroupId: historicalGroupId,
+            liveGroupId: liveGroupId,
+            idOf: { $0.id }
+        )
     }
 
     private static func isLocalTranscriptEcho(_ message: MarmotService.MarmotMessage) -> Bool {
@@ -4092,13 +4112,24 @@ final class MarmotChatModel: ObservableObject {
         freshRowsByGroup: [String: [MarmotService.MarmotMessage]] = [:]
     ) -> [String: [MarmotService.MarmotMessage]] {
         guard !pendingOptimistic.isEmpty else { return byGroup }
+        let folds = historicalFoldsMap()
         var merged = byGroup
         for (groupId, pending) in pendingOptimistic {
+            // First-resume send echoes on hist; the relay copy lands on live.
+            // Compose `freshCanonicalForChat` already unions the fold family.
+            let freshCanonical = snOptimisticFreshCanonicalRows(
+                echoGroupId: groupId,
+                freshRowsByGroup: freshRowsByGroup,
+                cachedRowsByGroup: merged,
+                historicalFolds: folds,
+                isLocalEcho: Self.isLocalTranscriptEcho,
+                idOf: { $0.id }
+            )
             let reconciliation = Self.reconciledOptimisticMessages(
                 source: byGroup[groupId] ?? [],
                 pending: pending,
                 exclusionsByOptimisticID: preexistingCanonicalMessageIDsByOptimisticID,
-                freshCanonical: freshRowsByGroup[groupId] ?? []
+                freshCanonical: freshCanonical
             )
             for echo in pending where !reconciliation.survivors.contains(where: { $0.id == echo.id }) {
                 preexistingCanonicalMessageIDsByOptimisticID[echo.id] = nil
@@ -4108,7 +4139,15 @@ final class MarmotChatModel: ObservableObject {
             } else {
                 pendingOptimistic[groupId] = reconciliation.survivors
             }
-            merged[groupId] = reconciliation.visible
+            merged = snTranscriptsAfterOptimisticReconcile(
+                echoGroupId: groupId,
+                messagesByGroup: merged,
+                pendingIds: pending.map(\.id),
+                survivorIds: reconciliation.survivors.map(\.id),
+                visible: reconciliation.visible,
+                historicalFolds: folds,
+                idOf: { $0.id }
+            )
         }
         return merged
     }
