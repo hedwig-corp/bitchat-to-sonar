@@ -2126,3 +2126,70 @@ async fn persist_folds_lost_core_sidecar_refolds_empty_desc_room_from_index() {
         "restored bind must invite leftover 0.8 members without a hist send"
     );
 }
+
+/// Persist-folds remounts and pages live before idle reconcile. A lost
+/// JSON sidecar must not make `messages_page(live)` hist-blind — restore
+/// the recorded index bind on the first local page.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_messages_page_restores_index_bind() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    let live_only = alice
+        .engine()
+        .messages_page(&live, 80, 0)
+        .expect("engine page is live-only without fold_aliases");
+    assert!(
+        live_only.iter().all(|m| m.content != "carol in the room"),
+        "engine messages_page(live) must not invent hist rows before restore"
+    );
+
+    let page = alice
+        .messages_page(&live, 80, 0)
+        .expect("client page restores the index bind");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "first FFI page must restore the recorded bind without ensure_subscriptions"
+    );
+    assert!(
+        page.iter().any(|m| m.content == "carol in the room"),
+        "messages_page(live) must union recovered 0.8 rows after index restore"
+    );
+}

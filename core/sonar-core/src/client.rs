@@ -7459,6 +7459,17 @@ impl SonarClient {
         }
     }
 
+    /// Host persist-folds can remount and page live before idle
+    /// `ensure_subscriptions`. If the JSON sidecar is gone, restore the
+    /// recorded index bind so `messages_page(live)` unions hist instead of
+    /// waiting on housekeeping. No-op when this id already has aliases.
+    fn restore_recorded_folds_touching(&self, group_id: &GroupId) {
+        if self.engine.fold_aliases(group_id).len() > 1 {
+            return;
+        }
+        self.restore_recorded_folds_from_index();
+    }
+
     fn restore_recorded_folds_from_index(&self) {
         let Some(ref idx) = self.conversation_index else {
             return;
@@ -7569,6 +7580,7 @@ impl SonarClient {
     }
 
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
+        self.restore_recorded_folds_touching(group_id);
         self.engine.messages(group_id).map(|msgs| {
             msgs.into_iter()
                 .map(|m| self.with_delivery_state(m))
@@ -7582,6 +7594,7 @@ impl SonarClient {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ChatMessage>> {
+        self.restore_recorded_folds_touching(group_id);
         self.engine
             .messages_page(group_id, limit, offset)
             .map(|msgs| {
@@ -7596,6 +7609,7 @@ impl SonarClient {
         group_limit: usize,
         page_limit: usize,
     ) -> Result<Vec<RecentMessagePage>> {
+        self.restore_recorded_folds_from_index();
         self.engine
             .recent_message_pages(group_limit, page_limit)
             .map(|pages| {
@@ -7716,6 +7730,9 @@ impl SonarClient {
     }
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
+        if let Some(group_id) = decode_group_id_hex(group_id_hex) {
+            self.restore_recorded_folds_touching(&group_id);
+        }
         let ids = self.fold_index_ids(group_id_hex);
         if let Some(ref idx) = self.conversation_index {
             for id in &ids {
@@ -7736,6 +7753,7 @@ impl SonarClient {
         before_id: Option<&nostr::EventId>,
         limit: usize,
     ) -> Result<Vec<ChatMessage>> {
+        self.restore_recorded_folds_touching(group_id);
         self.engine
             .messages_cursor_page(group_id, before_secs, before_id, limit)
             .map(|msgs| {
