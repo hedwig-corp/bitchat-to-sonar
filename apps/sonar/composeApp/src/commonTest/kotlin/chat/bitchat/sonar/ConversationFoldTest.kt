@@ -596,6 +596,22 @@ class ConversationFoldTest {
         assertEquals("standup", sittingOnHidden?.name)
         assertEquals(listOf("npub1a", "npub1b"), sittingOnHidden?.members)
         assertEquals(false, sittingOnHidden?.isDirect)
+        val liveDm = SonarChat(
+            id = "dm-09",
+            name = "",
+            members = listOf("npub1me", "npub1bob"),
+            isDirect = true,
+        )
+        val hiddenDm = listedOrFoldedSiblingChat(
+            chatId = "dm-08",
+            listedChats = listOf(liveDm),
+            historicalFolds = mapOf("dm-08" to "dm-09"),
+        )
+        assertEquals("dm-08", hiddenDm?.id)
+        assertEquals(
+            "npub1bob",
+            directMarmotPeerKey(hiddenDm!!, "npub1me"),
+        )
         val stub = notificationOpenChat("group-09", emptyList())
         assertEquals("group-09", stub.id)
         assertEquals("", stub.name)

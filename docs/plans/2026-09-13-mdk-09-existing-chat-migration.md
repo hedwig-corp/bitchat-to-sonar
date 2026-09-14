@@ -527,7 +527,10 @@ sibling; `notificationOpenChat` supplies the stub row. iOS
 `snRemountFoldedOpenGroupId` is the same),
 `listedOrFoldedSiblingChat` is bidirectional: unlisted live inherits
 the still-listed 0.8 sibling; sitting on a hidden 0.8 id inherits the
-listed live sibling. `notificationOpenChat` uses that, else a not-direct
+listed live sibling. Compose `listedChat` (peer/call/send-duplicate
+lookups) uses that so a hidden 0.8 id still finds the live DM peer —
+iOS `marmotGroup(byId:)` already remaps via `snListedOrFoldedSiblingGroupId`.
+`notificationOpenChat` uses that, else a not-direct
 stub. `adoptedListedChatTitle` replaces a captured Compose
 `Screen.Chat.name` of "Group chat" once `chats()` lists the remapped
 row. iOS derives the title from `marmot.groups` / `marmot.title(for:)`

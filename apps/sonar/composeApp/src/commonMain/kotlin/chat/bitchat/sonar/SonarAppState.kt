@@ -523,7 +523,8 @@ internal fun marmotSendTargetGroupId(
     duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
 
 /** After FFI `groups()` hides a folded 0.8 room, remount the open transcript
- *  onto the live 0.9 sibling so lookups (`chats.firstOrNull`) stay valid. */
+ *  onto the live 0.9 sibling. Peer / call / send-duplicate lookups use
+ *  [listedChat] so a still-open hidden id still finds the live sibling. */
 /** Move in-flight media uploads off a hidden 0.8 id onto the live sibling. */
 internal fun <V> remountFoldedPendingMediaUploads(
     historical: String,
@@ -2325,7 +2326,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return foldedPeerName(peerId, group)
         }
         val mine = canonicalProfileKey(npub)
-        return chats.firstOrNull { it.id == chatId }
+        return listedChat(chatId)
             ?.members?.firstOrNull { canonicalProfileKey(it) != mine && it.isNotBlank() }
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName ?: (it.take(10) + "…") } ?: "secure chat"
     }
@@ -3029,7 +3030,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun duplicateDirectMarmotChats(chatId: String): List<SonarChat> {
-        val chat = chats.firstOrNull { it.id == chatId } ?: return emptyList()
+        val chat = listedChat(chatId) ?: return emptyList()
         return duplicateDirectMarmotChats(chat)
     }
 
@@ -3039,8 +3040,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun isSameDirectMarmotChat(leftId: String, rightId: String): Boolean {
-        val left = chats.firstOrNull { it.id == leftId } ?: return false
-        val right = chats.firstOrNull { it.id == rightId } ?: return false
+        val left = listedChat(leftId) ?: return false
+        val right = listedChat(rightId) ?: return false
         val leftKey = directMarmotPeerKey(left) ?: return false
         return leftKey == directMarmotPeerKey(right)
     }
@@ -11275,7 +11276,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
 
     private fun peerIdForMarmotGroup(groupId: String): String? {
-        val group = chats.firstOrNull { it.id == groupId }
+        val group = listedChat(groupId)
         foldedGroupPeerIds[groupId]?.let { peerId ->
             if (group == null || peerLinkMatchesGroup(group, peerId)) return peerId
         }
