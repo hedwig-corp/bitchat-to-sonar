@@ -413,7 +413,10 @@ then `deleteChat` the persist-folds hist sibling after `leaveGroup(live)`
 (`leaveFamilyCorePurgeIds` / `snLeaveFamilyCorePurgeIds`) so a leftover
 0.8 row cannot resurrect on the next cold start. Load-older on the listed
 live id waits if the hidden 0.8 sibling is already paging
-(`loadOlderBusyRetryShouldWait` / `snLoadOlderBusyRetryShouldWait`). `members()` / `group_is_direct`
+(`loadOlderBusyRetryShouldWait` / `snLoadOlderBusyRetryShouldWait`).
+Compose quote-jump retries on `quotedJumpRetryToken` (size + oldest +
+newest), not `feed.size` alone, so a 500-row bak slide still finds a
+recovered 0.8 parent. `members()` / `group_is_direct`
 stay live-session only so leftover peers remain late-resume invites.
 If the user is sitting in that recovered transcript when resume lands,
 Compose and iOS remount the open chat id onto `live_fold_target` so

@@ -710,6 +710,18 @@ func snShouldSettleQuotedJump(parentInFeed: Bool) -> Bool {
     parentInFeed
 }
 
+/// Quote-jump retry identity. At the 500-row cap a bak page trims the
+/// newer edge and keeps `msgs.count` constant. iOS `SNTailRevision`
+/// already keys count + tail; include the oldest id so a size-only
+/// observer still retries. Compose `quotedJumpRetryToken`.
+func snQuotedJumpRetryToken(
+    itemCount: Int,
+    oldestId: String?,
+    newestId: String? = nil
+) -> String {
+    "\(itemCount):\(oldestId ?? ""):\(newestId ?? "")"
+}
+
 /// Soft-fail after a load-older miss must keep the jump. An empty first
 /// bak page is not exhaustion. Compose `shouldClearQuotedJumpAfterMiss`.
 /// `added` is ignored on purpose — do not `if !added { clear }`.

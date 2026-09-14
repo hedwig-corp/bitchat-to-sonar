@@ -1406,6 +1406,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
     }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
+    val oldestFeedKey = feed.firstOrNull()?.let(::transcriptFeedKey)
+    val quotedJumpRetry = quotedJumpRetryToken(feed.size, oldestFeedKey, newestFeedKey)
     val currentFeed by rememberUpdatedState(feed)
     // Debug-only SONAR_BENCH marker (issue #305): time from the chat-open push
     // to the end of the transcript's first composed frame. Parsed by
@@ -1659,14 +1661,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // Quote tap after the transcript has already opened: the open-path
     // LaunchedEffect above only runs while `didInitialScroll` is false.
-    LaunchedEffect(screen.id, state.jumpMessageIdForChat(screen.id), feed.size, didInitialScroll) {
+    LaunchedEffect(screen.id, state.jumpMessageIdForChat(screen.id), quotedJumpRetry, didInitialScroll) {
         if (!didInitialScroll) return@LaunchedEffect
         val jumpId = state.jumpMessageIdForChat(screen.id) ?: return@LaunchedEffect
         val jumpIdx = feed.indexOfFirst { transcriptFeedKey(it) == jumpId }
         if (jumpIdx < 0) {
             // Parent not painted yet. Pull one older local page (including
-            // 0.8 remainder) so this effect can retry when feed.size grows.
+            // 0.8 remainder) so this effect can retry when the painted
+            // window slides — size-only keys miss a 500-row bak page.
             val added = state.loadOlderMessages(screen.id)
+            state.revealQuotedJumpIfCached(screen.id)
             if (shouldClearQuotedJumpAfterMiss(added = added, parentInFeed = false)) {
                 state.clearOpenChatJump(screen.id)
             }

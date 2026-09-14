@@ -885,6 +885,17 @@ internal fun shouldClearQuotedJumpAfterMiss(
     parentInFeed: Boolean,
 ): Boolean = shouldSettleQuotedJump(parentInFeed)
 
+/** Quote-jump retry identity. At the 500-row cap a bak page trims the
+ *  newer edge and keeps `feed.size` constant — size-only keys never
+ *  re-run, so a recovered 0.8 parent past the painted suffix stays
+ *  unreachable. Include the oldest and newest ids. iOS
+ *  `snQuotedJumpRetryToken` / `SNTailRevision`. */
+internal fun quotedJumpRetryToken(
+    feedSize: Int,
+    oldestId: String?,
+    newestId: String? = null,
+): String = "$feedSize:${oldestId.orEmpty()}:${newestId.orEmpty()}"
+
 /** Quote-jump parent stored on any fold-family key. After remount the
  *  open screen may still look up hist / mesh while the live sibling
  *  holds the target — or the reverse. iOS `snQuotedJumpParentId`. */
@@ -4566,6 +4577,20 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  remount cannot hide a recovered 0.8 quote. */
     fun jumpMessageIdForChat(chatId: String): String? =
         quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap)
+
+    /** After a load-older miss, expand the painted page if the parent
+     *  just landed in the family cache. Size-only quote-jump effects
+     *  would otherwise keep paging past a parent already in the window. */
+    fun revealQuotedJumpIfCached(chatId: String) {
+        val parentId = jumpMessageIdForChat(chatId) ?: return
+        val cached = quotedMessageRevealCache(chatId)
+        applyQuotedMessageReveal(parentId, cached)
+        if (chatId in transcriptSessionChatIds()) {
+            val sessionId = activeTranscriptChatId ?: chatId
+            val bounded = refreshConversationRows(cached, sessionId, transcriptGeneration)
+            setCurrentVisibleMessages(sessionId, withSendEchoes(sessionId, bounded))
+        }
+    }
 
     /** Host + window rows a quote-jump may expand into without a load-older. */
     private fun quotedMessageRevealCache(chatId: String): List<SonarMsg> {

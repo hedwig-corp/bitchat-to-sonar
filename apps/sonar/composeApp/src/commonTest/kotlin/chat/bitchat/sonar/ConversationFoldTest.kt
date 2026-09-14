@@ -1580,6 +1580,15 @@ class ConversationFoldTest {
         assertFalse(shouldClearQuotedJumpAfterMiss(added = false, parentInFeed = false))
         assertFalse(shouldClearQuotedJumpAfterMiss(added = true, parentInFeed = false))
         assertTrue(shouldClearQuotedJumpAfterMiss(added = true, parentInFeed = true))
+        assertEquals("500:old:new", quotedJumpRetryToken(500, "old", "new"))
+        assertTrue(
+            quotedJumpRetryToken(500, "older", "new") !=
+                quotedJumpRetryToken(500, "old", "new"),
+        )
+        assertTrue(
+            quotedJumpRetryToken(500, "old", "newer") !=
+                quotedJumpRetryToken(500, "old", "new"),
+        )
         val folds = mapOf("group-08" to "group-09")
         val histJump = mapOf("group-08" to "parent-08")
         assertEquals("parent-08", quotedJumpParentId("group-09", histJump, folds))

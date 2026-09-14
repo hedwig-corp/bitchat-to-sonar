@@ -1548,6 +1548,11 @@ struct SonarConversationFoldTests {
         #expect(
             snShouldClearQuotedJumpAfterMiss(added: true, parentVisible: true)
         )
+        #expect(snQuotedJumpRetryToken(itemCount: 500, oldestId: "old", newestId: "new") == "500:old:new")
+        #expect(
+            snQuotedJumpRetryToken(itemCount: 500, oldestId: "older", newestId: "new") !=
+                snQuotedJumpRetryToken(itemCount: 500, oldestId: "old", newestId: "new")
+        )
         #expect(
             snQuotedJumpParentId(
                 conversationId: "marmot:group-09",
