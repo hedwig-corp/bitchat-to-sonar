@@ -1916,6 +1916,18 @@ internal fun firstOpenHasLocalTranscriptPaint(
     snapshot: List<SonarMsg>,
 ): Boolean = retained.isNotEmpty() || snapshot.withoutSyntheticSummaryRows().isNotEmpty()
 
+/** Empty persist-folds hide a recovered 0.8 sibling from retained paint
+ *  and `transcriptGroupIds`. Merge FFI `fold_aliases` before first paint.
+ *  iOS `snFirstOpenShouldMergeFolds` / `openDM`. */
+internal fun firstOpenShouldMergeFolds(
+    seedId: String,
+    persistedFolds: Map<String, String>,
+): Boolean {
+    val bare = seedId.removePrefix("marmot:").trim()
+    if (bare.isEmpty()) return false
+    return foldFamilyIds(bare, persistedFolds).size <= 1
+}
+
 /** Newest-page hydrate must keep remounted fold-family rows.
  *  After persist-folds those rows sit on live (sibling cache empty).
  *  A live-only FFI page must merge into that window — not replace it —

@@ -676,6 +676,22 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == ["group-09"]
         )
+        #expect(snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: [:]))
+        #expect(!snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: wakeFolds))
+        #expect(
+            snRetainedTranscriptForChat(
+                chatId: "group-09",
+                retainedByChat: ["group-08": ["old from 0.8"]],
+                historicalFolds: wakeFolds
+            ) == ["old from 0.8"]
+        )
+        #expect(
+            snRetainedTranscriptForChat(
+                chatId: "group-09",
+                retainedByChat: ["group-08": ["old from 0.8"]],
+                historicalFolds: [:]
+            ).isEmpty
+        )
         #expect(
             SNUnreadCounts.remountFoldedUnread(
                 next: [:],
@@ -1271,6 +1287,10 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ).isEmpty
         )
+        #expect(snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: [:]))
+        #expect(snFirstOpenShouldMergeFolds(seedId: "marmot:group-09", persistedFolds: [:]))
+        #expect(!snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: ["group-08": "group-09"]))
+        #expect(!snFirstOpenShouldMergeFolds(seedId: "marmot:group-09", persistedFolds: ["group-08": "group-09"]))
         #expect(
             snFirstOpenTranscriptPaintRows(
                 chatId: "marmot:group-09",

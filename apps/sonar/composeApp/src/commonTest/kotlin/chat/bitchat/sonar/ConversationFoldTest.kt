@@ -1462,6 +1462,10 @@ class ConversationFoldTest {
         assertEquals(historical, retainedTranscriptForChat("group-09", retained, folds))
         assertEquals(historical, retainedTranscriptForChat("group-08", retained, folds))
         assertEquals(emptyList(), retainedTranscriptForChat("group-09", retained, emptyMap()))
+        assertTrue(firstOpenShouldMergeFolds("group-09", emptyMap()))
+        assertTrue(firstOpenShouldMergeFolds("marmot:group-09", emptyMap()))
+        assertFalse(firstOpenShouldMergeFolds("group-09", folds))
+        assertFalse(firstOpenShouldMergeFolds("marmot:group-09", folds))
         assertEquals(
             listOf(historical.single(), snapshot.single()),
             firstOpenTranscriptPaintRows("group-09", retained, snapshot, folds),
@@ -2065,6 +2069,37 @@ class ConversationFoldTest {
         assertEquals(
             4L,
             openChatUnreadFromCache(notificationSuppressIds(listOf("group-09"), folds), histUnread),
+        )
+        val histRetained = listOf(
+            SonarMsg(id = "m1", senderNpub = "npub1peer", content = "old", mine = false, tsSecs = 1L),
+        )
+        assertTrue(firstOpenShouldMergeFolds("group-09", emptyMap()))
+        assertFalse(firstOpenShouldMergeFolds("group-09", folds))
+        assertEquals(
+            emptyList(),
+            retainedTranscriptForChat("group-09", mapOf("group-08" to histRetained), emptyMap()),
+        )
+        assertEquals(
+            histRetained,
+            retainedTranscriptForChat("group-09", mapOf("group-08" to histRetained), folds),
+        )
+        assertEquals(
+            histRetained,
+            firstOpenTranscriptPaintRows(
+                "group-09",
+                mapOf("group-08" to histRetained),
+                emptyList(),
+                folds,
+            ),
+        )
+        assertEquals(
+            emptyList(),
+            firstOpenTranscriptPaintRows(
+                "group-09",
+                mapOf("group-08" to histRetained),
+                emptyList(),
+                emptyMap(),
+            ),
         )
     }
 
