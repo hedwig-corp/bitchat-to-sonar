@@ -1269,6 +1269,27 @@ struct SonarConversationFoldTests {
             ) == ["group-09"]
         )
         #expect(
+            snLoadOlderBusyRetryShouldWait(
+                openGroupId: "group-09",
+                loadingGroupIds: ["group-08"],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            snLoadOlderBusyRetryShouldWait(
+                openGroupId: "group-09",
+                loadingGroupIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snLoadOlderBusyRetryShouldWait(
+                openGroupId: "group-09",
+                loadingGroupIds: ["group-08"],
+                historicalFolds: [:]
+            )
+        )
+        #expect(
             !snFoldFamilySourceNeedsNewestPage(
                 groupId: "group-09",
                 pagedGroupIds: ["group-08"],

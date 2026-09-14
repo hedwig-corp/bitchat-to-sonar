@@ -950,6 +950,18 @@ class ConversationFoldTest {
             listOf("group-09"),
             loadOlderFamilyPageIds("group-09", emptyMap(), mapOf("group-09" to true)),
         )
+        assertTrue(
+            loadOlderBusyRetryShouldWait("group-09", setOf("group-08"), folds),
+        )
+        assertTrue(
+            loadOlderBusyRetryShouldWait("group-09", setOf("group-09"), folds),
+        )
+        assertFalse(
+            loadOlderBusyRetryShouldWait("group-09", setOf("group-08"), emptyMap()),
+        )
+        assertFalse(
+            loadOlderBusyRetryShouldWait("group-09", emptySet(), folds),
+        )
         // loadOlderDM may pass hist. A remounted live extract must not be
         // newest-paged (snap). Empty unpaged hist still needs a newest page.
         assertFalse(foldFamilySourceNeedsNewestPage("group-09", setOf("group-08"), cachedRowCount = 20))

@@ -971,6 +971,21 @@ internal fun loadOlderFamilyPageIds(
     return ids.filter { hasOlderByGroup[it] == true }.sorted()
 }
 
+/** Wait for a fold-family sibling that is already paging, not only the
+ *  listed live id. Persist-folds load-older on live while hist is
+ *  newest-paging returns false immediately if we only watch [openGroupId].
+ *  iOS `snLoadOlderBusyRetryShouldWait`. */
+internal fun loadOlderBusyRetryShouldWait(
+    openGroupId: String,
+    loadingGroupIds: Set<String>,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    val open = openGroupId.trim()
+    if (open.isEmpty() || loadingGroupIds.isEmpty()) return false
+    val family = foldFamilyIds(open, historicalFolds).ifEmpty { setOf(open) }
+    return family.any { it in loadingGroupIds }
+}
+
 /** Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
  *  hist onto live and drops the hist cache key; paging maps keep hist
  *  once it has been paged. iOS `snHiddenFoldFamilyNeedsPage`. */
@@ -13018,6 +13033,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
 
         val groupIds = transcriptGroupIds(chatId)
+        val folds = historicalFoldMap
+        var busyWait = 0
+        while (
+            busyWait < 21 &&
+            loadOlderBusyRetryShouldWait(
+                chatId,
+                transcriptWindows.filter { it.value.loadingOlder }.keys,
+                folds,
+            )
+        ) {
+            delay(50)
+            busyWait++
+            if (!isCurrentTranscriptSession(chatId, generation)) return false
+        }
         val paged = pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys)
         val listed = chats.mapTo(hashSetOf()) { it.id }
         for (sibling in loadOlderHiddenSiblingsNeedingNewestPage(

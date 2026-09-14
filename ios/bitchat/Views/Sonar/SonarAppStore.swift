@@ -805,6 +805,22 @@ func snLoadOlderFamilyPageIds(
     return ids.filter { hasOlderByGroup[$0] == true }.sorted()
 }
 
+/// Wait for a fold-family sibling that is already paging, not only the
+/// listed live id. Persist-folds load-older on live while hist is
+/// newest-paging returns false immediately if we only watch `openGroupId`.
+/// Compose `loadOlderBusyRetryShouldWait`.
+func snLoadOlderBusyRetryShouldWait(
+    openGroupId: String,
+    loadingGroupIds: Set<String>,
+    historicalFolds: [String: String]
+) -> Bool {
+    let open = openGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !open.isEmpty, !loadingGroupIds.isEmpty else { return false }
+    let family = snFoldFamilyIds(id: open, historicalFolds: historicalFolds)
+    let ids = family.isEmpty ? [open] : Array(family)
+    return ids.contains { loadingGroupIds.contains($0) }
+}
+
 /// Newest-page these hidden siblings before cursor-paging. Walk listed
 /// live ids only — passing hist would newest-page a remounted live
 /// extract and snap. Compose `loadOlderHiddenSiblingsNeedingNewestPage`.

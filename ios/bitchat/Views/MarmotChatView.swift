@@ -2909,8 +2909,11 @@ final class MarmotChatModel: ObservableObject {
     func loadOlderLocalPageWhenAvailable(groupId: String) async -> Bool {
         for attempt in 0..<Self.localTranscriptBusyRetryLimit {
             if await loadOlderLocalPage(groupId: groupId) { return true }
-            guard localTranscriptLoadingGroups.contains(groupId),
-                  attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
+            guard snLoadOlderBusyRetryShouldWait(
+                openGroupId: groupId,
+                loadingGroupIds: localTranscriptLoadingGroups,
+                historicalFolds: historicalFoldsMap()
+            ), attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
             do {
                 try await Task.sleep(nanoseconds: 50_000_000)
             } catch {
