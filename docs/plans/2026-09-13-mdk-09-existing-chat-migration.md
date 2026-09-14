@@ -1574,6 +1574,15 @@ Sidecar-only previews hide folded hist and union family counts. Pins:
 `account_backup::tests::preview_paints_sidecar_name_when_index_name_blank`,
 `account_backup::tests::preview_sidecars_hide_folded_hist_and_union_counts`.
 
+Backup stats still summed every index row. After resume hist
+`message_count` stays on the hidden 0.8 id (`copy_summary` zeroes unread
+only), so Settings showed ~2× messages next to a remounted dry-run
+total. `count_indexed_messages` / restore policy promotion now remount
+like preview. Transcript-sidecar fallback unions the fold family when
+the live id is present and keeps hist-only recovered chats. Pins:
+`account_backup::tests::backup_stats_do_not_double_count_folded_hist`,
+`account_backup::tests::transcript_stats_union_folded_family_without_double_listing`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

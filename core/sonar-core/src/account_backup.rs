@@ -540,7 +540,9 @@ pub fn record_backup_success(
     })
 }
 
-/// Total messages across every conversation in the local index.
+/// Total messages across published conversations in the local index.
+/// Folded 0.8 hist rows stay in the table after resume; summing them with
+/// the live sibling double-counts the Settings backup stats strip.
 fn count_indexed_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
     let key: [u8; 32] = hex::decode(db_key_hex).ok()?.try_into().ok()?;
     let index = crate::conversation_index::ConversationIndex::open(
@@ -549,7 +551,19 @@ fn count_indexed_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
     )
     .ok()?;
     let summaries = index.summaries_ordered().ok()?;
-    Some(summaries.iter().map(|s| s.message_count).sum())
+    let folds = merge_preview_folds(
+        index.list_folds().unwrap_or_default(),
+        sidecar_string_map(db_path, crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX)
+            .into_iter()
+            .collect(),
+    );
+    let rows = remount_preview_summaries(
+        summaries,
+        &folds,
+        &dropped_group_hexes_on_disk(db_path),
+        &sidecar_string_map(db_path, crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX),
+    );
+    Some(rows.iter().map(|row| row.message_count).sum())
 }
 
 /// Index first; recovered-chat transcript sidecar if the index is missing
@@ -568,12 +582,80 @@ fn count_transcript_sidecar_messages(db_path: &Path) -> Option<u64> {
         crate::marmot::TRANSCRIPT_FILE_SUFFIX,
     ))
     .ok()?;
-    count_transcript_bytes(&bytes)
+    let folds: Vec<(String, String)> =
+        sidecar_string_map(db_path, crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX)
+            .into_iter()
+            .collect();
+    count_transcript_bytes_remounted(&bytes, &folds, &dropped_group_hexes_on_disk(db_path))
 }
 
 fn count_transcript_bytes(bytes: &[u8]) -> Option<u64> {
+    count_transcript_bytes_remounted(bytes, &[], &HashSet::new())
+}
+
+fn count_transcript_bytes_remounted(
+    bytes: &[u8],
+    folds: &[(String, String)],
+    dropped: &HashSet<String>,
+) -> Option<u64> {
     let keyed: HashMap<String, Vec<serde_json::Value>> = serde_json::from_slice(bytes).ok()?;
-    Some(keyed.values().map(|msgs| msgs.len() as u64).sum())
+    let hidden = folded_historical_hexes(folds);
+    let live_present = |live: &str| {
+        let live_key = preview_hex_key(live);
+        keyed.keys().any(|id| preview_hex_key(id) == live_key)
+    };
+    let mut total = 0u64;
+    for (id, msgs) in &keyed {
+        let hex = preview_hex_key(id);
+        if dropped.contains(&hex) {
+            continue;
+        }
+        if hidden.contains(&hex) {
+            let live = folds.iter().find_map(|(historical, live)| {
+                (preview_hex_key(historical) == hex).then_some(live.as_str())
+            });
+            if live.is_some_and(live_present) {
+                continue;
+            }
+        }
+        let mut n = msgs.len() as u64;
+        for (historical, live) in folds {
+            if preview_hex_key(live) != hex {
+                continue;
+            }
+            let hist_key = preview_hex_key(historical);
+            if let Some(hist_msgs) = keyed
+                .iter()
+                .find(|(other, _)| preview_hex_key(other) == hist_key)
+                .map(|(_, rows)| rows)
+            {
+                n += hist_msgs.len() as u64;
+            }
+        }
+        total += n;
+    }
+    Some(total)
+}
+
+fn sidecar_string_map(db_path: &Path, suffix: &str) -> HashMap<String, String> {
+    fs::read(sidecar_named(db_path, suffix))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn dropped_group_hexes_on_disk(db_path: &Path) -> HashSet<String> {
+    fs::read(sidecar_named(
+        db_path,
+        crate::marmot::DROPPED_GROUPS_FILE_SUFFIX,
+    ))
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|id| !id.is_empty())
+    .map(|id| id.to_ascii_lowercase())
+    .collect()
 }
 
 /// Wipe hook: remove a plaintext key sidecar left by builds that briefly wrote
@@ -3348,6 +3430,92 @@ mod tests {
         assert_eq!(listed[0].name, "standup");
         assert_eq!(listed[0].latest_content, "keep this chat");
         assert_eq!(listed[0].message_count, 50);
+        let live_with_new = crate::conversation_index::ConversationSummary {
+            group_id_hex: "09".repeat(16),
+            name: String::new(),
+            latest_content: "new 0.9".into(),
+            latest_sender: "alice".into(),
+            latest_at_secs: 200,
+            latest_mine: true,
+            message_count: 5,
+            unread_count: 0,
+            version: 1,
+        };
+        let folded = remount_preview_summaries(
+            vec![
+                crate::conversation_index::ConversationSummary {
+                    group_id_hex: "08".repeat(16),
+                    name: "standup".into(),
+                    latest_content: "keep this chat".into(),
+                    latest_sender: "alice".into(),
+                    latest_at_secs: 100,
+                    latest_mine: false,
+                    message_count: 50,
+                    unread_count: 0,
+                    version: 1,
+                },
+                live_with_new,
+            ],
+            &folds,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            folded.iter().map(|row| row.message_count).sum::<u64>(),
+            50,
+            "stats must remount max, not sum hist+live: {folded:?}"
+        );
+    }
+
+    #[test]
+    fn backup_stats_do_not_double_count_folded_hist() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        let key: [u8; 32] = hex::decode(&key_hex).unwrap().try_into().unwrap();
+        {
+            let idx = crate::conversation_index::ConversationIndex::open(
+                &crate::conversation_index::index_db_path_for_db(&db_path),
+                key,
+            )
+            .unwrap();
+            let hist = "08".repeat(16);
+            let live = "09".repeat(16);
+            idx.upsert_summary(&hist, "standup", "old 1", "alice", 80, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist, "standup", "old 2", "alice", 90, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist, "standup", "keep", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live, "", "new 0.9", "alice", 200, false, true)
+                .unwrap();
+            idx.record_fold(&hist, &live).unwrap();
+        }
+        assert_eq!(
+            count_indexed_messages(&db_path, &key_hex),
+            Some(3),
+            "folded hist count must remount, not add onto live"
+        );
+    }
+
+    #[test]
+    fn transcript_stats_union_folded_family_without_double_listing() {
+        let hist = "08".repeat(16);
+        let live = "09".repeat(16);
+        let mut keyed = HashMap::new();
+        keyed.insert(hist.clone(), vec![serde_json::json!({"n": 1})]);
+        keyed.insert(live.clone(), vec![serde_json::json!({"n": 2})]);
+        let bytes = serde_json::to_vec(&keyed).unwrap();
+        let folds = vec![(hist, live)];
+        assert_eq!(
+            count_transcript_bytes_remounted(&bytes, &folds, &HashSet::new()),
+            Some(2)
+        );
+        assert_eq!(
+            count_transcript_bytes(&bytes),
+            Some(2),
+            "no-fold helper still sums every group"
+        );
     }
 
     #[test]
