@@ -907,6 +907,39 @@ class ConversationFoldTest {
         assertTrue(hasOlderForFoldFamily("group-09", mapOf("group-09" to true), folds))
         assertFalse(hasOlderForFoldFamily("group-09", mapOf("group-08" to false, "group-09" to false), folds))
         assertFalse(hasOlderForFoldFamily("group-09", mapOf("group-08" to true), emptyMap()))
+        assertTrue(
+            hasOlderForFoldFamily(
+                "group-09",
+                mapOf("group-08" to false, "group-09" to false),
+                folds,
+                cachedCount = TRANSCRIPT_PAGE_SIZE + 1,
+                pageSize = TRANSCRIPT_PAGE_SIZE,
+            ),
+        )
+        assertFalse(
+            foldFamilyCacheHasOlderThanPage(
+                cachedCount = TRANSCRIPT_PAGE_SIZE,
+                pageSize = TRANSCRIPT_PAGE_SIZE,
+            ),
+        )
+        assertTrue(
+            seededFoldFamilyTranscriptHasMore(
+                cachedCount = TRANSCRIPT_PAGE_SIZE + 10,
+                familyHasOlder = false,
+            ),
+        )
+        assertFalse(
+            seededFoldFamilyTranscriptHasMore(
+                cachedCount = TRANSCRIPT_PAGE_SIZE,
+                familyHasOlder = false,
+            ),
+        )
+        assertTrue(
+            seededFoldFamilyTranscriptHasMore(
+                cachedCount = TRANSCRIPT_PAGE_SIZE,
+                familyHasOlder = true,
+            ),
+        )
     }
 
     @Test

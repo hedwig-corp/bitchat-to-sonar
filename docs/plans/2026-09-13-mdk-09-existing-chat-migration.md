@@ -948,6 +948,18 @@ promote. `snTrillCooldownUntil` reuses the payment key set. Pins:
 `ConversationFoldTest.trillCooldownReadsHiddenHistoricalSibling`,
 `SonarConversationFoldTests` `snTrillCooldownUntil`.
 
+Family-cache overflow hole closed after this commit: Compose first
+paint `takeLast(page)` of a family-unioned host cache dropped older
+recovered 0.8 rows while both `hasMore` flags stayed false, and
+`beginTranscriptSession` cleared the source window so load-older
+could not prepend them. iOS already compared render vs `dmMsgs`
+candidates (`hasRowsOlder`). `seededFoldFamilyTranscriptHasMore` /
+`snSeededFoldFamilyTranscriptHasMore` treat union count > page as
+has-older; open / newest-reload seed the full family cache (capped
+at the retained window) before bounding paint. Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
+`SonarConversationFoldTests` `snSeededFoldFamilyTranscriptHasMore`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

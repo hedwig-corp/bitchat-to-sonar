@@ -811,6 +811,19 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snFoldFamilyHasOlder(
+                groupId: "group-09",
+                hasOlderByGroup: ["group-08": false, "group-09": false],
+                historicalFolds: ["group-08": "group-09"],
+                cachedCount: 31,
+                pageSize: 30
+            )
+        )
+        #expect(!snFoldFamilyCacheHasOlderThanPage(cachedCount: 30, pageSize: 30))
+        #expect(snSeededFoldFamilyTranscriptHasMore(cachedCount: 40, familyHasOlder: false))
+        #expect(!snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: false))
+        #expect(snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: true))
+        #expect(
             snFoldFamilyPagingCursor(
                 groupId: "group-09",
                 cursorsByGroup: ["group-08": "cursor-08"],

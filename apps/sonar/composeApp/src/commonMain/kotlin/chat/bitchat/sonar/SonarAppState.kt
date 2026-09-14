@@ -730,14 +730,35 @@ internal fun foldedSiblingHasMore(
     liveHasMore: Boolean,
 ): Boolean = historicalHasMore || liveHasMore
 
-/** True when any fold-family id still has an older local page. */
+/** True when a family-unioned host cache is larger than the painted page.
+ *  First paint takeLast(page) would otherwise drop recovered 0.8 rows while
+ *  every stored hasMore flag stays false (iOS `hasRowsOlder`). */
+internal fun foldFamilyCacheHasOlderThanPage(
+    cachedCount: Int,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+): Boolean = pageSize > 0 && cachedCount > pageSize
+
+/** Seeded window / load-older gate after a fold: leftover host rows or a
+ *  stored family flag both mean the live transcript still has older history. */
+internal fun seededFoldFamilyTranscriptHasMore(
+    cachedCount: Int,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+    familyHasOlder: Boolean = false,
+): Boolean = familyHasOlder || foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)
+
+/** True when any fold-family id still has an older local page, or when the
+ *  unioned host cache itself overflows the painted page. */
 internal fun hasOlderForFoldFamily(
     groupId: String,
     hasMoreById: Map<String, Boolean>,
     historicalFolds: Map<String, String>,
-): Boolean =
-    foldFamilyIds(groupId, historicalFolds).ifEmpty { setOf(groupId) }
+    cachedCount: Int = 0,
+    pageSize: Int = 0,
+): Boolean {
+    if (foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)) return true
+    return foldFamilyIds(groupId, historicalFolds).ifEmpty { setOf(groupId) }
         .any { hasMoreById[it] == true }
+}
 
 /** Promote load-older flags from a hidden 0.8 id onto the listed live sibling. */
 internal fun promotedFoldedPagingFlags(
@@ -2226,7 +2247,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val snapshot = if (isMeshChat(chatId)) {
             refreshMeshTranscriptWindow(meshPeerId(chatId))
         } else {
-            snapshotMessagesForChat(chatId).takeLast(TRANSCRIPT_PAGE_SIZE)
+            val full = snapshotMessagesForChat(chatId).withoutSyntheticSummaryRows()
+            seedFoldFamilyTranscriptWindows(chatId, full)
+            full
         }
         val immediate = refreshConversationRows(snapshot, chatId, generation)
         setCurrentVisibleMessages(
@@ -3399,6 +3422,25 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun snapshotMessagesForChat(chatId: String): List<SonarMsg> =
         foldFamilyCachedMessages(chatId, chatSnapshotMessagesByChat, historicalFoldMap) { it.id }
             .sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+
+    /** Keep the full family-unioned host cache in the source window so first
+     *  paint takeLast(page) cannot hide recovered 0.8 rows or disable load-older. */
+    private fun seedFoldFamilyTranscriptWindows(chatId: String, snapshot: List<SonarMsg>) {
+        val rows = snapshot.withoutSyntheticSummaryRows().takeLast(TRANSCRIPT_RETAINED_ROWS)
+        if (rows.isEmpty()) return
+        val hasMore = seededFoldFamilyTranscriptHasMore(
+            cachedCount = rows.size,
+            familyHasOlder = hasOlderForFoldFamily(
+                chatId,
+                transcriptWindows.mapValues { it.value.hasMore },
+                historicalFoldMap,
+            ),
+        )
+        val window = TranscriptGroupWindow(rows = rows, hasMore = hasMore)
+        for (id in foldFamilyIds(chatId, historicalFoldMap).ifEmpty { setOf(chatId) }) {
+            transcriptWindows[id] = window
+        }
+    }
 
     private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
         // Local cursor reads race navigation. A late page from chat A must not
@@ -7507,15 +7549,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
             return
         }
+        val snapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
+        seedFoldFamilyTranscriptWindows(chat.id, snapshot)
         val snapshotPaint = visibleMessagesForChat(
             chat.id,
             withSendEchoes(
                 chat.id,
-                boundedTranscriptRows(
-                    snapshotMessagesForChat(chat.id),
-                    TRANSCRIPT_PAGE_SIZE,
-                    pinnedToOlderEdge = false,
-                ),
+                refreshConversationRows(snapshot, chat.id, generation),
             ),
         )
         messages = firstOpenTranscriptPaint(chat.id, snapshotPaint)
@@ -12188,11 +12228,17 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun transcriptWindowHasMore(groupId: String): Boolean {
         val window = transcriptWindows[groupId]
+        val cachedCount = foldFamilyIds(groupId, historicalFoldMap).ifEmpty { setOf(groupId) }
+            .flatMap { transcriptWindows[it]?.rows.orEmpty() }
+            .distinctBy { it.id }
+            .size
         return (window?.hasMore == true) ||
             hasOlderForFoldFamily(
                 groupId,
                 transcriptWindows.mapValues { it.value.hasMore },
                 historicalFoldMap,
+                cachedCount = cachedCount,
+                pageSize = conversationVisibleRowLimit,
             )
     }
 

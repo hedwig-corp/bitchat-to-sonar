@@ -550,14 +550,40 @@ func snFoldedSiblingHasMore(historicalHasMore: Bool, liveHasMore: Bool) -> Bool 
     historicalHasMore || liveHasMore
 }
 
-/// True when any fold-family id still has an older local page. Promote
-/// copies the hist flag onto live asynchronously; first paint of the live
-/// row must still offer load-older for leftover 0.8 remainder.
+/// True when a family-unioned host cache is larger than the painted page.
+/// First paint `suffix(page)` would otherwise drop recovered 0.8 rows while
+/// every stored hasOlder flag stays false (Compose `hasRowsOlder` twin).
+func snFoldFamilyCacheHasOlderThanPage(
+    cachedCount: Int,
+    pageSize: Int = 30
+) -> Bool {
+    pageSize > 0 && cachedCount > pageSize
+}
+
+/// Seeded window / load-older gate after a fold: leftover host rows or a
+/// stored family flag both mean the live transcript still has older history.
+func snSeededFoldFamilyTranscriptHasMore(
+    cachedCount: Int,
+    pageSize: Int = 30,
+    familyHasOlder: Bool = false
+) -> Bool {
+    familyHasOlder || snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize)
+}
+
+/// True when any fold-family id still has an older local page, or when the
+/// unioned host cache itself overflows the painted page. Promote copies
+/// the hist flag onto live asynchronously; first paint of the live row
+/// must still offer load-older for leftover 0.8 remainder.
 func snFoldFamilyHasOlder(
     groupId: String,
     hasOlderByGroup: [String: Bool],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    cachedCount: Int = 0,
+    pageSize: Int = 0
 ) -> Bool {
+    if snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize) {
+        return true
+    }
     let ids = [groupId] + snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
     return ids.contains { hasOlderByGroup[$0] == true }
 }
