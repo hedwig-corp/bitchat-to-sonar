@@ -1062,6 +1062,53 @@ class ConversationFoldTest {
             RecoveredChatResumeUi.Live,
             recoveredChatResumeUi(hasLiveFoldSibling = false, keyPackageMissing = false),
         )
+        // FFI hides the folded 0.8 id, so listed duplicates go back to 1.
+        // Rooms never have listed 1:1 duplicates. The hist→live blob is
+        // the live sibling.
+        assertTrue(
+            recoveredChatHasLiveFoldSibling(
+                chatId = "group-08",
+                listedDuplicateCount = 1,
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertTrue(
+            recoveredChatHasLiveFoldSibling(
+                chatId = "group-09",
+                listedDuplicateCount = 1,
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertFalse(
+            recoveredChatHasLiveFoldSibling(
+                chatId = "group-08",
+                listedDuplicateCount = 1,
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(
+            recoveredChatHasLiveFoldSibling(
+                chatId = "group-08",
+                listedDuplicateCount = 2,
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            setOf("other"),
+            remountClearsRecoveredWaitingFlag(
+                needsUpdate = setOf("group-08", "other"),
+                historicalId = "group-08",
+                liveId = "group-09",
+            ),
+        )
+        assertEquals(
+            emptySet(),
+            remountClearsRecoveredWaitingFlag(
+                needsUpdate = setOf("group-08", "group-09"),
+                historicalId = "group-08",
+                liveId = "group-09",
+            ),
+        )
         assertTrue(marmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         assertEquals(
             "Waiting for them to update Sonar",

@@ -633,6 +633,36 @@ func snRecoveredChatNeedsPeerUpdate(
     !hasLiveFoldSibling && keyPackageMissing
 }
 
+/// FFI hides the folded 0.8 id, so listed duplicate DMs go back to 1.
+/// Rooms never have listed duplicates. A persisted hist→live binding is
+/// the live sibling.
+func snRecoveredChatHasLiveFoldSibling(
+    chatId: String,
+    listedDuplicateCount: Int,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> Bool {
+    if listedDuplicateCount > 1 { return true }
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    guard !bare.isEmpty else { return false }
+    if let live = historicalFolds[bare] ?? historicalFolds[chatId],
+       !live.isEmpty,
+       snBareMarmotGroupId(live, prefix: prefix) != bare {
+        return true
+    }
+    return historicalFolds.contains { _, live in
+        snBareMarmotGroupId(live, prefix: prefix) == bare
+    }
+}
+
+/// Resume created the live sibling. Drop the waiting flag — do not copy it.
+func snRemountClearsRecoveredWaitingFlag(
+    needsUpdate: Set<String>,
+    remountedIds: [String]
+) -> Set<String> {
+    needsUpdate.subtracting(Set(remountedIds))
+}
+
 let SNRecoveredLegacyMediaCopy =
     "This attachment is from an older Sonar and can't be opened after the update."
 
@@ -5542,10 +5572,20 @@ final class SonarAppStore: ObservableObject {
         } else {
             groups = []
         }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let family = snFoldFamilyIds(id: groupId ?? id, historicalFolds: folds)
         let flagged = recoveredChatNeedsUpdate.contains(id)
             || groupId.map { recoveredChatNeedsUpdate.contains($0) } == true
+            || family.contains(where: {
+                recoveredChatNeedsUpdate.contains($0)
+                    || recoveredChatNeedsUpdate.contains(Self.marmotIDPrefix + $0)
+            })
         return snRecoveredChatNeedsPeerUpdate(
-            hasLiveFoldSibling: groups.count > 1,
+            hasLiveFoldSibling: snRecoveredChatHasLiveFoldSibling(
+                chatId: groupId ?? id,
+                listedDuplicateCount: groups.count,
+                historicalFolds: folds
+            ),
             keyPackageMissing: flagged
         )
     }
@@ -7850,11 +7890,12 @@ final class SonarAppStore: ObservableObject {
             )
             persistCallLogs()
         }
-        if recoveredChatNeedsUpdate.contains(openId) || recoveredChatNeedsUpdate.contains(groupId) {
-            recoveredChatNeedsUpdate.remove(openId)
-            recoveredChatNeedsUpdate.remove(groupId)
-            recoveredChatNeedsUpdate.insert(realId)
-            recoveredChatNeedsUpdate.insert(remounted)
+        if recoveredChatNeedsUpdate.contains(openId) || recoveredChatNeedsUpdate.contains(groupId)
+            || recoveredChatNeedsUpdate.contains(realId) || recoveredChatNeedsUpdate.contains(remounted) {
+            recoveredChatNeedsUpdate = snRemountClearsRecoveredWaitingFlag(
+                needsUpdate: recoveredChatNeedsUpdate,
+                remountedIds: [openId, groupId, realId, remounted]
+            )
         }
         if marmotVerified[groupId] == true, marmotVerified[remounted] != true {
             marmotVerified[remounted] = true

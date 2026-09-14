@@ -872,6 +872,28 @@ internal fun recoveredChatResumeUi(
         RecoveredChatResumeUi.Live
     }
 
+/** FFI hides the folded 0.8 id, so listed duplicate DMs go back to 1.
+ *  Rooms never have listed duplicates. A persisted hist→live binding is
+ *  the live sibling. */
+internal fun recoveredChatHasLiveFoldSibling(
+    chatId: String,
+    listedDuplicateCount: Int,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    if (listedDuplicateCount > 1) return true
+    if (chatId.isBlank()) return false
+    val live = historicalFolds[chatId]
+    if (!live.isNullOrBlank() && live != chatId) return true
+    return historicalFolds.values.any { it == chatId }
+}
+
+/** Resume created the live sibling. Drop the waiting flag — do not copy it. */
+internal fun remountClearsRecoveredWaitingFlag(
+    needsUpdate: Set<String>,
+    historicalId: String,
+    liveId: String,
+): Set<String> = needsUpdate - historicalId - liveId
+
 internal fun marmotSendUserMessage(error: String): String {
     val lower = error.lowercase()
     return if (
@@ -2961,8 +2983,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun recoveredChatWaitingForPeerUpdate(chatId: String): Boolean {
         val groups = duplicateDirectMarmotChats(chatId)
-        val hasLiveSibling = groups.size > 1
-        val flagged = chatId in recoveredChatNeedsUpdate || groups.any { it.id in recoveredChatNeedsUpdate }
+        val hasLiveSibling = recoveredChatHasLiveFoldSibling(
+            chatId = chatId,
+            listedDuplicateCount = groups.size,
+            historicalFolds = historicalFoldMap,
+        )
+        val family = foldFamilyIds(chatId, historicalFoldMap)
+        val flagged = chatId in recoveredChatNeedsUpdate ||
+            groups.any { it.id in recoveredChatNeedsUpdate } ||
+            family.any { it in recoveredChatNeedsUpdate }
         return recoveredChatResumeUi(
             hasLiveFoldSibling = hasLiveSibling,
             keyPackageMissing = flagged,
@@ -12759,8 +12788,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             callLogs.remove(open.id)
             callVersion++
         }
-        if (open.id in recoveredChatNeedsUpdate) {
-            recoveredChatNeedsUpdate = recoveredChatNeedsUpdate - open.id + live
+        if (open.id in recoveredChatNeedsUpdate || live in recoveredChatNeedsUpdate) {
+            recoveredChatNeedsUpdate = remountClearsRecoveredWaitingFlag(
+                recoveredChatNeedsUpdate,
+                open.id,
+                live,
+            )
         }
         if (open.id in verifiedChatIds && live !in verifiedChatIds) {
             persistVerifiedId(live)

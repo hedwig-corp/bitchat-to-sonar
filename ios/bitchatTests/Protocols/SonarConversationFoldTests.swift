@@ -388,6 +388,49 @@ struct SonarConversationFoldTests {
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))
         #expect(!snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: true, keyPackageMissing: true))
+        // FFI hides the folded 0.8 id, so listed duplicates go back to 1.
+        // Rooms never have listed 1:1 duplicates. The hist→live blob is
+        // the live sibling.
+        #expect(
+            snRecoveredChatHasLiveFoldSibling(
+                chatId: "group-08",
+                listedDuplicateCount: 1,
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            snRecoveredChatHasLiveFoldSibling(
+                chatId: "marmot:group-09",
+                listedDuplicateCount: 1,
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snRecoveredChatHasLiveFoldSibling(
+                chatId: "group-08",
+                listedDuplicateCount: 1,
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snRecoveredChatHasLiveFoldSibling(
+                chatId: "group-08",
+                listedDuplicateCount: 2,
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snRemountClearsRecoveredWaitingFlag(
+                needsUpdate: ["marmot:group-08", "other"],
+                remountedIds: ["marmot:group-08", "group-08", "marmot:group-09", "group-09"]
+            ) == ["other"]
+        )
+        #expect(
+            snRemountClearsRecoveredWaitingFlag(
+                needsUpdate: ["marmot:group-08", "marmot:group-09"],
+                remountedIds: ["marmot:group-08", "group-08", "marmot:group-09", "group-09"]
+            ).isEmpty
+        )
         #expect(
             snRecoveredLegacyMediaUnavailable(
                 "encrypted media error: this attachment is from an older Sonar and cannot be opened after the update"
