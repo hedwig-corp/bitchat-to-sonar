@@ -503,6 +503,10 @@ struct SonarConversationFoldTests {
         )
         #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
+        #expect(
+            snMarmotInviteUserMessage("this recovered chat cannot invite until it is resumed")
+                == "Send a message first to resume this chat, then invite"
+        )
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))
         #expect(!snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: true, keyPackageMissing: true))
         // FFI hides the folded 0.8 id, so listed duplicates go back to 1.

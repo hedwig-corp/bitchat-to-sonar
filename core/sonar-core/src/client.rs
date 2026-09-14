@@ -7256,18 +7256,24 @@ impl SonarClient {
     /// must embed the live sibling so a joiner requests the 0.9 group. Do not
     /// call `resolve_send_group`: minting must not create a group. Pre-fold
     /// tokens stay on the 0.8 id; family union still lists and approves them.
+    /// An unresumed recovered room has no live sibling — minting would embed
+    /// a dead 0.8 MLS id that a 0.9 joiner cannot request.
     fn invite_mint_group(&self, group_id: &GroupId) -> Result<GroupId> {
         if self.engine.is_dropped(group_id) {
             return Err(Error::InvalidInput("this chat was deleted".into()));
         }
-        let mint_id = self
-            .engine
-            .live_fold_target(group_id)
-            .unwrap_or_else(|| group_id.clone());
-        if self.engine.is_dropped(&mint_id) {
-            return Err(Error::InvalidInput("this chat was deleted".into()));
+        if let Some(live) = self.engine.live_fold_target(group_id) {
+            if self.engine.is_dropped(&live) {
+                return Err(Error::InvalidInput("this chat was deleted".into()));
+            }
+            return Ok(live);
         }
-        Ok(mint_id)
+        if self.engine.is_historical_group(group_id)? {
+            return Err(Error::InvalidInput(
+                "this recovered chat cannot invite until it is resumed".into(),
+            ));
+        }
+        Ok(group_id.clone())
     }
 
     fn record_resume_fold(&self, historical: &GroupId, live: &GroupId) {
@@ -9101,6 +9107,53 @@ mod tests {
         );
         assert_eq!(client.active_invite_links(&historical).len(), 1);
         assert_eq!(client.active_invite_links(&live).len(), 1);
+    }
+
+    /// A recovered 0.8 room has no live MLS group until resume. Minting a
+    /// token that names that id would hand a 0.9 joiner a dead group.
+    #[tokio::test]
+    async fn create_invite_link_rejects_unresumed_historical_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x17u8; 16]);
+        let peer = Keys::generate().public_key();
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(3),
+            group_id: historical.clone(),
+            sender: peer,
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(1),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        assert!(
+            client.engine.is_historical_group(&historical).unwrap(),
+            "transcript-only id must be a recovered room"
+        );
+        let err = client
+            .create_invite_link(&historical, "standup")
+            .expect_err("unresumed recovered room must not mint a dead 0.8 token");
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "unresumed recovered room must fail closed: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("cannot invite until it is resumed"),
+            "host toast maps this string: {err}"
+        );
+        let live = GroupId::new([0x19u8; 16]);
+        client.engine.record_historical_fold(&historical, &live);
+        let token = client
+            .create_invite_link(&historical, "standup")
+            .expect("mint after resume");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        assert_eq!(decoded.group_id, live.as_slice());
     }
 
     #[tokio::test]

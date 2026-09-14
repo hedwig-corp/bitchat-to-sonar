@@ -749,6 +749,14 @@ func snMarmotSendUserMessage(_ error: String) -> String {
         : "Couldn't send: \(error)"
 }
 
+/// Invite mint is local and must not create a group. An unresumed 0.8 room
+/// has no live MLS id — fail closed instead of handing out a dead token.
+func snMarmotInviteUserMessage(_ error: String) -> String {
+    error.lowercased().contains("cannot invite until it is resumed")
+        ? "Send a message first to resume this chat, then invite"
+        : "Couldn't create link: \(error)"
+}
+
 func snRecoveredChatNeedsPeerUpdate(
     hasLiveFoldSibling: Bool,
     keyPackageMissing: Bool

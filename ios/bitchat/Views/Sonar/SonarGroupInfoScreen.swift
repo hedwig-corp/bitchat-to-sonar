@@ -350,7 +350,7 @@ struct SonarGroupInfoScreen: View {
                 copyInviteLink(link)
                 showToast("Invite link created and copied")
             } catch {
-                showToast("Couldn't create link: \(MarmotChatModel.describe(error))")
+                showToast(snMarmotInviteUserMessage(MarmotChatModel.describe(error)))
             }
         }
     }

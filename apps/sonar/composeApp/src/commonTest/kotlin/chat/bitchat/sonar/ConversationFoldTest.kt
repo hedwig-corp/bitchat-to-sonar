@@ -1273,6 +1273,10 @@ class ConversationFoldTest {
             "Waiting for them to update Sonar",
             marmotSendUserMessage("no key package found on relays for npub1abc"),
         )
+        assertEquals(
+            "Send a message first to resume this chat, then invite",
+            marmotInviteUserMessage("this recovered chat cannot invite until it is resumed"),
+        )
         assertTrue(
             recoveredLegacyMediaUnavailable(
                 "encrypted media error: this attachment is from an older Sonar and cannot be opened after the update",

@@ -999,6 +999,17 @@ internal fun marmotSendUserMessage(error: String): String {
     }
 }
 
+/** Invite mint is local and must not create a group. An unresumed 0.8 room
+ *  has no live MLS id — fail closed instead of handing out a dead token. */
+internal fun marmotInviteUserMessage(error: String): String {
+    val lower = error.lowercase()
+    return if ("cannot invite until it is resumed" in lower) {
+        "Send a message first to resume this chat, then invite"
+    } else {
+        "couldn't create invite link: $error"
+    }
+}
+
 internal fun marmotSendNeedsPeerUpdate(error: String): Boolean =
     marmotSendUserMessage(error) == "Waiting for them to update Sonar"
 
@@ -11015,7 +11026,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val token = SonarCore.createInviteLink(chatId, groupName)
                 onResult(token)
             } catch (e: Throwable) {
-                toast = "couldn't create invite link: ${e.message}"
+                toast = marmotInviteUserMessage(e.message.orEmpty())
             }
         }
     }

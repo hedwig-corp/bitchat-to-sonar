@@ -479,6 +479,10 @@ on `resolve_send_group`),
 (a new token after resume embeds the live 0.9 id even when the host
 still passes the recovered 0.8 id; minting does not call
 `resolve_send_group` and must not create a group),
+`client::tests::create_invite_link_rejects_unresumed_historical_group`
+(an unresumed recovered room must not mint a token that names the dead
+0.8 MLS id; send first to resume, then invite. Hosts map that error to
+"Send a message first to resume this chat, then invite"),
 `client::tests::create_invite_link_rejects_dropped_group`,
 `client::tests::create_invite_link_marks_account_backup_dirty`
 (minting a shareable secret enters the opportunistic backup window
