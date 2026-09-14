@@ -453,6 +453,12 @@ async fn wipe_removes_the_database() {
     let invite_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-invites.json.tmp");
     std::fs::write(&invite_path, b"{}").expect("fake invite sidecar");
     std::fs::write(&invite_tmp_path, b"{}").expect("fake invite temp sidecar");
+    let descriptions_path =
+        db_path.with_file_name("marmot.sqlite.sonar-historical-descriptions.json");
+    let descriptions_tmp_path =
+        db_path.with_file_name("marmot.sqlite.sonar-historical-descriptions.json.tmp");
+    std::fs::write(&descriptions_path, b"{}").expect("fake recovered descriptions");
+    std::fs::write(&descriptions_tmp_path, b"{}").expect("fake recovered descriptions temp");
 
     MarmotEngine::wipe(&db_path).expect("wipe");
     assert!(!db_path.exists(), "db file removed by wipe");
@@ -479,6 +485,14 @@ async fn wipe_removes_the_database() {
     assert!(
         !invite_tmp_path.exists(),
         "a crashed invite-sidecar rename must not survive a wipe"
+    );
+    assert!(
+        !descriptions_path.exists(),
+        "recovered 0.8 room descriptions must not survive a wipe"
+    );
+    assert!(
+        !descriptions_tmp_path.exists(),
+        "a crashed descriptions-sidecar rename must not survive a wipe"
     );
 
     // Wipe is idempotent.

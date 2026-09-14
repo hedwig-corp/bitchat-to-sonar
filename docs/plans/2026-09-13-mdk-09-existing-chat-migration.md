@@ -494,7 +494,8 @@ permanently urgent),
 `account_backup::tests::write_read_package_files_roundtrips_invite_sidecar`
 (v2 backup packs `.sonar-invites.json` so nsec restore keeps minted
 `sinvite1` secrets and pending join requests),
-`persistence::wipe_removes_the_database` (wipe deletes the invite sidecar),
+`persistence::wipe_removes_the_database` (wipe deletes the invite sidecar
+and recovered room descriptions, including crashed `.tmp` renames),
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
