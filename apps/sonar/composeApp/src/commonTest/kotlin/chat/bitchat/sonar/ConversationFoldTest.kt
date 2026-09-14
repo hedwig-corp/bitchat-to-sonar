@@ -1084,6 +1084,48 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun accountRestoreHostFoldsComeFromLiveSiblingNotPreviousAccount() {
+        val previousAccount = mapOf("other-08" to "other-09", "group-08" to "stale-09")
+        val aliases = { id: String ->
+            if (id == "group-09" || id == "group-08") listOf("group-09", "group-08") else listOf(id)
+        }
+        val live = { id: String -> if (id == "group-08" || id == "group-09") "group-09" else null }
+        val restored = historicalFoldsAfterAccountRestore(
+            previousAccountFolds = previousAccount,
+            listedIds = listOf("group-09"),
+            foldAliases = aliases,
+            liveFoldTarget = live,
+        )
+        assertEquals(mapOf("group-08" to "group-09"), restored)
+        assertFalse("other-08" in restored)
+        assertEquals("group-09", restored["group-08"])
+        assertEquals(
+            listOf("group-09"),
+            collapsedFoldedSnapshotChats(
+                chats = listOf(
+                    SonarChat(id = "group-08", name = "room", members = listOf("npub1a"), isDirect = false),
+                    SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false),
+                ),
+                historicalFolds = restored,
+            ).map { it.id },
+        )
+    }
+
+    @Test
+    fun retainedScanChatIdsKeepHiddenHistoricalSibling() {
+        val listed = setOf("group-09")
+        assertEquals(listed, retainedScanChatIds(listed, emptyMap()))
+        assertEquals(
+            setOf("group-08", "group-09"),
+            retainedScanChatIds(listed, mapOf("group-08" to "group-09")),
+        )
+        assertEquals(
+            listed,
+            retainedScanChatIds(listed, mapOf("other-08" to "other-09")),
+        )
+    }
+
+    @Test
     fun foldedHistoricalVerifiedBlobRecoversOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

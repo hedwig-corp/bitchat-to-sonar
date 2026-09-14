@@ -283,6 +283,38 @@ struct SonarConversationFoldTests {
                 liveFoldTarget: { _ in nil }
             ).isEmpty
         )
+        #expect(
+            snHistoricalFoldsAfterAccountRestore(
+                previousAccountFolds: ["other-08": "other-09", "group-08": "stale-09"],
+                listedIds: ["group-09"],
+                foldAliases: { $0 == "group-09" || $0 == "group-08" ? ["group-09", "group-08"] : [$0] },
+                liveFoldTarget: { $0 == "group-08" || $0 == "group-09" ? "group-09" : nil }
+            ) == ["group-08": "group-09"]
+        )
+        #expect(
+            snCollapsedFoldedSnapshotGroups(
+                groups: ["group-08", "group-09"],
+                id: { $0 },
+                historicalFolds: snHistoricalFoldsAfterAccountRestore(
+                    previousAccountFolds: ["other-08": "other-09"],
+                    listedIds: ["group-09"],
+                    foldAliases: { $0 == "group-09" ? ["group-09", "group-08"] : [$0] },
+                    liveFoldTarget: { $0 == "group-09" || $0 == "group-08" ? "group-09" : nil }
+                )
+            ) == ["group-09"]
+        )
+        #expect(
+            snRetainedScanChatIds(
+                listedIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snRetainedScanChatIds(
+                listedIds: ["group-09"],
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
         // Notification / deep-link ids stay on the hidden 0.8 row until remap.
         #expect(
             snRemountFoldedOpenGroupId(

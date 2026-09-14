@@ -514,6 +514,36 @@ func snHistoricalFoldsFromAliases(
     return next
 }
 
+/// After nsec restore the previous account's host fold blob must not
+/// survive, but the restored core sidecar still knows hist→live.
+/// Rebuild from listed live ids; never merge `previousAccountFolds`.
+func snHistoricalFoldsAfterAccountRestore(
+    previousAccountFolds: [String: String],
+    listedIds: [String],
+    foldAliases: (String) -> [String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    _ = previousAccountFolds
+    return snHistoricalFoldsFromAliases(
+        listedIds: listedIds,
+        foldAliases: foldAliases,
+        liveFoldTarget: liveFoldTarget
+    )
+}
+
+/// Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide.
+func snRetainedScanChatIds(
+    listedIds: Set<String>,
+    historicalFolds: [String: String]
+) -> Set<String> {
+    if historicalFolds.isEmpty { return listedIds }
+    var out = listedIds
+    for id in listedIds {
+        out.formUnion(snFoldFamilyIds(id: id, historicalFolds: historicalFolds))
+    }
+    return out
+}
+
 /// Historical group ids that disappeared because they folded onto a listed live id.
 func snPromotedFoldedMutePairs(
     previousGroupIds: Set<String>,
@@ -2970,6 +3000,11 @@ final class SonarAppStore: ObservableObject {
                 let current = Set(groups.map(\.id))
                 self.resolvePendingSecureChats()
                 Task { @MainActor in
+                    // Rediscover hist→live from FFI before host family walks.
+                    // After nsec restore the host blob was wiped; NSE / mute /
+                    // notification-tap fallbacks would otherwise miss the
+                    // restored sidecar until a later groups emission.
+                    await self.rememberHistoricalFolds(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedMutes(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
@@ -2979,7 +3014,6 @@ final class SonarAppStore: ObservableObject {
                     await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedVerified(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedScanWatermarks(from: self.lastMarmotGroupIds, to: current)
-                    await self.rememberHistoricalFolds(from: self.lastMarmotGroupIds, to: current)
                     self.lastMarmotGroupIds = current
                     await self.remountFoldedOpenChatIfNeeded()
                 }
@@ -8078,11 +8112,18 @@ final class SonarAppStore: ObservableObject {
             }
             aliasesById[id] = await marmot.foldAliases(groupId: id)
         }
-        let discovered = snHistoricalFoldsFromAliases(
-            listedIds: listed,
-            foldAliases: { aliasesById[$0] ?? [] },
-            liveFoldTarget: { liveById[$0] }
-        )
+        let discovered = map.isEmpty
+            ? snHistoricalFoldsAfterAccountRestore(
+                previousAccountFolds: [:],
+                listedIds: listed,
+                foldAliases: { aliasesById[$0] ?? [] },
+                liveFoldTarget: { liveById[$0] }
+            )
+            : snHistoricalFoldsFromAliases(
+                listedIds: listed,
+                foldAliases: { aliasesById[$0] ?? [] },
+                liveFoldTarget: { liveById[$0] }
+            )
         for (historical, live) in discovered {
             if map[historical] != live {
                 map[historical] = live

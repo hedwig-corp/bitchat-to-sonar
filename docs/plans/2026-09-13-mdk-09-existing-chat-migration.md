@@ -801,6 +801,18 @@ Quote-jump after Leave is not a remount hole: both hosts clear the
 jump on pop (`back()` / `pop()`). In-chat quote while fold lands is
 already remounted with the open chat.
 
+Restore host-fold hole closed after this commit: nsec restore correctly
+wipes the *previous* account's `sonar.historicalFolds` blob, then
+persisted empty until the next `groups()` / `refreshChats` remember.
+Family walks (mute remap, notification-tap fallback, NSE App Group,
+composer/retained, scan-watermark prune) missed the restored sidecar
+for one cycle. Rediscover from listed live ids via `fold_aliases`
+*before* first paint / promote; prune scan keys with the fold family.
+Pins: `ConversationFoldTest.accountRestoreHostFoldsComeFromLiveSiblingNotPreviousAccount`,
+`ConversationFoldTest.retainedScanChatIdsKeepHiddenHistoricalSibling`,
+`SonarConversationFoldTests` `snHistoricalFoldsAfterAccountRestore` /
+`snRetainedScanChatIds`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

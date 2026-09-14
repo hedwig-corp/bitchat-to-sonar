@@ -686,6 +686,40 @@ internal fun historicalFoldsFromAliases(
     return next
 }
 
+/**
+ * After nsec restore the previous account's host fold blob must not
+ * survive, but the restored core sidecar still knows hist→live.
+ * Rebuild from listed live ids via `fold_aliases`; never merge
+ * [previousAccountFolds] — those belong to the wiped identity.
+ */
+internal fun historicalFoldsAfterAccountRestore(
+    previousAccountFolds: Map<String, String>,
+    listedIds: Collection<String>,
+    foldAliases: (String) -> List<String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> {
+    val rediscovered = historicalFoldsFromAliases(listedIds, foldAliases, liveFoldTarget)
+    for (historical in previousAccountFolds.keys) {
+        if (historical !in rediscovered) continue
+        // Keep the rediscovered live target even when the wiped account
+        // pointed the same hist id at a different sibling.
+    }
+    return rediscovered
+}
+
+/** Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide. */
+internal fun retainedScanChatIds(
+    listedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+): Set<String> {
+    if (historicalFolds.isEmpty()) return listedIds
+    val out = listedIds.toMutableSet()
+    for (id in listedIds) {
+        out.addAll(foldFamilyIds(id, historicalFolds))
+    }
+    return out
+}
+
 /** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
 /** Copy a mute from every hidden 0.8 row onto its live sibling. */
 internal fun promotedFoldedMutesFromFolds(
@@ -3568,11 +3602,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun rememberHistoricalFolds(previousIds: Set<String>, currentIds: Set<String>) {
         var changed = false
         val listed = previousIds + currentIds + historicalFoldMap.keys + historicalFoldMap.values
-        val discovered = historicalFoldsFromAliases(
-            listedIds = listed,
-            foldAliases = { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
-            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
-        )
+        val foldAliases = { id: String -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) }
+        val liveTarget = { id: String -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() }
+        val discovered = if (historicalFoldMap.isEmpty()) {
+            historicalFoldsAfterAccountRestore(
+                previousAccountFolds = emptyMap(),
+                listedIds = listed,
+                foldAliases = foldAliases,
+                liveFoldTarget = liveTarget,
+            )
+        } else {
+            historicalFoldsFromAliases(
+                listedIds = listed,
+                foldAliases = foldAliases,
+                liveFoldTarget = liveTarget,
+            )
+        }
         for ((historical, live) in discovered) {
             if (historicalFoldMap[historical] != live) {
                 historicalFoldMap[historical] = live
@@ -12855,7 +12900,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun refreshChatsInner() {
         val previousOrder = chats.map { it.id }
         val loadedChats = SonarCore.chats()
-        val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
+        val loadedOrCached = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
+        // Rediscover hist→live from FFI before first paint. After nsec restore
+        // the host blob was wiped (previous account) and family walks would
+        // otherwise miss the restored sidecar for one refresh cycle.
+        rememberHistoricalFolds(previousOrder.toSet(), loadedOrCached.mapTo(hashSetOf()) { it.id })
+        val localChats = collapsedFoldedSnapshotChats(loadedOrCached, historicalFoldMap)
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
         val liveFoldTarget = { id: String ->
             runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
@@ -12898,7 +12948,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             previousOrder = previousOrder,
         )
         val listedIds = chats.mapTo(hashSetOf()) { it.id }
-        rememberHistoricalFolds(previousOrder.toSet(), listedIds)
         promoteFoldedPaymentActivitiesFromFolds()
         promoteFoldedMutes(previousOrder.toSet(), listedIds)
         promoteFoldedComposerState(previousOrder.toSet(), listedIds)
@@ -13645,12 +13694,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             scanWatermark[c.id] = latestByChat[c.id] ?: ScanMark(0L, 0L)
         }
-        // Prune watermarks for chats that no longer exist.
-        if (scanWatermark.size > latestByChat.size) {
-            scanWatermark.keys.retainAll(latestByChat.keys)
-        }
-        stagedChangedPages.keys.retainAll(latestByChat.keys)
-        failedChangedPageReads.retainAll(latestByChat.keys)
+        // Prune watermarks for chats that no longer exist, but keep hidden
+        // 0.8 siblings so a missed promote cannot drop recovered history
+        // into "unseen" and re-banner it.
+        val retainScanIds = retainedScanChatIds(latestByChat.keys, historicalFoldMap)
+        scanWatermark.keys.retainAll(retainScanIds)
+        stagedChangedPages.keys.retainAll(retainScanIds)
+        failedChangedPageReads.retainAll(retainScanIds)
         senders.forEach { ensureProfile(it) }
         if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
             sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")
