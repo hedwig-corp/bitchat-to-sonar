@@ -1217,6 +1217,16 @@ recovered row. Compose hydrate already mints a synthetic from
 `SonarConversationRegressionSmokeTests.copySummaryZeroCountStillPaintsHomeRowFromLatestAt`,
 `HomeMessageRowsTest.copySummaryZeroCountStillHydratesPreviewFromLatestAt`.
 
+iOS load-older family-cursor hole closed after this commit: after
+newest-paging hist, `loadOlderLocalPage` borrowed the hist cursor onto
+`messagesCursorPage(live)`. Persist-folds live FFI has no hist rows, so
+extract 32–80 and bak stayed stuck. Page each sibling that still has
+remainder with that sibling's own cursor (Compose
+`loadOlderMessages` already does). Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`
+(`loadOlderFamilyPageIds`),
+`SonarConversationFoldTests` `snLoadOlderFamilyPageIds`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

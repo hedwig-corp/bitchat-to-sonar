@@ -2805,17 +2805,26 @@ final class MarmotChatModel: ObservableObject {
             }
         }
         if addedHidden { return true }
-        guard snFoldFamilyHasOlder(
-                groupId: groupId,
-                hasOlderByGroup: localTranscriptHasOlderByGroup,
-                historicalFolds: folds,
-                unpagedHiddenSibling: false
-              ),
-              let cursor = snFoldFamilyPagingCursor(
-                groupId: groupId,
-                cursorsByGroup: localTranscriptCursorByGroup,
-                historicalFolds: folds
-              ),
+        // Persist-folds: do not older-page live with a borrowed hist cursor.
+        // Compose `loadOlderMessages` pages each family source with its own
+        // cursor so bak remainder stays reachable.
+        let pageIds = snLoadOlderFamilyPageIds(
+            openGroupId: groupId,
+            historicalFolds: folds,
+            hasOlderByGroup: localTranscriptHasOlderByGroup
+        )
+        var addedAny = false
+        for sibling in pageIds {
+            if await loadOlderCursorPage(groupId: sibling) {
+                addedAny = true
+            }
+        }
+        return addedAny
+    }
+
+    /// Cursor-page one fold-family sibling using that sibling's own cursor.
+    private func loadOlderCursorPage(groupId: String) async -> Bool {
+        guard let cursor = localTranscriptCursorByGroup[groupId],
               localTranscriptLoadingGroups.insert(groupId).inserted else {
             return false
         }

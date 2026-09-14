@@ -922,6 +922,34 @@ class ConversationFoldTest {
                 setOf("group-08", "group-09"),
             ),
         )
+        assertEquals(
+            listOf("group-08"),
+            loadOlderFamilyPageIds(
+                "group-09",
+                folds,
+                mapOf("group-08" to true),
+            ),
+        )
+        assertEquals(
+            listOf("group-08", "group-09"),
+            loadOlderFamilyPageIds(
+                "group-09",
+                folds,
+                mapOf("group-08" to true, "group-09" to true),
+            ),
+        )
+        assertEquals(
+            emptyList<String>(),
+            loadOlderFamilyPageIds(
+                "group-09",
+                folds,
+                mapOf("group-08" to false, "group-09" to false),
+            ),
+        )
+        assertEquals(
+            listOf("group-09"),
+            loadOlderFamilyPageIds("group-09", emptyMap(), mapOf("group-09" to true)),
+        )
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", folds, setOf("group-08", "group-09")))
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", emptyMap(), setOf("group-09")))
         assertTrue(foldFamilySourceNeedsNewestPage("group-08", setOf("group-09"), cachedRowCount = 0))

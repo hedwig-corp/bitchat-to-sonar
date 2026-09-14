@@ -1174,6 +1174,34 @@ struct SonarConversationFoldTests {
             ).isEmpty
         )
         #expect(
+            snLoadOlderFamilyPageIds(
+                openGroupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                hasOlderByGroup: ["group-08": true]
+            ) == ["group-08"]
+        )
+        #expect(
+            snLoadOlderFamilyPageIds(
+                openGroupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                hasOlderByGroup: ["group-08": true, "group-09": true]
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snLoadOlderFamilyPageIds(
+                openGroupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                hasOlderByGroup: ["group-08": false, "group-09": false]
+            ).isEmpty
+        )
+        #expect(
+            snLoadOlderFamilyPageIds(
+                openGroupId: "group-09",
+                historicalFolds: [:],
+                hasOlderByGroup: ["group-09": true]
+            ) == ["group-09"]
+        )
+        #expect(
             !snHiddenFoldFamilyNeedsPage(
                 groupId: "group-09",
                 historicalFolds: ["group-08": "group-09"],

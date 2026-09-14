@@ -789,6 +789,22 @@ func snPagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>) -> Set<String> {
     Set(trustedFfiPageIds.filter { !$0.isEmpty })
 }
 
+/// After hidden siblings have a newest page, older-page each sibling that
+/// still has remainder — with that sibling's own cursor. Persist-folds
+/// live FFI has no hist rows; paging live with a borrowed hist cursor
+/// returns empty and bak stays stuck. Compose `loadOlderFamilyPageIds`.
+func snLoadOlderFamilyPageIds(
+    openGroupId: String,
+    historicalFolds: [String: String],
+    hasOlderByGroup: [String: Bool]
+) -> [String] {
+    let trimmed = openGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return [] }
+    let family = snFoldFamilyIds(id: trimmed, historicalFolds: historicalFolds)
+    let ids = family.isEmpty ? [trimmed] : Array(family)
+    return ids.filter { hasOlderByGroup[$0] == true }.sorted()
+}
+
 /// Newest-page these hidden siblings before cursor-paging. Walk listed
 /// live ids only — passing hist would newest-page a remounted live
 /// extract and snap. Compose `loadOlderHiddenSiblingsNeedingNewestPage`.

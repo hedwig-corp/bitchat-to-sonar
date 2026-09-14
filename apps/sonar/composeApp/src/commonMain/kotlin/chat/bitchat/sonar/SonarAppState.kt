@@ -956,6 +956,21 @@ internal fun loadOlderHiddenSiblingsNeedingNewestPage(
     return out.sorted()
 }
 
+/** After hidden siblings have a newest page, older-page each sibling that
+ *  still has remainder — with that sibling's own cursor. Persist-folds
+ *  live FFI has no hist rows; paging live with a borrowed hist cursor
+ *  returns empty and bak stays stuck. iOS `snLoadOlderFamilyPageIds`. */
+internal fun loadOlderFamilyPageIds(
+    openGroupId: String,
+    historicalFolds: Map<String, String>,
+    hasOlderByGroup: Map<String, Boolean>,
+): List<String> {
+    if (openGroupId.isBlank()) return emptyList()
+    val family = foldFamilyIds(openGroupId, historicalFolds)
+    val ids = if (family.isEmpty()) listOf(openGroupId) else family.toList()
+    return ids.filter { hasOlderByGroup[it] == true }.sorted()
+}
+
 /** Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
  *  hist onto live and drops the hist cache key; paging maps keep hist
  *  once it has been paged. iOS `snHiddenFoldFamilyNeedsPage`. */
