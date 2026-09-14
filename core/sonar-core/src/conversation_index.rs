@@ -445,6 +445,9 @@ impl ConversationIndex {
     /// non-empty index: existing summaries (and their unread counts) stay put.
     pub fn seed_missing_recovered(&self, engine: &MarmotEngine) -> Result<()> {
         for group_id in engine.recovered_group_ids() {
+            if engine.is_dropped(&group_id) {
+                continue;
+            }
             let hex = hex::encode(group_id.as_slice());
             if self.summary(&hex)?.is_some() {
                 continue;

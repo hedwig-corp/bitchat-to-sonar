@@ -1382,6 +1382,7 @@ impl MarmotEngine {
         let mut ids = self.transcript_group_ids();
         ids.extend(self.historical_group_names.keys().cloned());
         ids.extend(self.historical_members.keys().cloned());
+        ids.retain(|id| !self.is_dropped(id));
         ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
         ids.dedup();
         ids
@@ -3064,7 +3065,7 @@ impl MarmotEngine {
         self.persist_dropped();
     }
 
-    fn is_dropped(&self, group_id: &GroupId) -> bool {
+    pub(crate) fn is_dropped(&self, group_id: &GroupId) -> bool {
         self.dropped_groups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4008,6 +4009,19 @@ mod historical_fold_tests {
         assert!(
             remaining.is_empty(),
             "deleted recovered title must leave the sidecar so Settings preview cannot list it"
+        );
+        assert!(
+            !engine.recovered_group_ids().contains(&historical),
+            "in-memory title leftover must not keep a deleted id listable for index seed"
+        );
+        let idx = crate::conversation_index::ConversationIndex::open_in_memory().expect("index");
+        idx.seed_missing_recovered(&engine)
+            .expect("seed after Leave");
+        assert!(
+            idx.summary(&hex::encode(historical.as_slice()))
+                .expect("lookup")
+                .is_none(),
+            "connectLocal seed must not recreate a chat the user already left"
         );
     }
 

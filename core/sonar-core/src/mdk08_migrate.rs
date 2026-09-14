@@ -296,16 +296,37 @@ fn mark_metadata_backfill_complete(db_path: &Path) -> Result<()> {
     write_json(&path, &marker)
 }
 
+fn load_dropped_group_ids(db_path: &Path) -> HashSet<GroupId> {
+    let path = sidecar_named(db_path, crate::marmot::DROPPED_GROUPS_FILE_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashSet::new();
+    };
+    serde_json::from_slice::<Vec<String>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|h| hex::decode(h).ok().map(GroupId::new))
+        .collect()
+}
+
 fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Result<()> {
+    let omit = load_dropped_group_ids(db_path);
     let mut names = load_historical_group_names(db_path);
+    names.retain(|id, _| !omit.contains(id));
     for (id, name) in &extracted.group_names {
+        if omit.contains(id) {
+            continue;
+        }
         let entry = names.entry(id.clone()).or_default();
         if entry.is_empty() && !name.is_empty() {
             *entry = name.clone();
         }
     }
     let mut members = load_historical_members(db_path);
+    members.retain(|id, _| !omit.contains(id));
     for (id, pks) in &extracted.members {
+        if omit.contains(id) {
+            continue;
+        }
         let entry = members.entry(id.clone()).or_default();
         for pk in pks {
             if !entry.contains(pk) {
@@ -316,7 +337,11 @@ fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         entry.dedup();
     }
     let mut secrets = load_historical_media_secrets(db_path);
+    secrets.retain(|id, _| !omit.contains(id));
     for (id, values) in &extracted.media_exporter_secrets {
+        if omit.contains(id) {
+            continue;
+        }
         let entry = secrets.entry(id.clone()).or_default();
         for secret in values {
             if !entry.iter().any(|existing| existing == secret) {
@@ -324,7 +349,7 @@ fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
             }
         }
     }
-    if !names.is_empty() {
+    if !names.is_empty() || !omit.is_empty() {
         let keyed: HashMap<String, String> = names
             .iter()
             .map(|(id, name)| (hex::encode(id.as_slice()), name.clone()))
@@ -335,14 +360,18 @@ fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         )?;
     }
     let mut descriptions = load_historical_group_descriptions(db_path);
+    descriptions.retain(|id, _| !omit.contains(id));
     for (id, desc) in &extracted.group_descriptions {
+        if omit.contains(id) {
+            continue;
+        }
         let entry = descriptions.entry(id.clone()).or_default();
         if entry.is_empty() && !desc.is_empty() {
             *entry = desc.clone();
         }
     }
     write_group_descriptions(db_path, &descriptions)?;
-    if !members.is_empty() {
+    if !members.is_empty() || !omit.is_empty() {
         let keyed: HashMap<String, Vec<String>> = members
             .iter()
             .map(|(id, pks)| {
@@ -358,12 +387,16 @@ fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         )?;
     }
     let mut counts = load_historical_member_counts(db_path);
+    counts.retain(|id, _| !omit.contains(id));
     for (id, count) in &extracted.member_counts {
+        if omit.contains(id) {
+            continue;
+        }
         let entry = counts.entry(id.clone()).or_insert(0);
         *entry = (*entry).max(*count);
     }
     write_member_counts(db_path, &counts)?;
-    if !secrets.is_empty() {
+    if !secrets.is_empty() || !omit.is_empty() {
         let keyed: HashMap<String, Vec<String>> = secrets
             .iter()
             .map(|(id, values)| {
@@ -2833,6 +2866,50 @@ mod tests {
         assert!(
             !more,
             "when every leftover group is omitted, remainder must go idle"
+        );
+    }
+
+    #[test]
+    fn backfill_skips_dropped_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let bak = backup_path(&db);
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&bak, &local, peer, "hello");
+        let conn = Connection::open(&bak).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let keep = vec![0x55u8; 16];
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'keep room', '')",
+            rusqlite::params![keep.clone(), vec![0x66u8; 32]],
+        )
+        .unwrap();
+        drop(conn);
+        std::fs::write(&db, b"live").unwrap();
+        let gone = GroupId::new(vec![0x11u8; 16]);
+        write_json(
+            &sidecar_named(&db, crate::marmot::DROPPED_GROUPS_FILE_SUFFIX),
+            &vec![hex::encode(gone.as_slice())],
+        )
+        .unwrap();
+        write_json(
+            &sidecar_named(&db, MDK08_MIGRATED_MARKER_SUFFIX),
+            &serde_json::json!({ "status": "complete" }),
+        )
+        .unwrap();
+        assert!(backfill_metadata_from_bak(&db, KEY).unwrap());
+        let names = load_historical_group_names(&db);
+        assert!(
+            !names.contains_key(&gone),
+            "bak backfill must not restore a title the user already deleted"
+        );
+        assert_eq!(
+            names.get(&GroupId::new(keep)).map(String::as_str),
+            Some("keep room")
         );
     }
 

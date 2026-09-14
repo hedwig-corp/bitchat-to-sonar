@@ -1825,6 +1825,31 @@ async fn delete_then_remainder_does_not_restore_transcript() {
         "dropped recovered row must stay unlistable"
     );
     assert!(
+        !engine.recovered_group_ids().contains(&gone),
+        "in-memory 0.8 names leftover after Leave must not stay seedable"
+    );
+    let idx = sonar_core::conversation_index::ConversationIndex::open_in_memory().expect("index");
+    idx.seed_missing_recovered(&engine)
+        .expect("seed after Leave");
+    let gone_hex = gone
+        .as_slice()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let keep_hex = keep
+        .as_slice()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert!(
+        idx.summary(&gone_hex).expect("lookup gone").is_none(),
+        "chat-list seed must not recreate the left conversation"
+    );
+    assert!(
+        idx.summary(&keep_hex).expect("lookup keep").is_some(),
+        "other recovered chats must still seed"
+    );
+    assert!(
         db_path.with_file_name("marmot.sqlite.mdk08.bak").exists(),
         "quarantine stays on disk; remainder just refuses to copy dropped ids"
     );

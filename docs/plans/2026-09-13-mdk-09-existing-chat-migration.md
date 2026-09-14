@@ -138,6 +138,7 @@ Guarded by:
 - `mdk08_migrate::remainder_page_skips_copied_ids_and_reports_more`
 - `mdk08_migrate::remainder_page_can_target_one_group_without_clearing_others`
 - `mdk08_migrate::remainder_page_skips_omitted_groups`
+- `mdk08_migrate::backfill_skips_dropped_groups`
 - `persistence::delete_then_remainder_does_not_restore_transcript`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
@@ -421,9 +422,15 @@ so a backup taken after Leave does not list a chat the user already removed.
 Remainder ticks from `*.mdk08.bak` also omit `.sonar-dropped-groups.json`
 ids: Leave clears the transcript but the bak is never rewritten, so an idle
 `ensure_mdk08_remainder` / `messages()` drain on any other chat must not copy
-those rows back. Pins:
+those rows back. `recovered_group_ids` / `seed_missing_recovered` skip dropped
+ids so a leftover in-memory title cannot recreate the chat-list row on the
+next `connectLocal`. Bak metadata backfill (`metadata_backfill=v2` for older
+markers) also omits dropped ids so a later open cannot restore forgotten
+names/members/secrets. Pins:
 `mdk08_migrate::remainder_page_skips_omitted_groups`,
+`mdk08_migrate::backfill_skips_dropped_groups`,
 `persistence::delete_then_remainder_does_not_restore_transcript`,
+`marmot::historical_fold_tests::delete_live_group_forgets_historical_name_sidecar`,
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
 `snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no
