@@ -2045,6 +2045,19 @@ class ConversationFoldTest {
             listOf("group-09"),
             deletedConversationCorePurgeIds(listOf("group-09"), emptyMap()),
         )
+        val marked = notificationSuppressIds(listOf("group-09"), folds).toSet()
+        assertEquals(setOf("group-08", "group-09"), marked)
+        val histUnread = mapOf("group-08" to 4L)
+        assertEquals(emptyMap(), histUnread - marked)
+        assertEquals(
+            emptyMap<String, Long>(),
+            remountFoldedUnread(emptyMap(), histUnread - marked, folds),
+        )
+        assertEquals(
+            mapOf("group-08" to 4L),
+            remountFoldedUnread(emptyMap(), histUnread, folds),
+            "uncleared hist unread still remounts — mark-read must subtract the FFI family first",
+        )
     }
 
     @Test

@@ -3354,12 +3354,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (groupIds.isEmpty()) return
         // Home-row unread walks the fold family. Clearing only the live id
         // leaves unreadByChat[hist] in place and the badge returns after
-        // open. Core mark_read already folds; expand the host map to match.
-        val marked = notificationSuppressIds(groupIds, historicalFoldMap).toSet()
+        // persist-folds remounts. Merge FFI aliases the same way unmute /
+        // leave do so a first open before the host blob exists still
+        // clears the hidden 0.8 key.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(groupIds)
+        adoptActionHistoricalFolds(folds)
+        val marked = notificationSuppressIds(groupIds, folds).toSet()
         unreadSuppressGroupIds.addAll(marked)
         unreadByChat = unreadByChat - marked
+        if (folds != beforeFolds) persistHistoricalFolds()
         scope.launch {
-            for (groupId in groupIds.filter { it.isNotBlank() }.toSet()) {
+            for (groupId in marked.filter { it.isNotBlank() }) {
                 runCatching { SonarCore.markConversationRead(groupId) }
             }
             // End in-flight suppress for this batch, then reconcile from core.

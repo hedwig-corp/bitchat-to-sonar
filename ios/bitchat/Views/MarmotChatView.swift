@@ -3448,12 +3448,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func markConversationRead(groupId: String) {
-        let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
-        let ids = snConversationReadGroupIds(
+        let blobFolds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+        let blobIds = snConversationReadGroupIds(
             groupId: groupId,
-            historicalFolds: folds
+            historicalFolds: blobFolds
         )
-        for id in ids {
+        for id in blobIds {
             unreadSuppressGroupIds.insert(id)
             unreadByGroup[id] = nil
         }
@@ -3461,8 +3461,32 @@ final class MarmotChatModel: ObservableObject {
             // Persist-folds remounts before core fold_aliases exist.
             // mark_conversation_read only walks engine aliases, so a
             // live-only FFI call leaves unread on the hidden 0.8 id and
-            // publishUnread restores the badge. Compose markGroupsRead
-            // FFI-marks each transcriptGroupIds entry.
+            // publishUnread restores the badge. Merge FFI the same way
+            // unmute / leave do so a first open before the host blob
+            // exists still clears the hidden 0.8 key.
+            var aliasesById: [String: [String]] = [:]
+            var liveById: [String: String] = [:]
+            aliasesById[groupId] = await foldAliases(groupId: groupId)
+            if let live = await liveFoldTarget(groupId: groupId) {
+                liveById[groupId] = live
+            }
+            let folds = snWakeMuteHistoricalFolds(
+                persisted: blobFolds,
+                listedIds: [groupId],
+                foldAliases: { aliasesById[$0] ?? [] },
+                liveFoldTarget: { liveById[$0] }
+            )
+            let ids = snConversationReadGroupIds(
+                groupId: groupId,
+                historicalFolds: folds
+            )
+            for id in ids {
+                unreadSuppressGroupIds.insert(id)
+                unreadByGroup[id] = nil
+            }
+            if folds != blobFolds {
+                snPersistHistoricalFolds(folds, to: defaults)
+            }
             for id in ids {
                 await service.markConversationRead(groupId: id)
             }

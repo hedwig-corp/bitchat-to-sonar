@@ -655,6 +655,27 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == ["group-09"]
         )
+        #expect(
+            Set(snConversationReadGroupIds(groupId: "group-09", historicalFolds: wakeFolds))
+                == ["group-08", "group-09"]
+        )
+        #expect(
+            snConversationReadGroupIds(groupId: "group-09", historicalFolds: [:]) == ["group-09"]
+        )
+        #expect(
+            SNUnreadCounts.remountFoldedUnread(
+                next: [:],
+                previous: [:],
+                historicalFolds: wakeFolds
+            ).isEmpty
+        )
+        #expect(
+            SNUnreadCounts.remountFoldedUnread(
+                next: [:],
+                previous: ["group-08": 4],
+                historicalFolds: wakeFolds
+            )["group-08"] == 4
+        )
         #expect(SonarNSEDecoratePolicy.historicalFoldsUserDefaultsKey == snHistoricalFoldsDefaultsKey)
         #expect(
             Set(snMeshNotificationSuppressIds(
