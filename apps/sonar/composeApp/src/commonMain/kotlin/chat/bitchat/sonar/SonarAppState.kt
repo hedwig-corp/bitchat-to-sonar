@@ -3279,6 +3279,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      * leaves the key unset. Empty success settles 0.
      */
     private fun captureOpenChatUnread(chatId: String, jumpMessageId: String? = null) {
+        // First open after upgrade can have hist unread in unreadByChat
+        // while the host blob is still empty. Expand ids via FFI before
+        // the cache/probe so the divider is not settled as 0 / unset.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(listOf(chatId) + transcriptGroupIds(chatId))
+        adoptActionHistoricalFolds(folds)
+        if (folds != beforeFolds) persistHistoricalFolds()
         val ids = transcriptGroupIds(chatId)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
         openChatJumpMessageId = if (jumpMessageId != null) {

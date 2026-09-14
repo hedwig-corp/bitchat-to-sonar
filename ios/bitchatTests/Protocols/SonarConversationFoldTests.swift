@@ -663,6 +663,20 @@ struct SonarConversationFoldTests {
             snConversationReadGroupIds(groupId: "group-09", historicalFolds: [:]) == ["group-09"]
         )
         #expect(
+            snTranscriptSourceIds(
+                groupId: "group-09",
+                listedDirectIds: [],
+                historicalFolds: wakeFolds
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snTranscriptSourceIds(
+                groupId: "group-09",
+                listedDirectIds: [],
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
+        #expect(
             SNUnreadCounts.remountFoldedUnread(
                 next: [:],
                 previous: [:],

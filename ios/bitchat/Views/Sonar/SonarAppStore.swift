@@ -11639,15 +11639,31 @@ final class SonarAppStore: ObservableObject {
             unreadCountAtOpenByDM[id] = 0
             return
         }
-        let ids = transcriptSourceIds(forGroupId: groupId)
-        let hasCachedEntry = ids.contains { marmot.unreadByGroup[$0] != nil }
-        let cached = ids.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
+        let blobIds = transcriptSourceIds(forGroupId: groupId)
+        let hasCachedEntry = blobIds.contains { marmot.unreadByGroup[$0] != nil }
+        let cached = blobIds.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
         if hasCachedEntry || cached > 0 {
             unreadCountAtOpenByDM[id] = cached
             return
         }
         Task { [weak self] in
             guard let self else { return }
+            let folds = await self.mergedActionHistoricalFolds(for: groupId)
+            let persisted = (self.defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if folds != persisted {
+                snPersistHistoricalFolds(folds, to: self.defaults)
+            }
+            let ids = snTranscriptSourceIds(
+                groupId: groupId,
+                listedDirectIds: self.directMarmotGroups(matchingGroupId: groupId).map(\.id),
+                historicalFolds: folds
+            )
+            let familyHit = ids.contains { self.marmot.unreadByGroup[$0] != nil }
+            let familyCached = ids.reduce(UInt64(0)) { $0 + (self.marmot.unreadByGroup[$1] ?? 0) }
+            if familyHit || familyCached > 0 {
+                self.unreadCountAtOpenByDM[id] = familyCached
+                return
+            }
             if let unread = await self.marmot.unreadCount(forGroups: ids) {
                 self.unreadCountAtOpenByDM[id] = unread
             }

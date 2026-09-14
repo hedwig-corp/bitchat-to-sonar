@@ -2058,6 +2058,14 @@ class ConversationFoldTest {
             remountFoldedUnread(emptyMap(), histUnread, folds),
             "uncleared hist unread still remounts — mark-read must subtract the FFI family first",
         )
+        assertNull(
+            openChatUnreadFromCache(listOf("group-09"), histUnread),
+            "live-only open ids miss hist unread when the fold blob is empty",
+        )
+        assertEquals(
+            4L,
+            openChatUnreadFromCache(notificationSuppressIds(listOf("group-09"), folds), histUnread),
+        )
     }
 
     @Test
