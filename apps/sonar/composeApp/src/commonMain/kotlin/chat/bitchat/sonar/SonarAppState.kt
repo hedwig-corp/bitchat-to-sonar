@@ -2667,9 +2667,9 @@ internal fun <V> removePendingMessagesForChat(
     chatId: String,
     messagesByChat: MutableMap<String, MutableList<V>>,
     historicalFolds: Map<String, String>,
-    shouldRemove: (V) -> Boolean,
     openedConversationId: String? = null,
     openedConversationPaneId: String? = null,
+    shouldRemove: (V) -> Boolean,
 ) {
     for (key in paymentActivityPeerKeys(
         chatId,
