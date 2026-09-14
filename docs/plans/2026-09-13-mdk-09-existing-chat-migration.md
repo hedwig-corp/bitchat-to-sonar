@@ -1126,6 +1126,16 @@ recovered history. Take `max(tsSecs)` and `latestByChat`. iOS
 Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
 `SonarConversationFoldTests` `snLocalLatestTsForChat`.
 
+Persist-folds quote-preview hole closed after this commit:
+`hydrate_page_reply_previews` only looked at parents on the same FFI
+page. A live reply to a hist parent left an empty chip. Look the
+parent up across stored transcripts (`lookup_chat`) — do not invent a
+fold (R-045). Compose `quotedParentInFamilyCache` matches iOS
+`snReplyRef(parents:)`. Pins:
+`persist_folds_live_page_hydrates_reply_preview_from_hist_parent`,
+`ConversationFoldTest.quotedMessageRevealExpandsPaintedPageToParent`,
+`SonarConversationFoldTests` `snQuotedParentInFamilyCache`.
+
 Process-death snapshot recency hole closed after this commit:
 `encodeChatSnapshot` preferred `lastOrNull()` over `latestByChat`.
 A newest-first remount persisted the oldest extract row as durable

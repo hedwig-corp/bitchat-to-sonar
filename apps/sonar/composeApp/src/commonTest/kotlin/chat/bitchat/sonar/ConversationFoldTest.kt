@@ -1353,6 +1353,12 @@ class ConversationFoldTest {
                 tsSecs = i.toLong(),
             )
         }
+        val parent = cached.first { it.id == "m5" }
+        val painted = cached.takeLast(TRANSCRIPT_PAGE_SIZE)
+        assertNull(painted.firstOrNull { it.id == "m5" })
+        assertEquals(parent, quotedParentInFamilyCache("m5", cached))
+        assertEquals(parent, quotedParentInFamilyCache("M5", cached))
+        assertNull(quotedParentInFamilyCache("m5", painted))
         assertEquals(36, quotedMessageRevealLimit("m5", cached))
         assertEquals(TRANSCRIPT_PAGE_SIZE, quotedMessageRevealLimit("m39", cached))
         assertNull(quotedMessageRevealLimit("missing", cached))

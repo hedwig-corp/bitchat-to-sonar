@@ -670,6 +670,18 @@ func snCachedFoldFamilySourceLimit(
     return min(retainedLimit, max(currentLimit, max(0, cachedCount)))
 }
 
+/// Parent row for a quote chip. Walk the family-unioned cache, not only
+/// the painted page. Compose `quotedParentInFamilyCache`.
+func snQuotedParentInFamilyCache<Message>(
+    parentId: String,
+    familyMessages: [Message],
+    idOf: (Message) -> String
+) -> Message? {
+    let id = parentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty else { return nil }
+    return familyMessages.first { idOf($0).caseInsensitiveCompare(id) == .orderedSame }
+}
+
 /// Visible-row budget that includes `parentId` when it already sits in the
 /// family-unioned host cache. Quote-jump searches the painted suffix; a
 /// parent older than `pageSize` but still in the retained window must

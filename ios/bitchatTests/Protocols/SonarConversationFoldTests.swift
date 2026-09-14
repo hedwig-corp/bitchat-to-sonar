@@ -1042,6 +1042,9 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == 200
         )
+        #expect(snQuotedParentInFamilyCache(parentId: "m5", familyMessages: Array(1...40).map { "m\($0)" }, idOf: { $0 }) == "m5")
+        #expect(snQuotedParentInFamilyCache(parentId: "M5", familyMessages: Array(1...40).map { "m\($0)" }, idOf: { $0 }) == "m5")
+        #expect(snQuotedParentInFamilyCache(parentId: "m5", familyMessages: Array(11...40).map { "m\($0)" }, idOf: { $0 }) == nil)
         #expect(snChatSnapshotLatestTs(messageTimestamps: Array((1...80).reversed().map(Int64.init)), persistedLatest: 0) == 80)
         #expect(snChatSnapshotLatestTs(messageTimestamps: Array((1...80).reversed().map(Int64.init)), persistedLatest: 200) == 200)
         #expect(

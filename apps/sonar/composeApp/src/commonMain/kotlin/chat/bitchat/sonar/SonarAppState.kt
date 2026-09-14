@@ -840,6 +840,18 @@ internal fun <T> foldFamilyPagingCursor(
     return null
 }
 
+/** Parent row for a quote chip. Walk the family-unioned cache, not only
+ *  the painted page — persist-folds keep the hist parent off a short live
+ *  window. iOS `snQuotedParentInFamilyCache` / `snReplyRef(parents:)`. */
+internal fun quotedParentInFamilyCache(
+    parentId: String,
+    familyMessages: List<SonarMsg>,
+): SonarMsg? {
+    val id = parentId.trim()
+    if (id.isEmpty()) return null
+    return familyMessages.firstOrNull { it.id.equals(id, ignoreCase = true) }
+}
+
 /** Visible-row budget that includes [parentId] when it already sits in the
  *  family-unioned host cache. Quote-jump searches the painted suffix; a
  *  parent older than [pageSize] but still in the retained window must
@@ -4290,6 +4302,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             composerReplyByChat.remove(id)
         }
     }
+
+    /** Quote-chip parent from the fold-family cache, then the painted page. */
+    fun quotedParentMessage(chatId: String, parentId: String): SonarMsg? =
+        quotedParentInFamilyCache(parentId, quotedMessageRevealCache(chatId))
+            ?: quotedParentInFamilyCache(parentId, messages)
 
     fun jumpToQuotedMessage(chatId: String, parentId: String) {
         val trimmed = parentId.trim()

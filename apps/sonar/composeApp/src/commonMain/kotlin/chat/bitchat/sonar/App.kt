@@ -3080,7 +3080,7 @@ private fun ReplyDecorated(
         val reply = m.reply
         val resolvedReply = if (sonarReplyUiEnabled() && reply != null) {
             val fallback = stringResource(Res.string.chat_reply_fallback)
-            val parent = state.messages.firstOrNull { it.id.equals(reply.parentId, ignoreCase = true) }
+            val parent = state.quotedParentMessage(chatId, reply.parentId)
             val paymentLabel = stringResource(Res.string.chat_reply_payment)
             val photoLabel = stringResource(Res.string.chat_reply_photo)
             val stickerLabel = stringResource(Res.string.chat_reply_sticker)

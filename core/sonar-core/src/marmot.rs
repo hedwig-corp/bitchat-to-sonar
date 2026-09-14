@@ -2910,7 +2910,7 @@ impl MarmotEngine {
                 .cmp(&b.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        hydrate_page_reply_previews(&mut mapped);
+        hydrate_page_reply_previews(self, &mut mapped);
         Ok(mapped)
     }
 
@@ -2962,7 +2962,7 @@ impl MarmotEngine {
             .collect();
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
-        hydrate_page_reply_previews(&mut candidates);
+        hydrate_page_reply_previews(self, &mut candidates);
         Ok(candidates)
     }
 
@@ -3462,8 +3462,12 @@ fn overlay_reply_preview(incoming: Incoming, reply: Option<&ReplyTo>) -> Incomin
     Incoming::Message(message)
 }
 
-fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
-    let by_id: HashMap<EventId, String> = msgs
+/// Fill missing quote-chip text from this page, then from any stored
+/// transcript row. Persist-folds serve a short live page whose parent
+/// still sits on hist; same-page hydrate left those chips empty.
+/// `lookup_chat` walks every transcript — do not invent a fold (R-045).
+fn hydrate_page_reply_previews(engine: &MarmotEngine, msgs: &mut [ChatMessage]) {
+    let mut by_id: HashMap<EventId, String> = msgs
         .iter()
         .filter_map(|m| {
             crate::reply::parent_content_for_preview(
@@ -3475,6 +3479,25 @@ fn hydrate_page_reply_previews(msgs: &mut [ChatMessage]) {
             .map(|t| (m.id, t.to_string()))
         })
         .collect();
+    for m in msgs.iter() {
+        let Some(reply) = m.reply.as_ref() else {
+            continue;
+        };
+        if by_id.contains_key(&reply.parent_id) {
+            continue;
+        }
+        let Some(parent) = engine.lookup_chat(&reply.parent_id) else {
+            continue;
+        };
+        if let Some(t) = crate::reply::parent_content_for_preview(
+            &parent.classification,
+            parent.sticker_ref.is_some(),
+            !parent.media.is_empty(),
+            &parent.content,
+        ) {
+            by_id.insert(reply.parent_id, t.to_string());
+        }
+    }
     for m in msgs.iter_mut() {
         let Some(reply) = m.reply.as_mut() else {
             continue;
@@ -4134,6 +4157,24 @@ mod historical_fold_tests {
         }
     }
 
+    fn chat_replying(
+        id: u8,
+        group: &[u8],
+        sender: PublicKey,
+        body: &str,
+        mine: bool,
+        parent: u8,
+        parent_pk: PublicKey,
+    ) -> ChatMessage {
+        let mut msg = chat(id, group, sender, body, mine);
+        msg.reply = Some(ReplyRef {
+            parent_id: EventId::from_slice(&[parent; 32]).expect("event id"),
+            parent_pubkey: Some(parent_pk),
+            preview: None,
+        });
+        msg
+    }
+
     #[test]
     fn recovered_history_survives_fold_onto_new_group() {
         let alice = Identity::generate();
@@ -4680,6 +4721,51 @@ mod historical_fold_tests {
             .decrypt_media_by_url(&live, url, &upload.encrypted_data)
             .expect("remounted live id must still open the recovered blob");
         assert_eq!(remounted, b"photo-bytes");
+    }
+
+    #[test]
+    fn persist_folds_live_page_hydrates_reply_preview_from_hist_parent() {
+        // Host sidecar remounts the live row before record_historical_fold.
+        // A live-only cursor page must still fill the quote chip from the
+        // hist parent — do not invent a fold (R-045).
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        engine.push_transcript_message(chat(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            "old hello",
+            false,
+        ));
+        engine.push_transcript_message(chat_replying(
+            2,
+            live.as_slice(),
+            alice.public_key(),
+            "replying",
+            true,
+            1,
+            bob.public_key(),
+        ));
+        assert!(
+            engine.live_fold_target(&historical).is_none(),
+            "this window has no core fold"
+        );
+        let page = engine
+            .messages_cursor_page(&live, None, None, 10)
+            .expect("live page");
+        let reply = page
+            .iter()
+            .find(|m| m.content == "replying")
+            .and_then(|m| m.reply.as_ref())
+            .expect("reply pointer");
+        assert_eq!(
+            reply.preview.as_deref(),
+            Some("old hello"),
+            "live page must hydrate the hist parent without a core fold"
+        );
     }
 
     #[test]
