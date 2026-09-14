@@ -1424,6 +1424,21 @@ struct SonarConversationFoldTests {
             openedConversationId: "marmot:group-09",
             openedConversationPaneId: "marmot:group-09"
         ))
+        #expect(snMacSelectionAfterFoldRemount(
+            selectionId: "marmot:group-08",
+            openId: "marmot:group-08",
+            realId: "marmot:group-09"
+        ) == "marmot:group-09")
+        #expect(snMacSelectionAfterFoldRemount(
+            selectionId: "group-08",
+            openId: "marmot:group-08",
+            realId: "marmot:group-09"
+        ) == "marmot:group-09")
+        #expect(snMacSelectionAfterFoldRemount(
+            selectionId: "marmot:other",
+            openId: "marmot:group-08",
+            realId: "marmot:group-09"
+        ) == "marmot:other")
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

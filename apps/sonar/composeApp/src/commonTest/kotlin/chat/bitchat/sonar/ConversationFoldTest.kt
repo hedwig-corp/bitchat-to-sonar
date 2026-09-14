@@ -1173,6 +1173,34 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun macFoldRemountHopsSelectionOntoLiveId() {
+        assertEquals(
+            "marmot:group-09",
+            macSelectionAfterFoldRemount(
+                selectionId = "marmot:group-08",
+                openId = "marmot:group-08",
+                realId = "marmot:group-09",
+            ),
+        )
+        assertEquals(
+            "marmot:group-09",
+            macSelectionAfterFoldRemount(
+                selectionId = "group-08",
+                openId = "marmot:group-08",
+                realId = "marmot:group-09",
+            ),
+        )
+        assertEquals(
+            "marmot:other",
+            macSelectionAfterFoldRemount(
+                selectionId = "marmot:other",
+                openId = "marmot:group-08",
+                realId = "marmot:group-09",
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

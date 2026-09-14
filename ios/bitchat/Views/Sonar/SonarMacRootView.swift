@@ -143,8 +143,14 @@ struct SonarMacRootView: View {
             syncSelection(with: newPath.last)
         }
         .onChange(of: store.pendingMarmotRouteReplacement) { replacement in
-            guard let replacement, selection == .dm(replacement.pendingId) else { return }
-            selection = .dm(replacement.realId)
+            guard let replacement, case .dm(let id) = selection else { return }
+            let next = snMacSelectionAfterFoldRemount(
+                selectionId: id,
+                openId: replacement.pendingId,
+                realId: replacement.realId
+            )
+            guard next != id else { return }
+            selection = .dm(next)
         }
         .onChange(of: store.pendingMarmotRouteFailure) { failure in
             guard let failure, selection == .dm(failure.pendingId) else { return }

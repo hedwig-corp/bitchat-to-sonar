@@ -1875,6 +1875,19 @@ internal fun closedDMShouldClearOpened(
         openedConversationIdMatches(closing, openedConversationPaneId)
 }
 
+/** Mac split-view keeps `.dm(hist)` after fold remount. Hop selection
+ *  to live so send/call/group-info bind the remounted transcript.
+ *  Compose remounts `Screen.Chat.id` in place — iOS `snMacSelectionAfterFoldRemount`. */
+internal fun macSelectionAfterFoldRemount(
+    selectionId: String,
+    openId: String,
+    realId: String,
+): String {
+    val live = realId.trim()
+    if (live.isEmpty()) return selectionId
+    return if (openedConversationIdMatches(selectionId, openId)) live else selectionId
+}
+
 /** Viewing the recovered 0.8 id must still mark-read a live sibling
  *  change. Empty persist-folds cannot match; merge first.
  *  iOS `snViewingConversationShouldMarkRead`. */

@@ -1673,6 +1673,20 @@ func snClosedDMShouldClearOpened(
     return snOpenedConversationIdMatches(closingId, openedConversationPaneId)
 }
 
+/// Mac split-view keeps `.dm(hist)` after fold remount copies state onto
+/// live. Hop selection to live so the pane binds the activated transcript
+/// (send / call / group-info) instead of the deactivated hist id.
+/// Compose remounts `Screen.Chat.id` in place.
+func snMacSelectionAfterFoldRemount(
+    selectionId: String,
+    openId: String,
+    realId: String
+) -> String {
+    if realId.isEmpty { return selectionId }
+    if snOpenedConversationIdMatches(selectionId, openId) { return realId }
+    return selectionId
+}
+
 /// Viewing the recovered 0.8 id must still mark-read a live sibling
 /// change. Empty persist-folds cannot match; merge first.
 /// Compose `viewingConversationShouldMarkRead`.
@@ -10220,8 +10234,12 @@ final class SonarAppStore: ObservableObject {
             path.append(.dm(realId))
         }
         openedConversationId = realId
-        // Keep `openedConversationPaneId` on the still-mounted Mac pane
-        // (hist). iPhone path rewrite closedDM/openedDM will refresh it.
+        // Keep `openedConversationPaneId` on hist until Mac selection /
+        // iPhone onAppear hops to live. Same publish as pending→real.
+        pendingMarmotRouteReplacement = SNMarmotRouteReplacement(
+            pendingId: openId,
+            realId: realId
+        )
         suppressOpenedDMHydrateIds.insert(realId)
         suppressOpenedDMHydrateIds.insert(remounted)
         // Do not call `openedDM` here: it hydrates the live id as a fresh
