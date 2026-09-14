@@ -532,6 +532,20 @@ struct SonarConversationFoldTests {
             ) == "hello from 0.8"
         )
         #expect(
+            snRetainedTranscriptForChat(
+                chatId: "marmot:group-09",
+                retainedByChat: ["marmot:group-08": ["old from 0.8"]],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["old from 0.8"]
+        )
+        #expect(
+            snRetainedTranscriptForChat(
+                chatId: "marmot:group-09",
+                retainedByChat: ["marmot:group-08": ["old from 0.8"]],
+                historicalFolds: [:]
+            ).isEmpty
+        )
+        #expect(
             snComposerDraftsAfterEdit(
                 drafts: ["marmot:group-08": "hello from 0.8"],
                 chatId: "marmot:group-09",

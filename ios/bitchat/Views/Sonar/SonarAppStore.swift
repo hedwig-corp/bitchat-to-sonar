@@ -740,6 +740,23 @@ func snPendingUploadLookupGroupIds(
     return family.isEmpty ? [groupId] : family.sorted()
 }
 
+/// Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold.
+func snRetainedTranscriptForChat<Message>(
+    chatId: String,
+    retainedByChat: [String: [Message]],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> [Message] {
+    if let rows = retainedByChat[chatId], !rows.isEmpty { return rows }
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+        for key in [alias, prefix + alias] where key != chatId {
+            if let rows = retainedByChat[key], !rows.isEmpty { return rows }
+        }
+    }
+    return []
+}
+
 /// Read a draft from the open id or its hidden 0.8 sibling after a fold.
 func snComposerDraft(
     chatId: String,
@@ -2958,6 +2975,7 @@ final class SonarAppStore: ObservableObject {
                     await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedPendingEchoes(from: self.lastMarmotGroupIds, to: current)
                     self.promoteFoldedPendingMediaPreviews()
+                    self.promoteFoldedConversationViewStates(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedVerified(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedScanWatermarks(from: self.lastMarmotGroupIds, to: current)
@@ -8408,6 +8426,27 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Leave-paint `ConversationViewState` stays on the hidden 0.8 id when
+    /// fold lands after the user already left. Reopen of the live row must
+    /// still see that window (Compose `promoteFoldedRetainedTranscripts`).
+    @MainActor
+    private func promoteFoldedConversationViewStates(from previous: Set<String>, to current: Set<String>) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        var pairs: [(historical: String, live: String)] = []
+        for historical in previous.union(Set(folds.keys)).subtracting(current) {
+            if let live = folds[historical], current.contains(live) {
+                pairs.append((historical, live))
+            }
+        }
+        for pair in pairs {
+            remountFoldedConversationViewState(
+                from: Self.marmotIDPrefix + pair.historical,
+                groupId: pair.historical,
+                onto: Self.marmotIDPrefix + pair.live
+            )
+        }
+    }
+
     private func resolvePendingSecureChats() {
         guard !pendingMarmotChats.isEmpty else { return }
         for (pendingId, pending) in Array(pendingMarmotChats) {
@@ -9929,7 +9968,19 @@ final class SonarAppStore: ObservableObject {
     /// True when a local newest page (or retained ConversationViewState) can
     /// paint without awaiting disk — Compose `retainedTranscriptByChat` reopen.
     private func dmHasLocalTranscriptPaint(_ id: String, marmotGroupId knownMarmotGroupId: String?) -> Bool {
-        if let retained = conversationViewStates[id], !retained.messages.isEmpty { return true }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let retainedMessages = Dictionary(
+            uniqueKeysWithValues: conversationViewStates.compactMap { key, state in
+                state.messages.isEmpty ? nil : (key, state.messages)
+            }
+        )
+        if !snRetainedTranscriptForChat(
+            chatId: id,
+            retainedByChat: retainedMessages,
+            historicalFolds: folds
+        ).isEmpty {
+            return true
+        }
         if cachedMeshMessageCount(id) > 0 { return true }
         let groupId = knownMarmotGroupId
             ?? marmotGroupId(id)

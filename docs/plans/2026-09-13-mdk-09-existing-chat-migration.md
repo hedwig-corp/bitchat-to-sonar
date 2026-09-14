@@ -785,6 +785,22 @@ stage remainder ticks on the listed live id. Pins:
 `SonarConversationFoldTests` `snPendingUploadLookupGroupIds` /
 `snComposerDraft` / `snConversationChangeTargetId`.
 
+Leave-paint hole closed after this commit: Compose remounted
+`retainedTranscriptByChat` only while the recovered transcript was
+open. Fold after Leave left the last painted window keyed on the
+hidden 0.8 id, so tapping the live 0.9 row awaited FFI before first
+paint. Promote retained + transcript windows on the same refresh
+path as send echoes; `openChat` / `firstOpenTranscriptPaint` walk
+the fold family. iOS already promoted `messagesByGroup`; it now also
+remounts closed `ConversationViewState` windows and
+`dmHasLocalTranscriptPaint` walks the family. Pins:
+`ConversationFoldTest.retainedTranscriptReadWalksFoldFamily`,
+`SonarConversationFoldTests` `snRetainedTranscriptForChat`.
+
+Quote-jump after Leave is not a remount hole: both hosts clear the
+jump on pop (`back()` / `pop()`). In-chat quote while fold lands is
+already remounted with the open chat.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

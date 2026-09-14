@@ -852,6 +852,33 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun retainedTranscriptReadWalksFoldFamily() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = listOf(
+            SonarMsg(id = "m1", senderNpub = "npub1peer", content = "old", mine = false, tsSecs = 1L),
+        )
+        val snapshot = listOf(
+            SonarMsg(id = "m2", senderNpub = "npub1me", content = "snap", mine = true, tsSecs = 2L),
+        )
+        val retained = mapOf("group-08" to historical)
+        assertEquals(historical, retainedTranscriptForChat("group-09", retained, folds))
+        assertEquals(historical, retainedTranscriptForChat("group-08", retained, folds))
+        assertEquals(emptyList(), retainedTranscriptForChat("group-09", retained, emptyMap()))
+        assertEquals(
+            historical,
+            firstOpenTranscriptPaintRows("group-09", retained, snapshot, folds),
+        )
+        assertEquals(
+            snapshot,
+            firstOpenTranscriptPaintRows("group-09", retained, snapshot, emptyMap()),
+        )
+        assertEquals(
+            snapshot,
+            firstOpenTranscriptPaintRows("group-09", emptyMap(), snapshot, folds),
+        )
+    }
+
+    @Test
     fun composerDraftReadAndClearWalkFoldFamily() {
         val folds = mapOf("group-08" to "group-09")
         val drafts = mapOf("group-08" to "hello from 0.8")

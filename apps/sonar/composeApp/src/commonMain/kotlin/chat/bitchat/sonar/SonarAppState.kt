@@ -942,6 +942,31 @@ internal fun pendingMediaUploadStoreId(
     return historicalFolds.entries.firstOrNull { it.value == chatId }?.value ?: chatId
 }
 
+/** Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold. */
+internal fun retainedTranscriptForChat(
+    chatId: String,
+    retainedByChat: Map<String, List<SonarMsg>>,
+    historicalFolds: Map<String, String>,
+): List<SonarMsg> {
+    retainedByChat[chatId]?.takeIf { it.isNotEmpty() }?.let { return it }
+    for (id in foldFamilyIds(chatId, historicalFolds)) {
+        if (id == chatId) continue
+        retainedByChat[id]?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return emptyList()
+}
+
+/** Prefer last leave paint (including a hidden 0.8 sibling), else snapshot. */
+internal fun firstOpenTranscriptPaintRows(
+    chatId: String,
+    retainedByChat: Map<String, List<SonarMsg>>,
+    snapshotPaint: List<SonarMsg>,
+    historicalFolds: Map<String, String>,
+): List<SonarMsg> {
+    val retained = retainedTranscriptForChat(chatId, retainedByChat, historicalFolds)
+    return if (retained.isNotEmpty()) retained else snapshotPaint
+}
+
 /** Read a draft from the open id or its hidden 0.8 sibling after a fold. */
 internal fun composerDraftForChat(
     chatId: String,
@@ -3149,13 +3174,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Prefer last leave paint, else snapshot — never open on empty when we can avoid it. */
-    private fun firstOpenTranscriptPaint(chatId: String, snapshotPaint: List<SonarMsg>): List<SonarMsg> {
-        val retained = retainedTranscriptByChat[chatId]
-        return when {
-            retained != null && retained.isNotEmpty() -> retained
-            else -> snapshotPaint
-        }
-    }
+    private fun firstOpenTranscriptPaint(chatId: String, snapshotPaint: List<SonarMsg>): List<SonarMsg> =
+        firstOpenTranscriptPaintRows(
+            chatId,
+            retainedTranscriptByChat,
+            snapshotPaint,
+            historicalFoldMap,
+        )
 
     /**
      * Signal-Android list bind: warm disk thumbs into [MediaImageMemoryCache]
@@ -6965,7 +6990,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val title = chatTitle(chat)
 
         // Reopen: retained paint is already the last leave frame — push now.
-        retainedTranscriptByChat[chat.id]?.takeIf { it.isNotEmpty() }?.let { retained ->
+        // After an MDK 0.8→0.9 fold the leave frame may still be keyed on
+        // the hidden historical id; walk the family so first paint is not empty.
+        retainedTranscriptForChat(chat.id, retainedTranscriptByChat, historicalFoldMap)
+            .takeIf { it.isNotEmpty() }
+            ?.let { retained ->
+            if (retainedTranscriptByChat[chat.id].isNullOrEmpty()) {
+                retainOpenTranscript(chat.id, retained)
+            }
             messages = retained
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("marmot", chat.id, "push-retained")
@@ -12876,6 +12908,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         promoteFoldedPendingEchoes(previousOrder.toSet(), listedIds)
         promoteFoldedInFlightSends(previousOrder.toSet(), listedIds)
         promoteFoldedPendingMediaPreviews()
+        promoteFoldedRetainedTranscripts(previousOrder.toSet(), listedIds)
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -13219,6 +13252,44 @@ class SonarAppState(private val scope: CoroutineScope) {
         activeCall?.let { call ->
             val live = liveFor(call.chatId)
             if (live != call.chatId) activeCall = call.copy(chatId = live)
+        }
+    }
+
+    /** Leave-paint / scroll windows stay on the hidden 0.8 id when fold lands
+     *  after the user already left. Reopen of the live row must paint that
+     *  frame immediately — iOS promotes `messagesByGroup` the same way. */
+    private fun promoteFoldedRetainedTranscripts(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String ->
+            historicalFoldMap[id]
+                ?: runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
+        }
+        val nextRetained = promotedFoldedSnapshotMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = retainedTranscriptByChat,
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextRetained != retainedTranscriptByChat) {
+            retainedTranscriptByChat.clear()
+            retainedTranscriptByChat.putAll(nextRetained)
+        }
+        for (historical in previousIds + transcriptWindows.keys) {
+            if (historical in currentIds) continue
+            val live = liveFoldTarget(historical) ?: continue
+            if (live !in currentIds) continue
+            val historicalWindow = transcriptWindows[historical] ?: continue
+            if (historicalWindow.rows.isEmpty()) continue
+            val liveWindow = transcriptWindows[live]
+            transcriptWindows[live] = TranscriptGroupWindow(
+                rows = mergedFoldedMessageLists(
+                    historicalWindow.rows,
+                    liveWindow?.rows.orEmpty(),
+                ) { it.id },
+                hasMore = historicalWindow.hasMore || liveWindow?.hasMore == true,
+                loadingOlder = liveWindow?.loadingOlder == true,
+                pinnedToOlderEdge = historicalWindow.pinnedToOlderEdge ||
+                    liveWindow?.pinnedToOlderEdge == true,
+            )
         }
     }
 
