@@ -1199,6 +1199,59 @@ class ConversationFoldTest {
                 suppressedIds = setOf("marmot:group-09"),
             ),
         )
+        val remountKeys = remountOpeningHydrateKeys(
+            openId = "marmot:group-08",
+            groupId = "group-08",
+            liveId = "marmot:group-09",
+            liveGroupId = "group-09",
+        )
+        assertTrue(openedDMShouldSkipHydrate("marmot:group-08", remountKeys))
+        assertTrue(openedDMShouldSkipHydrate("group-08", remountKeys))
+        assertTrue(openedDMShouldSkipHydrate("marmot:group-09", remountKeys))
+        assertFalse(openedDMShouldSkipHydrate("marmot:other", remountKeys))
+    }
+
+    @Test
+    fun meshDeletePopsRemountedLivePane() {
+        val purge = deletedMeshConversationPurgeIds(
+            meshChatIds = listOf("mesh:peer"),
+            foldedGroupIds = listOf("group-08", "group-09"),
+        )
+        assertTrue(
+            deletedConversationShouldClearScreen(
+                Screen.Chat("group-09", "Alice"),
+                deletedId = "mesh:peer",
+                purgeIds = purge,
+            ),
+        )
+        assertTrue(
+            deletedConversationShouldClearScreen(
+                Screen.GroupInfo("marmot:group-08"),
+                deletedId = "mesh:peer",
+                purgeIds = purge,
+            ),
+        )
+        assertTrue(
+            deletedConversationClearsOpen(
+                openId = "group-09",
+                deletedId = "mesh:peer",
+                purgeIds = purge,
+            ),
+        )
+        assertFalse(
+            deletedConversationShouldClearScreen(
+                Screen.Chat("group-09", "Alice"),
+                deletedId = "mesh:peer",
+                purgeIds = setOf("mesh:peer"),
+            ),
+        )
+        assertFalse(
+            deletedConversationShouldClearScreen(
+                Screen.GroupInfo("marmot:other"),
+                deletedId = "mesh:peer",
+                purgeIds = purge,
+            ),
+        )
     }
 
     @Test

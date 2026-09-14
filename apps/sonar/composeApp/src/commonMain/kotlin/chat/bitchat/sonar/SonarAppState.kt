@@ -1906,6 +1906,42 @@ internal fun openedDMShouldSkipHydrate(
     return bare in suppressedIds || "marmot:$bare" in suppressedIds
 }
 
+/** Warmup / pane keys whose in-flight `openChat` newest-page must stop
+ *  when remount copies the window onto live. iOS
+ *  `snRemountOpeningHydrateKeys`. */
+internal fun remountOpeningHydrateKeys(
+    openId: String,
+    groupId: String,
+    liveId: String,
+    liveGroupId: String,
+): Set<String> {
+    val keys = linkedSetOf<String>()
+    fun insert(id: String) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) return
+        keys.add(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isEmpty()) return
+        keys.add(bare)
+        keys.add("marmot:$bare")
+    }
+    insert(openId)
+    insert(groupId)
+    insert(liveId)
+    insert(liveGroupId)
+    return keys
+}
+
+/** Mesh-row delete must also pop a remounted live Marmot pane / group-info.
+ *  iOS `snDeletedMeshConversationPurgeIds`. */
+internal fun deletedMeshConversationPurgeIds(
+    meshChatIds: Collection<String>,
+    foldedGroupIds: Collection<String>,
+): Set<String> = (meshChatIds + foldedGroupIds)
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+    .toSet()
+
 /** Mac remount rewrites the logical open id to live while the pane
  *  stays hist. `closedDM(hist)` must still clear the leaked live id.
  *  Compose remounts `Screen.Chat.id` in place — iOS `snClosedDMShouldClearOpened`. */
@@ -3528,6 +3564,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         conversationTranscriptRows = emptyList()
         conversationVisibleRowLimit = TRANSCRIPT_PAGE_SIZE
         conversationPinnedToOlderEdge = false
+        suppressOpenedHydrateIds = emptySet()
         return transcriptGeneration
     }
 
@@ -3709,6 +3746,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatUnreadAnchor = emptyMap()
         openChatJumpMessageId = emptyMap()
         hydratedTranscripts = emptySet()
+        suppressOpenedHydrateIds = emptySet()
         unreadSuppressGroupIds.clear()
         // Every caller is a full teardown (account wipe, eraseAllChats,
         // restoreAccount). Echoes now outlive their first reconcile (R-025),
@@ -3765,6 +3803,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     var hydratedTranscripts by mutableStateOf<Set<String>>(emptySet())
         private set
+
+    /** Fold remount copied the window — in-flight `openChat` newest-page
+     *  must not publish over it. iOS `suppressOpenedDMHydrateIds`. */
+    private var suppressOpenedHydrateIds: Set<String> = emptySet()
 
     fun isTranscriptHydrated(chatId: String): Boolean = chatId in hydratedTranscripts
 
@@ -4856,6 +4898,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         ) {
             return
         }
+        if (openedDMShouldSkipHydrate(chatId, suppressOpenedHydrateIds)) return
         if (!sameTranscriptPaint(messages, visible)) {
             messages = visible
         }
@@ -9351,7 +9394,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val aliases = meshPeerAliases(canonicalPeerId)
         val chatId = meshChatId(canonicalPeerId)
-        val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val foldedGroups = (
             npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }.orEmpty() +
                 chats.filter { group ->
@@ -9363,6 +9405,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         adoptActionHistoricalFolds(meshFolds)
         val foldedGroupIdsToDelete = foldedGroups.flatMapTo(hashSetOf()) { group ->
             foldFamilyIds(group.id, meshFolds) + group.id
+        }
+        val deleteIdSet = deletedMeshConversationPurgeIds(
+            aliases.map(::meshChatId) + chatId,
+            foldedGroupIdsToDelete,
+        )
+        val wasOpen = stack.any { screen ->
+            deletedConversationShouldClearScreen(screen, chatId, deleteIdSet)
         }
         aliases.forEach { alias ->
             meshChats.remove(alias)
@@ -9393,7 +9442,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // ghost as a phantom bubble or — worse — be DELIVERED by
         // flushPendingMarmot after the user removed the conversation (R-025
         // sibling of the "/clear" scoped ledger clear).
-        val deletedChatIds = (aliases.map(::meshChatId) + chatId + foldedGroupIdsToDelete).toSet()
+        val deletedChatIds = deleteIdSet
         deletedChatIds.forEach { id ->
             pendingSendEchoes.remove(id)?.forEach { echo ->
                 previouslyPublishedMessageIdsByEcho.remove(echo.id)
@@ -9406,7 +9455,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         updateBleDiscoveryPolicy()
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
-            stack = stack.dropLast(1)
+            while (stack.size > 1 && stack.lastOrNull()?.let {
+                    deletedConversationShouldClearScreen(it, chatId, deleteIdSet)
+                } == true) {
+                stack = stack.dropLast(1)
+            }
             restoreRevealedChatOrClear()
         }
         scope.launch {
@@ -13700,7 +13753,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 expectedNewestTsForOpenChat(sessionChatId),
             ),
         )
-        if (!isCurrentTranscriptSession(sessionChatId, generation)) {
+        if (!isCurrentTranscriptSession(sessionChatId, generation) ||
+            openedDMShouldSkipHydrate(sessionChatId, suppressOpenedHydrateIds)
+        ) {
             return when {
                 untrusted -> snapshotMessagesForChat(groupId).takeLast(TRANSCRIPT_PAGE_SIZE)
                 else -> visibleTranscriptPage(fetched.orEmpty())
@@ -13909,8 +13964,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         generation: Long,
     ): List<SonarMsg> {
         val merged = mergeAllTranscriptRows(source)
-        if (!isCurrentTranscriptSession(chatId, generation)) {
-            return boundedTranscriptRows(merged, TRANSCRIPT_PAGE_SIZE, pinnedToOlderEdge = false)
+        if (!isCurrentTranscriptSession(chatId, generation) ||
+            openedDMShouldSkipHydrate(chatId, suppressOpenedHydrateIds)
+        ) {
+            return if (openedDMShouldSkipHydrate(chatId, suppressOpenedHydrateIds) &&
+                conversationTranscriptRows.isNotEmpty()
+            ) {
+                conversationTranscriptRows
+            } else {
+                boundedTranscriptRows(merged, TRANSCRIPT_PAGE_SIZE, pinnedToOlderEdge = false)
+            }
         }
         conversationTranscriptRows = if (conversationTranscriptRows.isEmpty()) {
             boundedTranscriptRows(merged, conversationVisibleRowLimit, conversationPinnedToOlderEdge)
@@ -15477,6 +15540,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (activeTranscriptChatId == open.id || open.id in transcriptSessionAliases) {
             transcriptSessionAliases = transcriptSessionAliases + open.id + live
             activeTranscriptChatId = live
+        }
+        // Hist-only: live must still newest-page hidden siblings.
+        // iOS also suppresses live because `onAppear` re-runs `openedDM`.
+        suppressOpenedHydrateIds = suppressOpenedHydrateIds + remountOpeningHydrateKeys(
+            openId = open.id,
+            groupId = open.id,
+            liveId = open.id,
+            liveGroupId = open.id,
+        )
+        if (historicalWindow?.pinnedToOlderEdge == true) {
+            conversationPinnedToOlderEdge = true
         }
         stack = stack.map { s ->
             if (s is Screen.Chat && s.id == open.id) {

@@ -1725,6 +1725,43 @@ func snOpenedDMShouldSkipHydrate(
     return false
 }
 
+/// Warmup / pane keys whose in-flight `openedDM` newest-page must stop
+/// when remount copies the window onto live. Pinned older-edge
+/// (`snNewestPageShouldMergeFamilyWindow` is false) would otherwise
+/// snap the recovered transcript to the tail. Compose
+/// `remountOpeningHydrateKeys`.
+func snRemountOpeningHydrateKeys(
+    openId: String,
+    groupId: String,
+    liveId: String,
+    liveGroupId: String
+) -> Set<String> {
+    var keys = Set<String>()
+    func insert(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        keys.insert(trimmed)
+        let bare = snBareMarmotGroupId(trimmed)
+        guard !bare.isEmpty else { return }
+        keys.insert(bare)
+        keys.insert("marmot:" + bare)
+    }
+    insert(openId)
+    insert(groupId)
+    insert(liveId)
+    insert(liveGroupId)
+    return keys
+}
+
+/// Mesh-row delete must also pop a remounted live Marmot pane / group-info.
+/// Compose `deletedMeshConversationPurgeIds`.
+func snDeletedMeshConversationPurgeIds(
+    meshChatIds: [String],
+    foldedGroupIds: [String]
+) -> Set<String> {
+    Set((meshChatIds + foldedGroupIds).filter { !$0.isEmpty })
+}
+
 /// Mac remount rewrites `openedConversationId` to live while the pane
 /// `.id` stays hist. `closedDM(hist)` must still clear the leaked live
 /// id — otherwise notification suppress / mark-read keep treating the
@@ -10264,6 +10301,12 @@ final class SonarAppStore: ObservableObject {
             return
         }
         let realId = Self.marmotIDPrefix + remounted
+        cancelOpeningHydrateForFoldRemount(
+            openId: openId,
+            groupId: groupId,
+            liveId: realId,
+            liveGroupId: remounted
+        )
         marmot.remountFoldedLocalTranscriptWindow(from: groupId, onto: remounted)
         remountFoldedPendingEchoes(from: [openId, groupId], onto: realId)
         remountFoldedPendingSendQueues(from: [openId, groupId], onto: realId)
@@ -10352,8 +10395,6 @@ final class SonarAppStore: ObservableObject {
             pendingId: openId,
             realId: realId
         )
-        suppressOpenedDMHydrateIds.insert(realId)
-        suppressOpenedDMHydrateIds.insert(remounted)
         // Do not call `openedDM` here: it hydrates the live id as a fresh
         // open (`loadLocalWhenConnected` newest-page) and would snap a
         // scrolled recovered transcript back to the tail. The chat is
@@ -10414,6 +10455,29 @@ final class SonarAppStore: ObservableObject {
                     speakerOn: call.speakerOn
                 )
             }
+        }
+    }
+
+    /// Stop in-flight hist newest-page before remount copies the window.
+    /// `openedDM` already passed `consumeOpenedDMHydrateSuppression`; a
+    /// sibling `.newestPage` on live drops the older-edge pin.
+    private func cancelOpeningHydrateForFoldRemount(
+        openId: String,
+        groupId: String,
+        liveId: String,
+        liveGroupId: String
+    ) {
+        let keys = snRemountOpeningHydrateKeys(
+            openId: openId,
+            groupId: groupId,
+            liveId: liveId,
+            liveGroupId: liveGroupId
+        )
+        for key in keys {
+            openingDMTasks.removeValue(forKey: key)?.cancel()
+            refreshingDMTasks.removeValue(forKey: key)?.cancel()
+            localHydratingDMs.remove(key)
+            suppressOpenedDMHydrateIds.insert(key)
         }
     }
 
@@ -12440,6 +12504,10 @@ final class SonarAppStore: ObservableObject {
                         ? [MarmotService.MarmotGroup(id: hydratedGroupId, name: "", memberNpubs: [])]
                         : groups)
                 for group in sourceGroups {
+                    guard !Task.isCancelled else {
+                        self.localHydratingDMs.remove(id)
+                        return
+                    }
                     // `loadLocalWhenConnected(groupId:)` already painted the
                     // known source. Only hydrate additional family ids here.
                     if groupId == nil || group.id != groupId {
@@ -14775,7 +14843,10 @@ final class SonarAppStore: ObservableObject {
             foldedGroups = []
             meshPurgeIds = []
         }
-        let meshRoutePurge = Set(meshPurgeIds + foldedGroups.map(\.id))
+        let meshRoutePurge = snDeletedMeshConversationPurgeIds(
+            meshChatIds: [id],
+            foldedGroupIds: meshPurgeIds + foldedGroups.map(\.id)
+        )
         path.removeAll {
             snDeletedConversationShouldClearRoute(
                 $0,

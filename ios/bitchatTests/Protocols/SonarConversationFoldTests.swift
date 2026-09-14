@@ -202,6 +202,30 @@ struct SonarConversationFoldTests {
             deletedId: "marmot:group-09",
             purgeIds: ["group-09"]
         ))
+        let meshPurge = snDeletedMeshConversationPurgeIds(
+            meshChatIds: ["mesh:peer"],
+            foldedGroupIds: ["group-08", "group-09"]
+        )
+        #expect(snDeletedConversationShouldClearRoute(
+            .dm("marmot:group-09"),
+            deletedId: "mesh:peer",
+            purgeIds: meshPurge
+        ))
+        #expect(snDeletedConversationShouldClearRoute(
+            .groupInfo("marmot:group-08"),
+            deletedId: "mesh:peer",
+            purgeIds: meshPurge
+        ))
+        #expect(snDeletedConversationClearsOpen(
+            openId: "group-09",
+            deletedId: "mesh:peer",
+            purgeIds: meshPurge
+        ))
+        #expect(!snDeletedConversationShouldClearRoute(
+            .dm("marmot:group-09"),
+            deletedId: "mesh:peer",
+            purgeIds: ["mesh:peer"]
+        ))
         #expect(
             snNotificationOpenGroupId(
                 tappedGroupId: "group-08",
@@ -1468,6 +1492,16 @@ struct SonarConversationFoldTests {
             openingId: "marmot:other",
             suppressedIds: ["marmot:group-09"]
         ))
+        let remountKeys = snRemountOpeningHydrateKeys(
+            openId: "marmot:group-08",
+            groupId: "group-08",
+            liveId: "marmot:group-09",
+            liveGroupId: "group-09"
+        )
+        #expect(snOpenedDMShouldSkipHydrate(openingId: "marmot:group-08", suppressedIds: remountKeys))
+        #expect(snOpenedDMShouldSkipHydrate(openingId: "group-08", suppressedIds: remountKeys))
+        #expect(snOpenedDMShouldSkipHydrate(openingId: "marmot:group-09", suppressedIds: remountKeys))
+        #expect(!snOpenedDMShouldSkipHydrate(openingId: "marmot:other", suppressedIds: remountKeys))
         #expect(snClosedDMShouldClearOpened(
             closingId: "marmot:group-08",
             openedConversationId: "marmot:group-09",
