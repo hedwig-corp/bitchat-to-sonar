@@ -194,6 +194,9 @@ Guarded by:
 - `ConversationFoldTest.foldedHistoricalComposerReplyMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotMessagesMoveOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalCallLogsMoveOntoLiveSibling`
+- `ConversationFoldTest.foldAliasesDiscoverHiddenHistoricalIdFromLiveSibling`
+- `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
+  (also pins `fold_aliases` both directions)
 - `ConversationFoldTest.foldedHistoricalVerifiedBlobRecoversOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalVerifiedMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotChatDropsOnceLiveSiblingIsListed`
@@ -347,7 +350,7 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply / verify / call logs / unread-at-open / transcript window onto the live sibling. A persisted `sonar.historicalFolds` map drops a recovered snapshot row on the next cold start once the live sibling is already listed. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply / verify / call logs / unread-at-open / transcript window onto the live sibling. FFI `fold_aliases` lets a listed live id name its hidden 0.8 siblings so the host fold map hydrates on first launch without a leftover snapshot row. A persisted `sonar.historicalFolds` map drops a recovered snapshot row on the next cold start once the live sibling is already listed. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
 | iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. Mute / draft / reply / verify / call-log / unread-at-open / transcript-window promotion and open-chat remount match Compose. Cold-start snapshot load collapses folded historical ids via `sonar.historicalFolds.v1`. | same | none |
 | Mesh | untouched | untouched | none |
 
@@ -434,7 +437,7 @@ filters last verified on `ba346336`; Compose remount pin on this commit.
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 41 passed (includes remount unread / transcript-window pin) |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 43 passed (includes fold_aliases discovery + verify-blob recover) |
 | `scripts/check-regression-ledger.sh` | 236 citations |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with

@@ -1294,6 +1294,11 @@ final class MarmotService: @unchecked Sendable {
         await readOnlyNonThrowing({ $0.liveFoldTarget(groupIdHex: groupId) }, default: nil)
     }
 
+    /// Recovered and live ids that share one conversation after resume.
+    func foldAliases(groupId: String) async -> [String] {
+        await readOnlyNonThrowing({ $0.foldAliases(groupIdHex: groupId) }, default: [groupId])
+    }
+
     /// Decrypted message history for a group, oldest first.
     func messages(groupId: String) async throws -> [MarmotMessage] {
         try await readOnly {

@@ -545,6 +545,24 @@ internal fun remountFoldedOpenId(
     id: String,
 ): String = if (id in historicalKeys) liveId else id
 
+/** Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`. */
+internal fun historicalFoldsFromAliases(
+    listedIds: Collection<String>,
+    foldAliases: (String) -> List<String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> {
+    val next = linkedMapOf<String, String>()
+    for (id in listedIds) {
+        val live = liveFoldTarget(id) ?: continue
+        if (live.isBlank()) continue
+        for (alias in foldAliases(id)) {
+            if (alias.isBlank() || alias == live) continue
+            next[alias] = live
+        }
+    }
+    return next
+}
+
 /** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
 internal fun promotedFoldedMutes(
     previousIds: Set<String>,
@@ -3108,7 +3126,19 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun rememberHistoricalFolds(previousIds: Set<String>, currentIds: Set<String>) {
         var changed = false
-        for (id in previousIds + currentIds + historicalFoldMap.keys) {
+        val listed = previousIds + currentIds + historicalFoldMap.keys + historicalFoldMap.values
+        val discovered = historicalFoldsFromAliases(
+            listedIds = listed,
+            foldAliases = { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+        for ((historical, live) in discovered) {
+            if (historicalFoldMap[historical] != live) {
+                historicalFoldMap[historical] = live
+                changed = true
+            }
+        }
+        for (id in listed) {
             val live = runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() ?: continue
             if (live.isBlank() || live == id) continue
             if (historicalFoldMap[id] != live) {

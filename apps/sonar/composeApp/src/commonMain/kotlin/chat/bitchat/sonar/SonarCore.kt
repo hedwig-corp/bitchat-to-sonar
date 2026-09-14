@@ -876,6 +876,9 @@ expect object SonarCore {
     /** Live 0.9 group that replaced a recovered 0.8 row, or null if not folded. */
     fun liveFoldTarget(groupId: String): String?
 
+    /** Recovered and live ids that share one conversation after resume. */
+    fun foldAliases(groupId: String): List<String>
+
     /** Start (or fetch) a 1:1 chat with a peer (npub or hex). Returns chat id. */
     suspend fun startChat(peer: String): String
 

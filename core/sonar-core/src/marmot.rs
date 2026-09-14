@@ -3887,6 +3887,16 @@ mod historical_fold_tests {
             vec![bob.public_key()]
         );
         assert_eq!(engine.live_fold_target(&historical).as_ref(), Some(&live));
+        let from_live = engine.fold_aliases(&live);
+        let from_historical = engine.fold_aliases(&historical);
+        assert!(
+            from_live.contains(&historical),
+            "live id must name the hidden 0.8 sibling"
+        );
+        assert!(
+            from_historical.contains(&live),
+            "hidden id must name the live sibling"
+        );
 
         let pages = engine
             .recent_message_pages(8, 8)

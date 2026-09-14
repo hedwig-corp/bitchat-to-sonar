@@ -111,6 +111,20 @@ struct SonarConversationFoldTests {
                 id: "other"
             ) == "other"
         )
+        #expect(
+            snHistoricalFoldsFromAliases(
+                listedIds: ["group-09"],
+                foldAliases: { $0 == "group-09" || $0 == "group-08" ? ["group-09", "group-08"] : [$0] },
+                liveFoldTarget: { $0 == "group-08" || $0 == "group-09" ? "group-09" : nil }
+            ) == ["group-08": "group-09"]
+        )
+        #expect(
+            snHistoricalFoldsFromAliases(
+                listedIds: ["plain"],
+                foldAliases: { [$0] },
+                liveFoldTarget: { _ in nil }
+            ).isEmpty
+        )
         // Notification / deep-link ids stay on the hidden 0.8 row until remap.
         #expect(
             snRemountFoldedOpenGroupId(

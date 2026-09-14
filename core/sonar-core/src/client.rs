@@ -7231,6 +7231,13 @@ impl SonarClient {
         Some(hex::encode(live.as_slice()))
     }
 
+    /// Recovered and live ids that share one conversation after resume.
+    /// Includes `group_id_hex` itself. Hosts use this to discover hidden 0.8
+    /// siblings from a listed live id (`live_fold_target(live)` is just live).
+    pub fn fold_aliases_hex(&self, group_id_hex: &str) -> Vec<String> {
+        self.fold_index_ids(group_id_hex)
+    }
+
     fn fold_index_ids(&self, group_id_hex: &str) -> Vec<String> {
         let Ok(bytes) = hex::decode(group_id_hex) else {
             return vec![group_id_hex.to_string()];

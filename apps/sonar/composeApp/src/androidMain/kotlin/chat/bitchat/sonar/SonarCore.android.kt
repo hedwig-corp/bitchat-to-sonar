@@ -193,6 +193,11 @@ actual object SonarCore {
         return n.liveFoldTarget(groupId)
     }
 
+    actual fun foldAliases(groupId: String): List<String> {
+        val n = node ?: return listOf(groupId)
+        return n.foldAliases(groupId)
+    }
+
     actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {
         val n = requireNode()
         n.startDm(peer.trim(), "")

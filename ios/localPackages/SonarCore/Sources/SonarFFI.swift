@@ -1627,6 +1627,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws  -> StickerPackInfo
 
     /**
+     * Recovered and live ids that share one conversation after resume.
+     * Local read; includes `group_id_hex` itself.
+     */
+    func foldAliases(groupIdHex: String)  -> [String]
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -2473,6 +2479,19 @@ open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrl
         FfiConverterString.lower(authorPubkeyHex),
         FfiConverterString.lower(identifier),
         FfiConverterSequenceString.lower(relayUrls),$0
+    )
+})
+}
+
+    /**
+     * Recovered and live ids that share one conversation after resume.
+     * Local read; includes `group_id_hex` itself.
+     */
+open func foldAliases(groupIdHex: String) -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_fold_aliases(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
     )
 })
 }
@@ -9376,6 +9395,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_pack() != 19095) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fold_aliases() != 36383) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {

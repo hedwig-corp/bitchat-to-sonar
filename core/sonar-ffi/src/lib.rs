@@ -1733,6 +1733,12 @@ impl SonarNode {
         self.client.live_fold_target_hex(&group_id_hex)
     }
 
+    /// Recovered and live ids that share one conversation after resume.
+    /// Local read; includes `group_id_hex` itself.
+    pub fn fold_aliases(&self, group_id_hex: String) -> Vec<String> {
+        self.client.fold_aliases_hex(&group_id_hex)
+    }
+
     /// Decrypted message history for a group, oldest first.
     pub fn messages(&self, group_id_hex: String) -> FfiResult<Vec<MessageInfo>> {
         let group_id = parse_group_id(&group_id_hex)?;

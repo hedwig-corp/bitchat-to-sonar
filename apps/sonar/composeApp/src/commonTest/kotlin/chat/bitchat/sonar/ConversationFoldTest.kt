@@ -691,6 +691,26 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldAliasesDiscoverHiddenHistoricalIdFromLiveSibling() {
+        val folds = historicalFoldsFromAliases(
+            listedIds = listOf("group-09"),
+            foldAliases = { id ->
+                if (id == "group-09" || id == "group-08") listOf("group-09", "group-08") else listOf(id)
+            },
+            liveFoldTarget = { id -> if (id == "group-08" || id == "group-09") "group-09" else null },
+        )
+        assertEquals(mapOf("group-08" to "group-09"), folds)
+        assertEquals(
+            emptyMap(),
+            historicalFoldsFromAliases(
+                listedIds = listOf("plain"),
+                foldAliases = { listOf(it) },
+                liveFoldTarget = { null },
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalVerifiedBlobRecoversOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

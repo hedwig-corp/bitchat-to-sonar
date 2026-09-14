@@ -315,6 +315,22 @@ func snRemountFoldedOpenId(
     historicalKeys.contains(id) ? liveId : id
 }
 
+/// Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`.
+func snHistoricalFoldsFromAliases(
+    listedIds: [String],
+    foldAliases: (String) -> [String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    var next: [String: String] = [:]
+    for id in listedIds {
+        guard let live = liveFoldTarget(id), !live.isEmpty else { continue }
+        for alias in foldAliases(id) where !alias.isEmpty && alias != live {
+            next[alias] = live
+        }
+    }
+    return next
+}
+
 /// Historical group ids that disappeared because they folded onto a listed live id.
 func snPromotedFoldedMutePairs(
     previousGroupIds: Set<String>,
@@ -7402,8 +7418,28 @@ final class SonarAppStore: ObservableObject {
     private func rememberHistoricalFolds(from previous: Set<String>, to current: Set<String>) async {
         var map = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         var changed = false
-        for id in previous.union(current).union(Set(map.keys)) {
-            guard let live = await marmot.liveFoldTarget(groupId: id), live != id else { continue }
+        let listed = Array(previous.union(current).union(Set(map.keys)).union(Set(map.values)))
+        var liveById: [String: String] = [:]
+        var aliasesById: [String: [String]] = [:]
+        for id in listed {
+            if let live = await marmot.liveFoldTarget(groupId: id) {
+                liveById[id] = live
+            }
+            aliasesById[id] = await marmot.foldAliases(groupId: id)
+        }
+        let discovered = snHistoricalFoldsFromAliases(
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
+        for (historical, live) in discovered {
+            if map[historical] != live {
+                map[historical] = live
+                changed = true
+            }
+        }
+        for id in listed {
+            guard let live = liveById[id], live != id else { continue }
             if map[id] != live {
                 map[id] = live
                 changed = true

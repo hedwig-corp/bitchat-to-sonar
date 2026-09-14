@@ -3268,6 +3268,11 @@ final class MarmotChatModel: ObservableObject {
         await service.liveFoldTarget(groupId: groupId)
     }
 
+    /// Recovered and live ids that share one conversation after resume.
+    func foldAliases(groupId: String) async -> [String] {
+        await service.foldAliases(groupId: groupId)
+    }
+
     /// Resolve a handle (`vincenzo` / `alice@domain`) to its owner via NIP-05.
     func resolveHandle(_ input: String) async throws -> MarmotService.ResolvedHandle {
         try await service.resolveHandle(input)
