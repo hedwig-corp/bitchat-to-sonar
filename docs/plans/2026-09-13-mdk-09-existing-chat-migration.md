@@ -1073,6 +1073,15 @@ admit the parent. Clear only through `shouldClearQuotedJumpAfterMiss`
 target. Pins: `ConversationFoldTest` `shouldClearQuotedJumpAfterMiss`,
 `SonarConversationFoldTests` `snShouldClearQuotedJumpAfterMiss`.
 
+Short live-page hasOlder hole closed after this commit: home hydrate
+only remounts 20 rows (`LOCAL_SUMMARY_PAGE_LIMIT`). After persist-folds
+the live 0.9 newest page is short, so `existing+incoming` stays ≤30 and
+`newestPageFamilyHasOlder` disarmed load-older while extract 21–80 and
+bak remained on hist. A short incoming page now keeps the flag when a
+fold family remount already exists. Pins: `ConversationFoldTest`
+`newestPageFamilyHasOlder` `hasFoldFamily`, `SonarConversationFoldTests`
+`snNewestPageFamilyHasOlder`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

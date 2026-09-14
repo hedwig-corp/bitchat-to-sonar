@@ -1035,6 +1035,33 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snNewestPageFamilyHasOlder(
+                existingCount: 20,
+                incomingCount: 2,
+                rawPageCount: 2,
+                previousHasOlder: false,
+                hasFoldFamily: true
+            )
+        )
+        #expect(
+            !snNewestPageFamilyHasOlder(
+                existingCount: 20,
+                incomingCount: 2,
+                rawPageCount: 2,
+                previousHasOlder: false,
+                hasFoldFamily: false
+            )
+        )
+        #expect(
+            !snNewestPageFamilyHasOlder(
+                existingCount: 0,
+                incomingCount: 2,
+                rawPageCount: 2,
+                previousHasOlder: false,
+                hasFoldFamily: true
+            )
+        )
+        #expect(
             snLoadOlderPageHasOlder(
                 rawPageCount: 0,
                 pageSize: 30,

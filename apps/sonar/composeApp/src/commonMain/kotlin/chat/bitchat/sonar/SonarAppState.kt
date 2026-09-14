@@ -771,8 +771,10 @@ internal fun familyTranscriptNeedsNetworkBackfill(
 
 /** Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
  *  Comparing overflow to the 500-row retained cap hid bak remainder after
- *  the first-paint extract (80). Page-size overflow or a short live FFI
- *  page still means older family history exists.
+ *  the first-paint extract (80). Home hydrate only remounts
+ *  [LOCAL_SUMMARY_PAGE_LIMIT] (20) rows, so cache overflow vs page-size
+ *  (30) is not enough: a short live FFI page on a fold family still
+ *  means extract / bak remain on hist.
  *  iOS `snNewestPageFamilyHasOlder`. */
 internal fun newestPageFamilyHasOlder(
     existingCount: Int,
@@ -780,10 +782,13 @@ internal fun newestPageFamilyHasOlder(
     pageSize: Int = TRANSCRIPT_PAGE_SIZE,
     rawPageCount: Int,
     previousHasOlder: Boolean,
+    hasFoldFamily: Boolean = false,
 ): Boolean = seededFoldFamilyTranscriptHasMore(
     cachedCount = existingCount + incomingCount,
     pageSize = pageSize,
-    familyHasOlder = previousHasOlder || rawPageCount > pageSize,
+    familyHasOlder = previousHasOlder ||
+        rawPageCount > pageSize ||
+        (hasFoldFamily && existingCount > 0 && pageSize > 0 && incomingCount < pageSize),
 )
 
 /** A short/empty load-older page must not disarm a previously armed
@@ -12389,6 +12394,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             rawPageCount = page.size,
             previousHasOlder = current?.hasMore == true
                 || unboundedCount > TRANSCRIPT_RETAINED_ROWS,
+            hasFoldFamily = foldFamilyIds(groupId, historicalFoldMap).any { it != groupId },
         )
         transcriptWindows[groupId] = TranscriptGroupWindow(
             rows = merged,

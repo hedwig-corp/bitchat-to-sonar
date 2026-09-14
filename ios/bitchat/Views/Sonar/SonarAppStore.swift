@@ -618,20 +618,24 @@ func snFamilyTranscriptNeedsNetworkBackfill<Message>(
 
 /// Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
 /// Comparing overflow to the 500-row retained cap hid bak remainder after
-/// the first-paint extract (80). Page-size overflow or a short live FFI
-/// page still means older family history exists.
+/// the first-paint extract (80). Home hydrate only remounts 20 rows, so
+/// cache overflow vs page-size (30) is not enough: a short live FFI page
+/// on a fold family still means extract / bak remain on hist.
 /// Compose `newestPageFamilyHasOlder`.
 func snNewestPageFamilyHasOlder(
     existingCount: Int,
     incomingCount: Int,
     pageSize: Int = 30,
     rawPageCount: Int,
-    previousHasOlder: Bool
+    previousHasOlder: Bool,
+    hasFoldFamily: Bool = false
 ) -> Bool {
     snSeededFoldFamilyTranscriptHasMore(
         cachedCount: existingCount + incomingCount,
         pageSize: pageSize,
-        familyHasOlder: previousHasOlder || rawPageCount > pageSize
+        familyHasOlder: previousHasOlder
+            || rawPageCount > pageSize
+            || (hasFoldFamily && existingCount > 0 && pageSize > 0 && incomingCount < pageSize)
     )
 }
 

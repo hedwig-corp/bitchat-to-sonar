@@ -2614,10 +2614,11 @@ final class MarmotChatModel: ObservableObject {
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
             let shouldPreserveHistoricalWindow = mode == .preserveHistoricalWindow
                 && !existingCanonical.isEmpty
+            let hasFoldFamily = familyIds.contains { $0 != groupId }
             let shouldMergeFamilyWindow = snNewestPageShouldMergeFamilyWindow(
                 existingCanonicalCount: existingCanonical.count,
                 hiddenSiblingHasRows: hiddenSiblingHasRows,
-                hasFoldFamily: familyIds.contains { $0 != groupId },
+                hasFoldFamily: hasFoldFamily,
                 pinnedToOlderEdge: localTranscriptPreservesOlderEdgeGroups.contains(groupId)
             )
             let familyHasOlder = familyIds.contains {
@@ -2644,7 +2645,8 @@ final class MarmotChatModel: ObservableObject {
                     pageSize: Self.localTranscriptPageLimit,
                     rawPageCount: rawPage.count,
                     previousHasOlder: familyHasOlder
-                        || merged.count > Self.localTranscriptRetainedLimit
+                        || merged.count > Self.localTranscriptRetainedLimit,
+                    hasFoldFamily: hasFoldFamily
                 )
             } else if shouldMergeFamilyWindow {
                 // A live-only newest page must not drop recovered 0.8 rows.
@@ -2661,7 +2663,8 @@ final class MarmotChatModel: ObservableObject {
                     incomingCount: page.count,
                     pageSize: Self.localTranscriptPageLimit,
                     rawPageCount: rawPage.count,
-                    previousHasOlder: familyHasOlder
+                    previousHasOlder: familyHasOlder,
+                    hasFoldFamily: hasFoldFamily
                 )
             } else {
                 let oldestPageDate = page.map(\.createdAt).min()
@@ -2684,7 +2687,8 @@ final class MarmotChatModel: ObservableObject {
                     incomingCount: page.count,
                     pageSize: Self.localTranscriptPageLimit,
                     rawPageCount: rawPage.count,
-                    previousHasOlder: familyHasOlder || hiddenSiblingHasRows
+                    previousHasOlder: familyHasOlder || hiddenSiblingHasRows,
+                    hasFoldFamily: hasFoldFamily
                 )
                 localTranscriptPreservesOlderEdgeGroups.remove(groupId)
             }

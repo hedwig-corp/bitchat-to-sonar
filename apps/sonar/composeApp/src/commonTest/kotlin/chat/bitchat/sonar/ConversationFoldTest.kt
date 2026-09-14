@@ -976,6 +976,36 @@ class ConversationFoldTest {
                 previousHasOlder = true,
             ),
         )
+        // Home hydrate remounts only 20 rows. Persist-folds live is a
+        // short 0.9 page; extract 21–80 + bak stay on hist. Without
+        // hasFoldFamily this must stay false (ordinary short chat).
+        assertTrue(
+            newestPageFamilyHasOlder(
+                existingCount = 20,
+                incomingCount = 2,
+                rawPageCount = 2,
+                previousHasOlder = false,
+                hasFoldFamily = true,
+            ),
+        )
+        assertFalse(
+            newestPageFamilyHasOlder(
+                existingCount = 20,
+                incomingCount = 2,
+                rawPageCount = 2,
+                previousHasOlder = false,
+                hasFoldFamily = false,
+            ),
+        )
+        assertFalse(
+            newestPageFamilyHasOlder(
+                existingCount = 0,
+                incomingCount = 2,
+                rawPageCount = 2,
+                previousHasOlder = false,
+                hasFoldFamily = true,
+            ),
+        )
         // First load-older can hit an empty/short page before bak
         // remainder is copied. Do not disarm the newest-page arm.
         assertTrue(
