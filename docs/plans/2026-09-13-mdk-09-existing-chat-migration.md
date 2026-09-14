@@ -1359,6 +1359,16 @@ closed-node throw and wiped recovered hist join requests from group-info.
 It now keeps the painted list (`pendingJoinRequestsOrCached`). iOS already
 keeps the list on `catch`.
 
+Persist-folds remounts group-info `hist → live` in place. Compose used
+to `remember(chatId)` the painted list, so remount reset it to `[]`
+and a closed-node live probe had nothing to keep. It now remaps via
+`pendingJoinRequestsAcrossRemount` (same fold family keeps; other
+rooms clear). iOS may recreate `SonarGroupInfoScreen` when the path
+associated value changes; a store cache seeds the new view, and a
+nil `marmotGroupId` no longer wipes the painted list. Pins:
+`ConversationFoldTest.closedNodeInviteProbeDoesNotClearCachedWelcomes`,
+`SonarConversationFoldTests.remountKeepsPendingJoinRequestsOnFoldFamily`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

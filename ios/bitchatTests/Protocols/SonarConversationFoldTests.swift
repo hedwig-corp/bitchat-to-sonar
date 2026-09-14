@@ -1949,6 +1949,44 @@ struct SonarConversationFoldTests {
     }
 
     @Test
+    func remountKeepsPendingJoinRequestsOnFoldFamily() {
+        let folds = ["group-08": "group-09"]
+        let requests = ["npub1joiner"]
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "marmot:group-08",
+                nextChatId: "marmot:group-09",
+                requests: requests,
+                historicalFolds: folds
+            ) == requests
+        )
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "marmot:group-09",
+                nextChatId: "marmot:group-08",
+                requests: requests,
+                historicalFolds: folds
+            ) == requests
+        )
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "marmot:group-08",
+                nextChatId: "marmot:other-room",
+                requests: requests,
+                historicalFolds: folds
+            ).isEmpty
+        )
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "",
+                nextChatId: "marmot:group-09",
+                requests: requests,
+                historicalFolds: folds
+            ) == requests
+        )
+    }
+
+    @Test
     func sameNpubMeshFingerprintsShareIdentityKey() {
         let npub = String(repeating: "ab", count: 32)
         #expect(

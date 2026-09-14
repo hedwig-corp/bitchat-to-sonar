@@ -263,7 +263,16 @@ struct SonarGroupInfoScreen: View {
         .background(SonarTheme.bg.ignoresSafeArea())
         .overlay(alignment: .bottom) { toastView }
         .animation(.easeOut(duration: 0.2), value: toast)
-        .task(id: "\(peerId)-\(store.marmot.groupInfoPendingRevision)") { await loadPendingJoinRequests() }
+        .task(id: "\(peerId)-\(store.marmot.groupInfoPendingRevision)") {
+            // Persist-folds remounts `groupInfo(hist) → groupInfo(live)` and
+            // may recreate this view. Seed from the store cache before the
+            // live probe so a closed node cannot start from `[]`.
+            pendingJoinRequests = store.pendingJoinRequestsCached(
+                for: peerId,
+                painted: pendingJoinRequests
+            )
+            await loadPendingJoinRequests()
+        }
         .snSheet(isPresented: $leaveSheet, title: "Leave group") {
             VStack(spacing: 12) {
                 Text("Are you sure you want to leave this group? You won\u{2019}t be able to read or send messages anymore.")
@@ -358,12 +367,21 @@ struct SonarGroupInfoScreen: View {
     @MainActor
     private func loadPendingJoinRequests() async {
         guard let groupId = store.marmotGroupId(peerId) else {
-            pendingJoinRequests = []
+            pendingJoinRequests = store.pendingJoinRequestsCached(
+                for: peerId,
+                painted: pendingJoinRequests
+            )
             return
         }
         do {
-            pendingJoinRequests = try await store.marmot.pendingJoinRequests(groupId: groupId)
+            let loaded = try await store.marmot.pendingJoinRequests(groupId: groupId)
+            pendingJoinRequests = loaded
+            store.rememberPendingJoinRequests(loaded, for: peerId)
         } catch {
+            pendingJoinRequests = store.pendingJoinRequestsCached(
+                for: peerId,
+                painted: pendingJoinRequests
+            )
             showToast("Couldn't load join requests: \(MarmotChatModel.describe(error))")
         }
     }
@@ -376,6 +394,7 @@ struct SonarGroupInfoScreen: View {
             do {
                 try await store.marmot.approveJoinRequest(groupId: groupId, requesterNpub: request.requesterNpub)
                 pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
+                store.rememberPendingJoinRequests(pendingJoinRequests, for: peerId)
                 showToast("Member added")
                 await loadPendingJoinRequests()
             } catch {
@@ -390,6 +409,7 @@ struct SonarGroupInfoScreen: View {
             do {
                 try await store.marmot.declineJoinRequest(groupId: groupId, requesterNpub: request.requesterNpub)
                 pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
+                store.rememberPendingJoinRequests(pendingJoinRequests, for: peerId)
                 showToast("Request declined")
             } catch {
                 showToast("Couldn't decline: \(MarmotChatModel.describe(error))")

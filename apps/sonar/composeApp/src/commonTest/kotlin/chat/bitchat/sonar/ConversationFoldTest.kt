@@ -2516,6 +2516,34 @@ class ConversationFoldTest {
             emptyList(),
             pendingJoinRequestsOrCached(loaded = emptyList(), cached = cachedRequests),
         )
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            cachedRequests,
+            pendingJoinRequestsAcrossRemount(
+                previousChatId = "group-08",
+                nextChatId = "group-09",
+                requests = cachedRequests,
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            cachedRequests,
+            pendingJoinRequestsAcrossRemount(
+                previousChatId = "group-09",
+                nextChatId = "group-08",
+                requests = cachedRequests,
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            emptyList(),
+            pendingJoinRequestsAcrossRemount(
+                previousChatId = "group-08",
+                nextChatId = "other-room",
+                requests = cachedRequests,
+                historicalFolds = folds,
+            ),
+        )
     }
 
     @Test

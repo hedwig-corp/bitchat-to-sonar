@@ -1407,6 +1407,24 @@ internal fun pendingJoinRequestsOrCached(
     cached: List<SonarJoinRequest>,
 ): List<SonarJoinRequest> = loaded ?: cached
 
+/**
+ * Persist-folds remounts group-info `hist → live`. Resetting the painted
+ * list on that id change drops recovered requests; a closed-node live
+ * probe then has nothing to keep ([pendingJoinRequestsOrCached]).
+ */
+internal fun pendingJoinRequestsAcrossRemount(
+    previousChatId: String,
+    nextChatId: String,
+    requests: List<SonarJoinRequest>,
+    historicalFolds: Map<String, String>,
+): List<SonarJoinRequest> {
+    if (previousChatId.isBlank() || nextChatId.isBlank()) return requests
+    if (conversationsMatchFoldFamily(previousChatId, nextChatId, historicalFolds)) {
+        return requests
+    }
+    return emptyList()
+}
+
 internal fun collapsedFoldedSnapshotChats(
     chats: List<SonarChat>,
     historicalFolds: Map<String, String>,
@@ -4243,6 +4261,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun canManageGroup(chatId: String): Boolean =
         !isPendingMarmotGroup(chatId) &&
             listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
+
+    fun pendingJoinRequestsAfterNavIdChange(
+        previousChatId: String,
+        nextChatId: String,
+        requests: List<SonarJoinRequest>,
+    ): List<SonarJoinRequest> = pendingJoinRequestsAcrossRemount(
+        previousChatId = previousChatId,
+        nextChatId = nextChatId,
+        requests = requests,
+        historicalFolds = historicalFoldMap,
+    )
 
     fun hasDirectPaymentRoute(chatId: String): Boolean {
         if (directPaymentOffer(chatId) != null) return true

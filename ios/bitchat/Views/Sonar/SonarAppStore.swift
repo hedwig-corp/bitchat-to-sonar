@@ -415,6 +415,27 @@ func snConversationsMatchFoldFamily(
     return snFoldFamilyIds(id: leftBare, historicalFolds: historicalFolds).contains(rightBare)
 }
 
+/// Persist-folds remounts group-info `hist → live`. A view identity
+/// change must not drop recovered requests before the live probe.
+func snPendingJoinRequestsAcrossRemount<Request>(
+    previousChatId: String,
+    nextChatId: String,
+    requests: [Request],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> [Request] {
+    if previousChatId.isEmpty || nextChatId.isEmpty { return requests }
+    if snConversationsMatchFoldFamily(
+        left: previousChatId,
+        right: nextChatId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    ) {
+        return requests
+    }
+    return []
+}
+
 /// Open group-info must reload pending joins when `conversationChanged`
 /// names this room or its hidden 0.8 sibling. Compose
 /// `groupInfoShouldReloadPending`.
@@ -3262,6 +3283,10 @@ final class SonarAppStore: ObservableObject {
     @Published var toast: String? = nil
     /// Recovered 0.8 chats whose resume send failed because the peer has no 0.9 KeyPackage.
     @Published private(set) var recoveredChatNeedsUpdate: Set<String> = []
+    /// Last painted group-info join-request list. Persist-folds remounts
+    /// `groupInfo(hist) → groupInfo(live)` and SwiftUI may recreate the
+    /// screen; a closed-node live probe must not start from `[]`.
+    private var pendingJoinRequestsCache: (chatId: String, requests: [JoinRequestInfo])?
     /// External payments this process is currently sending, keyed by activity
     /// id. The persisted ledger owns the outcome; this holds only what it
     /// deliberately does not keep — the resolving/paying/slow split and the
@@ -5123,6 +5148,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
         recoveredChatNeedsUpdate = []
+        pendingJoinRequestsCache = nil
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil
@@ -7123,6 +7149,32 @@ final class SonarAppStore: ObservableObject {
         guard snMarmotSendNeedsPeerUpdate(error) else { return }
         recoveredChatNeedsUpdate.insert(chatId)
         showToast(snMarmotSendUserMessage(error))
+    }
+
+    func rememberPendingJoinRequests(_ requests: [JoinRequestInfo], for chatId: String) {
+        pendingJoinRequestsCache = (chatId, requests)
+    }
+
+    /// Seed group-info after persist-folds remounts `hist → live`. Same-family
+    /// cache wins (including a remembered empty success); other rooms keep
+    /// the in-view list.
+    func pendingJoinRequestsCached(
+        for chatId: String,
+        painted: [JoinRequestInfo] = []
+    ) -> [JoinRequestInfo] {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        guard let cache = pendingJoinRequestsCache else { return painted }
+        if cache.chatId.isEmpty || chatId.isEmpty {
+            return cache.requests
+        }
+        if snConversationsMatchFoldFamily(
+            left: cache.chatId,
+            right: chatId,
+            historicalFolds: folds
+        ) {
+            return cache.requests
+        }
+        return painted
     }
 
     func marmotGroupId(_ id: String) -> String? {
@@ -13764,6 +13816,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
         recoveredChatNeedsUpdate = []
+        pendingJoinRequestsCache = nil
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil
@@ -13905,6 +13958,7 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
         recoveredChatNeedsUpdate = []
+        pendingJoinRequestsCache = nil
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil

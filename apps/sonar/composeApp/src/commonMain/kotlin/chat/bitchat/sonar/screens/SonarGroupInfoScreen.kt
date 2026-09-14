@@ -72,7 +72,18 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     var addDraft by remember { mutableStateOf("") }
     var showLeaveSheet by remember { mutableStateOf(false) }
     var inviteLink by remember { mutableStateOf<String?>(null) }
-    var pendingJoinRequests by remember(chatId) { mutableStateOf<List<SonarJoinRequest>>(emptyList()) }
+    // Do not `remember(chatId)`: persist-folds remounts hist→live in place
+    // and that key reset dropped recovered requests before the live probe.
+    var pendingJoinRequests by remember { mutableStateOf<List<SonarJoinRequest>>(emptyList()) }
+    var joinRequestsBoundId by remember { mutableStateOf(chatId) }
+    if (joinRequestsBoundId != chatId) {
+        pendingJoinRequests = state.pendingJoinRequestsAfterNavIdChange(
+            joinRequestsBoundId,
+            chatId,
+            pendingJoinRequests,
+        )
+        joinRequestsBoundId = chatId
+    }
     var approvingJoinRequests by remember(chatId) { mutableStateOf<Set<String>>(emptySet()) }
     val clipboard = LocalClipboardManager.current
     fun refreshPendingJoinRequests() {
