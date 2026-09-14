@@ -3511,6 +3511,11 @@ impl SonarClient {
                 );
             }
         }
+        // Auto-accept is Incoming::GroupUpdated (below). Parked 2-member
+        // welcomes land here when the user taps Accept. Either path must
+        // fold a recovered 0.8 DM onto this live id so history is not a
+        // second row and a later send on the 0.8 id cannot mint a third.
+        self.maybe_fold_new_group(&group_id);
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
@@ -6890,6 +6895,15 @@ impl SonarClient {
                     | Incoming::GroupInvitePending(group_id) = &incoming
                     {
                         if !self.engine.is_dropped(group_id) {
+                            if matches!(incoming, Incoming::GroupUpdated(_)) {
+                                // 1:1 welcomes auto-join here. Fold a recovered
+                                // 0.8 DM with the same peer onto this live id
+                                // before hosts paint chats() — otherwise both
+                                // rows stay listed and a send on the 0.8 id
+                                // mints a second 0.9 group. Rooms skip inside
+                                // maybe_fold_new_group (R-045).
+                                self.maybe_fold_new_group(group_id);
+                            }
                             changed_groups.insert(hex::encode(group_id.as_slice()));
                         }
                     }
@@ -11384,6 +11398,114 @@ mod tests {
             changed,
             vec![expected],
             "welcome must notify the conversation listener exactly once for the new group"
+        );
+    }
+
+    /// Peer-initiated 0.9 DM: the welcome auto-joins as GroupUpdated and
+    /// must record a hist→live fold. Without that, FFI still lists the
+    /// recovered 0.8 row, hosts only merge 1:1 duplicates while both are
+    /// listed, and a send on the 0.8 id mints a *second* 0.9 group.
+    #[tokio::test]
+    async fn incoming_09_dm_welcome_folds_recovered_08_direct_chat() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        assert!(
+            bob.engine.historical_resume_is_direct(&historical),
+            "empty name+desc recovered row must classify as a DM"
+        );
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "old 1", "alice", 80, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "old 2", "alice", 90, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            assert_eq!(idx.summary(&hist_hex).unwrap().unwrap().unread_count, 3);
+        }
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+
+        let (report, _) = bob
+            .process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        assert_eq!(report.processed, 1);
+
+        let live_groups = bob.engine.groups().expect("bob live groups");
+        assert_eq!(live_groups.len(), 1);
+        let live = live_groups[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "auto-accepted 0.9 DM must fold the recovered 0.8 sibling"
+        );
+        assert!(
+            bob.is_folded_historical_group(&historical),
+            "FFI groups() hides folded historical via this flag"
+        );
+        let from_live = bob.messages(&live).expect("union transcript");
+        assert!(
+            from_live.iter().any(|m| m.content == "keep this chat"),
+            "messages(live) must include recovered 0.8 history after the incoming fold"
+        );
+
+        let summaries = bob.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "conversation_summaries must hide the folded 0.8 sibling: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+        assert_eq!(
+            summaries[0].unread_count, 3,
+            "recovered unread must land on the live row; hosts hide hist"
+        );
+        assert_eq!(
+            bob.conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            0,
+            "second copy_summary must not double-count"
         );
     }
 

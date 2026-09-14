@@ -161,6 +161,10 @@ Guarded by:
   badge; `conversation_summaries()` hides the historical sibling, so
   unread must be **added** onto live and then zeroed on hist or the
   host divider undercounts recovered missed messages)
+- `client::tests::incoming_09_dm_welcome_folds_recovered_08_direct_chat`
+  (auto-accepted GroupUpdated and parked-then-accept must call
+  `maybe_fold_new_group`; otherwise a peer-started 0.9 DM leaves the
+  0.8 row listed and a send on that id mints a second 0.9 group)
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
 - `account_backup::decode_v1_package_has_empty_sidecars`
@@ -636,6 +640,16 @@ only one known peer no longer resumes as `start_dm`. Extract copies
 `historical_resume_is_direct` matches live `group_is_direct`. Early
 `metadata_backfill=complete` markers re-run as `v2` so already-quarantined
 baks pick up the new sidecars.
+
+Incoming 0.9 DM welcome hole closed after this commit: 1:1 welcomes
+auto-join as `Incoming::GroupUpdated` and parked 2-member Accept uses
+`accept_group_invite`. Neither path called `maybe_fold_new_group` (only
+local `publish_group_creation` did), so a peer who already updated
+could start a new 0.9 DM and leave the recovered 0.8 row listed. Hosts
+dedupe 1:1s by npub while both ids are listed, but a send on the 0.8 id
+then minted a *second* 0.9 group. Rooms still skip inside
+`maybe_fold_new_group` (R-045). Pins:
+`client::tests::incoming_09_dm_welcome_folds_recovered_08_direct_chat`.
 
 Incoming-DM unread hole closed after this commit: `copy_summary` used to
 keep live unread when the live 0.9 row already had a badge
