@@ -34,9 +34,9 @@ use crate::conversation_index::{
 use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
-    ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, HistoricalGroup,
-    Incoming, MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SONAR_DIRECT_DM_DESCRIPTION,
-    SYNC_STATE_FILE_SUFFIX,
+    gift_wrap_with_current_timestamp_async, ChatMessage, DeliveryState, GroupCreation, GroupInvite,
+    GroupMembershipUpdate, HistoricalGroup, Incoming, MarmotEngine, RecentMessagePage,
+    KEY_PACKAGE_KIND, SONAR_DIRECT_DM_DESCRIPTION, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
@@ -1889,6 +1889,9 @@ pub struct SonarClient {
     sticker_ref_prefetch_inflight: StickerRefPrefetchInflight,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// How many times a new live join/create asked to share our push token.
+    /// Tests pin first-resume mint / Accept without waiting on relays.
+    push_token_share_after_join: Arc<AtomicU64>,
     /// Incoming-message notifications produced by the forced-sync gap-recovery
     /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
     /// `drain_pending_marmot()`; the recovered messages are stored by the sync
@@ -2435,6 +2438,7 @@ impl SonarClient {
             )),
             sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
+            push_token_share_after_join: Arc::new(AtomicU64::new(0)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
@@ -3153,6 +3157,10 @@ impl SonarClient {
             .unwrap_or_default();
         self.ensure_index_for_group(&group_id, &name);
         self.maybe_fold_new_group(&group_id);
+        // First-resume mint and start_dm create a live group peers will
+        // send into. Share our token now so a killed-app gap before the
+        // next sync does not leave them without a Transponder wake.
+        self.schedule_share_push_token_with_groups();
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
@@ -3540,6 +3548,7 @@ impl SonarClient {
         // sync never re-lists this room — enqueue the same empty-live
         // retry auto-joined DMs use. Folded hist does not count.
         self.enqueue_empty_live_transcript_backfill(&group_id);
+        self.schedule_share_push_token_with_groups();
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
@@ -5870,6 +5879,7 @@ impl SonarClient {
                     process_report.record_retryable(Timestamp::now().as_secs());
                 }
             }
+            self.schedule_share_push_token_with_groups();
         }
         // Existing installs can have group/MLS rows locally while the chat
         // transcript page is empty. Full-backfill those groups once. The scan
@@ -7248,6 +7258,7 @@ impl SonarClient {
                 }
             }
             let _ = self.resubscribe_marmot_groups_if_live().await;
+            self.schedule_share_push_token_with_groups();
         }
         if let Some(secs) = process_report.oldest_retryable_secs {
             self.rewind_sync_watermark_for_retry(secs)?;
@@ -8720,6 +8731,66 @@ impl SonarClient {
         self.share_push_token_with_groups().await;
 
         Ok(())
+    }
+
+    /// After a new live group is minted or joined, share our token without
+    /// waiting for the next sync. First-resume send and Accept are the
+    /// common killed-app gap: peers on the new 0.9 group otherwise cannot
+    /// Transponder-wake this install. No-ops without a cached registration.
+    /// Relays and gift-wraps run off the send/accept path.
+    fn schedule_share_push_token_with_groups(&self) {
+        let Some(reg) = self.own_push_registration.lock().unwrap().clone() else {
+            return;
+        };
+        self.push_token_share_after_join
+            .fetch_add(1, Ordering::Relaxed);
+        let my_pubkey = self.engine.identity().public_key();
+        let identity_keys = self.engine.identity().keys().clone();
+        let nostr = self.nostr.clone();
+        let mut recipients = HashSet::new();
+        for group_id in self.membership_group_ids() {
+            let Ok(members) = self.engine.members(&group_id) else {
+                continue;
+            };
+            for member in members {
+                if member != my_pubkey {
+                    recipients.insert(member);
+                }
+            }
+        }
+        if recipients.is_empty() {
+            return;
+        }
+        let payload = crate::push::PushTokenSharePayload {
+            encrypted_token: reg.encrypted_token_b64.clone(),
+            server_pubkey: reg.server_pubkey.to_hex(),
+        };
+        let Ok(payload_json) = serde_json::to_string(&payload) else {
+            return;
+        };
+        tokio::spawn(async move {
+            for recipient in recipients {
+                let rumor = EventBuilder::new(
+                    Kind::Custom(crate::push::KIND_PUSH_TOKEN_SHARE),
+                    payload_json.clone(),
+                )
+                .tags([Tag::public_key(recipient)])
+                .build(my_pubkey);
+                let Ok(wrapped) =
+                    gift_wrap_with_current_timestamp_async(&identity_keys, &recipient, rumor).await
+                else {
+                    continue;
+                };
+                if let Err(err) = nostr.send_event(&wrapped).await {
+                    tracing::debug!(%err, "push token share after join failed");
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn push_token_share_after_join_count(&self) -> u64 {
+        self.push_token_share_after_join.load(Ordering::Relaxed)
     }
 
     /// Send our encrypted push token to every member of every joined group
@@ -11545,6 +11616,63 @@ mod tests {
         assert!(
             queued.iter().any(|id| id == &h),
             "accept must re-queue the empty live room after the one-shot scan: {queued:?}"
+        );
+        assert_eq!(
+            bob.push_token_share_after_join_count(),
+            0,
+            "Accept must not schedule a token share before this device registered"
+        );
+    }
+
+    /// First-resume mint and Accept create a live group peers will send
+    /// into. If we wait for the next sync to share our kind-447 token,
+    /// a killed-app gap leaves them unable to Transponder-wake us.
+    #[tokio::test]
+    async fn accept_09_room_schedules_push_token_share_when_registered() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        *bob.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
+            encrypted_token_b64: "dGVzdA==".to_owned(),
+            server_pubkey: Keys::generate().public_key(),
+        });
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice creates room");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 room")
+            .await;
+        assert_eq!(bob.push_token_share_after_join_count(), 0);
+
+        let invite = bob
+            .pending_group_invites()
+            .expect("parked 3-member welcome")
+            .remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts the room");
+        assert_eq!(
+            bob.push_token_share_after_join_count(),
+            1,
+            "Accept must schedule a token share so peers can wake this install"
         );
     }
 

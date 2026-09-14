@@ -7240,6 +7240,14 @@ final class SonarAppStore: ObservableObject {
         return preferredDirectMarmotGroup(in: marmotGroups(forNpub: peer))?.id ?? groupId
     }
 
+    /// Sticker / media / payment / call must use the same live duplicate as text.
+    private func marmotOutboundGroupId(_ id: String) -> String? {
+        if let groupId = marmotSendTargetGroupId(id) { return groupId }
+        guard let profile = resolvedSonarProfile(id) else { return nil }
+        return preferredDirectMarmotGroup(in: marmotGroups(forNpub: profile.npub))?.id
+            ?? marmotGroup(forNpub: profile.npub)?.id
+    }
+
     func recoveredChatWaitingForPeerUpdate(_ id: String) -> Bool {
         let groupId = marmotGroupId(id)
         let groups: [MarmotService.MarmotGroup]
@@ -7683,9 +7691,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func callMarmotGroupId(_ id: String) -> String? {
-        if let groupId = marmotGroupId(id) { return groupId }
-        guard let profile = resolvedSonarProfile(id) else { return nil }
-        return marmotGroup(forNpub: profile.npub)?.id
+        marmotOutboundGroupId(id)
     }
 
     private func callProfile(_ id: String) -> SonarPeerProfile? {
@@ -9033,7 +9039,7 @@ final class SonarAppStore: ObservableObject {
             for line in lines { chatViewModel.sendPrivateMessage(line, to: peer) }
             return true
         }
-        if let groupId = marmotGroupId(id) {
+        if let groupId = marmotOutboundGroupId(id) {
             return await marmot.send(lines, to: groupId)
         }
         if let profile = resolvedSonarProfile(id) {
@@ -9058,7 +9064,7 @@ final class SonarAppStore: ObservableObject {
             chatViewModel.sendPrivateMessage(content, to: PeerID(str: route))
             return
         }
-        if let groupId = marmotGroupId(id) {
+        if let groupId = marmotOutboundGroupId(id) {
             marmot.sendSticker(
                 groupId: groupId,
                 packCoordinate: packCoordinate,
@@ -10833,7 +10839,7 @@ final class SonarAppStore: ObservableObject {
             return
         }
         let groupId: String?
-        if let gid = marmotGroupId(id) {
+        if let gid = marmotOutboundGroupId(id) {
             groupId = gid
         } else if let profile = resolvedSonarProfile(id) {
             groupId = marmotGroup(forNpub: profile.npub)?.id
@@ -10916,7 +10922,7 @@ final class SonarAppStore: ObservableObject {
             return
         }
         let groupId: String?
-        if let gid = marmotGroupId(id) {
+        if let gid = marmotOutboundGroupId(id) {
             groupId = gid
         } else if let profile = resolvedSonarProfile(id) {
             groupId = marmotGroup(forNpub: profile.npub)?.id
@@ -10999,7 +11005,7 @@ final class SonarAppStore: ObservableObject {
         }
 
         let groupId: String?
-        if let gid = marmotGroupId(id) {
+        if let gid = marmotOutboundGroupId(id) {
             groupId = gid
         } else if let profile = resolvedSonarProfile(id) {
             groupId = marmotGroup(forNpub: profile.npub)?.id
@@ -11061,7 +11067,7 @@ final class SonarAppStore: ObservableObject {
         }
         guard let data = try? Data(contentsOf: url) else { return }
         let groupId: String?
-        if let gid = marmotGroupId(id) {
+        if let gid = marmotOutboundGroupId(id) {
             groupId = gid
         } else if let profile = resolvedSonarProfile(id) {
             groupId = marmotGroup(forNpub: profile.npub)?.id
@@ -11121,9 +11127,10 @@ final class SonarAppStore: ObservableObject {
         let filename = packet.fileName ?? "file"
         let mime = packet.mimeType ?? "application/octet-stream"
         let key = canonicalPeerKey(peerID)
-        var groupId = marmotGroupId(key)
+        var groupId = marmotOutboundGroupId(key)
         if groupId == nil, let profile = resolvedSonarProfile(key) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
+            groupId = preferredDirectMarmotGroup(in: marmotGroups(forNpub: profile.npub))?.id
+                ?? marmotGroup(forNpub: profile.npub)?.id
         }
         if groupId == nil {
             for alias in meshPeerAliases(for: key) {

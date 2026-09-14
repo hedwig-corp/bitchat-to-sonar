@@ -736,7 +736,7 @@ impl TransportPeeler for SonarWelcomePeeler {
     }
 }
 
-async fn gift_wrap_with_current_timestamp_async(
+pub(crate) async fn gift_wrap_with_current_timestamp_async(
     keys: &Keys,
     receiver: &PublicKey,
     rumor: UnsignedEvent,

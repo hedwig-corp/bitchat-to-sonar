@@ -467,6 +467,46 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun sharedGroupsSkipFoldedHistoricalRoom() {
+        val ownRaw = ByteArray(32) { 1 }
+        val peerRaw = ByteArray(32) { 2 }
+        val thirdRaw = ByteArray(32) { 3 }
+        val ownNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ownRaw)!!
+        val peerNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", peerRaw)!!
+        val thirdNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", thirdRaw)!!
+        val historical = SonarChat(
+            id = "group-08",
+            name = "standup",
+            members = listOf(ownNpub, peerNpub, thirdNpub),
+            isDirect = false,
+        )
+        val live = SonarChat(
+            id = "group-09",
+            name = "standup",
+            members = listOf(ownNpub, peerNpub, thirdNpub),
+            isDirect = false,
+        )
+        assertEquals(
+            listOf(historical, live),
+            sharedGroupsWithContact(
+                chats = listOf(historical, live),
+                ownNpub = ownNpub,
+                peerNpub = peerNpub,
+                isMultiMember = { !it.isDirect },
+            ),
+        )
+        assertEquals(
+            listOf(live),
+            sharedGroupsWithContact(
+                chats = listOf(live),
+                ownNpub = ownNpub,
+                peerNpub = peerNpub,
+                isMultiMember = { !it.isDirect },
+            ),
+        )
+    }
+
+    @Test
     fun foldedOpenUnreadAndTranscriptWindowRemountOntoLiveSibling() {
         assertEquals(
             mapOf("group-08" to 3L, "group-09" to 3L),

@@ -46,6 +46,7 @@ import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.canonicalProfileKey
 import chat.bitchat.sonar.directMarmotChatIdForPeer
+import chat.bitchat.sonar.sharedGroupsWithContact
 import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -135,16 +136,14 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
 
     // Find shared groups: multi-member groups where both the local user and this
     // contact are members.
-    val sharedGroups = remember(state.chats.size, peerNpub) {
-        if (peerNpub == null) emptyList()
-        else {
-            val mine = canonicalProfileKey(state.npub)
-            state.chats.filter { chat ->
-                state.isMultiMemberChat(chat.id) &&
-                    chat.members.any { canonicalProfileKey(it) == mine } &&
-                    chat.members.any { canonicalProfileKey(it) == peerNpub }
-            }
-        }
+    val sharedGroups = remember(state.visibleChats, peerNpub) {
+        val npub = peerNpub ?: return@remember emptyList()
+        sharedGroupsWithContact(
+            chats = state.visibleChats,
+            ownNpub = state.npub,
+            peerNpub = npub,
+            isMultiMember = { chat -> state.isMultiMemberChat(chat.id) },
+        )
     }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {

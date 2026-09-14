@@ -558,6 +558,24 @@ internal fun marmotSendTargetGroupId(
 ): String =
     duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
 
+/** Shared groups on a contact profile. Callers must pass the collapsed
+ *  home list — raw [SonarChat] rows still include folded 0.8 hist. */
+internal fun sharedGroupsWithContact(
+    chats: List<SonarChat>,
+    ownNpub: String,
+    peerNpub: String,
+    isMultiMember: (SonarChat) -> Boolean,
+): List<SonarChat> {
+    val mine = canonicalProfileKey(ownNpub)
+    val peer = canonicalProfileKey(peerNpub)
+    if (mine.isBlank() || peer.isBlank()) return emptyList()
+    return chats.filter { chat ->
+        isMultiMember(chat) &&
+            chat.members.any { canonicalProfileKey(it) == mine } &&
+            chat.members.any { canonicalProfileKey(it) == peer }
+    }
+}
+
 /** After FFI `groups()` hides a folded 0.8 room, remount the open transcript
  *  onto the live 0.9 sibling. Peer / call / send-duplicate lookups use
  *  [listedChat] so a still-open hidden id still finds the live sibling. */
@@ -5666,7 +5684,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshPeerId = peerId,
             )
         }
-        return sendPaymentReceiptLinesOverMarmot(chatId, clean, refreshPeerId = null)
+        return sendPaymentReceiptLinesOverMarmot(
+            resolveMarmotSendTargetGroupId(chatId) ?: chatId,
+            clean,
+            refreshPeerId = null,
+        )
     }
 
     private suspend fun sendPaymentReceiptLinesOverMarmot(
@@ -9669,7 +9691,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val uploads = matchingIndices.map { pending[it] }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
+            val groupId = resolveMarmotSendTargetGroupId(chatId)
             if (groupId == null) {
                 markPendingMediaFailed(chatId, pendingId)
                 toast = "This media is no longer available to retry."
@@ -9793,7 +9815,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
 
-        val groupId = resolveMarmotGroupId(chatId)
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
         if (groupId != null) {
             scope.launch {
                 try {
@@ -10436,6 +10458,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
     }
 
+    /** Newest live duplicate for outbound Marmot traffic. Hist remaps via
+     *  [resolveMarmotGroupId]; two live 0.9 siblings pick the same target
+     *  text send already uses. */
+    private fun resolveMarmotSendTargetGroupId(chatId: String): String? {
+        val open = resolveMarmotGroupId(chatId) ?: return null
+        return marmotSendTargetGroupId(open, directMarmotChatIds(chatId), ::localLatestTs)
+    }
+
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
     private fun resolveMarmotGroupId(chatId: String): String? {
@@ -10478,7 +10508,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             return AttachmentRoutePreparation.Ready(chatId)
         }
-        resolveMarmotGroupId(chatId)?.let { return AttachmentRoutePreparation.Ready(it) }
+        resolveMarmotSendTargetGroupId(chatId)?.let { return AttachmentRoutePreparation.Ready(it) }
 
         val pendingNpub = pendingMarmotNpub(chatId)
             ?: return AttachmentRoutePreparation.Unavailable
@@ -10590,7 +10620,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
+            val groupId = resolveMarmotSendTargetGroupId(chatId)
             if (groupId == null) {
                 if (isMeshChat(chatId)) {
                     queueMeshMediaForRetry(chatId, data, filename, mime)
@@ -10739,7 +10769,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
+            val groupId = resolveMarmotSendTargetGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
             val pendingId = "pending-media-${randomMeshId()}"
             val startedAtSecs = SonarClock.nowSecs()
@@ -10877,7 +10907,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (resolveMarmotGroupId(chatId) == null) return
         }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
+            val groupId = resolveMarmotSendTargetGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first to send a voice note."; return@launch }
             val pendingId = "pending-media-${randomMeshId()}"
             val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
@@ -10998,7 +11028,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             sendPendingMarmotGroup(chatId, encoded)
             return
         }
-        val groupId = resolveMarmotGroupId(chatId)
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
         if (groupId == null) {
             toast = "Stickers require an encrypted chat"
             return
@@ -11649,7 +11679,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return ok
             }
         }
-        val groupId = resolveMarmotGroupId(chatId)
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
         if (groupId != null) {
             return sendCallOverMarmot(groupId, text)
         }
