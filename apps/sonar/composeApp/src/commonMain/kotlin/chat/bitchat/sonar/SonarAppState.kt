@@ -573,6 +573,23 @@ internal fun remountFoldedOpenChatId(
  *  the live sibling yet, reuse the other listed fold sibling so title /
  *  members / directness stay correct. The returned [SonarChat.id] is always
  *  [chatId] so send/admin keep the open id. */
+/** Open / catch-up / media-send target. A stale hist id remaps onto the
+ *  listed live sibling so `preferCatchupGroup` hits `engine.groups()`. */
+internal fun resolvedOpenGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: Map<String, String>,
+): String {
+    if (groupId in listedGroupIds) return groupId
+    historicalFolds[groupId]
+        ?.takeIf { it.isNotBlank() && it != groupId && it in listedGroupIds }
+        ?.let { return it }
+    historicalFolds.entries
+        .firstOrNull { it.value == groupId && it.key.isNotBlank() && it.key != groupId && it.key in listedGroupIds }
+        ?.let { return it.key }
+    return groupId
+}
+
 internal fun listedOrFoldedSiblingChat(
     chatId: String,
     listedChats: List<SonarChat>,
@@ -9199,7 +9216,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
     private fun resolveMarmotGroupId(chatId: String): String? {
         if (chatId.startsWith(PENDING_MARMOT_CHAT_PREFIX) || chatId.startsWith(PENDING_MARMOT_GROUP_PREFIX)) return null
-        if (!isMeshChat(chatId)) return chatId
+        if (!isMeshChat(chatId)) {
+            return resolvedOpenGroupId(
+                chatId,
+                chats.mapTo(hashSetOf()) { it.id },
+                historicalFoldMap,
+            )
+        }
         val raw = npubRawFor(meshPeerId(chatId)) ?: return null
         return marmotGroupForNpub(raw)?.id
     }

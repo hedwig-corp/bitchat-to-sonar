@@ -909,6 +909,15 @@ echo cannot stay "Sending" on the live row. Pins:
 `ConversationFoldTest.pendingMessagesMutateWalksFoldFamily`,
 `SonarConversationFoldTests` `snPendingMessageKeys`.
 
+Open-target hole closed after this commit: iOS `marmotGroupId` and
+Compose `resolveMarmotGroupId` returned a persisted / prefix-stripped
+hist id even after FFI listed only the live sibling. `preferCatchupGroup`
+looks up `engine.groups()` (live MLS only), so a stale mesh mapping
+cleared catch-up instead of kicking the 0.9 group. `resolvedOpenGroupId`
+/ `snResolvedOpenGroupId` remap onto the listed sibling. Pins:
+`ConversationFoldTest.resolvedOpenGroupIdRemapsStaleHistOntoListedLive`,
+`SonarConversationFoldTests` `snResolvedOpenGroupId`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

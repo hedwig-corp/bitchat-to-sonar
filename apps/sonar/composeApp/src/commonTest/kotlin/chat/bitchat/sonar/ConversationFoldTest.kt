@@ -860,6 +860,27 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            "group-09",
+            resolvedOpenGroupId("group-08", setOf("group-09"), folds),
+        )
+        assertEquals(
+            "group-09",
+            resolvedOpenGroupId("group-09", setOf("group-09"), folds),
+        )
+        assertEquals(
+            "group-08",
+            resolvedOpenGroupId("group-08", emptySet(), folds),
+        )
+        assertEquals(
+            "group-08",
+            resolvedOpenGroupId("group-09", setOf("group-08"), folds),
+        )
+    }
+
+    @Test
     fun foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling() {
         assertEquals(
             mapOf("group-09" to listOf("uploading")),

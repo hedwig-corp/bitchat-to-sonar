@@ -346,6 +346,20 @@ func snListedOrFoldedSiblingGroupId(
     return nil
 }
 
+/// Open / catch-up / media-send target. A stale hist mapping remaps onto
+/// the listed live sibling so `preferCatchupGroup` hits `engine.groups()`.
+func snResolvedOpenGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String]
+) -> String {
+    snListedOrFoldedSiblingGroupId(
+        groupId: groupId,
+        listedGroupIds: listedGroupIds,
+        historicalFolds: historicalFolds
+    ) ?? groupId
+}
+
 /// Bare MLS id whether the tap carried `marmot:` or not.
 func snBareMarmotGroupId(_ id: String, prefix: String = "marmot:") -> String {
     id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : id
@@ -6292,26 +6306,38 @@ final class SonarAppStore: ObservableObject {
         if isPendingMarmotGroup(id) { return nil }
         if let pendingNpub = pendingMarmotNpub(for: id),
            let group = marmotGroup(forNpub: pendingNpub) {
-            return group.id
+            return resolvedOpenGroupId(group.id)
         }
         if id.hasPrefix(Self.marmotIDPrefix) {
-            return String(id.dropFirst(Self.marmotIDPrefix.count))
+            return resolvedOpenGroupId(String(id.dropFirst(Self.marmotIDPrefix.count)))
         }
         if let mapped = marmotGroupIdsByConversationId[id] {
-            return mapped
+            return resolvedOpenGroupId(mapped)
         }
         if let fp = chatViewModel.getFingerprint(for: PeerID(str: id)),
            let mapped = marmotGroupIdsByConversationId[fp] {
-            rememberMarmotGroup(mapped, forConversationId: id)
-            return mapped
+            let resolved = resolvedOpenGroupId(mapped)
+            rememberMarmotGroup(resolved, forConversationId: id)
+            return resolved
         }
         guard let profile = resolvedSonarProfile(id),
               let group = marmotGroup(forNpub: profile.npub)
         else { return nil }
-        rememberMarmotGroup(group.id, forConversationId: id)
+        let resolved = resolvedOpenGroupId(group.id)
+        rememberMarmotGroup(resolved, forConversationId: id)
         let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
-        rememberMarmotGroup(group.id, forConversationId: fp)
-        return group.id
+        rememberMarmotGroup(resolved, forConversationId: fp)
+        return resolved
+    }
+
+    /// Persist-fold remap so catch-up / load / send hit the listed live id.
+    private func resolvedOpenGroupId(_ groupId: String) -> String {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snResolvedOpenGroupId(
+            groupId: groupId,
+            listedGroupIds: Set(marmot.groups.map(\.id)),
+            historicalFolds: folds
+        )
     }
 
     private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
