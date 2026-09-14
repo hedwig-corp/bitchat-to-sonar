@@ -538,6 +538,56 @@ internal fun promotedFoldedMutes(
     return next
 }
 
+/** Copy a host map from a hidden 0.8 row onto the live sibling. */
+internal fun <V> promotedFoldedValues(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    values: Map<String, V>,
+    liveFoldTarget: (String) -> String?,
+    preferExisting: (V) -> Boolean = { true },
+): Map<String, V> {
+    var next = values
+    for (historical in previousIds + values.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = values[historical] ?: continue
+        val existing = next[live]
+        if (existing != null && preferExisting(existing)) continue
+        next = next + (live to incoming)
+    }
+    return next
+}
+
+/** When FFI hides a folded 0.8 row, keep its in-progress draft on the live sibling. */
+internal fun promotedFoldedComposerDrafts(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    drafts: Map<String, String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> =
+    promotedFoldedValues(
+        previousIds = previousIds,
+        currentIds = currentIds,
+        values = drafts.filterValues { it.isNotEmpty() },
+        liveFoldTarget = liveFoldTarget,
+        preferExisting = { it.isNotEmpty() },
+    )
+
+/** When FFI hides a folded 0.8 row, keep its reply target on the live sibling. */
+internal fun <V> promotedFoldedComposerReplies(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    replies: Map<String, V>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, V> =
+    promotedFoldedValues(
+        previousIds = previousIds,
+        currentIds = currentIds,
+        values = replies,
+        liveFoldTarget = liveFoldTarget,
+    )
+
 internal enum class RecoveredChatResumeUi { Live, WaitingForPeerUpdate }
 
 internal fun recoveredChatResumeUi(
@@ -12065,7 +12115,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             latestSecs = { hydration.latestByChat[it] ?: 0L },
             previousOrder = previousOrder,
         )
-        promoteFoldedMutes(previousOrder.toSet(), chats.mapTo(hashSetOf()) { it.id })
+        val listedIds = chats.mapTo(hashSetOf()) { it.id }
+        promoteFoldedMutes(previousOrder.toSet(), listedIds)
+        promoteFoldedComposerState(previousOrder.toSet(), listedIds)
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12093,6 +12145,34 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun promoteFoldedComposerState(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String ->
+            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
+        }
+        val nextDrafts = promotedFoldedComposerDrafts(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            drafts = composerDrafts.toMap(),
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextDrafts != composerDrafts.toMap()) {
+            for ((id, text) in nextDrafts) {
+                composerDrafts[id] = text
+            }
+        }
+        val nextReplies = promotedFoldedComposerReplies(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            replies = composerReplyByChat.toMap(),
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextReplies != composerReplyByChat.toMap()) {
+            for ((id, reply) in nextReplies) {
+                composerReplyByChat[id] = reply
+            }
+        }
+    }
+
     /** FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
      *  transcript, swap the nav id to the live 0.9 sibling so member/title
      *  lookups keep working. In-flight send closures keep the historical id
@@ -12114,8 +12194,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatJumpMessageId[open.id]?.let {
             openChatJumpMessageId = openChatJumpMessageId - open.id + (live to it)
         }
-        composerDrafts[open.id]?.let { composerDrafts[live] = it }
+        val historicalDraft = composerDrafts[open.id]
+        if (!historicalDraft.isNullOrEmpty() && composerDrafts[live].isNullOrEmpty()) {
+            composerDrafts[live] = historicalDraft
+        }
         composerDrafts.remove(open.id)
+        composerReplyByChat[open.id]?.let { reply ->
+            if (live !in composerReplyByChat) composerReplyByChat[live] = reply
+        }
+        composerReplyByChat.remove(open.id)
         if (open.id in recoveredChatNeedsUpdate) {
             recoveredChatNeedsUpdate = recoveredChatNeedsUpdate - open.id + live
         }

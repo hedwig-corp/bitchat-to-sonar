@@ -188,6 +188,8 @@ Guarded by:
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
 - `ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalMuteMovesOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalComposerDraftMovesOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalComposerReplyMovesOntoLiveSibling`
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
   (also pins `live_fold_target_hex` after the home-list hide)
 
@@ -336,8 +338,8 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
-| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. | same | none |
+| Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply onto the live sibling. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. Mute / draft / reply promotion and open-chat remount match Compose. | same | none |
 | Mesh | untouched | untouched | none |
 
 Resume-chat fold: recovered 0.8 rows appear in FFI `groups()` with
@@ -352,7 +354,11 @@ Compose and iOS remount the open chat id onto `live_fold_target` so
 member/title lookups do not miss the hidden row; in-flight send still
 resolves through the fold map. A mute on the recovered id is copied onto
 the live sibling when the historical row disappears, so resume does not
-start notifying a chat the user already silenced. A pending welcome with
+start notifying a chat the user already silenced. An in-progress composer
+draft or reply target on that hidden id is copied the same way — including
+when the user already left the recovered transcript — so the live composer
+is not empty after fold. Remount of an open chat does not overwrite a
+non-empty live draft. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
 (new DM with the same known peer) is the same hazard and must skip

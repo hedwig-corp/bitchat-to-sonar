@@ -543,6 +543,72 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalComposerDraftMovesOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            mapOf("group-08" to "hello from 0.8", "group-09" to "hello from 0.8"),
+            promotedFoldedComposerDrafts(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                drafts = mapOf("group-08" to "hello from 0.8"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to "old", "group-09" to "already typing"),
+            promotedFoldedComposerDrafts(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                drafts = mapOf("group-08" to "old", "group-09" to "already typing"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to "hello from 0.8"),
+            promotedFoldedComposerDrafts(
+                previousIds = setOf("group-08"),
+                currentIds = setOf("group-08"),
+                drafts = mapOf("group-08" to "hello from 0.8"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to "hello from 0.8", "group-09" to "hello from 0.8"),
+            promotedFoldedComposerDrafts(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                drafts = mapOf("group-08" to "hello from 0.8"),
+                liveFoldTarget = folds::get,
+            ),
+        )
+    }
+
+    @Test
+    fun foldedHistoricalComposerReplyMovesOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = SonarReplyRef(parentId = "evt-08", preview = "quote")
+        val live = SonarReplyRef(parentId = "evt-09", preview = "newer")
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to historical),
+            promotedFoldedComposerReplies(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                replies = mapOf("group-08" to historical),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to live),
+            promotedFoldedComposerReplies(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                replies = mapOf("group-08" to historical, "group-09" to live),
+                liveFoldTarget = folds::get,
+            ),
+        )
+    }
+
+    @Test
     fun recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect() {
         val ownRaw = ByteArray(32) { 1 }
         val peerRaw = ByteArray(32) { 2 }

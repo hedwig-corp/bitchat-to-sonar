@@ -90,6 +90,30 @@ struct SonarConversationFoldTests {
         )
         #expect(fromMuteOnly.first?.historical == "group-08")
         #expect(fromMuteOnly.first?.live == "group-09")
+        #expect(
+            snPromotedFoldedComposerDrafts(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                drafts: ["group-08": "hello from 0.8"],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            )["group-09"] == "hello from 0.8"
+        )
+        #expect(
+            snPromotedFoldedComposerDrafts(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                drafts: ["group-08": "old", "group-09": "already typing"],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            )["group-09"] == "already typing"
+        )
+        #expect(
+            snPromotedFoldedComposerDrafts(
+                previousGroupIds: [],
+                currentGroupIds: ["group-09"],
+                drafts: ["group-08": "hello from 0.8"],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            )["group-09"] == "hello from 0.8"
+        )
         #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))

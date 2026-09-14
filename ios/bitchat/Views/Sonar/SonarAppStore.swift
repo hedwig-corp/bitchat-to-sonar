@@ -300,6 +300,30 @@ func snPromotedFoldedMutePairs(
     }
 }
 
+/// When FFI hides a folded 0.8 row, keep its in-progress draft on the live sibling.
+func snPromotedFoldedComposerDrafts(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    drafts: [String: String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    var next = drafts.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let draft = next[pair.historical], !draft.isEmpty else { continue }
+        let existing = next[pair.live] ?? ""
+        if existing.isEmpty {
+            next[pair.live] = draft
+        }
+    }
+    return next
+}
+
 func snMarmotSendNeedsPeerUpdate(_ error: String) -> Bool {
     let lower = error.lowercased()
     return lower.contains("no key package")
@@ -2256,6 +2280,7 @@ final class SonarAppStore: ObservableObject {
                 self.resolvePendingSecureChats()
                 Task { @MainActor in
                     await self.promoteFoldedMutes(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
                     self.lastMarmotGroupIds = current
                     await self.remountFoldedOpenChatIfNeeded()
                 }
@@ -7077,6 +7102,65 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Copy a draft / reply target from a hidden 0.8 row onto the live sibling.
+    @MainActor
+    private func promoteFoldedComposerState(from previous: Set<String>, to current: Set<String>) async {
+        var extraGroupIds = Set<String>()
+        for key in Set(composerDrafts.keys).union(composerReplyByChat.keys) {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                extraGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                extraGroupIds.insert(key.lowercased())
+            }
+        }
+        var targets: [String: String] = [:]
+        for historical in previous.union(extraGroupIds).subtracting(current) {
+            if let live = await marmot.liveFoldTarget(groupId: historical) {
+                targets[historical] = live
+            }
+        }
+        var draftsByGroup: [String: String] = [:]
+        for (key, value) in composerDrafts {
+            guard !value.isEmpty else { continue }
+            let groupId: String
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                groupId = String(key.dropFirst(Self.marmotIDPrefix.count))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                groupId = key.lowercased()
+            } else {
+                continue
+            }
+            draftsByGroup[groupId] = value
+        }
+        let nextDrafts = snPromotedFoldedComposerDrafts(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            drafts: draftsByGroup,
+            liveFoldTarget: { targets[$0] }
+        )
+        for (groupId, draft) in nextDrafts {
+            guard current.contains(groupId) else { continue }
+            let liveId = Self.marmotIDPrefix + groupId
+            if composerDraft(for: liveId).isEmpty {
+                setComposerDraft(draft, for: liveId)
+            }
+        }
+        let pairs = snPromotedFoldedMutePairs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            muteKeys: extraGroupIds,
+            liveFoldTarget: { targets[$0] }
+        )
+        for pair in pairs {
+            let historicalIds = [pair.historical, Self.marmotIDPrefix + pair.historical]
+            let liveId = Self.marmotIDPrefix + pair.live
+            guard composerReplyByChat[liveId] == nil else { continue }
+            if let reply = historicalIds.compactMap({ composerReplyByChat[$0] }).first {
+                composerReplyByChat[liveId] = reply
+            }
+        }
+    }
+
     /// FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
     /// transcript, swap the nav id to the live 0.9 sibling.
     @MainActor
@@ -7095,10 +7179,19 @@ final class SonarAppStore: ObservableObject {
            let historical = marmot.messagesByGroup[groupId] {
             marmot.messagesByGroup[remounted] = historical
         }
-        if let draft = composerDrafts[openId], !draft.isEmpty {
+        if let draft = composerDrafts[openId], !draft.isEmpty,
+           composerDraft(for: realId).isEmpty {
             setComposerDraft(draft, for: realId)
+        }
+        if composerDrafts[openId] != nil {
             setComposerDraft("", for: openId)
         }
+        if composerReplyByChat[realId] == nil,
+           let reply = composerReplyByChat[openId] ?? composerReplyByChat[groupId] {
+            composerReplyByChat[realId] = reply
+        }
+        composerReplyByChat[openId] = nil
+        composerReplyByChat[groupId] = nil
         if recoveredChatNeedsUpdate.contains(openId) || recoveredChatNeedsUpdate.contains(groupId) {
             recoveredChatNeedsUpdate.remove(openId)
             recoveredChatNeedsUpdate.remove(groupId)
