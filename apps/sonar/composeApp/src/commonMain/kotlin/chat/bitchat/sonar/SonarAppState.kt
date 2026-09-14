@@ -2218,11 +2218,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
     private fun markGroupsRead(groupIds: Collection<String>) {
         if (groupIds.isEmpty()) return
-        val marked = groupIds.toSet()
+        // Home-row unread walks the fold family. Clearing only the live id
+        // leaves unreadByChat[hist] in place and the badge returns after
+        // open. Core mark_read already folds; expand the host map to match.
+        val marked = notificationSuppressIds(groupIds, historicalFoldMap).toSet()
         unreadSuppressGroupIds.addAll(marked)
         unreadByChat = unreadByChat - marked
         scope.launch {
-            for (groupId in marked) {
+            for (groupId in groupIds.filter { it.isNotBlank() }.toSet()) {
                 runCatching { SonarCore.markConversationRead(groupId) }
             }
             // End in-flight suppress for this batch, then reconcile from core.
@@ -7146,12 +7149,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             push(Screen.Chat(chat.id, chatTitle(chat)))
             return
         }
-        val readChatIds = directMarmotChatIds(chat.id)
         captureOpenChatUnread(chat.id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(chat.id)
         // Mark read immediately — do not wait for the local page. Housekeeping
         // can otherwise restore unreadByChat from still-nonzero summaries.
-        markGroupsRead(readChatIds)
+        // Same family set as openDm / unread-at-open so a leftover hist
+        // unread cannot re-badge the live row after our home-row walk.
+        markGroupsRead(transcriptGroupIds(chat.id))
         val title = chatTitle(chat)
 
         // Reopen: retained paint is already the last leave frame — push now.
@@ -12244,7 +12248,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
-        markGroupsRead(groups.map { it.id })
+        markGroupsRead(transcriptGroupIds(chatId))
     }
 
     private fun observedMeshPeer(peerId: String): Boolean =

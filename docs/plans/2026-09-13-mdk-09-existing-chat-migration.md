@@ -843,6 +843,14 @@ onto live — the visible row looked read. `unreadForFoldFamily` /
 `ConversationFoldTest.homeRowUnreadFollowsPersistedFoldOntoLiveSibling`,
 `SonarConversationFoldTests` `snUnreadForFoldFamily`.
 
+Mark-read follow-up: `openChat` still passed only `directMarmotChatIds`
+(rooms = live id) into `markGroupsRead`, unlike `openDm`. After the
+home-row walk, leftover `unreadByChat[hist]` re-badged the live row
+until summaries refreshed. `markGroupsRead` now expands the fold
+family on the host map (core already did); `openChat` /
+`refreshOpenDm` use `transcriptGroupIds`. iOS `markConversationRead`
+clears the same family keys.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

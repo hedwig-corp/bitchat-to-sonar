@@ -1434,6 +1434,20 @@ class ConversationFoldTest {
                 listedDuplicateIds = listOf("dm-09", "dm-extra"),
             ),
         )
+        // openChat used to mark only the live id. Home-row unread then
+        // walked the leftover hist key and the badge returned after open.
+        assertEquals(
+            listOf("group-09", "group-08"),
+            notificationSuppressIds(listOf("group-09"), folds),
+        )
+        assertEquals(
+            0L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = emptyMap(),
+                historicalFolds = folds,
+            ),
+        )
     }
 
     @Test

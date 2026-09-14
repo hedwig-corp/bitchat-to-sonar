@@ -3126,14 +3126,22 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func markConversationRead(groupId: String) {
-        unreadSuppressGroupIds.insert(groupId)
-        unreadByGroup[groupId] = nil
+        let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+        let ids = snTranscriptSourceIds(
+            groupId: groupId,
+            listedDirectIds: [],
+            historicalFolds: folds
+        )
+        for id in ids {
+            unreadSuppressGroupIds.insert(id)
+            unreadByGroup[id] = nil
+        }
         Task { @MainActor in
             await service.markConversationRead(groupId: groupId)
             // End in-flight suppress for this id, then reconcile from core.
             // Viewing suppress still covers an open DM; without this release a
             // failed/raced mark could hide real unread for the rest of the process.
-            unreadSuppressGroupIds.remove(groupId)
+            for id in ids { unreadSuppressGroupIds.remove(id) }
             // Always reconcile. `readOnlyNonThrowing` maps FFI failure to [],
             // which clears badges until the next successful summary load — the
             // same self-correcting window as Compose's null-vs-empty split, and
