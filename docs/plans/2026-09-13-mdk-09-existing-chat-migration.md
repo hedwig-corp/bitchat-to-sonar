@@ -722,6 +722,14 @@ incoming rows, and `conversation_summaries()` hides the historical sibling,
 so recovered missed messages lost their divider. Pins:
 `conversation_index::copy_summary_adds_historical_unread_onto_live_that_already_has_unread`.
 
+Compose room-banner hole closed after this commit: `maybeNotify`
+scanned and suppressed only the listed live id. iOS already treats
+fold-family ids as the same conversation (`snConversationsMatchFoldFamily`).
+Sitting in the recovered 0.8 transcript when the 0.9 sibling landed
+could ring the live banner. Suppress the fold family; keep scan on
+listed ids so a bak remainder cannot replay recovered history.
+Pin: `ConversationFoldTest.notificationSuppressIdsIncludeHiddenHistoricalSibling`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

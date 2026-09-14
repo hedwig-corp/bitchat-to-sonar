@@ -891,6 +891,23 @@ internal fun foldFamilyIds(
     return family.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
+/** Ids that count as "this chat is open" for banner suppression after a fold.
+ *  Scan stays on listed ids so a bak remainder cannot replay recovered
+ *  history as never-seen. Suppression must include the hidden 0.8 sibling
+ *  — iOS `snConversationsMatchFoldFamily` already does. */
+internal fun notificationSuppressIds(
+    listedIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+): List<String> {
+    val out = linkedSetOf<String>()
+    for (id in listedIds) {
+        if (id.isBlank()) continue
+        out += id
+        out.addAll(foldFamilyIds(id, historicalFolds))
+    }
+    return out.toList()
+}
+
 /** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
 internal fun conversationsMatchFoldFamily(
     left: String,
@@ -5967,7 +5984,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notifyChatIfNew(
                 c,
                 scanIds = chatIds,
-                suppressIds = chatIds,
+                suppressIds = notificationSuppressIds(chatIds, historicalFoldMap),
                 openChatId = openChatId,
                 idKey = c.id,
                 title = chatTitle(c),

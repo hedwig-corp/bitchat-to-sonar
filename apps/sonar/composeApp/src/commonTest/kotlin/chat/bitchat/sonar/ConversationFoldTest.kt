@@ -1106,6 +1106,21 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun notificationSuppressIdsIncludeHiddenHistoricalSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            listOf("group-09", "group-08"),
+            notificationSuppressIds(listOf("group-09"), folds),
+        )
+        assertEquals(
+            listOf("group-09"),
+            notificationSuppressIds(listOf("group-09"), emptyMap()),
+        )
+        assertTrue("group-08" in notificationSuppressIds(listOf("group-09"), folds))
+        assertFalse("group-08" in listOf("group-09"))
+    }
+
+    @Test
     fun deleteAfterFoldDropsTheHiddenHistoricalSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-09", folds))
