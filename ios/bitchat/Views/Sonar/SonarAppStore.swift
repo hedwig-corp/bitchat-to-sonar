@@ -9382,7 +9382,7 @@ final class SonarAppStore: ObservableObject {
             listedGroupIds: listedGroupIds
         ) { id in
             let bare = snBareMarmotGroupId(id)
-            folds[bare]
+            return folds[bare]
         }
         if next != path {
             path = next
