@@ -2404,11 +2404,27 @@ final class MarmotChatModel: ObservableObject {
     /// Never blocks first paint (XChat-Style Chat Startup Rule): the chat is
     /// already open and typable while this runs in the background.
     func scheduleBlankTranscriptRecovery(groupId: String, storeReadable: Bool) {
-        let rendered = (messagesByGroup[groupId] ?? []).isEmpty == false
-        if rendered { return }
-        let summary = conversationSummariesByGroup[groupId]
-        let knownNonEmpty = (summary?.messageCount ?? 0) > 0
-        let sourcesResolved = groups.contains { $0.id == groupId }
+        let folds = historicalFoldsMap()
+        let pagingIds = snTranscriptSourceIds(
+            groupId: groupId,
+            listedDirectIds: [],
+            historicalFolds: folds
+        )
+        if snBlankTranscriptFamilyRendered(
+            groupId: groupId,
+            messagesByGroup: messagesByGroup,
+            historicalFolds: folds
+        ) { return }
+        let counts = Dictionary(
+            uniqueKeysWithValues: conversationSummariesByGroup.map { ($0.key, $0.value.messageCount) }
+        )
+        let knownNonEmpty = snBlankTranscriptKnownNonEmpty(
+            groupId: groupId,
+            messageCountByGroup: counts,
+            historicalFolds: folds
+        )
+        let listed = Set(groups.map(\.id))
+        let sourcesResolved = pagingIds.contains { listed.contains($0) }
         guard SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript(
             knownNonEmpty: knownNonEmpty,
             storeReadable: storeReadable,
@@ -2439,7 +2455,11 @@ final class MarmotChatModel: ObservableObject {
                 guard let self, !Task.isCancelled,
                       self.isCurrentAccountWork(generation) else { return }
                 // Rows arrived by any route (sync, drain, another load): done.
-                if (self.messagesByGroup[groupId] ?? []).isEmpty == false { return }
+                if snBlankTranscriptFamilyRendered(
+                    groupId: groupId,
+                    messagesByGroup: self.messagesByGroup,
+                    historicalFolds: folds
+                ) { return }
                 // Transcript-only: the metadata hydrate must not run ten times.
                 // Keep the result: `loadLocalPage` returns false when it threw
                 // OR when it coalesced against another in-flight load for this
@@ -2448,20 +2468,39 @@ final class MarmotChatModel: ObservableObject {
                 // "the store is fine and this chat is empty", which ended the
                 // retry budget after the first 100ms attempt — precisely in the
                 // racy case the budget exists for.
-                let storeReadable = await self.loadLocalPage(
+                // Page the hidden 0.8 sibling too (Compose `transcriptGroupIds`).
+                var storeReadable = false
+                for pagingId in pagingIds {
+                    if await self.loadLocalPage(
+                        groupId: pagingId,
+                        mode: .newestPage,
+                        hydrateMetadata: false
+                    ) {
+                        storeReadable = true
+                    }
+                }
+                if snBlankTranscriptFamilyRendered(
                     groupId: groupId,
-                    mode: .newestPage,
-                    hydrateMetadata: false
-                )
-                if (self.messagesByGroup[groupId] ?? []).isEmpty == false { return }
+                    messagesByGroup: self.messagesByGroup,
+                    historicalFolds: folds
+                ) { return }
                 // Stop once the conversation is provably readable AND empty —
                 // otherwise a genuinely empty chat burns the whole budget on
                 // every open.
-                let summary = self.conversationSummariesByGroup[groupId]
+                let counts = Dictionary(
+                    uniqueKeysWithValues: self.conversationSummariesByGroup.map {
+                        ($0.key, $0.value.messageCount)
+                    }
+                )
+                let listed = Set(self.groups.map(\.id))
                 if !SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript(
-                    knownNonEmpty: (summary?.messageCount ?? 0) > 0,
+                    knownNonEmpty: snBlankTranscriptKnownNonEmpty(
+                        groupId: groupId,
+                        messageCountByGroup: counts,
+                        historicalFolds: folds
+                    ),
                     storeReadable: storeReadable,
-                    sourcesResolved: self.groups.contains { $0.id == groupId }
+                    sourcesResolved: pagingIds.contains { listed.contains($0) }
                 ) { return }
             }
         }

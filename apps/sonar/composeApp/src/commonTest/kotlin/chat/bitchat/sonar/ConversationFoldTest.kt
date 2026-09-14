@@ -1781,10 +1781,35 @@ class ConversationFoldTest {
             transcriptSourceIds("group-09", listOf("group-09"), emptyMap()),
         )
         // Room / persist-folds: listed live-only would miss bak remainder.
-        // iOS `localTranscriptGroups` pages these same ids.
+        // iOS `localTranscriptGroups` and Compose `marmotMessagesPageForChat`
+        // page these same ids.
         assertEquals(
             listOf("group-09", "group-08"),
             transcriptSourceIds("group-09", emptyList(), folds),
+        )
+        assertTrue(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = emptyMap(),
+                messageCountByChat = mapOf("group-08" to 80L),
+                historicalFolds = folds,
+            ),
+        )
+        assertFalse(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = emptyMap(),
+                messageCountByChat = mapOf("group-08" to 80L),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                messageCountByChat = emptyMap(),
+                historicalFolds = folds,
+            ),
         )
     }
 

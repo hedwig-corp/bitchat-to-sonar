@@ -596,13 +596,41 @@ struct SonarConversationFoldTests {
             ) == 1
         )
         // Room / persist-folds: listed live-only would miss bak remainder.
-        // `localTranscriptGroups` pages these same ids.
+        // `localTranscriptGroups` / blank recovery page these same ids.
         #expect(
             snTranscriptSourceIds(
                 groupId: "group-09",
                 listedDirectIds: [],
                 historicalFolds: ["group-08": "group-09"]
             ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snBlankTranscriptKnownNonEmpty(
+                groupId: "group-09",
+                messageCountByGroup: ["group-08": 80],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snBlankTranscriptKnownNonEmpty(
+                groupId: "group-09",
+                messageCountByGroup: ["group-08": 80],
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snBlankTranscriptFamilyRendered(
+                groupId: "group-09",
+                messagesByGroup: ["group-08": ["old from 0.8"]],
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snBlankTranscriptFamilyRendered(
+                groupId: "group-09",
+                messagesByGroup: ["group-08": ["old from 0.8"]],
+                historicalFolds: [:]
+            )
         )
         #expect(
             snUnreadForFoldFamily(

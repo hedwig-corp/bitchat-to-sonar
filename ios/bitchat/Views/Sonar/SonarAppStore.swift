@@ -570,6 +570,36 @@ func snSeededFoldFamilyTranscriptHasMore(
     familyHasOlder || snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize)
 }
 
+/// Blank-transcript recovery must treat a leftover hist summary as
+/// proof the conversation is non-empty. A live-only 0.9 count is 0
+/// after resume and used to skip recovery while bak remainder sat on
+/// hist. Compose `blankTranscriptKnownNonEmpty`.
+func snBlankTranscriptKnownNonEmpty(
+    groupId: String,
+    messageCountByGroup: [String: UInt64],
+    historicalFolds: [String: String]
+) -> Bool {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds
+    ).contains { (messageCountByGroup[$0] ?? 0) > 0 }
+}
+
+/// Family cache already has rows — do not start blank recovery, and
+/// treat a live-only empty `messagesByGroup[live]` as painted.
+func snBlankTranscriptFamilyRendered<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String]
+) -> Bool {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds
+    ).contains { !(messagesByGroup[$0] ?? []).isEmpty }
+}
+
 /// Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
 /// Comparing overflow to the 500-row retained cap hid bak remainder after
 /// the first-paint extract (80). Page-size overflow or a short live FFI

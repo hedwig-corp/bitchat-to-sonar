@@ -746,6 +746,19 @@ internal fun seededFoldFamilyTranscriptHasMore(
     familyHasOlder: Boolean = false,
 ): Boolean = familyHasOlder || foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)
 
+/** Blank-transcript recovery must treat a leftover hist summary / latest
+ *  as proof the conversation is non-empty. A live-only 0.9 summary is 0
+ *  after resume and used to skip recovery while bak remainder sat on hist.
+ *  iOS `snBlankTranscriptKnownNonEmpty`. */
+internal fun blankTranscriptKnownNonEmpty(
+    chatId: String,
+    latestByChat: Map<String, Long>,
+    messageCountByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Boolean = transcriptSourceIds(chatId, emptyList(), historicalFolds).any { id ->
+    (latestByChat[id] ?: 0L) > 0L || (messageCountByChat[id] ?: 0L) > 0L
+}
+
 /** Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
  *  Comparing overflow to the 500-row retained cap hid bak remainder after
  *  the first-paint extract (80). Page-size overflow or a short live FFI
@@ -12278,8 +12291,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True when local metadata remembers messages for this conversation, even
      *  if the encrypted store cannot be read right now. Survives a cold launch,
      *  so it is the signal that a blank transcript is wrong rather than empty. */
-    private fun transcriptKnownNonEmpty(chatId: String): Boolean =
-        localLatestTs(chatId) > 0L || transcriptGroupIds(chatId).any { localLatestTs(it) > 0L }
+    private fun transcriptKnownNonEmpty(chatId: String): Boolean {
+        val latest = buildMap {
+            for (id in transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }) {
+                put(id, localLatestTs(id))
+            }
+        }
+        return blankTranscriptKnownNonEmpty(
+            chatId,
+            latestByChat = latest,
+            messageCountByChat = emptyMap(),
+            historicalFolds = historicalFoldMap,
+        )
+    }
 
     /** Whether this conversation's transport legs are known yet. A mesh route
      *  resolves its folded White Noise groups through `chats` / `npubRawFor`,
@@ -12363,17 +12387,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         chatId: String,
         generation: Long = transcriptGeneration,
     ): List<SonarMsg> {
-        val groups = duplicateDirectMarmotChats(chatId)
-        if (groups.isEmpty()) {
-            return refreshConversationRows(
-                refreshTranscriptGroupWindow(chatId, chatId, generation),
-                chatId,
-                generation,
-            )
-        }
+        // Rooms are not 1:1 duplicates — `duplicateDirectMarmotChats` is only
+        // the live row. Page the hidden 0.8 sibling too so first-open FFI
+        // and blank recovery can fill bak remainder. iOS blank recovery
+        // pages `snTranscriptSourceIds` the same way.
+        val groupIds = transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }
         val merged = ArrayList<SonarMsg>()
-        for (group in groups) {
-            merged += refreshTranscriptGroupWindow(group.id, chatId, generation)
+        for (groupId in groupIds) {
+            merged += refreshTranscriptGroupWindow(groupId, chatId, generation)
         }
         return refreshConversationRows(merged, chatId, generation)
     }
