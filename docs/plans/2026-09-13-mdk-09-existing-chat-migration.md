@@ -137,6 +137,8 @@ Guarded by:
 - `mdk08_migrate::remainder_candidate_sql_ranks_ids_without_payload_columns`
 - `mdk08_migrate::remainder_page_skips_copied_ids_and_reports_more`
 - `mdk08_migrate::remainder_page_can_target_one_group_without_clearing_others`
+- `mdk08_migrate::remainder_page_skips_omitted_groups`
+- `persistence::delete_then_remainder_does_not_restore_transcript`
 - `persistence::mdk08_store_wrong_key_is_left_intact`
 - `marmot::historical_fold_tests::recovered_history_survives_fold_onto_new_group`
 - `e2e::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
@@ -415,7 +417,13 @@ delete cannot leave a recovered 0.8 row for the next first paint.
 Core also forgets recovered name/member/description/count/secret sidecars
 for that family. Settings restore preview subtracts `.sonar-dropped-groups.json`
 ids from both the historical-groups sidecar and packed `*.mdk08.bak` titles,
-so a backup taken after Leave does not list a chat the user already removed. Pins:
+so a backup taken after Leave does not list a chat the user already removed.
+Remainder ticks from `*.mdk08.bak` also omit `.sonar-dropped-groups.json`
+ids: Leave clears the transcript but the bak is never rewritten, so an idle
+`ensure_mdk08_remainder` / `messages()` drain on any other chat must not copy
+those rows back. Pins:
+`mdk08_migrate::remainder_page_skips_omitted_groups`,
+`persistence::delete_then_remainder_does_not_restore_transcript`,
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
 `snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no

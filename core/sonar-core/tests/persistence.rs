@@ -1702,6 +1702,145 @@ async fn mdk08_first_paint_defers_older_rows_until_remainder() {
     assert!(!engine.has_pending_mdk08_remainder());
 }
 
+/// Leave/delete clears the transcript but leaves `*.mdk08.bak` intact. A later
+/// remainder tick (idle sync or `messages()` on any other chat) must not copy
+/// those rows back onto a dropped group.
+#[tokio::test]
+async fn delete_then_remainder_does_not_restore_transcript() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let keep_id = vec![0x11u8; 16];
+    let gone_id = vec![0x33u8; 16];
+    let per_group = 90usize;
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open 0.8 file");
+        let hex_key = DB_KEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .expect("0.8 raw key");
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );",
+        )
+        .expect("0.8 schema");
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'keep', 'sonar.direct-dm.v1'),
+                    (?3, ?4, 'deleted room', '')",
+            rusqlite::params![
+                keep_id.clone(),
+                vec![0x22u8; 32],
+                gone_id.clone(),
+                vec![0x44u8; 32],
+            ],
+        )
+        .expect("group rows");
+        for i in 0..per_group {
+            let mut keep_msg = [0u8; 32];
+            keep_msg[0] = 0xA0;
+            keep_msg[1] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed')",
+                rusqlite::params![
+                    keep_id.clone(),
+                    keep_msg.to_vec(),
+                    bob.public_key().to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("keep-{i}"),
+                ],
+            )
+            .expect("keep row");
+            let mut gone_msg = [0u8; 32];
+            gone_msg[0] = 0xB0;
+            gone_msg[1] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed')",
+                rusqlite::params![
+                    gone_id.clone(),
+                    gone_msg.to_vec(),
+                    bob.public_key().to_bytes().to_vec(),
+                    1_800_000_000 + i as i64,
+                    format!("gone-{i}"),
+                ],
+            )
+            .expect("gone row");
+        }
+    }
+
+    let engine =
+        MarmotEngine::persistent(alice.clone(), &db_path, DB_KEY).expect("0.8 store must migrate");
+    assert!(engine.has_pending_mdk08_remainder());
+    let keep = GroupId::new(keep_id);
+    let gone = GroupId::new(gone_id);
+    engine.purge_fold_family(&gone);
+    assert!(
+        engine.messages(&gone).expect("deleted chat").is_empty(),
+        "Leave must not let messages() drain bak rows back onto the dropped id"
+    );
+    let kept = engine
+        .messages(&keep)
+        .expect("other recovered chat must still drain");
+    assert_eq!(kept.len(), per_group);
+    assert!(kept.iter().all(|m| m.content.starts_with("keep-")));
+    assert!(
+        engine
+            .messages(&gone)
+            .expect("deleted after drain")
+            .is_empty(),
+        "draining another chat must not resurrect the left conversation"
+    );
+    assert!(
+        engine
+            .historical_groups()
+            .expect("historical groups")
+            .iter()
+            .all(|g| g.id != gone),
+        "dropped recovered row must stay unlistable"
+    );
+    assert!(
+        db_path.with_file_name("marmot.sqlite.mdk08.bak").exists(),
+        "quarantine stays on disk; remainder just refuses to copy dropped ids"
+    );
+    drop(engine);
+
+    let reopened = MarmotEngine::persistent(alice, &db_path, DB_KEY).expect("reopen after Leave");
+    assert!(
+        reopened.messages(&gone).expect("reopen deleted").is_empty(),
+        "cold start must not copy dropped bak rows back into the transcript"
+    );
+    assert_eq!(
+        reopened.messages(&keep).expect("reopen keep").len(),
+        per_group
+    );
+}
+
 /// A 0.8-shaped store with the wrong host key must stay on disk and must not
 /// be treated as a migratable store (Account Key Durability).
 #[tokio::test]

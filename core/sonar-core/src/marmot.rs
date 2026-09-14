@@ -1042,6 +1042,7 @@ impl MarmotEngine {
                 .map(|msg| msg.id)
                 .collect::<HashSet<_>>()
         };
+        let omit_groups = self.dropped_group_id_set();
         let extracted = match crate::mdk08_migrate::detect_and_extract_remainder(
             &pending.bak_path,
             pending.key,
@@ -1049,6 +1050,7 @@ impl MarmotEngine {
             &skip,
             budget,
             only_group,
+            &omit_groups,
         ) {
             Ok(Some((extracted, more))) => {
                 if more {
@@ -1086,6 +1088,9 @@ impl MarmotEngine {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for msgs in extracted.messages.into_values() {
                 for msg in msgs {
+                    if omit_groups.contains(&msg.group_id) {
+                        continue;
+                    }
                     let rows = transcript.entry(msg.group_id.clone()).or_default();
                     if !rows.iter().any(|existing| existing.id == msg.id) {
                         rows.push(msg);
@@ -1109,6 +1114,13 @@ impl MarmotEngine {
         group_id: &GroupId,
         enough: impl Fn(&Self) -> bool,
     ) -> Result<()> {
+        if self
+            .fold_family(group_id)
+            .iter()
+            .all(|id| self.is_dropped(id))
+        {
+            return Ok(());
+        }
         while self.has_pending_mdk08_remainder() && !enough(self) {
             let before = self.transcript_for_family(group_id).len();
             let mut progressed = false;
@@ -3057,6 +3069,13 @@ impl MarmotEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(group_id)
+    }
+
+    fn dropped_group_id_set(&self) -> HashSet<GroupId> {
+        self.dropped_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn persist_parked(&self) {

@@ -159,6 +159,7 @@ pub(crate) fn detect_and_extract_remainder(
     skip: &HashSet<EventId>,
     budget: usize,
     only_group: Option<&GroupId>,
+    omit_groups: &HashSet<GroupId>,
 ) -> Result<Option<(Mdk08Migration, bool)>> {
     let Some(conn) = open_mdk08(path, key)? else {
         return Ok(None);
@@ -167,7 +168,8 @@ pub(crate) fn detect_and_extract_remainder(
         return Ok(None);
     }
     let budget = budget.max(1);
-    let (extracted, more) = extract_remainder_page(&conn, local_pk, skip, budget, only_group)?;
+    let (extracted, more) =
+        extract_remainder_page(&conn, local_pk, skip, budget, only_group, omit_groups)?;
     Ok(Some((extracted, more)))
 }
 
@@ -1188,15 +1190,22 @@ fn remainder_has_unskipped(
     has_state: bool,
     skip: &HashSet<EventId>,
     extra: &HashSet<EventId>,
+    omit_groups: &HashSet<GroupId>,
 ) -> Result<bool> {
     let mut stmt = conn
         .prepare(&remainder_candidate_sql(has_state, false))
         .map_err(|e| Error::Storage(format!("mdk08 remainder more prepare: {e}")))?;
     let rows = stmt
-        .query_map((), |row| row.get::<_, Vec<u8>>(1))
+        .query_map((), |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
         .map_err(|e| Error::Storage(format!("mdk08 remainder more query: {e}")))?;
     for row in rows {
-        let id = row.map_err(|e| Error::Storage(format!("mdk08 remainder more row: {e}")))?;
+        let (group_id, id) =
+            row.map_err(|e| Error::Storage(format!("mdk08 remainder more row: {e}")))?;
+        if omit_groups.contains(&GroupId::new(group_id)) {
+            continue;
+        }
         let Ok(event_id) = EventId::from_slice(&id) else {
             continue;
         };
@@ -1235,6 +1244,7 @@ fn extract_remainder_page(
     skip: &HashSet<EventId>,
     budget: usize,
     only_group: Option<&GroupId>,
+    omit_groups: &HashSet<GroupId>,
 ) -> Result<(Mdk08Migration, bool)> {
     let cols = message_select_columns(conn)?;
     let mut extracted = Mdk08Migration::default();
@@ -1242,7 +1252,10 @@ fn extract_remainder_page(
     let mut chosen: Vec<Vec<u8>> = Vec::new();
     let mut chosen_ids = HashSet::new();
     let mut hit_budget = false;
-    for (_group_id, id) in candidates {
+    for (group_id, id) in candidates {
+        if omit_groups.contains(&GroupId::new(group_id)) {
+            continue;
+        }
         let Ok(event_id) = EventId::from_slice(&id) else {
             continue;
         };
@@ -1257,7 +1270,7 @@ fn extract_remainder_page(
         chosen.push(id);
     }
     let more = if only_group.is_some() {
-        remainder_has_unskipped(conn, cols.has_state, skip, &chosen_ids)?
+        remainder_has_unskipped(conn, cols.has_state, skip, &chosen_ids, omit_groups)?
     } else {
         hit_budget
     };
@@ -2598,10 +2611,17 @@ mod tests {
             .collect();
         assert_eq!(skip.len(), FIRST_PAINT_MESSAGES_PER_GROUP);
 
-        let (page, more) =
-            detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 10, None)
-                .unwrap()
-                .expect("remainder page");
+        let (page, more) = detect_and_extract_remainder(
+            &path,
+            KEY,
+            local.public_key(),
+            &skip,
+            10,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap()
+        .expect("remainder page");
         let msgs = page.messages.values().next().unwrap();
         assert!(more);
         assert_eq!(msgs.len(), 10);
@@ -2612,10 +2632,17 @@ mod tests {
 
         let mut skip = skip;
         skip.extend(msgs.iter().map(|m| m.id));
-        let (rest, more) =
-            detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 400, None)
-                .unwrap()
-                .expect("remainder tail");
+        let (rest, more) = detect_and_extract_remainder(
+            &path,
+            KEY,
+            local.public_key(),
+            &skip,
+            400,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap()
+        .expect("remainder tail");
         assert!(!more);
         let rest_len = rest.messages.values().map(|m| m.len()).sum::<usize>();
         // seed + msg-1..15 remain after the first-paint 80 and the 10-row page.
@@ -2697,6 +2724,7 @@ mod tests {
             &skip,
             5,
             Some(&GroupId::new(group_b)),
+            &HashSet::new(),
         )
         .unwrap()
         .expect("group-b remainder");
@@ -2708,6 +2736,104 @@ mod tests {
         assert!(!msgs
             .iter()
             .any(|m| m.content.starts_with("a-") || m.content.contains("oldest")));
+    }
+
+    #[test]
+    fn remainder_page_skips_omitted_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        write_mdk08_fixture(&path, &local, peer, "keep-oldest");
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        let keep = vec![0x11u8; 16];
+        let gone = vec![0x33u8; 16];
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'deleted room', '')",
+            rusqlite::params![gone.clone(), vec![0x44u8; 32]],
+        )
+        .unwrap();
+        for i in 1..=(FIRST_PAINT_MESSAGES_PER_GROUP + 5) {
+            let mut keep_id = [0u8; 32];
+            keep_id[0] = 0xA0;
+            keep_id[1] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    keep.clone(),
+                    keep_id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_700_000_000 + i as i64,
+                    format!("keep-{i}"),
+                ],
+            )
+            .unwrap();
+            let mut gone_id = [0u8; 32];
+            gone_id[0] = 0xB0;
+            gone_id[1] = i as u8;
+            conn.execute(
+                "INSERT INTO messages
+                    (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                     wrapper_event_id, state, epoch)
+                 VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed', 1)",
+                rusqlite::params![
+                    gone.clone(),
+                    gone_id.to_vec(),
+                    peer.to_bytes().to_vec(),
+                    1_800_000_000 + i as i64,
+                    format!("gone-{i}"),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let window = detect_and_extract_first_paint(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("first paint");
+        let skip: HashSet<EventId> = window
+            .messages
+            .values()
+            .flatten()
+            .map(|msg| msg.id)
+            .collect();
+        let omit = HashSet::from([GroupId::new(gone)]);
+        let (page, more) =
+            detect_and_extract_remainder(&path, KEY, local.public_key(), &skip, 400, None, &omit)
+                .unwrap()
+                .expect("remainder after omit");
+        assert!(
+            !more,
+            "leftover rows that only belong to omitted groups must not keep remainder pending"
+        );
+        let msgs: Vec<&ChatMessage> = page.messages.values().flatten().collect();
+        assert_eq!(msgs.len(), 6, "seed + 5 leftover keep-group rows");
+        assert!(msgs.iter().all(|m| !m.content.starts_with("gone-")));
+        assert!(msgs.iter().any(|m| m.content == "keep-oldest"));
+
+        let (empty, more) = detect_and_extract_remainder(
+            &path,
+            KEY,
+            local.public_key(),
+            &HashSet::new(),
+            400,
+            Some(&GroupId::new(keep.clone())),
+            &HashSet::from([GroupId::new(keep), GroupId::new(vec![0x33u8; 16])]),
+        )
+        .unwrap()
+        .expect("omitted target group");
+        assert!(empty.messages.is_empty());
+        assert!(
+            !more,
+            "when every leftover group is omitted, remainder must go idle"
+        );
     }
 
     #[test]
