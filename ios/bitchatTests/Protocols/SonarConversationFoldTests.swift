@@ -799,7 +799,7 @@ struct SonarConversationFoldTests {
                 changedGroupId: "group-08",
                 listedGroupIds: ["group-09"],
                 historicalFolds: ["group-08": "group-09"]
-            ) == ["group-09"]
+            ) == ["group-08", "group-09"]
         )
         #expect(
             snConversationRefreshIds(
@@ -814,6 +814,24 @@ struct SonarConversationFoldTests {
                 listedGroupIds: [],
                 historicalFolds: ["group-08": "group-09"]
             ) == ["group-08"]
+        )
+        #expect(
+            snConversationRefreshShouldLoadPage(
+                refreshId: "group-08",
+                listedGroupIds: ["group-09"],
+                cachedGroupIds: [],
+                changedGroupId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snConversationRefreshShouldLoadPage(
+                refreshId: "brand-new",
+                listedGroupIds: ["group-09"],
+                cachedGroupIds: [],
+                changedGroupId: "brand-new",
+                historicalFolds: ["group-08": "group-09"]
+            )
         )
         #expect(
             snConversationChangeTargetId(

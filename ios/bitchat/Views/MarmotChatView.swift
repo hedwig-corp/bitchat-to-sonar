@@ -2538,13 +2538,19 @@ final class MarmotChatModel: ObservableObject {
                         historicalFolds: folds
                     )
                     var deferredChanged = false
+                    let cached = Set(self.messagesByGroup.keys)
                     for refreshId in refreshIds {
                         if self.localTranscriptLoadingGroups.contains(refreshId) {
                             deferredChanged = true
                             continue
                         }
-                        if self.groups.contains(where: { $0.id == refreshId })
-                            || self.messagesByGroup[refreshId] != nil {
+                        if snConversationRefreshShouldLoadPage(
+                            refreshId: refreshId,
+                            listedGroupIds: listed,
+                            cachedGroupIds: cached,
+                            changedGroupId: changedGroupId,
+                            historicalFolds: folds
+                        ) {
                             _ = await self.loadLocalPage(
                                 groupId: refreshId,
                                 mode: .preserveHistoricalWindow

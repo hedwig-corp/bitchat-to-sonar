@@ -1257,6 +1257,41 @@ internal fun foldFamilyIds(
     return family.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
+/** Ids whose local transcript window must reload for one conversation
+ *  change. A bak remainder tick names the hidden 0.8 id. Persist-folds
+ *  can land before core `fold_family`, so FFI `messages(live)` does not
+ *  union hist yet — refresh the listed sibling **and** the changed
+ *  hidden id. iOS `snConversationRefreshIds`. */
+internal fun conversationRefreshIds(
+    changedId: String,
+    listedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+): List<String> {
+    if (changedId.isBlank()) return emptyList()
+    val family = foldFamilyIds(changedId, historicalFolds)
+    val listedFamily = family.filter { it in listedIds }.sorted()
+    val out = ArrayList(if (listedFamily.isEmpty()) listOf(changedId) else listedFamily)
+    if (changedId !in out) out += changedId
+    return out.sorted()
+}
+
+/** Hidden 0.8 remainder ticks are unlisted and may have no host cache
+ *  key after remount. Still page them — do not treat that as a brand-new
+ *  group. iOS `snConversationRefreshShouldLoadPage`. */
+internal fun conversationRefreshShouldLoadPage(
+    refreshId: String,
+    listedIds: Set<String>,
+    cachedIds: Set<String>,
+    changedId: String,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    if (refreshId in listedIds || refreshId in cachedIds) return true
+    val family = foldFamilyIds(changedId, historicalFolds)
+    if (refreshId !in family) return false
+    // Only the hidden sibling of a listed live — not a brand-new group.
+    return family.any { it in listedIds && it != refreshId }
+}
+
 /** Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id. */
 internal fun conversationChangeTargetId(
     changedId: String,

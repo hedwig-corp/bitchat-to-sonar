@@ -1183,21 +1183,43 @@ func snVerifiedForFoldFamily(
 }
 
 /// Ids whose local transcript window must reload for one `conversationChanged`.
-/// A bak remainder / fold-alias tick names the hidden 0.8 id; FFI
-/// `messages()` unions the family, so refresh the listed sibling instead of
-/// treating an unlisted hist id as a brand-new group.
+/// A bak remainder tick names the hidden 0.8 id. Persist-folds can land
+/// before core `fold_family`, so FFI `messages(live)` does not union hist
+/// yet — refresh the listed sibling **and** the changed hidden id. Compose
+/// `conversationRefreshIds`.
 func snConversationRefreshIds(
     changedGroupId: String,
     listedGroupIds: Set<String>,
     historicalFolds: [String: String]
 ) -> [String] {
     guard !changedGroupId.isEmpty else { return [] }
-    let listedFamily = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
-        .filter { listedGroupIds.contains($0) }
-    if listedFamily.isEmpty {
-        return [changedGroupId]
+    let family = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
+    let listedFamily = family.filter { listedGroupIds.contains($0) }
+    var out = listedFamily.isEmpty ? [changedGroupId] : listedFamily.sorted()
+    if !out.contains(changedGroupId) {
+        out.append(changedGroupId)
     }
-    return listedFamily.sorted()
+    return out.sorted()
+}
+
+/// Hidden 0.8 remainder ticks are unlisted and may have no host cache key
+/// after remount. Still `loadLocalPage` them — do not treat that as a
+/// brand-new group (`loadLocalSummaries`). Compose
+/// `conversationRefreshShouldLoadPage`.
+func snConversationRefreshShouldLoadPage(
+    refreshId: String,
+    listedGroupIds: Set<String>,
+    cachedGroupIds: Set<String>,
+    changedGroupId: String,
+    historicalFolds: [String: String]
+) -> Bool {
+    if listedGroupIds.contains(refreshId) || cachedGroupIds.contains(refreshId) {
+        return true
+    }
+    let family = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
+    guard family.contains(refreshId) else { return false }
+    // Only the hidden sibling of a listed live — not a brand-new group.
+    return family.contains { listedGroupIds.contains($0) && $0 != refreshId }
 }
 
 /// Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id.
@@ -1206,11 +1228,11 @@ func snConversationChangeTargetId(
     listedGroupIds: Set<String>,
     historicalFolds: [String: String]
 ) -> String {
-    snConversationRefreshIds(
-        changedGroupId: changedGroupId,
-        listedGroupIds: listedGroupIds,
-        historicalFolds: historicalFolds
-    ).first ?? changedGroupId
+    guard !changedGroupId.isEmpty else { return changedGroupId }
+    if listedGroupIds.contains(changedGroupId) { return changedGroupId }
+    let listedFamily = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
+        .filter { listedGroupIds.contains($0) }
+    return listedFamily.sorted().first ?? changedGroupId
 }
 
 /// Group ids that may still hold in-flight upload bytes after a hist→live remount.

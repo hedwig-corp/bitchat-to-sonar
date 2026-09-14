@@ -1082,6 +1082,16 @@ fold family remount already exists. Pins: `ConversationFoldTest`
 `newestPageFamilyHasOlder` `hasFoldFamily`, `SonarConversationFoldTests`
 `snNewestPageFamilyHasOlder`.
 
+iOS remainder-tick refresh hole closed after this commit: a bak tick
+names hist; `snConversationRefreshIds` remapped to listed live only.
+Persist-folds `messages(live)` does not union hist, so the open
+transcript never grew and a kept quote-jump could not retry. Refresh
+now pages the hidden sibling too (`snConversationRefreshShouldLoadPage`
+even when unlisted / uncached). Compose `marmotMessagesPageForChat`
+already pages the family; helpers stay in lockstep. Pins:
+`ConversationFoldTest` `conversationRefreshIds`,
+`SonarConversationFoldTests` `snConversationRefreshIds`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

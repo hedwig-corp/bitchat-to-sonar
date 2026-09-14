@@ -1138,6 +1138,40 @@ class ConversationFoldTest {
     fun conversationChangeTargetPrefersListedLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(
+            listOf("group-08", "group-09"),
+            conversationRefreshIds(
+                changedId = "group-08",
+                listedIds = setOf("group-09"),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            listOf("group-09"),
+            conversationRefreshIds(
+                changedId = "group-09",
+                listedIds = setOf("group-09"),
+                historicalFolds = folds,
+            ),
+        )
+        assertTrue(
+            conversationRefreshShouldLoadPage(
+                refreshId = "group-08",
+                listedIds = setOf("group-09"),
+                cachedIds = emptySet(),
+                changedId = "group-08",
+                historicalFolds = folds,
+            ),
+        )
+        assertFalse(
+            conversationRefreshShouldLoadPage(
+                refreshId = "brand-new",
+                listedIds = setOf("group-09"),
+                cachedIds = emptySet(),
+                changedId = "brand-new",
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
             "group-09",
             conversationChangeTargetId(
                 changedId = "group-08",
