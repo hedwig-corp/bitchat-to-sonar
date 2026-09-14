@@ -574,6 +574,21 @@ internal fun promotedFoldedComposerDrafts(
         preferExisting = { it.isNotEmpty() },
     )
 
+/** Keep a recovered transcript window on the live sibling after FFI hides the 0.8 id. */
+internal fun promotedFoldedSnapshotMessages(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, List<SonarMsg>> =
+    promotedFoldedValues(
+        previousIds = previousIds,
+        currentIds = currentIds,
+        values = messagesByChat.filterValues { it.isNotEmpty() },
+        liveFoldTarget = liveFoldTarget,
+        preferExisting = { it.isNotEmpty() },
+    )
+
 /** When FFI hides a folded 0.8 row, keep its reply target on the live sibling. */
 internal fun <V> promotedFoldedComposerReplies(
     previousIds: Set<String>,
@@ -12090,6 +12105,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         val loadedChats = SonarCore.chats()
         val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
+        val liveFoldTarget = { id: String ->
+            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
+        }
+        val existingMessages = promotedFoldedSnapshotMessages(
+            previousIds = previousOrder.toSet(),
+            currentIds = activeIds,
+            messagesByChat = chatSnapshotMessagesByChat,
+            liveFoldTarget = liveFoldTarget,
+        )
+        val existingLatest = promotedFoldedValues(
+            previousIds = previousOrder.toSet(),
+            currentIds = activeIds,
+            values = chatSnapshotLatestByChat,
+            liveFoldTarget = liveFoldTarget,
+        )
         val summaries = if (localChats.isEmpty()) emptyList() else runCatching {
             SonarCore.conversationSummaries()
         }.getOrDefault(emptyList())
@@ -12098,8 +12128,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         }.getOrDefault(emptyList())
         val hydration = hydrateLocalConversationRows(
             activeChatIds = activeIds,
-            existingMessagesByChat = chatSnapshotMessagesByChat,
-            existingLatestByChat = chatSnapshotLatestByChat,
+            existingMessagesByChat = existingMessages,
+            existingLatestByChat = existingLatest,
             summaries = summaries,
             pages = pages,
         )

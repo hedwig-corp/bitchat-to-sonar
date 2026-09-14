@@ -324,6 +324,29 @@ func snPromotedFoldedComposerDrafts(
     return next
 }
 
+/// Keep a recovered in-memory transcript window on the live sibling.
+func snPromotedFoldedMessagesByGroup<Message>(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    messagesByGroup: [String: [Message]],
+    liveFoldTarget: (String) -> String?
+) -> [String: [Message]] {
+    var next = messagesByGroup.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let rows = next[pair.historical], !rows.isEmpty else { continue }
+        if next[pair.live]?.isEmpty ?? true {
+            next[pair.live] = rows
+        }
+    }
+    return next
+}
+
 func snMarmotSendNeedsPeerUpdate(_ error: String) -> Bool {
     let lower = error.lowercased()
     return lower.contains("no key package")
@@ -2281,6 +2304,7 @@ final class SonarAppStore: ObservableObject {
                 Task { @MainActor in
                     await self.promoteFoldedMutes(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
                     self.lastMarmotGroupIds = current
                     await self.remountFoldedOpenChatIfNeeded()
                 }
@@ -7158,6 +7182,30 @@ final class SonarAppStore: ObservableObject {
             if let reply = historicalIds.compactMap({ composerReplyByChat[$0] }).first {
                 composerReplyByChat[liveId] = reply
             }
+        }
+    }
+
+    /// Copy an in-memory recovered transcript onto the live sibling so home
+    /// preview / open-chat first paint do not miss the hidden 0.8 id.
+    @MainActor
+    private func promoteFoldedTranscriptCache(from previous: Set<String>, to current: Set<String>) async {
+        var extraGroupIds = Set(marmot.messagesByGroup.keys)
+        extraGroupIds.formUnion(previous)
+        extraGroupIds.subtract(current)
+        var targets: [String: String] = [:]
+        for historical in extraGroupIds {
+            if let live = await marmot.liveFoldTarget(groupId: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedMessagesByGroup(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            messagesByGroup: marmot.messagesByGroup,
+            liveFoldTarget: { targets[$0] }
+        )
+        if next != marmot.messagesByGroup {
+            marmot.messagesByGroup = next
         }
     }
 

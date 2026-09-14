@@ -584,6 +584,35 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalSnapshotMessagesMoveOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = listOf(
+            SonarMsg(id = "m1", senderNpub = "npub1peer", content = "old", mine = false, tsSecs = 1L),
+        )
+        val live = listOf(
+            SonarMsg(id = "m2", senderNpub = "npub1me", content = "new", mine = true, tsSecs = 2L),
+        )
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to historical),
+            promotedFoldedSnapshotMessages(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                messagesByChat = mapOf("group-08" to historical),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to live),
+            promotedFoldedSnapshotMessages(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                messagesByChat = mapOf("group-08" to historical, "group-09" to live),
+                liveFoldTarget = folds::get,
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalComposerReplyMovesOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         val historical = SonarReplyRef(parentId = "evt-08", preview = "quote")

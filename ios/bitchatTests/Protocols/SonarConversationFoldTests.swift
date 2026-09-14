@@ -114,6 +114,23 @@ struct SonarConversationFoldTests {
                 liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
             )["group-09"] == "hello from 0.8"
         )
+        let historicalRows = ["old from 0.8"]
+        #expect(
+            snPromotedFoldedMessagesByGroup(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                messagesByGroup: ["group-08": historicalRows],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            )["group-09"] == historicalRows
+        )
+        #expect(
+            snPromotedFoldedMessagesByGroup(
+                previousGroupIds: [],
+                currentGroupIds: ["group-09"],
+                messagesByGroup: ["group-08": historicalRows, "group-09": ["already live"]],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            )["group-09"] == ["already live"]
+        )
         #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))

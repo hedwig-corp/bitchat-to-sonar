@@ -190,6 +190,7 @@ Guarded by:
 - `ConversationFoldTest.foldedHistoricalMuteMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalComposerDraftMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalComposerReplyMovesOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalSnapshotMessagesMoveOntoLiveSibling`
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
   (also pins `live_fold_target_hex` after the home-list hide)
 
@@ -358,7 +359,9 @@ start notifying a chat the user already silenced. An in-progress composer
 draft or reply target on that hidden id is copied the same way — including
 when the user already left the recovered transcript — so the live composer
 is not empty after fold. Remount of an open chat does not overwrite a
-non-empty live draft. A pending welcome with
+non-empty live draft. Host snapshot / in-memory transcript rows on the
+hidden id are copied onto the live sibling so home preview does not go
+blank between `groups()` hide and the next bounded page. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
 (new DM with the same known peer) is the same hazard and must skip
@@ -400,7 +403,7 @@ Re-run on this cloud agent after the joined-room `is_direct` pin. All green.
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 31 passed (includes first-paint `isDirect` pins) |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 36 passed (includes remount / mute / draft / snapshot-fold pins) |
 | `scripts/check-regression-ledger.sh` | 236 citations |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with
