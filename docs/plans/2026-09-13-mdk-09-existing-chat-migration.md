@@ -378,7 +378,11 @@ Re-run on this cloud agent after the joined-room `is_direct` pin. All green.
 | --- | --- |
 | `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` | 95 passed |
 | `--lib` `--` `client::tests` | 72 passed |
-| `--test persistence` | 29 passed (includes `mdk08_named_room_with_one_known_peer_is_not_direct`) |
+| `--test persistence` | 29 passed (includes description backup + v2 bak backfill of DM/room `is_direct`) |
+| `--test group_invites` | 17 passed |
+| `--test failed_events` | 1 passed |
+| `--test media` | 4 passed |
+| `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
 | Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 31 passed (includes first-paint `isDirect` pins) |
 | `scripts/check-regression-ledger.sh` | 236 citations |

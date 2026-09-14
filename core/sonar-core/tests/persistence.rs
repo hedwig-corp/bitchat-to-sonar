@@ -1038,6 +1038,20 @@ async fn mdk08_account_backup_preserves_recovered_transcript() {
         listed[0].members.contains(&bob.public_key()),
         "resume peers must survive nsec restore"
     );
+    assert!(
+        package.sidecar_files.iter().any(|(name, bytes)| name
+            == ".sonar-historical-descriptions.json"
+            && !bytes.is_empty()),
+        "DM description must travel with the account backup"
+    );
+    assert_eq!(
+        restored.historical_group_description(&gid).as_deref(),
+        Some("sonar.direct-dm.v1")
+    );
+    assert!(
+        restored.historical_resume_is_direct(&gid),
+        "nsec restore must keep a recovered DM on start_dm"
+    );
     let index = sonar_core::conversation_index::ConversationIndex::open_in_memory().expect("index");
     index
         .materialize_from(&restored)
@@ -1905,7 +1919,7 @@ async fn mdk08_named_room_with_one_known_peer_is_not_direct() {
     }
 
     let engine =
-        MarmotEngine::persistent(alice, &db_path, DB_KEY).expect("named room must migrate");
+        MarmotEngine::persistent(alice.clone(), &db_path, DB_KEY).expect("named room must migrate");
     let gid = GroupId::new(group_id);
     assert!(
         !engine.historical_resume_is_direct(&gid),
@@ -1916,6 +1930,24 @@ async fn mdk08_named_room_with_one_known_peer_is_not_direct() {
         Some("weekend hike")
     );
     assert_eq!(engine.historical_group_description(&gid), None);
+    drop(engine);
+
+    let key_hex = DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let package = sonar_core::account_backup::read_account_backup_package(&db_path, &key_hex)
+        .expect("post-migrate backup");
+    let restore_dir = tempfile::tempdir().expect("restore dir");
+    let restore_path = restore_dir.path().join("marmot.sqlite");
+    sonar_core::account_backup::write_account_backup_package(&restore_path, &package)
+        .expect("restore package");
+    let restored = MarmotEngine::persistent(alice, &restore_path, DB_KEY)
+        .expect("named room must survive nsec restore");
+    assert!(
+        !restored.historical_resume_is_direct(&gid),
+        "nsec restore must keep a named room off start_dm"
+    );
 }
 
 /// Labeled 0.8 `encrypted-media` exporter secrets must decrypt recovered
@@ -2215,6 +2247,9 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
     let _ = std::fs::remove_file(
         db_path.with_file_name("marmot.sqlite.sonar-historical-member-counts.json"),
     );
+    let _ = std::fs::remove_file(
+        db_path.with_file_name("marmot.sqlite.sonar-historical-descriptions.json"),
+    );
     let chat_hex = chat_id
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -2371,6 +2406,18 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
         "connect() must seed the recovered invite onto the home list: {summaries:?}"
     );
     let chat = GroupId::new(chat_id);
+    assert_eq!(
+        client
+            .engine()
+            .historical_group_description(&chat)
+            .as_deref(),
+        Some("sonar.direct-dm.v1"),
+        "v2 bak backfill must restore the DM description"
+    );
+    assert!(
+        client.engine().historical_resume_is_direct(&chat),
+        "a recovered DM must stay a DM after description backfill"
+    );
     let plain = client
         .engine()
         .decrypt_media_by_url(&chat, url, &upload.encrypted_data)
