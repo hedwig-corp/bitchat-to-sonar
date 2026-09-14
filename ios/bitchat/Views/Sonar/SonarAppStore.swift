@@ -4217,6 +4217,9 @@ final class SonarAppStore: ObservableObject {
         invalidateHomeRows(on: marmot.$groups)
         invalidateHomeRows(on: marmot.$messagesByGroup)
         invalidateHomeRows(on: marmot.$unreadByGroup)
+        // Compose `conversationIndexVersion`: remounted index latest_at /
+        // preview can land without groups/messages/unread identity moving.
+        invalidateHomeRows(on: marmot.$conversationSummariesByGroup)
         invalidateHomeRows(on: marmot.$profilesByNpub)
         invalidateHomeRows(on: $sonarProfiles)
         invalidateHomeRows(on: $marmotVerified)

@@ -7878,7 +7878,76 @@ impl SonarClient {
                 }
             }
         }
+        // Hide must not invent 0 on the live row. Restore records the bind
+        // only — `copy_summary` stays on `maybe_fold` so a second copy cannot
+        // double-count. Hist remains in the table; first-process hosts and
+        // NSE have no previous cache, so remount unread / latest_at /
+        // message_count onto the published live id here.
+        self.remount_hidden_hist_onto_published_summaries(&mut summaries);
         summaries
+    }
+
+    fn remount_hidden_hist_onto_published_summaries(
+        &self,
+        summaries: &mut Vec<ConversationSummary>,
+    ) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let pairs = self.engine.historical_fold_pairs();
+        if pairs.is_empty() {
+            return;
+        }
+        let idx = idx.lock().unwrap();
+        let mut synthesized = false;
+        for (historical, live) in pairs {
+            if live == historical {
+                continue;
+            }
+            let hist_hex = hex::encode(historical.as_slice());
+            let live_hex = hex::encode(live.as_slice());
+            let Ok(Some(hist)) = idx.summary(&hist_hex) else {
+                continue;
+            };
+            if hist.unread_count == 0 && hist.latest_at_secs == 0 && hist.message_count == 0 {
+                continue;
+            }
+            if let Some(live_summary) = summaries
+                .iter_mut()
+                .find(|s| s.group_id_hex == live_hex)
+            {
+                Self::remount_hist_fields_onto_live(live_summary, &hist);
+                continue;
+            }
+            if self.engine.is_dropped(&live)
+                || !self.engine.is_live_group(&live).unwrap_or(false)
+            {
+                continue;
+            }
+            let mut published = hist.clone();
+            published.group_id_hex = live_hex;
+            summaries.push(published);
+            synthesized = true;
+        }
+        if synthesized {
+            summaries.sort_by(|a, b| b.latest_at_secs.cmp(&a.latest_at_secs));
+        }
+    }
+
+    fn remount_hist_fields_onto_live(live: &mut ConversationSummary, hist: &ConversationSummary) {
+        live.unread_count = live.unread_count.saturating_add(hist.unread_count);
+        if hist.latest_at_secs > live.latest_at_secs {
+            live.latest_content = hist.latest_content.clone();
+            live.latest_sender = hist.latest_sender.clone();
+            live.latest_at_secs = hist.latest_at_secs;
+            live.latest_mine = hist.latest_mine;
+        }
+        if hist.message_count > live.message_count {
+            live.message_count = hist.message_count;
+        }
+        if live.name.is_empty() && !hist.name.is_empty() {
+            live.name = hist.name.clone();
+        }
     }
 
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
@@ -9379,6 +9448,109 @@ mod tests {
         assert!(
             client.conversation_summary(&group_hex).is_none(),
             "index upsert after Leave must not recreate the home-list row"
+        );
+    }
+
+    /// Restore records the hist→live bind without `copy_summary`. Hide must
+    /// still publish hist unread / latest_at / message_count on the live row
+    /// so first-process hosts and NSE do not invent 0. A later `copy_summary`
+    /// zeros hist unread, so a second remount cannot double-count.
+    #[tokio::test]
+    async fn conversation_summaries_remount_hidden_hist_without_copy_summary() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "old 1", "alice", 80, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "old 2", "alice", 90, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live_hex, "", "", "", 0, true, false)
+                .unwrap();
+            assert_eq!(idx.summary(&hist_hex).unwrap().unwrap().unread_count, 3);
+            assert_eq!(idx.summary(&live_hex).unwrap().unwrap().unread_count, 0);
+        }
+        client.engine.record_historical_fold(&historical, &live);
+
+        let summaries = client.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "folded hist must stay hidden: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, live_hex);
+        assert_eq!(
+            summaries[0].unread_count, 3,
+            "first-process hide must remount hist unread onto live"
+        );
+        assert_eq!(summaries[0].latest_at_secs, 100);
+        assert_eq!(summaries[0].latest_content, "keep this chat");
+        assert_eq!(
+            summaries[0].message_count, 3,
+            "blank-recovery count must remount when live count is still 0"
+        );
+        assert_eq!(
+            client
+                .conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            3,
+            "display remount must not write copy_summary"
+        );
+
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&live_hex, "alice", "new 0.9", "alice", 200, false, true)
+                .unwrap();
+        }
+        let with_live_unread = client.conversation_summaries();
+        assert_eq!(
+            with_live_unread[0].unread_count, 4,
+            "incoming 0.9 unread must add hist, matching copy_summary"
+        );
+        assert_eq!(with_live_unread[0].latest_at_secs, 200);
+        assert_eq!(with_live_unread[0].latest_content, "new 0.9");
+
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.copy_summary(&hist_hex, &live_hex).unwrap();
+            assert_eq!(idx.summary(&hist_hex).unwrap().unwrap().unread_count, 0);
+            assert_eq!(idx.summary(&live_hex).unwrap().unwrap().unread_count, 4);
+        }
+        let after_copy = client.conversation_summaries();
+        assert_eq!(
+            after_copy[0].unread_count, 4,
+            "after copy_summary hist unread is 0; remount must not double-count"
+        );
+        assert_eq!(after_copy[0].latest_at_secs, 200);
+        assert!(
+            after_copy[0].message_count >= 3,
+            "hist count must still remount after copy_summary leaves live count stale"
         );
     }
 

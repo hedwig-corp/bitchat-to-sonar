@@ -1501,6 +1501,20 @@ still used the snapshot-0 order until chats/snapshot identity moved.
 Bump `conversationIndexVersion` into `VisibleChatsKey`. Pin:
 `EventDrivenRefreshTest.conversationIndexVersionChangeInvalidates`.
 
+iOS `dmRows` revision ignored `conversationSummariesByGroup`. A remounted
+index `latestAt` / preview can land without groups / messages / unread
+identity moving, so Home kept the snapshot-0 cache. Subscribe
+`marmot.$conversationSummariesByGroup` the same way Compose bumps
+`conversationIndexVersion`.
+
+`conversation_summaries()` hid folded hist without remounting its index
+row onto live. Restore does not `copy_summary` (double-count). First
+process after hide — and NSE, which has no previous host cache — published
+live unread / `latest_at` / `message_count` 0. Display-remount hist onto
+the published live id (add unread, max latest/count). After
+`copy_summary` hist unread is 0 so a second remount cannot double-count.
+Pin: `client::tests::conversation_summaries_remount_hidden_hist_without_copy_summary`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot
