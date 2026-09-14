@@ -491,19 +491,18 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after cold-start notification remap from the
-persisted hist→live blob.
+Re-run on this cloud agent on `e218e2f0` (cold-start persisted-fold remap).
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `historical_fold` `fetch_media_with_stored` | 11 passed (includes remounted live-id decrypt) |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 178 passed |
+| `--test persistence` | 30 passed |
+| `--test group_invites` | 17 passed |
+| `--test failed_events` | 1 passed |
+| `--test media` | 4 passed |
+| `-p sonar-sim` | 5 passed |
+| `--test e2e` `recovered_08` | 7 passed |
 | Compose `SonarNotificationHandoffTest` + `ConversationFoldTest` | passed |
-| `--test persistence` | 30 passed (previous HEAD) |
-| `--test group_invites` | 17 passed (previous HEAD) |
-| `--test failed_events` | 1 passed (previous HEAD) |
-| `--test media` | 4 passed (previous HEAD) |
-| `-p sonar-sim` | 5 passed (previous HEAD) |
-| `--test e2e` `recovered_08` | 7 passed (previous HEAD) |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with
 only one known peer no longer resumes as `start_dm`. Extract copies
