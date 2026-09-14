@@ -447,6 +447,33 @@ final class ConversationViewState: ObservableObject {
         isLoadingOlder = false
     }
 
+    /// Expand the painted suffix so a quote parent already in the family
+    /// cache is reachable without waiting on load-older.
+    private func applyQuotedMessageRevealIfNeeded(store: SonarAppStore) {
+        guard let parentId = store.jumpMessageIdAtOpenByDM[conversationId]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !parentId.isEmpty
+        else { return }
+        let retained = TransportConfig.sonarTranscriptRetainedCount
+        let pageSize = TransportConfig.sonarTranscriptPageCount
+        let cached = store.dmMsgs(
+            conversationId,
+            limit: retained,
+            meshNewestOffset: meshNewestOffset,
+            paymentNewestOffset: paymentNewestOffset,
+            callNewestOffset: callNewestOffset
+        )
+        guard let reveal = snQuotedMessageRevealLimit(
+            parentId: parentId,
+            cached: cached,
+            idOf: { $0.id },
+            pageSize: pageSize,
+            retainedRows: retained
+        ) else { return }
+        visibleMessageLimit = max(visibleMessageLimit, reveal)
+        sourceMessageLimit = max(sourceMessageLimit, reveal)
+    }
+
     /// Coalesce rebuild requests: at most one queued build at a time. A change
     /// arriving mid-build is covered by the next invalidation tick.
     private func scheduleRebuild() {
@@ -497,6 +524,7 @@ final class ConversationViewState: ObservableObject {
             // its newest page while the visible anchor remains much older.
             store.preserveHistoricalDM(conversationId)
         }
+        applyQuotedMessageRevealIfNeeded(store: store)
         let sourceLookaheadLimit = min(
             TransportConfig.sonarTranscriptRetainedCount,
             sourceMessageLimit + 1

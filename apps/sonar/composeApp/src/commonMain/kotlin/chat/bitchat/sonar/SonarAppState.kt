@@ -746,6 +746,23 @@ internal fun seededFoldFamilyTranscriptHasMore(
     familyHasOlder: Boolean = false,
 ): Boolean = familyHasOlder || foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)
 
+/** Visible-row budget that includes [parentId] when it already sits in the
+ *  family-unioned host cache. Quote-jump searches the painted suffix; a
+ *  parent older than [pageSize] but still in the retained window must
+ *  expand the budget instead of soft-failing. iOS `snQuotedMessageRevealLimit`. */
+internal fun quotedMessageRevealLimit(
+    parentId: String,
+    cached: List<SonarMsg>,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+    retainedRows: Int = TRANSCRIPT_RETAINED_ROWS,
+): Int? {
+    val id = parentId.trim()
+    if (id.isEmpty() || cached.isEmpty() || pageSize <= 0 || retainedRows <= 0) return null
+    val idx = cached.indexOfFirst { it.id == id }
+    if (idx < 0) return null
+    return maxOf(pageSize, cached.size - idx).coerceAtMost(retainedRows)
+}
+
 /** True when any fold-family id still has an older local page, or when the
  *  unioned host cache itself overflows the painted page. */
 internal fun hasOlderForFoldFamily(
@@ -2440,9 +2457,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     private fun meshWhiteNoiseSeed(chatId: String): List<SonarMsg> =
         transcriptGroupIds(chatId).flatMap { groupId ->
-            chatSnapshotMessagesByChat[groupId].orEmpty()
-                .withoutSyntheticSummaryRows()
-                .map { it.copy(viaInternet = true) }
+            snapshotMessagesForChat(groupId).map { it.copy(viaInternet = true) }
         }
 
     // ── Mocked voice/video call log (in-memory only) ──
@@ -4024,7 +4039,41 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun jumpToQuotedMessage(chatId: String, parentId: String) {
-        openChatJumpMessageId = openChatJumpMessageId + (chatId to parentId)
+        val trimmed = parentId.trim()
+        if (trimmed.isEmpty()) return
+        val cached = quotedMessageRevealCache(chatId)
+        applyQuotedMessageReveal(trimmed, cached)
+        if (chatId in transcriptSessionChatIds()) {
+            val sessionId = activeTranscriptChatId ?: chatId
+            val bounded = refreshConversationRows(cached, sessionId, transcriptGeneration)
+            setCurrentVisibleMessages(sessionId, withSendEchoes(sessionId, bounded))
+        }
+        openChatJumpMessageId = openChatJumpMessageId + (chatId to trimmed)
+    }
+
+    /** Host + window rows a quote-jump may expand into without a load-older. */
+    private fun quotedMessageRevealCache(chatId: String): List<SonarMsg> {
+        val rows = ArrayList<SonarMsg>()
+        rows += snapshotMessagesForChat(chatId)
+        if (isMeshChat(chatId)) {
+            rows += meshWhiteNoiseSeed(chatId)
+            for (groupId in transcriptGroupIds(chatId)) {
+                rows += snapshotMessagesForChat(groupId)
+                rows += transcriptWindows[groupId]?.rows.orEmpty()
+            }
+        } else {
+            for (id in foldFamilyIds(chatId, historicalFoldMap).ifEmpty { setOf(chatId) }) {
+                rows += transcriptWindows[id]?.rows.orEmpty()
+            }
+        }
+        rows += conversationTranscriptRows
+        return mergeAllTranscriptRows(rows)
+    }
+
+    private fun applyQuotedMessageReveal(parentId: String, cached: List<SonarMsg>) {
+        quotedMessageRevealLimit(parentId, cached)?.let { reveal ->
+            conversationVisibleRowLimit = maxOf(conversationVisibleRowLimit, reveal)
+        }
     }
 
     private fun consumeComposerReply(chatId: String): SonarReplyRef? {
@@ -7371,6 +7420,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 historicalFoldMap,
             )
             seedFoldFamilyTranscriptWindows(chat.id, union)
+            applyQuotedMessageReveal(jumpMessageId.orEmpty(), union)
             messages = visibleMessagesForChat(
                 chat.id,
                 withSendEchoes(
@@ -7407,6 +7457,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             chat.id,
             snapshotMessagesForChat(chat.id),
         )
+        applyQuotedMessageReveal(jumpMessageId.orEmpty(), snapshotMessagesForChat(chat.id))
         scope.launch {
             val local = withSendEchoes(
                 chat.id,
@@ -7451,8 +7502,38 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
 
         // Reopen: retained leave paint → push now; hydrate quietly.
-        retainedTranscriptByChat[id]?.takeIf { it.isNotEmpty() }?.let { retained ->
-            messages = retained
+        // After an MDK 0.8→0.9 fold the leave frame may be a short live
+        // 0.9 + mesh tail; union remounted WN family rows so first paint
+        // cannot hide recovered 0.8 history. iOS `rebuildNow` already
+        // unions via `dmMsgs`.
+        retainedTranscriptForChat(id, retainedTranscriptByChat, historicalFoldMap)
+            .takeIf { it.isNotEmpty() }
+            ?.let {
+            if (retainedTranscriptByChat[id].isNullOrEmpty()) {
+                retainOpenTranscript(id, it)
+            }
+            val familySnapshot = mergeAllTranscriptRows(
+                meshWhiteNoiseSeed(id) + snapshotMessagesForChat(id),
+            )
+            val union = firstOpenTranscriptPaintRows(
+                id,
+                retainedTranscriptByChat,
+                familySnapshot,
+                historicalFoldMap,
+            )
+            for (groupId in transcriptGroupIds(id)) {
+                seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
+            }
+            seedFoldFamilyTranscriptWindows(id, union)
+            applyQuotedMessageReveal(jumpMessageId.orEmpty(), union)
+            messages = visibleMessagesForChat(
+                id,
+                withSendEchoes(
+                    id,
+                    refreshConversationRows(union, id, generation),
+                ),
+            )
+            retainOpenTranscript(id, messages)
             processPayLines(id, messages)
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("mesh-folded", id, "push-retained")
@@ -7473,6 +7554,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         for (groupId in transcriptGroupIds(id)) {
             seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
         }
+        applyQuotedMessageReveal(
+            jumpMessageId.orEmpty(),
+            mergeAllTranscriptRows(meshWhiteNoiseSeed(id) + snapshotMessagesForChat(id)),
+        )
         scope.launch {
             val mesh = refreshMeshTranscriptWindow(canonicalPeerId)
             val wn = marmotMessagesForPeer(canonicalPeerId, id, generation)

@@ -842,6 +842,34 @@ struct SonarConversationFoldTests {
         #expect(!snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: false))
         #expect(snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: true))
         #expect(
+            snQuotedMessageRevealLimit(
+                parentId: "m5",
+                cached: (1...40).map { "m\($0)" },
+                idOf: { $0 }
+            ) == 36
+        )
+        #expect(
+            snQuotedMessageRevealLimit(
+                parentId: "m39",
+                cached: (1...40).map { "m\($0)" },
+                idOf: { $0 }
+            ) == 30
+        )
+        #expect(
+            snQuotedMessageRevealLimit(
+                parentId: "missing",
+                cached: (1...40).map { "m\($0)" },
+                idOf: { $0 }
+            ) == nil
+        )
+        #expect(
+            snQuotedMessageRevealLimit(
+                parentId: "r1",
+                cached: (1...520).map { "r\($0)" },
+                idOf: { $0 }
+            ) == 500
+        )
+        #expect(
             snFoldFamilyPagingCursor(
                 groupId: "group-09",
                 cursorsByGroup: ["group-08": "cursor-08"],

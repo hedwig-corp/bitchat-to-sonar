@@ -570,6 +570,23 @@ func snSeededFoldFamilyTranscriptHasMore(
     familyHasOlder || snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize)
 }
 
+/// Visible-row budget that includes `parentId` when it already sits in the
+/// family-unioned host cache. Quote-jump searches the painted suffix; a
+/// parent older than `pageSize` but still in the retained window must
+/// expand the budget instead of soft-failing. Compose `quotedMessageRevealLimit`.
+func snQuotedMessageRevealLimit<Message>(
+    parentId: String,
+    cached: [Message],
+    idOf: (Message) -> String,
+    pageSize: Int = 30,
+    retainedRows: Int = 500
+) -> Int? {
+    let id = parentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty, !cached.isEmpty, pageSize > 0, retainedRows > 0 else { return nil }
+    guard let idx = cached.firstIndex(where: { idOf($0) == id }) else { return nil }
+    return min(retainedRows, max(pageSize, cached.count - idx))
+}
+
 /// True when any fold-family id still has an older local page, or when the
 /// unioned host cache itself overflows the painted page. Promote copies
 /// the hist flag onto live asynchronously; first paint of the live row
@@ -2743,6 +2760,8 @@ final class SonarAppStore: ObservableObject {
 
     func jumpToQuotedMessage(chatId: String, parentId: String) {
         jumpMessageIdAtOpenByDM[chatId] = parentId
+        // `ConversationViewState.rebuildNow` expands `visibleMessageLimit`
+        // when the parent already sits in the family-unioned host cache.
         objectWillChange.send()
     }
 

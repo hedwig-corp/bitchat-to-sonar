@@ -1104,6 +1104,37 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun quotedMessageRevealExpandsPaintedPageToParent() {
+        val cached = (1..40).map { i ->
+            SonarMsg(
+                id = "m$i",
+                senderNpub = "npub1peer",
+                content = "row $i",
+                mine = false,
+                tsSecs = i.toLong(),
+            )
+        }
+        assertEquals(36, quotedMessageRevealLimit("m5", cached))
+        assertEquals(TRANSCRIPT_PAGE_SIZE, quotedMessageRevealLimit("m39", cached))
+        assertNull(quotedMessageRevealLimit("missing", cached))
+        assertNull(quotedMessageRevealLimit("m5", emptyList()))
+        assertNull(quotedMessageRevealLimit("  ", cached))
+        val retained = (1..TRANSCRIPT_RETAINED_ROWS + 20).map { i ->
+            SonarMsg(
+                id = "r$i",
+                senderNpub = "npub1peer",
+                content = "row $i",
+                mine = false,
+                tsSecs = i.toLong(),
+            )
+        }
+        assertEquals(
+            TRANSCRIPT_RETAINED_ROWS,
+            quotedMessageRevealLimit("r1", retained),
+        )
+    }
+
+    @Test
     fun composerDraftReadAndClearWalkFoldFamily() {
         val folds = mapOf("group-08" to "group-09")
         val drafts = mapOf("group-08" to "hello from 0.8")
