@@ -2467,6 +2467,34 @@ class ConversationFoldTest {
         assertTrue(conversationsMatchFoldFamily("group-09", "group-09", folds))
         assertFalse(conversationsMatchFoldFamily("group-08", "other", folds))
         assertFalse(conversationsMatchFoldFamily("group-08", "group-09", emptyMap()))
+        assertTrue(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = "group-09",
+                changedId = "group-08",
+                historicalFolds = folds,
+            ),
+        )
+        assertTrue(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = "group-09",
+                changedId = "group-09",
+                historicalFolds = folds,
+            ),
+        )
+        assertFalse(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = "group-09",
+                changedId = "other",
+                historicalFolds = folds,
+            ),
+        )
+        assertFalse(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = null,
+                changedId = "group-08",
+                historicalFolds = folds,
+            ),
+        )
         assertEquals(emptyMap(), purgedHistoricalFolds(folds, setOf("group-09")))
         assertEquals(folds, purgedHistoricalFolds(folds, setOf("unrelated")))
         assertEquals(

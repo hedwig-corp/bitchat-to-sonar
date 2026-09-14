@@ -263,7 +263,7 @@ struct SonarGroupInfoScreen: View {
         .background(SonarTheme.bg.ignoresSafeArea())
         .overlay(alignment: .bottom) { toastView }
         .animation(.easeOut(duration: 0.2), value: toast)
-        .task(id: peerId) { await loadPendingJoinRequests() }
+        .task(id: "\(peerId)-\(store.marmot.groupInfoPendingRevision)") { await loadPendingJoinRequests() }
         .snSheet(isPresented: $leaveSheet, title: "Leave group") {
             VStack(spacing: 12) {
                 Text("Are you sure you want to leave this group? You won\u{2019}t be able to read or send messages anymore.")

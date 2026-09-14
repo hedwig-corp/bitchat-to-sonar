@@ -483,6 +483,9 @@ final class MarmotChatModel: ObservableObject {
     @Published private(set) var initialLocalHomeReady = false
     /// Unread message counts per Marmot group, keyed by group ID hex.
     @Published var unreadByGroup: [String: UInt64] = [:]
+    /// Bumped when `conversationChanged` lands so open group-info reloads
+    /// pending join requests without leaving the screen.
+    @Published private(set) var groupInfoPendingRevision: UInt64 = 0
     /// Groups marked read whose core `unread_count` may still be nonzero while
     /// `markConversationRead` is in flight. Summary refresh must not restore
     /// their badges (Compose `unreadSuppressGroupIds` parity).
@@ -2603,6 +2606,7 @@ final class MarmotChatModel: ObservableObject {
                 }
             }
             self.conversationRefreshTask = nil
+            self.groupInfoPendingRevision &+= 1
         }
     }
 

@@ -78,7 +78,7 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     fun refreshPendingJoinRequests() {
         state.loadPendingJoinRequests(chatId) { pendingJoinRequests = it }
     }
-    LaunchedEffect(chatId) { refreshPendingJoinRequests() }
+    LaunchedEffect(chatId, state.groupInfoPendingRevision) { refreshPendingJoinRequests() }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(s.bg)) {

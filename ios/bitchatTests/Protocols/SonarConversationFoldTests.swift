@@ -247,6 +247,34 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: "marmot:group-09",
+                changedId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: "marmot:group-09",
+                changedId: "marmot:group-09",
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: "marmot:group-09",
+                changedId: "other",
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
+            !snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: nil,
+                changedId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            )
+        )
+        #expect(
             snRemountFoldedOpenValues(
                 historicalKeys: ["marmot:group-08", "group-08"],
                 liveKeys: ["marmot:group-09", "group-09"],

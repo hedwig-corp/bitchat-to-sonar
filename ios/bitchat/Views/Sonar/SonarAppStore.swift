@@ -415,6 +415,26 @@ func snConversationsMatchFoldFamily(
     return snFoldFamilyIds(id: leftBare, historicalFolds: historicalFolds).contains(rightBare)
 }
 
+/// Open group-info must reload pending joins when `conversationChanged`
+/// names this room or its hidden 0.8 sibling. Compose
+/// `groupInfoShouldReloadPending`.
+func snGroupInfoShouldReloadPending(
+    openGroupInfoChatId: String?,
+    changedId: String,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> Bool {
+    guard let open = openGroupInfoChatId, !open.isEmpty, !changedId.isEmpty else {
+        return false
+    }
+    return snConversationsMatchFoldFamily(
+        left: open,
+        right: changedId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    )
+}
+
 /// Copy an open-chat host map (unread divider, jump, window) from a hidden
 /// 0.8 id onto the live sibling so remount does not treat the chat as a
 /// fresh open.

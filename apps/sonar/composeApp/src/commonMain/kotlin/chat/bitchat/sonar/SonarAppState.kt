@@ -1821,6 +1821,18 @@ internal fun conversationsMatchFoldFamily(
     return foldFamilyIds(left, historicalFolds).contains(right)
 }
 
+/** Open group-info must reload pending joins when `conversationChanged`
+ *  names this room or its hidden 0.8 sibling. iOS
+ *  `snGroupInfoShouldReloadPending`. */
+internal fun groupInfoShouldReloadPending(
+    openGroupInfoChatId: String?,
+    changedId: String,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    val open = openGroupInfoChatId?.takeIf { it.isNotBlank() } ?: return false
+    return conversationsMatchFoldFamily(open, changedId, historicalFolds)
+}
+
 /** Conversation keys a chat-scoped payment read must check after a fold. */
 internal fun paymentActivityPeerKeys(
     chatId: String,
@@ -3018,6 +3030,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val callLogs = mutableMapOf<String, MutableList<CallRecord>>()
     /** Bumped on every call-log change so the open chat recomposes. */
     var callVersion by mutableStateOf(0)
+        private set
+    /** Bumped when `conversationChanged` hits the open group-info family
+     *  so pending join requests reload without leaving the screen. */
+    var groupInfoPendingRevision by mutableStateOf(0)
         private set
 
     /** Call-log records for [chatId] (oldest first). Deduped last-wins so a
@@ -14673,6 +14689,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                     stagedChangedPages.remove(targetId)
                     failedChangedPageReads.add(targetId)
                     if (targetId != groupIdHex) stagedChangedPages.remove(groupIdHex)
+                }
+                (screen as? Screen.GroupInfo)?.let { info ->
+                    if (groupInfoShouldReloadPending(info.chatId, groupIdHex, historicalFoldMap) ||
+                        groupInfoShouldReloadPending(info.chatId, targetId, historicalFoldMap)
+                    ) {
+                        groupInfoPendingRevision++
+                    }
                 }
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && (
