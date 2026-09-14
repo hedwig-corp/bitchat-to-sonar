@@ -508,6 +508,11 @@ members / exporter secrets / folds / transcript / parked invites),
 `media_staging::tests::wipe_removes_crashed_state_tmp`,
 `push::tests::wipe_removes_crashed_cache_tmp`,
 `account_backup::tests::wipe_backup_policy_removes_crashed_unique_tmp`,
+`ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`
+(`conversationsMatchFoldFamily` — Compose open-transcript refresh must
+treat a remounted room and its hidden 0.8 sibling as the same chat,
+matching iOS `snConversationsMatchFoldFamily`. `isSameDirectMarmotChat`
+alone misses rooms after FFI hide),
 `ConversationFoldTest.foldedHistoricalPaymentActivitiesMoveOntoLiveSibling`
 (chat-scoped `SonarPaymentActivity.peerKey` remounts from the hidden 0.8
 id onto the live sibling; wallet / Unify keys stay put. Hosts persist

@@ -891,6 +891,17 @@ internal fun foldFamilyIds(
     return family.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
+/** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
+internal fun conversationsMatchFoldFamily(
+    left: String,
+    right: String,
+    historicalFolds: Map<String, String>,
+): Boolean {
+    if (left.isBlank() || right.isBlank()) return false
+    if (left == right) return true
+    return foldFamilyIds(left, historicalFolds).contains(right)
+}
+
 /** Conversation keys a chat-scoped payment read must check after a fold. */
 internal fun paymentActivityPeerKeys(
     chatId: String,
@@ -5993,8 +6004,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 observedLatestSecs = summaryByChat[chatId]?.latestAtSecs ?: 0L,
             )
         }
-        notificationSeenMessageIds.keys.retainAll(knownChatIds)
-        notificationLatestSecs.keys.retainAll(knownChatIds)
+        // After FFI hides a folded 0.8 id it leaves knownChatIds. Keep
+        // fold-family watermarks so a later historical remainder tick cannot
+        // replay recovered history as never-seen.
+        val retainIds = knownChatIds.flatMapTo(hashSetOf()) { id ->
+            foldFamilyIds(id, historicalFoldMap) + id
+        }
+        notificationSeenMessageIds.keys.retainAll(retainIds)
+        notificationLatestSecs.keys.retainAll(retainIds)
     }
 
     private fun notifyChatIfNew(
@@ -13028,7 +13045,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     failedChangedPageReads.add(groupIdHex)
                 }
                 (screen as? Screen.Chat)?.let { sc ->
-                    if (!isMeshChat(sc.id) && (sc.id == groupIdHex || isSameDirectMarmotChat(sc.id, groupIdHex))) {
+                    if (!isMeshChat(sc.id) && (
+                        sc.id == groupIdHex ||
+                            isSameDirectMarmotChat(sc.id, groupIdHex) ||
+                            conversationsMatchFoldFamily(sc.id, groupIdHex, historicalFoldMap)
+                    )) {
                         val mergedMessages = marmotMessagesPageForChat(sc.id)
                         setCurrentVisibleMessages(
                             sc.id,
@@ -13036,7 +13057,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                             processCalls = true,
                         )
                         // Viewing the chat: new arrivals must not leave a badge.
-                        markGroupsRead(directMarmotChatIds(sc.id))
+                        // Core mark_read walks the fold family; include both
+                        // ids here so viewing-suppress matches a remainder
+                        // tick that still names the hidden 0.8 sibling.
+                        markGroupsRead(
+                            (directMarmotChatIds(sc.id) + foldFamilyIds(sc.id, historicalFoldMap))
+                                .distinct(),
+                        )
                     } else if (isMeshChat(sc.id)) {
                         val peerId = peerIdForMarmotGroup(groupIdHex)
                         if (peerId != null && sc.id == meshChatId(peerId)) {
