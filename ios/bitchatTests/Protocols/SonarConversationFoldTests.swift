@@ -226,6 +226,9 @@ struct SonarConversationFoldTests {
             deletedId: "mesh:peer",
             purgeIds: ["mesh:peer"]
         ))
+        #expect(snMacSelectionShouldHopAfterOpenSessionCleared(isDM: true, isChannel: false))
+        #expect(snMacSelectionShouldHopAfterOpenSessionCleared(isDM: false, isChannel: true))
+        #expect(!snMacSelectionShouldHopAfterOpenSessionCleared(isDM: false, isChannel: false))
         #expect(
             snNotificationOpenGroupId(
                 tappedGroupId: "group-08",

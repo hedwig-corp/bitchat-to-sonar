@@ -1255,6 +1255,13 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun wipeEraseRestoreHopMacOffOpenConversation() {
+        assertTrue(macSelectionShouldHopAfterOpenSessionCleared(isDM = true, isChannel = false))
+        assertTrue(macSelectionShouldHopAfterOpenSessionCleared(isDM = false, isChannel = true))
+        assertFalse(macSelectionShouldHopAfterOpenSessionCleared(isDM = false, isChannel = false))
+    }
+
+    @Test
     fun macClosedDmClearsRemountedLiveOpenedId() {
         assertTrue(
             closedDMShouldClearOpened(

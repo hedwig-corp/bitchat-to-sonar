@@ -161,7 +161,16 @@ struct SonarMacRootView: View {
             store.path.removeAll()
         }
         .onChange(of: store.deletedOpenConversationTick) { _ in
-            if case .dm = selection { selection = .radar }
+            let isDM: Bool
+            let isChannel: Bool
+            switch selection {
+            case .dm: isDM = true; isChannel = false
+            case .channel: isDM = false; isChannel = true
+            default: return
+            }
+            if snMacSelectionShouldHopAfterOpenSessionCleared(isDM: isDM, isChannel: isChannel) {
+                selection = .radar
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .sonarMacOpenSearch)) { _ in
             searchOpen = true

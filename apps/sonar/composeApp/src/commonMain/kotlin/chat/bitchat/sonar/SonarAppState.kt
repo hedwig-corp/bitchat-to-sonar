@@ -767,6 +767,14 @@ internal fun deletedConversationIdInPurge(id: String, purgeIds: Set<String>): Bo
     return bare.isNotEmpty() && (bare in purgeIds || "marmot:$bare" in purgeIds)
 }
 
+/** Wipe / erase / nsec restore hop Mac off a dead DM or channel.
+ *  Compose resets `stack` to Home. iOS
+ *  `snMacSelectionShouldHopAfterOpenSessionCleared`. */
+internal fun macSelectionShouldHopAfterOpenSessionCleared(
+    isDM: Boolean,
+    isChannel: Boolean,
+): Boolean = isDM || isChannel
+
 internal fun deletedConversationClearsOpen(
     openId: String?,
     deletedId: String,

@@ -612,6 +612,16 @@ func snDeletedConversationIdInPurge(_ id: String, purgeIds: Set<String>) -> Bool
     return false
 }
 
+/// Wipe / erase / nsec restore must hop Mac split-view off a dead
+/// DM *or* channel. Compose resets `stack` to Home. Single-chat
+/// delete already increments `deletedOpenConversationTick`.
+func snMacSelectionShouldHopAfterOpenSessionCleared(
+    isDM: Bool,
+    isChannel: Bool
+) -> Bool {
+    isDM || isChannel
+}
+
 func snDeletedConversationClearsOpen(
     openId: String?,
     deletedId: String,
@@ -5763,8 +5773,7 @@ final class SonarAppStore: ObservableObject {
         // replace the account, so both have to.
         defaults.removeObject(forKey: MarmotAccountBackupFlow.cellularOptInKey)
         path = []
-        openedConversationId = nil
-        openedConversationPaneId = nil
+        hopMacOpenConversationSelection()
         suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -14723,6 +14732,12 @@ final class SonarAppStore: ObservableObject {
             deletedId: deletedId,
             purgeIds: purgeIds
         ) else { return }
+        hopMacOpenConversationSelection()
+    }
+
+    /// Compose `stack = listOf(Home)` on erase / wipe / nsec restore.
+    /// Mac selection is view-local and would otherwise keep `.dm` / `.channel`.
+    private func hopMacOpenConversationSelection() {
         openedConversationId = nil
         openedConversationPaneId = nil
         deletedOpenConversationTick &+= 1
@@ -14906,8 +14921,7 @@ final class SonarAppStore: ObservableObject {
         // store is erased so a late completion cannot recreate a group.
         await quiescePendingMarmotGroupSetups()
         path = []
-        openedConversationId = nil
-        openedConversationPaneId = nil
+        hopMacOpenConversationSelection()
         suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -14997,8 +15011,7 @@ final class SonarAppStore: ObservableObject {
         marmot.stopPolling()
         await marmot.wipeDatabase()
         path = []
-        openedConversationId = nil
-        openedConversationPaneId = nil
+        hopMacOpenConversationSelection()
         suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
