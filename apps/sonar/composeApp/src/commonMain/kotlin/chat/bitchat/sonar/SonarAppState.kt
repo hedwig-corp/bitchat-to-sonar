@@ -1825,6 +1825,37 @@ internal fun <V> updatePendingMessagesForChat(
     return found
 }
 
+/** Hidden 0.8 ids core `leave_group(live)` will not purge when persist-folds
+ *  landed before `fold_family`. Hosts must `deleteChat` these after leave or
+ *  the next cold start resurrects the room. iOS `snLeaveFamilyCorePurgeIds`. */
+internal fun leaveFamilyCorePurgeIds(
+    leaveId: String,
+    historicalFolds: Map<String, String>,
+): List<String> {
+    val leave = leaveId.trim()
+    if (leave.isEmpty()) return emptyList()
+    return foldFamilyIds(leave, historicalFolds)
+        .filter { it.isNotBlank() && it != leave }
+        .sorted()
+}
+
+/** Listed Marmot ids plus their persist-folds siblings. Mesh-folded DM
+ *  delete must `deleteChat` the hidden 0.8 id, not only the listed live
+ *  group. iOS `snDeletedConversationCorePurgeIds`. */
+internal fun deletedConversationCorePurgeIds(
+    listedIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+): List<String> {
+    val out = linkedSetOf<String>()
+    for (id in listedIds) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) continue
+        out += trimmed
+        out.addAll(foldFamilyIds(trimmed, historicalFolds))
+    }
+    return out.filter { it.isNotBlank() }.sorted()
+}
+
 /** Drop host fold bindings whose historical or live id was just deleted. */
 internal fun purgedHistoricalFolds(
     folds: Map<String, String>,
@@ -8241,6 +8272,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
             ) + foldFamilyIds(chatId, historicalFoldMap)
         val deleteIdSet = deleteIds.toSet()
+        // Capture before forget: persist-folds sidecar is the only name
+        // core leave has for the hidden 0.8 sibling.
+        val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, historicalFoldMap)
         forgetHistoricalFolds(deleteIdSet)
         chats = chats.filterNot { it.id in deleteIdSet }
         chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it !in deleteIdSet }
@@ -8270,6 +8304,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 if (isGroup) {
                     SonarCore.leaveGroup(chatId)
+                    // Persist-folds: core leave only purges fold_aliases.
+                    for (id in familyPurgeIds) {
+                        runCatching { SonarCore.deleteChat(id) }
+                    }
                 } else {
                     for (id in deleteIds) SonarCore.deleteChat(id)
                 }
@@ -8343,11 +8381,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             aliases.forEach { MessageStore.deleteMeshDm(it) }
-            foldedGroups.forEach { group ->
-                runCatching { SonarCore.deleteChat(group.id) }
+            val purgeIds = deletedConversationCorePurgeIds(
+                foldedGroupIdsToDelete,
+                historicalFoldMap,
+            )
+            for (id in purgeIds) {
+                runCatching { SonarCore.deleteChat(id) }
                     .onFailure { toast = "couldn't delete chat: ${it.message}" }
             }
-            if (foldedGroups.isNotEmpty()) refreshChats()
+            if (purgeIds.isNotEmpty()) refreshChats()
         }
     }
 

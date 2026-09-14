@@ -2428,6 +2428,17 @@ class ConversationFoldTest {
         val live = SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false)
         val leftover = listOf(historical, live).filterNot { it.id in foldFamilyIds("group-09", folds) }
         assertEquals(emptyList(), leftover)
+        assertEquals(listOf("group-08"), leaveFamilyCorePurgeIds("group-09", folds))
+        assertEquals(listOf("group-09"), leaveFamilyCorePurgeIds("group-08", folds))
+        assertEquals(emptyList(), leaveFamilyCorePurgeIds("group-09", emptyMap()))
+        assertEquals(
+            listOf("group-08", "group-09"),
+            deletedConversationCorePurgeIds(listOf("group-09"), folds),
+        )
+        assertEquals(
+            listOf("group-09"),
+            deletedConversationCorePurgeIds(listOf("group-09"), emptyMap()),
+        )
         assertEquals(
             listOf(historical),
             collapsedFoldedSnapshotChats(

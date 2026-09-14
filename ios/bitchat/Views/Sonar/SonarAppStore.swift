@@ -1882,6 +1882,38 @@ func snMutedFoldKeys(
     return keys
 }
 
+/// Hidden 0.8 ids core `leave_group(live)` will not purge when persist-folds
+/// landed before `fold_family`. Hosts must `deleteGroup` these after leave
+/// or the next cold start resurrects the room. Compose
+/// `leaveFamilyCorePurgeIds`.
+func snLeaveFamilyCorePurgeIds(
+    leaveId: String,
+    historicalFolds: [String: String]
+) -> [String] {
+    let leave = leaveId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !leave.isEmpty else { return [] }
+    return snFoldFamilyIds(id: leave, historicalFolds: historicalFolds)
+        .filter { !$0.isEmpty && $0 != leave }
+        .sorted()
+}
+
+/// Listed Marmot ids plus their persist-folds siblings. Mesh-folded DM
+/// delete must `deleteGroup` the hidden 0.8 id, not only the listed live
+/// group. Compose `deletedConversationCorePurgeIds`.
+func snDeletedConversationCorePurgeIds(
+    listedIds: [String],
+    historicalFolds: [String: String]
+) -> [String] {
+    var out = Set<String>()
+    for id in listedIds {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        out.insert(trimmed)
+        out.formUnion(snFoldFamilyIds(id: trimmed, historicalFolds: historicalFolds))
+    }
+    return out.filter { !$0.isEmpty }.sorted()
+}
+
 /// Drop host fold bindings whose historical or live id was just deleted.
 func snPurgedHistoricalFolds(
     _ folds: [String: String],
@@ -13405,6 +13437,10 @@ final class SonarAppStore: ObservableObject {
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
             let family = snFoldFamilyIds(id: groupId, historicalFolds: folds)
             let groupIds = Array(Set((matching.isEmpty ? [groupId] : matching) + family))
+            let familyPurgeIds = snLeaveFamilyCorePurgeIds(
+                leaveId: groupId,
+                historicalFolds: folds
+            )
             let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: Set(groupIds))
             if nextFolds != folds {
                 snPersistHistoricalFolds(nextFolds, to: defaults)
@@ -13423,6 +13459,9 @@ final class SonarAppStore: ObservableObject {
                 do {
                     if shouldLeave {
                         try await marmot.leaveGroup(groupId)
+                        for gid in familyPurgeIds {
+                            try await marmot.deleteGroup(gid)
+                        }
                     } else {
                         for gid in groupIds { try await marmot.deleteGroup(gid) }
                     }
@@ -13443,27 +13482,39 @@ final class SonarAppStore: ObservableObject {
         // Mesh / Sonar peer: erase mesh transcript and every folded WN leg.
         chatViewModel.deleteConversation(with: PeerID(str: id))
         let foldedGroups: [MarmotService.MarmotGroup]
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let meshPurgeIds: [String]
         if let profile = resolvedSonarProfile(id) {
             foldedGroups = marmotGroups(forNpub: profile.npub)
-            for g in foldedGroups {
-                discardRetainedConversation(g.id)
-                forgetMarmotGroupMappings(forGroupId: g.id)
-                marmot.dropGroupFromLocalState(g.id)
+            meshPurgeIds = snDeletedConversationCorePurgeIds(
+                listedIds: foldedGroups.map(\.id),
+                historicalFolds: folds
+            )
+            for gid in meshPurgeIds {
+                discardRetainedConversation(gid)
+                forgetMarmotGroupMappings(forGroupId: gid)
+                marmot.dropGroupFromLocalState(gid)
+            }
+            let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: Set(meshPurgeIds))
+            if nextFolds != folds {
+                snPersistHistoricalFolds(nextFolds, to: defaults)
             }
         } else {
             foldedGroups = []
+            meshPurgeIds = []
         }
         path.removeAll { route in
             if case .dm(let rid) = route {
-                return rid == id || foldedGroups.contains(where: { $0.id == rid })
+                return rid == id || meshPurgeIds.contains(rid) ||
+                    foldedGroups.contains(where: { $0.id == rid })
             }
             return false
         }
         objectWillChange.send()
-        if !foldedGroups.isEmpty {
+        if !meshPurgeIds.isEmpty {
             Task { @MainActor in
                 do {
-                    for g in foldedGroups { try await marmot.deleteGroup(g.id) }
+                    for gid in meshPurgeIds { try await marmot.deleteGroup(gid) }
                 } catch {
                     _ = await marmot.loadLocalSummaries(resolveMembers: false)
                     showToast("Couldn't delete chat: \(error.localizedDescription)")

@@ -507,6 +507,30 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == ["group-08"]
         )
+        #expect(
+            snLeaveFamilyCorePurgeIds(
+                leaveId: "group-09",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08"]
+        )
+        #expect(
+            snLeaveFamilyCorePurgeIds(
+                leaveId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09"]
+        )
+        #expect(
+            snLeaveFamilyCorePurgeIds(
+                leaveId: "group-09",
+                historicalFolds: [:]
+            ).isEmpty
+        )
+        #expect(
+            snDeletedConversationCorePurgeIds(
+                listedIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08", "group-09"]
+        )
         #expect(snCollapsedFoldDisplayName(liveName: "", historicalName: "Family") == "Family")
         #expect(snCollapsedFoldDisplayName(liveName: "new name", historicalName: "Family") == "new name")
         #expect(

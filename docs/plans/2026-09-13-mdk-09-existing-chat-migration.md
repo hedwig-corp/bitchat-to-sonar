@@ -408,7 +408,10 @@ lists people who have not joined 0.9 yet. Persist-folds can hide hist
 from the host list before core `fold_family` exists; host collapse then
 copies the recovered name / roster onto the live row
 (`collapsedFoldedSnapshotChats` / `snCollapsedFoldedSnapshotGroups`)
-without touching `isDirect` (R-045). `members()` / `group_is_direct`
+without touching `isDirect` (R-045). Room leave / mesh-folded delete
+then `deleteChat` the persist-folds hist sibling after `leaveGroup(live)`
+(`leaveFamilyCorePurgeIds` / `snLeaveFamilyCorePurgeIds`) so a leftover
+0.8 row cannot resurrect on the next cold start. `members()` / `group_is_direct`
 stay live-session only so leftover peers remain late-resume invites.
 If the user is sitting in that recovered transcript when resume lands,
 Compose and iOS remount the open chat id onto `live_fold_target` so
