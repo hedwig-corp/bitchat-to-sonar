@@ -760,6 +760,18 @@ internal fun blankTranscriptKnownNonEmpty(
     (latestByChat[id] ?: 0L) > 0L || (messageCountByChat[id] ?: 0L) > 0L
 }
 
+/** Index `message_count` from the last successful summaries probe.
+ *  A failed probe (`null`) keeps [previous] so blank-transcript recovery
+ *  can still see a recovered 0.8 hist count. Empty success clears.
+ *  iOS `conversationSummariesByGroup`. */
+internal fun conversationMessageCountsFromSummaries(
+    summaries: List<SonarConversationSummary>?,
+    previous: Map<String, Long>,
+): Map<String, Long> {
+    if (summaries == null) return previous
+    return summaries.associate { it.groupIdHex to it.messageCount }
+}
+
 /** First-open must not wait on relay when any fold-family cache already
  *  has rows. iOS `openDM` used a live-only empty check
  *  (`snFamilyTranscriptNeedsNetworkBackfill`). */
@@ -2543,6 +2555,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Message bodies remain in the core database; this map only prevents the
      *  mixed mesh/Marmot Home list from treating every restored Marmot row as 0. */
     private var chatSnapshotLatestByChat: Map<String, Long> = initialChatSnapshotLatest
+    /** Index `message_count` from the last successful summaries probe.
+     *  `transcriptKnownNonEmpty` must not hard-code `emptyMap()` — iOS feeds
+     *  `conversationSummariesByGroup`. A failed probe keeps this map. */
+    private var conversationMessageCountByChat: Map<String, Long> = emptyMap()
 
     private fun localLatestTs(chatId: String): Long =
         localLatestTsForChat(
@@ -12939,7 +12955,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return blankTranscriptKnownNonEmpty(
             chatId,
             latestByChat = latest,
-            messageCountByChat = emptyMap(),
+            messageCountByChat = conversationMessageCountByChat,
             historicalFolds = historicalFoldMap,
         )
     }
@@ -14256,9 +14272,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             ),
             historicalFoldMap,
         )
-        val summaries = if (localChats.isEmpty()) emptyList() else runCatching {
-            SonarCore.conversationSummaries()
-        }.getOrDefault(emptyList())
+        val summaries = if (localChats.isEmpty()) {
+            emptyList()
+        } else {
+            runCatching { SonarCore.conversationSummaries() }.getOrNull()
+        }
+        conversationMessageCountByChat = conversationMessageCountsFromSummaries(
+            summaries,
+            conversationMessageCountByChat,
+        )
         val pages = if (localChats.isEmpty()) emptyList() else runCatching {
                 SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
         }.getOrDefault(emptyList())
@@ -14266,7 +14288,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             activeChatIds = activeIds,
             existingMessagesByChat = existingMessages,
             existingLatestByChat = existingLatest,
-            summaries = summaries,
+            summaries = summaries.orEmpty(),
             pages = pages,
             historicalFolds = historicalFoldMap,
         )
@@ -14889,6 +14911,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         unreadSuppressGroupIds.clear()
         unreadSuppressGroupIds.addAll(pruned)
         unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds)
+        conversationMessageCountByChat = conversationMessageCountsFromSummaries(
+            summaries,
+            conversationMessageCountByChat,
+        )
     }
 
     /** Request a housekeeping pass. Conflated: many requests within one in-flight

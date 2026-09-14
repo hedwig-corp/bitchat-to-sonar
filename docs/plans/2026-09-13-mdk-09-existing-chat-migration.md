@@ -1433,6 +1433,14 @@ The path now awaits fold rediscovery and retries once (Compose
 `openConversationFromNotification`) before toasting. Pin:
 `SonarConversationFoldTests.notificationTapRecoversFoldFromAliasesWhenPersistBlobEmpty`.
 
+Compose `transcriptKnownNonEmpty` hard-coded `messageCountByChat = emptyMap()`.
+iOS feeds `conversationSummariesByGroup` counts. After upgrade a recovered
+0.8 chat can have index `message_count` and `latestAt == 0` (`copy_summary`
+conflict); the first trusted-empty FFI page then skipped R-018 recovery and
+painted a blank transcript. Cache counts from the last successful summaries
+probe and keep them on a failed probe. Pin:
+`ConversationFoldTest.failedSummariesProbeKeepsHistMessageCountForBlankRecovery`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

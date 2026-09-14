@@ -2356,6 +2356,53 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun failedSummariesProbeKeepsHistMessageCountForBlankRecovery() {
+        val previous = mapOf("group-08" to 80L)
+        assertEquals(
+            previous,
+            conversationMessageCountsFromSummaries(summaries = null, previous = previous),
+        )
+        assertEquals(
+            emptyMap(),
+            conversationMessageCountsFromSummaries(summaries = emptyList(), previous = previous),
+        )
+        val hist = SonarConversationSummary(
+            groupIdHex = "group-08",
+            name = "",
+            latestContent = "from 0.8",
+            latestSenderNpub = "npub1peer",
+            latestAtSecs = 0L,
+            latestMine = false,
+            messageCount = 80L,
+            unreadCount = 0L,
+        )
+        val counts = conversationMessageCountsFromSummaries(
+            summaries = listOf(hist),
+            previous = emptyMap(),
+        )
+        assertEquals(mapOf("group-08" to 80L), counts)
+        assertTrue(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = emptyMap(),
+                messageCountByChat = counts,
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertFalse(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = emptyMap(),
+                messageCountByChat = conversationMessageCountsFromSummaries(
+                    summaries = null,
+                    previous = emptyMap(),
+                ),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+    }
+
+    @Test
     fun homeRowUnreadFollowsPersistedFoldOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         val unreadOnHist = mapOf("group-08" to 3L)
