@@ -2991,6 +2991,16 @@ final class MarmotChatModel: ObservableObject {
             .reduce(UInt64(0)) { $0 + $1.unreadCount }
     }
 
+    /// Bounded newest page for one group. Hosts scan published media URLs
+    /// on persist-folds siblings that are not yet in `messagesByGroup`.
+    func messagesPage(
+        groupId: String,
+        limit: UInt32,
+        offset: UInt32 = 0
+    ) async throws -> [MarmotService.MarmotMessage] {
+        try await service.messagesPage(groupId: groupId, limit: limit, offset: offset)
+    }
+
     /// Load conversation summaries from the local Marmot DB.
     /// Returns `true` only when the read path succeeded — callers that use
     /// the result as an unread-delta baseline must not treat a failed load

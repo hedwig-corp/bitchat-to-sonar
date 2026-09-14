@@ -1369,6 +1369,11 @@ nil `marmotGroupId` no longer wipes the painted list. Pins:
 `ConversationFoldTest.closedNodeInviteProbeDoesNotClearCachedWelcomes`,
 `SonarConversationFoldTests.remountKeepsPendingJoinRequestsOnFoldFamily`.
 
+iOS app builds failed on `0c0ab448`: `existingPublishedMediaUrls`
+called `marmot.messagesPage` but only `MarmotService` exposed it.
+`MarmotChatModel` now forwards that bounded page so a remounted 0.8
+attachment still lands in the exclude set.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot
