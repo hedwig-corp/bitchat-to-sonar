@@ -640,20 +640,36 @@ internal fun <V> promotedFoldedPendingMessages(
     return next
 }
 
+/** Merge recovered transcript rows onto the live sibling after FFI hides the 0.8 id. */
+internal fun <V> mergedFoldedMessageLists(
+    historical: List<V>,
+    live: List<V>,
+    idOf: (V) -> String,
+): List<V> {
+    if (historical.isEmpty()) return live
+    if (live.isEmpty()) return historical
+    val seen = live.mapTo(hashSetOf(), idOf)
+    return live + historical.filter { idOf(it) !in seen }
+}
+
 /** Keep a recovered transcript window on the live sibling after FFI hides the 0.8 id. */
 internal fun promotedFoldedSnapshotMessages(
     previousIds: Set<String>,
     currentIds: Set<String>,
     messagesByChat: Map<String, List<SonarMsg>>,
     liveFoldTarget: (String) -> String?,
-): Map<String, List<SonarMsg>> =
-    promotedFoldedValues(
-        previousIds = previousIds,
-        currentIds = currentIds,
-        values = messagesByChat.filterValues { it.isNotEmpty() },
-        liveFoldTarget = liveFoldTarget,
-        preferExisting = { it.isNotEmpty() },
-    )
+): Map<String, List<SonarMsg>> {
+    var next = messagesByChat.filterValues { it.isNotEmpty() }
+    for (historical in previousIds + messagesByChat.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = messagesByChat[historical].orEmpty()
+        if (incoming.isEmpty()) continue
+        next = next + (live to mergedFoldedMessageLists(incoming, next[live].orEmpty()) { it.id })
+    }
+    return next
+}
 
 /** Keep recovered call-log rows on the live sibling after FFI hides the 0.8 id. */
 internal fun promotedFoldedCallLogs(
@@ -12571,23 +12587,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         retainedTranscriptByChat[open.id]?.let { retainedTranscriptByChat[live] = it }
         retainedTranscriptByChat.remove(open.id)
-        remountFoldedOpenValues(
-            historicalKeys = listOf(open.id),
-            liveKeys = listOf(live),
-            values = transcriptWindows,
-            preferExisting = { it.rows.isNotEmpty() },
-        ).let { remounted ->
-            transcriptWindows.clear()
-            transcriptWindows.putAll(remounted)
+        val historicalWindow = transcriptWindows[open.id]
+        val liveWindow = transcriptWindows[live]
+        if (historicalWindow != null && historicalWindow.rows.isNotEmpty()) {
+            transcriptWindows[live] = TranscriptGroupWindow(
+                rows = mergedFoldedMessageLists(
+                    historicalWindow.rows,
+                    liveWindow?.rows.orEmpty(),
+                ) { it.id },
+                hasMore = historicalWindow.hasMore || liveWindow?.hasMore == true,
+                loadingOlder = liveWindow?.loadingOlder == true,
+                pinnedToOlderEdge = historicalWindow.pinnedToOlderEdge ||
+                    liveWindow?.pinnedToOlderEdge == true,
+            )
         }
-        remountFoldedOpenValues(
-            historicalKeys = listOf(open.id),
-            liveKeys = listOf(live),
-            values = freshCanonicalByGroup,
-            preferExisting = { it.isNotEmpty() },
-        ).let { remounted ->
-            freshCanonicalByGroup.clear()
-            freshCanonicalByGroup.putAll(remounted)
+        val historicalCanonical = freshCanonicalByGroup[open.id].orEmpty()
+        if (historicalCanonical.isNotEmpty()) {
+            freshCanonicalByGroup[live] = mergedFoldedMessageLists(
+                historicalCanonical,
+                freshCanonicalByGroup[live].orEmpty(),
+            ) { it.id }
         }
         if (pendingMediaPreviews.any { it.chatId == open.id }) {
             pendingMediaPreviews = pendingMediaPreviews.map { preview ->

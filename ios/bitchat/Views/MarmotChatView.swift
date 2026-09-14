@@ -2918,10 +2918,13 @@ final class MarmotChatModel: ObservableObject {
     /// an open recovered transcript back to the newest page.
     func remountFoldedLocalTranscriptWindow(from historicalGroupId: String, onto liveGroupId: String) {
         guard historicalGroupId != liveGroupId else { return }
-        if messagesByGroup[liveGroupId]?.contains(where: { !Self.isLocalTranscriptEcho($0) }) != true,
-           let historical = messagesByGroup[historicalGroupId],
+        if let historical = messagesByGroup[historicalGroupId],
            historical.contains(where: { !Self.isLocalTranscriptEcho($0) }) {
-            messagesByGroup[liveGroupId] = historical
+            messagesByGroup[liveGroupId] = snMergedFoldedMessageLists(
+                historical: historical,
+                live: messagesByGroup[liveGroupId] ?? [],
+                idOf: { $0.id }
+            )
         }
         if localTranscriptCursorByGroup[liveGroupId] == nil {
             localTranscriptCursorByGroup[liveGroupId] = localTranscriptCursorByGroup[historicalGroupId]

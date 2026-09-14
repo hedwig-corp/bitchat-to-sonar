@@ -399,12 +399,29 @@ func snPromotedFoldedPendingMessages<Message>(
     return next
 }
 
+/// Merge recovered transcript rows onto the live sibling without dropping either side.
+func snMergedFoldedMessageLists<Message>(
+    historical: [Message],
+    live: [Message],
+    idOf: (Message) -> String
+) -> [Message] {
+    if historical.isEmpty { return live }
+    if live.isEmpty { return historical }
+    var seen = Set(live.map(idOf))
+    var merged = live
+    for message in historical where seen.insert(idOf(message)).inserted {
+        merged.append(message)
+    }
+    return merged
+}
+
 /// Keep a recovered in-memory transcript window on the live sibling.
 func snPromotedFoldedMessagesByGroup<Message>(
     previousGroupIds: Set<String>,
     currentGroupIds: Set<String>,
     messagesByGroup: [String: [Message]],
-    liveFoldTarget: (String) -> String?
+    liveFoldTarget: (String) -> String?,
+    idOf: (Message) -> String
 ) -> [String: [Message]] {
     var next = messagesByGroup.filter { !$0.value.isEmpty }
     let pairs = snPromotedFoldedMutePairs(
@@ -415,9 +432,11 @@ func snPromotedFoldedMessagesByGroup<Message>(
     )
     for pair in pairs {
         guard let rows = next[pair.historical], !rows.isEmpty else { continue }
-        if next[pair.live]?.isEmpty ?? true {
-            next[pair.live] = rows
-        }
+        next[pair.live] = snMergedFoldedMessageLists(
+            historical: rows,
+            live: next[pair.live] ?? [],
+            idOf: idOf
+        )
     }
     return next
 }
@@ -7374,7 +7393,8 @@ final class SonarAppStore: ObservableObject {
             previousGroupIds: previous,
             currentGroupIds: current,
             messagesByGroup: marmot.messagesByGroup,
-            liveFoldTarget: { targets[$0] }
+            liveFoldTarget: { targets[$0] },
+            idOf: { $0.id }
         )
         if next != marmot.messagesByGroup {
             marmot.messagesByGroup = next

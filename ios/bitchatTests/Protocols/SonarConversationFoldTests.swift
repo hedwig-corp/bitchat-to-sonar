@@ -186,7 +186,8 @@ struct SonarConversationFoldTests {
                 previousGroupIds: ["group-08", "group-09"],
                 currentGroupIds: ["group-09"],
                 messagesByGroup: ["group-08": historicalRows],
-                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil },
+                idOf: { $0 }
             )["group-09"] == historicalRows
         )
         #expect(
@@ -194,8 +195,16 @@ struct SonarConversationFoldTests {
                 previousGroupIds: [],
                 currentGroupIds: ["group-09"],
                 messagesByGroup: ["group-08": historicalRows, "group-09": ["already live"]],
-                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
-            )["group-09"] == ["already live"]
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil },
+                idOf: { $0 }
+            )["group-09"] == ["already live"] + historicalRows
+        )
+        #expect(
+            snMergedFoldedMessageLists(
+                historical: ["old-1", "shared"],
+                live: ["shared", "new-1"],
+                idOf: { $0 }
+            ) == ["shared", "new-1", "old-1"]
         )
         #expect(
             snPromotedFoldedPendingMessages(

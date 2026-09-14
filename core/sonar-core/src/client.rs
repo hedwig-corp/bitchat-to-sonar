@@ -7091,9 +7091,22 @@ impl SonarClient {
             self.start_dm_with_key_package(packages.into_iter().next().expect("nonempty"), &name)
                 .await?
         } else {
+            // Keep the 0.8 room topic. Never copy the DM marker onto a room —
+            // that would make hosts treat a recovered group as a 1:1 (R-045).
+            let description = self
+                .engine
+                .historical_group_description(group_id)
+                .filter(|desc| desc != SONAR_DIRECT_DM_DESCRIPTION)
+                .unwrap_or_default();
             let creation = self
                 .engine
-                .create_group(&name, packages, self.relays.clone())
+                .create_group_with_description(
+                    &name,
+                    &description,
+                    packages,
+                    self.relays.clone(),
+                    Vec::new(),
+                )
                 .await?;
             self.publish_group_creation(creation).await?
         };

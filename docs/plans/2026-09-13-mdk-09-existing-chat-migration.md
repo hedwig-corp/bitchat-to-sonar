@@ -380,7 +380,11 @@ files. An in-flight send echo on the hidden id is merged onto the live
 sibling (Compose `pendingSendEchoes`, iOS `pendingMarmotMessagesByChat`
 plus queued `pendingDirectMarmotSends` / `pendingMarmotGroupSends`) so
 the first resume send does not vanish from the remounted transcript.
-Trill cooldown moves with the same remount. A mute on the recovered id is copied onto
+Trill cooldown moves with the same remount. Recovered transcript rows
+merge onto a live sibling that already has the new send, so a one-row
+live cache cannot hide the 0.8 history. Room resume copies the 0.8
+`groups.description` onto `create_group_with_description` (never the
+DM marker). A mute on the recovered id is copied onto
 the live sibling when the historical row disappears, so resume does not
 start notifying a chat the user already silenced. An in-progress composer
 draft or reply target on that hidden id is copied the same way — including
@@ -444,7 +448,7 @@ filters last verified on `ba346336`; Compose remount pin on this commit.
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 44 passed (includes pending-echo remount) |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 44 passed (includes pending-echo remount + merged recovered transcript) |
 | `scripts/check-regression-ledger.sh` | 236 citations |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with

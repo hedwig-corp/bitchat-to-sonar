@@ -1384,7 +1384,7 @@ fn write_mdk08_pending_room_welcome(
             (id, event, mls_group_id, nostr_group_id, group_name, group_description,
              group_admin_pubkeys, group_relays, welcomer, member_count, state,
              wrapper_event_id)
-         VALUES (?1, '{}', ?2, ?3, 'pending room', '', ?4, '[]', ?5, 3, 'pending', ?1)",
+         VALUES (?1, '{}', ?2, ?3, 'pending room', 'weekly standup', ?4, '[]', ?5, 3, 'pending', ?1)",
         rusqlite::params![
             vec![0xAAu8; 32],
             group_bytes.clone(),
@@ -1484,9 +1484,9 @@ async fn recovered_08_pending_room_send_creates_named_group_not_dm() {
         .iter()
         .find(|g| g.name == "pending room")
         .expect("resumed room keeps the 0.8 name");
-    assert_ne!(
-        room.description, "sonar.direct-dm.v1",
-        "resolve_send_group must create_group, not start_dm_with_key_package"
+    assert_eq!(
+        room.description, "weekly standup",
+        "resume must copy the 0.8 room topic onto the live 0.9 group"
     );
     assert_ne!(room.id, bob_dm, "send target must not be the existing DM");
     assert_ne!(room.id, historical);
@@ -1564,7 +1564,7 @@ fn write_mdk08_alice_bob_carol_store(
     let group_bytes = vec![0x33u8; 16];
     conn.execute(
         "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-         VALUES (?1, ?2, 'alice bob carol', '')",
+         VALUES (?1, ?2, 'alice bob carol', 'field notes')",
         rusqlite::params![group_bytes.clone(), vec![0x44u8; 32]],
     )
     .expect("group row");
@@ -1637,6 +1637,10 @@ async fn recovered_08_group_resumes_on_a_new_09_group_through_a_relay() {
     let live = alice.groups().expect("live groups");
     assert_eq!(live.len(), 1);
     assert_ne!(live[0].id, historical);
+    assert_eq!(
+        live[0].description, "field notes",
+        "joined-room resume must copy the 0.8 description"
+    );
     let members = alice.members(&live[0].id).expect("live members");
     assert_eq!(members.len(), 3);
 

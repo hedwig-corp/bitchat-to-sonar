@@ -502,13 +502,18 @@ class ConversationFoldTest {
             ),
         )
         assertEquals(
-            mapOf("group-08" to historicalRows, "group-09" to listOf("already-live")),
-            remountFoldedOpenValues(
-                historicalKeys = listOf("group-08"),
-                liveKeys = listOf("group-09"),
-                values = mapOf("group-08" to historicalRows, "group-09" to listOf("already-live")),
-                preferExisting = { it.isNotEmpty() },
-            ),
+            listOf("already-live", "old-1", "old-2"),
+            mergedFoldedMessageLists(
+                historicalRows,
+                listOf("already-live"),
+            ) { it },
+        )
+        assertEquals(
+            listOf("shared", "new-1", "old-1"),
+            mergedFoldedMessageLists(
+                listOf("old-1", "shared"),
+                listOf("shared", "new-1"),
+            ) { it },
         )
         assertEquals("group-09", remountFoldedOpenId(listOf("group-08"), "group-09", "group-08"))
         assertEquals("other", remountFoldedOpenId(listOf("group-08"), "group-09", "other"))
@@ -652,11 +657,20 @@ class ConversationFoldTest {
             ),
         )
         assertEquals(
-            mapOf("group-08" to historical, "group-09" to live),
+            mapOf("group-08" to historical, "group-09" to live + historical),
             promotedFoldedSnapshotMessages(
                 previousIds = emptySet(),
                 currentIds = setOf("group-09"),
                 messagesByChat = mapOf("group-08" to historical, "group-09" to live),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to historical),
+            promotedFoldedSnapshotMessages(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                messagesByChat = mapOf("group-08" to historical, "group-09" to historical),
                 liveFoldTarget = folds::get,
             ),
         )
