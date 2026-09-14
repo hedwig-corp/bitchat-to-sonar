@@ -912,6 +912,32 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ).contains("marmot:group-08")
         )
+        let histTrill = Date(timeIntervalSince1970: 80)
+        let liveTrill = Date(timeIntervalSince1970: 90)
+        #expect(
+            snTrillCooldownUntil(
+                conversationId: "marmot:group-09",
+                cooldownUntilByChat: ["marmot:group-08": histTrill],
+                historicalFolds: ["group-08": "group-09"]
+            ) == histTrill
+        )
+        #expect(
+            snTrillCooldownUntil(
+                conversationId: "marmot:group-09",
+                cooldownUntilByChat: [
+                    "marmot:group-08": histTrill,
+                    "marmot:group-09": liveTrill,
+                ],
+                historicalFolds: ["group-08": "group-09"]
+            ) == liveTrill
+        )
+        #expect(
+            snTrillCooldownUntil(
+                conversationId: "marmot:group-09",
+                cooldownUntilByChat: ["marmot:group-08": histTrill],
+                historicalFolds: [:]
+            ) == nil
+        )
         #expect(
             snPaymentActivityPeerKeys(
                 conversationId: "group-08",

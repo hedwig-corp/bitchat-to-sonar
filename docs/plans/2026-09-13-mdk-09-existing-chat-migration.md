@@ -940,6 +940,14 @@ row has none. Untrusted Compose snapshot fallback no longer pins
 `SonarConversationFoldTests` `snFoldFamilyHasOlder` /
 `snFoldFamilyPagingCursor`.
 
+iOS trill cooldown hole closed after this commit: Compose
+`trillCooldownUntilMsForChat` already walked the fold family; iOS
+`canSendTrill` keyed only `chatAlertKey(id)`. After collapse a nudge
+sent on the hidden 0.8 id did not disable the live row until async
+promote. `snTrillCooldownUntil` reuses the payment key set. Pins:
+`ConversationFoldTest.trillCooldownReadsHiddenHistoricalSibling`,
+`SonarConversationFoldTests` `snTrillCooldownUntil`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
