@@ -1355,6 +1355,16 @@ Empty success still clears stale dots. Pin:
 (`shouldApplyUnreadCounts`),
 `SNUnreadCountsTests.failedSummariesProbeDoesNotPublishUnread`.
 
+Catch-up / media hist-id hole closed after this commit:
+`prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
+A recovered 0.8 id is hidden after fold, so opening that row (snapshot
+still lists it, remount has not swapped nav) cleared the preference
+and 0.9 traffic sat behind every other chat. Restore the index bind
+and remap onto the live sibling first. `fetch_media` /
+`fetch_media_to_file` restore the same way so a hist-id fetch of a
+0.9 blob can use the live exporter after sidecar loss. Pin:
+`client::tests::prefer_catchup_maps_folded_hist_to_live_mls_hex`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

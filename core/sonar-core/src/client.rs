@@ -5585,6 +5585,10 @@ impl SonarClient {
     /// Download the encrypted blob at `url` and decrypt it with the group media
     /// key (resolved from the message's imeta tag). Returns plaintext bytes.
     pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
+        // Lost JSON sidecar: restore the index bind so a hist-id fetch of a
+        // 0.9 blob can use `live_fold_target` / the live exporter. 0.8
+        // attachments are found by blossom URL either way.
+        self.restore_recorded_folds_touching(group_id);
         if self.engine.recovered_08_media_unavailable(group_id, url) {
             return Err(Error::Media(
                 crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
@@ -5605,6 +5609,7 @@ impl SonarClient {
         destination: &Path,
         observer: &dyn MediaDownloadObserver,
     ) -> Result<u64> {
+        self.restore_recorded_folds_touching(group_id);
         if self.engine.recovered_08_media_unavailable(group_id, url) {
             return Err(Error::Media(
                 crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
@@ -6336,11 +6341,29 @@ impl SonarClient {
         });
     }
 
+    /// Map a recovered 0.8 MLS id onto the live sibling before `groups()`
+    /// lookup. Restores a recorded index bind when the JSON sidecar is gone.
+    fn resolve_catchup_mls_hex(&self, clean: &str) -> String {
+        let Some(group_id) = decode_group_id_hex(clean) else {
+            return clean.to_string();
+        };
+        self.restore_recorded_folds_touching(&group_id);
+        match self.engine.live_fold_target(&group_id) {
+            Some(live) if live != group_id => hex::encode(live.as_slice()),
+            _ => clean.to_string(),
+        }
+    }
+
     /// Prefer catch-up for the open chat.
     ///
     /// Hosts pass the MLS group id hex (same id used by send_text / messages).
     /// We map it to the public nostr group id used by the catch-up queue (#h tag).
     /// Unknown/empty clears the preference.
+    ///
+    /// A recovered 0.8 id is remapped onto its live sibling first. Opening the
+    /// hist row (snapshot still lists it, or remount has not swapped nav)
+    /// used to miss `engine.groups()` and clear the preference, so 0.9
+    /// traffic sat behind every other chat's catch-up.
     pub fn prefer_catchup_group(&self, mls_group_id_hex: Option<String>) {
         let preferred = match mls_group_id_hex {
             None => None,
@@ -6348,22 +6371,28 @@ impl SonarClient {
                 let clean = raw.trim().to_ascii_lowercase();
                 if clean.is_empty() {
                     None
-                } else if let Ok(groups) = self.engine.groups() {
-                    groups.into_iter().find_map(|g| {
-                        let mls = hex::encode(g.id.as_slice());
-                        let h = self.engine.nostr_h_tag_hex(&g.id).ok().flatten();
-                        if mls == clean {
-                            h
-                        } else if h.as_deref() == Some(clean.as_str()) {
-                            Some(clean.clone())
-                        } else {
-                            None
-                        }
-                    })
                 } else {
-                    // Fall back to treating the input as already-nostr hex so
-                    // tests/tools can still target the queue key directly.
-                    Some(clean)
+                    let lookup = self.resolve_catchup_mls_hex(&clean);
+                    if let Ok(groups) = self.engine.groups() {
+                        groups.into_iter().find_map(|g| {
+                            let mls = hex::encode(g.id.as_slice());
+                            let h = self.engine.nostr_h_tag_hex(&g.id).ok().flatten();
+                            if mls == lookup {
+                                h
+                            } else if h.as_deref() == Some(lookup.as_str())
+                                || h.as_deref() == Some(clean.as_str())
+                            {
+                                Some(lookup.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        // Fall back to treating the (possibly remapped) hex as
+                        // already-nostr so tests/tools can still target the
+                        // queue key directly.
+                        Some(lookup)
+                    }
                 }
             }
         };
@@ -11075,6 +11104,27 @@ mod tests {
         );
         assert_eq!(map_mls_hex_to_nostr_hex("", &pairs), None);
         assert_eq!(map_mls_hex_to_nostr_hex("zz", &pairs), None);
+    }
+
+    #[tokio::test]
+    async fn prefer_catchup_maps_folded_hist_to_live_mls_hex() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        client.engine().record_historical_fold(&historical, &live);
+        let hist_hex = hex::encode(historical.as_slice());
+        assert_eq!(
+            client.resolve_catchup_mls_hex(&hist_hex),
+            hex::encode(live.as_slice()),
+            "opening a recovered 0.8 id must catch-up the live sibling"
+        );
+        assert_eq!(
+            client.resolve_catchup_mls_hex(&hex::encode(live.as_slice())),
+            hex::encode(live.as_slice()),
+            "a live id must stay itself"
+        );
     }
 
     #[test]
