@@ -2563,10 +2563,11 @@ final class MarmotChatModel: ObservableObject {
                 historicalFolds: folds,
                 idOf: { $0.id }
             )
-            let hiddenSiblingHasRows = snFoldFamilyIds(
+            let familyIds = snFoldFamilyIds(
                 id: groupId,
                 historicalFolds: folds
-            ).contains {
+            )
+            let hiddenSiblingHasRows = familyIds.contains {
                 $0 != groupId &&
                     (messagesByGroup[$0] ?? []).contains { !Self.isLocalTranscriptEcho($0) }
             }
@@ -2574,6 +2575,12 @@ final class MarmotChatModel: ObservableObject {
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
             let shouldPreserveHistoricalWindow = mode == .preserveHistoricalWindow
                 && !existingCanonical.isEmpty
+            let shouldMergeFamilyWindow = snNewestPageShouldMergeFamilyWindow(
+                existingCanonicalCount: existingCanonical.count,
+                hiddenSiblingHasRows: hiddenSiblingHasRows,
+                hasFoldFamily: familyIds.contains { $0 != groupId },
+                pinnedToOlderEdge: localTranscriptPreservesOlderEdgeGroups.contains(groupId)
+            )
             let canonical: [MarmotService.MarmotMessage]
             if shouldPreserveHistoricalWindow {
                 let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
@@ -2593,12 +2600,11 @@ final class MarmotChatModel: ObservableObject {
                     localTranscriptHasOlderByGroup[groupId] == true
                     || rawPage.count > Self.localTranscriptPageLimit
                     || merged.count > Self.localTranscriptRetainedLimit
-            } else if hiddenSiblingHasRows, !existingCanonical.isEmpty {
-                // A live-only newest page must not drop recovered 0.8 rows that
-                // still sit on the hidden sibling (persist-folds before core
-                // fold). Merge, then keep the newest retained window.
-                // Compose first-open seeds `firstOpenFoldFamilySeedRows` into
-                // the source window before the same local cursor read.
+            } else if shouldMergeFamilyWindow {
+                // A live-only newest page must not drop recovered 0.8 rows.
+                // After persist-folds those rows sit on live (sibling cache
+                // empty); first-open already painted them. Merge, then keep
+                // the newest retained window. Compose `refreshTranscriptRows`.
                 canonical = Array(
                     Self.mergeMessages(existing: existingCanonical, incoming: page)
                         .suffix(Self.localTranscriptRetainedLimit)

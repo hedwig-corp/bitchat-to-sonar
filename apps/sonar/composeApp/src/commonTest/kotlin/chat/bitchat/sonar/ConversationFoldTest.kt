@@ -1106,6 +1106,46 @@ class ConversationFoldTest {
         assertTrue(afterLocal.any { it.id == "h1" })
         assertTrue(afterLocal.any { it.id == "l1" })
         assertTrue(seededFoldFamilyTranscriptHasMore(cachedCount = afterLocal.size))
+        assertTrue(
+            newestPageShouldMergeFamilyWindow(
+                existingCanonicalCount = hist.size,
+                hiddenSiblingHasRows = false,
+                hasFoldFamily = true,
+                pinnedToOlderEdge = false,
+            ),
+        )
+        assertFalse(
+            newestPageShouldMergeFamilyWindow(
+                existingCanonicalCount = hist.size,
+                hiddenSiblingHasRows = false,
+                hasFoldFamily = true,
+                pinnedToOlderEdge = true,
+            ),
+        )
+        assertFalse(
+            newestPageShouldMergeFamilyWindow(
+                existingCanonicalCount = hist.size,
+                hiddenSiblingHasRows = false,
+                hasFoldFamily = false,
+                pinnedToOlderEdge = false,
+            ),
+        )
+        assertTrue(
+            newestPageShouldMergeFamilyWindow(
+                existingCanonicalCount = hist.size,
+                hiddenSiblingHasRows = true,
+                hasFoldFamily = false,
+                pinnedToOlderEdge = false,
+            ),
+        )
+        assertFalse(
+            newestPageShouldMergeFamilyWindow(
+                existingCanonicalCount = 0,
+                hiddenSiblingHasRows = true,
+                hasFoldFamily = true,
+                pinnedToOlderEdge = false,
+            ),
+        )
         assertEquals(
             hist,
             firstOpenFoldFamilySeedRows(hist + listOf(

@@ -771,6 +771,46 @@ struct SonarConversationFoldTests {
         #expect(snFirstOpenHasLocalTranscriptPaint(retained: ["leave"], familyCached: [String]()))
         #expect(!snFirstOpenHasLocalTranscriptPaint(retained: [String](), familyCached: [String]()))
         #expect(
+            snNewestPageShouldMergeFamilyWindow(
+                existingCanonicalCount: 40,
+                hiddenSiblingHasRows: false,
+                hasFoldFamily: true,
+                pinnedToOlderEdge: false
+            )
+        )
+        #expect(
+            !snNewestPageShouldMergeFamilyWindow(
+                existingCanonicalCount: 40,
+                hiddenSiblingHasRows: false,
+                hasFoldFamily: true,
+                pinnedToOlderEdge: true
+            )
+        )
+        #expect(
+            !snNewestPageShouldMergeFamilyWindow(
+                existingCanonicalCount: 40,
+                hiddenSiblingHasRows: false,
+                hasFoldFamily: false,
+                pinnedToOlderEdge: false
+            )
+        )
+        #expect(
+            snNewestPageShouldMergeFamilyWindow(
+                existingCanonicalCount: 40,
+                hiddenSiblingHasRows: true,
+                hasFoldFamily: false,
+                pinnedToOlderEdge: false
+            )
+        )
+        #expect(
+            !snNewestPageShouldMergeFamilyWindow(
+                existingCanonicalCount: 0,
+                hiddenSiblingHasRows: true,
+                hasFoldFamily: true,
+                pinnedToOlderEdge: false
+            )
+        )
+        #expect(
             snDMHasLocalMarmotPaint(
                 groupId: "group-09",
                 listedGroupIds: ["group-09"],

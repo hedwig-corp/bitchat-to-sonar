@@ -1232,6 +1232,20 @@ internal fun firstOpenHasLocalTranscriptPaint(
     snapshot: List<SonarMsg>,
 ): Boolean = retained.isNotEmpty() || snapshot.withoutSyntheticSummaryRows().isNotEmpty()
 
+/** Newest-page hydrate must keep remounted fold-family rows.
+ *  After persist-folds those rows sit on live (sibling cache empty).
+ *  A live-only FFI page must merge into that window — not replace it —
+ *  or first-open paint vanishes. iOS `snNewestPageShouldMergeFamilyWindow`. */
+internal fun newestPageShouldMergeFamilyWindow(
+    existingCanonicalCount: Int,
+    hiddenSiblingHasRows: Boolean,
+    hasFoldFamily: Boolean,
+    pinnedToOlderEdge: Boolean,
+): Boolean {
+    if (existingCanonicalCount <= 0 || pinnedToOlderEdge) return false
+    return hiddenSiblingHasRows || hasFoldFamily
+}
+
 /** Read a draft from the open id or its hidden 0.8 sibling after a fold. */
 internal fun composerDraftForChat(
     chatId: String,

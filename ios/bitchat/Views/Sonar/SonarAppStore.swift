@@ -1244,6 +1244,21 @@ func snDMHasLocalMarmotPaint<Message>(
     ).isEmpty
 }
 
+/// Newest-page hydrate must keep remounted fold-family rows.
+/// After persist-folds, recovered 0.8 rows sit on live (sibling cache
+/// empty). `loadLocalWhenConnected` then loads `.newestPage`, and the
+/// live-only replace path hid history first-open had just painted.
+/// Compose `newestPageShouldMergeFamilyWindow` / `refreshTranscriptRows`.
+func snNewestPageShouldMergeFamilyWindow(
+    existingCanonicalCount: Int,
+    hiddenSiblingHasRows: Bool,
+    hasFoldFamily: Bool,
+    pinnedToOlderEdge: Bool
+) -> Bool {
+    guard existingCanonicalCount > 0, !pinnedToOlderEdge else { return false }
+    return hiddenSiblingHasRows || hasFoldFamily
+}
+
 /// Read a draft from the open id or its hidden 0.8 sibling after a fold.
 func snComposerDraft(
     chatId: String,
