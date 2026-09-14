@@ -963,14 +963,20 @@ impl MarmotEngine {
         let session = AccountDeviceSession::open(config)?;
         let parked = load_parked(db_path);
         let dropped = load_dropped(db_path);
-        let transcript = load_transcript(db_path);
+        let mut transcript = load_transcript(db_path);
+        let mut transcript_healed = false;
+        for id in &dropped {
+            if transcript.remove(id).is_some() {
+                transcript_healed = true;
+            }
+        }
         let historical_group_names = crate::mdk08_migrate::load_historical_group_names(db_path);
         let historical_members = crate::mdk08_migrate::load_historical_members(db_path);
         let historical_folds = load_historical_folds(db_path);
         let pending_mdk08 =
             crate::mdk08_migrate::pending_remainder(db_path, key, identity.public_key());
         let historical_media_secrets = crate::mdk08_migrate::load_historical_media_secrets(db_path);
-        Ok(Self {
+        let engine = Self {
             session: Mutex::new(Some(session)),
             identity,
             dm_autoaccept_budget: Mutex::new(DmAutoacceptBudget::load(db_path)),
@@ -991,7 +997,11 @@ impl MarmotEngine {
             pending_mdk08: Mutex::new(pending_mdk08),
             historical_media_secrets: Mutex::new(historical_media_secrets),
             _tempdir: None,
-        })
+        };
+        if transcript_healed {
+            engine.persist_transcript();
+        }
+        Ok(engine)
     }
 
     pub fn has_pending_mdk08_remainder(&self) -> bool {
@@ -1958,12 +1968,22 @@ impl MarmotEngine {
             .cloned()
             .collect();
         for id in ids {
+            if self.is_dropped(&id) {
+                self.pending_convergence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id);
+                continue;
+            }
             self.advance_group_convergence(&id).await?;
         }
         Ok(())
     }
 
     pub async fn advance_group_convergence(&self, group_id: &GroupId) -> Result<()> {
+        if self.is_dropped(group_id) {
+            return Ok(());
+        }
         let mut lease = self.lease_session().await;
         let _ = lease.get_mut().ensure_group_hydrated(group_id);
         let _ = lease
@@ -2479,6 +2499,9 @@ impl MarmotEngine {
                 return Ok(Incoming::Failed)
             }
             IngestOutcome::Buffered { group_id, .. } => {
+                if self.is_dropped(&group_id) {
+                    return Ok(Incoming::None);
+                }
                 // MDK accepted the commit into durable storage but will not
                 // apply it until `advance_convergence` after the MIP-03
                 // quiescence window. Returning Failed here made sonar-sim
@@ -2515,6 +2538,12 @@ impl MarmotEngine {
                     payload,
                     ..
                 } => {
+                    // Leave/delete marks the fold family dropped. Relay replay
+                    // of an old kind-445 must not rewrite the transcript or
+                    // surface Incoming::Message (hosts upsert + notify from that).
+                    if self.is_dropped(&group_id) {
+                        continue;
+                    }
                     // Persist kind-9 chat rows only. `chat_from_payload` already
                     // returns None for other Marmot app-event kinds.
                     if let Some(msg) =
@@ -2534,7 +2563,11 @@ impl MarmotEngine {
                 GroupEvent::GroupCreated { group_id }
                 | GroupEvent::EpochChanged { group_id, .. }
                 | GroupEvent::GroupStateChanged { group_id, .. } => {
-                    last = Incoming::GroupUpdated(group_id);
+                    last = if self.is_dropped(&group_id) {
+                        Incoming::None
+                    } else {
+                        Incoming::GroupUpdated(group_id)
+                    };
                 }
                 _ => {}
             }
@@ -2951,6 +2984,12 @@ impl MarmotEngine {
     /// resurrect a chat the user already deleted.
     pub fn purge_fold_family(&self, group_id: &GroupId) {
         let family = self.fold_family(group_id);
+        // Mark dropped before clearing rows so a concurrent remainder tick or
+        // relay ingest cannot rewrite the transcript in the window between
+        // persist_transcript and persist_dropped.
+        for id in &family {
+            self.drop_group(id);
+        }
         {
             let mut transcript = self
                 .transcript
@@ -2961,9 +3000,6 @@ impl MarmotEngine {
             }
         }
         self.persist_transcript();
-        for id in &family {
-            self.drop_group(id);
-        }
         {
             let mut folds = self
                 .historical_folds
@@ -2988,6 +3024,9 @@ impl MarmotEngine {
     }
 
     fn store_chat(&self, msg: ChatMessage) {
+        if self.is_dropped(&msg.group_id) {
+            return;
+        }
         let mut transcript = self
             .transcript
             .lock()
@@ -3009,9 +3048,13 @@ impl MarmotEngine {
             .flatten()
             .find(|m| m.id == *id)
             .cloned()
+            .filter(|m| !self.is_dropped(&m.group_id))
     }
 
     fn transcript_for(&self, group_id: &GroupId) -> Vec<ChatMessage> {
+        if self.is_dropped(group_id) {
+            return Vec::new();
+        }
         self.transcript
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3107,12 +3150,14 @@ impl MarmotEngine {
         let Some(path) = self.db_path.as_ref() else {
             return;
         };
+        let dropped = self.dropped_group_id_set();
         let transcript = self
             .transcript
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let keyed: HashMap<String, Vec<ChatMessage>> = transcript
             .iter()
+            .filter(|(id, _)| !dropped.contains(*id))
             .map(|(id, msgs)| (hex::encode(id.as_slice()), msgs.clone()))
             .collect();
         let _ = atomic_write_json(&sidecar_named(path, TRANSCRIPT_FILE_SUFFIX), &keyed);
@@ -3984,6 +4029,100 @@ mod historical_fold_tests {
         assert!(
             engine.live_fold_target(&historical).is_none(),
             "fold binding must die with the conversation"
+        );
+    }
+
+    /// Leave/delete marks the family dropped. A later ingest / send echo
+    /// (`store_chat`) must not rewrite the transcript the user already cleared.
+    #[test]
+    fn store_chat_skips_dropped_groups() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice.clone());
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        engine.push_transcript_message(chat(
+            1,
+            historical.as_slice(),
+            bob.public_key(),
+            "old hello",
+            false,
+        ));
+        engine.record_historical_fold(&historical, &live);
+        engine.purge_fold_family(&live);
+
+        engine.push_transcript_message(chat(
+            3,
+            historical.as_slice(),
+            bob.public_key(),
+            "resurrected",
+            false,
+        ));
+        engine.push_transcript_message(chat(
+            4,
+            live.as_slice(),
+            alice.public_key(),
+            "also resurrected",
+            true,
+        ));
+
+        assert!(
+            engine.messages(&historical).expect("historical").is_empty(),
+            "ingest after Leave must not restore recovered 0.8 rows"
+        );
+        assert!(
+            engine.messages(&live).expect("live").is_empty(),
+            "ingest after Leave must not restore live 0.9 rows"
+        );
+    }
+
+    /// Crash after persist_dropped and before persist_transcript leaves leftover
+    /// rows on the sidecar. The next open must omit them and heal the file so
+    /// an unrelated persist cannot write the deleted chat back.
+    #[test]
+    fn reopen_omits_dropped_transcript_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let key = [0x42u8; 32];
+        let historical = GroupId::new(vec![0x11; 16]);
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        {
+            let engine = MarmotEngine::persistent(alice.clone(), &db_path, key).expect("open");
+            engine.push_transcript_message(chat(
+                1,
+                historical.as_slice(),
+                bob.public_key(),
+                "old hello",
+                false,
+            ));
+            assert_eq!(engine.messages(&historical).expect("seeded").len(), 1);
+            let dropped_path = db_path.with_file_name(format!(
+                "marmot.sqlite{}",
+                crate::marmot::DROPPED_GROUPS_FILE_SUFFIX
+            ));
+            std::fs::write(
+                &dropped_path,
+                serde_json::to_vec(&vec![hex::encode(historical.as_slice())])
+                    .expect("dropped json"),
+            )
+            .expect("write dropped");
+        }
+        let engine = MarmotEngine::persistent(alice, &db_path, key).expect("reopen");
+        assert!(
+            engine.messages(&historical).expect("reopen").is_empty(),
+            "next connectLocal must not paint a chat already marked dropped"
+        );
+        let transcript_path = db_path.with_file_name(format!(
+            "marmot.sqlite{}",
+            crate::marmot::TRANSCRIPT_FILE_SUFFIX
+        ));
+        let leftover: HashMap<String, serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&transcript_path).expect("healed transcript"))
+                .expect("transcript json");
+        assert!(
+            !leftover.contains_key(&hex::encode(historical.as_slice())),
+            "open must heal leftover dropped rows off the transcript sidecar"
         );
     }
 

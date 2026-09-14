@@ -428,11 +428,17 @@ next `connectLocal`. Bak metadata backfill (`metadata_backfill=v2` for older
 markers) also omits dropped ids so a later open cannot restore forgotten
 names/members/secrets. `conversation_summaries` omits dropped ids and heals
 a leftover index row (crash between core purge and index remove) so unread
-probes cannot keep a deleted recovered chat. Pins:
+probes cannot keep a deleted recovered chat. Ingest after Leave
+(`store_chat` / `persist_session_effects` / drain `Incoming::Message`)
+also skips dropped ids so relay replay of an old kind-445 cannot rewrite
+the transcript, reindex the home row, or toast a chat the user already
+left. Pins:
 `mdk08_migrate::remainder_page_skips_omitted_groups`,
 `mdk08_migrate::backfill_skips_dropped_groups`,
 `persistence::delete_then_remainder_does_not_restore_transcript`,
 `marmot::historical_fold_tests::delete_live_group_forgets_historical_name_sidecar`,
+`marmot::historical_fold_tests::store_chat_skips_dropped_groups`,
+`marmot::historical_fold_tests::reopen_omits_dropped_transcript_rows`,
 `client::tests::conversation_summaries_omit_and_heal_dropped_groups`,
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
@@ -467,12 +473,12 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after the delete-after-fold host snapshot purge.
+Re-run on this cloud agent after the ingest-after-Leave dropped-group skip.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 170 passed |
-| `--test persistence` | 29 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 175 passed |
+| `--test persistence` | 30 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
 | `--test media` | 4 passed |

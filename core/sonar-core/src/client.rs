@@ -6808,6 +6808,14 @@ impl SonarClient {
                     report.record_processed();
                 }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
+                    if self.engine.is_dropped(&message.group_id) {
+                        // Persist already skips dropped ids; keep the event
+                        // marked processed so relay replay cannot toast or
+                        // reindex a chat the user already left.
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                        continue;
+                    }
                     self.record_delivery_for_incoming(incoming);
                     if let Some(sticker_ref) = &message.sticker_ref {
                         sticker_refs.push(sticker_ref.clone());
@@ -6845,7 +6853,9 @@ impl SonarClient {
                     if let Incoming::GroupUpdated(group_id)
                     | Incoming::GroupInvitePending(group_id) = &incoming
                     {
-                        changed_groups.insert(hex::encode(group_id.as_slice()));
+                        if !self.engine.is_dropped(group_id) {
+                            changed_groups.insert(hex::encode(group_id.as_slice()));
+                        }
                     }
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
@@ -7446,6 +7456,9 @@ impl SonarClient {
     }
 
     fn upsert_index_for_message(&self, message: &ChatMessage, group_name: Option<&str>) {
+        if self.engine.is_dropped(&message.group_id) {
+            return;
+        }
         if let Some(ref idx) = self.conversation_index {
             let group_id_hex = hex::encode(message.group_id.as_slice());
             let name = group_name.unwrap_or("");
@@ -7487,6 +7500,9 @@ impl SonarClient {
     }
 
     fn ensure_index_for_group(&self, group_id: &GroupId, name: &str) {
+        if self.engine.is_dropped(group_id) {
+            return;
+        }
         let Some(ref idx) = self.conversation_index else {
             return;
         };
@@ -8837,6 +8853,48 @@ mod tests {
         assert!(
             leftover.is_none(),
             "listing must heal the leftover index row so the next cold start stays clean"
+        );
+
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(2),
+            group_id: group_id.clone(),
+            sender: peer,
+            content: "replayed after leave".into(),
+            created_at: Timestamp::from_secs(200),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("replayed after leave"),
+            reply: None,
+        });
+        client.upsert_index_for_message(
+            &ChatMessage {
+                id: test_event_id(2),
+                group_id: group_id.clone(),
+                sender: peer,
+                content: "replayed after leave".into(),
+                created_at: Timestamp::from_secs(200),
+                mine: false,
+                delivery_state: crate::marmot::DeliveryState::Received,
+                media: vec![],
+                sticker_ref: None,
+                classification: crate::marmot::MessageClassification::of("replayed after leave"),
+                reply: None,
+            },
+            Some("standup"),
+        );
+        assert!(
+            client
+                .engine
+                .messages(&group_id)
+                .expect("transcript")
+                .is_empty(),
+            "store_chat after Leave must not rewrite a deleted recovered chat"
+        );
+        assert!(
+            client.conversation_summary(&group_hex).is_none(),
+            "index upsert after Leave must not recreate the home-list row"
         );
     }
 
