@@ -1112,6 +1112,32 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedSiblingHasMoreKeepsLoadOlderAfterLeave() {
+        assertTrue(foldedSiblingHasMore(historicalHasMore = true, liveHasMore = false))
+        assertTrue(foldedSiblingHasMore(historicalHasMore = false, liveHasMore = true))
+        assertFalse(foldedSiblingHasMore(historicalHasMore = false, liveHasMore = false))
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            mapOf("group-08" to true, "group-09" to true),
+            promotedFoldedPagingFlags(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                flags = mapOf("group-08" to true, "group-09" to false),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to true, "group-09" to true),
+            promotedFoldedPagingFlags(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                flags = mapOf("group-08" to true),
+                liveFoldTarget = { if (it == "group-08") "group-09" else null },
+            ),
+        )
+    }
+
+    @Test
     fun retainedScanChatIdsKeepHiddenHistoricalSibling() {
         val listed = setOf("group-09")
         assertEquals(listed, retainedScanChatIds(listed, emptyMap()))

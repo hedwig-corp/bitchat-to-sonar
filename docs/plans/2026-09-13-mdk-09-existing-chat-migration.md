@@ -801,6 +801,16 @@ Quote-jump after Leave is not a remount hole: both hosts clear the
 jump on pop (`back()` / `pop()`). In-chat quote while fold lands is
 already remounted with the open chat.
 
+Load-older hole closed after this commit: iOS remounted `messagesByGroup`
+after fold but left `hasOlder` / load-older cursors on the hidden 0.8 id.
+Fold after Leave, then reopen the live row offline, could not page bak
+remainder. Promote paging flags/cursors on the same `groups()` path as
+the transcript cache; remount ORs `hasOlder`. Compose already ORs
+`transcriptWindows.hasMore` and now pins `foldedSiblingHasMore`.
+Pins: `ConversationFoldTest.foldedSiblingHasMoreKeepsLoadOlderAfterLeave`,
+`SonarConversationFoldTests` `snPromotedFoldedPagingFlags` /
+`snPromotedFoldedPagingCursors`.
+
 Restore host-fold hole closed after this commit: nsec restore correctly
 wipes the *previous* account's `sonar.historicalFolds` blob, then
 persisted empty until the next `groups()` / `refreshChats` remember.

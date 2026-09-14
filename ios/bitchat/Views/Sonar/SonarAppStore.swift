@@ -531,6 +531,56 @@ func snHistoricalFoldsAfterAccountRestore(
     )
 }
 
+/// Load-older / older-edge pins must survive a fold after Leave.
+func snFoldedSiblingHasMore(historicalHasMore: Bool, liveHasMore: Bool) -> Bool {
+    historicalHasMore || liveHasMore
+}
+
+/// Promote load-older flags from a hidden 0.8 id onto the listed live sibling.
+func snPromotedFoldedPagingFlags(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    flags: [String: Bool],
+    liveFoldTarget: (String) -> String?
+) -> [String: Bool] {
+    var next = flags
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(flags.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        next[pair.live] = snFoldedSiblingHasMore(
+            historicalHasMore: next[pair.historical] == true,
+            liveHasMore: next[pair.live] == true
+        )
+    }
+    return next
+}
+
+/// Copy a hist-only paging cursor onto the live sibling when live has none.
+func snPromotedFoldedPagingCursors<Cursor>(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    cursors: [String: Cursor],
+    liveFoldTarget: (String) -> String?
+) -> [String: Cursor] {
+    var next = cursors
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(cursors.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        if next[pair.live] == nil, let incoming = next[pair.historical] {
+            next[pair.live] = incoming
+        }
+    }
+    return next
+}
+
 /// Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide.
 func snRetainedScanChatIds(
     listedIds: Set<String>,
@@ -7958,6 +8008,11 @@ final class SonarAppStore: ObservableObject {
         if next != marmot.messagesByGroup {
             marmot.messagesByGroup = next
         }
+        marmot.promoteFoldedLocalTranscriptPaging(
+            from: previous,
+            to: current,
+            liveFoldTarget: { targets[$0] }
+        )
     }
 
     /// Keep an in-flight send echo on the live sibling after FFI hides the 0.8 id.

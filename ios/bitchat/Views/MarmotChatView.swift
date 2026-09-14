@@ -2928,6 +2928,33 @@ final class MarmotChatModel: ObservableObject {
         localTranscriptPreservesOlderEdgeGroups.insert(groupId)
     }
 
+    /// After FFI hides a folded 0.8 room, keep load-older cursors on the live
+    /// sibling even when the recovered transcript is already closed.
+    func promoteFoldedLocalTranscriptPaging(
+        from previous: Set<String>,
+        to current: Set<String>,
+        liveFoldTarget: (String) -> String?
+    ) {
+        localTranscriptHasOlderByGroup = snPromotedFoldedPagingFlags(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            flags: localTranscriptHasOlderByGroup,
+            liveFoldTarget: liveFoldTarget
+        )
+        localTranscriptCursorByGroup = snPromotedFoldedPagingCursors(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            cursors: localTranscriptCursorByGroup,
+            liveFoldTarget: liveFoldTarget
+        )
+        localTranscriptPreservesOlderEdgeGroups = snPromotedFoldedVerifiedIds(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            verifiedIds: localTranscriptPreservesOlderEdgeGroups,
+            liveFoldTarget: liveFoldTarget
+        )
+    }
+
     /// After FFI hides a folded 0.8 room, keep the in-memory page, older-edge
     /// pin, and load-older cursor on the live sibling so remount does not snap
     /// an open recovered transcript back to the newest page.
@@ -2944,9 +2971,10 @@ final class MarmotChatModel: ObservableObject {
         if localTranscriptCursorByGroup[liveGroupId] == nil {
             localTranscriptCursorByGroup[liveGroupId] = localTranscriptCursorByGroup[historicalGroupId]
         }
-        if localTranscriptHasOlderByGroup[liveGroupId] == nil {
-            localTranscriptHasOlderByGroup[liveGroupId] = localTranscriptHasOlderByGroup[historicalGroupId]
-        }
+        localTranscriptHasOlderByGroup[liveGroupId] = snFoldedSiblingHasMore(
+            historicalHasMore: localTranscriptHasOlderByGroup[historicalGroupId] == true,
+            liveHasMore: localTranscriptHasOlderByGroup[liveGroupId] == true
+        )
         if localTranscriptPreservesOlderEdgeGroups.contains(historicalGroupId) {
             localTranscriptPreservesOlderEdgeGroups.insert(liveGroupId)
         }

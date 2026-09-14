@@ -707,6 +707,34 @@ internal fun historicalFoldsAfterAccountRestore(
     return rediscovered
 }
 
+/** Load-older / older-edge pins must survive a fold after Leave. */
+internal fun foldedSiblingHasMore(
+    historicalHasMore: Boolean,
+    liveHasMore: Boolean,
+): Boolean = historicalHasMore || liveHasMore
+
+/** Promote load-older flags from a hidden 0.8 id onto the listed live sibling. */
+internal fun promotedFoldedPagingFlags(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    flags: Map<String, Boolean>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, Boolean> {
+    var next = flags
+    for (historical in previousIds + flags.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        next = next + (
+            live to foldedSiblingHasMore(
+                historicalHasMore = flags[historical] == true,
+                liveHasMore = next[live] == true,
+            )
+        )
+    }
+    return next
+}
+
 /** Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide. */
 internal fun retainedScanChatIds(
     listedIds: Set<String>,
@@ -13214,10 +13242,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                     historicalWindow.rows,
                     liveWindow?.rows.orEmpty(),
                 ) { it.id },
-                hasMore = historicalWindow.hasMore || liveWindow?.hasMore == true,
+                hasMore = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.hasMore,
+                    liveHasMore = liveWindow?.hasMore == true,
+                ),
                 loadingOlder = liveWindow?.loadingOlder == true,
-                pinnedToOlderEdge = historicalWindow.pinnedToOlderEdge ||
-                    liveWindow?.pinnedToOlderEdge == true,
+                pinnedToOlderEdge = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.pinnedToOlderEdge,
+                    liveHasMore = liveWindow?.pinnedToOlderEdge == true,
+                ),
             )
         }
         val historicalCanonical = freshCanonicalByGroup[open.id].orEmpty()
@@ -13334,10 +13367,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                     historicalWindow.rows,
                     liveWindow?.rows.orEmpty(),
                 ) { it.id },
-                hasMore = historicalWindow.hasMore || liveWindow?.hasMore == true,
+                hasMore = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.hasMore,
+                    liveHasMore = liveWindow?.hasMore == true,
+                ),
                 loadingOlder = liveWindow?.loadingOlder == true,
-                pinnedToOlderEdge = historicalWindow.pinnedToOlderEdge ||
-                    liveWindow?.pinnedToOlderEdge == true,
+                pinnedToOlderEdge = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.pinnedToOlderEdge,
+                    liveHasMore = liveWindow?.pinnedToOlderEdge == true,
+                ),
             )
         }
     }

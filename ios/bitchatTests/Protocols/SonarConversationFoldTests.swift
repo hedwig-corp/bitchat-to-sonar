@@ -577,6 +577,33 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ).isEmpty
         )
+        #expect(snFoldedSiblingHasMore(historicalHasMore: true, liveHasMore: false))
+        #expect(snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: true))
+        #expect(!snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: false))
+        #expect(
+            snPromotedFoldedPagingFlags(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                flags: ["group-08": true, "group-09": false],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            ) == ["group-08": true, "group-09": true]
+        )
+        #expect(
+            snPromotedFoldedPagingCursors(
+                previousGroupIds: ["group-08"],
+                currentGroupIds: ["group-09"],
+                cursors: ["group-08": "cursor-08"],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            )["group-09"] == "cursor-08"
+        )
+        #expect(
+            snPromotedFoldedPagingCursors(
+                previousGroupIds: ["group-08"],
+                currentGroupIds: ["group-09"],
+                cursors: ["group-08": "cursor-08", "group-09": "cursor-09"],
+                liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+            )["group-09"] == "cursor-09"
+        )
         #expect(
             snComposerDraftsAfterEdit(
                 drafts: ["marmot:group-08": "hello from 0.8"],
