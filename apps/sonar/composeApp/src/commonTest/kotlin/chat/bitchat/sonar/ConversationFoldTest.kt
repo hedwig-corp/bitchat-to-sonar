@@ -2481,6 +2481,30 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun closedNodeInviteProbeDoesNotClearCachedWelcomes() {
+        val cached = listOf(
+            SonarGroupInvite(
+                id = "welcome-08",
+                groupId = "group-08",
+                groupName = "standup",
+                groupDescription = "",
+                welcomerNpub = "npub1welcomer",
+                memberCount = 3,
+                relays = emptyList(),
+            ),
+        )
+        assertEquals(cached, pendingInvitesOrCached(loaded = null, cached = cached))
+        assertEquals(
+            emptyList(),
+            pendingInvitesOrCached(loaded = emptyList(), cached = cached),
+        )
+        assertEquals(
+            emptyList(),
+            pendingInvitesOrCached(loaded = emptyList(), cached = emptyList()),
+        )
+    }
+
+    @Test
     fun emptyAuthoritativeListingDoesNotPruneFolds() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

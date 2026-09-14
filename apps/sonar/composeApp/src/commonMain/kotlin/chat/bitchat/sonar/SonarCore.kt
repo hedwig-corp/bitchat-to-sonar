@@ -901,7 +901,7 @@ expect object SonarCore {
     /** Start a multi-member group with peers (npub or hex). Returns chat id. */
     suspend fun startGroup(members: List<String>, name: String): String
 
-    /** Pending multi-member group invites. */
+    /** Pending multi-member group invites. Throws when the node is closed. */
     suspend fun pendingGroupInvites(): List<SonarGroupInvite>
 
     /** Accept a pending group invite. Returns chat id. */
@@ -1039,17 +1039,20 @@ expect object SonarCore {
         listener: SonarMediaDownloadListener,
     ): Long
 
-    /** Decrypted message history for a chat, oldest first. */
+    /** Decrypted message history for a chat, oldest first. Throws when the node is closed. */
     suspend fun messages(chatId: String): List<SonarMsg>
 
-    /** Bounded local message window for a chat, oldest first within the page. */
+    /** Bounded local message window for a chat, oldest first within the page.
+     *  Throws when the node is closed. */
     suspend fun messagesPage(chatId: String, limit: Int, offset: Int = 0): List<SonarMsg>
 
-    /** Bounded local transcript windows for the most recent chats. */
+    /** Bounded local transcript windows for the most recent chats.
+     *  Throws when the node is closed. */
     suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage>
 
     /** Precomputed conversation summaries from the core-owned index, ordered
-     *  by latest message timestamp (newest first). */
+     *  by latest message timestamp (newest first). Throws when the node is closed
+     *  so a seal cannot look like a successful empty inbox and wipe badges. */
     suspend fun conversationSummaries(): List<SonarConversationSummary>
 
     /** Reset unread count for a chat to 0. */

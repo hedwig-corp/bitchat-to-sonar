@@ -1335,6 +1335,17 @@ success list (no chats) still replaces. iOS only assigns `groups`
 after a successful FFI read. Pin:
 `ConversationFoldTest.closedNodeListingDoesNotReplaceOrPersistCachedChats`.
 
+Same hole class on the other listing helpers: `conversationSummaries()`,
+`recentMessagePages()`, `pendingGroupInvites()`, and `messages()` also
+returned `[]` on a closed node. Housekeeping / `markGroupsRead` already
+keep badges when the probe is `null`, but an empty *success* still
+clears them; `refreshChatsInner` used
+`pendingGroupInvites().getOrDefault(emptyList())` and wiped recovered
+pending welcomes. Those actuals now throw; invite assign uses
+`pendingInvitesOrCached`. iOS `pendingGroupInvites()` already throws and
+only assigns on a successful `try`. Pin:
+`ConversationFoldTest.closedNodeInviteProbeDoesNotClearCachedWelcomes`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

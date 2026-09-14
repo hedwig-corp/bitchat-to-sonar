@@ -1395,6 +1395,12 @@ internal fun chatListingOrCached(
 
 internal fun shouldPersistChatListing(loaded: List<SonarChat>?): Boolean = loaded != null
 
+/** A failed invite probe must not clear recovered pending welcomes. */
+internal fun pendingInvitesOrCached(
+    loaded: List<SonarGroupInvite>?,
+    cached: List<SonarGroupInvite>,
+): List<SonarGroupInvite> = loaded ?: cached
+
 internal fun collapsedFoldedSnapshotChats(
     chats: List<SonarChat>,
     historicalFolds: Map<String, String>,
@@ -14203,7 +14209,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
             }
         }
-        groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
+        groupInvites = pendingInvitesOrCached(
+            loaded = runCatching { SonarCore.pendingGroupInvites() }.getOrNull(),
+            cached = groupInvites,
+        )
         resolvePendingMarmotChats()
         remountFoldedOpenChat()
         adoptOpenChatTitleIfListed()
