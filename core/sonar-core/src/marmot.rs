@@ -3211,6 +3211,39 @@ impl MarmotEngine {
         self.store_chat(msg);
     }
 
+    /// Stored 0.8 `member_count` when extract copied it, else inferred
+    /// from the recovered roster (peers + local).
+    pub fn historical_declared_member_count(&self, group_id: &GroupId) -> u32 {
+        self.historical_member_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(group_id)
+            .copied()
+            .unwrap_or_else(|| self.historical_members(group_id).len() as u32)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_historical_metadata(
+        &self,
+        group_id: GroupId,
+        name: &str,
+        members: Vec<PublicKey>,
+        member_count: u32,
+    ) {
+        self.historical_group_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id.clone(), name.to_string());
+        self.historical_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id.clone(), members);
+        self.historical_member_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group_id, member_count);
+    }
+
     #[cfg(test)]
     pub(crate) fn add_historical_media_secret(&self, group_id: GroupId, secret: Vec<u8>) {
         self.historical_media_secrets

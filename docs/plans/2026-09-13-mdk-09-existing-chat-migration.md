@@ -165,6 +165,12 @@ Guarded by:
   (auto-accepted GroupUpdated and parked-then-accept must call
   `maybe_fold_new_group`; otherwise a peer-started 0.9 DM leaves the
   0.8 row listed and a send on that id mints a second 0.9 group)
+- `client::tests::incoming_09_room_welcome_folds_recovered_08_room`
+  (accepting a 3+ 0.9 room whose other members match the recovered
+  sidecar folds history; 2-person named rooms stay off this path)
+- `client::tests::incoming_09_dm_welcome_does_not_fold_recovered_room`
+  (R-045 at the incoming-welcome call site: welcomer-only known
+  members must not absorb a recovered room into a 1:1)
 - `ConversationFoldTest.recoveredAndResumedDirectChatsRenderOnceByPeer`
 - existing `wrong_key_cannot_open_existing_db` / `self_heals_an_unencrypted_legacy_database`
 - `account_backup::decode_v1_package_has_empty_sidecars`
@@ -640,6 +646,15 @@ only one known peer no longer resumes as `start_dm`. Extract copies
 `historical_resume_is_direct` matches live `group_is_direct`. Early
 `metadata_backfill=complete` markers re-run as `v2` so already-quarantined
 baks pick up the new sidecars.
+
+Incoming 0.9 room welcome hole closed after this commit: `maybe_fold`
+used to skip every recovered room (only `resolve_send_group` folded
+them). A peer who recreated the same 3+ room left a split: new empty
+0.9 row + recovered 0.8 history. Fold when both sides are non-DM, both
+have 3+ members, and the other-member sets match. A recovered room
+still must not fold onto a welcomer 1:1 (R-045). Pins:
+`incoming_09_room_welcome_folds_recovered_08_room`,
+`incoming_09_dm_welcome_does_not_fold_recovered_room`.
 
 Incoming 0.9 DM welcome hole closed after this commit: 1:1 welcomes
 auto-join as `Incoming::GroupUpdated` and parked 2-member Accept uses

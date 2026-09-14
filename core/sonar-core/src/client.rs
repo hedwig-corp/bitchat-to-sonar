@@ -7249,14 +7249,25 @@ impl SonarClient {
             if hist_others != live_others {
                 continue;
             }
-            // R-003 folds a recovered *DM* onto a new 1:1 with the same peer.
-            // A recovered room (member_count > 2) must not ride that path:
-            // only the welcomer may be known yet, and folding would absorb
-            // the room into a DM. Rooms resume only via resolve_send_group.
-            if !self.engine.historical_resume_is_direct(&group.id) {
+            let hist_direct = self.engine.historical_resume_is_direct(&group.id);
+            // R-003: recovered DM onto the new 2-person group with that
+            // peer. Live may carry a display name (`create_group("alice
+            // & bob")`); do not require `group_is_direct` here.
+            if hist_direct {
+                self.record_resume_fold(&group.id, live_id);
                 continue;
             }
-            self.record_resume_fold(&group.id, live_id);
+            // Rooms fold only onto a live 3+ non-DM with the same other
+            // members (peer recreated the same room). Never absorb a
+            // room into a 1:1 / welcomer DM (R-045).
+            if self.group_is_direct(live_id) {
+                continue;
+            }
+            let live_count = live_others.len() as u32 + 1;
+            let hist_count = self.engine.historical_declared_member_count(&group.id);
+            if live_count >= 3 && hist_count >= 3 {
+                self.record_resume_fold(&group.id, live_id);
+            }
         }
     }
 
@@ -11506,6 +11517,163 @@ mod tests {
                 .unread_count,
             0,
             "second copy_summary must not double-count"
+        );
+    }
+
+    /// Peer recreated the same 3-person room on 0.9. Accept must fold the
+    /// recovered 0.8 room onto that live id so history is not a second row.
+    #[tokio::test]
+    async fn incoming_09_room_welcome_folds_recovered_08_room() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x18u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(11),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key(), carol.identity().public_key()],
+            3,
+        );
+        assert!(
+            !bob.engine.historical_resume_is_direct(&historical),
+            "named 3-member sidecar must stay a room"
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice recreates the room");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let (report, _) = bob
+            .process_marmot_events([bob_welcome], "incoming 0.9 room")
+            .await;
+        assert_eq!(report.processed, 1);
+        let invite = bob
+            .pending_group_invites()
+            .expect("parked 3-member welcome")
+            .remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts the recreated room");
+
+        let live_groups = bob.engine.groups().expect("bob live groups");
+        assert_eq!(live_groups.len(), 1);
+        let live = live_groups[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "accepting the matching 0.9 room must fold recovered 0.8 history"
+        );
+        assert!(bob.is_folded_historical_group(&historical));
+        assert!(
+            bob.messages(&live)
+                .expect("union")
+                .iter()
+                .any(|m| m.content == "old standup"),
+            "messages(live) must include the recovered room transcript"
+        );
+        assert_eq!(
+            bob.conversation_summaries().len(),
+            1,
+            "folded historical room must leave one home-list row"
+        );
+    }
+
+    /// R-045 at the incoming-welcome call site: a recovered room that only
+    /// knows the welcomer must not fold onto that peer's new 0.9 DM.
+    #[tokio::test]
+    async fn incoming_09_dm_welcome_does_not_fold_recovered_room() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x28u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(12),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key()],
+            3,
+        );
+        assert!(!bob.engine.historical_resume_is_direct(&historical));
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice starts a DM");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let (report, _) = bob
+            .process_marmot_events([bob_welcome], "incoming dm beside room")
+            .await;
+        assert_eq!(report.processed, 1);
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "maybe_fold must not absorb a 3-member recovered room into the welcomer DM"
+        );
+        assert!(!bob.is_folded_historical_group(&historical));
+        assert_eq!(bob.engine.groups().expect("live dm").len(), 1);
+        assert!(
+            bob.historical_groups()
+                .expect("room stays listed")
+                .iter()
+                .any(|g| g.id == historical),
+            "recovered room must remain a separate conversation"
         );
     }
 
