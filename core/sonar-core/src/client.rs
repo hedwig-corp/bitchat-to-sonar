@@ -6896,12 +6896,11 @@ impl SonarClient {
                     {
                         if !self.engine.is_dropped(group_id) {
                             if matches!(incoming, Incoming::GroupUpdated(_)) {
-                                // 1:1 welcomes auto-join here. Fold a recovered
-                                // 0.8 DM with the same peer onto this live id
-                                // before hosts paint chats() — otherwise both
-                                // rows stay listed and a send on the 0.8 id
-                                // mints a second 0.9 group. Rooms skip inside
-                                // maybe_fold_new_group (R-045).
+                                // Auto-joined welcomes fold a recovered 0.8
+                                // sibling onto this live id before hosts paint
+                                // chats(). Already-folded hist is skipped so a
+                                // second matching welcome cannot steal history.
+                                // Rooms still must not fold onto a 1:1 (R-045).
                                 self.maybe_fold_new_group(group_id);
                             }
                             changed_groups.insert(hex::encode(group_id.as_slice()));
@@ -7253,6 +7252,12 @@ impl SonarClient {
             .unwrap_or_default();
         let mut room_candidates: Vec<(GroupId, String, Vec<PublicKey>)> = Vec::new();
         for group in historical {
+            // Already bound to a live sibling. A later matching welcome
+            // (peer also created a 0.9 group) must not steal history onto
+            // that second MLS id — `record_historical_fold` overwrites.
+            if self.is_folded_historical_group(&group.id) {
+                continue;
+            }
             let mut hist_others: Vec<PublicKey> =
                 group.members.into_iter().filter(|pk| *pk != me).collect();
             hist_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
@@ -12069,6 +12074,117 @@ mod tests {
                 .iter()
                 .any(|g| g.id == historical),
             "recovered 3-person standup must remain a separate conversation"
+        );
+    }
+
+    /// Concurrent resume: the first matching 0.9 standup already owns the
+    /// recovered history. A second same-name welcome from the same peer
+    /// must not overwrite `historical_folds` and move 0.8 messages onto
+    /// the empty new MLS group.
+    #[tokio::test]
+    async fn incoming_09_named_pair_second_welcome_does_not_steal_fold() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x5bu8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(19),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "standup from 0.8".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("standup from 0.8"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key()],
+            2,
+        );
+
+        let first_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob first key package");
+        let first = alice
+            .create_group("standup", vec![first_kp], relays.clone())
+            .await
+            .expect("alice first standup");
+        let (_pk, first_welcome) = first
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("first welcome");
+        bob.process_marmot_events([first_welcome], "first named pair")
+            .await;
+
+        let first_live = bob.engine.groups().expect("first live")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&first_live)
+        );
+
+        let second_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob second key package");
+        let second = alice
+            .create_group("standup", vec![second_kp], relays)
+            .await
+            .expect("alice second standup");
+        let (_pk, second_welcome) = second
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("second welcome");
+        bob.process_marmot_events([second_welcome], "second named pair")
+            .await;
+
+        let live_ids: Vec<_> = bob
+            .engine
+            .groups()
+            .expect("two live standups")
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(
+            live_ids.len(),
+            2,
+            "concurrent resume still mints a second MLS group"
+        );
+        let second_live = live_ids
+            .iter()
+            .find(|id| *id != &first_live)
+            .expect("second live id")
+            .clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&first_live),
+            "second matching welcome must not steal the hist→live fold"
+        );
+        assert!(
+            bob.messages(&first_live)
+                .expect("first")
+                .iter()
+                .any(|m| m.content == "standup from 0.8"),
+            "0.8 history must stay on the first resumed standup"
+        );
+        assert!(
+            !bob.messages(&second_live)
+                .expect("second")
+                .iter()
+                .any(|m| m.content == "standup from 0.8"),
+            "the empty second standup must not inherit recovered history"
         );
     }
 

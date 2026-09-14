@@ -176,6 +176,8 @@ Guarded by:
 - `client::tests::incoming_09_named_pair_welcome_does_not_fold_three_member_room`
   (R-045: a recovered 3-person standup must not fold onto a 2-person
   live standup just because the names match)
+- `client::tests::incoming_09_named_pair_second_welcome_does_not_steal_fold`
+  (already-folded hist must not move onto a second matching 0.9 group)
 - `client::tests::incoming_09_room_welcome_folds_when_live_is_subset_of_recovered`
   (incoming mixed resume matches `resolve_send_group`: live others
   may be a unique subset of the recovered roster; leftovers stay
@@ -651,7 +653,7 @@ Re-run on `d5e2a5b6` after named-pair incoming fold.
 | `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 201 passed on `d5e2a5b6` |
 | `--lib` `--` `incoming_09_` | 8 passed on `d5e2a5b6` |
 | `--lib` `--` `historical_fold` `copy_summary` | 14 passed on `d5e2a5b6` |
-| `--test persistence` | 30 passed earlier on this branch |
+| `--test persistence` | 30 passed on `d5e2a5b6` |
 | `--test group_invites` | 17 passed earlier on this branch |
 | `--test failed_events` | 1 passed earlier on this branch |
 | `--test media` | 4 passed earlier on this branch |
@@ -692,6 +694,14 @@ Fold on unique name + exact member match only. Name mismatch and a
 `incoming_09_named_pair_welcome_folds_recovered_named_room`,
 `incoming_09_named_pair_welcome_skips_when_names_differ`,
 `incoming_09_named_pair_welcome_does_not_fold_three_member_room`.
+
+Concurrent-resume hole closed after this commit: `historical_groups()`
+still lists a folded 0.8 row, so a second matching 0.9 welcome
+overwrote `historical_folds` and `messages()` moved 0.8 history onto
+the empty new MLS group. Skip already-folded hist. The second live
+group can still appear (two MLS graphs cannot merge); history stays
+on the first resume. Pin:
+`incoming_09_named_pair_second_welcome_does_not_steal_fold`.
 
 Incoming 0.9 DM welcome hole closed after this commit: 1:1 welcomes
 auto-join as `Incoming::GroupUpdated` and parked 2-member Accept uses
