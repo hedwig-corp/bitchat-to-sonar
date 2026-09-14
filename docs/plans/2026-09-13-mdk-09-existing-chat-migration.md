@@ -373,7 +373,9 @@ tap whose payload still names the hidden 0.8 id remaps onto
 call-log rows on the hidden id are merged onto the live sibling so resume
 does not drop the recovered call history. A safety-number verify on the
 hidden id is copied onto the live sibling so resume does not drop the
-checkmark. Hosts persist hist→live bindings and drop a recovered snapshot
+checkmark. Call/pay/notification scan watermarks and seen-ids move with
+the fold so recovered history is not replayed as new traffic on the live
+id. Hosts persist hist→live bindings and drop a recovered snapshot
 row on the next cold start when the live sibling is already listed, so an
 older mid-PR snapshot that still has both ids does not flash two room
 rows. Leave/delete of the live sibling
