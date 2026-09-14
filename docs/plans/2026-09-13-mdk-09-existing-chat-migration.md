@@ -447,6 +447,9 @@ chat stays silent when the next push names the live 0.9 id. Pins:
 `marmot::historical_fold_tests::park_invite_skips_dropped_groups`,
 `client::tests::conversation_summaries_omit_and_heal_dropped_groups`,
 `client::tests::send_text_rejects_dropped_group`,
+`ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
+`SonarConversationFoldTests` (`snNotificationOpenGroupId` remaps a shade
+tap onto the live sibling even before that id is listed),
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
 `snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no
@@ -480,7 +483,7 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after parked-invite purge and fold-aware mute.
+Re-run on this cloud agent after iOS notification remount and pending-media fold.
 
 | Gate | Result |
 | --- | --- |

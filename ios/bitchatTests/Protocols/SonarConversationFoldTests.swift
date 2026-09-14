@@ -68,6 +68,24 @@ struct SonarConversationFoldTests {
             ) == "group-08"
         )
         #expect(
+            snNotificationOpenGroupId(
+                tappedGroupId: "group-08",
+                liveFoldTarget: "group-09"
+            ) == "group-09"
+        )
+        #expect(
+            snNotificationOpenGroupId(
+                tappedGroupId: "group-08",
+                liveFoldTarget: nil
+            ) == "group-08"
+        )
+        #expect(
+            snNotificationOpenGroupId(
+                tappedGroupId: "group-09",
+                liveFoldTarget: "group-09"
+            ) == "group-09"
+        )
+        #expect(
             snRemountFoldedOpenValues(
                 historicalKeys: ["marmot:group-08", "group-08"],
                 liveKeys: ["marmot:group-09", "group-09"],

@@ -286,6 +286,19 @@ func snRemountFoldedOpenGroupId(
     return live
 }
 
+/// Shade / deep-link taps can still name a hidden 0.8 id after resume.
+/// Remap onto `live_fold_target` even before the home list lists the live
+/// sibling so a tap cannot clear the banner and leave the user on Home.
+func snNotificationOpenGroupId(
+    tappedGroupId: String,
+    liveFoldTarget: String?
+) -> String {
+    guard let live = liveFoldTarget, !live.isEmpty, live != tappedGroupId else {
+        return tappedGroupId
+    }
+    return live
+}
+
 /// Copy an open-chat host map (unread divider, jump, window) from a hidden
 /// 0.8 id onto the live sibling so remount does not treat the chat as a
 /// fresh open.
@@ -7744,6 +7757,7 @@ final class SonarAppStore: ObservableObject {
             values: pendingJumpMessageIdByDM
         )
         remountFoldedConversationViewState(from: openId, groupId: groupId, onto: realId)
+        remountFoldedPendingUploadMedia(from: groupId, onto: remounted)
         if pendingMediaPreviews.contains(where: { $0.peerId == openId || $0.peerId == groupId }) {
             pendingMediaPreviews = pendingMediaPreviews.map { preview in
                 PendingMediaPreview(
@@ -8281,6 +8295,25 @@ final class SonarAppStore: ObservableObject {
         caption: String
     ) -> String {
         [groupId, filename, mime, caption].joined(separator: "\u{1f}")
+    }
+
+    /// Keep in-flight upload bytes when resume folds the recovered id away.
+    private func remountFoldedPendingUploadMedia(from historical: String, onto live: String) {
+        guard historical != live, !historical.isEmpty, !live.isEmpty else { return }
+        var next: [String: [PendingUploadMedia]] = [:]
+        var changed = false
+        for (key, items) in pendingUploadMediaCache {
+            let parts = key.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false)
+            if String(parts[0]) == historical, parts.count == 2 {
+                next[live + "\u{1f}" + String(parts[1])] = items
+                changed = true
+            } else {
+                next[key] = items
+            }
+        }
+        if changed {
+            pendingUploadMediaCache = next
+        }
     }
 
     private func rememberPendingUploadMedia(
@@ -10686,23 +10719,26 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// A shade tap can still carry the hidden 0.8 group id after resume.
-    /// Remap it onto `live_fold_target` instead of treating the chat as gone.
+    /// Refresh local groups, then remap onto `live_fold_target` even if the
+    /// home list has not listed the live sibling yet.
     @MainActor
     private func openFoldedNotificationConversation(_ id: String, jump: String?) async {
         let groupId = marmotGroupId(id) ?? {
             id.count == 64 && id.allSatisfy(\.isHexDigit) ? id.lowercased() : nil
         }()
-        guard let groupId,
-              let live = await marmot.liveFoldTarget(groupId: groupId) else {
+        guard let groupId else {
             clearNotificationsForConversation(id)
             return
         }
-        let remounted = snRemountFoldedOpenGroupId(
-            openGroupId: groupId,
-            listedGroupIds: Set(marmot.groups.map(\.id)),
+        _ = await marmot.loadLocalSummaries(resolveMembers: false)
+        let live = await marmot.liveFoldTarget(groupId: groupId)
+        let remounted = snNotificationOpenGroupId(
+            tappedGroupId: groupId,
             liveFoldTarget: live
         )
-        guard remounted != groupId else {
+        let listed = Set(marmot.groups.map(\.id))
+        guard remounted != groupId || listed.contains(groupId) || listed.contains(remounted) else {
+            showToast("That chat isn’t ready yet — try again from Messages.")
             clearNotificationsForConversation(id)
             return
         }

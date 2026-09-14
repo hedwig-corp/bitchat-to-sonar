@@ -605,6 +605,29 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling() {
+        assertEquals(
+            mapOf("group-09" to listOf("uploading")),
+            remountFoldedPendingMediaUploads(
+                historical = "group-08",
+                live = "group-09",
+                uploads = mapOf("group-08" to listOf("uploading")),
+            ),
+        )
+        assertEquals(
+            mapOf("group-09" to listOf("already", "uploading")),
+            remountFoldedPendingMediaUploads(
+                historical = "group-08",
+                live = "group-09",
+                uploads = mapOf(
+                    "group-08" to listOf("uploading"),
+                    "group-09" to listOf("already"),
+                ),
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalComposerDraftMovesOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

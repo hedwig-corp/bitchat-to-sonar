@@ -511,6 +511,18 @@ internal fun marmotSendTargetGroupId(
 
 /** After FFI `groups()` hides a folded 0.8 room, remount the open transcript
  *  onto the live 0.9 sibling so lookups (`chats.firstOrNull`) stay valid. */
+/** Move in-flight media uploads off a hidden 0.8 id onto the live sibling. */
+internal fun <V> remountFoldedPendingMediaUploads(
+    historical: String,
+    live: String,
+    uploads: Map<String, List<V>>,
+): Map<String, List<V>> {
+    if (historical.isBlank() || live.isBlank() || historical == live) return uploads
+    val incoming = uploads[historical] ?: return uploads
+    val existing = uploads[live].orEmpty()
+    return uploads - historical + (live to (existing + incoming))
+}
+
 internal fun remountFoldedOpenChatId(
     openChatId: String,
     listedChatIds: Set<String>,
@@ -12709,6 +12721,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (pendingMediaPreviews.any { it.chatId == open.id }) {
             pendingMediaPreviews = pendingMediaPreviews.map { preview ->
                 preview.copy(chatId = remountFoldedOpenId(listOf(open.id), live, preview.chatId))
+            }
+        }
+        if (open.id in pendingMediaUploads) {
+            val remountedUploads = remountFoldedPendingMediaUploads(
+                historical = open.id,
+                live = live,
+                uploads = pendingMediaUploads,
+            )
+            pendingMediaUploads.clear()
+            remountedUploads.forEach { (id, rows) ->
+                pendingMediaUploads[id] = rows.toMutableList()
             }
         }
         if (open.id in hydratedTranscripts) {
