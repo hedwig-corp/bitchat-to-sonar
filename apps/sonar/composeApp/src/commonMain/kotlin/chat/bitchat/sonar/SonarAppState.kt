@@ -785,7 +785,8 @@ internal fun conversationLatestAtFromSummaries(
 
 /** Newest known timestamp across snapshot + remounted index latest.
  *  Snapshot-only understates a recovered 0.8 hist `latest_at` when the
- *  first live page is still short. iOS `expectedNewestMessageDate`. */
+ *  first live page is still short — home-list recency then sinks the
+ *  recovered row. iOS `expectedNewestMessageDate` / `latestMarmotMessage`. */
 internal fun expectedNewestTsForChat(
     chatId: String,
     messagesByChat: Map<String, List<SonarMsg>>,
@@ -3165,7 +3166,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun chatHasFoldFamily(chatId: String): Boolean =
         foldFamilyIds(chatId, historicalFoldMap).size > 1
 
-    /** Newest known local timestamp across the fold family (index + snapshot). */
+    /** Newest known local timestamp across the fold family (index + snapshot).
+     *  Home-list recency, unread retire, and extract-keep must use this —
+     *  not snapshot-only [localLatestTs]. */
     fun expectedNewestTsForOpenChat(chatId: String): Long = expectedNewestTsForChat(
         chatId,
         chatSnapshotMessagesByChat,
@@ -3920,7 +3923,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val result = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
             chats = standalone,
             ownNpub = npub,
-            latestSecs = ::localLatestTs,
+            latestSecs = ::expectedNewestTsForOpenChat,
         )
         // Only cache the stable (no active settle window) computation. A held
         // chat can flip to visible purely by time passing, which the key can't
@@ -6775,7 +6778,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         dedupeDirectMarmotChats(
             chats = chats,
             ownNpub = npub,
-            latestSecs = ::localLatestTs,
+            latestSecs = ::expectedNewestTsForOpenChat,
         ).count { isVerified(it.id) }
 
     fun unreadForChat(chatId: String): Long =
@@ -6853,7 +6856,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 },
                 // Pending rows use creation time so recency merge does not sink
                 // a freshly-started chat under older history (iOS dmRows parity).
-                tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
+                // Recovered 0.8 rows must use index `latest_at` when the
+                // snapshot is still empty — iOS `latestMarmotMessage`.
+                tsSecs = newest?.tsSecs
+                    ?: pendingCreatedAtSecs(chat.id)
+                    ?: expectedNewestTsForOpenChat(chat.id),
                 verified = unreadIds.any { it in verifiedChatIds },
                 unread = unreadIds.sumOf { unreadByChat[it] ?: 0L } > 0,
                 pending = pending,
@@ -12910,7 +12917,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun preferredDirectMarmotChat(groups: List<SonarChat>): SonarChat? =
         groups.maxWithOrNull(
-            compareBy<SonarChat> { localLatestTs(it.id) }
+            compareBy<SonarChat> { expectedNewestTsForOpenChat(it.id) }
                 .thenBy { it.id }
         )
 
@@ -14172,7 +14179,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 groups.forEach { g -> folded += g.id; groupPeers[g.id] = peerId }
                 latestMarmotMessage(groups)?.let { if (it.tsSecs > last.tsSecs) last = it }
             }
-            val remountedTs = groups.maxOfOrNull { localLatestTs(it.id) } ?: 0L
+            val remountedTs = groups.maxOfOrNull { expectedNewestTsForOpenChat(it.id) } ?: 0L
             upsert(
                 peerId,
                 MeshDmRow(
@@ -14202,7 +14209,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     peerId,
                     foldedPeerName(peerId, group),
                     last?.let { messagePreview(it.content, it.stickerRef, it.media) } ?: "Secure chat · reaches anywhere",
-                    foldedMeshRowTs(last?.tsSecs, localLatestTs(group.id)),
+                    foldedMeshRowTs(last?.tsSecs, expectedNewestTsForOpenChat(group.id)),
                 )
             )
         }
@@ -14361,9 +14368,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         // That two-step hydrate was the visible startup reorder.
         chatSnapshotMessagesByChat = hydration.messagesByChat
         chatSnapshotLatestByChat = hydration.latestByChat
+        // Assign the snapshot first so `expectedNewestTsForOpenChat` can
+        // max hydration latest with a kept index `latest_at`. A failed
+        // summaries probe leaves `hydration.latestByChat` at snapshot 0
+        // while the remounted hist newest is still in the cache — using
+        // hydration alone sank the recovered row (iOS `latestAt`).
         chats = orderChatsByLocalRecency(
             chats = localChats,
-            latestSecs = { hydration.latestByChat[it] ?: 0L },
+            latestSecs = ::expectedNewestTsForOpenChat,
             previousOrder = previousOrder,
         )
         val listedIds = chats.mapTo(hashSetOf()) { it.id }

@@ -1463,6 +1463,16 @@ index `latest_at` already held the hist newest. iOS already feeds
 summary `latestAt`. Merge cached index latest into that map. Pin:
 `ConversationFoldTest.failedSummariesProbeKeepsHistMessageCountForBlankRecovery`.
 
+Compose home-list recency still used snapshot-only `localLatestTs`
+(`visibleChats` dedupe, `marmotRow` ts, `orderChatsByLocalRecency`,
+mesh `foldedMeshRowTs`). After upgrade a recovered chat with persist
+latest 0 and hist index `latest_at` 50 sank under every other row.
+iOS `latestMarmotMessage` already consults remounted `latestAt`.
+Those sites now use `expectedNewestTsForOpenChat`. Capability-settle
+and send-target stay snapshot-only. Pins: same
+`expectedNewestTsUsesRemountedIndexLatestWhenSnapshotStale`,
+`HomeMessageRowsTest.remountedIndexLatestKeepsRecoveredChatAboveNewerSnapshotRows`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

@@ -2510,6 +2510,53 @@ class ConversationFoldTest {
             ),
             "genuinely empty conversation stays a trusted empty page",
         )
+        val recovered = SonarChat(
+            id = "group-09",
+            name = "",
+            members = listOf("npub1me", "npub1peer"),
+            isDirect = true,
+        )
+        val other = SonarChat(
+            id = "group-other",
+            name = "other",
+            members = listOf("npub1me", "npub1other"),
+            isDirect = true,
+        )
+        val emptySibling = SonarChat(
+            id = "group-10",
+            name = "",
+            members = listOf("npub1me", "npub1peer"),
+            isDirect = true,
+        )
+        val homeLatest = { id: String ->
+            expectedNewestTsForChat(
+                chatId = id,
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-09" to 0L, "group-other" to 20L, "group-10" to 0L),
+                summaryLatestByChat = mapOf("group-08" to 50L),
+                historicalFolds = folds,
+            )
+        }
+        assertEquals(50L, homeLatest("group-09"))
+        assertEquals(20L, homeLatest("group-other"))
+        assertEquals(
+            listOf("group-09", "group-other"),
+            orderChatsByLocalRecency(
+                chats = listOf(other, recovered),
+                latestSecs = homeLatest,
+                previousOrder = listOf(other.id, recovered.id),
+            ).map { it.id },
+            "stale snapshot 0 + hist index 50 must keep the recovered row first",
+        )
+        assertEquals(50L, foldedMeshRowTs(latestMessageTs = null, localLatestTs = homeLatest("group-09")))
+        assertEquals(
+            listOf(recovered),
+            dedupeDirectMarmotChats(
+                chats = listOf(emptySibling, recovered),
+                ownNpub = "npub1me",
+                latestSecs = homeLatest,
+            ),
+        )
     }
 
     @Test

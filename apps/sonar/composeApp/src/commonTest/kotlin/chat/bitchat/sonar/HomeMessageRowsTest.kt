@@ -93,6 +93,41 @@ class HomeMessageRowsTest {
     }
 
     @Test
+    fun remountedIndexLatestKeepsRecoveredChatAboveNewerSnapshotRows() {
+        // After upgrade the persist blob can have live latest=0 while the
+        // remounted index still holds hist `latest_at`. Home merge must
+        // use that index newest or the recovered row sinks (iOS latestAt).
+        val recovered = chat("group-09")
+        val newerEmpty = chat("group-other")
+        val folds = mapOf("group-08" to "group-09")
+        val latestSecs = { id: String ->
+            expectedNewestTsForChat(
+                chatId = id,
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-09" to 0L, "group-other" to 20L),
+                summaryLatestByChat = mapOf("group-08" to 50L),
+                historicalFolds = folds,
+            )
+        }
+        val ordered = orderChatsByLocalRecency(
+            chats = listOf(newerEmpty, recovered),
+            latestSecs = latestSecs,
+            previousOrder = listOf(newerEmpty.id, recovered.id),
+        )
+        assertEquals(listOf("group-09", "group-other"), ordered.map { it.id })
+        val merged = mergeHomeMessageRows(
+            meshRows = listOf(mesh("mesh-mid", 30L)),
+            chatRows = ordered,
+            marmotTsSecs = latestSecs,
+        )
+        assertEquals(
+            listOf("group-09", "mesh:mesh-mid", "group-other"),
+            merged.map { it.listKey },
+        )
+        assertEquals(50L, foldedMeshRowTs(latestMessageTs = null, localLatestTs = latestSecs("group-09")))
+    }
+
+    @Test
     fun restoredMetadataKeepsMixedTransportRowsInRecencyOrder() {
         val newest = chat("marmot-new")
         val oldest = chat("marmot-old")
