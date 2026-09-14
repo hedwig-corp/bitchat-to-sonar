@@ -15017,7 +15017,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         unreadSuppressGroupIds.clear()
         unreadSuppressGroupIds.addAll(pruned)
-        unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds)
+        unreadByChat = if (summaries.isEmpty()) {
+            emptyMap()
+        } else {
+            remountFoldedUnread(
+                unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds),
+                unreadByChat,
+                historicalFoldMap,
+            )
+        }
         rememberConversationSummaryIndex(summaries)
     }
 

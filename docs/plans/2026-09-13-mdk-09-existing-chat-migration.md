@@ -1488,6 +1488,13 @@ recovery again. Remount previous fold-family values onto live; empty
 success still clears. Pin: same
 `failedSummariesProbeKeepsHistMessageCountForBlankRecovery`.
 
+Unread maps have the same hide: a later live-only probe (live unread
+0 after restore-without-`copy_summary`) dropped the hist badge.
+Keep the previous hist key only while live unread is still 0 —
+after `copy_summary` live already holds the sum. Pins:
+`UnreadCountsTest.liveOnlyProbeKeepsHistUnreadWhenLiveBadgeIsZero`,
+`SNUnreadCountsTests.liveOnlyProbeKeepsHistUnreadWhenLiveBadgeIsZero`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

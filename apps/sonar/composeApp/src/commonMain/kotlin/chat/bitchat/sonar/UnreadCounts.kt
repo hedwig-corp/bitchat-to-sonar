@@ -118,6 +118,35 @@ internal fun unreadCountsFromSummaries(
 }
 
 /**
+ * `conversation_summaries()` hides folded hist. A later live-only probe
+ * (live unread 0 after restore-without-`copy_summary`) used to drop the
+ * previous hist badge. Keep the hist key only while live unread is still
+ * 0 — after `copy_summary` live already holds the sum, so keeping hist
+ * would double-count. Callers clear on empty summaries (a live-only
+ * unread-0 probe publishes an empty map and must keep hist).
+ * iOS `SNUnreadCounts.remountFoldedUnread`.
+ */
+internal fun remountFoldedUnread(
+    next: Map<String, Long>,
+    previous: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Map<String, Long> {
+    // A live-only probe with unread 0 publishes an empty map (zeros are
+    // omitted). That is not empty success — callers clear on `summaries.isEmpty()`.
+    if (historicalFolds.isEmpty()) return next
+    var out = next
+    for ((historical, live) in historicalFolds) {
+        if (live.isBlank() || live == historical) continue
+        if (historical in next) continue
+        val histUnread = previous[historical] ?: 0L
+        if (histUnread <= 0L) continue
+        if ((out[live] ?: 0L) > 0L) continue
+        out = out + (historical to histUnread)
+    }
+    return out
+}
+
+/**
  * After a summaries refresh, drop suppress entries the core has confirmed as
  * read (`unread_count == 0` or missing). Keep suppressing while the DB still
  * reports unread so an in-flight mark-read cannot flash the badge back.

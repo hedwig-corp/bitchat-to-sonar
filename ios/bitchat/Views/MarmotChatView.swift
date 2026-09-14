@@ -3473,10 +3473,16 @@ final class MarmotChatModel: ObservableObject {
             unreadSuppressGroupIds,
             summaries: tuples
         )
-        unreadByGroup = SNUnreadCounts.unreadByGroup(
-            from: tuples,
-            suppressing: unreadSuppressGroupIds.union(viewingUnreadGroupIds)
-        )
+        unreadByGroup = summaries.isEmpty
+            ? [:]
+            : SNUnreadCounts.remountFoldedUnread(
+                next: SNUnreadCounts.unreadByGroup(
+                    from: tuples,
+                    suppressing: unreadSuppressGroupIds.union(viewingUnreadGroupIds)
+                ),
+                previous: unreadByGroup,
+                historicalFolds: historicalFoldsMap()
+            )
     }
 
     /// Publish our own kind-0 profile so peers see our nickname, not our npub.

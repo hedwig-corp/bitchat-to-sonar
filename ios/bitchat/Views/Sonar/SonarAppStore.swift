@@ -1774,7 +1774,7 @@ func snRemountedConversationSummaries(
                     unreadCount: liveSummary.unreadCount
                 )
             }
-        } else if live.isEmpty == false {
+        } else {
             out[live] = MarmotService.ConversationSummary(
                 groupIdHex: live,
                 name: hist.name,

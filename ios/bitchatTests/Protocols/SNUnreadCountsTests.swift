@@ -38,6 +38,52 @@ struct SNUnreadCountsTests {
     }
 
     @Test
+    func liveOnlyProbeKeepsHistUnreadWhenLiveBadgeIsZero() {
+        let folds = ["group-08": "group-09"]
+        let previous: [String: UInt64] = ["group-08": 4]
+        let liveOnly = SNUnreadCounts.unreadByGroup(
+            from: [("group-09", 0)],
+            suppressing: []
+        )
+        let kept = SNUnreadCounts.remountFoldedUnread(
+            next: liveOnly,
+            previous: previous,
+            historicalFolds: folds
+        )
+        #expect(kept == ["group-08": 4])
+        #expect(
+            snUnreadForFoldFamily(
+                groupId: "group-09",
+                unreadByGroup: kept,
+                historicalFolds: folds
+            ) == 4
+        )
+        let afterCopy = SNUnreadCounts.remountFoldedUnread(
+            next: SNUnreadCounts.unreadByGroup(
+                from: [("group-09", 4)],
+                suppressing: []
+            ),
+            previous: previous,
+            historicalFolds: folds
+        )
+        #expect(afterCopy == ["group-09": 4])
+        #expect(
+            snUnreadForFoldFamily(
+                groupId: "group-09",
+                unreadByGroup: afterCopy,
+                historicalFolds: folds
+            ) == 4
+        )
+        #expect(
+            SNUnreadCounts.remountFoldedUnread(
+                next: [:],
+                previous: previous,
+                historicalFolds: folds
+            ) == ["group-08": 4]
+        )
+    }
+
+    @Test
     func recoveredFoldUnreadDoesNotRetireBeforeFamilyHasOlder() {
         let histNewest = Date(timeIntervalSince1970: 50)
         let liveNewest = Date(timeIntervalSince1970: 10)

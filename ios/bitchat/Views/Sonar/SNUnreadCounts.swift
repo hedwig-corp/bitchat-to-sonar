@@ -47,6 +47,28 @@ enum SNUnreadCounts {
             .reduce(UInt64(0)) { $0 + $1.unreadCount }
     }
 
+    /// `conversation_summaries()` hides folded hist. Keep the previous hist
+    /// badge only while live unread is still 0 — after `copy_summary` live
+    /// already holds the sum. Empty success still clears.
+    /// Compose `remountFoldedUnread`.
+    static func remountFoldedUnread(
+        next: [String: UInt64],
+        previous: [String: UInt64],
+        historicalFolds: [String: String]
+    ) -> [String: UInt64] {
+        guard !historicalFolds.isEmpty else { return next }
+        var out = next
+        for (historical, live) in historicalFolds {
+            guard !live.isEmpty, live != historical else { continue }
+            guard out[historical] == nil else { continue }
+            let histUnread = previous[historical] ?? 0
+            guard histUnread > 0 else { continue }
+            guard (out[live] ?? 0) == 0 else { continue }
+            out[historical] = histUnread
+        }
+        return out
+    }
+
     /// Build the published unread map, skipping suppressed group ids.
     static func unreadByGroup(
         from summaries: [(groupIdHex: String, unreadCount: UInt64)],

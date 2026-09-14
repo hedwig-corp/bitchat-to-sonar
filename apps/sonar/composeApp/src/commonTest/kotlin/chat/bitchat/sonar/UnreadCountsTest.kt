@@ -189,6 +189,43 @@ class UnreadCountsTest {
     }
 
     @Test
+    fun liveOnlyProbeKeepsHistUnreadWhenLiveBadgeIsZero() {
+        val folds = mapOf("group-08" to "group-09")
+        val previous = mapOf("group-08" to 4L)
+        val liveOnly = unreadCountsFromSummaries(listOf(summary("group-09", 0)))
+        val kept = remountFoldedUnread(liveOnly, previous, folds)
+        assertEquals(mapOf("group-08" to 4L), kept)
+        assertEquals(
+            4L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = kept,
+                historicalFolds = folds,
+            ),
+        )
+        val afterCopy = remountFoldedUnread(
+            unreadCountsFromSummaries(listOf(summary("group-09", 4))),
+            previous,
+            folds,
+        )
+        assertEquals(mapOf("group-09" to 4L), afterCopy)
+        assertEquals(
+            4L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = afterCopy,
+                historicalFolds = folds,
+            ),
+            "copy_summary already summed hist onto live — do not double-count",
+        )
+        assertEquals(
+            mapOf("group-08" to 4L),
+            remountFoldedUnread(emptyMap(), previous, folds),
+            "live-only unread 0 publishes an empty map and must keep hist",
+        )
+    }
+
+    @Test
     fun recoveredFoldUnreadDoesNotRetireBeforeIndexNewest() {
         assertFalse(
             shouldRetireOpenChatUnread(
