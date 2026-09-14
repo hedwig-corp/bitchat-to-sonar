@@ -3361,14 +3361,29 @@ impl SonarClient {
     // ── Invite links ──────────────────────────────────────────────────
 
     pub fn create_invite_link(&self, group_id: &GroupId, group_name: &str) -> Result<String> {
+        let mint_id = self.invite_mint_group(group_id)?;
         let relay_strings: Vec<String> = self.relays.iter().map(|r| r.to_string()).collect();
-        self.invite_links
-            .create_link(group_id, group_name, self.engine.identity(), relay_strings)
+        let token = self.invite_links.create_link(
+            &mint_id,
+            group_name,
+            self.engine.identity(),
+            relay_strings,
+        )?;
+        // Minting a shareable secret is local-only and must not wait for the
+        // next outbound send to enter the opportunistic backup window.
+        if let Some(ref db_path) = self.marmot_db_path {
+            crate::account_backup::mark_backup_dirty(db_path);
+        }
+        Ok(token)
     }
 
     pub fn revoke_invite_link(&self, group_id: &GroupId, secret_hash: &[u8; 32]) -> Result<()> {
         self.invite_links
-            .revoke_link_for(&self.invite_family(group_id), secret_hash)
+            .revoke_link_for(&self.invite_family(group_id), secret_hash)?;
+        if let Some(ref db_path) = self.marmot_db_path {
+            crate::account_backup::mark_backup_dirty(db_path);
+        }
+        Ok(())
     }
 
     pub fn active_invite_links(
@@ -7229,6 +7244,26 @@ impl SonarClient {
         self.engine.fold_aliases(group_id)
     }
 
+    /// Group id a newly minted invite token should name.
+    ///
+    /// After resume the host may still pass the recovered 0.8 id. New tokens
+    /// must embed the live sibling so a joiner requests the 0.9 group. Do not
+    /// call `resolve_send_group`: minting must not create a group. Pre-fold
+    /// tokens stay on the 0.8 id; family union still lists and approves them.
+    fn invite_mint_group(&self, group_id: &GroupId) -> Result<GroupId> {
+        if self.engine.is_dropped(group_id) {
+            return Err(Error::InvalidInput("this chat was deleted".into()));
+        }
+        let mint_id = self
+            .engine
+            .live_fold_target(group_id)
+            .unwrap_or_else(|| group_id.clone());
+        if self.engine.is_dropped(&mint_id) {
+            return Err(Error::InvalidInput("this chat was deleted".into()));
+        }
+        Ok(mint_id)
+    }
+
     fn record_resume_fold(&self, historical: &GroupId, live: &GroupId) {
         self.engine.record_historical_fold(historical, live);
         self.promote_index_fold(historical, live);
@@ -8036,13 +8071,7 @@ impl SonarClient {
         let own_reg = self.own_push_registration.lock().unwrap().clone();
         let Some(reg) = own_reg else { return };
 
-        let groups = match self.engine.groups() {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(%e, "push token share: failed to list groups");
-                return;
-            }
-        };
+        let group_ids = self.membership_group_ids();
 
         let my_pubkey = self.engine.identity().public_key();
         let payload = crate::push::PushTokenSharePayload {
@@ -8057,16 +8086,20 @@ impl SonarClient {
             }
         };
 
-        for group in &groups {
-            let members = match self.engine.members(&group.id) {
+        let mut seen = HashSet::new();
+        for group_id in &group_ids {
+            let members = match self.engine.members(group_id) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            for member in &members {
-                if member == &my_pubkey {
+            for member in members {
+                if member == my_pubkey {
                     continue;
                 }
-                if let Err(e) = self.send_push_token_dm(member, &payload_json).await {
+                if !seen.insert(member.to_hex()) {
+                    continue;
+                }
+                if let Err(e) = self.send_push_token_dm(&member, &payload_json).await {
                     tracing::debug!(
                         recipient = %member,
                         %e,
@@ -8154,18 +8187,32 @@ impl SonarClient {
     /// protocol-critical decision, and a transient engine read failure must not
     /// crash or drop the sync batch.
     fn is_known_group_member(&self, sender: &PublicKey) -> bool {
-        let groups = match self.engine.groups() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        for group in &groups {
-            if let Ok(members) = self.engine.members(&group.id) {
+        for group_id in self.membership_group_ids() {
+            if let Ok(members) = self.engine.members(&group_id) {
                 if members.contains(sender) {
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Live 0.9 MLS ids plus recovered 0.8 conversations that are still
+    /// readable. Kind-447 push-token shares can arrive from a recovered peer
+    /// before either side resumes; walking `groups()` alone rejects them.
+    fn membership_group_ids(&self) -> Vec<GroupId> {
+        let mut ids = Vec::new();
+        match self.engine.groups() {
+            Ok(groups) => ids.extend(groups.into_iter().map(|group| group.id)),
+            Err(e) => tracing::warn!(%e, "membership walk: failed to list live groups"),
+        }
+        match self.engine.historical_groups() {
+            Ok(historical) => ids.extend(historical.into_iter().map(|group| group.id)),
+            Err(e) => tracing::warn!(%e, "membership walk: failed to list recovered groups"),
+        }
+        ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        ids.dedup();
+        ids
     }
 }
 
@@ -9016,6 +9063,116 @@ mod tests {
         assert!(client.active_invite_links(&historical).is_empty());
     }
 
+    /// After resume the host may still pass the recovered 0.8 id. A newly
+    /// minted token must name the live sibling so a joiner requests the 0.9
+    /// group rather than a dead MLS id.
+    #[tokio::test]
+    async fn create_invite_link_after_fold_mints_on_live_sibling() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        client.engine.record_historical_fold(&historical, &live);
+        let token = client
+            .create_invite_link(&historical, "standup")
+            .expect("mint after fold");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        assert_eq!(
+            decoded.group_id,
+            live.as_slice(),
+            "post-resume invite must embed the live 0.9 group id"
+        );
+        assert_eq!(client.active_invite_links(&historical).len(), 1);
+        assert_eq!(client.active_invite_links(&live).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_invite_link_rejects_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x13u8; 16]);
+        client.engine.purge_fold_family(&group_id);
+        let err = client
+            .create_invite_link(&group_id, "standup")
+            .expect_err("invite after Leave must fail");
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "deleted chat must not mint a new invite: {err:?}"
+        );
+    }
+
+    /// Minting a shareable `sinvite1` secret is local-only. Opportunistic
+    /// backup must not wait for the next outbound send — otherwise nsec
+    /// restore drops unused invite tokens.
+    #[tokio::test]
+    async fn create_invite_link_marks_account_backup_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        client.marmot_db_path = Some(db_path.clone());
+        crate::account_backup::save_backup_policy(
+            &db_path,
+            &crate::account_backup::BackupPolicy::default(),
+        )
+        .expect("seed policy");
+        assert!(!crate::account_backup::load_backup_policy(&db_path).dirty);
+
+        client
+            .create_invite_link(&GroupId::new([0x14u8; 16]), "standup")
+            .expect("mint");
+        assert!(
+            crate::account_backup::load_backup_policy(&db_path).dirty,
+            "invite mint must enter the opportunistic backup window"
+        );
+    }
+
+    /// Inbound join requests are replayable from the relay. Marking dirty here
+    /// would keep any account with a shared invite permanently urgent — the
+    /// same class of bug as dirty-on-receive.
+    #[tokio::test]
+    async fn inbound_join_request_does_not_mark_account_backup_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        client.marmot_db_path = Some(db_path.clone());
+        crate::account_backup::save_backup_policy(
+            &db_path,
+            &crate::account_backup::BackupPolicy::default(),
+        )
+        .expect("seed policy");
+        let group_id = GroupId::new([0x15u8; 16]);
+        let token = client
+            .create_invite_link(&group_id, "standup")
+            .expect("mint");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        let mut policy = crate::account_backup::load_backup_policy(&db_path);
+        policy.dirty = false;
+        crate::account_backup::save_backup_policy(&db_path, &policy).expect("clear dirty");
+        assert!(!crate::account_backup::load_backup_policy(&db_path).dirty);
+
+        let stored = client
+            .store_join_request(crate::invite_link::JoinRequest {
+                requester: Keys::generate().public_key(),
+                group_id,
+                secret_hash: crate::invite_link::sha256(&decoded.invite_secret),
+                key_package_event_id: None,
+                key_package_d_tag: None,
+                received_at: 1,
+            })
+            .expect("store");
+        assert!(stored, "valid inbound request must persist");
+        assert!(
+            !crate::account_backup::load_backup_policy(&db_path).dirty,
+            "inbound join request must not make the account backup urgent"
+        );
+    }
+
     /// R: a received message must NOT make the account "urgent" for auto-backup.
     ///
     /// Marking dirty on inbound kept any account in one active group dirty
@@ -9222,6 +9379,82 @@ mod tests {
         assert!(
             client.push_token_cache.lock().unwrap().is_empty(),
             "stranger push token must not be cached"
+        );
+    }
+
+    /// A recovered 0.8 peer can share kind-447 before either side resumes.
+    /// Walking live `groups()` alone would reject them and drop wake tokens
+    /// until the first send.
+    #[tokio::test]
+    async fn push_token_share_from_recovered_08_peer_is_cached() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("in-memory client");
+        let historical = GroupId::new([0x08u8; 16]);
+        let peer = Keys::generate().public_key();
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(1),
+            group_id: historical,
+            sender: peer,
+            content: "old hello".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old hello"),
+            reply: None,
+        });
+        let payload = serde_json::json!({
+            "encrypted_token": "dGVzdA==",
+            "server_pubkey": Keys::generate().public_key().to_hex(),
+        })
+        .to_string();
+        client
+            .handle_push_token_share(&peer, &payload)
+            .expect("recovered peer share accepted");
+        assert!(
+            client
+                .push_token_cache
+                .lock()
+                .unwrap()
+                .contains_key(&peer.to_hex()),
+            "recovered 0.8 peer must be able to share a wake token before resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_token_share_from_left_recovered_peer_is_rejected() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("in-memory client");
+        let historical = GroupId::new([0x08u8; 16]);
+        let peer = Keys::generate().public_key();
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(1),
+            group_id: historical.clone(),
+            sender: peer,
+            content: "old hello".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old hello"),
+            reply: None,
+        });
+        client.engine.purge_fold_family(&historical);
+        let payload = serde_json::json!({
+            "encrypted_token": "dGVzdA==",
+            "server_pubkey": Keys::generate().public_key().to_hex(),
+        })
+        .to_string();
+        client
+            .handle_push_token_share(&peer, &payload)
+            .expect("left-chat share ignored");
+        assert!(
+            client.push_token_cache.lock().unwrap().is_empty(),
+            "a peer from a chat the user already left must not pollute the cache"
         );
     }
 

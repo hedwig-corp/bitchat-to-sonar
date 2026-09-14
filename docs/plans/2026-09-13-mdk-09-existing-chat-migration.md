@@ -471,6 +471,21 @@ commits on the live sibling, and a left chat cannot resume via admin),
 union the fold family so a pre-migration `sinvite1` token still
 surfaces on the live group-info screen; `approve_join_request` commits
 on `resolve_send_group`),
+`client::tests::create_invite_link_after_fold_mints_on_live_sibling`
+(a new token after resume embeds the live 0.9 id even when the host
+still passes the recovered 0.8 id; minting does not call
+`resolve_send_group` and must not create a group),
+`client::tests::create_invite_link_rejects_dropped_group`,
+`client::tests::create_invite_link_marks_account_backup_dirty`
+(minting a shareable secret enters the opportunistic backup window
+without waiting for the next outbound send),
+`client::tests::inbound_join_request_does_not_mark_account_backup_dirty`
+(inbound joins stay relay-replayable and must not keep the account
+permanently urgent),
+`client::tests::push_token_share_from_recovered_08_peer_is_cached`
+(`is_known_group_member` / `share_push_token_with_groups` walk recovered
+0.8 members so a peer can share a wake token before either side resumes),
+`client::tests::push_token_share_from_left_recovered_peer_is_rejected`,
 `invite_link::tests::fold_family_unions_historical_invite_sidecar`,
 `account_backup::tests::write_read_package_files_roundtrips_invite_sidecar`
 (v2 backup packs `.sonar-invites.json` so nsec restore keeps minted
@@ -539,15 +554,13 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after packing `.sonar-invites.json` into
-v2 backup. On `e36f8e85`: persistence **30**, media **4**, failed_events
-**1**, sonar-sim **5**, recovered_08 **7**, group_invites **17**, lib
-migrate/fold/backup/client **179**. Invite-sidecar backup pin added
-after that.
+Re-run on this cloud agent after mint-on-live invites, recovered-peer
+push-token membership, and invite-mint backup dirty. Prior HEAD
+`c44c4034` packed `.sonar-invites.json`.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 178 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 187 passed |
 | `--test persistence` | 30 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
