@@ -1141,6 +1141,38 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun macClosedDmClearsRemountedLiveOpenedId() {
+        assertTrue(
+            closedDMShouldClearOpened(
+                closingId = "marmot:group-08",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertTrue(
+            closedDMShouldClearOpened(
+                closingId = "group-08",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertFalse(
+            closedDMShouldClearOpened(
+                closingId = "marmot:other",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertTrue(
+            closedDMShouldClearOpened(
+                closingId = "marmot:group-09",
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-09",
+            ),
+        )
+    }
+
+    @Test
     fun resolvedOpenGroupIdRemapsStaleHistOntoListedLive() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(

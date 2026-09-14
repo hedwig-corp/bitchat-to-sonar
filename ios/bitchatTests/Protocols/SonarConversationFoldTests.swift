@@ -1404,6 +1404,26 @@ struct SonarConversationFoldTests {
             openingId: "marmot:other",
             suppressedIds: ["marmot:group-09"]
         ))
+        #expect(snClosedDMShouldClearOpened(
+            closingId: "marmot:group-08",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ))
+        #expect(snClosedDMShouldClearOpened(
+            closingId: "group-08",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ))
+        #expect(!snClosedDMShouldClearOpened(
+            closingId: "marmot:other",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ))
+        #expect(snClosedDMShouldClearOpened(
+            closingId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-09"
+        ))
         #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",

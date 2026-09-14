@@ -1851,6 +1851,30 @@ internal fun openedDMShouldSkipHydrate(
     return bare in suppressedIds || "marmot:$bare" in suppressedIds
 }
 
+/** Mac remount rewrites the logical open id to live while the pane
+ *  stays hist. `closedDM(hist)` must still clear the leaked live id.
+ *  Compose remounts `Screen.Chat.id` in place — iOS `snClosedDMShouldClearOpened`. */
+internal fun openedConversationIdMatches(candidate: String, stored: String?): Boolean {
+    val left = candidate.trim()
+    val right = stored?.trim().orEmpty()
+    if (left.isEmpty() || right.isEmpty()) return false
+    if (left == right) return true
+    val leftBare = left.removePrefix("marmot:")
+    val rightBare = right.removePrefix("marmot:")
+    return leftBare.isNotEmpty() && leftBare == rightBare
+}
+
+internal fun closedDMShouldClearOpened(
+    closingId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+): Boolean {
+    val closing = closingId.trim()
+    if (closing.isEmpty()) return false
+    return openedConversationIdMatches(closing, openedConversationId) ||
+        openedConversationIdMatches(closing, openedConversationPaneId)
+}
+
 /** Viewing the recovered 0.8 id must still mark-read a live sibling
  *  change. Empty persist-folds cannot match; merge first.
  *  iOS `snViewingConversationShouldMarkRead`. */
