@@ -2677,7 +2677,7 @@ invited; the room name disappears; sends land in the wrong chat.
 
 **Guarded by:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`
 
-**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `ConversationFoldTest.startupSnapshotRewriteDoesNotStampInventedIsDirect`, `ConversationFoldTest.modernSnapshotDoesNotNeedStartupRewrite`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`
+**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `persistence.rs::mdk08_named_room_with_one_known_peer_is_not_direct`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `mdk08_migrate.rs::named_joined_room_description_is_copied`, `mdk08_migrate.rs::processed_welcome_member_count_survives_extract`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `ConversationFoldTest.startupSnapshotRewriteDoesNotStampInventedIsDirect`, `ConversationFoldTest.modernSnapshotDoesNotNeedStartupRewrite`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`
 
 **Not guarded:** a real 0.8 device upgrade with a pending White Noise room. Host chat-list rendering still needs a constructible store (the helper pins are the R-001 shape).
 
@@ -2685,7 +2685,12 @@ invited; the room name disappears; sends land in the wrong chat.
 `start_dm_with_key_package`, then `maybe_fold_new_group` absorbed the room into
 a new 1:1 with the same known peer. Hosts then folded any two-member FFI row
 by npub, so a pending room with only the welcomer listed still vanished into
-the 1:1. Core, FFI `is_direct`, and both hosts had to agree.
+the 1:1. Core, FFI `is_direct`, and both hosts had to agree. Joined rooms were
+a second hole: the 0.8 `groups` table has no `member_count`, so a named room
+where only one peer ever sent fell back to `peers+1 <= 2` and resumed as a DM.
+Extract now copies `groups.description` and processed-welcome counts, and
+`historical_resume_is_direct` matches live `group_is_direct` (DM description
+or empty name+description).
 
 **Rejected:**
 - *Pinning only `historical_resume_is_direct` / `groups().len() == 2`.*

@@ -35,7 +35,8 @@ use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, HistoricalGroup,
-    Incoming, MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    Incoming, MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SONAR_DIRECT_DM_DESCRIPTION,
+    SYNC_STATE_FILE_SUFFIX,
 };
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
@@ -121,7 +122,6 @@ const STICKER_REF_PREFETCH_BATCH_LIMIT: usize = 16;
 const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 /// How often a receive-prefetch await re-checks for an identity wipe.
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
-const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a

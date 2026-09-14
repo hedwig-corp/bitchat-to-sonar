@@ -1038,7 +1038,7 @@ fn write_mdk08_alice_bob_store(
     let event_id = EventId::from_slice(&[0xABu8; 32]).expect("event id");
     conn.execute(
         "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-         VALUES (?1, ?2, 'alice & bob', '')",
+         VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
         rusqlite::params![group_bytes.clone(), vec![0x22u8; 32]],
     )
     .expect("group row");
@@ -1100,7 +1100,7 @@ fn write_mdk08_alice_outbound_store(
     let admins = serde_json::json!([local.to_hex(), peer.to_hex()]).to_string();
     conn.execute(
         "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys)
-         VALUES (?1, ?2, 'outbound only', '', ?3)",
+         VALUES (?1, ?2, 'outbound only', 'sonar.direct-dm.v1', ?3)",
         rusqlite::params![group_bytes.clone(), vec![0x66u8; 32], admins],
     )
     .expect("group row");

@@ -169,6 +169,9 @@ Guarded by:
 - `mdk08_migrate::empty_named_group_is_kept_for_resume`
 - `mdk08_migrate::pending_welcome_is_kept_for_resume`
   (stores `member_count` so a 3+ pending room does not `start_dm`)
+- `mdk08_migrate::named_joined_room_description_is_copied`
+- `mdk08_migrate::processed_welcome_member_count_survives_extract`
+- `persistence::mdk08_named_room_with_one_known_peer_is_not_direct`
 - `mdk08_migrate::labeled_media_exporter_secret_is_copied_unlabeled_is_not`
 - `marmot.rs::recovered_08_media_decrypts_with_stored_exporter_secret`
 - `persistence::mdk08_pending_welcome_is_listed_for_resume`
@@ -329,7 +332,7 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| Compose (`apps/sonar`) | `groups()` includes recovered rows; `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). | send prefers newest duplicate; toast/banner if KeyPackage missing; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
 | iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. | same | none |
 | Mesh | untouched | untouched | none |
 
@@ -367,24 +370,23 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on `385e2b2d` (this cloud agent) after the first-paint `isDirect`
-snapshot pins. All green.
+Re-run on this cloud agent after the joined-room `is_direct` pin. All green.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 164 passed |
-| `--test persistence` | 28 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` | 95 passed |
+| `--lib` `--` `client::tests` | 72 passed |
+| `--test persistence` | 29 passed (includes `mdk08_named_room_with_one_known_peer_is_not_direct`) |
 | `--test e2e` `recovered_08` | 7 passed |
-| `--test group_invites` | 17 passed |
-| `--test failed_events` | 1 passed |
-| `--test media` | 4 passed |
-| `-p sonar-sim` | 5 passed |
-| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 30 passed (includes first-paint `isDirect` pins) |
-| `scripts/check-regression-ledger.sh` | 232 citations |
+| Compose `ConversationFoldTest` (`:composeApp:jvmTest`) | 31 passed (includes first-paint `isDirect` pins) |
+| `scripts/check-regression-ledger.sh` | 236 citations |
 
-CI on `385e2b2d`: Compose JVM unit tests and TranscriptEngine SPM are green.
-Rust core, iOS app build, and Android device tests were still running when
-this was recorded.
+Joined-room hole closed after `900f9788`: a recovered named 0.8 room with
+only one known peer no longer resumes as `start_dm`. Extract copies
+`groups.description` and processed-welcome `member_count`;
+`historical_resume_is_direct` matches live `group_is_direct`. Early
+`metadata_backfill=complete` markers re-run as `v2` so already-quarantined
+baks pick up the new sidecars.
 
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 

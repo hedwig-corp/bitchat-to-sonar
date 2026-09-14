@@ -38,8 +38,12 @@ pub(crate) const HISTORICAL_GROUPS_FILE_SUFFIX: &str = ".sonar-historical-groups
 /// Member pubkeys recovered from 0.8 `admin_pubkeys`, every `messages.pubkey`,
 /// and `p` tags. Needed so a chat you only ever sent into can still resume.
 pub(crate) const HISTORICAL_MEMBERS_FILE_SUFFIX: &str = ".sonar-historical-members.json";
-/// hex group id → original 0.8 member_count (pending welcomes).
+/// hex group id → original 0.8 member_count (pending + processed welcomes).
 pub(crate) const HISTORICAL_MEMBER_COUNTS_SUFFIX: &str = ".sonar-historical-member-counts.json";
+/// hex group id → 0.8 `groups.description` / welcome `group_description`.
+pub(crate) const HISTORICAL_DESCRIPTIONS_SUFFIX: &str = ".sonar-historical-descriptions.json";
+/// Marker value written after descriptions + all-welcome counts are copied.
+const METADATA_BACKFILL_VERSION: &str = "v2";
 
 /// Marker written after a successful extract so operators can see what moved.
 pub(crate) const MDK08_MIGRATED_MARKER_SUFFIX: &str = ".sonar-mdk08-migrated.json";
@@ -62,9 +66,11 @@ pub(crate) const REMAINDER_MESSAGES_PER_TICK: usize = 400;
 pub(crate) struct Mdk08Migration {
     pub messages: HashMap<GroupId, Vec<ChatMessage>>,
     pub group_names: HashMap<GroupId, String>,
+    /// 0.8 `groups.description` / welcome `group_description`.
+    pub group_descriptions: HashMap<GroupId, String>,
     pub members: HashMap<GroupId, Vec<PublicKey>>,
-    /// Original 0.8 `welcomes.member_count`. A 3+ room must not resume as a DM
-    /// just because only the welcomer is known after extract.
+    /// Original 0.8 `welcomes.member_count` (any state). A 3+ room must not
+    /// resume as a DM just because only the welcomer is known after extract.
     pub member_counts: HashMap<GroupId, u32>,
     /// MIP-04 exporter secrets copied from `group_exporter_secrets`.
     pub media_exporter_secrets: HashMap<GroupId, Vec<Vec<u8>>>,
@@ -183,6 +189,7 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         &sidecar_named(db_path, HISTORICAL_GROUPS_FILE_SUFFIX),
         &names,
     )?;
+    write_group_descriptions(db_path, &extracted.group_descriptions)?;
 
     let members: HashMap<String, Vec<String>> = extracted
         .members
@@ -225,7 +232,7 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
         "groups": extracted.messages.len(),
         "messages": extracted.messages.values().map(|m| m.len()).sum::<usize>(),
         "wire": "0xf2ee-plaintext-only",
-        "metadata_backfill": "complete",
+        "metadata_backfill": METADATA_BACKFILL_VERSION,
     });
     write_json(
         &sidecar_named(db_path, MDK08_MIGRATED_MARKER_SUFFIX),
@@ -234,10 +241,12 @@ pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
     Ok(())
 }
 
-/// One-shot: copy pending welcomes + labeled media secrets from `*.mdk08.bak`
-/// onto the host sidecars. Used when an earlier 0.9 open already quarantined
-/// the 0.8 file before those columns were extracted. Does not join chat
-/// payloads — remainder still owns leftover history.
+/// One-shot: copy pending welcomes, processed-welcome counts, group
+/// descriptions, and labeled media secrets from `*.mdk08.bak` onto the host
+/// sidecars. Used when an earlier 0.9 open already quarantined the 0.8 file
+/// before those columns were extracted. Does not join chat payloads —
+/// remainder still owns leftover history. `metadata_backfill=v2` also
+/// re-runs for installs that only have the older `complete` marker.
 pub(crate) fn backfill_metadata_from_bak(db_path: &Path, key: [u8; 32]) -> Result<bool> {
     if !metadata_backfill_pending(db_path) {
         return Ok(false);
@@ -256,7 +265,7 @@ fn metadata_backfill_pending(db_path: &Path) -> bool {
     if !backup_path(db_path).exists() {
         return false;
     }
-    metadata_backfill_status(db_path).as_deref() != Some("complete")
+    metadata_backfill_status(db_path).as_deref() != Some(METADATA_BACKFILL_VERSION)
 }
 
 fn metadata_backfill_status(db_path: &Path) -> Option<String> {
@@ -279,7 +288,7 @@ fn mark_metadata_backfill_complete(db_path: &Path) -> Result<()> {
     if let Some(obj) = marker.as_object_mut() {
         obj.insert(
             "metadata_backfill".into(),
-            serde_json::Value::String("complete".into()),
+            serde_json::Value::String(METADATA_BACKFILL_VERSION.into()),
         );
     }
     write_json(&path, &marker)
@@ -323,6 +332,14 @@ fn merge_historical_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Resu
             &keyed,
         )?;
     }
+    let mut descriptions = load_historical_group_descriptions(db_path);
+    for (id, desc) in &extracted.group_descriptions {
+        let entry = descriptions.entry(id.clone()).or_default();
+        if entry.is_empty() && !desc.is_empty() {
+            *entry = desc.clone();
+        }
+    }
+    write_group_descriptions(db_path, &descriptions)?;
     if !members.is_empty() {
         let keyed: HashMap<String, Vec<String>> = members
             .iter()
@@ -481,6 +498,33 @@ pub(crate) fn load_historical_group_names(db_path: &Path) -> HashMap<GroupId, St
         .collect()
 }
 
+pub(crate) fn load_historical_group_descriptions(db_path: &Path) -> HashMap<GroupId, String> {
+    let path = sidecar_named(db_path, HISTORICAL_DESCRIPTIONS_SUFFIX);
+    let Ok(bytes) = std::fs::read(path) else {
+        return HashMap::new();
+    };
+    serde_json::from_slice::<HashMap<String, String>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(hex_id, desc)| hex::decode(hex_id).ok().map(|b| (GroupId::new(b), desc)))
+        .collect()
+}
+
+fn write_group_descriptions(db_path: &Path, descriptions: &HashMap<GroupId, String>) -> Result<()> {
+    let keyed: HashMap<String, String> = descriptions
+        .iter()
+        .filter(|(_, desc)| !desc.is_empty())
+        .map(|(id, desc)| (hex::encode(id.as_slice()), desc.clone()))
+        .collect();
+    if keyed.is_empty() {
+        return Ok(());
+    }
+    write_json(
+        &sidecar_named(db_path, HISTORICAL_DESCRIPTIONS_SUFFIX),
+        &keyed,
+    )
+}
+
 pub(crate) fn load_historical_members(db_path: &Path) -> HashMap<GroupId, Vec<PublicKey>> {
     let path = sidecar_named(db_path, HISTORICAL_MEMBERS_FILE_SUFFIX);
     let Ok(bytes) = std::fs::read(path) else {
@@ -575,6 +619,7 @@ pub(crate) fn wipe_mdk08_backups(db_path: &Path) -> Result<()> {
     }
     for suffix in [
         HISTORICAL_GROUPS_FILE_SUFFIX,
+        HISTORICAL_DESCRIPTIONS_SUFFIX,
         HISTORICAL_MEMBERS_FILE_SUFFIX,
         HISTORICAL_MEMBER_COUNTS_SUFFIX,
         HISTORICAL_EXPORTER_SECRETS_SUFFIX,
@@ -623,10 +668,12 @@ fn extract_from_connection(
 fn extract_metadata(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
     if table_exists(conn, "groups")? {
         let has_admins = column_exists(conn, "groups", "admin_pubkeys")?;
-        let sql = if has_admins {
-            "SELECT mls_group_id, name, admin_pubkeys FROM groups"
-        } else {
-            "SELECT mls_group_id, name, NULL FROM groups"
+        let has_desc = column_exists(conn, "groups", "description")?;
+        let sql = match (has_desc, has_admins) {
+            (true, true) => "SELECT mls_group_id, name, description, admin_pubkeys FROM groups",
+            (true, false) => "SELECT mls_group_id, name, description, NULL FROM groups",
+            (false, true) => "SELECT mls_group_id, name, NULL, admin_pubkeys FROM groups",
+            (false, false) => "SELECT mls_group_id, name, NULL, NULL FROM groups",
         };
         let mut stmt = conn
             .prepare(sql)
@@ -637,17 +684,26 @@ fn extract_metadata(conn: &Connection, extracted: &mut Mdk08Migration) -> Result
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })
             .map_err(|e| Error::Storage(format!("mdk08 groups query: {e}")))?;
         for row in rows {
-            let (id, name, admins) =
+            let (id, name, description, admins) =
                 row.map_err(|e| Error::Storage(format!("mdk08 groups row: {e}")))?;
             if id.is_empty() {
                 continue;
             }
             let group_id = GroupId::new(id);
             extracted.group_names.insert(group_id.clone(), name);
+            if let Some(desc) = description {
+                if !desc.is_empty() {
+                    extracted
+                        .group_descriptions
+                        .entry(group_id.clone())
+                        .or_insert(desc);
+                }
+            }
             if let Some(raw) = admins {
                 for pk in parse_admin_pubkeys(&raw) {
                     note_member(extracted, &group_id, pk);
@@ -669,12 +725,24 @@ fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -
         return Ok(());
     }
     let has_count = column_exists(conn, "welcomes", "member_count")?;
-    let sql = if has_count {
-        "SELECT mls_group_id, group_name, group_admin_pubkeys, welcomer, member_count
-         FROM welcomes WHERE state = 'pending'"
-    } else {
-        "SELECT mls_group_id, group_name, group_admin_pubkeys, welcomer, NULL
-         FROM welcomes WHERE state = 'pending'"
+    let has_desc = column_exists(conn, "welcomes", "group_description")?;
+    let sql = match (has_desc, has_count) {
+        (true, true) => {
+            "SELECT mls_group_id, group_name, group_description, group_admin_pubkeys, welcomer, member_count
+             FROM welcomes WHERE state = 'pending'"
+        }
+        (true, false) => {
+            "SELECT mls_group_id, group_name, group_description, group_admin_pubkeys, welcomer, NULL
+             FROM welcomes WHERE state = 'pending'"
+        }
+        (false, true) => {
+            "SELECT mls_group_id, group_name, NULL, group_admin_pubkeys, welcomer, member_count
+             FROM welcomes WHERE state = 'pending'"
+        }
+        (false, false) => {
+            "SELECT mls_group_id, group_name, NULL, group_admin_pubkeys, welcomer, NULL
+             FROM welcomes WHERE state = 'pending'"
+        }
     };
     let mut stmt = conn
         .prepare(sql)
@@ -685,13 +753,14 @@ fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -
                 row.get::<_, Vec<u8>>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })
         .map_err(|e| Error::Storage(format!("mdk08 welcomes query: {e}")))?;
     for row in rows {
-        let (id, name, admins, welcomer, member_count) =
+        let (id, name, description, admins, welcomer, member_count) =
             row.map_err(|e| Error::Storage(format!("mdk08 welcomes row: {e}")))?;
         if id.is_empty() {
             continue;
@@ -701,6 +770,14 @@ fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -
             .group_names
             .entry(group_id.clone())
             .or_insert(name);
+        if let Some(desc) = description {
+            if !desc.is_empty() {
+                extracted
+                    .group_descriptions
+                    .entry(group_id.clone())
+                    .or_insert(desc);
+            }
+        }
         if let Some(raw) = admins {
             for pk in parse_admin_pubkeys(&raw) {
                 note_member(extracted, &group_id, pk);
@@ -714,6 +791,31 @@ fn extract_pending_welcomes(conn: &Connection, extracted: &mut Mdk08Migration) -
                 note_member_count(extracted, &group_id, count as u32);
             }
         }
+    }
+    extract_welcome_member_counts(conn, extracted)
+}
+
+/// Processed / accepted welcomes still carry the original room size. A joined
+/// 3-person room must keep that count even when only one peer ever sent.
+fn extract_welcome_member_counts(conn: &Connection, extracted: &mut Mdk08Migration) -> Result<()> {
+    if !column_exists(conn, "welcomes", "member_count")? {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare("SELECT mls_group_id, member_count FROM welcomes")
+        .map_err(|e| Error::Storage(format!("mdk08 welcome counts prepare: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|e| Error::Storage(format!("mdk08 welcome counts query: {e}")))?;
+    for row in rows {
+        let (id, count) =
+            row.map_err(|e| Error::Storage(format!("mdk08 welcome counts row: {e}")))?;
+        if id.is_empty() || count <= 0 {
+            continue;
+        }
+        note_member_count(extracted, &GroupId::new(id), count as u32);
     }
     Ok(())
 }
@@ -1423,7 +1525,7 @@ mod tests {
         let group_id = vec![0x11u8; 16];
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .unwrap();
@@ -1549,6 +1651,17 @@ mod tests {
         assert!(
             metadata_backfill_pending(&db),
             "pre-welcome extracts must backfill once from the bak"
+        );
+        mark_metadata_backfill_complete(&db).unwrap();
+        assert!(!metadata_backfill_pending(&db));
+        write_json(
+            &sidecar_named(&db, MDK08_MIGRATED_MARKER_SUFFIX),
+            &serde_json::json!({ "status": "complete", "metadata_backfill": "complete" }),
+        )
+        .unwrap();
+        assert!(
+            metadata_backfill_pending(&db),
+            "pre-description extracts (metadata_backfill=complete) must run v2"
         );
         mark_metadata_backfill_complete(&db).unwrap();
         assert!(!metadata_backfill_pending(&db));
@@ -1695,6 +1808,164 @@ mod tests {
     }
 
     #[test]
+    fn named_joined_room_description_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let peer = Identity::generate().public_key();
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB PRIMARY KEY,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let group_id = vec![0x91u8; 16];
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'team chat', 'weekend hike')",
+            rusqlite::params![group_id.clone(), vec![0x92u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, 1_700_000_000, 'hey', '[]', '{}', ?2, 'processed')",
+            rusqlite::params![group_id, vec![0xABu8; 32], peer.to_bytes().to_vec(),],
+        )
+        .unwrap();
+        drop(conn);
+
+        let extracted = detect_and_extract(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        assert_eq!(
+            extracted
+                .group_descriptions
+                .values()
+                .next()
+                .map(String::as_str),
+            Some("weekend hike")
+        );
+        assert_eq!(
+            extracted.group_names.values().next().map(String::as_str),
+            Some("team chat")
+        );
+    }
+
+    #[test]
+    fn processed_welcome_member_count_survives_extract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let local = Identity::generate();
+        let welcomer = Identity::generate().public_key();
+        let conn = Connection::open(&path).unwrap();
+        let hex_key = hex::encode(KEY);
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB PRIMARY KEY,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE welcomes (
+                id BLOB PRIMARY KEY,
+                event TEXT NOT NULL,
+                mls_group_id BLOB NOT NULL,
+                nostr_group_id BLOB NOT NULL,
+                group_name TEXT NOT NULL,
+                group_description TEXT NOT NULL,
+                group_admin_pubkeys TEXT NOT NULL,
+                group_relays TEXT NOT NULL,
+                welcomer BLOB NOT NULL,
+                member_count INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL
+            );",
+        )
+        .unwrap();
+        let group_id = vec![0x93u8; 16];
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'joined room', '')",
+            rusqlite::params![group_id.clone(), vec![0x94u8; 32]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, 1_700_000_000, 'only the welcomer spoke', '[]', '{}', ?2, 'processed')",
+            rusqlite::params![
+                group_id.clone(),
+                vec![0xABu8; 32],
+                welcomer.to_bytes().to_vec(),
+            ],
+        )
+        .unwrap();
+        let admins =
+            serde_json::json!([local.public_key().to_hex(), welcomer.to_hex()]).to_string();
+        conn.execute(
+            "INSERT INTO welcomes
+                (id, event, mls_group_id, nostr_group_id, group_name, group_description,
+                 group_admin_pubkeys, group_relays, welcomer, member_count, state,
+                 wrapper_event_id)
+             VALUES (?1, '{}', ?2, ?3, 'joined room', '', ?4, '[]', ?5, 4, 'processed', ?1)",
+            rusqlite::params![
+                vec![0xCCu8; 32],
+                group_id,
+                vec![0xDDu8; 32],
+                admins,
+                welcomer.to_bytes().to_vec(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let extracted = detect_and_extract(&path, KEY, local.public_key())
+            .unwrap()
+            .expect("0.8 store detected");
+        assert_eq!(
+            extracted.member_counts.values().next().copied(),
+            Some(4),
+            "processed welcome size must keep a joined room off start_dm"
+        );
+    }
+
+    #[test]
     fn labeled_media_exporter_secret_is_copied_unlabeled_is_not() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("marmot.sqlite");
@@ -1792,7 +2063,7 @@ mod tests {
         let admins = serde_json::json!([local.public_key().to_hex(), peer.to_hex()]).to_string();
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys)
-             VALUES (?1, ?2, 'just alice sent', '', ?3)",
+             VALUES (?1, ?2, 'just alice sent', 'sonar.direct-dm.v1', ?3)",
             rusqlite::params![group_id.clone(), vec![0x44u8; 32], admins],
         )
         .unwrap();

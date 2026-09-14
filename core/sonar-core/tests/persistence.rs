@@ -857,7 +857,7 @@ async fn mdk08_store_decrypts_and_moves_plaintext_without_wiping() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -976,7 +976,7 @@ async fn mdk08_account_backup_preserves_recovered_transcript() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -1090,7 +1090,7 @@ async fn mdk08_account_backup_preserves_remainder_after_restore() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -1203,7 +1203,7 @@ async fn mdk08_account_backup_omits_bak_after_remainder_complete() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -1334,7 +1334,7 @@ async fn mdk08_unreadable_bak_keeps_remainder_pending() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -1441,7 +1441,7 @@ async fn mdk08_account_backup_keeps_bak_when_transcript_is_missing() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -1538,7 +1538,7 @@ async fn mdk08_v1_backup_restores_and_migrates() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -1621,7 +1621,7 @@ async fn mdk08_first_paint_defers_older_rows_until_remainder() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![group_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group row");
@@ -1841,6 +1841,81 @@ async fn mdk08_pending_welcome_is_listed_for_resume() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "pending room");
     assert!(listed[0].members.contains(&welcomer.public_key()));
+}
+
+/// A joined 0.8 named room with only one known peer must stay a room.
+/// `member_count` is not on the groups table; the name (and empty
+/// non-DM description) is the signal that matches live `group_is_direct`.
+#[tokio::test]
+async fn mdk08_named_room_with_one_known_peer_is_not_direct() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let group_id = vec![0x91u8; 16];
+
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open 0.8 file");
+        let hex_key = DB_KEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .expect("0.8 raw key");
+        conn.execute_batch(
+            "CREATE TABLE groups (
+                mls_group_id BLOB PRIMARY KEY,
+                nostr_group_id BLOB NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                mls_group_id BLOB NOT NULL,
+                id BLOB NOT NULL,
+                pubkey BLOB NOT NULL,
+                kind INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                event TEXT NOT NULL,
+                wrapper_event_id BLOB NOT NULL,
+                state TEXT NOT NULL,
+                PRIMARY KEY (mls_group_id, id)
+            );",
+        )
+        .expect("0.8 schema");
+        conn.execute(
+            "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+             VALUES (?1, ?2, 'weekend hike', '')",
+            rusqlite::params![group_id.clone(), vec![0x92u8; 32]],
+        )
+        .expect("group row");
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, 1_700_000_000, 'only bob spoke', '[]', '{}', ?2, 'processed')",
+            rusqlite::params![
+                group_id.clone(),
+                vec![0xABu8; 32],
+                bob.public_key().to_bytes().to_vec(),
+            ],
+        )
+        .expect("chat row");
+    }
+
+    let engine =
+        MarmotEngine::persistent(alice, &db_path, DB_KEY).expect("named room must migrate");
+    let gid = GroupId::new(group_id);
+    assert!(
+        !engine.historical_resume_is_direct(&gid),
+        "named joined room must not resume as start_dm when only one peer is known"
+    );
+    assert_eq!(
+        engine.historical_group_name(&gid).as_deref(),
+        Some("weekend hike")
+    );
+    assert_eq!(engine.historical_group_description(&gid), None);
 }
 
 /// Labeled 0.8 `encrypted-media` exporter secrets must decrypt recovered
@@ -2087,7 +2162,7 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
         .expect("0.8 schema");
         conn.execute(
             "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-             VALUES (?1, ?2, 'alice & bob', '')",
+             VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
             rusqlite::params![chat_id.clone(), vec![0x22u8; 32]],
         )
         .expect("group");

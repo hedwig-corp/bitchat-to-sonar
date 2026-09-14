@@ -79,6 +79,10 @@ pub(crate) const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json"
 /// historical MLS group id hex → live 0.9 group id hex.
 pub(crate) const HISTORICAL_FOLDS_FILE_SUFFIX: &str = ".sonar-historical-folds.json";
 
+/// Live and recovered 1:1s stamp this on `Group.description`. A named 2-person
+/// room must not share the `start_dm` path just because only one peer is known.
+pub(crate) const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
+
 /// A recovered 0.8 conversation that is not a live 0.9 MLS group.
 #[derive(Debug, Clone)]
 pub struct HistoricalGroup {
@@ -775,6 +779,9 @@ pub struct MarmotEngine {
     pending_convergence: Mutex<HashSet<GroupId>>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
     historical_group_names: HashMap<GroupId, String>,
+    /// 0.8 `groups.description` / welcome `group_description`. Needed so a
+    /// named joined room is not classified as a DM when only one peer is known.
+    historical_group_descriptions: HashMap<GroupId, String>,
     /// Members recovered from a 0.8 store (`admin_pubkeys` + every message
     /// pubkey). Transcript senders are merged at read time so a chat you
     /// only ever sent into can still resume.
@@ -975,6 +982,9 @@ impl MarmotEngine {
             transcript: Mutex::new(transcript),
             pending_convergence: Mutex::new(HashSet::new()),
             historical_group_names,
+            historical_group_descriptions: crate::mdk08_migrate::load_historical_group_descriptions(
+                db_path,
+            ),
             historical_members,
             historical_member_counts: crate::mdk08_migrate::load_historical_member_counts(db_path),
             historical_folds: Mutex::new(historical_folds),
@@ -1313,6 +1323,11 @@ impl MarmotEngine {
         self.historical_group_names.get(group_id).cloned()
     }
 
+    /// Description recovered from an MDK 0.8 `groups` / welcome row, if any.
+    pub fn historical_group_description(&self, group_id: &GroupId) -> Option<String> {
+        self.historical_group_descriptions.get(group_id).cloned()
+    }
+
     /// True when `group_id` is a live (or still-unhydrated) 0.9 MLS group.
     pub fn is_live_group(&self, group_id: &GroupId) -> Result<bool> {
         self.with_session_mut(|session| {
@@ -1428,12 +1443,22 @@ impl MarmotEngine {
     }
 
     /// True when this recovered chat should resume with `start_dm`.
-    /// A pending 0.8 room (`member_count > 2`) stays a group even if only one
-    /// peer is known — otherwise resume folds the room onto a 1:1.
+    ///
+    /// Matches live `group_is_direct`: a named 2-person room is not a DM, and
+    /// a pending 0.8 room (`member_count > 2`) stays a group even if only the
+    /// welcomer is known.
     pub fn historical_resume_is_direct(&self, group_id: &GroupId) -> bool {
         let peers = self.historical_resume_peers(group_id).len();
         let stored = self.historical_member_counts.get(group_id).copied();
-        stored.unwrap_or((peers as u32).saturating_add(1)) <= 2
+        let members = stored.unwrap_or((peers as u32).saturating_add(1));
+        if members > 2 {
+            return false;
+        }
+        let name = self.historical_group_name(group_id).unwrap_or_default();
+        let desc = self
+            .historical_group_description(group_id)
+            .unwrap_or_default();
+        desc == SONAR_DIRECT_DM_DESCRIPTION || (desc.is_empty() && name.is_empty())
     }
 
     fn historical_members(&self, group_id: &GroupId) -> Vec<PublicKey> {

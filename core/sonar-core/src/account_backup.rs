@@ -876,6 +876,7 @@ fn backup_sidecar_suffixes() -> &'static [&'static str] {
     &[
         crate::marmot::TRANSCRIPT_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_DESCRIPTIONS_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_MEMBER_COUNTS_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_EXPORTER_SECRETS_SUFFIX,
