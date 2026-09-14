@@ -1727,6 +1727,33 @@ internal fun mediaFetchGroupIds(
     return out.toList()
 }
 
+/** Blossom URLs already on recovered or live rows. Pending echo blobs are
+ *  not published. A new send must exclude these so
+ *  `cacheUploadedMediaBytes` cannot bind new bytes to a 0.8 attachment
+ *  that shares filename/mime. Persist-folds remounts before core
+ *  `fold_family`, so a live-only page misses hist URLs. */
+internal fun publishedMediaUrlsFromMessages(
+    messages: Sequence<SonarMsg>,
+    pendingPrefix: String = "pending-media-",
+): Set<String> = messages
+    .flatMap { it.media.asSequence() }
+    .map { it.url }
+    .filter { it.isNotBlank() && !it.startsWith(pendingPrefix) }
+    .toSet()
+
+internal fun publishedMediaUrlsFromFamilyPages(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    pageForId: (String) -> List<SonarMsg>,
+    pendingPrefix: String = "pending-media-",
+): Set<String> {
+    val ids = mediaFetchGroupIds(groupId, historicalFolds).ifEmpty { listOf(groupId) }
+    return publishedMediaUrlsFromMessages(
+        ids.asSequence().flatMap { pageForId(it).asSequence() },
+        pendingPrefix,
+    )
+}
+
 internal fun meshFoldTranscriptSourceIds(
     listedDirectIds: Collection<String>,
     historicalFolds: Map<String, String>,
@@ -9965,14 +9992,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         mediaUploadProgress.remove(pendingId)
     }
 
-    private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> =
-        runCatching { SonarCore.messagesPage(groupId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }
-            .getOrDefault(messages)
-            .asSequence()
-            .flatMap { it.media.asSequence() }
-            .map { it.url }
-            .filterNot { it.startsWith(pendingMediaUrlPrefix) }
-            .toSet()
+    private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> {
+        val ids = mediaFetchGroupIds(groupId, historicalFoldMap).ifEmpty { listOf(groupId) }
+        val pages = ids.map { id ->
+            runCatching { SonarCore.messagesPage(id, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }
+                .getOrNull()
+                ?: chatSnapshotMessagesByChat[id].orEmpty()
+                    .ifEmpty { if (id == groupId) messages else emptyList() }
+        }
+        return publishedMediaUrlsFromMessages(
+            pages.asSequence().flatten(),
+            pendingMediaUrlPrefix,
+        )
+    }
 
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
@@ -14547,11 +14579,37 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // and process against the listed live sibling so housekeeping
                 // cannot drop the page and in-flight call/pay rows land on
                 // a chat FFI still lists.
+                val listedIds = chats.mapTo(hashSetOf()) { it.id }
                 val targetId = conversationChangeTargetId(
                     groupIdHex,
-                    chats.mapTo(hashSetOf()) { it.id },
+                    listedIds,
                     historicalFoldMap,
                 )
+                val refreshIds = conversationRefreshIds(
+                    groupIdHex,
+                    listedIds,
+                    historicalFoldMap,
+                )
+                val cachedIds = chatSnapshotMessagesByChat.keys
+                for (refreshId in refreshIds) {
+                    if (refreshId == targetId) continue
+                    if (!conversationRefreshShouldLoadPage(
+                            refreshId,
+                            listedIds,
+                            cachedIds,
+                            groupIdHex,
+                            historicalFoldMap,
+                        )
+                    ) {
+                        continue
+                    }
+                    val siblingPage = runCatching {
+                        SonarCore.messagesPage(refreshId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+                    }.getOrNull() ?: continue
+                    val existing = chatSnapshotMessagesByChat[refreshId].orEmpty()
+                    if (siblingPage.isEmpty() && existing.isNotEmpty()) continue
+                    chatSnapshotMessagesByChat = chatSnapshotMessagesByChat + (refreshId to siblingPage)
+                }
                 val freshChangedMessages = runCatching {
                     SonarCore.messagesPage(targetId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
                 }.getOrNull()

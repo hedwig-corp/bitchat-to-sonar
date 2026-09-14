@@ -1274,6 +1274,17 @@ unique subset (R-045). Pins:
 `conversation_index::record_fold_roundtrips_and_remove_group_forgets_bind`,
 `conversation_index::migrates_v2_schema_adding_historical_fold_table`.
 
+Compose persist-folds media-reconcile hole closed after this commit:
+`existingPublishedMediaUrls` paged only the listed live id. A remounted
+0.8 `image.jpg` then looked like the new send’s blossom URL. Exclude
+hist attachments via `publishedMediaUrlsFromFamilyPages`. Remainder
+ticks now also page hidden siblings (`conversationRefreshIds` at the
+`handleConversationChange` call site, matching iOS
+`snConversationRefreshIds`). iOS has no twin of this upload-reconcile
+path. Pins:
+`ConversationFoldTest.publishedMediaUrlsIncludeHiddenHistoricalSibling`,
+`ConversationFoldTest.conversationChangeTargetPrefersListedLiveSibling`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

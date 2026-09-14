@@ -2409,6 +2409,46 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun publishedMediaUrlsIncludeHiddenHistoricalSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val histPhoto = SonarMsg(
+            id = "h-photo",
+            senderNpub = "npub1peer",
+            content = "",
+            mine = false,
+            tsSecs = 1L,
+            media = listOf(
+                SonarMedia("https://blossom.example/old.jpg", "image/jpeg", "image.jpg", 640, 480, null),
+            ),
+        )
+        val liveOnly = listOf(
+            SonarMsg(id = "l1", senderNpub = "npub1me", content = "new 0.9", mine = true, tsSecs = 100L),
+        )
+        assertEquals(
+            emptySet<String>(),
+            publishedMediaUrlsFromMessages(liveOnly.asSequence()),
+            "live-only page must not invent the recovered 0.8 URL",
+        )
+        assertEquals(
+            setOf("https://blossom.example/old.jpg"),
+            publishedMediaUrlsFromFamilyPages(
+                groupId = "group-09",
+                historicalFolds = folds,
+                pageForId = { id -> if (id == "group-08") listOf(histPhoto) else liveOnly },
+            ),
+            "new-send exclude set must include remounted 0.8 attachments",
+        )
+        assertEquals(
+            emptySet<String>(),
+            publishedMediaUrlsFromFamilyPages(
+                groupId = "group-09",
+                historicalFolds = emptyMap(),
+                pageForId = { liveOnly },
+            ),
+        )
+    }
+
+    @Test
     fun deleteAfterFoldDropsTheHiddenHistoricalSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-09", folds))
