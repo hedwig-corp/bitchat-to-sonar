@@ -720,6 +720,53 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ).isEmpty
         )
+        let recoveredAttachment = MarmotService.MarmotMessage(
+            id: "hist-media",
+            senderNpub: "npub1peer",
+            content: "",
+            createdAt: Date(timeIntervalSince1970: 1),
+            isMine: false,
+            media: [
+                MarmotService.MarmotMedia(
+                    url: "https://blossom.example/old.jpg",
+                    mimeType: "image/jpeg",
+                    filename: "image.jpg",
+                    width: 640,
+                    height: 480,
+                    durationMs: nil
+                )
+            ]
+        )
+        let liveOnly = [
+            MarmotService.MarmotMessage(
+                id: "l1",
+                senderNpub: "npub1me",
+                content: "new 0.9",
+                createdAt: Date(timeIntervalSince1970: 100),
+                isMine: true,
+                media: []
+            )
+        ]
+        #expect(
+            snPublishedMediaUrlsFromMessages(liveOnly).isEmpty,
+            "live-only page must not invent the recovered 0.8 URL"
+        )
+        #expect(
+            snPublishedMediaUrlsFromFamilyPages(
+                startGroupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                pageForId: { id in
+                    id == "group-08" ? [recoveredAttachment] : liveOnly
+                }
+            ) == ["https://blossom.example/old.jpg"]
+        )
+        #expect(
+            snPublishedMediaUrlsFromFamilyPages(
+                startGroupId: "group-09",
+                historicalFolds: [:],
+                pageForId: { _ in liveOnly }
+            ).isEmpty
+        )
         #expect(
             snBlankTranscriptKnownNonEmpty(
                 groupId: "group-09",

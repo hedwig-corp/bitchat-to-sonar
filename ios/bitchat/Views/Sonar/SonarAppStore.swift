@@ -1328,6 +1328,47 @@ func snMediaFetchGroupIds(
     return out
 }
 
+/// Published blossom URLs from one transcript page. Pending echo blobs
+/// are not published. A new send must exclude these so
+/// `cachePublishedUploadMedia` cannot bind new bytes to a 0.8
+/// attachment that shares filename/mime.
+/// Compose `publishedMediaUrlsFromMessages`.
+func snPublishedMediaUrlsFromMessages(
+    _ messages: [MarmotService.MarmotMessage],
+    pendingPrefix: String = "pending-media-"
+) -> Set<String> {
+    Set(
+        messages.flatMap { $0.media.map(\.url) }.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && !$0.hasPrefix(pendingPrefix)
+        }
+    )
+}
+
+/// Union published blossom URLs across persist-folds siblings.
+/// `pageForId` must already have paged each sibling — a live-only
+/// extract does not invent hidden 0.8 attachments.
+/// Compose `publishedMediaUrlsFromFamilyPages`.
+func snPublishedMediaUrlsFromFamilyPages(
+    startGroupId: String,
+    historicalFolds: [String: String],
+    pageForId: (String) -> [MarmotService.MarmotMessage],
+    pendingPrefix: String = "pending-media-"
+) -> Set<String> {
+    let ids = snMediaFetchGroupIds(
+        startGroupId: startGroupId,
+        historicalFolds: historicalFolds
+    )
+    let walk = ids.isEmpty ? [startGroupId] : ids
+    var urls = Set<String>()
+    for id in walk {
+        urls.formUnion(
+            snPublishedMediaUrlsFromMessages(pageForId(id), pendingPrefix: pendingPrefix)
+        )
+    }
+    return urls
+}
+
 /// Mesh-folded DMs resolve to listed live groups only. After persist-folds
 /// the 0.8 sibling is hidden from `groups()`, so load-older / newest /
 /// preserve must still expand those live ids through the fold family.
@@ -10220,10 +10261,16 @@ final class SonarAppStore: ObservableObject {
             mime: mime,
             caption: caption
         )
-        let existingMediaURLs = Set(
-            marmot.messagesByGroup[groupId, default: []]
-                .flatMap { $0.media.map(\.url) }
-                .filter { !$0.hasPrefix(Self.pendingMediaURLPrefix) }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let existingMediaURLs = snPublishedMediaUrlsFromFamilyPages(
+            startGroupId: groupId,
+            historicalFolds: folds,
+            pageForId: { id in
+                marmot.messagesByGroup[id]
+                    ?? marmot.messagesByGroup[snBareMarmotGroupId(id)]
+                    ?? []
+            },
+            pendingPrefix: Self.pendingMediaURLPrefix
         )
         pendingUploadMediaCache[key, default: []].append(
             PendingUploadMedia(
