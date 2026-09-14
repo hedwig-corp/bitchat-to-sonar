@@ -4,14 +4,27 @@
 //! This is the M1 acceptance test: KeyPackage publication → group creation →
 //! gift-wrapped welcome → bidirectional encrypted messages.
 
+use std::sync::{Arc, Mutex};
+
 use nostr::prelude::*;
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::Client as NostrClient;
 use sonar_core::client::SonarClient;
+use sonar_core::conversation_index::ConversationChangeListener;
 use sonar_core::identity::Identity;
 use sonar_core::marmot::KEY_PACKAGE_KIND;
 use sonar_core::GroupId;
 use tokio::time::{timeout, Duration};
+
+struct RecordingChangeListener {
+    changed: Mutex<Vec<String>>,
+}
+
+impl ConversationChangeListener for RecordingChangeListener {
+    fn on_conversation_changed(&self, group_id_hex: String) {
+        self.changed.lock().unwrap().push(group_id_hex);
+    }
+}
 
 #[tokio::test]
 async fn profile_publish_and_fetch_through_a_relay() {
@@ -2542,9 +2555,35 @@ async fn persist_folds_lost_core_sidecar_invite_family_sees_hist_requests() {
         alice.engine().live_fold_target(&historical).is_none(),
         "JSON sidecar lost; index still holds the recorded bind"
     );
+    let listener = Arc::new(RecordingChangeListener {
+        changed: Mutex::new(Vec::new()),
+    });
+    alice.set_conversation_change_listener(Some(listener.clone()));
+    let second = Keys::generate().public_key();
+    let stored_again = alice
+        .store_join_request(sonar_core::invite_link::JoinRequest {
+            requester: second,
+            group_id: historical.clone(),
+            secret_hash: sonar_core::invite_link::sha256(&decoded.invite_secret),
+            key_package_event_id: None,
+            key_package_d_tag: None,
+            received_at: 2,
+        })
+        .expect("store second hist-keyed request after sidecar loss");
+    assert!(stored_again);
+    let live_hex = hex::encode(live.as_slice());
+    assert!(
+        listener
+            .changed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id == &live_hex),
+        "store on hist must wake the live sibling so group-info remounts"
+    );
     assert_eq!(
         alice.pending_join_requests(&live).len(),
-        1,
+        2,
         "live group-info must restore the family and see hist-keyed requests"
     );
     assert_eq!(

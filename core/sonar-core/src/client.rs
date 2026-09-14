@@ -3488,13 +3488,19 @@ impl SonarClient {
     }
 
     pub fn store_join_request(&self, request: crate::invite_link::JoinRequest) -> Result<bool> {
+        let family = self.invite_family(&request.group_id);
         if !self
             .invite_links
-            .validate_secret_for(&self.invite_family(&request.group_id), &request.secret_hash)
+            .validate_secret_for(&family, &request.secret_hash)
         {
             return Ok(false);
         }
         self.invite_links.add_join_request(request)?;
+        // Pre-migration requests key hist. Host group-info sits on live.
+        // Wake every family id so a lost JSON sidecar still remounts.
+        for id in family {
+            self.notify_conversation_changed(&hex::encode(id.as_slice()));
+        }
         Ok(true)
     }
 
