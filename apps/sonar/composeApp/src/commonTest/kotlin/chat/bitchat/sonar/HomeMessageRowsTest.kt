@@ -377,6 +377,138 @@ class HomeMessageRowsTest {
     }
 
     @Test
+    fun homeRowMessageUsesRemountedSummaryWhenSnapshotEmpty() {
+        // Metadata-only snapshot has no bodies after process death.
+        // iOS `snMarmotHomeRowMessage` paints from remounted index content.
+        val summary = SonarConversationSummary(
+            "group-09",
+            "",
+            "keep this chat",
+            "peer",
+            50L,
+            false,
+            80L,
+            4L,
+        )
+        val row = homeRowMessage(loaded = null, summary = summary)
+        assertEquals("keep this chat", row?.content)
+        assertEquals(50L, row?.tsSecs)
+        assertEquals("summary:group-09:80", row?.id)
+        assertEquals(
+            "keep this chat",
+            latestHomeRowForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                summaryByChat = mapOf("group-08" to summary.copy(groupIdHex = "group-08")),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            )?.content,
+        )
+    }
+
+    @Test
+    fun homeRowMessageKeepsRealRowWhenItMatchesSummary() {
+        val loaded = SonarMsg("real-message", "peer", "Good morning", false, 300L, viaInternet = true)
+        val summary = SonarConversationSummary(
+            "sara",
+            "",
+            "Good morning",
+            "peer",
+            300L,
+            false,
+            7L,
+            0L,
+        )
+        assertEquals(loaded.id, homeRowMessage(loaded, summary)?.id)
+    }
+
+    @Test
+    fun homeRowMessageUsesLatestAtWhenCopySummaryCountIsZero() {
+        val summary = SonarConversationSummary(
+            "group-09",
+            "",
+            "recovered latest",
+            "peer",
+            1_700_000_000L,
+            false,
+            0L,
+            0L,
+        )
+        assertTrue(homeRowSummaryKnownNonEmpty(summary))
+        val row = homeRowMessage(loaded = null, summary = summary)
+        assertEquals("recovered latest", row?.content)
+        assertEquals(1_700_000_000L, row?.tsSecs)
+        assertEquals("summary:group-09:0", row?.id)
+        assertNull(
+            homeRowMessage(
+                loaded = null,
+                summary = summary.copy(latestAtSecs = 0L, latestContent = "", messageCount = 0L),
+            ),
+        )
+    }
+
+    @Test
+    fun conversationSummariesByChatKeepsHistPreviewOnLiveOnlyProbe() {
+        val folds = mapOf("group-08" to "group-09")
+        val hist = SonarConversationSummary(
+            "group-08",
+            "",
+            "from 0.8",
+            "peer",
+            50L,
+            false,
+            80L,
+            4L,
+        )
+        val previous = conversationSummariesByChat(listOf(hist), emptyMap(), folds)
+        assertEquals("from 0.8", previous["group-08"]?.latestContent)
+        assertEquals("from 0.8", previous["group-09"]?.latestContent)
+        assertEquals(0L, previous["group-09"]?.unreadCount)
+        val liveOnly = SonarConversationSummary(
+            "group-09",
+            "",
+            "",
+            "peer",
+            0L,
+            false,
+            0L,
+            1L,
+        )
+        val remounted = conversationSummariesByChat(listOf(liveOnly), previous, folds)
+        assertEquals("from 0.8", remounted["group-08"]?.latestContent)
+        assertEquals("from 0.8", remounted["group-09"]?.latestContent)
+        assertEquals(50L, remounted["group-09"]?.latestAtSecs)
+        assertEquals(80L, remounted["group-09"]?.messageCount)
+        assertEquals(1L, remounted["group-09"]?.unreadCount)
+        assertEquals(
+            previous,
+            conversationSummariesByChat(summaries = null, previous = previous, historicalFolds = folds),
+        )
+        assertEquals(
+            emptyMap(),
+            conversationSummariesByChat(summaries = emptyList(), previous = previous, historicalFolds = folds),
+        )
+        assertEquals(
+            "from 0.8",
+            latestHomeRowForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                summaryByChat = remounted,
+                historicalFolds = folds,
+            )?.content,
+        )
+        assertEquals(
+            "Secure chat · reaches anywhere",
+            latestHomeRowForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                summaryByChat = emptyMap(),
+                historicalFolds = folds,
+            )?.let { messagePreview(it.content, it.stickerRef, it.media) }
+                ?: "Secure chat · reaches anywhere",
+        )
+    }
+
+    @Test
     fun remountedExtractMergesNewerLivePageInsteadOfReplacing() {
         val folds = mapOf("group-08" to "group-09")
         val histRows = (1..80).map { n ->

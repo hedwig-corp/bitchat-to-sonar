@@ -814,6 +814,46 @@ internal fun conversationLatestAtFromSummaries(
     )
 }
 
+/** Full remounted summaries (including `latestContent`) from the last
+ *  successful probe. Failed probe keeps [previous]. Empty success clears.
+ *  A live-only probe after hide must not drop hist preview text.
+ *  iOS `snRemountedConversationSummaries`. */
+internal fun conversationSummariesByChat(
+    summaries: List<SonarConversationSummary>?,
+    previous: Map<String, SonarConversationSummary>,
+    historicalFolds: Map<String, String> = emptyMap(),
+): Map<String, SonarConversationSummary> {
+    if (summaries == null) return previous
+    if (summaries.isEmpty()) return emptyMap()
+    var out = summaries.associateBy { it.groupIdHex }
+    if (historicalFolds.isEmpty()) return out
+    for ((historical, live) in historicalFolds) {
+        if (live.isBlank() || live == historical) continue
+        val hist = out[historical] ?: previous[historical] ?: continue
+        if (!homeRowSummaryKnownNonEmpty(hist)) continue
+        if (out[historical] == null) out = out + (historical to hist)
+        val liveSummary = out[live]
+        if (liveSummary == null) {
+            out = out + (live to hist.copy(groupIdHex = live, unreadCount = 0L))
+            continue
+        }
+        val histNewer = hist.latestAtSecs > liveSummary.latestAtSecs ||
+            (liveSummary.latestAtSecs <= 0L && hist.messageCount > liveSummary.messageCount)
+        if (histNewer) {
+            out = out + (
+                live to liveSummary.copy(
+                    latestContent = hist.latestContent,
+                    latestSenderNpub = hist.latestSenderNpub,
+                    latestAtSecs = hist.latestAtSecs,
+                    latestMine = hist.latestMine,
+                    messageCount = maxOf(liveSummary.messageCount, hist.messageCount),
+                )
+            )
+        }
+    }
+    return out
+}
+
 /** Newest known timestamp across snapshot + remounted index latest.
  *  Snapshot-only understates a recovered 0.8 hist `latest_at` when the
  *  first live page is still short — home-list recency then sinks the
@@ -1578,6 +1618,61 @@ internal fun localLatestTsForChat(
  *  iOS `latestMarmotMessage` uses `max(by: createdAt)`. */
 internal fun latestHomeRowMessage(messages: List<SonarMsg>): SonarMsg? =
     messages.maxWithOrNull(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+
+/** `copy_summary` leaves live `message_count` at 0 on conflict but still
+ *  copies `latest_*`. Count-only treated that as empty, so process-death
+ *  home paint (metadata-only snapshot) dropped preview. iOS
+ *  `snMarmotHomeRowSummaryKnownNonEmpty`. */
+internal fun homeRowSummaryKnownNonEmpty(summary: SonarConversationSummary): Boolean =
+    summary.messageCount > 0L || summary.latestAtSecs > 0L
+
+/** Home-only projection of the remounted conversation index. Transcript
+ *  pages stay bounded and authoritative; a synthetic row is used only
+ *  when the summary is newer than the loaded page (or that group is
+ *  outside the page window). iOS `snMarmotHomeRowMessage`. */
+internal fun homeRowMessage(
+    loaded: SonarMsg?,
+    summary: SonarConversationSummary?,
+): SonarMsg? {
+    val usable = summary?.takeIf(::homeRowSummaryKnownNonEmpty)
+    if (usable == null) return loaded
+    if (loaded != null) {
+        if (loaded.tsSecs > usable.latestAtSecs) return loaded
+        if (loaded.tsSecs == usable.latestAtSecs &&
+            loaded.senderNpub == usable.latestSenderNpub &&
+            loaded.content == usable.latestContent &&
+            loaded.mine == usable.latestMine
+        ) {
+            return loaded
+        }
+    }
+    return SonarMsg(
+        id = "$SYNTHETIC_SUMMARY_ID_PREFIX${usable.groupIdHex}:${usable.messageCount}",
+        senderNpub = usable.latestSenderNpub,
+        content = usable.latestContent,
+        mine = usable.latestMine,
+        tsSecs = usable.latestAtSecs,
+        viaInternet = true,
+    )
+}
+
+/** Newest home-row message across a fold family, preferring remounted
+ *  index preview when the metadata-only snapshot is empty.
+ *  iOS `latestMarmotMessage` walks aliases + `snMarmotHomeRowMessage`. */
+internal fun latestHomeRowForChat(
+    chatId: String,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    summaryByChat: Map<String, SonarConversationSummary>,
+    historicalFolds: Map<String, String>,
+): SonarMsg? {
+    val ids = foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }
+    return ids.mapNotNull { id ->
+        homeRowMessage(
+            loaded = latestHomeRowMessage(messagesByChat[id].orEmpty()),
+            summary = summaryByChat[id] ?: summaryByChat[chatId],
+        )
+    }.maxWithOrNull(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+}
 
 /** Mesh-folded row timestamp when the Marmot snapshot is still empty
  *  (process death, metadata-only blob). `latestMarmotMessage` would
@@ -2628,6 +2723,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  `expectedNewestTsForOpenChat` must not be snapshot-only — iOS reads
      *  remounted `conversationSummariesByGroup[].latestAt`. */
     private var conversationLatestAtByChat: Map<String, Long> = emptyMap()
+    /** Remounted summaries including `latestContent`. Home preview must not
+     *  depend on synthetics surviving in the metadata-only snapshot.
+     *  iOS `conversationSummariesByGroup`. */
+    private var conversationSummaryByChat: Map<String, SonarConversationSummary> = emptyMap()
     /** Bumped when the summaries-index cache changes so [visibleChats]
      *  dedupe / [marmotRow] recency re-run. Snapshot-only memo keys left a
      *  recovered row sunk after `rememberConversationSummaryIndex`. */
@@ -2644,13 +2743,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             conversationLatestAtByChat,
             historicalFoldMap,
         )
+        val nextSummaries = conversationSummariesByChat(
+            summaries,
+            conversationSummaryByChat,
+            historicalFoldMap,
+        )
         if (nextCounts !== conversationMessageCountByChat ||
-            nextLatest !== conversationLatestAtByChat
+            nextLatest !== conversationLatestAtByChat ||
+            nextSummaries !== conversationSummaryByChat
         ) {
             conversationIndexVersion++
         }
         conversationMessageCountByChat = nextCounts
         conversationLatestAtByChat = nextLatest
+        conversationSummaryByChat = nextSummaries
     }
 
     private fun localLatestTs(chatId: String): Long =
@@ -6890,7 +6996,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)
             val unreadIds = transcriptSourceIds(chat.id, ids, historicalFoldMap)
             val newest = if (pending) null else ids
-                .mapNotNull { latestHomeRowMessage(visibleMessagesForChat(it, snapshotMessagesForChat(it))) }
+                .mapNotNull { id ->
+                    homeRowMessage(
+                        loaded = latestHomeRowMessage(
+                            visibleMessagesForChat(id, snapshotMessagesForChat(id)),
+                        ),
+                        summary = foldFamilyIds(id, historicalFoldMap)
+                            .mapNotNull { conversationSummaryByChat[it] }
+                            .maxByOrNull { it.latestAtSecs },
+                    )
+                }
                 .maxByOrNull { it.tsSecs }
             chat.id to MarmotRowModel(
                 id = chat.id,
@@ -13540,7 +13655,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = latestHomeRowMessage(snapshotMessagesForChat(group.id))
+            val msg = latestHomeRowForChat(
+                chatId = group.id,
+                messagesByChat = chatSnapshotMessagesByChat,
+                summaryByChat = conversationSummaryByChat,
+                historicalFolds = historicalFoldMap,
+            )
             val current = latest
             if (msg != null && (current == null || msg.tsSecs > current.tsSecs ||
                     (msg.tsSecs == current.tsSecs && msg.id > current.id))
@@ -14399,11 +14519,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val pages = if (localChats.isEmpty()) emptyList() else runCatching {
                 SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
         }.getOrDefault(emptyList())
+        // Failed probe must still mint preview from the remounted cache
+        // (iOS keeps `conversationSummariesByGroup`). `orEmpty()` dropped
+        // hist `latestContent` and left process-death home on "Tap to open".
         val hydration = hydrateLocalConversationRows(
             activeChatIds = activeIds,
             existingMessagesByChat = existingMessages,
             existingLatestByChat = existingLatest,
-            summaries = summaries.orEmpty(),
+            summaries = conversationSummaryByChat.values.toList(),
             pages = pages,
             historicalFolds = historicalFoldMap,
         )
