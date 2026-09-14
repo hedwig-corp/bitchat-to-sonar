@@ -3209,13 +3209,17 @@ impl SonarClient {
     }
 
     /// Add members to an existing group.
+    ///
+    /// A recovered 0.8 id is routed onto the live 0.9 sibling first —
+    /// `engine.add_members` cannot commit on a historical group.
     pub async fn add_group_members(
         &self,
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
+        let group_id = self.resolve_send_group(group_id).await?;
         let key_packages = self.fetch_key_packages_for_members(members).await?;
-        self.commit_add_members(group_id, key_packages).await
+        self.commit_add_members(&group_id, key_packages).await
     }
 
     /// Commit already-resolved KeyPackages into `group_id`.
@@ -3230,6 +3234,9 @@ impl SonarClient {
     }
 
     /// Remove members from an existing group.
+    ///
+    /// Same fold routing as [`Self::add_group_members`]: admin on a recovered
+    /// 0.8 id must commit on the live sibling.
     pub async fn remove_group_members(
         &self,
         group_id: &GroupId,
@@ -3240,12 +3247,13 @@ impl SonarClient {
                 "remove_group_members requires at least one member".into(),
             ));
         }
+        let group_id = self.resolve_send_group(group_id).await?;
         // Write-hold the gate from commit creation through publish+merge so no
         // send can encrypt at the pre-removal epoch while the commit is on the
         // wire — the removed member must not be able to read anything sent
         // after the removal was initiated.
         let _epoch = self.membership_gate.write().await;
-        let update = self.engine.remove_members(group_id, &members).await?;
+        let update = self.engine.remove_members(&group_id, &members).await?;
         self.publish_membership_update(update).await
     }
 
@@ -8917,6 +8925,34 @@ mod tests {
         assert!(
             matches!(err, Error::InvalidInput(_)),
             "deleted chat must not resume as a new group: {err:?}"
+        );
+    }
+
+    /// Add/remove on a chat the user already left must fail closed the same
+    /// way as send — not fetch KeyPackages or resume a new group.
+    #[tokio::test]
+    async fn add_and_remove_members_reject_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x12u8; 16]);
+        client.engine.purge_fold_family(&group_id);
+        let peer = Keys::generate().public_key();
+        let add_err = client
+            .add_group_members(&group_id, vec![peer])
+            .await
+            .expect_err("add after Leave must fail");
+        assert!(
+            matches!(add_err, Error::InvalidInput(_)),
+            "deleted chat must not resume as a new group: {add_err:?}"
+        );
+        let remove_err = client
+            .remove_group_members(&group_id, vec![peer])
+            .await
+            .expect_err("remove after Leave must fail");
+        assert!(
+            matches!(remove_err, Error::InvalidInput(_)),
+            "deleted chat must not resume as a new group: {remove_err:?}"
         );
     }
 

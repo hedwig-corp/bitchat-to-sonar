@@ -463,6 +463,9 @@ chat stays silent when the next push names the live 0.9 id. Pins:
 `marmot::historical_fold_tests::park_invite_skips_dropped_groups`,
 `client::tests::conversation_summaries_omit_and_heal_dropped_groups`,
 `client::tests::send_text_rejects_dropped_group`,
+`client::tests::add_and_remove_members_reject_dropped_group`
+(add/remove route through `resolve_send_group` so a recovered 0.8 id
+commits on the live sibling, and a left chat cannot resume via admin),
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
