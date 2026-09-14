@@ -6,7 +6,7 @@
 //!
 //! Blossom sees ciphertext only (`application/vnd.sonar.account-backup-v1`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1889,6 +1889,19 @@ pub fn preview_conversations(
     out
 }
 
+fn dropped_group_hexes(package: &AccountBackupPackage) -> HashSet<String> {
+    package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::marmot::DROPPED_GROUPS_FILE_SUFFIX)
+        .and_then(|(_, bytes)| serde_json::from_slice::<Vec<String>>(bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_ascii_lowercase())
+        .collect()
+}
+
 fn preview_from_packed_bak(
     db_path: &Path,
     package: &AccountBackupPackage,
@@ -1914,9 +1927,11 @@ fn preview_from_packed_bak(
         Some(key) => key,
         None => return Vec::new(),
     };
-    crate::mdk08_migrate::preview_group_names_from_bak(&bak_path, key)
+    let dropped = dropped_group_hexes(package);
+    crate::mdk08_migrate::preview_groups_from_bak(&bak_path, key)
         .into_iter()
-        .map(|name| BackupPreviewConversation {
+        .filter(|(id, _)| !dropped.contains(&id.to_ascii_lowercase()))
+        .map(|(_, name)| BackupPreviewConversation {
             name,
             latest_content: String::new(),
             message_count: 0,
@@ -1985,10 +2000,12 @@ fn preview_from_recovered_sidecars(
     if transcript.is_empty() && names.is_empty() {
         return Vec::new();
     }
+    let dropped = dropped_group_hexes(package);
     let mut ids: Vec<String> = transcript
         .keys()
         .cloned()
         .chain(names.keys().cloned())
+        .filter(|id| !dropped.contains(&id.to_ascii_lowercase()))
         .collect();
     ids.sort();
     ids.dedup();
@@ -3039,6 +3056,56 @@ mod tests {
             count_transcript_bytes(&serde_json::to_vec(&transcript).unwrap()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn preview_omits_dropped_recovered_chats() {
+        let peer = Keys::generate();
+        let kept = crate::GroupId::new(vec![0x11u8; 16]);
+        let gone = crate::GroupId::new(vec![0x22u8; 16]);
+        let kept_hex = hex::encode(kept.as_slice());
+        let gone_hex = hex::encode(gone.as_slice());
+        let msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xABu8; 32]).unwrap(),
+            group_id: kept.clone(),
+            sender: peer.public_key(),
+            content: "still here".into(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("still here"),
+            reply: None,
+        };
+        let mut transcript = HashMap::new();
+        transcript.insert(kept_hex.clone(), vec![msg]);
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(kept_hex, "keep room".into());
+        names.insert(gone_hex.clone(), "deleted room".into());
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&transcript).unwrap(),
+                ),
+                (
+                    crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&names).unwrap(),
+                ),
+                (
+                    crate::marmot::DROPPED_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&vec![gone_hex]).unwrap(),
+                ),
+            ],
+        };
+        let listed = preview_from_recovered_sidecars(&package);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "keep room");
+        assert!(listed.iter().all(|row| row.name != "deleted room"));
     }
 
     #[test]

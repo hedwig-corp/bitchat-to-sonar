@@ -432,10 +432,9 @@ pub(crate) fn bak_needed_for_backup(db_path: &Path) -> bool {
     leftover_bak_needed(db_path) || metadata_backfill_pending(db_path)
 }
 
-/// Group titles from a quarantined 0.8 file, including pending welcomes.
-/// Settings preview uses this when the conversation index never stored those
-/// rows (an early 0.9 extract).
-pub(crate) fn preview_group_names_from_bak(bak_path: &Path, key: [u8; 32]) -> Vec<String> {
+/// Recovered 0.8 group id hex + title from a quarantined store.
+/// Preview subtracts `dropped` ids so a leave/delete is not listed again.
+pub(crate) fn preview_groups_from_bak(bak_path: &Path, key: [u8; 32]) -> Vec<(String, String)> {
     let Some(conn) = open_mdk08(bak_path, key).ok().flatten() else {
         return Vec::new();
     };
@@ -443,14 +442,136 @@ pub(crate) fn preview_group_names_from_bak(bak_path: &Path, key: [u8; 32]) -> Ve
     if extract_metadata(&conn, &mut extracted).is_err() {
         return Vec::new();
     }
-    let mut names: Vec<String> = extracted
+    let mut rows: Vec<(String, String)> = extracted
         .group_names
-        .into_values()
-        .filter(|name| !name.is_empty())
+        .into_iter()
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(id, name)| (hex::encode(id.as_slice()), name))
         .collect();
-    names.sort();
-    names.dedup();
-    names
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows.dedup_by(|a, b| a.0 == b.0);
+    rows
+}
+
+/// Forget recovered metadata for groups the user already deleted / left.
+/// The 0.8 bak is left intact; Settings preview subtracts these ids instead.
+pub(crate) fn forget_historical_metadata(db_path: &Path, ids: &[GroupId]) {
+    if ids.is_empty() {
+        return;
+    }
+    let drop: HashSet<GroupId> = ids.iter().cloned().collect();
+    forget_named_map(
+        db_path,
+        HISTORICAL_GROUPS_FILE_SUFFIX,
+        load_historical_group_names(db_path),
+        &drop,
+    );
+    forget_named_map(
+        db_path,
+        HISTORICAL_DESCRIPTIONS_SUFFIX,
+        load_historical_group_descriptions(db_path),
+        &drop,
+    );
+    forget_members_map(db_path, &drop);
+    forget_counts_map(db_path, &drop);
+    forget_secrets_map(db_path, &drop);
+}
+
+fn forget_named_map(
+    db_path: &Path,
+    suffix: &str,
+    mut map: HashMap<GroupId, String>,
+    drop: &HashSet<GroupId>,
+) {
+    let before = map.len();
+    map.retain(|id, _| !drop.contains(id));
+    if map.len() == before {
+        return;
+    }
+    rewrite_string_map(db_path, suffix, &map);
+}
+
+fn forget_members_map(db_path: &Path, drop: &HashSet<GroupId>) {
+    let mut members = load_historical_members(db_path);
+    let before = members.len();
+    members.retain(|id, _| !drop.contains(id));
+    if members.len() == before {
+        return;
+    }
+    if members.is_empty() {
+        let _ = std::fs::remove_file(sidecar_named(db_path, HISTORICAL_MEMBERS_FILE_SUFFIX));
+        return;
+    }
+    let keyed: HashMap<String, Vec<String>> = members
+        .iter()
+        .map(|(id, pks)| {
+            (
+                hex::encode(id.as_slice()),
+                pks.iter().map(|pk| pk.to_hex()).collect(),
+            )
+        })
+        .collect();
+    let _ = write_json(
+        &sidecar_named(db_path, HISTORICAL_MEMBERS_FILE_SUFFIX),
+        &keyed,
+    );
+}
+
+fn forget_counts_map(db_path: &Path, drop: &HashSet<GroupId>) {
+    let mut counts = load_historical_member_counts(db_path);
+    let before = counts.len();
+    counts.retain(|id, _| !drop.contains(id));
+    if counts.len() == before {
+        return;
+    }
+    if counts.is_empty() {
+        let _ = std::fs::remove_file(sidecar_named(db_path, HISTORICAL_MEMBER_COUNTS_SUFFIX));
+        return;
+    }
+    let _ = write_member_counts(db_path, &counts);
+}
+
+fn forget_secrets_map(db_path: &Path, drop: &HashSet<GroupId>) {
+    let mut secrets = load_historical_media_secrets(db_path);
+    let before = secrets.len();
+    secrets.retain(|id, _| !drop.contains(id));
+    if secrets.len() == before {
+        return;
+    }
+    if secrets.is_empty() {
+        let _ = std::fs::remove_file(sidecar_named(db_path, HISTORICAL_EXPORTER_SECRETS_SUFFIX));
+        return;
+    }
+    let keyed: HashMap<String, Vec<String>> = secrets
+        .iter()
+        .map(|(id, values)| {
+            (
+                hex::encode(id.as_slice()),
+                values.iter().map(hex::encode).collect(),
+            )
+        })
+        .collect();
+    let _ = write_json(
+        &sidecar_named(db_path, HISTORICAL_EXPORTER_SECRETS_SUFFIX),
+        &keyed,
+    );
+}
+
+fn rewrite_string_map(db_path: &Path, suffix: &str, map: &HashMap<GroupId, String>) {
+    if map.is_empty() {
+        let _ = std::fs::remove_file(sidecar_named(db_path, suffix));
+        return;
+    }
+    let keyed: HashMap<String, String> = map
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(id, value)| (hex::encode(id.as_slice()), value.clone()))
+        .collect();
+    if keyed.is_empty() {
+        let _ = std::fs::remove_file(sidecar_named(db_path, suffix));
+        return;
+    }
+    let _ = write_json(&sidecar_named(db_path, suffix), &keyed);
 }
 
 /// Resume leftover 0.8 rows from the quarantined file after first paint.
@@ -2587,5 +2708,22 @@ mod tests {
         assert!(!msgs
             .iter()
             .any(|m| m.content.starts_with("a-") || m.content.contains("oldest")));
+    }
+
+    #[test]
+    fn forget_historical_metadata_drops_deleted_sidecar_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let keep = GroupId::new(vec![0x11u8; 16]);
+        let gone = GroupId::new(vec![0x22u8; 16]);
+        let mut names = HashMap::new();
+        names.insert(keep.clone(), "keep room".into());
+        names.insert(gone.clone(), "deleted room".into());
+        rewrite_string_map(&db_path, HISTORICAL_GROUPS_FILE_SUFFIX, &names);
+        forget_historical_metadata(&db_path, &[gone]);
+        let remaining = load_historical_group_names(&db_path);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get(&keep).map(String::as_str), Some("keep room"));
+        assert!(!remaining.contains_key(&GroupId::new(vec![0x22u8; 16])));
     }
 }

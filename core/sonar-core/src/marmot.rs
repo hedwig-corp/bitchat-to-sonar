@@ -2960,6 +2960,18 @@ impl MarmotEngine {
                 .retain(|historical, live| !family.iter().any(|id| id == historical || id == live));
         }
         self.persist_historical_folds();
+        {
+            let mut secrets = self
+                .historical_media_secrets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in &family {
+                secrets.remove(id);
+            }
+        }
+        if let Some(path) = self.db_path.as_ref() {
+            crate::mdk08_migrate::forget_historical_metadata(path, &family);
+        }
     }
 
     fn store_chat(&self, msg: ChatMessage) {
@@ -3820,7 +3832,7 @@ mod classification_tests {
 #[cfg(test)]
 mod historical_fold_tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use crate::identity::Identity;
 
@@ -3952,6 +3964,31 @@ mod historical_fold_tests {
         assert!(
             engine.live_fold_target(&historical).is_none(),
             "fold binding must die with the conversation"
+        );
+    }
+
+    #[test]
+    fn delete_live_group_forgets_historical_name_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let key = [0x42u8; 32];
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        let mut names = HashMap::new();
+        names.insert(hex::encode(historical.as_slice()), "standup".to_string());
+        let sidecar = db_path.with_file_name(format!(
+            "marmot.sqlite{}",
+            crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX
+        ));
+        std::fs::write(&sidecar, serde_json::to_vec(&names).expect("names json")).expect("write");
+        let alice = Identity::generate();
+        let engine = MarmotEngine::persistent(alice, &db_path, key).expect("fresh 0.9 store");
+        engine.record_historical_fold(&historical, &live);
+        engine.purge_fold_family(&live);
+        let remaining = crate::mdk08_migrate::load_historical_group_names(&db_path);
+        assert!(
+            remaining.is_empty(),
+            "deleted recovered title must leave the sidecar so Settings preview cannot list it"
         );
     }
 

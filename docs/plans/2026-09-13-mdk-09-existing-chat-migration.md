@@ -187,6 +187,9 @@ Guarded by:
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
 - `marmot::historical_fold_tests::delete_live_group_purges_folded_historical_history`
+- `marmot::historical_fold_tests::delete_live_group_forgets_historical_name_sidecar`
+- `account_backup::preview_omits_dropped_recovered_chats`
+- `mdk08_migrate::forget_historical_metadata_drops_deleted_sidecar_rows`
 - `ConversationFoldTest.foldedOpenUnreadAndTranscriptWindowRemountOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalMuteMovesOntoLiveSibling`
@@ -408,7 +411,11 @@ purges the whole fold family so a later `start_dm` with the same peer cannot
 resurrect a conversation the user already removed. Hosts also drop the
 hist→live blob (`sonar.historicalFolds` / `sonar.historicalFolds.v1`) and
 persist the chat snapshot without the family immediately, so a mid-session
-delete cannot leave a recovered 0.8 row for the next first paint. Pins:
+delete cannot leave a recovered 0.8 row for the next first paint.
+Core also forgets recovered name/member/description/count/secret sidecars
+for that family. Settings restore preview subtracts `.sonar-dropped-groups.json`
+ids from both the historical-groups sidecar and packed `*.mdk08.bak` titles,
+so a backup taken after Leave does not list a chat the user already removed. Pins:
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
 `snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no
@@ -446,7 +453,7 @@ Re-run on this cloud agent after the delete-after-fold host snapshot purge.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 167 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 170 passed |
 | `--test persistence` | 29 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
