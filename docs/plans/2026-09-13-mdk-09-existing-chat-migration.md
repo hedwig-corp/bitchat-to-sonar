@@ -499,6 +499,7 @@ sidecar and its crashed `{suffix}.tmp`, including historical groups /
 members / exporter secrets / folds / transcript / parked invites),
 `media_staging::tests::wipe_removes_crashed_state_tmp`,
 `push::tests::wipe_removes_crashed_cache_tmp`,
+`account_backup::tests::wipe_backup_policy_removes_crashed_unique_tmp`,
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
@@ -562,20 +563,19 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after mint-on-live invites, recovered-peer
-push-token membership, and invite-mint backup dirty. Prior HEAD
-`c44c4034` packed `.sonar-invites.json`.
+Re-run on `fb08afe5` after wipe-tmp completeness. Next commit adds
+backup-policy unique-tmp wipe.
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 189 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 189 passed on `fb08afe5` |
 | `--test persistence` | 30 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |
 | `--test media` | 4 passed |
 | `-p sonar-sim` | 5 passed |
 | `--test e2e` `recovered_08` | 7 passed |
-| Compose `SonarNotificationHandoffTest` + `ConversationFoldTest` | passed |
+| Compose `SonarNotificationHandoffTest` + `ConversationFoldTest` | passed earlier on this branch |
 
 Joined-room hole closed after `900f9788`: a recovered named 0.8 room with
 only one known peer no longer resumes as `start_dm`. Extract copies

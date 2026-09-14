@@ -687,6 +687,41 @@ pub fn wipe_backup_policy_for_db(db_path: &Path) {
             tracing::warn!(%e, path = %path.display(), "wipe backup policy failed");
         }
     }
+    wipe_backup_policy_tmps(&path);
+}
+
+/// Policy writes `{name}.{pid}.{secs}.tmp` then renames. A reset that only
+/// deletes the final file leaves the previous account's cadence / dirty
+/// state on disk for the next install on this path.
+fn wipe_backup_policy_tmps(path: &Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        if !(fname.starts_with(&prefix) && fname.ends_with(".tmp")) {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(entry.path()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    %e,
+                    path = %entry.path().display(),
+                    "wipe backup policy tmp failed"
+                );
+            }
+        }
+    }
 }
 
 /// Plaintext package before AEAD wrap.
@@ -3366,6 +3401,25 @@ mod tests {
             .unwrap();
         let v: i64 = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn wipe_backup_policy_removes_crashed_unique_tmp() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let path = backup_policy_path_for_db(&db_path);
+        std::fs::write(&path, b"{}").unwrap();
+        let tmp = path.with_file_name(format!(
+            "{}.1234.1700000000.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap()
+        ));
+        std::fs::write(&tmp, b"{\"previous-account\":true}").unwrap();
+        wipe_backup_policy_for_db(&db_path);
+        assert!(!path.exists(), "backup policy sidecar removed");
+        assert!(
+            !tmp.exists(),
+            "a crashed unique policy rename must not survive a wipe"
+        );
     }
 
     #[test]
