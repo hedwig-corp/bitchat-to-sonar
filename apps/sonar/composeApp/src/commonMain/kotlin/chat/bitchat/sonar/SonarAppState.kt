@@ -1949,13 +1949,17 @@ internal fun purgedHistoricalFolds(
  * bindings whose whole family is gone. First-paint / core-not-ready listings
  * must pass [listedAuthoritative] = false so a recovered 0.8 row is not
  * forgotten before the live sibling appears.
+ *
+ * An empty listing is never authoritative: `SonarCore.chats()` returns `[]`
+ * when the node is closed, and a transient empty `groups()` must not persist
+ * an empty host fold blob. Wipe / delete already call [forgetHistoricalFolds].
  */
 internal fun prunedOrphanedHistoricalFolds(
     folds: Map<String, String>,
     listedIds: Set<String>,
     listedAuthoritative: Boolean,
 ): Map<String, String> {
-    if (!listedAuthoritative) return folds
+    if (!listedAuthoritative || listedIds.isEmpty()) return folds
     return folds.filter { (historical, live) ->
         live == historical || live in listedIds || historical in listedIds
     }

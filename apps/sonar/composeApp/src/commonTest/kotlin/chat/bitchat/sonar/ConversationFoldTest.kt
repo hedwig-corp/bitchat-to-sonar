@@ -2457,6 +2457,27 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun emptyAuthoritativeListingDoesNotPruneFolds() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            folds,
+            prunedOrphanedHistoricalFolds(
+                folds = folds,
+                listedIds = emptySet(),
+                listedAuthoritative = true,
+            ),
+        )
+        assertEquals(
+            emptyMap(),
+            prunedOrphanedHistoricalFolds(
+                folds = folds,
+                listedIds = setOf("other-room"),
+                listedAuthoritative = true,
+            ),
+        )
+    }
+
+    @Test
     fun deleteAfterFoldDropsTheHiddenHistoricalSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-09", folds))
@@ -2519,6 +2540,14 @@ class ConversationFoldTest {
                 folds = folds,
                 listedIds = emptySet(),
                 listedAuthoritative = false,
+            ),
+        )
+        assertEquals(
+            folds,
+            prunedOrphanedHistoricalFolds(
+                folds = folds,
+                listedIds = emptySet(),
+                listedAuthoritative = true,
             ),
         )
         val historical = SonarChat(id = "group-08", name = "room", members = listOf("npub1a"), isDirect = false)

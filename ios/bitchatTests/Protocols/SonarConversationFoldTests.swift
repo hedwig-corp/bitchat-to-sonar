@@ -1859,6 +1859,13 @@ struct SonarConversationFoldTests {
                 listedAuthoritative: false
             ) == ["group-08": "group-09"]
         )
+        #expect(
+            snPrunedOrphanedHistoricalFolds(
+                ["group-08": "group-09"],
+                listedIds: [],
+                listedAuthoritative: true
+            ) == ["group-08": "group-09"]
+        )
         let historicalMark = SNScanMark(secs: 50, count: 12)
         let promotedMarks = snPromotedFoldedScanMarks(
             previousGroupIds: ["group-08", "group-09"],

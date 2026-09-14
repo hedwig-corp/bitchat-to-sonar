@@ -1319,6 +1319,13 @@ still 0.8. Pin:
 `e2e.rs::recovered_08_pending_outbox_survives_upgrade_connect`,
 `outbox.rs::retryable_events_keeps_unpublishable_active_rows_and_marks_failed`.
 
+Host fold-blob prune hole closed after this commit: an empty
+`chats()` / `$groups` listing (node closed, reconnect, first sink)
+must not persist an empty `sonar.historicalFolds` map. Wipe and
+leave already forget the family. Pins:
+`ConversationFoldTest.emptyAuthoritativeListingDoesNotPruneFolds`,
+`SonarConversationFoldTests` empty `listedIds` + `listedAuthoritative`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

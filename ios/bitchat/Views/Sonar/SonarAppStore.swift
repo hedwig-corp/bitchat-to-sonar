@@ -2033,12 +2033,16 @@ func snPurgedHistoricalFolds(
 /// whole family is gone. First-paint / empty startup listings must pass
 /// `listedAuthoritative == false` so a recovered 0.8 row is not forgotten
 /// before the live sibling appears.
+///
+/// An empty listing is never authoritative: `$groups` can emit `[]` while
+/// the node is closed or reconnecting, and that must not persist an empty
+/// host fold blob. Wipe / leave already forget the family explicitly.
 func snPrunedOrphanedHistoricalFolds(
     _ folds: [String: String],
     listedIds: Set<String>,
     listedAuthoritative: Bool
 ) -> [String: String] {
-    guard listedAuthoritative else { return folds }
+    guard listedAuthoritative, !listedIds.isEmpty else { return folds }
     return folds.filter { historical, live in
         live == historical || listedIds.contains(live) || listedIds.contains(historical)
     }
