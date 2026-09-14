@@ -1056,6 +1056,37 @@ func snTranscriptSourceIds(
     return out
 }
 
+/// Mesh-folded DMs resolve to listed live groups only. After persist-folds
+/// the 0.8 sibling is hidden from `groups()`, so load-older / newest /
+/// preserve must still expand those live ids through the fold family.
+/// Compose `meshFoldTranscriptSourceIds`.
+func snMeshFoldTranscriptSourceIds(
+    listedDirectIds: [String],
+    historicalFolds: [String: String],
+    resolvedGroupId: String? = nil
+) -> [String] {
+    var seeds: [String] = []
+    var seen = Set<String>()
+    func appendSeed(_ id: String) {
+        guard !id.isEmpty, seen.insert(id).inserted else { return }
+        seeds.append(id)
+    }
+    for id in listedDirectIds { appendSeed(id) }
+    if let resolvedGroupId { appendSeed(resolvedGroupId) }
+    var out: [String] = []
+    var outSeen = Set<String>()
+    for id in seeds {
+        for source in snTranscriptSourceIds(
+            groupId: id,
+            listedDirectIds: listedDirectIds,
+            historicalFolds: historicalFolds
+        ) where outSeen.insert(source).inserted {
+            out.append(source)
+        }
+    }
+    return out
+}
+
 /// Home-row unread across listed 1:1 duplicates plus the hidden 0.8 sibling.
 /// Compose `unreadForFoldFamily` — rooms used to key only the live id.
 func snUnreadForFoldFamily(
@@ -7615,11 +7646,12 @@ final class SonarAppStore: ObservableObject {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         // Load-older / newest / preserve must page the hidden 0.8 sibling
         // too. Listed live-only groups miss bak remainder when core
-        // `fold_family(live)` is not ready yet. Compose `transcriptGroupIds`.
-        let ids = snTranscriptSourceIds(
-            groupId: groupId,
+        // `fold_family(live)` is not ready yet. Compose `transcriptGroupIds`
+        // / `meshFoldTranscriptSourceIds`.
+        let ids = snMeshFoldTranscriptSourceIds(
             listedDirectIds: folded.map(\.id),
-            historicalFolds: folds
+            historicalFolds: folds,
+            resolvedGroupId: groupId
         )
         let byId = Dictionary(uniqueKeysWithValues: folded.map { ($0.id, $0) })
         return ids.map { pagingId in

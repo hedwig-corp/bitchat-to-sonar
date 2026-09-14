@@ -1400,6 +1400,28 @@ internal fun transcriptSourceIds(
     return out.toList()
 }
 
+/** Mesh-folded DMs resolve to listed live groups only. After persist-folds
+ *  the 0.8 sibling is hidden from `groups()`, so load-older / first-open
+ *  FFI must still expand those live ids through the fold family.
+ *  iOS `snMeshFoldTranscriptSourceIds` / `localTranscriptGroups`. */
+internal fun meshFoldTranscriptSourceIds(
+    listedDirectIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    resolvedGroupId: String? = null,
+): List<String> {
+    val seeds = linkedSetOf<String>()
+    for (id in listedDirectIds) {
+        if (id.isNotBlank()) seeds += id
+    }
+    if (!resolvedGroupId.isNullOrBlank()) seeds += resolvedGroupId
+    if (seeds.isEmpty()) return emptyList()
+    val out = linkedSetOf<String>()
+    for (id in seeds) {
+        out.addAll(transcriptSourceIds(id, listedDirectIds, historicalFolds))
+    }
+    return out.toList()
+}
+
 /**
  * Home-row / notification unread across the fold family.
  *
@@ -12439,9 +12461,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
+        val groupIds = meshFoldTranscriptSourceIds(
+            groups.map { it.id },
+            historicalFoldMap,
+            resolveMarmotGroupId(sessionChatId),
+        ).ifEmpty { groups.map { it.id } }
         val merged = ArrayList<SonarMsg>()
-        for (group in groups) {
-            val msgs = refreshTranscriptGroupWindow(group.id, sessionChatId, generation)
+        for (groupId in groupIds) {
+            val msgs = refreshTranscriptGroupWindow(groupId, sessionChatId, generation)
             merged += msgs.map { it.copy(viaInternet = true) }
         }
         return mergeAllTranscriptRows(merged)
@@ -12550,7 +12577,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val aliases = meshPeerAliases(peerId)
         val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
-        return groups.map { it.id }.distinct()
+        // Listed live-only misses the hidden 0.8 sibling after persist-folds.
+        // iOS `localTranscriptGroups` / `snMeshFoldTranscriptSourceIds`.
+        return meshFoldTranscriptSourceIds(
+            groups.map { it.id },
+            historicalFoldMap,
+            resolveMarmotGroupId(chatId),
+        )
     }
 
     /** Keep only the active viewport's BLE history; the complete transcript remains in MessageStore. */

@@ -1014,6 +1014,16 @@ when the hist window is empty (`foldFamilyPagingCursor`). Pins:
 `ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
 `SonarConversationFoldTests` `snLoadOlderPageHasOlder`.
 
+Mesh-folded paging hole closed after this commit: Compose
+`transcriptGroupIds` / `marmotMessagesForPeer` for a `mesh:` row returned
+listed live groups only. After persist-folds the 0.8 sibling is hidden
+from `groups()`, so openDm hydrate and load-older never queried hist.
+`meshFoldTranscriptSourceIds` / `snMeshFoldTranscriptSourceIds` expand
+those live / resolved ids through the fold family (iOS
+`localTranscriptGroups` uses the same helper). Pins:
+`ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
+`SonarConversationFoldTests` `snMeshFoldTranscriptSourceIds`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

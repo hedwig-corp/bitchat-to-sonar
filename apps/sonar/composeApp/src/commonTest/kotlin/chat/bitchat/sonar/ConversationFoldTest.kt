@@ -1845,6 +1845,23 @@ class ConversationFoldTest {
             listOf("group-09", "group-08"),
             transcriptSourceIds("group-09", emptyList(), folds),
         )
+        // Mesh-folded openDm / load-older used listed live ids only.
+        assertEquals(
+            listOf("group-09", "group-08"),
+            meshFoldTranscriptSourceIds(listOf("group-09"), folds),
+        )
+        assertEquals(
+            listOf("group-09", "group-08"),
+            meshFoldTranscriptSourceIds(emptyList(), folds, resolvedGroupId = "group-09"),
+        )
+        assertEquals(
+            listOf("group-09"),
+            meshFoldTranscriptSourceIds(listOf("group-09"), emptyMap()),
+        )
+        assertEquals(
+            emptyList(),
+            meshFoldTranscriptSourceIds(emptyList(), folds),
+        )
         assertTrue(
             blankTranscriptKnownNonEmpty(
                 chatId = "group-09",

@@ -605,6 +605,31 @@ struct SonarConversationFoldTests {
             ) == ["group-09", "group-08"]
         )
         #expect(
+            snMeshFoldTranscriptSourceIds(
+                listedDirectIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snMeshFoldTranscriptSourceIds(
+                listedDirectIds: [],
+                historicalFolds: ["group-08": "group-09"],
+                resolvedGroupId: "group-09"
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snMeshFoldTranscriptSourceIds(
+                listedDirectIds: ["group-09"],
+                historicalFolds: [:]
+            ) == ["group-09"]
+        )
+        #expect(
+            snMeshFoldTranscriptSourceIds(
+                listedDirectIds: [],
+                historicalFolds: ["group-08": "group-09"]
+            ).isEmpty
+        )
+        #expect(
             snBlankTranscriptKnownNonEmpty(
                 groupId: "group-09",
                 messageCountByGroup: ["group-08": 80],
