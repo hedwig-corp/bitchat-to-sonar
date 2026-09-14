@@ -2218,22 +2218,57 @@ internal fun conversationChangeShouldRefreshOpenMesh(
     return false
 }
 
-/** Chat ids that may still hold in-flight media after a hist→live promote. */
+/** Chat ids that may still hold in-flight media after a hist→live promote.
+ *  Remount MOVES hist buckets onto live before wake-mute persist writes
+ *  `fold_aliases`. Empty persist-folds still union the remount pair so
+ *  hist-keyed send closures find the moved bytes. */
 internal fun pendingMediaUploadLookupIds(
     chatId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<String> {
-    val family = foldFamilyIds(chatId, historicalFolds)
-    return if (family.isEmpty()) listOf(chatId) else family.toList()
+    val ids = linkedSetOf<String>()
+    fun add(raw: String) {
+        if (raw.isBlank()) return
+        ids += raw
+        ids.addAll(foldFamilyIds(raw, historicalFolds))
+        val bare = raw.removePrefix("marmot:")
+        if (bare.isNotBlank() && bare != raw) {
+            ids += bare
+            ids.addAll(foldFamilyIds(bare, historicalFolds))
+        }
+    }
+    add(chatId)
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        add(id)
+    }
+    return if (ids.isEmpty()) listOf(chatId) else ids.toList()
 }
 
-/** Store in-flight media on the live sibling so hist-keyed send closures still find it. */
+/** Store in-flight media on the live sibling so hist-keyed send closures still find it.
+ *  Prefer persist-fold live, then the remount-pair live, so a new album
+ *  started from the painted hist pane joins the bucket remount already moved. */
 internal fun pendingMediaUploadStoreId(
     chatId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String {
     val live = historicalFolds[chatId]
     if (!live.isNullOrBlank() && live != chatId) return live
+    val pair = remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (pair.size > 1) {
+        openedConversationId?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+    }
     return historicalFolds.entries.firstOrNull { it.value == chatId }?.value ?: chatId
 }
 
@@ -11203,7 +11238,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  per-attachment entry is appended so each reconciles independently. */
     private fun rememberPendingMediaUploads(chatId: String, uploads: List<PendingMediaUpload>) {
         if (uploads.isEmpty()) return
-        val storeId = pendingMediaUploadStoreId(chatId, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val storeId = pendingMediaUploadStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         val pending = pendingMediaUploads.getOrPut(storeId) { mutableListOf() }
         val ids = uploads.mapTo(mutableSetOf()) { it.message.id }
         pending.removeAll { it.message.id in ids }
@@ -11223,13 +11264,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun pendingMediaUploadsAcrossFamily(chatId: String): List<PendingMediaUpload> =
-        pendingMediaUploadLookupIds(chatId, historicalFoldMap)
-            .flatMap { pendingMediaUploads[it].orEmpty() }
+    private fun pendingMediaUploadsAcrossFamily(chatId: String): List<PendingMediaUpload> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return pendingMediaUploadLookupIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).flatMap { pendingMediaUploads[it].orEmpty() }
+    }
 
     /** The bucket that still holds this chat's in-flight media after a fold promote. */
     private fun pendingMediaUploadBucket(chatId: String): MutableList<PendingMediaUpload>? {
-        for (id in pendingMediaUploadLookupIds(chatId, historicalFoldMap)) {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        for (id in pendingMediaUploadLookupIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )) {
             pendingMediaUploads[id]?.let { return it }
         }
         return null
@@ -11246,7 +11299,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun mergePendingMediaUploads(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
-        val lookupIds = pendingMediaUploadLookupIds(chatId, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val lookupIds = pendingMediaUploadLookupIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         val pending = lookupIds.flatMap { pendingMediaUploads[it].orEmpty() }
         if (pending.isEmpty()) return published.sortedBy { it.tsSecs }
         // Track matched entries INDIVIDUALLY, not by message id: an album's N
@@ -11274,7 +11333,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (ok) matchedUrls += upload.pendingUrl
         }
         val survivors = pending.filterNot { it.pendingUrl in matchedUrls }
-        val storeId = pendingMediaUploadStoreId(chatId, historicalFoldMap)
+        val storeId = pendingMediaUploadStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         for (id in lookupIds) {
             if (id != storeId) pendingMediaUploads.remove(id)
         }

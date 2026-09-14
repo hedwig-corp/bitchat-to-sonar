@@ -2154,6 +2154,42 @@ class ConversationFoldTest {
         assertEquals("group-09", pendingMediaUploadStoreId("group-08", folds))
         assertEquals("group-09", pendingMediaUploadStoreId("group-09", folds))
         assertEquals("group-08", pendingMediaUploadStoreId("group-08", emptyMap()))
+        assertEquals(
+            setOf("group-08", "group-09"),
+            pendingMediaUploadLookupIds(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ).toSet(),
+        )
+        assertEquals(
+            "group-09",
+            pendingMediaUploadStoreId(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-other"),
+            pendingMediaUploadLookupIds(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ).toSet(),
+        )
+        assertEquals(
+            "group-other",
+            pendingMediaUploadStoreId(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

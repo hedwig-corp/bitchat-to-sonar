@@ -2137,12 +2137,55 @@ func snConversationChangeShouldRefreshOpenMesh(
 }
 
 /// Group ids that may still hold in-flight upload bytes after a hist→live remount.
+/// Remount MOVES cache-key prefixes onto live before wake-mute persist
+/// writes `fold_aliases`. Empty persist-folds still union the remount pair
+/// so hist-keyed mark/forget/cache find the moved bytes.
 func snPendingUploadLookupGroupIds(
     groupId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
-    let family = snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
-    return family.isEmpty ? [groupId] : family.sorted()
+    var family = snFoldFamilyIds(id: snBareMarmotGroupId(groupId), historicalFolds: historicalFolds)
+    if family.isEmpty {
+        if !groupId.isEmpty { family.insert(groupId) }
+    }
+    for id in snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id)
+        if !bare.isEmpty { family.insert(bare) }
+        family.formUnion(snFoldFamilyIds(id: bare, historicalFolds: historicalFolds))
+    }
+    return family.filter { !$0.isEmpty }.sorted()
+}
+
+/// Store in-flight upload bytes on the live sibling. Prefer persist-fold
+/// live, then the remount-pair live, so a new album from the painted hist
+/// pane joins the bucket remount already moved. Compose `pendingMediaUploadStoreId`.
+func snPendingUploadStoreGroupId(
+    groupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    let bare = snBareMarmotGroupId(groupId)
+    if let live = historicalFolds[bare] ?? historicalFolds[groupId],
+       !live.isEmpty, live != bare, live != groupId {
+        return snBareMarmotGroupId(live)
+    }
+    let pair = snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if pair.count > 1, let opened = openedConversationId, !opened.isEmpty {
+        return snBareMarmotGroupId(opened)
+    }
+    return historicalFolds.first(where: { $0.value == bare || $0.value == groupId })?.value
+        ?? (bare.isEmpty ? groupId : bare)
 }
 
 /// Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold.
@@ -11333,7 +11376,14 @@ final class SonarAppStore: ObservableObject {
         caption: String
     ) -> String {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        for alias in snPendingUploadLookupGroupIds(groupId: groupId, historicalFolds: folds) {
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        for alias in snPendingUploadLookupGroupIds(
+            groupId: groupId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
             let key = Self.pendingUploadMediaKey(
                 groupId: alias,
                 filename: filename,
@@ -11342,9 +11392,12 @@ final class SonarAppStore: ObservableObject {
             )
             if pendingUploadMediaCache[key] != nil { return key }
         }
-        let store = folds[groupId]
-            ?? folds[snBareMarmotGroupId(groupId)]
-            ?? groupId
+        let store = snPendingUploadStoreGroupId(
+            groupId: groupId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
         return Self.pendingUploadMediaKey(
             groupId: store,
             filename: filename,
