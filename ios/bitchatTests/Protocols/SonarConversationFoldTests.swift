@@ -1075,6 +1075,27 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snCachedFoldFamilySourceLimit(
+                cachedCount: 80,
+                currentLimit: 30,
+                retainedLimit: 500
+            ) == 80
+        )
+        #expect(
+            snCachedFoldFamilySourceLimit(
+                cachedCount: 10,
+                currentLimit: 30,
+                retainedLimit: 500
+            ) == 30
+        )
+        #expect(
+            snCachedFoldFamilySourceLimit(
+                cachedCount: 520,
+                currentLimit: 30,
+                retainedLimit: 500
+            ) == 500
+        )
+        #expect(
             snQuotedMessageRevealLimit(
                 parentId: "m5",
                 cached: (1...40).map { "m\($0)" },

@@ -501,6 +501,15 @@ final class ConversationViewState: ObservableObject {
             )
         }
         #endif
+        let retained = TransportConfig.sonarTranscriptRetainedCount
+        // Remounted 0.8 extract rows are already in the family cache.
+        // Keep the source window large enough that load-older can
+        // prepend them without waiting for a new database id.
+        sourceMessageLimit = snCachedFoldFamilySourceLimit(
+            cachedCount: store.cachedMarmotFamilyRowCount(for: conversationId),
+            currentLimit: sourceMessageLimit,
+            retainedLimit: retained
+        )
         let meshCount = store.cachedMeshMessageCount(conversationId)
         let paymentCount = store.cachedPaymentActivityCount(conversationId)
         let callCount = store.cachedCallRecordCount(conversationId)
@@ -577,6 +586,11 @@ final class ConversationViewState: ObservableObject {
     /// different chat after navigation.
     func loadOlder() async -> Bool {
         guard !isLoadingOlder, hasOlderMessages, let store else { return false }
+        sourceMessageLimit = snCachedFoldFamilySourceLimit(
+            cachedCount: store.cachedMarmotFamilyRowCount(for: conversationId),
+            currentLimit: sourceMessageLimit,
+            retainedLimit: TransportConfig.sonarTranscriptRetainedCount
+        )
         isLoadingOlder = true
         defer { isLoadingOlder = false }
         let pageSize = TransportConfig.sonarTranscriptPageCount

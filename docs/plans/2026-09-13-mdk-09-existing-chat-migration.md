@@ -1053,6 +1053,17 @@ secrets. Both hosts now try `mediaFetchGroupIds` /
 `ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
 `SonarConversationFoldTests` `snMediaFetchGroupIds`.
 
+iOS remounted-extract source-limit hole closed after this commit:
+`dmMsgs` formats only `sourceMessageLimit` (30) Marmot rows. After
+persist-folds the 80-row first-paint extract is already in the family
+cache; load-older that re-reads that page reports `added=false` and
+never grew the source window, so the rest of the extract — and bak
+when bak is empty — stayed unreachable. `rebuildNow` now raises
+`sourceMessageLimit` with `snCachedFoldFamilySourceLimit`. Compose
+`transcriptWindows` already hold the full extract. Pins:
+`ConversationFoldTest` `cachedFoldFamilySourceLimit`,
+`SonarConversationFoldTests` `snCachedFoldFamilySourceLimit`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

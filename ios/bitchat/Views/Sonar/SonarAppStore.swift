@@ -650,6 +650,22 @@ func snLoadOlderPageHasOlder(
     return previousHasOlder
 }
 
+/// iOS `dmMsgs` formats only `sourceMessageLimit` rows per Marmot source.
+/// After persist-folds the first-paint extract (80) is already in the
+/// family cache, but load-older that re-reads the same page reports
+/// `added=false` and used to leave the rest of that extract — and bak
+/// when bak is empty — unreachable. Raise the source window to the
+/// already-loaded family count (capped at the retained budget).
+/// Compose keeps the full extract in `transcriptWindows`.
+func snCachedFoldFamilySourceLimit(
+    cachedCount: Int,
+    currentLimit: Int,
+    retainedLimit: Int
+) -> Int {
+    guard retainedLimit > 0 else { return max(0, currentLimit) }
+    return min(retainedLimit, max(currentLimit, max(0, cachedCount)))
+}
+
 /// Visible-row budget that includes `parentId` when it already sits in the
 /// family-unioned host cache. Quote-jump searches the painted suffix; a
 /// parent older than `pageSize` but still in the retained window must
@@ -7696,6 +7712,23 @@ final class SonarAppStore: ObservableObject {
         return ids.map { pagingId in
             byId[pagingId] ?? MarmotService.MarmotGroup(id: pagingId, name: "", memberNpubs: [])
         }
+    }
+
+    /// Already-loaded fold-family Marmot rows. `ConversationViewState`
+    /// raises `sourceMessageLimit` to this count so remounted 0.8
+    /// extract rows stay reachable without a new database id.
+    func cachedMarmotFamilyRowCount(for conversationId: String) -> Int {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let seed = localTranscriptGroups(for: conversationId).first?.id
+            ?? marmotGroupId(conversationId)
+        guard let seed else { return 0 }
+        var seen = Set<String>()
+        return snFoldFamilyCachedMessages(
+            groupId: seed,
+            messagesByGroup: marmot.messagesByGroup,
+            historicalFolds: folds,
+            idOf: { $0.id }
+        ).filter { seen.insert($0.id).inserted }.count
     }
 
     /// How one chat line renders: regular text, a ⚡PAY receipt bubble,

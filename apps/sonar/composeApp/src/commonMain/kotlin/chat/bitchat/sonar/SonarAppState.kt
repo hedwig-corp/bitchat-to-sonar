@@ -801,6 +801,24 @@ internal fun loadOlderPageHasOlder(
     return previousHasOlder
 }
 
+/** iOS `dmMsgs` formats only `sourceMessageLimit` rows per Marmot source.
+ *  After persist-folds the first-paint extract (80) is already in the
+ *  family cache, but load-older that re-reads the same page reports
+ *  `added=false` and used to leave the rest of that extract — and bak
+ *  when bak is empty — unreachable. Raise the source window to the
+ *  already-loaded family count (capped at the retained budget).
+ *  Compose `transcriptWindows` already hold the full extract, so the
+ *  coordinator does not need this raise; keep the helper in lockstep
+ *  with iOS `snCachedFoldFamilySourceLimit`. */
+internal fun cachedFoldFamilySourceLimit(
+    cachedCount: Int,
+    currentLimit: Int,
+    retainedLimit: Int = TRANSCRIPT_RETAINED_ROWS,
+): Int {
+    if (retainedLimit <= 0) return maxOf(0, currentLimit)
+    return minOf(retainedLimit, maxOf(currentLimit, maxOf(0, cachedCount)))
+}
+
 /** Prefer this id's load-older cursor; fall back to a hidden sibling so
  *  an unpaged live / remounted-empty hist row can still request remainder.
  *  iOS `snFoldFamilyPagingCursor`. */

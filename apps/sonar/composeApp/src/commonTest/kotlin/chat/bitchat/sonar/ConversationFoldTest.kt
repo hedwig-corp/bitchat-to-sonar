@@ -1018,6 +1018,30 @@ class ConversationFoldTest {
                 previousHasOlder = false,
             ),
         )
+        // iOS formats only sourceMessageLimit Marmot rows. An 80-row
+        // remounted extract must raise that window or load-older that
+        // re-reads the same page leaves the rest unreachable.
+        assertEquals(
+            80,
+            cachedFoldFamilySourceLimit(
+                cachedCount = 80,
+                currentLimit = TRANSCRIPT_PAGE_SIZE,
+            ),
+        )
+        assertEquals(
+            TRANSCRIPT_PAGE_SIZE,
+            cachedFoldFamilySourceLimit(
+                cachedCount = 10,
+                currentLimit = TRANSCRIPT_PAGE_SIZE,
+            ),
+        )
+        assertEquals(
+            TRANSCRIPT_RETAINED_ROWS,
+            cachedFoldFamilySourceLimit(
+                cachedCount = TRANSCRIPT_RETAINED_ROWS + 20,
+                currentLimit = TRANSCRIPT_PAGE_SIZE,
+            ),
+        )
         assertEquals(
             "cursor-08",
             foldFamilyPagingCursor(
