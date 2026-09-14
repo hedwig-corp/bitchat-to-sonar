@@ -359,8 +359,8 @@ Never Uninstall Device Apps). Record pass/fail against this sheet:
 | --- | --- | --- | --- |
 | Rust core | decrypt-and-move (this PR) | `send_*` resumes via `start_dm` / `create_group` and records a fold. Resume peers include 0.8 `admin_pubkeys` so outbound-only chats can restart. Direct chats auto-join; recovered rooms use the existing pending-invite accept path, include whoever already published a 0.9 KeyPackage, and `add_members` leftover peers on the next send **or** background `sync` / `ensure_subscriptions` | none |
 | Conversation index | preserved + seeded from sidecar | fold copies the recovered row onto the live id; `conversation_summaries()` hides the historical sibling; `mark_conversation_read` clears the whole fold family | none |
-| Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply / verify / call logs / unread-at-open / transcript window / in-flight send echoes onto the live sibling. FFI `fold_aliases` lets a listed live id name its hidden 0.8 siblings so the host fold map hydrates on first launch without a leftover snapshot row. A persisted `sonar.historicalFolds` map drops a recovered snapshot row on the next cold start once the live sibling is already listed. After a KeyPackage miss, `recoveredChatHasLiveFoldSibling` treats a hist→live binding as the live sibling even when FFI has hidden the 0.8 id (listed duplicates go back to 1; rooms never have listed 1:1 duplicates). Remount **drops** the waiting-banner flag instead of copying it onto the live id. | send prefers newest duplicate; toast/banner if KeyPackage missing — cleared once a live sibling exists; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
-| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. Mute / draft / reply / verify / call-log / unread-at-open / transcript-window / in-flight send-echo promotion and open-chat remount match Compose. Cold-start snapshot load collapses folded historical ids via `sonar.historicalFolds.v1`. `snRecoveredChatHasLiveFoldSibling` + remount-drop of `recoveredChatNeedsUpdate` match Compose so a successful resume clears “Waiting for them to update Sonar”. | same | none |
+| Compose (`apps/sonar`) | Recovered rows stay in `groups()` until resume; after fold, FFI hides the historical sibling. `GroupInfo.is_direct` keeps rooms off the 1:1 npub fold. First-paint snapshot now persists `isDirect` (6th field) so a two-member recovered room does not fold onto the welcomer DM before `chats()` returns. Pre-`isDirect` blobs default **not-direct** in memory so the room stays visible; startup rewrite of old blobs omits the flag until `groups()` returns so invented `false` is not durable. A joined named room with only one known peer stays a room (`historical_resume_is_direct` matches live `group_is_direct`). Host remounts an open historical id onto `live_fold_target` and copies mute / composer draft / reply / verify / call logs / unread-at-open / transcript window / in-flight send echoes onto the live sibling. FFI `fold_aliases` lets a listed live id name its hidden 0.8 siblings so the host fold map hydrates on first launch without a leftover snapshot row. A persisted `sonar.historicalFolds` map drops a recovered snapshot row on the next cold start once the live sibling is already listed. After a KeyPackage miss, `recoveredChatHasLiveFoldSibling` treats a hist→live binding as the live sibling even when FFI has hidden the 0.8 id (listed duplicates go back to 1; rooms never have listed 1:1 duplicates). Remount **drops** the waiting-banner flag instead of copying it onto the live id. Shade taps inherit the still-listed 0.8 sibling's name/members, then `adoptedListedChatTitle` replaces a captured "Group chat" stub once the live row lists. | send prefers newest duplicate; toast/banner if KeyPackage missing — cleared once a live sibling exists; recovered 0.8 attachments show a non-retryable “older Sonar” state | none |
+| iOS (`ios/`) | same (`MarmotGroup.isDirect` in the Codable snapshot). Old snapshots without the key default not-direct in memory. `SNMarmotChatSnapshotCache.load` strips leftover message bodies without re-encoding groups, so invented `isDirect=false` is not stamped durable before FFI `groups()`. Mute / draft / reply / verify / call-log / unread-at-open / transcript-window / in-flight send-echo promotion and open-chat remount match Compose. Cold-start snapshot load collapses folded historical ids via `sonar.historicalFolds.v1`. `snRecoveredChatHasLiveFoldSibling` + remount-drop of `recoveredChatNeedsUpdate` match Compose so a successful resume clears “Waiting for them to update Sonar”. Title is derived each render (`marmot.title(for:)`); `marmotGroup(byId:)` walks `snListedOrFoldedSiblingGroupId` so a hidden 0.8 id still resolves the listed sibling. | same | none |
 | Mesh | untouched | untouched | none |
 
 Resume-chat fold: recovered 0.8 rows appear in FFI `groups()` with
@@ -406,7 +406,15 @@ does that from the persisted hist→live blob (`sonar.historicalFolds` /
 not wait on `connect()` to open a chat the snapshot already listed.
 Compose now remaps and opens that live id even when it is not yet in
 `chats()` (iOS already did via `snNotificationOpenGroupId` / `openDM`).
-A stub row is not-direct so a recovered room cannot fold as a 1:1. Persisted
+A stub row is not-direct so a recovered room cannot fold as a 1:1.
+Compose captures `Screen.Chat.name` at push; after `refreshChats()` lists
+the remapped row, `adoptedListedChatTitle` replaces a stub "Group chat"
+title. iOS derives the title from `marmot.groups` / `marmot.title(for:)`
+each render (no captured stub). Both hosts resolve title / members /
+verify / call / pay chrome through a bidirectional fold-sibling lookup
+(`listedOrFoldedSiblingChat` / `snListedOrFoldedSiblingGroupId`) so a
+hidden 0.8 id or an unlisted live id still sees the other listed sibling.
+Persisted
 call-log rows on the hidden id are merged onto the live sibling so resume
 does not drop the recovered call history. A safety-number verify on the
 hidden id is copied onto the live sibling so resume does not drop the
@@ -460,7 +468,14 @@ chat stays silent when the next push names the live 0.9 id. Pins:
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
 (remap even when the live id is not in `knownChatIds`),
 `ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
-(`notificationOpenChat` synthesizes a not-direct stub),
+(`listedOrFoldedSiblingChat` is bidirectional: unlisted live inherits
+the still-listed 0.8 sibling; sitting on a hidden 0.8 id inherits the
+listed live sibling. `notificationOpenChat` uses that, else a not-direct
+stub. `adoptedListedChatTitle` replaces a captured Compose
+`Screen.Chat.name` of "Group chat" once `chats()` lists the remapped
+row. iOS derives the title from `marmot.groups` / `marmot.title(for:)`
+each render, so it does not have this captured-stub hole;
+`snListedOrFoldedSiblingGroupId` is the iOS mirror),
 `SonarConversationFoldTests` (`snNotificationLiveFoldTarget` remaps a
 shade tap from the persisted blob when FFI is down),
 `marmot::historical_fold_tests::recovered_08_media_decrypts_with_stored_exporter_secret`
@@ -508,8 +523,9 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after in-memory historical sidecar purge.
-`historical_fold` lib tests green. Full rust suite last verified on `e218e2f0`.
+Re-run on this cloud agent after captured-title + bidirectional fold
+sibling lookup. Compose fold/notification tests green. Full rust suite
+last verified on `e218e2f0`.
 
 | Gate | Result |
 | --- | --- |

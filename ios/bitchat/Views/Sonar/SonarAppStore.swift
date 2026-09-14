@@ -299,6 +299,25 @@ func snNotificationOpenGroupId(
     return live
 }
 
+/// Prefer the listed MLS id. If FFI hid a folded 0.8 row or has not
+/// painted the live sibling yet, return the other listed fold sibling
+/// so title / members / verify / call lookups stay valid.
+func snListedOrFoldedSiblingGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String]
+) -> String? {
+    if listedGroupIds.contains(groupId) { return groupId }
+    if let historical = historicalFolds.first(where: { $0.value == groupId && $0.key != groupId })?.key,
+       listedGroupIds.contains(historical) {
+        return historical
+    }
+    if let live = historicalFolds[groupId], live != groupId, listedGroupIds.contains(live) {
+        return live
+    }
+    return nil
+}
+
 /// Bare MLS id whether the tap carried `marmot:` or not.
 func snBareMarmotGroupId(_ id: String, prefix: String = "marmot:") -> String {
     id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : id
@@ -5454,7 +5473,7 @@ final class SonarAppStore: ObservableObject {
             )
         }
         if id.hasPrefix(Self.marmotIDPrefix), let groupId = marmotGroupId(id) {
-            let group = marmot.groups.first { $0.id == groupId }
+            let group = marmotGroup(byId: groupId)
             return SNPeerItem(
                 id: id,
                 name: group.map { marmot.title(for: $0) } ?? "Secure chat",
@@ -5623,7 +5642,17 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
-        marmot.groups.first { $0.id == groupId }
+        if let exact = marmot.groups.first(where: { $0.id == groupId }) {
+            return exact
+        }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let listed = Set(marmot.groups.map(\.id))
+        guard let sibling = snListedOrFoldedSiblingGroupId(
+            groupId: groupId,
+            listedGroupIds: listed,
+            historicalFolds: folds
+        ) else { return nil }
+        return marmot.groups.first { $0.id == sibling }
     }
 
     private func directMarmotPeerKey(in group: MarmotService.MarmotGroup) -> String? {
@@ -5987,7 +6016,7 @@ final class SonarAppStore: ObservableObject {
     private func callDisplayName(_ id: String) -> String {
         if !meshReachable(id),
            let groupId = callMarmotGroupId(id),
-           let group = marmot.groups.first(where: { $0.id == groupId }) {
+           let group = marmotGroup(byId: groupId) {
             return marmot.title(for: group)
         }
         return peerItem(id).name

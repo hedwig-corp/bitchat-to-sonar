@@ -533,14 +533,45 @@ internal fun remountFoldedOpenChatId(
     return if (live in listedChatIds) live else openChatId
 }
 
+/** Prefer the listed row. If FFI hid a folded 0.8 id or has not painted
+ *  the live sibling yet, reuse the other listed fold sibling so title /
+ *  members / directness stay correct. The returned [SonarChat.id] is always
+ *  [chatId] so send/admin keep the open id. */
+internal fun listedOrFoldedSiblingChat(
+    chatId: String,
+    listedChats: List<SonarChat>,
+    historicalFolds: Map<String, String>,
+): SonarChat? {
+    listedChats.firstOrNull { it.id == chatId }?.let { return it }
+    val historicalId = historicalFolds.entries
+        .firstOrNull { it.value == chatId && it.key != chatId }
+        ?.key
+    listedChats.firstOrNull { it.id == historicalId }?.let { return it.copy(id = chatId) }
+    val liveId = historicalFolds[chatId]?.takeIf { it != chatId }
+    return listedChats.firstOrNull { it.id == liveId }?.copy(id = chatId)
+}
+
 /** Shade taps remapped onto a live sibling must open even before `chats()`
- *  lists that id. Default not-direct so a recovered room cannot fold as a 1:1. */
+ *  lists that id. Prefer the recovered sibling's name/members so a named
+ *  room does not open as "Group chat". Default not-direct (R-045). */
 internal fun notificationOpenChat(
     remappedChatId: String,
     listedChats: List<SonarChat>,
-): SonarChat =
-    listedChats.firstOrNull { it.id == remappedChatId }
-        ?: SonarChat(id = remappedChatId, name = "", members = emptyList(), isDirect = false)
+    historicalFolds: Map<String, String> = emptyMap(),
+): SonarChat = listedOrFoldedSiblingChat(remappedChatId, listedChats, historicalFolds)
+    ?: SonarChat(id = remappedChatId, name = "", members = emptyList(), isDirect = false)
+
+/** After `chats()` lists the remapped row, replace a stub "Group chat" title. */
+internal fun adoptedListedChatTitle(
+    openChatId: String,
+    currentTitle: String,
+    listedChats: List<SonarChat>,
+    titleOf: (SonarChat) -> String,
+): String? {
+    val listed = listedChats.firstOrNull { it.id == openChatId } ?: return null
+    val next = titleOf(listed)
+    return next.takeIf { it.isNotBlank() && it != currentTitle }
+}
 
 /** Copy an open-chat host map from a hidden 0.8 id onto the live sibling. */
 internal fun <V> remountFoldedOpenValues(
@@ -3013,14 +3044,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun listedChat(chatId: String): SonarChat? =
+        listedOrFoldedSiblingChat(chatId, chats, historicalFoldMap)
+
     fun isMultiMemberChat(chatId: String): Boolean =
         if (isPendingMarmotChat(chatId)) false
         else if (isPendingMarmotGroup(chatId)) true
-        else chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+        else listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
 
     fun canManageGroup(chatId: String): Boolean =
         !isPendingMarmotGroup(chatId) &&
-            chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+            listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
 
     fun hasDirectPaymentRoute(chatId: String): Boolean {
         if (directPaymentOffer(chatId) != null) return true
@@ -3071,7 +3105,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun groupMemberContacts(chatId: String): List<GroupContact> {
         val members = pendingMarmotGroups[chatId]?.members
-            ?: chats.firstOrNull { it.id == chatId }?.let { otherMembers(it) }
+            ?: listedChat(chatId)?.let { otherMembers(it) }
             ?: emptyList()
         return members.map { member ->
             ensureProfile(member)
@@ -3086,7 +3120,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun allGroupMemberContacts(chatId: String): List<GroupContact> {
-        val chat = chats.firstOrNull { it.id == chatId } ?: return emptyList()
+        val chat = listedChat(chatId) ?: return emptyList()
         return chat.members
             .map { canonicalProfileKey(it) }
             .filter { it.isNotBlank() }
@@ -3119,7 +3153,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun mentionRoster(chatId: String): List<MentionCandidate> {
         if (!isMultiMemberChat(chatId)) return emptyList()
         val members = pendingMarmotGroups[chatId]?.members
-            ?: chats.firstOrNull { it.id == chatId }?.let { otherMembers(it) }
+            ?: listedChat(chatId)?.let { otherMembers(it) }
             ?: return emptyList()
         return members.mapNotNull { member ->
             val name = profilesByNpub[canonicalProfileKey(member)]?.bestName ?: return@mapNotNull null
@@ -3158,7 +3192,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun groupMemberNpubs(chatId: String): Set<String> =
         pendingMarmotGroups[chatId]?.members?.toSet()
-            ?: chats.firstOrNull { it.id == chatId }?.members.orEmpty().toSet()
+            ?: listedChat(chatId)?.members.orEmpty().toSet()
 
     /** This peer's npub (32 raw bytes) if known — from a live 0x53 OR the persisted
      *  [linkByFp] (so it still resolves out of range / after restart). The bridge
@@ -3771,7 +3805,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isMeshChat(chatId)) {
             npubRawFor(meshPeerId(chatId))?.toHexLower()
         } else {
-            chats.firstOrNull { it.id == chatId }
+            listedChat(chatId)
                 ?.takeIf { isDirectMarmotChat(it) }
                 ?.let { otherMembers(it).singleOrNull() }
                 ?.let { canonicalNpubHex(it) }
@@ -4443,7 +4477,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Verify info for a Marmot chat: the 12 safety groups, or an honest note. */
     fun verifyInfo(chatId: String): SonarVerify {
-        val chat = chats.firstOrNull { it.id == chatId }
+        val chat = listedChat(chatId)
         if (chat != null && !isDirectMarmotChat(chat)) {
             return SonarVerify(emptyList(), false, "Safety numbers are available for 1:1 chats.")
         }
@@ -5814,7 +5848,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             is SonarNotificationOpenTarget.MeshPeer ->
                 openDm(target.peerId, meshPeerName(target.peerId), jumpMessageId = jumpMessageId)
             is SonarNotificationOpenTarget.Chat -> {
-                val chat = notificationOpenChat(target.chatId, chats)
+                val chat = notificationOpenChat(target.chatId, chats, historicalFoldMap)
                 openChat(chat, jumpMessageId = jumpMessageId)
                 if (conversationId != target.chatId) {
                     clearNotificationsForChat(conversationId)
@@ -6957,7 +6991,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
-        val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+        val isGroup = listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
         // A deduped direct row can represent several duplicate Marmot groups for
         // the same peer; delete the whole set so hidden duplicates don't resurface.
         // After an MDK 0.8→0.9 resume the hidden 0.8 sibling must leave too,
@@ -11835,7 +11869,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun marmotChatPeerNpubHex(chatId: String): String? {
         val mine = canonicalProfileKey(npub)
-        val other = chats.firstOrNull { it.id == chatId }
+        val other = listedChat(chatId)
             ?.members
             ?.map { canonicalProfileKey(it) }
             ?.firstOrNull { it != mine && it.isNotBlank() }
@@ -12573,6 +12607,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
         resolvePendingMarmotChats()
         remountFoldedOpenChat()
+        adoptOpenChatTitleIfListed()
+    }
+
+    /** Compose captures `Screen.Chat.name` at push. After `chats()` lists the
+     *  remapped live row, replace a stub "Group chat" title. iOS derives the
+     *  title from `marmot.groups` each render, so it does not need this. */
+    private fun adoptOpenChatTitleIfListed() {
+        val open = screen as? Screen.Chat ?: return
+        val next = adoptedListedChatTitle(open.id, open.name, chats, ::chatTitle) ?: return
+        stack = stack.map { s ->
+            if (s is Screen.Chat && s.id == open.id) s.copy(name = next) else s
+        }
     }
 
     private fun promoteFoldedMutes(previousIds: Set<String>, currentIds: Set<String>) {

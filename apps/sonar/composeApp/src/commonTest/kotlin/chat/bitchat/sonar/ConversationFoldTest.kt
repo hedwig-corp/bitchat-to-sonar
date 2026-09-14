@@ -556,9 +556,75 @@ class ConversationFoldTest {
         )
         val listedLive = SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false)
         assertEquals(listedLive, notificationOpenChat("group-09", listOf(listedLive)))
+        val historical = SonarChat(
+            id = "group-08",
+            name = "standup",
+            members = listOf("npub1a", "npub1b"),
+            isDirect = false,
+        )
+        val remapped = notificationOpenChat(
+            "group-09",
+            listOf(historical),
+            mapOf("group-08" to "group-09"),
+        )
+        assertEquals("group-09", remapped.id)
+        assertEquals("standup", remapped.name)
+        assertEquals(listOf("npub1a", "npub1b"), remapped.members)
+        assertFalse(remapped.isDirect)
+        assertEquals(
+            remapped,
+            listedOrFoldedSiblingChat(
+                chatId = "group-09",
+                listedChats = listOf(historical),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        val sittingOnHidden = listedOrFoldedSiblingChat(
+            chatId = "group-08",
+            listedChats = listOf(listedLive.copy(name = "standup", members = listOf("npub1a", "npub1b"))),
+            historicalFolds = mapOf("group-08" to "group-09"),
+        )
+        assertEquals("group-08", sittingOnHidden?.id)
+        assertEquals("standup", sittingOnHidden?.name)
+        assertEquals(listOf("npub1a", "npub1b"), sittingOnHidden?.members)
+        assertEquals(false, sittingOnHidden?.isDirect)
         val stub = notificationOpenChat("group-09", emptyList())
         assertEquals("group-09", stub.id)
+        assertEquals("", stub.name)
         assertFalse(stub.isDirect)
+        assertNull(
+            listedOrFoldedSiblingChat(
+                chatId = "group-09",
+                listedChats = emptyList(),
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        val titleOf: (SonarChat) -> String = { it.name.ifBlank { "Group chat" } }
+        assertEquals(
+            "standup",
+            adoptedListedChatTitle(
+                openChatId = "group-09",
+                currentTitle = "Group chat",
+                listedChats = listOf(listedLive.copy(name = "standup")),
+                titleOf = titleOf,
+            ),
+        )
+        assertNull(
+            adoptedListedChatTitle(
+                openChatId = "group-09",
+                currentTitle = "standup",
+                listedChats = listOf(listedLive.copy(name = "standup")),
+                titleOf = titleOf,
+            ),
+        )
+        assertNull(
+            adoptedListedChatTitle(
+                openChatId = "group-09",
+                currentTitle = "Group chat",
+                listedChats = emptyList(),
+                titleOf = titleOf,
+            ),
+        )
     }
 
     @Test
