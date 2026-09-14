@@ -466,6 +466,12 @@ chat stays silent when the next push names the live 0.9 id. Pins:
 `client::tests::add_and_remove_members_reject_dropped_group`
 (add/remove route through `resolve_send_group` so a recovered 0.8 id
 commits on the live sibling, and a left chat cannot resume via admin),
+`client::tests::pending_join_requests_see_folded_historical_sidecar`
+(`pending_join_requests` / `active_invite_links` / decline / revoke
+union the fold family so a pre-migration `sinvite1` token still
+surfaces on the live group-info screen; `approve_join_request` commits
+on `resolve_send_group`),
+`invite_link::tests::fold_family_unions_historical_invite_sidecar`,
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
@@ -529,9 +535,9 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after captured-title + bidirectional fold
-sibling lookup. Compose fold/notification tests green. Full rust suite
-last verified on `e218e2f0`.
+Re-run on this cloud agent after invite-fold union. Lib migrate/fold/
+backup/client was **179** before the invite pin; `group_invites` **17**.
+Full rust suite last verified on `e218e2f0`.
 
 | Gate | Result |
 | --- | --- |

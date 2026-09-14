@@ -3367,14 +3367,16 @@ impl SonarClient {
     }
 
     pub fn revoke_invite_link(&self, group_id: &GroupId, secret_hash: &[u8; 32]) -> Result<()> {
-        self.invite_links.revoke_link(group_id, secret_hash)
+        self.invite_links
+            .revoke_link_for(&self.invite_family(group_id), secret_hash)
     }
 
     pub fn active_invite_links(
         &self,
         group_id: &GroupId,
     ) -> Vec<crate::invite_link::InviteLinkMeta> {
-        self.invite_links.active_links(group_id)
+        self.invite_links
+            .active_links_for(&self.invite_family(group_id))
     }
 
     pub async fn request_join_via_link(&self, token_str: &str) -> Result<()> {
@@ -3423,7 +3425,8 @@ impl SonarClient {
         &self,
         group_id: &GroupId,
     ) -> Vec<crate::invite_link::JoinRequest> {
-        self.invite_links.pending_join_requests(group_id)
+        self.invite_links
+            .pending_join_requests_for(&self.invite_family(group_id))
     }
 
     pub async fn approve_join_request(
@@ -3439,26 +3442,30 @@ impl SonarClient {
                 "cannot approve your own join request".into(),
             ));
         }
+        let family = self.invite_family(group_id);
         let request = self
             .invite_links
-            .pending_join_requests(group_id)
+            .pending_join_requests_for(&family)
             .into_iter()
             .find(|request| request.requester == *requester)
             .ok_or_else(|| Error::InvalidInput("no pending join request".into()))?;
+        let live = self.resolve_send_group(group_id).await?;
         let key_package = self.key_package_for_join_request(&request).await?;
-        self.commit_add_members(group_id, vec![key_package]).await?;
-        self.invite_links.remove_join_request(group_id, requester)?;
+        self.commit_add_members(&live, vec![key_package]).await?;
+        self.invite_links
+            .remove_join_request_for(&family, requester)?;
         Ok(())
     }
 
     pub fn decline_join_request(&self, group_id: &GroupId, requester: &PublicKey) -> Result<()> {
-        self.invite_links.remove_join_request(group_id, requester)
+        self.invite_links
+            .remove_join_request_for(&self.invite_family(group_id), requester)
     }
 
     pub fn store_join_request(&self, request: crate::invite_link::JoinRequest) -> Result<bool> {
         if !self
             .invite_links
-            .validate_secret(&request.group_id, &request.secret_hash)
+            .validate_secret_for(&self.invite_family(&request.group_id), &request.secret_hash)
         {
             return Ok(false);
         }
@@ -7218,6 +7225,10 @@ impl SonarClient {
         }
     }
 
+    fn invite_family(&self, group_id: &GroupId) -> Vec<GroupId> {
+        self.engine.fold_aliases(group_id)
+    }
+
     fn record_resume_fold(&self, historical: &GroupId, live: &GroupId) {
         self.engine.record_historical_fold(historical, live);
         self.promote_index_fold(historical, live);
@@ -8954,6 +8965,55 @@ mod tests {
             matches!(remove_err, Error::InvalidInput(_)),
             "deleted chat must not resume as a new group: {remove_err:?}"
         );
+    }
+
+    /// A pre-migration invite token still names the 0.8 MLS id. After resume
+    /// the admin UI queries the live sibling — the sidecar must union the
+    /// fold family so the request is visible and decline/revoke still work.
+    #[tokio::test]
+    async fn pending_join_requests_see_folded_historical_sidecar() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let token = client
+            .create_invite_link(&historical, "standup")
+            .expect("create 0.8 invite");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        let requester = Keys::generate().public_key();
+        let stored = client
+            .store_join_request(crate::invite_link::JoinRequest {
+                requester,
+                group_id: historical.clone(),
+                secret_hash: crate::invite_link::sha256(&decoded.invite_secret),
+                key_package_event_id: None,
+                key_package_d_tag: None,
+                received_at: 1,
+            })
+            .expect("store");
+        assert!(stored, "0.8 token must still validate after mint");
+        client.engine.record_historical_fold(&historical, &live);
+        assert_eq!(
+            client.pending_join_requests(&live).len(),
+            1,
+            "live group-info must list requests stored on the recovered id"
+        );
+        assert_eq!(
+            client.active_invite_links(&live).len(),
+            1,
+            "live group-info must list links minted on the recovered id"
+        );
+        client
+            .decline_join_request(&live, &requester)
+            .expect("decline via live id");
+        assert!(client.pending_join_requests(&live).is_empty());
+        assert!(client.pending_join_requests(&historical).is_empty());
+        client
+            .revoke_invite_link(&live, &crate::invite_link::sha256(&decoded.invite_secret))
+            .expect("revoke via live id");
+        assert!(client.active_invite_links(&live).is_empty());
+        assert!(client.active_invite_links(&historical).is_empty());
     }
 
     /// R: a received message must NOT make the account "urgent" for auto-backup.
