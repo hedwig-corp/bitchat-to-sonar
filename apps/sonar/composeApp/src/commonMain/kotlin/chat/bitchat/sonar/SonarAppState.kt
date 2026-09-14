@@ -622,6 +622,34 @@ internal fun remountFoldedOpenId(
     id: String,
 ): String = if (id in historicalKeys) liveId else id
 
+/** Remount group-info / contact-profile / call / buried chat routes after
+ *  FFI hides a folded 0.8 id. Transcript remount still copies host state
+ *  separately; this only rewrites nav ids. */
+internal fun remountFoldedNavStack(
+    stack: List<Screen>,
+    liveTarget: (String) -> String,
+): List<Screen> = stack.map { screen ->
+    when (screen) {
+        is Screen.Chat -> {
+            val live = liveTarget(screen.id)
+            if (live == screen.id) screen else screen.copy(id = live)
+        }
+        is Screen.GroupInfo -> {
+            val live = liveTarget(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        is Screen.ContactProfile -> {
+            val live = liveTarget(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        is Screen.Call -> {
+            val live = liveTarget(screen.peerId)
+            if (live == screen.peerId) screen else screen.copy(peerId = live)
+        }
+        else -> screen
+    }
+}
+
 /** Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`. */
 internal fun historicalFoldsFromAliases(
     listedIds: Collection<String>,
@@ -3069,7 +3097,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun listedChat(chatId: String): SonarChat? =
+    internal fun listedChat(chatId: String): SonarChat? =
         listedOrFoldedSiblingChat(chatId, chats, historicalFoldMap)
 
     fun isMultiMemberChat(chatId: String): Boolean =
@@ -12796,18 +12824,21 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
-     *  transcript, swap the nav id to the live 0.9 sibling so member/title
+     *  transcript — or in group-info / contact-profile / an in-flight call on
+     *  that id — swap the nav id to the live 0.9 sibling so member/title
      *  lookups keep working. In-flight send closures keep the historical id
      *  via [transcriptSessionAliases]. */
     private fun remountFoldedOpenChat() {
-        val open = screen as? Screen.Chat ?: return
-        val live = remountFoldedOpenChatId(
-            openChatId = open.id,
-            listedChatIds = chats.mapTo(hashSetOf()) { it.id },
-            liveFoldTarget = runCatching { SonarCore.liveFoldTarget(open.id) }.getOrNull(),
+        val listed = chats.mapTo(hashSetOf()) { it.id }
+        fun liveFor(id: String) = remountFoldedOpenChatId(
+            openChatId = id,
+            listedChatIds = listed,
+            liveFoldTarget = runCatching { SonarCore.liveFoldTarget(id) }.getOrNull(),
         )
-        if (live == open.id) return
-        val liveChat = chats.firstOrNull { it.id == live }
+        val open = stack.filterIsInstance<Screen.Chat>().firstOrNull { liveFor(it.id) != it.id }
+        if (open != null) {
+            val live = liveFor(open.id)
+            val liveChat = chats.firstOrNull { it.id == live }
             ?: notificationOpenChat(live, chats, historicalFoldMap)
         moveSendEchoes(open.id, live)
         trillCooldownUntilMs = remountFoldedOpenValues(
@@ -12900,6 +12931,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 s
             }
         }
+        }
+        val nextStack = remountFoldedNavStack(stack, ::liveFor)
+        if (nextStack != stack) stack = nextStack
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)

@@ -29,6 +29,9 @@ struct SonarGroupInfoScreen: View {
     private var members: [SNGroupContact] { store.groupMemberContacts(forConversationId: peerId) }
 
     private var groupTitle: String {
+        if let group = store.marmotGroup(forConversationId: peerId) {
+            return store.marmot.title(for: group)
+        }
         let row = store.dmRows.first { $0.id == peerId }
         return row?.title ?? peer.name
     }

@@ -115,6 +115,30 @@ struct SonarConversationFoldTests {
             ) == "group-09"
         )
         #expect(
+            snRemountFoldedConversationId(
+                "marmot:group-08",
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: "group-09"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snRemountFoldedPath(
+                path: [
+                    .dm("marmot:group-08"),
+                    .groupInfo("marmot:group-08"),
+                    .contactProfile("marmot:group-08", "Ada"),
+                    .call("marmot:group-08", video: false),
+                ],
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: { _ in "group-09" }
+            ) == [
+                .dm("marmot:group-09"),
+                .groupInfo("marmot:group-09"),
+                .contactProfile("marmot:group-09", "Ada"),
+                .call("marmot:group-09", video: false),
+            ]
+        )
+        #expect(
             snNotificationOpenGroupId(
                 tappedGroupId: "group-08",
                 liveFoldTarget: "group-09"

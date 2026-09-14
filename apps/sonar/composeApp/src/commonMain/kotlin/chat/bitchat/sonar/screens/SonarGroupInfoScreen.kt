@@ -64,7 +64,7 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     val s = sonar
     val chatId = screen.chatId
-    val chat = state.chats.firstOrNull { it.id == chatId }
+    val chat = state.listedChat(chatId)
     val groupName = chat?.let { state.chatTitle(it) } ?: "Group chat"
     val members = state.allGroupMemberContacts(chatId)
 

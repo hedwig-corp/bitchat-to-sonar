@@ -1736,7 +1736,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             isPrepending = { isPrepending || unreadAnchorPending() },
         )
     }
-    val currentChat = state.chats.firstOrNull { it.id == screen.id }
+    val currentChat = state.listedChat(screen.id)
     val isGroup = state.isMultiMemberChat(screen.id)
     val canManageGroup = state.canManageGroup(screen.id)
     // Hoisted out of the row loop: resolving it costs a bech32 decode per group

@@ -80,7 +80,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
         } else if (screen.chatId.startsWith("npub1")) {
             canonicalProfileKey(screen.chatId)
         } else {
-            val chat = state.chats.firstOrNull { it.id == screen.chatId }
+            val chat = state.listedChat(screen.chatId)
             val mine = canonicalProfileKey(state.npub)
             chat?.members
                 ?.map { canonicalProfileKey(it) }
@@ -208,7 +208,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                             return@ActionCircle
                         }
                         if (effectiveChatId != screen.chatId) {
-                            val dmChat = state.chats.firstOrNull { it.id == effectiveChatId }
+                            val dmChat = state.listedChat(effectiveChatId)
                             if (dmChat != null) state.openChat(dmChat)
                             else state.back()
                         } else {

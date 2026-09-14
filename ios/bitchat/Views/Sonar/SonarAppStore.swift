@@ -421,6 +421,74 @@ func snRemountFoldedOpenId(
     historicalKeys.contains(id) ? liveId : id
 }
 
+/// Remount a conversation id that may carry the `marmot:` prefix.
+func snRemountFoldedConversationId(
+    _ id: String,
+    listedGroupIds: Set<String>,
+    liveFoldTarget: String?,
+    prefix: String = "marmot:"
+) -> String {
+    let bare = snBareMarmotGroupId(id, prefix: prefix)
+    let remounted = snRemountFoldedOpenGroupId(
+        openGroupId: bare,
+        listedGroupIds: listedGroupIds,
+        liveFoldTarget: liveFoldTarget
+    )
+    guard remounted != bare else { return id }
+    if id.hasPrefix(prefix) { return prefix + remounted }
+    return remounted
+}
+
+/// Remount group-info / contact-profile / call / buried DM routes after
+/// FFI hides a folded 0.8 id.
+func snRemountFoldedPath(
+    path: [SonarRoute],
+    listedGroupIds: Set<String>,
+    liveFoldTarget: (String) -> String?,
+    prefix: String = "marmot:"
+) -> [SonarRoute] {
+    path.map { route in
+        switch route {
+        case .dm(let id):
+            return .dm(snRemountFoldedConversationId(
+                id,
+                listedGroupIds: listedGroupIds,
+                liveFoldTarget: liveFoldTarget(id),
+                prefix: prefix
+            ))
+        case .groupInfo(let id):
+            return .groupInfo(snRemountFoldedConversationId(
+                id,
+                listedGroupIds: listedGroupIds,
+                liveFoldTarget: liveFoldTarget(id),
+                prefix: prefix
+            ))
+        case .contactProfile(let id, let name):
+            return .contactProfile(
+                snRemountFoldedConversationId(
+                    id,
+                    listedGroupIds: listedGroupIds,
+                    liveFoldTarget: liveFoldTarget(id),
+                    prefix: prefix
+                ),
+                name
+            )
+        case .call(let id, let video):
+            return .call(
+                snRemountFoldedConversationId(
+                    id,
+                    listedGroupIds: listedGroupIds,
+                    liveFoldTarget: liveFoldTarget(id),
+                    prefix: prefix
+                ),
+                video: video
+            )
+        default:
+            return route
+        }
+    }
+}
+
 /// Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`.
 func snHistoricalFoldsFromAliases(
     listedIds: [String],
@@ -7880,11 +7948,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
-    /// transcript, swap the nav id to the live 0.9 sibling.
+    /// transcript — or in group-info / contact-profile / an in-flight call on
+    /// that id — swap the nav id to the live 0.9 sibling.
     @MainActor
     private func remountFoldedOpenChatIfNeeded() async {
-        guard let openId = currentDMId, let groupId = marmotGroupId(openId) else { return }
         let listed = Set(marmot.groups.map(\.id))
+        defer { remountFoldedNavigationPath(listedGroupIds: listed) }
+        guard let openId = currentDMId, let groupId = marmotGroupId(openId) else { return }
         let live = await marmot.liveFoldTarget(groupId: groupId)
         let remounted = snRemountFoldedOpenGroupId(
             openGroupId: groupId,
@@ -7981,6 +8051,23 @@ final class SonarAppStore: ObservableObject {
         markMarmotGroupsRead(matchingGroupId: remounted)
         syncViewingUnreadGroups()
         Task { await self.marmot.refreshWhenConnected(groupId: remounted, hydrateBeforeSync: false) }
+    }
+
+    /// Rewrite group-info / contact-profile / call / buried DM routes after
+    /// FFI hides a folded 0.8 id. Transcript remount still copies host state
+    /// when the open route is a DM.
+    private func remountFoldedNavigationPath(listedGroupIds: Set<String>) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let next = snRemountFoldedPath(
+            path: path,
+            listedGroupIds: listedGroupIds
+        ) { id in
+            let bare = snBareMarmotGroupId(id)
+            folds[bare]
+        }
+        if next != path {
+            path = next
+        }
     }
 
     /// Move in-flight send echoes off a hidden 0.8 conversation id.

@@ -527,9 +527,13 @@ sibling; `notificationOpenChat` supplies the stub row. iOS
 `snRemountFoldedOpenGroupId` is the same),
 `listedOrFoldedSiblingChat` is bidirectional: unlisted live inherits
 the still-listed 0.8 sibling; sitting on a hidden 0.8 id inherits the
-listed live sibling. Compose `listedChat` (peer/call/send-duplicate
-lookups) uses that so a hidden 0.8 id still finds the live DM peer —
-iOS `marmotGroup(byId:)` already remaps via `snListedOrFoldedSiblingGroupId`.
+listed live sibling. Compose `listedChat` (peer/call/send-duplicate /
+group-info / contact-profile / open-chat chrome) uses that so a hidden
+0.8 id still finds the live sibling — iOS `marmotGroup(byId:)` already
+remaps via `snListedOrFoldedSiblingGroupId`. Open-transcript remount
+also rewrites group-info / contact-profile / call nav ids
+(`remountFoldedNavStack` / `snRemountFoldedPath`) so those screens do
+not stay on a chat that `groups()` no longer lists.
 `notificationOpenChat` uses that, else a not-direct
 stub. `adoptedListedChatTitle` replaces a captured Compose
 `Screen.Chat.name` of "Group chat" once `chats()` lists the remapped

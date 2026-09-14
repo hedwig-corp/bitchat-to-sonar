@@ -612,6 +612,22 @@ class ConversationFoldTest {
             "npub1bob",
             directMarmotPeerKey(hiddenDm!!, "npub1me"),
         )
+        assertEquals(
+            listOf(
+                Screen.Chat("group-09", "standup"),
+                Screen.GroupInfo("group-09"),
+                Screen.ContactProfile("group-09", "Ada"),
+                Screen.Call("group-09", "Ada", false),
+            ),
+            remountFoldedNavStack(
+                listOf(
+                    Screen.Chat("group-08", "standup"),
+                    Screen.GroupInfo("group-08"),
+                    Screen.ContactProfile("group-08", "Ada"),
+                    Screen.Call("group-08", "Ada", false),
+                ),
+            ) { id -> if (id == "group-08") "group-09" else id },
+        )
         val stub = notificationOpenChat("group-09", emptyList())
         assertEquals("group-09", stub.id)
         assertEquals("", stub.name)
