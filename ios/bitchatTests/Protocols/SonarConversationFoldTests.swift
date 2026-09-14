@@ -1476,8 +1476,8 @@ struct SonarConversationFoldTests {
             openedConversationId: "marmot:group-08"
         ) == "marmot:group-08")
         #expect(snCurrentOpenConversationId(
-            pathDMId: "marmot:group-09",
-            openedConversationId: "marmot:group-08"
+            pathDMId: "marmot:group-08",
+            openedConversationId: "marmot:group-09"
         ) == "marmot:group-09")
         #expect(snCurrentOpenConversationId(
             pathDMId: nil,
@@ -1553,6 +1553,16 @@ struct SonarConversationFoldTests {
         ) == "marmot:other")
         #expect(snClosedDMShouldSkipFoldRemountHop(
             closingId: "marmot:group-08",
+            pathDMId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            routeReplacement: SNMarmotRouteReplacement(
+                pendingId: "marmot:group-08",
+                realId: "marmot:group-09"
+            )
+        ))
+        #expect(!snClosedDMShouldSkipFoldRemountHop(
+            closingId: "marmot:group-08",
+            pathDMId: "marmot:group-08",
             openedConversationId: "marmot:group-09",
             routeReplacement: SNMarmotRouteReplacement(
                 pendingId: "marmot:group-08",
@@ -1561,11 +1571,30 @@ struct SonarConversationFoldTests {
         ))
         #expect(!snClosedDMShouldSkipFoldRemountHop(
             closingId: "marmot:group-09",
+            pathDMId: "marmot:group-09",
             openedConversationId: "marmot:group-09",
             routeReplacement: SNMarmotRouteReplacement(
                 pendingId: "marmot:group-08",
                 realId: "marmot:group-09"
             )
+        ))
+        #expect(
+            snRemountFoldedPath(
+                path: [
+                    .dm("marmot:group-08"),
+                    .groupInfo("marmot:group-08"),
+                ],
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: { _ in "group-09" },
+                preserveIds: ["marmot:group-08"]
+            ) == [
+                .dm("marmot:group-08"),
+                .groupInfo("marmot:group-09"),
+            ]
+        )
+        #expect(snRemountShouldPreserveOpenTranscriptRoute(
+            routeId: "marmot:group-08",
+            preserveIds: ["group-08"]
         ))
         #expect(snClosedDMShouldClearOpened(
             closingId: "marmot:group-08",

@@ -711,6 +711,17 @@ internal fun remountFoldedOpenId(
     id: String,
 ): String = if (id in historicalKeys) liveId else id
 
+/** Painted iPhone DM route stays hist. Compose remounts [Screen.Chat.id]
+ *  and keeps viewport via [remountStableTranscriptSessionKey].
+ *  iOS `snRemountShouldPreserveOpenTranscriptRoute`. */
+internal fun remountShouldPreserveOpenTranscriptRoute(
+    routeId: String,
+    preserveIds: Set<String>,
+): Boolean {
+    if (routeId in preserveIds) return true
+    return preserveIds.any { openedConversationIdMatches(routeId, it) }
+}
+
 /** Remount group-info / contact-profile / call / buried chat routes after
  *  FFI hides a folded 0.8 id. Transcript remount still copies host state
  *  separately; this only rewrites nav ids. */
@@ -1893,10 +1904,13 @@ internal fun currentOpenConversationId(
     pathDMId: String?,
     openedConversationId: String?,
 ): String? {
-    val path = pathDMId?.trim().orEmpty()
-    if (path.isNotEmpty()) return path
+    // Remount writes opened to live while iPhone path may stay hist
+    // so NavigationStack does not remake the pane. Opened is the
+    // logical open. iOS `snCurrentOpenConversationId`.
     val opened = openedConversationId?.trim().orEmpty()
-    return opened.takeIf { it.isNotEmpty() }
+    if (opened.isNotEmpty()) return opened
+    val path = pathDMId?.trim().orEmpty()
+    return path.takeIf { it.isNotEmpty() }
 }
 
 /** Fold remount copies the scrolled window onto live, then a host

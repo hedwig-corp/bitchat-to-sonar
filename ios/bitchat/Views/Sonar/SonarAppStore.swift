@@ -515,17 +515,34 @@ func snRemountFoldedConversationId(
     return remounted
 }
 
+/// Painted iPhone DM route stays hist. Changing it remakes
+/// `NavigationStack` and snaps scroll. Group-info / call still hop.
+func snRemountShouldPreserveOpenTranscriptRoute(
+    routeId: String,
+    preserveIds: Set<String>
+) -> Bool {
+    if preserveIds.contains(routeId) { return true }
+    return preserveIds.contains { snOpenedConversationIdMatches(routeId, $0) }
+}
+
 /// Remount group-info / contact-profile / call / buried DM routes after
 /// FFI hides a folded 0.8 id.
 func snRemountFoldedPath(
     path: [SonarRoute],
     listedGroupIds: Set<String>,
     liveFoldTarget: (String) -> String?,
-    prefix: String = "marmot:"
+    prefix: String = "marmot:",
+    preserveIds: Set<String> = []
 ) -> [SonarRoute] {
     path.map { route in
         switch route {
         case .dm(let id):
+            if snRemountShouldPreserveOpenTranscriptRoute(
+                routeId: id,
+                preserveIds: preserveIds
+            ) {
+                return .dm(id)
+            }
             return .dm(snRemountFoldedConversationId(
                 id,
                 listedGroupIds: listedGroupIds,
@@ -1715,8 +1732,11 @@ func snCurrentOpenConversationId(
     pathDMId: String?,
     openedConversationId: String?
 ) -> String? {
-    if let pathDMId, !pathDMId.isEmpty { return pathDMId }
+    // Remount writes opened to live while iPhone path may stay hist
+    // so NavigationStack does not remake the pane. Opened is the
+    // logical open. Compose `currentOpenConversationId`.
     if let openedConversationId, !openedConversationId.isEmpty { return openedConversationId }
+    if let pathDMId, !pathDMId.isEmpty { return pathDMId }
     return nil
 }
 
@@ -1822,11 +1842,15 @@ func snMacConversationPaneIdentity(
 /// Skip `closedDM(hist)` so the hop does not clear currentDM.
 func snClosedDMShouldSkipFoldRemountHop(
     closingId: String,
+    pathDMId: String?,
     openedConversationId: String?,
     routeReplacement: SNMarmotRouteReplacement?
 ) -> Bool {
     guard let replacement = routeReplacement else { return false }
+    // Only the hist disappear caused by a path hop onto live. A user
+    // leave while the painted route is still hist must still close.
     return snOpenedConversationIdMatches(closingId, replacement.pendingId)
+        && snOpenedConversationIdMatches(pathDMId, replacement.realId)
         && snOpenedConversationIdMatches(openedConversationId, replacement.realId)
 }
 
@@ -10406,10 +10430,12 @@ final class SonarAppStore: ObservableObject {
     private func remountFoldedOpenChatIfNeeded() async {
         let listed = Set(marmot.groups.map(\.id))
         var knownLiveTargets: [String: String] = [:]
+        var preserveOpenTranscriptIds: Set<String> = []
         defer {
             remountFoldedNavigationPath(
                 listedGroupIds: listed,
-                knownLiveTargets: knownLiveTargets
+                knownLiveTargets: knownLiveTargets,
+                preserveIds: preserveOpenTranscriptIds
             )
             syncViewingUnreadGroups()
         }
@@ -10523,25 +10549,27 @@ final class SonarAppStore: ObservableObject {
             marmotVerified[remounted] = true
             defaults.set(marmotVerified, forKey: Keys.marmotVerified)
         }
-        if case .dm(let id) = path.last, id == openId {
-            path.removeLast()
-            path.append(.dm(realId))
-        }
+        preserveOpenTranscriptIds = Set(
+            [openId, groupId, openedConversationPaneId].compactMap { $0 }.filter { !$0.isEmpty }
+        )
         openedConversationId = realId
-        // Keep `openedConversationPaneId` on hist until Mac selection /
-        // iPhone onAppear hops to live. Same publish as pending→real.
+        // Keep `openedConversationPaneId` on hist. iPhone NavigationStack
+        // stays on `.dm(hist)` so the painted pane is not remade. Mac hops
+        // selection to live while `.id` stays hist. Same publish as
+        // pending→real for attachment-import preserve.
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(
             pendingId: openId,
             realId: realId
         )
         // Do not call `openedDM` here: it hydrates the live id as a fresh
         // open (`loadLocalWhenConnected` newest-page) and would snap a
-        // scrolled recovered transcript back to the tail. The chat is
-        // already painted; keep it open on the live sibling. SwiftUI
-        // `onAppear` after the path/selection swap still calls `openedDM`
-        // — skip hydrate via `suppressOpenedDMHydrateIds`.
+        // scrolled recovered transcript back to the tail.
+        // iPhone keeps the hist pane/CVS active. Mac hops selection onto
+        // live, so hist can deactivate.
+        #if !os(iOS)
         conversationViewStates[openId]?.deactivate()
         conversationViewStates[groupId]?.deactivate()
+        #endif
         conversationViewStates[realId]?.activate()
         rememberMarmotGroup(remounted, forConversationId: realId)
         markMarmotGroupsRead(matchingGroupId: remounted)
@@ -10560,19 +10588,22 @@ final class SonarAppStore: ObservableObject {
     /// when the open route is a DM.
     private func remountFoldedNavigationPath(
         listedGroupIds: Set<String>,
-        knownLiveTargets: [String: String] = [:]
+        knownLiveTargets: [String: String] = [:],
+        preserveIds: Set<String> = []
     ) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let next = snRemountFoldedPath(
             path: path,
-            listedGroupIds: listedGroupIds
-        ) { id in
-            snPathRemountLiveTarget(
-                id: id,
-                persistedFolds: folds,
-                knownLiveTargets: knownLiveTargets
-            )
-        }
+            listedGroupIds: listedGroupIds,
+            liveFoldTarget: { id in
+                snPathRemountLiveTarget(
+                    id: id,
+                    persistedFolds: folds,
+                    knownLiveTargets: knownLiveTargets
+                )
+            },
+            preserveIds: preserveIds
+        )
         if next != path {
             path = next
         }
@@ -12735,8 +12766,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
+        let pathDMId: String?
+        if case .dm(let pathId) = path.last { pathDMId = pathId } else { pathDMId = nil }
         if snClosedDMShouldSkipFoldRemountHop(
             closingId: id,
+            pathDMId: pathDMId,
             openedConversationId: openedConversationId,
             routeReplacement: pendingMarmotRouteReplacement
         ) {

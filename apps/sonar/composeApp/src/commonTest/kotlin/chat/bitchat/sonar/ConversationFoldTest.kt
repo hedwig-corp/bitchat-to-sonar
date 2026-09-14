@@ -1171,8 +1171,8 @@ class ConversationFoldTest {
         assertEquals(
             "marmot:group-09",
             currentOpenConversationId(
-                pathDMId = "marmot:group-09",
-                openedConversationId = "marmot:group-08",
+                pathDMId = "marmot:group-08",
+                openedConversationId = "marmot:group-09",
             ),
         )
         assertNull(currentOpenConversationId(pathDMId = null, openedConversationId = null))
@@ -1244,6 +1244,22 @@ class ConversationFoldTest {
                 historicalKeys = listOf("marmot:group-08", "group-08"),
                 liveKeys = listOf("marmot:group-09", "group-09"),
                 hydrating = setOf("marmot:group-08", "other"),
+            ),
+        )
+    }
+
+    @Test
+    fun remountShouldPreserveOpenTranscriptRouteKeepsPaintedDm() {
+        assertTrue(
+            remountShouldPreserveOpenTranscriptRoute(
+                routeId = "marmot:group-08",
+                preserveIds = setOf("group-08"),
+            ),
+        )
+        assertFalse(
+            remountShouldPreserveOpenTranscriptRoute(
+                routeId = "marmot:other",
+                preserveIds = setOf("group-08"),
             ),
         )
     }
