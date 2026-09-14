@@ -2398,3 +2398,73 @@ async fn persist_folds_lost_core_sidecar_delete_live_purges_hist_from_index() {
         "deleted room must not reappear on the next home-list paint"
     );
 }
+
+/// A recovered DM already bound to live A must stay there when a second
+/// 0.9 group with the same peer is created after the JSON sidecar is lost.
+/// `maybe_fold_new_group` used to miss `is_folded_historical_group` and
+/// `record_historical_fold` overwrote the bind — history vanished from A.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_second_dm_does_not_steal_hist() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, _) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "resume hello")
+        .await
+        .expect("resume send");
+    let live_a = alice.groups().expect("live A")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live_a)
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+
+    let live_b = alice
+        .start_group(vec![bob.identity().public_key()], "stolen")
+        .await
+        .expect("second 0.9 group with the same peer");
+    assert_ne!(live_b, live_a, "start_group must mint a distinct id");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live_a),
+        "second create must not steal hist onto the new MLS id"
+    );
+    let on_a = alice.messages(&live_a).expect("live A family");
+    assert!(
+        on_a.iter().any(|m| m.content == "keep this chat"),
+        "recovered 0.8 transcript must stay on the first live sibling"
+    );
+    let on_b = alice
+        .engine()
+        .messages(&live_b)
+        .expect("live B engine-only");
+    assert!(
+        on_b.iter().all(|m| m.content != "keep this chat"),
+        "engine messages(B) must not union hist after a steal"
+    );
+}

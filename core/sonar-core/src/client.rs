@@ -7266,6 +7266,11 @@ impl SonarClient {
     }
 
     fn maybe_fold_new_group(&self, live_id: &GroupId) {
+        // Incoming GroupUpdated / local create can land before summaries.
+        // Restore recorded binds so `is_folded_historical_group` still
+        // skips hist after a lost JSON sidecar — otherwise a second 0.9
+        // DM with the same peer steals history onto the new MLS id.
+        self.restore_recorded_folds_from_index();
         let Ok(live_members) = self.engine.members(live_id) else {
             return;
         };
