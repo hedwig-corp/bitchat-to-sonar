@@ -188,6 +188,20 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == ["group-08"]
         )
+        let historicalMark = SNScanMark(secs: 50, count: 12)
+        let promotedMarks = snPromotedFoldedScanMarks(
+            previousGroupIds: ["group-08", "group-09"],
+            currentGroupIds: ["group-09"],
+            watermarks: ["group-08": historicalMark],
+            liveFoldTarget: { $0 == "group-08" ? "group-09" : nil }
+        )
+        #expect(promotedMarks["group-09"] == historicalMark)
+        #expect(
+            snChatsNeedingMessageScan(
+                latestByChat: ["group-09": historicalMark],
+                scannedWatermark: promotedMarks
+            ).isEmpty
+        )
         #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")
         #expect(snRecoveredChatNeedsPeerUpdate(hasLiveFoldSibling: false, keyPackageMissing: true))

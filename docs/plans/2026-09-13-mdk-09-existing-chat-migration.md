@@ -195,6 +195,7 @@ Guarded by:
 - `ConversationFoldTest.foldedHistoricalCallLogsMoveOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalVerifiedMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotChatDropsOnceLiveSiblingIsListed`
+- `ConversationFoldTest.foldedHistoricalScanWatermarkMovesOntoLiveSibling`
 - `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
   (also pins `live_fold_target_hex` after the home-list hide)

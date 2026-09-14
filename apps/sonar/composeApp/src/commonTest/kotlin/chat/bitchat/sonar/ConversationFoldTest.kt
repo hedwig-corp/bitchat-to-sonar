@@ -682,6 +682,58 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalScanWatermarkMovesOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val historical = ScanMark(secs = 50L, count = 12L)
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to historical),
+            promotedFoldedScanMarks(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                watermarks = mapOf("group-08" to historical),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf(
+                "group-08" to historical,
+                "group-09" to ScanMark(secs = 80L, count = 2L),
+            ),
+            promotedFoldedScanMarks(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                watermarks = mapOf(
+                    "group-08" to historical,
+                    "group-09" to ScanMark(secs = 80L, count = 2L),
+                ),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        val promoted = promotedFoldedScanMarks(
+            previousIds = setOf("group-08"),
+            currentIds = setOf("group-09"),
+            watermarks = mapOf("group-08" to historical),
+            liveFoldTarget = folds::get,
+        )
+        assertEquals(
+            emptySet(),
+            chatsNeedingPageScan(
+                latestByChat = mapOf("group-09" to historical),
+                scannedWatermark = promoted,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to setOf("evt-1"), "group-09" to setOf("evt-1", "evt-2")),
+            promotedFoldedSeenMessageIds(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                seenByChat = mapOf("group-08" to setOf("evt-1"), "group-09" to setOf("evt-2")),
+                liveFoldTarget = folds::get,
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalSnapshotChatDropsOnceLiveSiblingIsListed() {
         val historical = SonarChat(id = "group-08", name = "room", members = listOf("npub1a"), isDirect = false)
         val live = SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false)

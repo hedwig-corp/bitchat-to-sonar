@@ -654,6 +654,42 @@ internal fun collapsedFoldedSnapshotChats(
     }
 }
 
+/** Keep call/pay/notification watermarks on the live sibling after FFI hide. */
+internal fun promotedFoldedScanMarks(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    watermarks: Map<String, ScanMark>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, ScanMark> {
+    var next = watermarks
+    for (historical in previousIds + watermarks.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = watermarks[historical] ?: continue
+        next = next + (live to maxScanMark(next[live], incoming))
+    }
+    return next
+}
+
+/** Keep notification seen-ids on the live sibling so recovered history is not re-bannered. */
+internal fun promotedFoldedSeenMessageIds(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    seenByChat: Map<String, Set<String>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, Set<String>> {
+    var next = seenByChat
+    for (historical in previousIds + seenByChat.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = seenByChat[historical] ?: continue
+        next = next + (live to next[live].orEmpty() + incoming)
+    }
+    return next
+}
+
 internal enum class RecoveredChatResumeUi { Live, WaitingForPeerUpdate }
 
 internal fun recoveredChatResumeUi(
@@ -785,6 +821,15 @@ internal fun isMeshAliasGroupBlocked(
  *  the last scanned one (common for ⚡PAY PAY/DONE pairs or a call control sent
  *  right after a text) leaves `secs` unchanged — the count catches it. */
 internal data class ScanMark(val secs: Long, val count: Long)
+
+internal fun maxScanMark(left: ScanMark?, right: ScanMark): ScanMark {
+    val existing = left ?: return right
+    return when {
+        right.secs > existing.secs -> right
+        right.secs < existing.secs -> existing
+        else -> ScanMark(existing.secs, maxOf(existing.count, right.count))
+    }
+}
 
 /** Per-chat probe used to decide, from the single `conversationSummaries()` FFI
  *  call, which chats actually gained a newer message since the last scan. Only
@@ -12250,6 +12295,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         promoteFoldedComposerState(previousOrder.toSet(), listedIds)
         promoteFoldedCallLogs(previousOrder.toSet(), listedIds)
         promoteFoldedVerified(previousOrder.toSet(), listedIds)
+        promoteFoldedScanState(previousOrder.toSet(), listedIds)
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12302,6 +12348,45 @@ class SonarAppState(private val scope: CoroutineScope) {
             for ((id, reply) in nextReplies) {
                 composerReplyByChat[id] = reply
             }
+        }
+    }
+
+    private fun promoteFoldedScanState(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String ->
+            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
+        }
+        val nextMarks = promotedFoldedScanMarks(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            watermarks = scanWatermark.toMap(),
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextMarks != scanWatermark) {
+            scanWatermark.clear()
+            scanWatermark.putAll(nextMarks)
+        }
+        val nextLatest = promotedFoldedValues(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            values = notificationLatestSecs.toMap(),
+            liveFoldTarget = liveFoldTarget,
+            preferExisting = { false },
+        ).mapValues { (id, incoming) ->
+            maxOf(notificationLatestSecs[id] ?: incoming, incoming)
+        }
+        if (nextLatest != notificationLatestSecs) {
+            notificationLatestSecs.clear()
+            notificationLatestSecs.putAll(nextLatest)
+        }
+        val nextSeen = promotedFoldedSeenMessageIds(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            seenByChat = notificationSeenMessageIds.mapValues { it.value.toSet() },
+            liveFoldTarget = liveFoldTarget,
+        )
+        for ((id, ids) in nextSeen) {
+            val seen = notificationSeenMessageIds.getOrPut(id) { LinkedHashSet() }
+            seen.addAll(ids)
         }
     }
 

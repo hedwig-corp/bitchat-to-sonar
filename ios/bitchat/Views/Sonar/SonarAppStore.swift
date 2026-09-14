@@ -1097,6 +1097,36 @@ struct SNScanMark: Equatable, Hashable {
     static let unseen = SNScanMark(secs: Int64.min, count: Int64.min)
 }
 
+func snMaxScanMark(_ left: SNScanMark, _ right: SNScanMark) -> SNScanMark {
+    if right.secs != left.secs { return right.secs > left.secs ? right : left }
+    return SNScanMark(secs: left.secs, count: max(left.count, right.count))
+}
+
+/// Keep call/pay/notification watermarks on the live sibling after FFI hide.
+func snPromotedFoldedScanMarks(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    watermarks: [String: SNScanMark],
+    liveFoldTarget: (String) -> String?
+) -> [String: SNScanMark] {
+    var next = watermarks
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(watermarks.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let incoming = watermarks[pair.historical] else { continue }
+        if let existing = next[pair.live] {
+            next[pair.live] = snMaxScanMark(existing, incoming)
+        } else {
+            next[pair.live] = incoming
+        }
+    }
+    return next
+}
+
 func snChatsNeedingMessageScan(
     latestByChat: [String: SNScanMark],
     scannedWatermark: [String: SNScanMark],
@@ -2370,6 +2400,7 @@ final class SonarAppStore: ObservableObject {
                     await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedVerified(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedScanWatermarks(from: self.lastMarmotGroupIds, to: current)
                     await self.rememberHistoricalFolds(from: self.lastMarmotGroupIds, to: current)
                     self.lastMarmotGroupIds = current
                     await self.remountFoldedOpenChatIfNeeded()
@@ -7310,6 +7341,29 @@ final class SonarAppStore: ObservableObject {
             defaults.set(marmotVerified, forKey: Keys.marmotVerified)
             invalidateHomeDMRows()
             objectWillChange.send()
+        }
+    }
+
+    /// Keep call/pay/notification watermarks on the live sibling after FFI hide.
+    @MainActor
+    private func promoteFoldedScanWatermarks(from previous: Set<String>, to current: Set<String>) async {
+        var extra = Set(marmotMessageScanWatermark.keys)
+        extra.formUnion(previous)
+        extra.subtract(current)
+        var targets: [String: String] = [:]
+        for historical in extra {
+            if let live = await marmot.liveFoldTarget(groupId: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedScanMarks(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            watermarks: marmotMessageScanWatermark,
+            liveFoldTarget: { targets[$0] }
+        )
+        if next != marmotMessageScanWatermark {
+            marmotMessageScanWatermark = next
         }
     }
 
