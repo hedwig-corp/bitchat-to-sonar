@@ -928,6 +928,29 @@ class ConversationFoldTest {
                 setOf("group-08", "group-09"),
             ),
         )
+        assertTrue(
+            shouldPageHiddenFoldFamilyForOpenLive(
+                "mesh:peer",
+                folds,
+                setOf("group-09"),
+                listOf("group-09"),
+            ),
+        )
+        assertFalse(
+            shouldPageHiddenFoldFamilyForOpenLive(
+                "mesh:peer",
+                folds,
+                setOf("group-08", "group-09"),
+                listOf("group-09"),
+            ),
+        )
+        assertFalse(
+            shouldPageHiddenFoldFamilyForOpenLive(
+                "mesh:peer",
+                folds,
+                setOf("group-09"),
+            ),
+        )
         assertTrue(loadOlderEmptyPaintShouldPublishFamily(paintedCount = 0, familyRowCount = 30))
         assertFalse(loadOlderEmptyPaintShouldPublishFamily(paintedCount = 0, familyRowCount = 0))
         assertFalse(loadOlderEmptyPaintShouldPublishFamily(paintedCount = 5, familyRowCount = 30))

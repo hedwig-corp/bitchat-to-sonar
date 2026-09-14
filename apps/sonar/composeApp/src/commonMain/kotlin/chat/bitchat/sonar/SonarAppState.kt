@@ -964,12 +964,18 @@ internal fun foldFamilySourceNeedsNewestPage(
 
 /** Already sitting on listed live: remountFoldedOpenChatId is a no-op.
  *  Still newest-page hist so an empty 0.9 room is not stuck on “Say hi”.
- *  iOS `pageUnpagedHiddenFoldFamily`. */
+ *  A mesh route id (`mesh:<peer>`) is not a fold-family key — pass
+ *  [familySourceIds] from `transcriptGroupIds` / `meshFoldTranscriptSourceIds`.
+ *  iOS `pageUnpagedHiddenFoldFamily` resolves `marmotGroupId` first. */
 internal fun shouldPageHiddenFoldFamilyForOpenLive(
     openChatId: String,
     historicalFolds: Map<String, String>,
     pagedGroupIds: Set<String>,
-): Boolean = hiddenFoldFamilyNeedsPage(openChatId, historicalFolds, pagedGroupIds)
+    familySourceIds: Collection<String> = emptyList(),
+): Boolean = (listOf(openChatId) + familySourceIds)
+    .filter { it.isNotBlank() }
+    .distinct()
+    .any { hiddenFoldFamilyNeedsPage(it, historicalFolds, pagedGroupIds) }
 
 /** Load-older pages missing family windows first, then used to bail when
  *  the painted feed was empty — empty live rooms never mount that list.
@@ -14192,16 +14198,19 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  the hidden sibling — iOS `pageUnpagedHiddenFoldFamily`. */
     private fun pageHiddenFoldFamilyForOpenLiveChat() {
         val sc = screen as? Screen.Chat ?: return
-        if (isMeshChat(sc.id)) return
+        val familyIds = transcriptGroupIds(sc.id)
         if (!shouldPageHiddenFoldFamilyForOpenLive(
                 sc.id,
                 historicalFoldMap,
                 transcriptWindows.keys,
+                familyIds,
             )
         ) return
         val chatId = sc.id
         scope.launch {
-            val merged = marmotMessagesPageForChat(chatId)
+            // Mesh route ids are not Marmot group ids — use the same
+            // family merge as openDm (`localTranscriptRowsForChat`).
+            val merged = localTranscriptRowsForChat(chatId, transcriptGeneration)
             if (chatId !in transcriptSessionChatIds() ||
                 (screen as? Screen.Chat)?.id !in transcriptSessionChatIds()
             ) return@launch

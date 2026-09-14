@@ -1126,6 +1126,17 @@ recovered history. Take `max(tsSecs)` and `latestByChat`. iOS
 Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
 `SonarConversationFoldTests` `snLocalLatestTsForChat`.
 
+Compose already-open mesh-folded remount hole closed after this commit:
+`pageHiddenFoldFamilyForOpenLiveChat` returned on `isMeshChat`. A
+`mesh:<peer>` route is not a fold-family key and cannot be handed to
+`marmotMessagesPageForChat`. Sitting in that DM while persist-folds
+landed skipped hist, so an empty mesh+0.9 paint stayed on “Say hi”.
+Gate on `transcriptGroupIds` / `meshFoldTranscriptSourceIds` and page
+through `localTranscriptRowsForChat` (iOS `marmotGroupId` then
+`pageUnpagedHiddenFoldFamily`). Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`
+(`shouldPageHiddenFoldFamilyForOpenLive` mesh family ids).
+
 Compose already-open live remount hole closed after this commit:
 `remountFoldedOpenChat` only swapped nav when the open id was hist.
 Sitting on an empty listed 0.9 room skipped the hidden sibling page,
