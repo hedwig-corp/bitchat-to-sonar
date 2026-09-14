@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::marmot::MarmotEngine;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 pub struct ConversationIndex {
     db: Connection,
@@ -196,6 +196,21 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index add version column: {e}")))?;
         }
 
+        if current < 3 {
+            // Durable hist→live binds. The JSON fold sidecar can vanish while
+            // this SQLCipher file stays put. Restore only recorded pairs —
+            // do not infer a bind from members/name (R-045).
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS historical_fold (
+                    historical_hex TEXT PRIMARY KEY,
+                    live_hex TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_historical_fold_live
+                    ON historical_fold(live_hex);",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index create historical_fold: {e}")))?;
+        }
+
         tx.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
             params![SCHEMA_VERSION],
@@ -372,6 +387,57 @@ impl ConversationIndex {
                 params![group_id_hex],
             )
             .map_err(|e| crate::Error::Storage(format!("index remove: {e}")))?;
+        self.forget_folds_for(group_id_hex)
+    }
+
+    /// Persist a hist→live resume bind that `record_historical_fold` already
+    /// accepted. Lost JSON sidecars rebuild from this table; they must not
+    /// invent a pair from overlapping members.
+    pub fn record_fold(&self, historical_hex: &str, live_hex: &str) -> Result<()> {
+        if historical_hex == live_hex || historical_hex.is_empty() || live_hex.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .execute(
+                "INSERT INTO historical_fold (historical_hex, live_hex)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(historical_hex) DO UPDATE SET live_hex = excluded.live_hex",
+                params![historical_hex, live_hex],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index record_fold: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_folds(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT historical_hex, live_hex FROM historical_fold")
+            .map_err(|e| crate::Error::Storage(format!("index list_folds prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| crate::Error::Storage(format!("index list_folds query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index list_folds row: {e}")))
+    }
+
+    pub fn forget_folds_for(&self, group_id_hex: &str) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM historical_fold
+                 WHERE historical_hex = ?1 OR live_hex = ?1",
+                params![group_id_hex],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index forget_folds: {e}")))?;
+        Ok(())
+    }
+
+    /// Drop every recorded bind. Tests pair this with
+    /// [`crate::marmot::MarmotEngine::clear_historical_folds`] to isolate the
+    /// topic-match heal from index restore. Production hosts must not call it.
+    pub fn clear_folds(&self) -> Result<()> {
+        self.db
+            .execute("DELETE FROM historical_fold", [])
+            .map_err(|e| crate::Error::Storage(format!("index clear_folds: {e}")))?;
         Ok(())
     }
 
@@ -821,7 +887,7 @@ mod tests {
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
 
-        // Reopen: schema_version is now 2, migration is a no-op.
+        // Reopen: schema_version is now SCHEMA_VERSION, migration is a no-op.
         drop(idx);
         let idx = ConversationIndex::open(&path, key).expect("reopen must not fail");
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
@@ -859,5 +925,78 @@ mod tests {
         // They are still messages: count, ordering and preview are untouched.
         assert_eq!(s.message_count, 3);
         assert_eq!(s.latest_at_secs, 300);
+    }
+
+    #[test]
+    fn record_fold_roundtrips_and_remove_group_forgets_bind() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
+
+        idx.record_fold("hist", "live2").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live2".into())],
+            "same historical id must replace the live sibling"
+        );
+
+        idx.remove_group("live2").unwrap();
+        assert!(
+            idx.list_folds().unwrap().is_empty(),
+            "leave/delete of either id must drop the recorded bind"
+        );
+    }
+
+    #[test]
+    fn clear_folds_drops_recorded_binds_only() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("hist", "room", "hi", "bob", 100, false, true)
+            .unwrap();
+        idx.record_fold("hist", "live").unwrap();
+        idx.clear_folds().unwrap();
+        assert!(idx.list_folds().unwrap().is_empty());
+        assert!(
+            idx.summary("hist").unwrap().is_some(),
+            "clear_folds must not wipe conversation summaries"
+        );
+    }
+
+    #[test]
+    fn migrates_v2_schema_adding_historical_fold_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x33u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex    TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL DEFAULT '',
+                    latest_content  TEXT NOT NULL DEFAULT '',
+                    latest_sender   TEXT NOT NULL DEFAULT '',
+                    latest_at_secs  INTEGER NOT NULL DEFAULT 0,
+                    latest_mine     INTEGER NOT NULL DEFAULT 0,
+                    message_count   INTEGER NOT NULL DEFAULT 0,
+                    unread_count    INTEGER NOT NULL DEFAULT 0,
+                    version         INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO schema_version(version) VALUES (2);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("v2 must migrate");
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
     }
 }

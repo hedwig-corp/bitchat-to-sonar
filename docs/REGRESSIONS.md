@@ -2677,7 +2677,7 @@ invited; the room name disappears; sends land in the wrong chat.
 
 **Guarded by:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm`
 
-**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `persistence.rs::mdk08_named_room_with_one_known_peer_is_not_direct`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `mdk08_migrate.rs::named_joined_room_description_is_copied`, `mdk08_migrate.rs::processed_welcome_member_count_survives_extract`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `ConversationFoldTest.startupSnapshotRewriteDoesNotStampInventedIsDirect`, `ConversationFoldTest.modernSnapshotDoesNotNeedStartupRewrite`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`
+**Also guarded by:** `persistence.rs::mdk08_pending_welcome_is_listed_for_resume`, `persistence.rs::mdk08_named_room_with_one_known_peer_is_not_direct`, `mdk08_migrate.rs::pending_welcome_is_kept_for_resume`, `mdk08_migrate.rs::named_joined_room_description_is_copied`, `mdk08_migrate.rs::processed_welcome_member_count_survives_extract`, `e2e.rs::recovered_08_group_resumes_with_whichever_peers_have_updated`, `ConversationFoldTest.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `ConversationFoldTest.chatSnapshotPreservesRecoveredRoomIsDirect`, `ConversationFoldTest.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `ConversationFoldTest.startupSnapshotRewriteDoesNotStampInventedIsDirect`, `ConversationFoldTest.modernSnapshotDoesNotNeedStartupRewrite`, `MarmotProfileCacheTests.recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect`, `MarmotProfileCacheTests.chatSnapshotPreservesRecoveredRoomIsDirect`, `MarmotProfileCacheTests.legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect`, `e2e.rs::persist_folds_lost_core_sidecar_refolds_empty_desc_room_from_index`, `e2e.rs::persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscriptions`, `client.rs::incoming_09_named_pair_welcome_does_not_fold_three_member_room`
 
 **Not guarded:** a real 0.8 device upgrade with a pending White Noise room. Host chat-list rendering still needs a constructible store (the helper pins are the R-001 shape).
 
@@ -2705,6 +2705,14 @@ or empty name+description).
 - *Using `members.count > 2` on hosts for notifications or contact-profile
   1:1 resolution.* A pending room lists only the welcomer after extract, so
   count-based checks still treat it as a DM. `is_direct` is the signal.
+- *Re-folding a unique subset + name when the live description is empty,
+  or treating “local user is founder/admin” as enough.* Incoming
+  `create_group("standup")` has an empty description, and a later local
+  2-person create of the same name still makes the user founder. Either
+  signal absorbs a recovered 3-person standup (the
+  `incoming_09_named_pair_welcome_does_not_fold_three_member_room` pin).
+  Empty-desc lost-sidecar heals restore only binds already recorded in
+  the conversation index at mint time.
 
 ## Unguarded
 

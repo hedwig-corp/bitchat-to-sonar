@@ -1965,6 +1965,11 @@ impl SonarClient {
         client.handle_state_path = Some(handle_path);
         client.marmot_db_path = Some(db_path.to_path_buf());
         client.materialize_index_if_empty();
+        // JSON folds → index (existing installs). Index folds → JSON
+        // (lost sidecar). Do this at connect so first paint does not wait
+        // on ensure_subscriptions.
+        client.persist_engine_folds_into_index();
+        client.restore_recorded_folds_from_index();
         Ok(client)
     }
 
@@ -7188,8 +7193,11 @@ impl SonarClient {
         // Host persist-folds remounts hist onto live before (or after)
         // core `fold_aliases` exist. Rebuild matching binds first so
         // leftover 0.8 members are invited without a send on the hidden
-        // hist id. `maybe_fold_new_group` still refuses R-045 (room onto
-        // a 1:1).
+        // hist id. Prefer previously recorded index binds (empty-desc
+        // rooms included). Topic-match is the fallback when the index
+        // never stored the pair. `maybe_fold_new_group` still refuses
+        // R-045 (room onto a 1:1 / incoming named pair).
+        self.restore_recorded_folds_from_index();
         self.maybe_fold_live_groups();
         for live in self.engine.live_resume_targets() {
             self.maybe_add_late_resume_members(&live).await;
@@ -7431,6 +7439,75 @@ impl SonarClient {
             if let Err(e) = idx.lock().unwrap().ensure_group(&live_hex, &name) {
                 tracing::warn!(%e, "index fold ensure_group failed");
             }
+        }
+        if let Err(e) = idx.lock().unwrap().record_fold(&hist_hex, &live_hex) {
+            tracing::warn!(%e, "index fold record failed");
+        }
+    }
+
+    fn persist_engine_folds_into_index(&self) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let idx = idx.lock().unwrap();
+        for (historical, live) in self.engine.historical_fold_pairs() {
+            let hist_hex = hex::encode(historical.as_slice());
+            let live_hex = hex::encode(live.as_slice());
+            if let Err(e) = idx.record_fold(&hist_hex, &live_hex) {
+                tracing::warn!(%e, "index fold backfill failed");
+            }
+        }
+    }
+
+    fn restore_recorded_folds_from_index(&self) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let Ok(pairs) = idx.lock().unwrap().list_folds() else {
+            return;
+        };
+        let mut stale = Vec::new();
+        for (hist_hex, live_hex) in pairs {
+            let Some(historical) = decode_group_id_hex(&hist_hex) else {
+                stale.push(hist_hex);
+                continue;
+            };
+            let Some(live) = decode_group_id_hex(&live_hex) else {
+                stale.push(hist_hex);
+                continue;
+            };
+            if self.engine.is_dropped(&historical) || self.engine.is_dropped(&live) {
+                stale.push(hist_hex);
+                continue;
+            }
+            if !self.engine.is_live_group(&live).unwrap_or(false) {
+                continue;
+            }
+            if self.engine.live_fold_target(&historical).is_some() {
+                continue;
+            }
+            self.engine.record_historical_fold(&historical, &live);
+            self.notify_fold_aliases(&historical);
+        }
+        if !stale.is_empty() {
+            let idx = idx.lock().unwrap();
+            for hist_hex in stale {
+                if let Err(e) = idx.forget_folds_for(&hist_hex) {
+                    tracing::warn!(%e, "index stale fold forget failed");
+                }
+            }
+        }
+    }
+
+    /// Drop index-recorded hist→live binds. Tests pair this with
+    /// [`MarmotEngine::clear_historical_folds`] so `maybe_fold_new_group`
+    /// topic-match stays the only heal. Production hosts must not call it.
+    pub fn clear_index_historical_folds(&self) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        if let Err(e) = idx.lock().unwrap().clear_folds() {
+            tracing::warn!(%e, "index fold clear failed");
         }
     }
 
@@ -8465,6 +8542,10 @@ pub(crate) fn index_preview(message: &ChatMessage) -> String {
 /// ordinary chat text allocation-free; only brace-prefixed text pays the
 /// parse check. The transcript bubble still renders the full raw text; this
 /// only guards the preview/banner copy.
+fn decode_group_id_hex(hex_id: &str) -> Option<GroupId> {
+    hex::decode(hex_id).ok().map(GroupId::new)
+}
+
 fn looks_like_json_payload(content: &str) -> bool {
     let trimmed = content.trim_start();
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {

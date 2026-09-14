@@ -1540,6 +1540,16 @@ fn write_mdk08_alice_bob_carol_store(
     bob: PublicKey,
     carol: PublicKey,
 ) -> GroupId {
+    write_mdk08_alice_bob_carol_store_with_topic(path, bob, carol, "alice bob carol", "field notes")
+}
+
+fn write_mdk08_alice_bob_carol_store_with_topic(
+    path: &std::path::Path,
+    bob: PublicKey,
+    carol: PublicKey,
+    name: &str,
+    description: &str,
+) -> GroupId {
     let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
     let hex_key = MDK08_DB_KEY
         .iter()
@@ -1572,8 +1582,8 @@ fn write_mdk08_alice_bob_carol_store(
     let group_bytes = vec![0x33u8; 16];
     conn.execute(
         "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
-         VALUES (?1, ?2, 'alice bob carol', 'field notes')",
-        rusqlite::params![group_bytes.clone(), vec![0x44u8; 32]],
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![group_bytes.clone(), vec![0x44u8; 32], name, description,],
     )
     .expect("group row");
     for (seed, peer, body, created_at) in [
@@ -2000,6 +2010,7 @@ async fn persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscrip
     );
 
     alice.engine().clear_historical_folds();
+    alice.clear_index_historical_folds();
     assert!(
         alice.engine().live_fold_target(&historical).is_none(),
         "lost core sidecar: host persist-folds remounts without fold_aliases"
@@ -2034,5 +2045,84 @@ async fn persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscrip
     assert!(
         painted.contains(&carol.identity().public_key()),
         "FFI groups() must list leftover carol after the bind is rebuilt"
+    );
+}
+
+/// Empty-description 0.8 rooms cannot use the topic-match heal (incoming
+/// `create_group` also has an empty desc — R-045). After a lost JSON
+/// sidecar, `ensure_subscriptions` must restore the bind recorded in the
+/// conversation index at mint time.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_refolds_empty_desc_room_from_index() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live)
+    );
+    assert!(
+        alice
+            .groups()
+            .expect("live")
+            .iter()
+            .any(|g| g.id == live && g.description.is_empty()),
+        "empty 0.8 topic must stay empty on the minted live room"
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+
+    carol.publish_key_package().await.expect("carol updates");
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("idle reconcile restores the index bind");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "empty-desc rooms must re-fold from the index, not from topic match"
+    );
+    let members = alice.members(&live).expect("members after index restore");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "restored bind must invite leftover 0.8 members without a hist send"
     );
 }

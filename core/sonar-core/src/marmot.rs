@@ -1580,6 +1580,21 @@ impl MarmotEngine {
         })
     }
 
+    /// Recorded hist→live pairs (JSON sidecar). Used to backfill the
+    /// conversation-index fold table after upgrade.
+    pub fn historical_fold_pairs(&self) -> Vec<(GroupId, GroupId)> {
+        let folds = self
+            .historical_folds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pairs: Vec<(GroupId, GroupId)> = folds
+            .iter()
+            .map(|(historical, live)| (historical.clone(), live.clone()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+        pairs
+    }
+
     /// Live 0.9 groups that carry a recovered 0.8 fold sibling.
     pub fn live_resume_targets(&self) -> Vec<GroupId> {
         let folds = self

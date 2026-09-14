@@ -1264,6 +1264,16 @@ non-empty 0.8 topic (name + description). An incoming 2-person
 `recovered_08_pending_room_send_creates_named_group_not_dm`
 (`ensure_subscriptions` after `start_dm`).
 
+Empty-description 0.8 rooms cannot use that topic-match heal. At mint,
+`promote_index_fold` now also writes the hist→live pair into the
+conversation-index SQLCipher file (schema v3 `historical_fold`).
+`connect` / `ensure_subscriptions` restore recorded pairs when the JSON
+sidecar is gone. Do not infer an empty-desc bind from founder/admin or
+unique subset (R-045). Pins:
+`persist_folds_lost_core_sidecar_refolds_empty_desc_room_from_index`,
+`conversation_index::record_fold_roundtrips_and_remove_group_forgets_bind`,
+`conversation_index::migrates_v2_schema_adding_historical_fold_table`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
