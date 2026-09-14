@@ -783,6 +783,27 @@ class ConversationFoldTest {
                 ),
             ),
         )
+        assertEquals(
+            mapOf("group-09" to listOf("already", "uploading")),
+            promotedFoldedPendingMediaUploads(
+                previousIds = setOf("group-08"),
+                currentIds = setOf("group-09"),
+                uploads = mapOf(
+                    "group-08" to listOf("uploading"),
+                    "group-09" to listOf("already"),
+                ),
+                liveFoldTarget = { if (it == "group-08") "group-09" else null },
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to listOf("uploading")),
+            promotedFoldedPendingMediaUploads(
+                previousIds = setOf("group-08"),
+                currentIds = setOf("group-08"),
+                uploads = mapOf("group-08" to listOf("uploading")),
+                liveFoldTarget = { if (it == "group-08") "group-09" else null },
+            ),
+        )
     }
 
     @Test

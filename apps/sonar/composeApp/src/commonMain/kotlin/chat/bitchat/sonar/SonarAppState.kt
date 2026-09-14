@@ -537,6 +537,24 @@ internal fun <V> remountFoldedPendingMediaUploads(
     return uploads - historical + (live to (existing + incoming))
 }
 
+/** Same move after FFI hides the 0.8 id even if the user already left. */
+internal fun <V> promotedFoldedPendingMediaUploads(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    uploads: Map<String, List<V>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, List<V>> {
+    var next = uploads
+    for (historical in previousIds + uploads.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        if (next[historical].isNullOrEmpty()) continue
+        next = remountFoldedPendingMediaUploads(historical, live, next)
+    }
+    return next
+}
+
 internal fun remountFoldedOpenChatId(
     openChatId: String,
     listedChatIds: Set<String>,
@@ -12743,6 +12761,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         promoteFoldedVerified(previousOrder.toSet(), listedIds)
         promoteFoldedScanState(previousOrder.toSet(), listedIds)
         promoteFoldedPendingEchoes(previousOrder.toSet(), listedIds)
+        promoteFoldedInFlightSends(previousOrder.toSet(), listedIds)
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12907,6 +12926,40 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         if (nextTrill != trillCooldownUntilMs) {
             trillCooldownUntilMs = nextTrill
+        }
+    }
+
+    /** In-flight media / pending-group queues stay on the hidden 0.8 id when
+     *  fold lands after the user leaves. Echoes already promote above; these
+     *  queues must move too or Send finishes against a chat FFI no longer lists. */
+    private fun promoteFoldedInFlightSends(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String ->
+            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
+        }
+        val nextUploads = promotedFoldedPendingMediaUploads(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            uploads = pendingMediaUploads.mapValues { it.value.toList() },
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextUploads != pendingMediaUploads.mapValues { it.value.toList() }) {
+            pendingMediaUploads.clear()
+            for ((id, rows) in nextUploads) {
+                if (rows.isNotEmpty()) pendingMediaUploads[id] = rows.toMutableList()
+            }
+        }
+        val nextGroupSends = promotedFoldedPendingMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = pendingMarmotGroupSends.mapValues { it.value.toList() },
+            liveFoldTarget = liveFoldTarget,
+            idOf = { it.echoId },
+        )
+        if (nextGroupSends != pendingMarmotGroupSends.mapValues { it.value.toList() }) {
+            pendingMarmotGroupSends.clear()
+            for ((id, rows) in nextGroupSends) {
+                if (rows.isNotEmpty()) pendingMarmotGroupSends[id] = rows.toMutableList()
+            }
         }
     }
 

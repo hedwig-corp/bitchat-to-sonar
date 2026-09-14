@@ -391,6 +391,20 @@ struct SonarConversationFoldTests {
                 idOf: { $0 }
             )["group-09"] == ["echo-08"]
         )
+        #expect(
+            snRemountedPendingUploadMediaKey(
+                "group-08\u{1f}photo.jpg",
+                historical: "group-08",
+                live: "group-09"
+            ) == "group-09\u{1f}photo.jpg"
+        )
+        #expect(
+            snRemountedPendingUploadMediaKey(
+                "group-09\u{1f}photo.jpg",
+                historical: "group-08",
+                live: "group-09"
+            ) == "group-09\u{1f}photo.jpg"
+        )
         let older = Date(timeIntervalSince1970: 1)
         let newer = Date(timeIntervalSince1970: 2)
         let historicalCall = SNCallRecord(

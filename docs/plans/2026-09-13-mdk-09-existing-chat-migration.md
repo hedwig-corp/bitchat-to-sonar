@@ -752,6 +752,14 @@ the remounted live window stale. `snConversationRefreshIds` reloads
 listed fold siblings. Pin: `SonarConversationFoldTests`
 `snConversationRefreshIds`.
 
+In-flight media hole closed after this commit: pending uploads remounted
+only while the recovered transcript was open. Fold after the user left
+left bytes keyed on the hidden 0.8 id. Promote uploads (and Compose
+pending-group queues) on the same refresh path as send echoes. iOS
+upload-cache remount merges colliding live keys instead of overwriting.
+Pins: `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
+`SonarConversationFoldTests` `snRemountedPendingUploadMediaKey`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

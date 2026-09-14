@@ -709,6 +709,21 @@ func snConversationRefreshIds(
     return listedFamily.sorted()
 }
 
+/// Rewrite a pending-upload cache key off a hidden 0.8 group id.
+/// Keys are `groupId + US + filename + …`; only the group prefix moves.
+func snRemountedPendingUploadMediaKey(
+    _ key: String,
+    historical: String,
+    live: String
+) -> String {
+    guard historical != live, !historical.isEmpty, !live.isEmpty, !key.isEmpty else {
+        return key
+    }
+    let parts = key.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false)
+    guard String(parts[0]) == historical, parts.count == 2 else { return key }
+    return live + "\u{1f}" + String(parts[1])
+}
+
 /// Conversation keys a chat-scoped payment read must check after a fold.
 /// Includes both bare MLS ids and `marmot:` conversation ids.
 func snPaymentActivityPeerKeys(
@@ -7851,6 +7866,7 @@ final class SonarAppStore: ObservableObject {
                 from: [pair.historical, Self.marmotIDPrefix + pair.historical],
                 onto: Self.marmotIDPrefix + pair.live
             )
+            remountFoldedPendingUploadMedia(from: pair.historical, onto: pair.live)
             if let until = trillCooldownUntilByChat[pair.historical]
                 ?? trillCooldownUntilByChat[Self.marmotIDPrefix + pair.historical] {
                 let liveId = Self.marmotIDPrefix + pair.live
@@ -8682,13 +8698,9 @@ final class SonarAppStore: ObservableObject {
         var next: [String: [PendingUploadMedia]] = [:]
         var changed = false
         for (key, items) in pendingUploadMediaCache {
-            let parts = key.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false)
-            if String(parts[0]) == historical, parts.count == 2 {
-                next[live + "\u{1f}" + String(parts[1])] = items
-                changed = true
-            } else {
-                next[key] = items
-            }
+            let remounted = snRemountedPendingUploadMediaKey(key, historical: historical, live: live)
+            if remounted != key { changed = true }
+            next[remounted, default: []].append(contentsOf: items)
         }
         if changed {
             pendingUploadMediaCache = next
