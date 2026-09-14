@@ -595,6 +595,8 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == 1
         )
+        // Room / persist-folds: listed live-only would miss bak remainder.
+        // `localTranscriptGroups` pages these same ids.
         #expect(
             snTranscriptSourceIds(
                 groupId: "group-09",

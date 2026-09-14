@@ -1780,6 +1780,12 @@ class ConversationFoldTest {
             listOf("group-09"),
             transcriptSourceIds("group-09", listOf("group-09"), emptyMap()),
         )
+        // Room / persist-folds: listed live-only would miss bak remainder.
+        // iOS `localTranscriptGroups` pages these same ids.
+        assertEquals(
+            listOf("group-09", "group-08"),
+            transcriptSourceIds("group-09", emptyList(), folds),
+        )
     }
 
     @Test

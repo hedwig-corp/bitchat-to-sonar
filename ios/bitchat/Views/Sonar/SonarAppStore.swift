@@ -7567,8 +7567,19 @@ final class SonarAppStore: ObservableObject {
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else { return [] }
         let folded = directMarmotGroups(matchingGroupId: groupId)
-        if !folded.isEmpty { return folded }
-        return [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        // Load-older / newest / preserve must page the hidden 0.8 sibling
+        // too. Listed live-only groups miss bak remainder when core
+        // `fold_family(live)` is not ready yet. Compose `transcriptGroupIds`.
+        let ids = snTranscriptSourceIds(
+            groupId: groupId,
+            listedDirectIds: folded.map(\.id),
+            historicalFolds: folds
+        )
+        let byId = Dictionary(uniqueKeysWithValues: folded.map { ($0.id, $0) })
+        return ids.map { pagingId in
+            byId[pagingId] ?? MarmotService.MarmotGroup(id: pagingId, name: "", memberNpubs: [])
+        }
     }
 
     /// How one chat line renders: regular text, a ⚡PAY receipt bubble,

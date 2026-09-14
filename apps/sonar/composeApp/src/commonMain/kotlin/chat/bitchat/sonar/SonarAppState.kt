@@ -12485,6 +12485,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun transcriptGroupIds(chatId: String): List<String> {
         if (!isMeshChat(chatId)) {
+            // Includes the hidden 0.8 sibling so load-older can page bak
+            // remainder when core fold_family(live) is not ready yet.
+            // iOS `localTranscriptGroups` / `snTranscriptSourceIds`.
             return transcriptSourceIds(
                 chatId,
                 directMarmotChatIds(chatId),
