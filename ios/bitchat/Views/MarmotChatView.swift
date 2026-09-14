@@ -2746,11 +2746,13 @@ final class MarmotChatModel: ObservableObject {
             let summaries = await service.conversationSummaries()
             let listed = publishedGroups(groups)
             let activeGroupIds = Set(listed.map(\.id))
-            let folds = historicalFoldsMap()
+            // Re-read after `groups()` — FFI restore can publish a new bind
+            // that the transcript-page snapshot above did not have.
+            let latestFolds = historicalFoldsMap()
             self.conversationSummariesByGroup = snRemountedConversationSummaries(
                 summaries: summaries,
                 activeGroupIds: activeGroupIds,
-                historicalFolds: folds
+                historicalFolds: latestFolds
             )
             self.publishUnread(from: summaries)
             self.groups = listed
