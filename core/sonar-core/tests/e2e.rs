@@ -1295,6 +1295,68 @@ async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
     assert!(after_reopen.iter().any(|m| m.content == "second resume"));
 }
 
+/// Two first-resume sends (text+media, double-tap) must share one 0.9 group.
+/// Without `resume_mint_lock` both pass the unbound check, each mint, and
+/// `record_resume_fold` steals history onto the second.
+#[tokio::test]
+async fn recovered_08_concurrent_first_resume_sends_share_one_live_group() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, _old_event) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates the 0.8 store");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+    bob.publish_key_package().await.expect("bob publishes kp");
+
+    let (first, second) = tokio::join!(
+        alice.send_text(&historical, "resume one"),
+        alice.send_text(&historical, "resume two"),
+    );
+    first.expect("first concurrent resume send");
+    second.expect("second concurrent resume send");
+
+    let live_groups = alice.groups().expect("live 0.9 groups");
+    assert_eq!(
+        live_groups.len(),
+        1,
+        "concurrent first-resume sends must not mint a second 0.9 group: {live_groups:?}"
+    );
+    let live = live_groups[0].id.clone();
+    let family = alice.messages(&live).expect("folded family");
+    assert!(
+        family.iter().any(|m| m.content == "keep this chat"),
+        "0.8 history must stay on the single live sibling: {family:?}"
+    );
+    assert!(
+        family.iter().any(|m| m.content == "resume one"),
+        "first concurrent send must land on the same group: {family:?}"
+    );
+    assert!(
+        family.iter().any(|m| m.content == "resume two"),
+        "second concurrent send must land on the same group: {family:?}"
+    );
+    assert_eq!(
+        alice.conversation_summaries().len(),
+        1,
+        "recovered+resumed person must occupy one conversation-index row"
+    );
+}
+
 /// A recovered DM that only has local kind-9 rows must still resume using the
 /// 0.8 `admin_pubkeys` list. This is the common "I wrote first, they never
 /// replied" case — transcript senders alone cannot recover the peer.

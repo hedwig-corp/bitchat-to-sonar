@@ -1810,6 +1810,13 @@ pub struct SonarClient {
     /// relay publish. (Incoming membership commits from OTHERS are inherently
     /// racy with sends across the network and are not gated.)
     membership_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Serializes first-resume mint (`resolve_send_group` creating a new 0.9
+    /// group for a recovered 0.8 row). Two concurrent sends (text+media,
+    /// double-tap) used to each mint a group; `record_resume_fold` then
+    /// stole history onto the second and left an extra empty chat.
+    /// Client-wide: first-resume mint is rare and the window includes the
+    /// KeyPackage fetch. Already-folded sends do not take this lock.
+    resume_mint_lock: Arc<tokio::sync::Mutex<()>>,
     /// How many times the live pending buffer dropped its oldest half.
     buffer_drops_total: Arc<AtomicUsize>,
     /// True after the real-session Marmot live tail is opened. Local group
@@ -2397,6 +2404,7 @@ impl SonarClient {
             marmot_notify,
             send_inflight,
             membership_gate,
+            resume_mint_lock: Arc::new(tokio::sync::Mutex::new(())),
             buffer_drops_total,
             live_marmot_enabled,
             marmot_group_subscriptions,
@@ -7284,25 +7292,23 @@ impl SonarClient {
             self.maybe_add_late_resume_members(group_id).await;
             return Ok(group_id.clone());
         }
-        if let Some(live) = self.engine.live_fold_target(group_id) {
+        if let Some(live) = self.rebound_resume_live(group_id) {
             self.maybe_add_late_resume_members(&live).await;
             return Ok(live);
-        }
-        // A live 0.9 sibling can already exist (incoming welcome, or a
-        // start_dm with the same peer) while the JSON + index binds are
-        // gone. Idle reconcile would fold; a send must not mint a second
-        // group or fail KeyPackageNotFound for a peer who already joined.
-        if self.engine.is_historical_group(group_id)? {
-            self.maybe_fold_live_groups();
-            if let Some(live) = self.engine.live_fold_target(group_id) {
-                self.maybe_add_late_resume_members(&live).await;
-                return Ok(live);
-            }
         }
         if !self.engine.is_historical_group(group_id)? {
             // Unknown / not-yet-created ids keep the existing send error
             // (group missing, media cap, …). Only recovered 0.8 rows resume.
             return Ok(group_id.clone());
+        }
+        // Two first-resume sends (text+media, double-tap) used to both pass
+        // the unbound check, each mint a 0.9 group, and steal hist onto the
+        // second. Hold the mint lock through KeyPackage fetch + create so
+        // the waiter re-discovers the winner instead of minting again.
+        let _mint = self.resume_mint_lock.lock().await;
+        if let Some(live) = self.rebound_resume_live(group_id) {
+            self.maybe_add_late_resume_members(&live).await;
+            return Ok(live);
         }
         let peers = self.engine.historical_resume_peers(group_id);
         let name = self
@@ -7317,6 +7323,12 @@ impl SonarClient {
         let packages = self.fetch_resume_key_packages(&peers).await?;
         if packages.is_empty() {
             return Err(Error::KeyPackageNotFound(peers[0]));
+        }
+        // A welcome can fold hist onto a peer-created live group while we
+        // waited for KeyPackages. Minting after that would steal history.
+        if let Some(live) = self.rebound_resume_live(group_id) {
+            self.maybe_add_late_resume_members(&live).await;
+            return Ok(live);
         }
         // A recovered room with only some peers on 0.9 must stay a group, even
         // when one reachable member would look like a DM. Reusing start_dm
@@ -7344,8 +7356,31 @@ impl SonarClient {
                 .await?;
             self.publish_group_creation(creation).await?
         };
+        // Do not steal hist if a welcome bound it during create/publish.
+        // The leftover empty mint is the same residual as two incoming
+        // matching welcomes; history stays on the first live sibling.
+        if let Some(existing) = self.engine.live_fold_target(group_id) {
+            if existing != live {
+                return Ok(existing);
+            }
+        }
         self.record_resume_fold(group_id, &live);
         Ok(live)
+    }
+
+    /// Restore a recorded bind, or re-discover unbound hist onto an
+    /// already-joined live sibling. Used by first-resume send so a lost
+    /// sidecar does not mint a second 0.9 group.
+    fn rebound_resume_live(&self, group_id: &GroupId) -> Option<GroupId> {
+        self.restore_recorded_folds_touching(group_id);
+        if let Some(live) = self.engine.live_fold_target(group_id) {
+            return Some(live);
+        }
+        if self.engine.is_historical_group(group_id).unwrap_or(false) {
+            self.maybe_fold_live_groups();
+            return self.engine.live_fold_target(group_id);
+        }
+        None
     }
 
     /// Background reconcile: leftover 0.8 room members who later publish a

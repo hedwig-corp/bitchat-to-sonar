@@ -1597,6 +1597,15 @@ now re-discover unbound hist onto an already-joined live sibling
 (no-op when live is empty or every hist row is already folded). Pin:
 `client::tests::conversation_summaries_rebind_lost_fold_without_waiting_for_send`.
 
+Two first-resume sends (text+media, double-tap) used to both pass the
+unbound check, each mint a 0.9 group, and steal hist onto the second.
+`resolve_send_group` now holds `resume_mint_lock` through KeyPackage
+fetch + create and re-discovers the winner before minting again. Pin:
+`e2e::recovered_08_concurrent_first_resume_sends_share_one_live_group`.
+Two incoming matching welcomes can still leave a second empty live
+group; that fold stays on the first
+(`incoming_09_named_pair_second_welcome_does_not_steal_fold`).
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`
