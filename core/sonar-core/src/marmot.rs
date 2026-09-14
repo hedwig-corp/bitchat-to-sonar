@@ -778,16 +778,16 @@ pub struct MarmotEngine {
     /// the quiescence window — ingest itself does not wait.
     pending_convergence: Mutex<HashSet<GroupId>>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
-    historical_group_names: HashMap<GroupId, String>,
+    historical_group_names: Mutex<HashMap<GroupId, String>>,
     /// 0.8 `groups.description` / welcome `group_description`. Needed so a
     /// named joined room is not classified as a DM when only one peer is known.
-    historical_group_descriptions: HashMap<GroupId, String>,
+    historical_group_descriptions: Mutex<HashMap<GroupId, String>>,
     /// Members recovered from a 0.8 store (`admin_pubkeys` + every message
     /// pubkey). Transcript senders are merged at read time so a chat you
     /// only ever sent into can still resume.
-    historical_members: HashMap<GroupId, Vec<PublicKey>>,
+    historical_members: Mutex<HashMap<GroupId, Vec<PublicKey>>>,
     /// Original 0.8 welcome `member_count` so a 3+ room does not resume as a DM.
-    historical_member_counts: HashMap<GroupId, u32>,
+    historical_member_counts: Mutex<HashMap<GroupId, u32>>,
     /// Recovered 0.8 group id → new 0.9 group created with the same members.
     historical_folds: Mutex<HashMap<GroupId, GroupId>>,
     /// Leftover 0.8 rows still in `*.mdk08.bak` after the first-paint window.
@@ -987,12 +987,14 @@ impl MarmotEngine {
             dropped_groups: Mutex::new(dropped),
             transcript: Mutex::new(transcript),
             pending_convergence: Mutex::new(HashSet::new()),
-            historical_group_names,
-            historical_group_descriptions: crate::mdk08_migrate::load_historical_group_descriptions(
-                db_path,
+            historical_group_names: Mutex::new(historical_group_names),
+            historical_group_descriptions: Mutex::new(
+                crate::mdk08_migrate::load_historical_group_descriptions(db_path),
             ),
-            historical_members,
-            historical_member_counts: crate::mdk08_migrate::load_historical_member_counts(db_path),
+            historical_members: Mutex::new(historical_members),
+            historical_member_counts: Mutex::new(
+                crate::mdk08_migrate::load_historical_member_counts(db_path),
+            ),
             historical_folds: Mutex::new(historical_folds),
             pending_mdk08: Mutex::new(pending_mdk08),
             historical_media_secrets: Mutex::new(historical_media_secrets),
@@ -1342,12 +1344,20 @@ impl MarmotEngine {
 
     /// Title recovered from an MDK 0.8 `groups` row, if any.
     pub fn historical_group_name(&self, group_id: &GroupId) -> Option<String> {
-        self.historical_group_names.get(group_id).cloned()
+        self.historical_group_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(group_id)
+            .cloned()
     }
 
     /// Description recovered from an MDK 0.8 `groups` / welcome row, if any.
     pub fn historical_group_description(&self, group_id: &GroupId) -> Option<String> {
-        self.historical_group_descriptions.get(group_id).cloned()
+        self.historical_group_descriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(group_id)
+            .cloned()
     }
 
     /// True when `group_id` is a live (or still-unhydrated) 0.9 MLS group.
@@ -1390,8 +1400,20 @@ impl MarmotEngine {
     /// Transcript ids plus named / member-only 0.8 rows (outbound-only chats).
     pub fn recovered_group_ids(&self) -> Vec<GroupId> {
         let mut ids = self.transcript_group_ids();
-        ids.extend(self.historical_group_names.keys().cloned());
-        ids.extend(self.historical_members.keys().cloned());
+        ids.extend(
+            self.historical_group_names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .cloned(),
+        );
+        ids.extend(
+            self.historical_members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .cloned(),
+        );
         ids.retain(|id| !self.is_dropped(id));
         ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
         ids.dedup();
@@ -1472,7 +1494,12 @@ impl MarmotEngine {
     /// welcomer is known.
     pub fn historical_resume_is_direct(&self, group_id: &GroupId) -> bool {
         let peers = self.historical_resume_peers(group_id).len();
-        let stored = self.historical_member_counts.get(group_id).copied();
+        let stored = self
+            .historical_member_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(group_id)
+            .copied();
         let members = stored.unwrap_or((peers as u32).saturating_add(1));
         if members > 2 {
             return false;
@@ -1491,8 +1518,14 @@ impl MarmotEngine {
             .into_iter()
             .map(|m| m.sender)
             .collect();
-        if let Some(stored) = self.historical_members.get(group_id) {
-            members.extend(stored.iter().cloned());
+        if let Some(stored) = self
+            .historical_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(group_id)
+            .cloned()
+        {
+            members.extend(stored);
         }
         members.push(me);
         members.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
@@ -3041,6 +3074,7 @@ impl MarmotEngine {
         if let Some(path) = self.db_path.as_ref() {
             crate::mdk08_migrate::forget_historical_metadata(path, &family);
         }
+        self.forget_in_memory_historical_sidecars(&family);
         {
             let mut parked = self
                 .parked_invites
@@ -3052,6 +3086,31 @@ impl MarmotEngine {
                 drop(parked);
                 self.persist_parked();
             }
+        }
+    }
+
+    fn forget_in_memory_historical_sidecars(&self, family: &[GroupId]) {
+        let mut names = self
+            .historical_group_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut descriptions = self
+            .historical_group_descriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut members = self
+            .historical_members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut counts = self
+            .historical_member_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for id in family {
+            names.remove(id);
+            descriptions.remove(id);
+            members.remove(id);
+            counts.remove(id);
         }
     }
 
@@ -4253,6 +4312,14 @@ mod historical_fold_tests {
         assert!(
             !engine.recovered_group_ids().contains(&historical),
             "in-memory title leftover must not keep a deleted id listable for index seed"
+        );
+        assert!(
+            engine.historical_group_name(&historical).is_none(),
+            "Leave must drop the in-memory 0.8 title, not only the sidecar"
+        );
+        assert!(
+            engine.historical_group_description(&historical).is_none(),
+            "Leave must drop the in-memory 0.8 description"
         );
         let idx = crate::conversation_index::ConversationIndex::open_in_memory().expect("index");
         idx.seed_missing_recovered(&engine)

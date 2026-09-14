@@ -422,7 +422,8 @@ hist→live blob (`sonar.historicalFolds` / `sonar.historicalFolds.v1`) and
 persist the chat snapshot without the family immediately, so a mid-session
 delete cannot leave a recovered 0.8 row for the next first paint.
 Core also forgets recovered name/member/description/count/secret sidecars
-for that family. Settings restore preview subtracts `.sonar-dropped-groups.json`
+for that family — disk and the in-memory maps, so a same-session
+`historical_group_name` lookup cannot seed a chat the user already left. Settings restore preview subtracts `.sonar-dropped-groups.json`
 ids from both the historical-groups sidecar and packed `*.mdk08.bak` titles,
 so a backup taken after Leave does not list a chat the user already removed.
 Remainder ticks from `*.mdk08.bak` also omit `.sonar-dropped-groups.json`
@@ -446,7 +447,8 @@ chat stays silent when the next push names the live 0.9 id. Pins:
 `mdk08_migrate::remainder_page_skips_omitted_groups`,
 `mdk08_migrate::backfill_skips_dropped_groups`,
 `persistence::delete_then_remainder_does_not_restore_transcript`,
-`marmot::historical_fold_tests::delete_live_group_forgets_historical_name_sidecar`,
+`marmot::historical_fold_tests::delete_live_group_forgets_historical_name_sidecar`
+(also pins in-memory `historical_group_name` / description are gone after Leave),
 `marmot::historical_fold_tests::store_chat_skips_dropped_groups`,
 `marmot::historical_fold_tests::reopen_omits_dropped_transcript_rows`,
 `marmot::historical_fold_tests::purge_fold_family_clears_parked_invites`,
@@ -506,8 +508,8 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after the unlisted-live notification open.
-Rust core gates last verified on `e218e2f0`.
+Re-run on this cloud agent after in-memory historical sidecar purge.
+`historical_fold` lib tests green. Full rust suite last verified on `e218e2f0`.
 
 | Gate | Result |
 | --- | --- |
