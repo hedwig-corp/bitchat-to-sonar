@@ -460,6 +460,20 @@ internal fun normalizedProfileCache(profiles: Map<String, SonarProfile>): Map<St
         result
     }
 
+/** Recency written into the metadata-only chat snapshot.
+ *  Fold remount does not sort, so `lastOrNull()` can be the oldest recovered
+ *  0.8 extract row. Persisting that as latest lets a newer empty live sibling
+ *  win `dedupeDirectMarmotChats` after process death — the in-memory extract
+ *  is gone and only this timestamp remains. iOS `snChatSnapshotLatestTs`;
+ *  iOS snapshot is groups-only, so that helper is the persist contract. */
+internal fun chatSnapshotLatestTs(
+    messages: List<SonarMsg>?,
+    persistedLatest: Long?,
+): Long {
+    val messageTs = messages?.maxOfOrNull { it.tsSecs } ?: 0L
+    return maxOf(messageTs, persistedLatest ?: 0L)
+}
+
 internal fun encodeChatSnapshot(
     chats: List<SonarChat>,
     messagesByChat: Map<String, List<SonarMsg>>,
@@ -480,7 +494,7 @@ internal fun encodeChatSnapshot(
             append(hexEnc(chat.id)).append('\t')
             append(hexEnc(chat.name)).append('\t')
             append(chat.members.joinToString(",") { hexEnc(it) }).append('\t')
-            append(messagesByChat[chat.id]?.lastOrNull()?.tsSecs ?: latestByChat[chat.id] ?: 0L)
+            append(chatSnapshotLatestTs(messagesByChat[chat.id], latestByChat[chat.id]))
             if (includeIsDirect) {
                 append('\t')
                 append(if (chat.isDirect) "1" else "0")

@@ -1126,6 +1126,16 @@ recovered history. Take `max(tsSecs)` and `latestByChat`. iOS
 Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
 `SonarConversationFoldTests` `snLocalLatestTsForChat`.
 
+Process-death snapshot recency hole closed after this commit:
+`encodeChatSnapshot` preferred `lastOrNull()` over `latestByChat`.
+A newest-first remount persisted the oldest extract row as durable
+latest. After process death the in-memory extract is gone, so
+`localLatestTsForChat` read that oldest stamp and hid the recovered
+row again. Persist `max(message ts, latestByChat)`. iOS snapshot is
+groups-only; `snChatSnapshotLatestTs` is the persist contract.
+Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
+`SonarConversationFoldTests` `snChatSnapshotLatestTs`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

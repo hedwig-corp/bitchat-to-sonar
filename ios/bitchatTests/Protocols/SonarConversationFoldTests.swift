@@ -1042,6 +1042,19 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == 200
         )
+        #expect(snChatSnapshotLatestTs(messageTimestamps: Array((1...80).reversed().map(Int64.init)), persistedLatest: 0) == 80)
+        #expect(snChatSnapshotLatestTs(messageTimestamps: Array((1...80).reversed().map(Int64.init)), persistedLatest: 200) == 200)
+        #expect(
+            snLocalLatestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-09": snChatSnapshotLatestTs(
+                    messageTimestamps: Array((1...80).reversed().map(Int64.init)),
+                    persistedLatest: 0
+                )],
+                historicalFolds: ["group-08": "group-09"]
+            ) == 80
+        )
         #expect(snFoldedSiblingHasMore(historicalHasMore: true, liveHasMore: false))
         #expect(snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: true))
         #expect(!snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: false))

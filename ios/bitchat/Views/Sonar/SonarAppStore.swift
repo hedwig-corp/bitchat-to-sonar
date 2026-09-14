@@ -1043,6 +1043,15 @@ func snSnapshotLatestAfterHistoricalFolds(
     return next
 }
 
+/// Recency a metadata snapshot must persist. Fold remount does not sort, so
+/// `last` can be the oldest recovered 0.8 extract row. Compose
+/// `chatSnapshotLatestTs` / `encodeChatSnapshot`. iOS snapshot is groups-only
+/// today; keep this as the persist contract so a later latest field cannot
+/// reintroduce the process-death hide.
+func snChatSnapshotLatestTs(messageTimestamps: [Int64], persistedLatest: Int64) -> Int64 {
+    max(messageTimestamps.max() ?? 0, persistedLatest)
+}
+
 /// Newest local timestamp across the fold family (hidden 0.8 sibling included).
 func snLocalLatestTsForChat(
     chatId: String,

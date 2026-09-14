@@ -1564,6 +1564,36 @@ class ConversationFoldTest {
                 latestSecs = latest,
             ),
         )
+        // Process death drops the remounted extract. Persist must keep max
+        // recency — `lastOrNull()` on newest-first extract is 1 and would
+        // let the empty sibling win after decode.
+        assertEquals(80L, chatSnapshotLatestTs(newestFirstExtract, null))
+        assertEquals(200L, chatSnapshotLatestTs(newestFirstExtract, 200L))
+        val persisted = decodeChatSnapshotLatest(
+            encodeChatSnapshot(
+                listOf(remounted, otherLive),
+                mapOf("group-09" to newestFirstExtract),
+                mapOf("group-10" to 10L),
+            ),
+        )
+        assertEquals(80L, persisted["group-09"])
+        assertEquals(10L, persisted["group-10"])
+        val afterDeath = { id: String ->
+            localLatestTsForChat(
+                chatId = id,
+                messagesByChat = emptyMap(),
+                latestByChat = persisted,
+                historicalFolds = folds,
+            )
+        }
+        assertEquals(
+            listOf(remounted),
+            dedupeDirectMarmotChats(
+                chats = listOf(remounted, otherLive),
+                ownNpub = ownNpub,
+                latestSecs = afterDeath,
+            ),
+        )
     }
 
     @Test
