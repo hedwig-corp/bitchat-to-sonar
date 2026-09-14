@@ -84,36 +84,66 @@ internal const val SYNTHETIC_SUMMARY_ID_PREFIX = "summary:"
 internal fun List<SonarMsg>.withoutSyntheticSummaryRows(): List<SonarMsg> =
     filterNot { it.id.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX) }
 
+/** Listed live id that should receive a hidden 0.8 summary / page. */
+internal fun hydrationTargetId(
+    sourceId: String,
+    activeChatIds: Set<String>,
+    historicalFolds: Map<String, String>,
+): String? {
+    if (sourceId in activeChatIds) return sourceId
+    val live = historicalFolds[sourceId]?.takeIf { it.isNotBlank() && it != sourceId }
+    return live?.takeIf { it in activeChatIds }
+}
+
 internal fun hydrateLocalConversationRows(
     activeChatIds: Set<String>,
     existingMessagesByChat: Map<String, List<SonarMsg>>,
     existingLatestByChat: Map<String, Long>,
     summaries: List<SonarConversationSummary>,
     pages: List<SonarRecentTranscriptPage>,
+    historicalFolds: Map<String, String> = emptyMap(),
 ): LocalConversationHydration {
     val messages = existingMessagesByChat.filterKeys { it in activeChatIds }.toMutableMap()
     val latest = existingLatestByChat.filterKeys { it in activeChatIds }.toMutableMap()
+    for ((historical, live) in historicalFolds) {
+        if (live !in activeChatIds) continue
+        val incoming = existingMessagesByChat[historical].orEmpty()
+        if (incoming.isNotEmpty()) {
+            messages[live] = mergedFoldedMessageLists(incoming, messages[live].orEmpty()) { it.id }
+        }
+        val incomingTs = existingLatestByChat[historical]
+            ?: incoming.maxOfOrNull { it.tsSecs }
+            ?: 0L
+        if (incomingTs > (latest[live] ?: 0L)) latest[live] = incomingTs
+    }
 
     for (summary in summaries) {
-        if (summary.groupIdHex !in activeChatIds || summary.latestAtSecs <= 0L) continue
-        latest[summary.groupIdHex] = summary.latestAtSecs
-        val existing = messages[summary.groupIdHex]
-        val previous = existing?.lastOrNull()
+        val target = hydrationTargetId(summary.groupIdHex, activeChatIds, historicalFolds)
+            ?: continue
+        if (summary.latestAtSecs <= 0L) continue
+        val previous = messages[target]?.lastOrNull()
+        if (previous != null && previous.tsSecs > summary.latestAtSecs) {
+            if (summary.latestAtSecs > (latest[target] ?: 0L)) {
+                latest[target] = summary.latestAtSecs
+            }
+            continue
+        }
+        latest[target] = maxOf(latest[target] ?: 0L, summary.latestAtSecs)
         val summaryId =
-            "$SYNTHETIC_SUMMARY_ID_PREFIX${summary.groupIdHex}:${summary.latestAtSecs}:${summary.messageCount}"
+            "$SYNTHETIC_SUMMARY_ID_PREFIX$target:${summary.latestAtSecs}:${summary.messageCount}"
         val visibleFieldsMatch = previous != null &&
             previous.tsSecs == summary.latestAtSecs &&
             previous.content == summary.latestContent &&
             previous.senderNpub == summary.latestSenderNpub &&
             previous.mine == summary.latestMine
         val staleSyntheticIdentity =
-            previous?.id?.startsWith("$SYNTHETIC_SUMMARY_ID_PREFIX${summary.groupIdHex}:") == true &&
+            previous?.id?.startsWith("$SYNTHETIC_SUMMARY_ID_PREFIX$target:") == true &&
             previous.id != summaryId
         // Preserve a real bounded-page row when it already represents the same
         // visible latest message. Synthetic summaries additionally track count,
         // because core timestamps have only second resolution.
         if (!visibleFieldsMatch || staleSyntheticIdentity) {
-            messages[summary.groupIdHex] = listOf(
+            messages[target] = listOf(
                 SonarMsg(
                     id = summaryId,
                     senderNpub = summary.latestSenderNpub,
@@ -127,13 +157,16 @@ internal fun hydrateLocalConversationRows(
     }
 
     for (page in pages) {
-        if (page.chatId !in activeChatIds || page.messages.isEmpty()) continue
+        val target = hydrationTargetId(page.chatId, activeChatIds, historicalFolds) ?: continue
+        if (page.messages.isEmpty()) continue
+        val existingTs = latest[target] ?: 0L
+        val pageTs = page.latestTsSecs.takeIf { it > 0L } ?: page.messages.maxOf { it.tsSecs }
+        if (messages[target]?.isNotEmpty() == true && pageTs < existingTs) continue
         // Normalize to the transcript display order (tsSecs, id) so the snapshot
         // paint on chat open matches the async bounded-page refresh; otherwise
         // equal-second messages visibly swap right after the transcript opens.
-        messages[page.chatId] = mergeAllTranscriptRows(page.messages)
-        latest[page.chatId] = page.latestTsSecs.takeIf { it > 0L }
-            ?: page.messages.maxOf { it.tsSecs }
+        messages[target] = mergeAllTranscriptRows(page.messages)
+        latest[target] = pageTs
     }
     return LocalConversationHydration(messages, latest)
 }

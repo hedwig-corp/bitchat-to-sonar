@@ -603,6 +603,61 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snHydrationTargetGroupId(
+                sourceId: "group-08",
+                activeGroupIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            snHydrationTargetGroupId(
+                sourceId: "group-09",
+                activeGroupIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            snHydrationTargetGroupId(
+                sourceId: "group-08",
+                activeGroupIds: ["group-09"],
+                historicalFolds: [:]
+            ) == nil
+        )
+        let histPreview = MarmotService.ConversationSummary(
+            groupIdHex: "group-08",
+            name: "",
+            latestContent: "keep this chat",
+            latestSenderNpub: "npub1peer",
+            latestAt: Date(timeIntervalSince1970: 100),
+            latestMine: false,
+            messageCount: 3,
+            unreadCount: 3
+        )
+        let remounted = snRemountedConversationSummaries(
+            summaries: [histPreview],
+            activeGroupIds: ["group-09"],
+            historicalFolds: ["group-08": "group-09"]
+        )
+        #expect(remounted["group-09"]?.latestContent == "keep this chat")
+        #expect(remounted["group-09"]?.groupIdHex == "group-09")
+        #expect(remounted["group-08"] == nil)
+        let liveNewer = MarmotService.ConversationSummary(
+            groupIdHex: "group-09",
+            name: "",
+            latestContent: "already on live",
+            latestSenderNpub: "npub1peer",
+            latestAt: Date(timeIntervalSince1970: 200),
+            latestMine: true,
+            messageCount: 1,
+            unreadCount: 0
+        )
+        let keptLive = snRemountedConversationSummaries(
+            summaries: [histPreview, liveNewer],
+            activeGroupIds: ["group-09"],
+            historicalFolds: ["group-08": "group-09"]
+        )
+        #expect(keptLive["group-09"]?.latestContent == "already on live")
+        #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",
                 listedGroupIds: ["group-09"],

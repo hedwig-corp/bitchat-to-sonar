@@ -865,6 +865,17 @@ only. After collapse the hist key stayed in `verifiedChatIds` while the
 visible 0.9 DM looked unverified until remount. `verifiedForFoldFamily`
 / `snVerifiedForFoldFamily` reuse the transcript-source set.
 
+Hydrate-preview hole: after collapse, Compose `hydrateLocalConversationRows`
+and iOS `conversationSummariesByGroup` kept only `groups()` / `activeChatIds`.
+A leftover hist-keyed conversation-index row was dropped, so the live home
+row stayed on "Tap to open" even when recovered last-message text was still
+in the index (window before `copy_summary`, or persist-folds collapse
+before core fold). `hydrationTargetId` / `snHydrationTargetGroupId`
+remount leftover hist summaries (and Compose pages) onto the live sibling.
+Pins: `HomeMessageRowsTest.foldedHistoricalSummaryHydratesOntoLiveSibling`,
+`SonarConversationFoldTests` `snHydrationTargetGroupId` /
+`snRemountedConversationSummaries`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

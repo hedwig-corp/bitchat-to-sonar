@@ -2615,10 +2615,11 @@ final class MarmotChatModel: ObservableObject {
             let invites = try await service.pendingGroupInvites()
             let summaries = await service.conversationSummaries()
             let activeGroupIds = Set(groups.map(\.id))
-            self.conversationSummariesByGroup = Dictionary(
-                uniqueKeysWithValues: summaries
-                    .filter { activeGroupIds.contains($0.groupIdHex) }
-                    .map { ($0.groupIdHex, $0) }
+            let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+            self.conversationSummariesByGroup = snRemountedConversationSummaries(
+                summaries: summaries,
+                activeGroupIds: activeGroupIds,
+                historicalFolds: folds
             )
             self.publishUnread(from: summaries)
             self.groups = groups
@@ -2788,10 +2789,11 @@ final class MarmotChatModel: ObservableObject {
             )
             let summaries = await service.conversationSummaries()
             let activeGroupIds = Set(groups.map(\.id))
-            self.conversationSummariesByGroup = Dictionary(
-                uniqueKeysWithValues: summaries
-                    .filter { activeGroupIds.contains($0.groupIdHex) }
-                    .map { ($0.groupIdHex, $0) }
+            let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+            self.conversationSummariesByGroup = snRemountedConversationSummaries(
+                summaries: summaries,
+                activeGroupIds: activeGroupIds,
+                historicalFolds: folds
             )
             // All service reads above suspend. Snapshot the live dictionary only
             // after they finish, then merge each result into that latest state in

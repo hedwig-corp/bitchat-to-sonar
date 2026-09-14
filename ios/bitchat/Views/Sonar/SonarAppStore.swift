@@ -951,6 +951,58 @@ func snNotificationClearIds(
     return out
 }
 
+/// Listed live id that should receive a hidden 0.8 conversation-index row.
+/// Compose `hydrationTargetId` — after collapse, hist-keyed summaries were
+/// dropped because they are not in `groups()`, so the live home row stayed
+/// on "Tap to open" even when recovered last-message text was still in the
+/// conversation index (window before `copy_summary`, or persist-folds
+/// collapse before core fold).
+func snHydrationTargetGroupId(
+    sourceId: String,
+    activeGroupIds: Set<String>,
+    historicalFolds: [String: String]
+) -> String? {
+    if activeGroupIds.contains(sourceId) { return sourceId }
+    guard let live = historicalFolds[sourceId], !live.isEmpty, live != sourceId else {
+        return nil
+    }
+    return activeGroupIds.contains(live) ? live : nil
+}
+
+/// Remount leftover hist conversation-index rows onto the listed live sibling.
+/// Keep the newer `latestAt` when both sides still have a snapshot.
+func snRemountedConversationSummaries(
+    summaries: [MarmotService.ConversationSummary],
+    activeGroupIds: Set<String>,
+    historicalFolds: [String: String]
+) -> [String: MarmotService.ConversationSummary] {
+    var out: [String: MarmotService.ConversationSummary] = [:]
+    for summary in summaries {
+        guard let target = snHydrationTargetGroupId(
+            sourceId: summary.groupIdHex,
+            activeGroupIds: activeGroupIds,
+            historicalFolds: historicalFolds
+        ) else { continue }
+        let remounted = summary.groupIdHex == target
+            ? summary
+            : MarmotService.ConversationSummary(
+                groupIdHex: target,
+                name: summary.name,
+                latestContent: summary.latestContent,
+                latestSenderNpub: summary.latestSenderNpub,
+                latestAt: summary.latestAt,
+                latestMine: summary.latestMine,
+                messageCount: summary.messageCount,
+                unreadCount: summary.unreadCount
+            )
+        if let existing = out[target], existing.latestAt > remounted.latestAt {
+            continue
+        }
+        out[target] = remounted
+    }
+    return out
+}
+
 func snRetainedTranscriptForChat<Message>(
     chatId: String,
     retainedByChat: [String: [Message]],

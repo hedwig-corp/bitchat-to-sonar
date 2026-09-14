@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class HomeMessageRowsTest {
@@ -233,5 +234,32 @@ class HomeMessageRowsTest {
         )
 
         assertEquals(listOf(pageRow), hydration.messagesByChat["chat"])
+    }
+
+    @Test
+    fun foldedHistoricalSummaryHydratesOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("group-09"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = listOf(
+                SonarConversationSummary("group-08", "", "keep this chat", "peer", 100L, false, 3L, 3L),
+            ),
+            pages = emptyList(),
+            historicalFolds = folds,
+        )
+        assertEquals("keep this chat", hydration.messagesByChat["group-09"]?.single()?.content)
+        assertEquals(100L, hydration.latestByChat["group-09"])
+        assertTrue(hydration.messagesByChat["group-08"].isNullOrEmpty())
+        assertEquals(
+            "group-09",
+            hydrationTargetId("group-08", setOf("group-09"), folds),
+        )
+        assertEquals(
+            "group-09",
+            hydrationTargetId("group-09", setOf("group-09"), folds),
+        )
+        assertNull(hydrationTargetId("group-08", setOf("group-09"), emptyMap()))
     }
 }
