@@ -3002,6 +3002,28 @@ impl MarmotEngine {
         Ok(members)
     }
 
+    /// Title hosts should paint for this conversation.
+    ///
+    /// Live MLS name wins (a later rename must stick). When that is blank
+    /// after remount, fall back to a recovered 0.8 fold-family name so a
+    /// named room does not become "Group chat". Do **not** use this for
+    /// `group_is_direct` — that path must keep the live session name.
+    pub fn display_name(&self, group_id: &GroupId, live_name: &str) -> String {
+        let trimmed = live_name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+        for alias in self.fold_family(group_id) {
+            if let Some(name) = self.historical_group_name(&alias) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    return name.to_owned();
+                }
+            }
+        }
+        String::new()
+    }
+
     pub fn latest_message_secs(&self) -> u64 {
         self.transcript
             .lock()
@@ -4149,6 +4171,31 @@ mod historical_fold_tests {
         assert!(
             display.contains(&carol.public_key()),
             "remounted room must still list people who have not joined 0.9 yet"
+        );
+    }
+
+    #[test]
+    fn display_name_falls_back_to_folded_historical_title() {
+        let alice = Identity::generate();
+        let engine = MarmotEngine::in_memory(alice);
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        engine
+            .historical_group_names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(historical.clone(), "standup".into());
+        engine.record_historical_fold(&historical, &live);
+
+        assert_eq!(
+            engine.display_name(&live, ""),
+            "standup",
+            "remounted room must keep the recovered 0.8 title when MLS name is blank"
+        );
+        assert_eq!(
+            engine.display_name(&live, "new name"),
+            "new name",
+            "a later live rename must win over the recovered title"
         );
     }
 

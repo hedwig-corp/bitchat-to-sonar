@@ -511,6 +511,10 @@ members / exporter secrets / folds / transcript / parked invites),
 `marmot::historical_fold_tests::display_members_unions_folded_historical_roster`
 (FFI paint unions leftover 0.8 members; `members(live)` stays single-id
 so late-resume still invites them),
+`marmot::historical_fold_tests::display_name_falls_back_to_folded_historical_title`
+(FFI live `GroupInfo.name` keeps the recovered 0.8 title when MLS name
+is blank; a later live rename wins. Compose `adoptedListedChatTitle`
+must not replace a recovered name with "Group chat"),
 `e2e.rs::recovered_08_group_adds_a_member_who_updates_later` and
 `e2e.rs::recovered_08_group_adds_late_member_on_sync_without_a_local_send`
 (after a mixed resume `members(live)==2` and `display_members` still

@@ -633,6 +633,14 @@ class ConversationFoldTest {
                 titleOf = titleOf,
             ),
         )
+        assertNull(
+            adoptedListedChatTitle(
+                openChatId = "group-09",
+                currentTitle = "standup",
+                listedChats = listOf(listedLive.copy(name = "")),
+                titleOf = titleOf,
+            ),
+        )
     }
 
     @Test

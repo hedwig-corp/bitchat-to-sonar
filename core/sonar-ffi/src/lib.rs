@@ -1698,7 +1698,7 @@ impl SonarNode {
             let is_direct = self.client.group_is_direct(&g.id);
             out.push(GroupInfo {
                 id_hex,
-                name: g.name,
+                name: self.client.display_name(&g.id, &g.name),
                 member_npubs: members,
                 is_direct,
             });

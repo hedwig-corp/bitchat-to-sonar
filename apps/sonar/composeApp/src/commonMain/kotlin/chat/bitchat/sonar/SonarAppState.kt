@@ -578,16 +578,23 @@ internal fun notificationOpenChat(
 ): SonarChat = listedOrFoldedSiblingChat(remappedChatId, listedChats, historicalFolds)
     ?: SonarChat(id = remappedChatId, name = "", members = emptyList(), isDirect = false)
 
-/** After `chats()` lists the remapped row, replace a stub "Group chat" title. */
+/** After `chats()` lists the remapped row, replace a stub "Group chat" title.
+ *  Do not replace a recovered room name with the generic placeholder if the
+ *  live MLS name is still blank. */
 internal fun adoptedListedChatTitle(
     openChatId: String,
     currentTitle: String,
     listedChats: List<SonarChat>,
     titleOf: (SonarChat) -> String,
+    genericTitle: String = "Group chat",
 ): String? {
     val listed = listedChats.firstOrNull { it.id == openChatId } ?: return null
     val next = titleOf(listed)
-    return next.takeIf { it.isNotBlank() && it != currentTitle }
+    if (next.isBlank() || next == currentTitle) return null
+    if (next == genericTitle && currentTitle.isNotBlank() && currentTitle != genericTitle) {
+        return null
+    }
+    return next
 }
 
 /** Copy an open-chat host map from a hidden 0.8 id onto the live sibling. */
