@@ -941,7 +941,9 @@ class ConversationFoldTest {
             ),
         )
         // First-paint extract is 80; a live-only newest page must not
-        // compare overflow to the 500-row retained cap.
+        // compare overflow to the 500-row retained cap. The iOS
+        // snap-to-newest replace path uses the same helper so dropping
+        // those 80 cannot disarm load-older.
         assertTrue(
             newestPageFamilyHasOlder(
                 existingCount = 80,

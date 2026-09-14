@@ -1034,6 +1034,16 @@ family cache is empty (`snFamilyTranscriptNeedsNetworkBackfill` /
 `ConversationFoldTest.transcriptSourceIdsIncludeHiddenHistoricalSibling`,
 `SonarConversationFoldTests` `snFamilyTranscriptNeedsNetworkBackfill`.
 
+iOS snap-to-newest hasOlder hole closed after this commit: after
+paging remounted 0.8 rows the older-edge pin is set; scrolling back
+to the bottom replaces the window with a short live 0.9 page and
+wrote `hasOlder = rawPage.count > page`. Remainder was unreachable.
+The replace path now uses `snNewestPageFamilyHasOlder` (existing
+family count + hidden-sibling/previous arm). Compose
+`refreshTranscriptGroupWindow` already did. Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
+`SonarConversationFoldTests` `snNewestPageFamilyHasOlder`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

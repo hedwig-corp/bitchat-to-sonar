@@ -2677,7 +2677,15 @@ final class MarmotChatModel: ObservableObject {
                         .suffix(Self.localTranscriptRetainedLimit)
                 )
                 localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-                localTranscriptHasOlderByGroup[groupId] = rawPage.count > Self.localTranscriptPageLimit
+                // Snap-to-newest drops remounted 0.8 rows older than this
+                // page. Keep load-older armed so they stay reachable.
+                localTranscriptHasOlderByGroup[groupId] = snNewestPageFamilyHasOlder(
+                    existingCount: existingCanonical.count,
+                    incomingCount: page.count,
+                    pageSize: Self.localTranscriptPageLimit,
+                    rawPageCount: rawPage.count,
+                    previousHasOlder: familyHasOlder || hiddenSiblingHasRows
+                )
                 localTranscriptPreservesOlderEdgeGroups.remove(groupId)
             }
             var byGroup = messagesByGroup
