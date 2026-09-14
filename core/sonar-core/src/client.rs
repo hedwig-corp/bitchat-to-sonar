@@ -4737,10 +4737,29 @@ impl SonarClient {
 
     /// Retry one failed outgoing message using the exact encrypted event stored
     /// in the durable outbox. This never creates a second local transcript row
-    /// or advances MLS state; it only republishes the original wrapper event.
+    /// or advances MLS state; it only republishes the original wrapper event
+    /// when that event is still live 0.9 ciphertext.
     pub async fn retry_message(&self, message_id_hex: &str) -> Result<String> {
         if self.relays.is_empty() {
             return Err(Error::NoRelayConnected);
+        }
+        let group_id_hex = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .group_id_hex_for_message(message_id_hex)
+            .ok_or_else(|| Error::InvalidInput("message is no longer available to retry".into()))?;
+        let Some(group_id) = decode_group_id_hex(&group_id_hex) else {
+            return Err(Error::InvalidInput(
+                "message is no longer available to retry".into(),
+            ));
+        };
+        self.restore_recorded_folds_from_index();
+        // 0.8 ciphertext cannot be decrypted by a 0.9 peer. Refuse before
+        // flipping the row back to Pending, or a tap would republish the
+        // dead wrapper and a successful relay ACK would paint Sent.
+        if !self.engine.is_live_group(&group_id).unwrap_or(false) {
+            return Err(Error::HistoricalProtocolRetry);
         }
         let (group_id_hex, event) = self
             .outbox_state
@@ -4756,7 +4775,7 @@ impl SonarClient {
         if self.relays.is_empty() {
             return;
         }
-        // `retryable_events` deletes rows whose group is not in this set.
+        // `retryable_events` deletes rows whose group is not in `active`.
         // Live MLS ids alone drop recovered 0.8 pending sends on the first
         // 0.9 connect; hosts then paint those mine rows as Sent.
         self.restore_recorded_folds_from_index();
@@ -4764,30 +4783,49 @@ impl SonarClient {
         if active_group_ids.is_empty() {
             return;
         }
-        let retryable = {
+        let publishable_group_ids = self.outbox_publishable_group_ids();
+        let (retryable, newly_failed) = {
             let mut outbox = self.outbox_state.lock().unwrap();
-            match outbox.retryable_events(Timestamp::now().as_secs(), &active_group_ids) {
-                Ok(events) => events,
+            match outbox.retryable_events(
+                Timestamp::now().as_secs(),
+                &active_group_ids,
+                &publishable_group_ids,
+            ) {
+                Ok(result) => result,
                 Err(err) => {
                     tracing::debug!(%err, "failed to load retryable outbox events");
                     return;
                 }
             }
         };
+        for group_id_hex in newly_failed {
+            self.notify_conversation_changed(&group_id_hex);
+        }
         for (message_id_hex, group_id_hex, event) in retryable {
-            let Some(group_id) = decode_group_id_hex(&group_id_hex) else {
-                continue;
-            };
-            // 0.8 ciphertext cannot be decrypted by a 0.9 peer. Keep the
-            // row so the transcript stays Pending/Failed, but do not
-            // republish it on the new wire.
-            if !self.engine.is_live_group(&group_id).unwrap_or(false) {
-                continue;
-            }
             // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
+    }
+
+    /// Live 0.9 MLS ids only. Fold aliases of a live group include the
+    /// recovered 0.8 sibling; that sibling's stored wrapper is still 0.8
+    /// ciphertext and must not be republished.
+    fn outbox_publishable_group_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        match self.engine.groups() {
+            Ok(groups) => {
+                for group in groups {
+                    if self.engine.is_live_group(&group.id).unwrap_or(false) {
+                        ids.insert(hex::encode(group.id.as_slice()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(%err, "failed to load live groups for outbox publish");
+            }
+        }
+        ids
     }
 
     /// Groups whose outbox rows must survive idle retry. Live 0.9 ids plus

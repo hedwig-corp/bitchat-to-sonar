@@ -1388,8 +1388,23 @@ async fn recovered_08_pending_outbox_survives_upgrade_connect() {
     assert!(recovered[0].mine, "outbound 0.8 row must stay mine");
     assert_eq!(
         recovered[0].delivery_state,
-        sonar_core::marmot::DeliveryState::Pending,
+        sonar_core::marmot::DeliveryState::Failed,
         "upgrade connect must not purge the 0.8 outbox row and lie that it sent"
+    );
+
+    let err = alice
+        .retry_message(&message_id.to_hex())
+        .await
+        .expect_err("manual retry must not republish 0.8 ciphertext");
+    assert!(
+        matches!(err, sonar_core::Error::HistoricalProtocolRetry),
+        "retry must refuse with HistoricalProtocolRetry, got {err:?}"
+    );
+    let still = alice.messages(&historical).expect("recovered after retry");
+    assert_eq!(
+        still[0].delivery_state,
+        sonar_core::marmot::DeliveryState::Failed,
+        "refusing retry must keep the outbox row so the transcript stays Failed, not Sent"
     );
 }
 

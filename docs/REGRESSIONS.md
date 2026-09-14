@@ -2716,6 +2716,43 @@ flag cannot fold an empty-topic remounted room onto the welcomer 1:1.
   Empty-desc lost-sidecar heals restore only binds already recorded in
   the conversation index at mint time.
 
+## R-046 — A recovered 0.8 pending send must not paint delivered
+
+**Invariant:** After a 0.8 → 0.9.14 upgrade, a still-pending outbound row
+stays on disk, paints Failed (not Sent, not eternal Sending), and a user
+tap on retry refuses to republish the 0.8 wrapper.
+
+**Breaks as:** The transcript shows Sent while the peer never decrypts the
+message; or shows Sending forever with no retry; or a tap publishes 0.8
+ciphertext that a 0.9 / White Noise peer cannot read and a relay ACK
+flips the row Sent.
+
+**Call sites:** Rust `client.rs::retry_outbox`, `client.rs::retry_message`,
+`outbox.rs::retryable_events`; Compose `SonarAppState.retryMessage` /
+`sonarCanRetryMessage` (Failed → retry button); iOS
+`MarmotChatModel.retryMessage` / `snCanRetryFailedMessage`. Hosts paint
+`delivery_state` from core and only offer retry on Failed.
+
+**Guarded by:** `e2e.rs::recovered_08_pending_outbox_survives_upgrade_connect`
+
+**Also guarded by:** `outbox.rs::retryable_events_keeps_unpublishable_active_rows_and_marks_failed`
+
+**Not guarded:** host toast copy; re-encrypt-in-place onto a new 0.9 group
+(would mint a second transcript row). iOS tests do not run in CI.
+
+**History:** #613. `retry_outbox` first kept recovered 0.8 group ids so
+upgrade connect would not purge the row and paint Sent. Leaving it
+Pending then painted eternal Sending, and `retry_message` still
+republished the dead wrapper.
+
+**Rejected:**
+- *Deleting the outbox row so the mine message paints Sent.* The 0.9 peer
+  never received it.
+- *Re-sending via `resolve_send_group` + `send_text` from `retry_message`.*
+  That API is documented never to create a second local transcript row.
+- *Including fold aliases of a live group in the publishable set.* After
+  resume the hist id is an alias of live; its stored wrapper is still 0.8.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

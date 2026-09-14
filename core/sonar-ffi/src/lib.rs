@@ -1633,8 +1633,10 @@ impl SonarNode {
     }
 
     /// Retry one failed outgoing message from the durable local outbox. The
-    /// original encrypted event is republished, so retry cannot duplicate the
-    /// plaintext transcript row or mutate MLS state a second time.
+    /// original encrypted event is republished when it is still live 0.9
+    /// ciphertext, so retry cannot duplicate the plaintext transcript row
+    /// or mutate MLS state a second time. Recovered 0.8 rows refuse with
+    /// `HistoricalProtocolRetry` and stay Failed.
     pub fn retry_message(&self, message_id_hex: String) -> FfiResult<String> {
         Ok(self
             .runtime

@@ -96,6 +96,11 @@ pub enum Error {
     #[error("no relay connected within timeout")]
     NoRelayConnected,
 
+    /// Recovered 0.8 ciphertext cannot be republished on the 0.9 wire.
+    /// Hosts must keep the row Failed (not Sent) and tell the user to send again.
+    #[error("this message used an older Sonar protocol; send it again")]
+    HistoricalProtocolRetry,
+
     #[error("rng error: {0}")]
     Rng(#[from] getrandom::Error),
 }
