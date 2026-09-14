@@ -191,6 +191,7 @@ Guarded by:
 - `ConversationFoldTest.foldedHistoricalComposerDraftMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalComposerReplyMovesOntoLiveSibling`
 - `ConversationFoldTest.foldedHistoricalSnapshotMessagesMoveOntoLiveSibling`
+- `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
   (also pins `live_fold_target_hex` after the home-list hide)
 
@@ -361,7 +362,9 @@ when the user already left the recovered transcript — so the live composer
 is not empty after fold. Remount of an open chat does not overwrite a
 non-empty live draft. Host snapshot / in-memory transcript rows on the
 hidden id are copied onto the live sibling so home preview does not go
-blank between `groups()` hide and the next bounded page. A pending welcome with
+blank between `groups()` hide and the next bounded page. A notification
+tap whose payload still names the hidden 0.8 id remaps onto
+`live_fold_target` instead of toasting that the chat is gone. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
 (new DM with the same known peer) is the same hazard and must skip

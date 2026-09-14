@@ -51,6 +51,7 @@ object SonarNotificationHandoff {
         knownChatIds: Set<String>,
         foldedGroupPeerIds: Map<String, String>,
         foldedGroupIds: Set<String>,
+        liveFoldTargets: Map<String, String> = emptyMap(),
     ): SonarNotificationOpenTarget? {
         val id = conversationId.trim()
         if (id.isEmpty()) return null
@@ -64,6 +65,9 @@ object SonarNotificationHandoff {
                 }
             }
             return SonarNotificationOpenTarget.Chat(id)
+        }
+        liveFoldTargets[id]?.takeIf { it in knownChatIds }?.let {
+            return SonarNotificationOpenTarget.Chat(it)
         }
         if (id.startsWith(MESH_CHAT_PREFIX)) {
             val peerId = id.removePrefix(MESH_CHAT_PREFIX)

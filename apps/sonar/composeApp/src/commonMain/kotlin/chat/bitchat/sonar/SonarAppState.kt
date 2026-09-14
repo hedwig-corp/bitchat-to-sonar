@@ -5414,11 +5414,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         conversationId: String,
         jumpMessageId: String? = null,
     ): Boolean {
+        val foldLookup = conversationId.removePrefix("marmot:")
+        val liveFold = runCatching { SonarCore.liveFoldTarget(foldLookup) }.getOrNull()
+            ?: runCatching { SonarCore.liveFoldTarget(conversationId) }.getOrNull()
+        val liveFoldTargets = liveFold?.let {
+            mapOf(conversationId to it, foldLookup to it)
+        }.orEmpty()
         val target = SonarNotificationHandoff.resolveOpenTarget(
             conversationId = conversationId,
             knownChatIds = chats.mapTo(hashSetOf()) { it.id },
             foldedGroupPeerIds = foldedGroupPeerIds,
             foldedGroupIds = foldedGroupIds,
+            liveFoldTargets = liveFoldTargets,
         ) ?: return false
         when (target) {
             is SonarNotificationOpenTarget.MeshPeer ->
@@ -5426,6 +5433,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             is SonarNotificationOpenTarget.Chat -> {
                 val chat = chats.firstOrNull { it.id == target.chatId } ?: return false
                 openChat(chat, jumpMessageId = jumpMessageId)
+                if (conversationId != target.chatId) {
+                    clearNotificationsForChat(conversationId)
+                }
             }
         }
         return true

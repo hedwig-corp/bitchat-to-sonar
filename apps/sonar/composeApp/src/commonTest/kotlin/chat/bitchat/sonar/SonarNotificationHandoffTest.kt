@@ -89,6 +89,29 @@ class SonarNotificationHandoffTest {
     }
 
     @Test
+    fun resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling() {
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("group-09"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "group-08",
+                knownChatIds = setOf("group-09"),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertNull(
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "group-08",
+                knownChatIds = setOf("group-09"),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = mapOf("group-08" to "missing-live"),
+            ),
+        )
+    }
+
+    @Test
     fun normalizeJumpMessageIdTrimsAndDropsBlanks() {
         assertEquals("msg-1", SonarNotificationHandoff.normalizeJumpMessageId(" msg-1 "))
         assertNull(SonarNotificationHandoff.normalizeJumpMessageId("   "))

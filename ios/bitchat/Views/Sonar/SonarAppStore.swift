@@ -10049,12 +10049,55 @@ final class SonarAppStore: ObservableObject {
             }
             return
         }
-        guard let target = resolveNotificationConversation(id) else {
-            // Deleted / left / never-hydrated — clear the shade, stay on Home.
+        if let target = resolveNotificationConversation(id) {
+            openDM(target.id, marmotGroupId: target.marmotGroupId, jumpMessageId: jump)
+            return
+        }
+        Task { @MainActor in
+            await self.openFoldedNotificationConversation(id, jump: jump)
+        }
+    }
+
+    /// A shade tap can still carry the hidden 0.8 group id after resume.
+    /// Remap it onto `live_fold_target` instead of treating the chat as gone.
+    @MainActor
+    private func openFoldedNotificationConversation(_ id: String, jump: String?) async {
+        let groupId = marmotGroupId(id) ?? {
+            id.count == 64 && id.allSatisfy(\.isHexDigit) ? id.lowercased() : nil
+        }()
+        guard let groupId,
+              let live = await marmot.liveFoldTarget(groupId: groupId) else {
             clearNotificationsForConversation(id)
             return
         }
-        openDM(target.id, marmotGroupId: target.marmotGroupId, jumpMessageId: jump)
+        let remounted = snRemountFoldedOpenGroupId(
+            openGroupId: groupId,
+            listedGroupIds: Set(marmot.groups.map(\.id)),
+            liveFoldTarget: live
+        )
+        guard remounted != groupId else {
+            clearNotificationsForConversation(id)
+            return
+        }
+        let liveId = Self.marmotIDPrefix + remounted
+        if isConversationOpen(liveId) || isConversationOpen(remounted) {
+            clearNotificationsForConversation(id)
+            clearNotificationsForConversation(liveId)
+            if let jump {
+                pendingJumpMessageIdByDM[liveId] = jump
+                jumpMessageIdAtOpenByDM[liveId] = jump
+                objectWillChange.send()
+            }
+            return
+        }
+        if let row = dmRows.first(where: {
+            $0.marmotGroupId == remounted || $0.id == liveId
+        }) {
+            openDM(row.id, marmotGroupId: remounted, jumpMessageId: jump)
+        } else {
+            openDM(liveId, marmotGroupId: remounted, jumpMessageId: jump)
+        }
+        clearNotificationsForConversation(id)
     }
 
     /// Drop a one-shot Jump target after the host has applied (or soft-failed)

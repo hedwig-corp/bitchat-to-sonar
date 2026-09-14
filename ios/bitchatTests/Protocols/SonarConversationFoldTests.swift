@@ -67,6 +67,14 @@ struct SonarConversationFoldTests {
                 liveFoldTarget: nil
             ) == "group-08"
         )
+        // Notification / deep-link ids stay on the hidden 0.8 row until remap.
+        #expect(
+            snRemountFoldedOpenGroupId(
+                openGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: "group-09"
+            ) == "group-09"
+        )
         let pairs = snPromotedFoldedMutePairs(
             previousGroupIds: ["group-08", "group-09"],
             currentGroupIds: ["group-09"],
