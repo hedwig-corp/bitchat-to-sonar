@@ -2468,3 +2468,99 @@ async fn persist_folds_lost_core_sidecar_second_dm_does_not_steal_hist() {
         "engine messages(B) must not union hist after a steal"
     );
 }
+
+/// Pre-migration join requests and `sinvite1` tokens still key the
+/// recovered 0.8 id. Host group-info queries the listed live sibling.
+/// After the JSON sidecar is lost, `invite_family` must restore the
+/// recorded index bind or those rows vanish until housekeeping.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_invite_family_sees_hist_requests() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+
+    let token = alice
+        .create_invite_link(&historical, "alice bob carol")
+        .expect("mint after fold remaps onto live");
+    let decoded = sonar_core::invite_link::decode_invite_token(&token).expect("decode");
+    assert_eq!(
+        decoded.group_id,
+        live.as_slice(),
+        "post-resume invite must embed the live 0.9 group id"
+    );
+    let requester = Keys::generate().public_key();
+    let stored = alice
+        .store_join_request(sonar_core::invite_link::JoinRequest {
+            requester,
+            group_id: historical.clone(),
+            secret_hash: sonar_core::invite_link::sha256(&decoded.invite_secret),
+            key_package_event_id: None,
+            key_package_d_tag: None,
+            received_at: 1,
+        })
+        .expect("store hist-keyed request");
+    assert!(
+        stored,
+        "family union must still validate a live-minted secret against hist"
+    );
+    assert_eq!(alice.pending_join_requests(&live).len(), 1);
+    assert_eq!(alice.active_invite_links(&live).len(), 1);
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    assert_eq!(
+        alice.pending_join_requests(&live).len(),
+        1,
+        "live group-info must restore the family and see hist-keyed requests"
+    );
+    assert_eq!(
+        alice.active_invite_links(&live).len(),
+        1,
+        "live group-info must restore the family and see hist-keyed links"
+    );
+
+    let reminted = alice
+        .create_invite_link(&historical, "alice bob carol")
+        .expect("mint via hist after sidecar loss");
+    let reminted_decoded =
+        sonar_core::invite_link::decode_invite_token(&reminted).expect("decode remint");
+    assert_eq!(
+        reminted_decoded.group_id,
+        live.as_slice(),
+        "invite_mint_group must restore the bind instead of rejecting hist as unresumed"
+    );
+}

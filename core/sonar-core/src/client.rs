@@ -7405,6 +7405,11 @@ impl SonarClient {
     }
 
     fn invite_family(&self, group_id: &GroupId) -> Vec<GroupId> {
+        // Host group-info queries the listed live id. Pre-migration
+        // `sinvite1` tokens and join requests still key the recovered 0.8
+        // id. Restore a recorded index bind so a lost JSON sidecar does
+        // not hide those rows until housekeeping.
+        self.restore_recorded_folds_touching(group_id);
         self.engine.fold_aliases(group_id)
     }
 
@@ -7417,6 +7422,7 @@ impl SonarClient {
     /// An unresumed recovered room has no live sibling — minting would embed
     /// a dead 0.8 MLS id that a 0.9 joiner cannot request.
     fn invite_mint_group(&self, group_id: &GroupId) -> Result<GroupId> {
+        self.restore_recorded_folds_touching(group_id);
         if self.engine.is_dropped(group_id) {
             return Err(Error::InvalidInput("this chat was deleted".into()));
         }
