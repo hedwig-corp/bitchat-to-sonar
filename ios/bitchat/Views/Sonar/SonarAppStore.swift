@@ -1528,6 +1528,24 @@ func snFoldFamilyCachedMessages<Message>(
     return out
 }
 
+/// Family-union event ids. `loadOlderDM` must compare this, not
+/// `messagesByGroup[live]` only — persist-folds older-pages hist.
+func snFoldFamilyCanonicalMessageIDs<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String
+) -> Set<String> {
+    Set(
+        snFoldFamilyCachedMessages(
+            groupId: groupId,
+            messagesByGroup: messagesByGroup,
+            historicalFolds: historicalFolds,
+            idOf: idOf
+        ).map(idOf)
+    )
+}
+
 func snRetainedTranscriptForChat<Message>(
     chatId: String,
     retainedByChat: [String: [Message]],
@@ -7861,13 +7879,24 @@ final class SonarAppStore: ObservableObject {
         groupIDs: Set<String>
     ) async -> SNConversationTranscriptLoadResult {
         var result = SNConversationTranscriptLoadResult.none
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
-            let before = marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+            let before = snFoldFamilyCanonicalMessageIDs(
+                groupId: group.id,
+                messagesByGroup: marmot.messagesByGroup,
+                historicalFolds: folds,
+                idOf: { $0.id }
+            )
             if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
                 marmotStagedPageRescanIds.insert(group.id)
                 result.record(
                     before: before,
-                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+                    after: snFoldFamilyCanonicalMessageIDs(
+                        groupId: group.id,
+                        messagesByGroup: marmot.messagesByGroup,
+                        historicalFolds: folds,
+                        idOf: { $0.id }
+                    )
                 )
             }
         }

@@ -950,6 +950,25 @@ class ConversationFoldTest {
             listOf("group-09"),
             loadOlderFamilyPageIds("group-09", emptyMap(), mapOf("group-09" to true)),
         )
+        // loadOlderDM may pass hist. A remounted live extract must not be
+        // newest-paged (snap). Empty unpaged hist still needs a newest page.
+        assertFalse(foldFamilySourceNeedsNewestPage("group-09", setOf("group-08"), cachedRowCount = 20))
+        assertTrue(foldFamilySourceNeedsNewestPage("group-08", setOf("group-09"), cachedRowCount = 0))
+        assertEquals(
+            setOf("h1", "l1"),
+            foldFamilyCanonicalMessageIds(
+                "group-09",
+                mapOf(
+                    "group-09" to listOf(
+                        SonarMsg("l1", "me", "live", true, 2L),
+                    ),
+                    "group-08" to listOf(
+                        SonarMsg("h1", "peer", "hist", false, 1L),
+                    ),
+                ),
+                folds,
+            ) { it.id },
+        )
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", folds, setOf("group-08", "group-09")))
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", emptyMap(), setOf("group-09")))
         assertTrue(foldFamilySourceNeedsNewestPage("group-08", setOf("group-09"), cachedRowCount = 0))

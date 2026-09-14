@@ -1191,6 +1191,20 @@ internal fun <V> foldFamilyCachedMessages(
     return out
 }
 
+/** Family-union event ids. iOS `loadOlderDM` must compare this, not
+ *  `messagesByGroup[live]` only — persist-folds older-pages hist. */
+internal fun <V> foldFamilyCanonicalMessageIds(
+    groupId: String,
+    messagesByChat: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    idOf: (V) -> String,
+): Set<String> = foldFamilyCachedMessages(
+    groupId,
+    messagesByChat,
+    historicalFolds,
+    idOf,
+).mapTo(linkedSetOf()) { idOf(it) }
+
 /** Merge recovered transcript rows onto the live sibling after FFI hides the 0.8 id. */
 internal fun <V> mergedFoldedMessageLists(
     historical: List<V>,

@@ -1202,6 +1202,28 @@ struct SonarConversationFoldTests {
             ) == ["group-09"]
         )
         #expect(
+            !snFoldFamilySourceNeedsNewestPage(
+                groupId: "group-09",
+                pagedGroupIds: ["group-08"],
+                cachedRowCount: 20
+            )
+        )
+        #expect(
+            snFoldFamilySourceNeedsNewestPage(
+                groupId: "group-08",
+                pagedGroupIds: ["group-09"],
+                cachedRowCount: 0
+            )
+        )
+        #expect(
+            snFoldFamilyCanonicalMessageIDs(
+                groupId: "group-09",
+                messagesByGroup: ["group-09": ["l1"], "group-08": ["h1"]],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0 }
+            ) == ["h1", "l1"] as Set
+        )
+        #expect(
             !snHiddenFoldFamilyNeedsPage(
                 groupId: "group-09",
                 historicalFolds: ["group-08": "group-09"],

@@ -1227,6 +1227,16 @@ remainder with that sibling's own cursor (Compose
 (`loadOlderFamilyPageIds`),
 `SonarConversationFoldTests` `snLoadOlderFamilyPageIds`.
 
+iOS load-older hist-as-open-id hole closed after this commit:
+`loadOlderDM` pages `localTranscriptGroups` including hist.
+`loadOlderLocalPage(hist)` then treated live as an unpaged hidden
+sibling and newest-paged the remounted extract (snap). Skip newest-page
+when the sibling already has cached rows. `loadOlderDM` compares
+family-union ids so a hist older-page counts as `added` and rebuilds.
+Pins: `ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`
+(`foldFamilyCanonicalMessageIds` / live extract not newest-paged),
+`SonarConversationFoldTests` `snFoldFamilyCanonicalMessageIDs`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

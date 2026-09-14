@@ -2800,6 +2800,16 @@ final class MarmotChatModel: ObservableObject {
         )
         var addedHidden = false
         for sibling in unpaged {
+            // `loadOlderDM` may pass hist. Newest-paging a remounted live
+            // extract snaps (R-045). Only newest-page an empty unpaged sibling.
+            let siblingCached = (messagesByGroup[sibling] ?? [])
+                .filter { !Self.isLocalTranscriptEcho($0) }
+                .count
+            guard snFoldFamilySourceNeedsNewestPage(
+                groupId: sibling,
+                pagedGroupIds: paged,
+                cachedRowCount: siblingCached
+            ) else { continue }
             if await loadLocalPage(groupId: sibling, mode: .newestPage) {
                 addedHidden = true
             }
