@@ -891,6 +891,16 @@ internal fun foldFamilyIds(
     return family.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
+/** Conversation keys a chat-scoped payment read must check after a fold. */
+internal fun paymentActivityPeerKeys(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+): Set<String> {
+    val keys = linkedSetOf(chatId)
+    keys.addAll(foldFamilyIds(chatId, historicalFolds))
+    return keys.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
 /** Drop host fold bindings whose historical or live id was just deleted. */
 internal fun purgedHistoricalFolds(
     folds: Map<String, String>,
@@ -3373,6 +3383,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (next != mutedUntilByChat) {
             mutedUntilByChat = next
             persistMutes()
+        }
+        promoteFoldedPaymentActivitiesFromFolds()
+    }
+
+    /** Persist-rewrite 0.8-keyed wallet rows onto the live sibling. */
+    private fun promoteFoldedPaymentActivitiesFromFolds() {
+        for ((historical, live) in historicalFoldMap) {
+            if (live.isBlank() || live == historical) continue
+            PaymentActivityStore.remountPeerKeys(listOf(historical), live)
         }
     }
 
@@ -12661,6 +12680,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         val listedIds = chats.mapTo(hashSetOf()) { it.id }
         rememberHistoricalFolds(previousOrder.toSet(), listedIds)
+        promoteFoldedPaymentActivitiesFromFolds()
         promoteFoldedMutes(previousOrder.toSet(), listedIds)
         promoteFoldedComposerState(previousOrder.toSet(), listedIds)
         promoteFoldedCallLogs(previousOrder.toSet(), listedIds)
@@ -12919,6 +12939,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             callLogs.remove(open.id)
             callVersion++
         }
+        PaymentActivityStore.remountPeerKeys(listOf(open.id), live)
         if (open.id in recoveredChatNeedsUpdate || live in recoveredChatNeedsUpdate) {
             recoveredChatNeedsUpdate = remountClearsRecoveredWaitingFlag(
                 recoveredChatNeedsUpdate,

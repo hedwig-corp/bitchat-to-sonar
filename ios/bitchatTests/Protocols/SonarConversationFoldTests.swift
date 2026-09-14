@@ -461,6 +461,45 @@ struct SonarConversationFoldTests {
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-08", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])
+        #expect(
+            snPaymentActivityPeerKeys(
+                conversationId: "marmot:group-09",
+                historicalFolds: ["group-08": "group-09"]
+            ) == [
+                "marmot:group-09", "group-09",
+                "marmot:group-08", "group-08",
+            ]
+        )
+        #expect(
+            snPaymentActivityPeerKeys(
+                conversationId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == [
+                "group-08", "marmot:group-08",
+                "group-09", "marmot:group-09",
+            ]
+        )
+        #expect(
+            snRemountedPaymentPeerKey(
+                peerKey: "marmot:group-08",
+                historicalKeys: ["marmot:group-08", "group-08"],
+                liveKey: "marmot:group-09"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snRemountedPaymentPeerKey(
+                peerKey: "wallet",
+                historicalKeys: ["marmot:group-08"],
+                liveKey: "marmot:group-09"
+            ) == "wallet"
+        )
+        #expect(
+            snRemountedPaymentPeerKey(
+                peerKey: "unify:peer",
+                historicalKeys: ["unify:peer"],
+                liveKey: "marmot:group-09"
+            ) == "unify:peer"
+        )
         #expect(snPurgedHistoricalFolds(["group-08": "group-09"], deletedIds: ["group-09"]).isEmpty)
         #expect(
             snPurgedHistoricalFolds(["group-08": "group-09"], deletedIds: ["unrelated"])

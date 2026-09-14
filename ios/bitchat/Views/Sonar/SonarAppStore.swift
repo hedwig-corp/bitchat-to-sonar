@@ -670,6 +670,40 @@ func snFoldFamilyIds(
     return family
 }
 
+/// Conversation keys a chat-scoped payment read must check after a fold.
+/// Includes both bare MLS ids and `marmot:` conversation ids.
+func snPaymentActivityPeerKeys(
+    conversationId: String,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> Set<String> {
+    let bare = snBareMarmotGroupId(conversationId, prefix: prefix)
+    var keys: Set<String> = [conversationId, bare]
+    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+        keys.insert(alias)
+        if !alias.hasPrefix(prefix) {
+            keys.insert(prefix + alias)
+        }
+    }
+    return keys.filter { !$0.isEmpty }
+}
+
+/// Rewrite a conversation-scoped payment peerKey onto the live sibling.
+/// Wallet / Unify keys stay put — those are not Marmot conversation ids.
+func snRemountedPaymentPeerKey(
+    peerKey: String,
+    historicalKeys: Set<String>,
+    liveKey: String
+) -> String {
+    guard !liveKey.isEmpty,
+          peerKey != liveKey,
+          peerKey != "wallet",
+          !peerKey.hasPrefix("unify:"),
+          historicalKeys.contains(peerKey)
+    else { return peerKey }
+    return liveKey
+}
+
 /// Mute keys a foreground / gap-recovery banner must check so a mute
 /// stored on the recovered 0.8 id still silences a live 0.9 push.
 func snMutedFoldKeys(
@@ -6584,7 +6618,13 @@ final class SonarAppStore: ObservableObject {
     }
 
     func cachedPaymentActivityCount(_ id: String) -> Int {
-        paymentActivityLedger.activities(peerKey: id).count
+        paymentActivityLedger.activities(peerKeys: paymentActivityKeys(for: id)).count
+    }
+
+    /// Bare + `marmot:` ids for this conversation and its recovered siblings.
+    private func paymentActivityKeys(for id: String) -> Set<String> {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snPaymentActivityPeerKeys(conversationId: id, historicalFolds: folds)
     }
 
     func cachedCallRecordCount(_ id: String) -> Int {
@@ -6727,7 +6767,7 @@ final class SonarAppStore: ObservableObject {
         limit: Int? = nil,
         newestOffset: Int = 0
     ) -> [(Date, SNMessage)] {
-        let relevant = paymentActivityLedger.activities(peerKey: id).filter { activity in
+        let relevant = paymentActivityLedger.activities(peerKeys: paymentActivityKeys(for: id)).filter { activity in
             payLedger.entry(for: activity.id) == nil || !transcriptPayIDs.contains(activity.id)
         }.sorted { lhs, rhs in
             (lhs.settledAt ?? lhs.createdAt) < (rhs.settledAt ?? rhs.createdAt)
@@ -7882,6 +7922,30 @@ final class SonarAppStore: ObservableObject {
             shared.set(map, forKey: Keys.historicalFolds)
         }
         promoteMutesFromHistoricalFolds(map)
+        promotePaymentActivitiesFromHistoricalFolds(map)
+    }
+
+    /// Persist-rewrite 0.8-keyed wallet rows onto the live sibling. Always
+    /// runs so already-folded testers remount on the next `groups()` sink.
+    @MainActor
+    private func promotePaymentActivitiesFromHistoricalFolds(_ folds: [String: String]) {
+        guard !folds.isEmpty else { return }
+        var changed = false
+        for (historical, live) in folds {
+            guard !live.isEmpty, live != historical else { continue }
+            let liveId = live.hasPrefix(Self.marmotIDPrefix) ? live : Self.marmotIDPrefix + live
+            let historicalKeys: Set<String> = [
+                historical,
+                Self.marmotIDPrefix + historical,
+                snBareMarmotGroupId(historical)
+            ]
+            if paymentActivityLedger.remountPeerKeys(historicalKeys: historicalKeys, onto: liveId) {
+                changed = true
+            }
+        }
+        if changed {
+            objectWillChange.send()
+        }
     }
 
     /// A mute stored on the recovered 0.8 id must also cover the live 0.9
@@ -7996,6 +8060,10 @@ final class SonarAppStore: ObservableObject {
         )
         remountFoldedConversationViewState(from: openId, groupId: groupId, onto: realId)
         remountFoldedPendingUploadMedia(from: groupId, onto: remounted)
+        paymentActivityLedger.remountPeerKeys(
+            historicalKeys: [openId, groupId],
+            onto: realId
+        )
         if pendingMediaPreviews.contains(where: { $0.peerId == openId || $0.peerId == groupId }) {
             pendingMediaPreviews = pendingMediaPreviews.map { preview in
                 PendingMediaPreview(

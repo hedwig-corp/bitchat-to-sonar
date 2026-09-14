@@ -1,5 +1,7 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.wallet.SonarPaymentActivity
+import chat.bitchat.sonar.wallet.remountedPaymentActivities
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -721,6 +723,43 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+    }
+
+    @Test
+    fun foldedHistoricalPaymentActivitiesMoveOntoLiveSibling() {
+        fun row(id: String, peerKey: String) = SonarPaymentActivity(
+            id = id,
+            kind = SonarPaymentActivity.Kind.SonarDirect,
+            peerKey = peerKey,
+            peerName = "Alice",
+            direction = SonarPaymentActivity.Direction.Outgoing,
+            sats = 1000,
+            via = "internet",
+            createdAtSecs = 100,
+            destinationHash = null,
+            status = SonarPaymentActivity.Status.Paid,
+        )
+        val historical = row("pay-08", "group-08")
+        val live = row("pay-09", "group-09")
+        val wallet = row("wallet", "wallet")
+        val unify = row("unify", "unify:peer")
+        assertEquals(
+            listOf(historical.copy(peerKey = "group-09"), live, wallet, unify),
+            remountedPaymentActivities(
+                historicalKeys = listOf("group-08"),
+                liveKey = "group-09",
+                activities = listOf(historical, live, wallet, unify),
+            ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            paymentActivityPeerKeys("group-09", mapOf("group-08" to "group-09")),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            paymentActivityPeerKeys("group-08", mapOf("group-08" to "group-09")),
+        )
+        assertEquals(setOf("group-09"), paymentActivityPeerKeys("group-09", emptyMap()))
     }
 
     @Test

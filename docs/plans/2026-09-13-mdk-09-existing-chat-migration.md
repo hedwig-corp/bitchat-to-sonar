@@ -508,6 +508,15 @@ members / exporter secrets / folds / transcript / parked invites),
 `media_staging::tests::wipe_removes_crashed_state_tmp`,
 `push::tests::wipe_removes_crashed_cache_tmp`,
 `account_backup::tests::wipe_backup_policy_removes_crashed_unique_tmp`,
+`ConversationFoldTest.foldedHistoricalPaymentActivitiesMoveOntoLiveSibling`
+(chat-scoped `SonarPaymentActivity.peerKey` remounts from the hidden 0.8
+id onto the live sibling; wallet / Unify keys stay put. Hosts persist
+the rewrite on fold promote and still read via the fold family so an
+already-folded tester keeps the ⚡ count / transcript inject.
+`SonarPaymentActivityLedgerTest.remountPeerKeysMovesHistoricalChatOntoLiveSibling`,
+`SonarPayTests.testRemountPeerKeysMovesHistoricalChatOntoLiveSibling`,
+`SonarConversationFoldTests` `snPaymentActivityPeerKeys` /
+`snRemountedPaymentPeerKey`),
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
 `SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
