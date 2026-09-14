@@ -940,6 +940,40 @@ class ConversationFoldTest {
                 familyHasOlder = true,
             ),
         )
+        // First-paint extract is 80; a live-only newest page must not
+        // compare overflow to the 500-row retained cap.
+        assertTrue(
+            newestPageFamilyHasOlder(
+                existingCount = 80,
+                incomingCount = 2,
+                rawPageCount = 2,
+                previousHasOlder = false,
+            ),
+        )
+        assertFalse(
+            newestPageFamilyHasOlder(
+                existingCount = 10,
+                incomingCount = 5,
+                rawPageCount = 5,
+                previousHasOlder = false,
+            ),
+        )
+        assertTrue(
+            newestPageFamilyHasOlder(
+                existingCount = 10,
+                incomingCount = 5,
+                rawPageCount = TRANSCRIPT_PAGE_SIZE + 1,
+                previousHasOlder = false,
+            ),
+        )
+        assertTrue(
+            newestPageFamilyHasOlder(
+                existingCount = 10,
+                incomingCount = 5,
+                rawPageCount = 5,
+                previousHasOlder = true,
+            ),
+        )
     }
 
     @Test

@@ -2581,6 +2581,9 @@ final class MarmotChatModel: ObservableObject {
                 hasFoldFamily: familyIds.contains { $0 != groupId },
                 pinnedToOlderEdge: localTranscriptPreservesOlderEdgeGroups.contains(groupId)
             )
+            let familyHasOlder = familyIds.contains {
+                localTranscriptHasOlderByGroup[$0] == true
+            }
             let canonical: [MarmotService.MarmotMessage]
             if shouldPreserveHistoricalWindow {
                 let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
@@ -2596,10 +2599,14 @@ final class MarmotChatModel: ObservableObject {
                     preservingOlderEdge: pinnedToOlderEdge
                 )
                 localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-                localTranscriptHasOlderByGroup[groupId] =
-                    localTranscriptHasOlderByGroup[groupId] == true
-                    || rawPage.count > Self.localTranscriptPageLimit
-                    || merged.count > Self.localTranscriptRetainedLimit
+                localTranscriptHasOlderByGroup[groupId] = snNewestPageFamilyHasOlder(
+                    existingCount: existingCanonical.count,
+                    incomingCount: page.count,
+                    pageSize: Self.localTranscriptPageLimit,
+                    rawPageCount: rawPage.count,
+                    previousHasOlder: familyHasOlder
+                        || merged.count > Self.localTranscriptRetainedLimit
+                )
             } else if shouldMergeFamilyWindow {
                 // A live-only newest page must not drop recovered 0.8 rows.
                 // After persist-folds those rows sit on live (sibling cache
@@ -2610,10 +2617,13 @@ final class MarmotChatModel: ObservableObject {
                         .suffix(Self.localTranscriptRetainedLimit)
                 )
                 localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-                localTranscriptHasOlderByGroup[groupId] =
-                    localTranscriptHasOlderByGroup[groupId] == true
-                    || rawPage.count > Self.localTranscriptPageLimit
-                    || existingCanonical.count + page.count > Self.localTranscriptRetainedLimit
+                localTranscriptHasOlderByGroup[groupId] = snNewestPageFamilyHasOlder(
+                    existingCount: existingCanonical.count,
+                    incomingCount: page.count,
+                    pageSize: Self.localTranscriptPageLimit,
+                    rawPageCount: rawPage.count,
+                    previousHasOlder: familyHasOlder
+                )
             } else {
                 let oldestPageDate = page.map(\.createdAt).min()
                 // Returning from a historical cache window must replace it with a

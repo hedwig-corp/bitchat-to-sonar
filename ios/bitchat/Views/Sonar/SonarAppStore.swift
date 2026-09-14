@@ -570,6 +570,25 @@ func snSeededFoldFamilyTranscriptHasMore(
     familyHasOlder || snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize)
 }
 
+/// Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
+/// Comparing overflow to the 500-row retained cap hid bak remainder after
+/// the first-paint extract (80). Page-size overflow or a short live FFI
+/// page still means older family history exists.
+/// Compose `newestPageFamilyHasOlder`.
+func snNewestPageFamilyHasOlder(
+    existingCount: Int,
+    incomingCount: Int,
+    pageSize: Int = 30,
+    rawPageCount: Int,
+    previousHasOlder: Bool
+) -> Bool {
+    snSeededFoldFamilyTranscriptHasMore(
+        cachedCount: existingCount + incomingCount,
+        pageSize: pageSize,
+        familyHasOlder: previousHasOlder || rawPageCount > pageSize
+    )
+}
+
 /// Visible-row budget that includes `parentId` when it already sits in the
 /// family-unioned host cache. Quote-jump searches the painted suffix; a
 /// parent older than `pageSize` but still in the retained window must

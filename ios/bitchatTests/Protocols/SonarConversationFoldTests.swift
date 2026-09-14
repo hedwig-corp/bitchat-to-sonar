@@ -903,6 +903,38 @@ struct SonarConversationFoldTests {
         #expect(!snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: false))
         #expect(snSeededFoldFamilyTranscriptHasMore(cachedCount: 30, familyHasOlder: true))
         #expect(
+            snNewestPageFamilyHasOlder(
+                existingCount: 80,
+                incomingCount: 2,
+                rawPageCount: 2,
+                previousHasOlder: false
+            )
+        )
+        #expect(
+            !snNewestPageFamilyHasOlder(
+                existingCount: 10,
+                incomingCount: 5,
+                rawPageCount: 5,
+                previousHasOlder: false
+            )
+        )
+        #expect(
+            snNewestPageFamilyHasOlder(
+                existingCount: 10,
+                incomingCount: 5,
+                rawPageCount: 31,
+                previousHasOlder: false
+            )
+        )
+        #expect(
+            snNewestPageFamilyHasOlder(
+                existingCount: 10,
+                incomingCount: 5,
+                rawPageCount: 5,
+                previousHasOlder: true
+            )
+        )
+        #expect(
             snQuotedMessageRevealLimit(
                 parentId: "m5",
                 cached: (1...40).map { "m\($0)" },

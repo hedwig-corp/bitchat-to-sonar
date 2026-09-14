@@ -746,6 +746,23 @@ internal fun seededFoldFamilyTranscriptHasMore(
     familyHasOlder: Boolean = false,
 ): Boolean = familyHasOlder || foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)
 
+/** Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
+ *  Comparing overflow to the 500-row retained cap hid bak remainder after
+ *  the first-paint extract (80). Page-size overflow or a short live FFI
+ *  page still means older family history exists.
+ *  iOS `snNewestPageFamilyHasOlder`. */
+internal fun newestPageFamilyHasOlder(
+    existingCount: Int,
+    incomingCount: Int,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+    rawPageCount: Int,
+    previousHasOlder: Boolean,
+): Boolean = seededFoldFamilyTranscriptHasMore(
+    cachedCount = existingCount + incomingCount,
+    pageSize = pageSize,
+    familyHasOlder = previousHasOlder || rawPageCount > pageSize,
+)
+
 /** Visible-row budget that includes [parentId] when it already sits in the
  *  family-unioned host cache. Quote-jump searches the painted suffix; a
  *  parent older than [pageSize] but still in the retained window must
@@ -12232,11 +12249,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             newest = newest,
             pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
         )
-        val hasMore = when {
-            unboundedCount > TRANSCRIPT_RETAINED_ROWS -> true
-            current != null -> current.hasMore || page.size > TRANSCRIPT_PAGE_SIZE
-            else -> page.size > TRANSCRIPT_PAGE_SIZE
-        }
+        val hasMore = newestPageFamilyHasOlder(
+            existingCount = current?.rows.orEmpty().size,
+            incomingCount = newest.size,
+            rawPageCount = page.size,
+            previousHasOlder = current?.hasMore == true
+                || unboundedCount > TRANSCRIPT_RETAINED_ROWS,
+        )
         transcriptWindows[groupId] = TranscriptGroupWindow(
             rows = merged,
             hasMore = hasMore,
