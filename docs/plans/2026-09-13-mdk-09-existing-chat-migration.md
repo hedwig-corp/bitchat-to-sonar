@@ -168,6 +168,13 @@ Guarded by:
 - `client::tests::incoming_09_room_welcome_folds_recovered_08_room`
   (accepting a 3+ 0.9 room whose other members match the recovered
   sidecar folds history; 2-person named rooms stay off this path)
+- `client::tests::incoming_09_room_welcome_folds_when_live_is_subset_of_recovered`
+  (incoming mixed resume matches `resolve_send_group`: live others
+  may be a unique subset of the recovered roster; leftovers stay
+  late-resume invites)
+- `client::tests::incoming_09_room_welcome_skips_ambiguous_overlapping_rooms`
+  (two recovered rooms that both contain the live others, with no
+  unique name, must not merge)
 - `client::tests::incoming_09_dm_welcome_does_not_fold_recovered_room`
   (R-045 at the incoming-welcome call site: welcomer-only known
   members must not absorb a recovered room into a 1:1)
@@ -646,6 +653,14 @@ only one known peer no longer resumes as `start_dm`. Extract copies
 `historical_resume_is_direct` matches live `group_is_direct`. Early
 `metadata_backfill=complete` markers re-run as `v2` so already-quarantined
 baks pick up the new sidecars.
+
+Incoming mixed-room hole closed after this commit: exact member match
+missed the `resolve_send_group` shape (live others are whoever already
+published a 0.9 KeyPackage). Fold a recovered 3+ room when the live
+others are a **unique subset** of that roster; if two recovered rooms
+overlap with no unique name, skip. Pins:
+`incoming_09_room_welcome_folds_when_live_is_subset_of_recovered`,
+`incoming_09_room_welcome_skips_ambiguous_overlapping_rooms`.
 
 Incoming 0.9 room welcome hole closed after this commit: `maybe_fold`
 used to skip every recovered room (only `resolve_send_group` folded

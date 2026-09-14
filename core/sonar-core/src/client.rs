@@ -7242,33 +7242,84 @@ impl SonarClient {
         let Ok(historical) = self.engine.historical_groups() else {
             return;
         };
+        let live_direct = self.group_is_direct(live_id);
+        let live_count = live_others.len() as u32 + 1;
+        let live_name = self
+            .engine
+            .groups()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|g| g.id == *live_id))
+            .map(|g| g.name)
+            .unwrap_or_default();
+        let mut room_candidates: Vec<(GroupId, String, Vec<PublicKey>)> = Vec::new();
         for group in historical {
             let mut hist_others: Vec<PublicKey> =
                 group.members.into_iter().filter(|pk| *pk != me).collect();
             hist_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
-            if hist_others != live_others {
+            if self.engine.historical_resume_is_direct(&group.id) {
+                // R-003: recovered DM onto the new 2-person group with that
+                // peer. Live may carry a display name (`create_group("alice
+                // & bob")`); do not require `group_is_direct` here.
+                if hist_others == live_others {
+                    self.record_resume_fold(&group.id, live_id);
+                }
                 continue;
             }
-            let hist_direct = self.engine.historical_resume_is_direct(&group.id);
-            // R-003: recovered DM onto the new 2-person group with that
-            // peer. Live may carry a display name (`create_group("alice
-            // & bob")`); do not require `group_is_direct` here.
-            if hist_direct {
-                self.record_resume_fold(&group.id, live_id);
+            // Rooms: never absorb into a 1:1 / welcomer DM (R-045). Local
+            // `resolve_send_group` already folds a mixed resume (whoever
+            // published a 0.9 KeyPackage). Incoming accept must do the same
+            // when the live others are a unique subset of one recovered room.
+            if live_direct || live_count < 3 {
                 continue;
             }
-            // Rooms fold only onto a live 3+ non-DM with the same other
-            // members (peer recreated the same room). Never absorb a
-            // room into a 1:1 / welcomer DM (R-045).
-            if self.group_is_direct(live_id) {
-                continue;
-            }
-            let live_count = live_others.len() as u32 + 1;
             let hist_count = self.engine.historical_declared_member_count(&group.id);
-            if live_count >= 3 && hist_count >= 3 {
-                self.record_resume_fold(&group.id, live_id);
+            if hist_count < 3 {
+                continue;
             }
+            if !live_others.iter().all(|pk| hist_others.contains(pk)) {
+                continue;
+            }
+            room_candidates.push((group.id, group.name, hist_others));
         }
+        if let Some(historical) =
+            Self::unique_recovered_room_fold(&room_candidates, &live_others, &live_name)
+        {
+            self.record_resume_fold(&historical, live_id);
+        }
+    }
+
+    /// Pick at most one recovered room for an incoming 0.9 group.
+    /// Prefer an exact member match; otherwise a single subset; otherwise a
+    /// unique name match. Two overlapping rooms with no unique name stay
+    /// unfolder — guessing would merge distinct conversations.
+    fn unique_recovered_room_fold(
+        candidates: &[(GroupId, String, Vec<PublicKey>)],
+        live_others: &[PublicKey],
+        live_name: &str,
+    ) -> Option<GroupId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let exact: Vec<&GroupId> = candidates
+            .iter()
+            .filter(|(_, _, hist)| hist.as_slice() == live_others)
+            .map(|(id, _, _)| id)
+            .collect();
+        if exact.len() == 1 {
+            return Some(exact[0].clone());
+        }
+        if candidates.len() == 1 {
+            return Some(candidates[0].0.clone());
+        }
+        if live_name.is_empty() {
+            return None;
+        }
+        let named: Vec<&GroupId> = candidates
+            .iter()
+            .filter(|(_, name, _)| name == live_name)
+            .map(|(id, _, _)| id)
+            .collect();
+        (named.len() == 1).then(|| named[0].clone())
     }
 
     fn invite_family(&self, group_id: &GroupId) -> Vec<GroupId> {
@@ -11609,6 +11660,157 @@ mod tests {
             bob.conversation_summaries().len(),
             1,
             "folded historical room must leave one home-list row"
+        );
+    }
+
+    /// Mixed resume: the peer's new 0.9 room has whoever already updated.
+    /// Local `resolve_send_group` already folds that; incoming accept must too.
+    #[tokio::test]
+    async fn incoming_09_room_welcome_folds_when_live_is_subset_of_recovered() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = Keys::generate().public_key();
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x38u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(13),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![
+                alice.identity().public_key(),
+                carol.identity().public_key(),
+                dave,
+            ],
+            4,
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice resumes with whoever is on 0.9");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "mixed room welcome")
+            .await;
+        let invite = bob.pending_group_invites().expect("parked").remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("accept mixed room");
+
+        let live = bob.engine.groups().expect("live")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "incoming mixed room must fold like resolve_send_group"
+        );
+        assert!(bob
+            .messages(&live)
+            .expect("union")
+            .iter()
+            .any(|m| m.content == "old standup"));
+    }
+
+    /// Two recovered rooms that both contain the live others: do not guess.
+    #[tokio::test]
+    async fn incoming_09_room_welcome_skips_ambiguous_overlapping_rooms() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = Keys::generate().public_key();
+        let eve = Keys::generate().public_key();
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let standup = GroupId::new([0x48u8; 16]);
+        let lunch = GroupId::new([0x49u8; 16]);
+        for (id, seed, name, extra) in [
+            (standup.clone(), 14u8, "standup", dave),
+            (lunch.clone(), 15u8, "lunch", eve),
+        ] {
+            bob.engine.push_transcript_message(ChatMessage {
+                id: test_event_id(seed),
+                group_id: id.clone(),
+                sender: alice.identity().public_key(),
+                content: name.into(),
+                created_at: Timestamp::from_secs(50),
+                mine: false,
+                delivery_state: crate::marmot::DeliveryState::Received,
+                media: vec![],
+                sticker_ref: None,
+                classification: crate::marmot::MessageClassification::of(name),
+                reply: None,
+            });
+            bob.engine.seed_historical_metadata(
+                id,
+                name,
+                vec![
+                    alice.identity().public_key(),
+                    carol.identity().public_key(),
+                    extra,
+                ],
+                4,
+            );
+        }
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("project", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("ambiguous 3-person group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "ambiguous room")
+            .await;
+        let invite = bob.pending_group_invites().expect("parked").remove(0);
+        bob.accept_group_invite(&invite.id).await.expect("accept");
+
+        assert!(
+            bob.engine.live_fold_target(&standup).is_none()
+                && bob.engine.live_fold_target(&lunch).is_none(),
+            "overlapping recovered rooms with no unique name must not merge"
         );
     }
 
