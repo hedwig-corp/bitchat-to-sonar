@@ -836,6 +836,21 @@ func snTranscriptSourceIds(
     return out
 }
 
+/// Home-row unread across listed 1:1 duplicates plus the hidden 0.8 sibling.
+/// Compose `unreadForFoldFamily` — rooms used to key only the live id.
+func snUnreadForFoldFamily(
+    groupId: String,
+    unreadByGroup: [String: UInt64],
+    historicalFolds: [String: String],
+    listedDuplicateIds: [String] = []
+) -> UInt64 {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: listedDuplicateIds,
+        historicalFolds: historicalFolds
+    ).reduce(UInt64(0)) { $0 + (unreadByGroup[$1] ?? 0) }
+}
+
 /// Ids whose local transcript window must reload for one `conversationChanged`.
 /// A bak remainder / fold-alias tick names the hidden 0.8 id; FFI
 /// `messages()` unions the family, so refresh the listed sibling instead of
@@ -6186,7 +6201,14 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func hasUnreadMarmotMessage(in groups: [MarmotService.MarmotGroup]) -> Bool {
-        groups.contains { (marmot.unreadByGroup[$0.id] ?? 0) > 0 }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        guard let first = groups.first else { return false }
+        return snUnreadForFoldFamily(
+            groupId: first.id,
+            unreadByGroup: marmot.unreadByGroup,
+            historicalFolds: folds,
+            listedDuplicateIds: groups.map(\.id)
+        ) > 0
     }
 
     private func hasVerifiedMarmotGroup(in groups: [MarmotService.MarmotGroup]) -> Bool {
@@ -6648,6 +6670,7 @@ final class SonarAppStore: ObservableObject {
         // (the DM screen renders both transcripts merged) instead of
         // showing a second row.
         var marmotRows: [SNDMRow] = []
+        let historicalFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
@@ -6658,7 +6681,11 @@ final class SonarAppStore: ObservableObject {
                     title: marmot.title(for: group),
                     preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure group · reaches anywhere",
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
+                    unread: snUnreadForFoldFamily(
+                        groupId: group.id,
+                        unreadByGroup: marmot.unreadByGroup,
+                        historicalFolds: historicalFolds
+                    ) > 0,
                     presence: false,
                     verified: false,
                     isMarmot: true,
@@ -8296,6 +8323,7 @@ final class SonarAppStore: ObservableObject {
         }
         if changed {
             snPersistHistoricalFolds(map, to: defaults)
+            invalidateHomeDMRows()
         } else if let shared = UserDefaults(suiteName: Self.appGroupId),
                   (shared.dictionary(forKey: Keys.historicalFolds) as? [String: String]) != map {
             // Heal an App Group mirror that missed a mid-session delete.

@@ -831,6 +831,18 @@ Pins: `ConversationFoldTest.accountRestoreHostFoldsComeFromLiveSiblingNotPreviou
 `SonarConversationFoldTests` `snHistoricalFoldsAfterAccountRestore` /
 `snRetainedScanChatIds`.
 
+Home-row unread hole closed after this commit: open-path
+`transcriptSourceIds` already walked the fold family (viewing suppress,
+mark-read, unread-at-open), but the home badge did not. Compose
+`computeMarmotRowModels` / `unreadForChat` summed listed ids only
+(rooms = live id); iOS room rows keyed `unreadByGroup[group.id]` and
+`hasUnreadMarmotMessage` walked listed 1:1 duplicates. After collapse,
+`unreadByChat[hist]` still held the badge until summaries remounted
+onto live — the visible row looked read. `unreadForFoldFamily` /
+`snUnreadForFoldFamily` reuse the transcript-source set. Pins:
+`ConversationFoldTest.homeRowUnreadFollowsPersistedFoldOntoLiveSibling`,
+`SonarConversationFoldTests` `snUnreadForFoldFamily`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

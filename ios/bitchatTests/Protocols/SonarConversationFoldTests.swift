@@ -530,6 +530,34 @@ struct SonarConversationFoldTests {
             ) == ["group-09"]
         )
         #expect(
+            snUnreadForFoldFamily(
+                groupId: "group-09",
+                unreadByGroup: ["group-08": 3],
+                historicalFolds: ["group-08": "group-09"]
+            ) == 3
+        )
+        #expect(
+            snUnreadForFoldFamily(
+                groupId: "group-09",
+                unreadByGroup: ["group-08": 3],
+                historicalFolds: [:]
+            ) == 0
+        )
+        #expect(
+            snUnreadForFoldFamily(
+                groupId: "group-09",
+                unreadByGroup: ["group-08": 3, "group-09": 1],
+                historicalFolds: ["group-08": "group-09"]
+            ) == 4
+        )
+        #expect(
+            snUnreadForFoldFamily(
+                groupId: "group-09",
+                unreadByGroup: ["group-09": 1],
+                historicalFolds: ["group-08": "group-09"]
+            ) == 1
+        )
+        #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",
                 listedGroupIds: ["group-09"],

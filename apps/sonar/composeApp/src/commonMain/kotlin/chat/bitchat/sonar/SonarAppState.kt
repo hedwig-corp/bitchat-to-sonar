@@ -1159,6 +1159,21 @@ internal fun transcriptSourceIds(
     return out.toList()
 }
 
+/**
+ * Home-row / notification unread across the fold family.
+ *
+ * After collapse the hist row is hidden and `unreadByChat` can still be keyed
+ * on that id until core summaries remount the count onto live. Rooms used to
+ * sum only the listed live id, so a recovered badge vanished until refresh.
+ */
+internal fun unreadForFoldFamily(
+    chatId: String,
+    unreadByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    listedDuplicateIds: Collection<String> = emptyList(),
+): Long = transcriptSourceIds(chatId, listedDuplicateIds, historicalFolds)
+    .sumOf { unreadByChat[it] ?: 0L }
+
 /** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
 internal fun conversationsMatchFoldFamily(
     left: String,
@@ -3737,7 +3752,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             historicalFoldMap.putAll(pruned)
             changed = true
         }
-        if (changed) persistHistoricalFolds()
+        if (changed) {
+            persistHistoricalFolds()
+            // Fold map is mutated in place; row-model identity cache would
+            // otherwise keep a live-only unread sum after hist is hidden.
+            marmotRowsKey = null
+        }
     }
 
     /** Record fingerprint→npub from a 0x53 (persisted on change). When a new
@@ -5724,7 +5744,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         ).count { isVerified(it.id) }
 
     fun unreadForChat(chatId: String): Long =
-        directMarmotChatIds(chatId).sumOf { unreadByChat[it] ?: 0L }
+        unreadForFoldFamily(
+            chatId = chatId,
+            unreadByChat = unreadByChat,
+            historicalFolds = historicalFoldMap,
+            listedDuplicateIds = directMarmotChatIds(chatId),
+        )
 
     /** Last-message preview + timestamp for a chat-list row (design ConvRow):
      *  replaces the static "Tap to open" with the real transcript tail, read
@@ -5779,6 +5804,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         return rows.associate { chat ->
             val pending = isPendingSecureChat(chat.id)
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)
+            val unreadIds = transcriptSourceIds(chat.id, ids, historicalFoldMap)
             val newest = if (pending) null else ids
                 .mapNotNull { visibleMessagesForChat(it, chatSnapshotMessagesByChat[it].orEmpty()).lastOrNull() }
                 .maxByOrNull { it.tsSecs }
@@ -5794,7 +5820,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // a freshly-started chat under older history (iOS dmRows parity).
                 tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
                 verified = ids.any { it in verifiedChatIds },
-                unread = ids.sumOf { unreadByChat[it] ?: 0L } > 0,
+                unread = unreadIds.sumOf { unreadByChat[it] ?: 0L } > 0,
                 pending = pending,
                 multiMember = isMultiMemberChat(chat.id),
             )

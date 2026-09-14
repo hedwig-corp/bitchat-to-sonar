@@ -1390,6 +1390,53 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun homeRowUnreadFollowsPersistedFoldOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val unreadOnHist = mapOf("group-08" to 3L)
+        assertEquals(
+            3L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = unreadOnHist,
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            0L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = unreadOnHist,
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            4L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = mapOf("group-08" to 3L, "group-09" to 1L),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            1L,
+            unreadForFoldFamily(
+                chatId = "group-09",
+                unreadByChat = mapOf("group-09" to 1L),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            2L,
+            unreadForFoldFamily(
+                chatId = "dm-09",
+                unreadByChat = mapOf("dm-08" to 2L),
+                historicalFolds = mapOf("dm-08" to "dm-09"),
+                listedDuplicateIds = listOf("dm-09", "dm-extra"),
+            ),
+        )
+    }
+
+    @Test
     fun deleteAfterFoldDropsTheHiddenHistoricalSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-09", folds))
