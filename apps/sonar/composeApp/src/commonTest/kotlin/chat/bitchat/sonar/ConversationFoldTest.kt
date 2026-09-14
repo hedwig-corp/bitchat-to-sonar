@@ -876,6 +876,28 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            muteConversationIds(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-other"),
+            muteConversationIds(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            muteConversationIds("group-08", folds),
+        )
     }
 
     @Test

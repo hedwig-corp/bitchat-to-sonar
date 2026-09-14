@@ -2972,16 +2972,32 @@ func snRemountedPaymentPeerKey(
 
 /// Mute keys a foreground / gap-recovery banner must check so a mute
 /// stored on the recovered 0.8 id still silences a live 0.9 push.
+/// Empty persist-folds still union the remount pair so a mute from the
+/// painted hist pane stamps the listed live sibling on the first write.
 func snMutedFoldKeys(
     groupIdHex: String,
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> [String] {
     var keys: [String] = []
-    for alias in snFoldFamilyIds(id: groupIdHex, historicalFolds: historicalFolds) {
-        keys.append(alias)
-        if !alias.hasPrefix(prefix) {
-            keys.append(prefix + alias)
+    var seen = Set<String>()
+    func append(_ raw: String) {
+        guard !raw.isEmpty, seen.insert(raw).inserted else { return }
+        keys.append(raw)
+    }
+    for seed in snRemountPairConversationIds(
+        conversationId: groupIdHex,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(seed, prefix: prefix)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+            append(alias)
+            if !alias.hasPrefix(prefix) {
+                append(prefix + alias)
+            }
         }
     }
     return keys
@@ -13927,12 +13943,15 @@ final class SonarAppStore: ObservableObject {
             keys.insert(alias)
         }
         let folds = folds ?? (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        let bareId = id.hasPrefix(Self.marmotIDPrefix)
-            ? String(id.dropFirst(Self.marmotIDPrefix.count))
-            : id
-        for alias in snFoldFamilyIds(id: bareId, historicalFolds: folds) {
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
+        for alias in snMutedFoldKeys(
+            groupIdHex: id,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
             keys.insert(alias)
-            keys.insert(Self.marmotIDPrefix + alias)
         }
         for group in localTranscriptGroups(for: id) where !group.id.isEmpty {
             keys.insert(group.id)

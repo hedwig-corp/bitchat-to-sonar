@@ -2696,6 +2696,27 @@ internal fun paymentConversationStoreId(
     )
 }
 
+/** Mute / unmute keys for one conversation. Empty persist-folds still
+ *  union the remount pair so a mute from a still-hist id stamps live
+ *  on the first write. iOS `snMutedFoldKeys`. */
+internal fun muteConversationIds(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val ids = linkedSetOf<String>()
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        if (id.isNotBlank()) ids += id
+        ids.addAll(foldFamilyIds(id, historicalFolds))
+    }
+    return ids.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
 /** Conversation keys a chat-scoped payment read must check after a fold.
  *  Empty persist-folds still union the remount pair so a moved live row
  *  stays visible on the painted hist pane. */
@@ -8092,7 +8113,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         add(chatId)
         addAll(directMarmotChatIds(chatId))
         addAll(transcriptGroupIds(chatId))
-        addAll(foldFamilyIds(chatId, historicalFoldMap))
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        addAll(
+            muteConversationIds(
+                chatId,
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            ),
+        )
         for (id in directMarmotChatIds(chatId) + transcriptGroupIds(chatId)) {
             addAll(foldFamilyIds(id, historicalFoldMap))
         }
