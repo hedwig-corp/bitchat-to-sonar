@@ -2403,6 +2403,54 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun expectedNewestTsUsesRemountedIndexLatestWhenSnapshotStale() {
+        val folds = mapOf("group-08" to "group-09")
+        val hist = SonarConversationSummary(
+            groupIdHex = "group-08",
+            name = "",
+            latestContent = "from 0.8",
+            latestSenderNpub = "npub1peer",
+            latestAtSecs = 50L,
+            latestMine = false,
+            messageCount = 80L,
+            unreadCount = 4L,
+        )
+        val summaryLatest = conversationLatestAtFromSummaries(listOf(hist), emptyMap())
+        assertEquals(mapOf("group-08" to 50L), summaryLatest)
+        assertEquals(
+            mapOf("group-08" to 50L),
+            conversationLatestAtFromSummaries(null, mapOf("group-08" to 50L)),
+        )
+        val expected = expectedNewestTsForChat(
+            chatId = "group-09",
+            messagesByChat = emptyMap(),
+            latestByChat = mapOf("group-09" to 10L),
+            summaryLatestByChat = summaryLatest,
+            historicalFolds = folds,
+        )
+        assertEquals(50L, expected)
+        assertFalse(
+            shouldRetireOpenChatUnread(
+                unreadAtOpen = 4L,
+                anchorIndex = -1,
+                feedNewestTsSecs = 10L,
+                expectedNewestTsSecs = expected,
+                familyHasOlder = false,
+            ),
+        )
+        assertEquals(
+            10L,
+            expectedNewestTsForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-09" to 10L),
+                summaryLatestByChat = emptyMap(),
+                historicalFolds = folds,
+            ),
+        )
+    }
+
+    @Test
     fun homeRowUnreadFollowsPersistedFoldOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         val unreadOnHist = mapOf("group-08" to 3L)

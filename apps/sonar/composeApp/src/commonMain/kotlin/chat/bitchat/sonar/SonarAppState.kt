@@ -772,6 +772,38 @@ internal fun conversationMessageCountsFromSummaries(
     return summaries.associate { it.groupIdHex to it.messageCount }
 }
 
+/** Index `latest_at` from the last successful summaries probe.
+ *  Failed probe keeps [previous]. Empty success clears.
+ *  iOS `conversationSummariesByGroup[].latestAt`. */
+internal fun conversationLatestAtFromSummaries(
+    summaries: List<SonarConversationSummary>?,
+    previous: Map<String, Long>,
+): Map<String, Long> {
+    if (summaries == null) return previous
+    return summaries.associate { it.groupIdHex to it.latestAtSecs }
+}
+
+/** Newest known timestamp across snapshot + remounted index latest.
+ *  Snapshot-only understates a recovered 0.8 hist `latest_at` when the
+ *  first live page is still short. iOS `expectedNewestMessageDate`. */
+internal fun expectedNewestTsForChat(
+    chatId: String,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    latestByChat: Map<String, Long>,
+    summaryLatestByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Long {
+    val snapshot = localLatestTsForChat(
+        chatId,
+        messagesByChat,
+        latestByChat,
+        historicalFolds,
+    )
+    val index = transcriptSourceIds(chatId, emptyList(), historicalFolds)
+        .maxOfOrNull { summaryLatestByChat[it] ?: 0L } ?: 0L
+    return maxOf(snapshot, index)
+}
+
 /** First-open must not wait on relay when any fold-family cache already
  *  has rows. iOS `openDM` used a live-only empty check
  *  (`snFamilyTranscriptNeedsNetworkBackfill`). */
@@ -2559,6 +2591,21 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  `transcriptKnownNonEmpty` must not hard-code `emptyMap()` — iOS feeds
      *  `conversationSummariesByGroup`. A failed probe keeps this map. */
     private var conversationMessageCountByChat: Map<String, Long> = emptyMap()
+    /** Index `latest_at` from the last successful summaries probe.
+     *  `expectedNewestTsForOpenChat` must not be snapshot-only — iOS reads
+     *  remounted `conversationSummariesByGroup[].latestAt`. */
+    private var conversationLatestAtByChat: Map<String, Long> = emptyMap()
+
+    private fun rememberConversationSummaryIndex(summaries: List<SonarConversationSummary>?) {
+        conversationMessageCountByChat = conversationMessageCountsFromSummaries(
+            summaries,
+            conversationMessageCountByChat,
+        )
+        conversationLatestAtByChat = conversationLatestAtFromSummaries(
+            summaries,
+            conversationLatestAtByChat,
+        )
+    }
 
     private fun localLatestTs(chatId: String): Long =
         localLatestTsForChat(
@@ -3020,6 +3067,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatUnread = openChatUnread - chatId
         scope.launch {
             val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
+            rememberConversationSummaryIndex(summaries)
             val unread = openChatUnreadFromSummaries(summaries, ids)
             if (unread != null) publishCapturedOpenUnread(chatId, unread)
             // Mark after capture so the probe still sees pre-open unread.
@@ -3118,7 +3166,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         foldFamilyIds(chatId, historicalFoldMap).size > 1
 
     /** Newest known local timestamp across the fold family (index + snapshot). */
-    fun expectedNewestTsForOpenChat(chatId: String): Long = localLatestTs(chatId)
+    fun expectedNewestTsForOpenChat(chatId: String): Long = expectedNewestTsForChat(
+        chatId,
+        chatSnapshotMessagesByChat,
+        chatSnapshotLatestByChat,
+        conversationLatestAtByChat,
+        historicalFoldMap,
+    )
 
     /** True when bak / hidden hist / overflow cache may still hold unread rows. */
     fun familyHasOlderForOpenChat(chatId: String): Boolean {
@@ -14277,10 +14331,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         } else {
             runCatching { SonarCore.conversationSummaries() }.getOrNull()
         }
-        conversationMessageCountByChat = conversationMessageCountsFromSummaries(
-            summaries,
-            conversationMessageCountByChat,
-        )
+        rememberConversationSummaryIndex(summaries)
         val pages = if (localChats.isEmpty()) emptyList() else runCatching {
                 SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
         }.getOrDefault(emptyList())
@@ -14911,10 +14962,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         unreadSuppressGroupIds.clear()
         unreadSuppressGroupIds.addAll(pruned)
         unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds)
-        conversationMessageCountByChat = conversationMessageCountsFromSummaries(
-            summaries,
-            conversationMessageCountByChat,
-        )
+        rememberConversationSummaryIndex(summaries)
     }
 
     /** Request a housekeeping pass. Conflated: many requests within one in-flight

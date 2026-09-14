@@ -1441,6 +1441,14 @@ painted a blank transcript. Cache counts from the last successful summaries
 probe and keep them on a failed probe. Pin:
 `ConversationFoldTest.failedSummariesProbeKeepsHistMessageCountForBlankRecovery`.
 
+Compose `expectedNewestTsForOpenChat` was snapshot-only `localLatestTs`
+despite the KDoc claiming index + snapshot. iOS reads remounted
+`conversationSummariesByGroup[].latestAt`. A short live first paint
+then retired unread (jump-to-tail) while hist index newest was still
+ahead. Cache `latest_at` from the same summaries probe and max it
+across the fold family. Pin:
+`ConversationFoldTest.expectedNewestTsUsesRemountedIndexLatestWhenSnapshotStale`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot
