@@ -779,17 +779,59 @@ func snQuotedJumpCleared(
     return next
 }
 
+/// Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
+/// hist onto live and drops the hist cache key; cursor / hasOlder maps
+/// keep hist once it has been paged, so a missing paging key means
+/// extract 21–80 and bak are still only in the DB. Compose
+/// `hiddenFoldFamilyNeedsPage`.
+func snHiddenFoldFamilyNeedsPage(
+    groupId: String,
+    historicalFolds: [String: String],
+    pagedGroupIds: Set<String>
+) -> Bool {
+    !snHiddenFoldFamilyIdsNeedingPage(
+        groupId: groupId,
+        historicalFolds: historicalFolds,
+        pagedGroupIds: pagedGroupIds
+    ).isEmpty
+}
+
+func snHiddenFoldFamilyIdsNeedingPage(
+    groupId: String,
+    historicalFolds: [String: String],
+    pagedGroupIds: Set<String>
+) -> [String] {
+    snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
+        .filter { $0 != groupId && !pagedGroupIds.contains($0) }
+        .sorted()
+}
+
+/// This source has no paging key and no cached rows. Newest-page it
+/// (Compose `refreshTranscriptGroupWindow`). A remounted live id with
+/// leftover extract rows must not take this path — that would snap.
+func snFoldFamilySourceNeedsNewestPage(
+    groupId: String,
+    pagedGroupIds: Set<String>,
+    cachedRowCount: Int
+) -> Bool {
+    return !pagedGroupIds.contains(groupId) && cachedRowCount <= 0
+}
+
 /// True when any fold-family id still has an older local page, or when the
 /// unioned host cache itself overflows the painted page. Promote copies
 /// the hist flag onto live asynchronously; first paint of the live row
 /// must still offer load-older for leftover 0.8 remainder.
+/// `unpagedHiddenSibling` is the persist-folds window: host remounted
+/// onto live before hist had a newest page (R-045 — do not invent a fold).
 func snFoldFamilyHasOlder(
     groupId: String,
     hasOlderByGroup: [String: Bool],
     historicalFolds: [String: String],
     cachedCount: Int = 0,
-    pageSize: Int = 0
+    pageSize: Int = 0,
+    unpagedHiddenSibling: Bool = false
 ) -> Bool {
+    if unpagedHiddenSibling { return true }
     if snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize) {
         return true
     }
@@ -9194,6 +9236,23 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Newest-page hidden 0.8 siblings that have never been paged. Host
+    /// remount drops the hist cache key; paging maps keep hist once it has
+    /// a cursor / hasOlder entry, so this is not a tight loop on summaries.
+    /// Compose `refreshTranscriptGroupWindow` for a missing family id.
+    @MainActor
+    private func pageUnpagedHiddenFoldFamily(for groupId: String) async {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let unpaged = snHiddenFoldFamilyIdsNeedingPage(
+            groupId: groupId,
+            historicalFolds: folds,
+            pagedGroupIds: marmot.pagedLocalTranscriptGroupIds()
+        )
+        for sibling in unpaged {
+            _ = await marmot.loadLocalPage(groupId: sibling, mode: .newestPage)
+        }
+    }
+
     /// FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
     /// transcript — or in group-info / contact-profile / an in-flight call on
     /// that id — swap the nav id to the live 0.9 sibling.
@@ -9211,7 +9270,13 @@ final class SonarAppStore: ObservableObject {
             listedGroupIds: listed,
             liveFoldTarget: live
         )
-        guard remounted != groupId else { return }
+        guard remounted != groupId else {
+            // Already sitting on live. Persist-folds remounts hist onto this
+            // id without re-running openedDM — still newest-page the hidden
+            // sibling so extract / bak stay reachable.
+            await pageUnpagedHiddenFoldFamily(for: groupId)
+            return
+        }
         let realId = Self.marmotIDPrefix + remounted
         marmot.remountFoldedLocalTranscriptWindow(from: groupId, onto: remounted)
         remountFoldedPendingEchoes(from: [openId, groupId], onto: realId)

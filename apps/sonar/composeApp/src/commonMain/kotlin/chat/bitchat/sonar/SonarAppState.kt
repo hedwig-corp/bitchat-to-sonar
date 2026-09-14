@@ -930,15 +930,51 @@ internal fun quotedJumpCleared(
     return next
 }
 
+/** Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
+ *  hist onto live and drops the hist cache key; paging maps keep hist
+ *  once it has been paged. iOS `snHiddenFoldFamilyNeedsPage`. */
+internal fun hiddenFoldFamilyNeedsPage(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+): Boolean = hiddenFoldFamilyIdsNeedingPage(
+    groupId,
+    historicalFolds,
+    pagedGroupIds,
+).isNotEmpty()
+
+internal fun hiddenFoldFamilyIdsNeedingPage(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+): List<String> = foldFamilyIds(groupId, historicalFolds)
+    .filter { it != groupId && it !in pagedGroupIds }
+    .sorted()
+
+/** This source has no paging key and no cached rows. Newest-page it
+ *  (iOS `snFoldFamilySourceNeedsNewestPage`). A remounted live id with
+ *  leftover extract rows must not take this path — that would snap. */
+internal fun foldFamilySourceNeedsNewestPage(
+    groupId: String,
+    pagedGroupIds: Set<String>,
+    cachedRowCount: Int,
+): Boolean {
+    return groupId !in pagedGroupIds && cachedRowCount <= 0
+}
+
 /** True when any fold-family id still has an older local page, or when the
- *  unioned host cache itself overflows the painted page. */
+ *  unioned host cache itself overflows the painted page.
+ *  `unpagedHiddenSibling` is the persist-folds window: host remounted
+ *  onto live before hist had a newest page (R-045 — do not invent a fold). */
 internal fun hasOlderForFoldFamily(
     groupId: String,
     hasMoreById: Map<String, Boolean>,
     historicalFolds: Map<String, String>,
     cachedCount: Int = 0,
     pageSize: Int = 0,
+    unpagedHiddenSibling: Boolean = false,
 ): Boolean {
+    if (unpagedHiddenSibling) return true
     if (foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)) return true
     return foldFamilyIds(groupId, historicalFolds).ifEmpty { setOf(groupId) }
         .any { hasMoreById[it] == true }
@@ -12687,6 +12723,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 historicalFoldMap,
                 cachedCount = cachedCount,
                 pageSize = conversationVisibleRowLimit,
+                unpagedHiddenSibling = hiddenFoldFamilyNeedsPage(
+                    groupId,
+                    historicalFoldMap,
+                    transcriptWindows.keys,
+                ),
             )
     }
 

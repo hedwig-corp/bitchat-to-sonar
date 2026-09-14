@@ -1062,6 +1062,71 @@ struct SonarConversationFoldTests {
         #expect(snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: true))
         #expect(!snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: false))
         #expect(
+            snHiddenFoldFamilyNeedsPage(
+                groupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                pagedGroupIds: ["group-09"]
+            )
+        )
+        #expect(
+            snHiddenFoldFamilyIdsNeedingPage(
+                groupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                pagedGroupIds: ["group-09"]
+            ) == ["group-08"]
+        )
+        #expect(
+            !snHiddenFoldFamilyNeedsPage(
+                groupId: "group-09",
+                historicalFolds: ["group-08": "group-09"],
+                pagedGroupIds: ["group-08", "group-09"]
+            )
+        )
+        #expect(
+            !snHiddenFoldFamilyNeedsPage(
+                groupId: "group-09",
+                historicalFolds: [:],
+                pagedGroupIds: ["group-09"]
+            )
+        )
+        #expect(
+            snFoldFamilySourceNeedsNewestPage(
+                groupId: "group-08",
+                pagedGroupIds: ["group-09"],
+                cachedRowCount: 0
+            )
+        )
+        #expect(
+            !snFoldFamilySourceNeedsNewestPage(
+                groupId: "group-09",
+                pagedGroupIds: ["group-09"],
+                cachedRowCount: 0
+            )
+        )
+        #expect(
+            !snFoldFamilySourceNeedsNewestPage(
+                groupId: "group-09",
+                pagedGroupIds: [],
+                cachedRowCount: 20
+            )
+        )
+        #expect(
+            snFoldFamilyHasOlder(
+                groupId: "group-09",
+                hasOlderByGroup: ["group-08": false, "group-09": false],
+                historicalFolds: ["group-08": "group-09"],
+                unpagedHiddenSibling: true
+            )
+        )
+        #expect(
+            !snFoldFamilyHasOlder(
+                groupId: "group-09",
+                hasOlderByGroup: ["group-08": false, "group-09": false],
+                historicalFolds: ["group-08": "group-09"],
+                unpagedHiddenSibling: false
+            )
+        )
+        #expect(
             snFoldFamilyHasOlder(
                 groupId: "group-09",
                 hasOlderByGroup: ["group-08": true],

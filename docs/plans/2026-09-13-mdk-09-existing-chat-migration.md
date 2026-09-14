@@ -1126,6 +1126,16 @@ recovered history. Take `max(tsSecs)` and `latestByChat`. iOS
 Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
 `SonarConversationFoldTests` `snLocalLatestTsForChat`.
 
+Persist-folds already-open live load-older hole closed after this commit:
+host remounts hist onto an already-open live transcript without
+re-running `openedDM`. Home hydrate then drops the hist cache key and
+leaves `hasOlder` false, so extract 21–80 and bak stayed in the DB.
+`hiddenFoldFamilyNeedsPage` arms load-older until hist has a paging
+key; `loadOlderLocalPage` newest-pages that sibling (Compose
+`refreshTranscriptGroupWindow`). Do not invent a fold (R-045). Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`,
+`SonarConversationFoldTests` `snHiddenFoldFamilyNeedsPage`.
+
 Persist-folds quote-preview hole closed after this commit:
 `hydrate_page_reply_previews` only looked at parents on the same FFI
 page. A live reply to a hist parent left an empty chip. Look the

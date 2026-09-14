@@ -2755,10 +2755,39 @@ final class MarmotChatModel: ObservableObject {
     /// row. Returns true only when at least one new row was prepended.
     func loadOlderLocalPage(groupId: String) async -> Bool {
         let folds = historicalFoldsMap()
+        let paged = pagedLocalTranscriptGroupIds()
+        let cachedRowCount = (messagesByGroup[groupId] ?? [])
+            .filter { !Self.isLocalTranscriptEcho($0) }
+            .count
+        // Persist-folds remounted onto live before hist had a newest page.
+        // Compose `refreshTranscriptGroupWindow` creates that missing window
+        // first. Do not newest-page a remounted live id that already holds
+        // extract rows — that snaps. Do not page live FFI with a live
+        // cursor for the hidden sibling (R-045).
+        if snFoldFamilySourceNeedsNewestPage(
+            groupId: groupId,
+            pagedGroupIds: paged,
+            cachedRowCount: cachedRowCount
+        ) {
+            return await loadLocalPage(groupId: groupId, mode: .newestPage)
+        }
+        let unpaged = snHiddenFoldFamilyIdsNeedingPage(
+            groupId: groupId,
+            historicalFolds: folds,
+            pagedGroupIds: paged
+        )
+        var addedHidden = false
+        for sibling in unpaged {
+            if await loadLocalPage(groupId: sibling, mode: .newestPage) {
+                addedHidden = true
+            }
+        }
+        if addedHidden { return true }
         guard snFoldFamilyHasOlder(
                 groupId: groupId,
                 hasOlderByGroup: localTranscriptHasOlderByGroup,
-                historicalFolds: folds
+                historicalFolds: folds,
+                unpagedHiddenSibling: false
               ),
               let cursor = snFoldFamilyPagingCursor(
                 groupId: groupId,
@@ -2861,11 +2890,21 @@ final class MarmotChatModel: ObservableObject {
         return false
     }
 
+    func pagedLocalTranscriptGroupIds() -> Set<String> {
+        Set(localTranscriptCursorByGroup.keys).union(localTranscriptHasOlderByGroup.keys)
+    }
+
     func hasOlderLocalMessages(groupId: String) -> Bool {
-        snFoldFamilyHasOlder(
+        let folds = historicalFoldsMap()
+        return snFoldFamilyHasOlder(
             groupId: groupId,
             hasOlderByGroup: localTranscriptHasOlderByGroup,
-            historicalFolds: historicalFoldsMap()
+            historicalFolds: folds,
+            unpagedHiddenSibling: snHiddenFoldFamilyNeedsPage(
+                groupId: groupId,
+                historicalFolds: folds,
+                pagedGroupIds: pagedLocalTranscriptGroupIds()
+            )
         )
     }
 
