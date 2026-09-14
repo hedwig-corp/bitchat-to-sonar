@@ -67,6 +67,36 @@ struct SonarConversationFoldTests {
                 liveFoldTarget: nil
             ) == "group-08"
         )
+        #expect(
+            snRemountFoldedOpenValues(
+                historicalKeys: ["marmot:group-08", "group-08"],
+                liveKeys: ["marmot:group-09", "group-09"],
+                values: ["marmot:group-08": UInt64(3)]
+            )["marmot:group-09"] == 3
+        )
+        #expect(
+            snRemountFoldedOpenValues(
+                historicalKeys: ["marmot:group-08"],
+                liveKeys: ["marmot:group-09"],
+                values: ["marmot:group-08": UInt64(3), "marmot:group-09": UInt64(1)]
+            )["marmot:group-09"] == 1
+        )
+        #expect(
+            snRemountFoldedOpenValues(
+                historicalKeys: ["group-08"],
+                liveKeys: ["group-09"],
+                values: ["group-08": ["old-1", "old-2"]],
+                preferExisting: { !$0.isEmpty }
+            )["group-09"] == ["old-1", "old-2"]
+        )
+        #expect(
+            snRemountFoldedOpenValues(
+                historicalKeys: ["group-08"],
+                liveKeys: ["group-09"],
+                values: ["group-08": ["old-1"], "group-09": ["already-live"]],
+                preferExisting: { !$0.isEmpty }
+            )["group-09"] == ["already-live"]
+        )
         // Notification / deep-link ids stay on the hidden 0.8 row until remap.
         #expect(
             snRemountFoldedOpenGroupId(

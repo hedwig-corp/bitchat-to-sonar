@@ -286,6 +286,26 @@ func snRemountFoldedOpenGroupId(
     return live
 }
 
+/// Copy an open-chat host map (unread divider, jump, window) from a hidden
+/// 0.8 id onto the live sibling so remount does not treat the chat as a
+/// fresh open.
+func snRemountFoldedOpenValues<Value>(
+    historicalKeys: [String],
+    liveKeys: [String],
+    values: [String: Value],
+    preferExisting: (Value) -> Bool = { _ in true }
+) -> [String: Value] {
+    guard let incoming = historicalKeys.compactMap({ values[$0] }).first else {
+        return values
+    }
+    var next = values
+    for live in liveKeys {
+        if let existing = next[live], preferExisting(existing) { continue }
+        next[live] = incoming
+    }
+    return next
+}
+
 /// Historical group ids that disappeared because they folded onto a listed live id.
 func snPromotedFoldedMutePairs(
     previousGroupIds: Set<String>,
@@ -7442,10 +7462,23 @@ final class SonarAppStore: ObservableObject {
         )
         guard remounted != groupId else { return }
         let realId = Self.marmotIDPrefix + remounted
-        if marmot.messagesByGroup[remounted] == nil,
-           let historical = marmot.messagesByGroup[groupId] {
-            marmot.messagesByGroup[remounted] = historical
-        }
+        marmot.remountFoldedLocalTranscriptWindow(from: groupId, onto: remounted)
+        unreadCountAtOpenByDM = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: unreadCountAtOpenByDM
+        )
+        jumpMessageIdAtOpenByDM = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: jumpMessageIdAtOpenByDM
+        )
+        pendingJumpMessageIdByDM = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: pendingJumpMessageIdByDM
+        )
+        remountFoldedConversationViewState(from: openId, groupId: groupId, onto: realId)
         if let draft = composerDrafts[openId], !draft.isEmpty,
            composerDraft(for: realId).isEmpty {
             setComposerDraft(draft, for: realId)
@@ -7482,7 +7515,41 @@ final class SonarAppStore: ObservableObject {
             path.removeLast()
             path.append(.dm(realId))
         }
-        openedDM(realId, marmotGroupId: remounted)
+        // Do not call `openedDM` here: it hydrates the live id as a fresh
+        // open (`loadLocalWhenConnected` newest-page) and would snap a
+        // scrolled recovered transcript back to the tail. The chat is
+        // already painted; keep it open on the live sibling.
+        conversationViewStates[openId]?.deactivate()
+        conversationViewStates[groupId]?.deactivate()
+        conversationViewStates[realId]?.activate()
+        rememberMarmotGroup(remounted, forConversationId: realId)
+        markMarmotGroupsRead(matchingGroupId: remounted)
+        syncViewingUnreadGroups()
+        Task { await self.marmot.refreshWhenConnected(groupId: remounted, hydrateBeforeSync: false) }
+    }
+
+    /// `ConversationViewState.conversationId` is immutable, so remount creates
+    /// a live-keyed state and copies the recovered window onto it.
+    private func remountFoldedConversationViewState(
+        from openId: String,
+        groupId: String,
+        onto realId: String
+    ) {
+        guard let historical = conversationViewStates[openId] ?? conversationViewStates[groupId]
+        else { return }
+        let liveState: ConversationViewState
+        if let existing = conversationViewStates[realId] {
+            liveState = existing
+        } else {
+            liveState = ConversationViewState(conversationId: realId, store: self)
+            conversationViewStates[realId] = liveState
+            retainedConversationOrder.removeAll { $0 == realId }
+            retainedConversationOrder.append(realId)
+        }
+        liveState.adoptOpenWindow(from: historical)
+        if historical.isPinnedToOlderEdge {
+            preserveHistoricalDM(realId)
+        }
     }
 
     private func resolvePendingSecureChats() {

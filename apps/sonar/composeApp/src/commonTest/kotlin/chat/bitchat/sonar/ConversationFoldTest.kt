@@ -465,6 +465,54 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedOpenUnreadAndTranscriptWindowRemountOntoLiveSibling() {
+        assertEquals(
+            mapOf("group-08" to 3L, "group-09" to 3L),
+            remountFoldedOpenValues(
+                historicalKeys = listOf("group-08"),
+                liveKeys = listOf("group-09"),
+                values = mapOf("group-08" to 3L),
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 3L, "group-09" to 1L),
+            remountFoldedOpenValues(
+                historicalKeys = listOf("group-08"),
+                liveKeys = listOf("group-09"),
+                values = mapOf("group-08" to 3L, "group-09" to 1L),
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 3L, "group-09" to 3L),
+            remountFoldedOpenValues(
+                historicalKeys = listOf("group-08"),
+                liveKeys = listOf("group-09"),
+                values = mapOf("group-08" to 3L, "group-09" to 0L),
+                preferExisting = { it > 0L },
+            ),
+        )
+        val historicalRows = listOf("old-1", "old-2")
+        assertEquals(
+            mapOf("group-08" to historicalRows, "group-09" to historicalRows),
+            remountFoldedOpenValues(
+                historicalKeys = listOf("group-08"),
+                liveKeys = listOf("group-09"),
+                values = mapOf("group-08" to historicalRows),
+                preferExisting = { it.isNotEmpty() },
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to historicalRows, "group-09" to listOf("already-live")),
+            remountFoldedOpenValues(
+                historicalKeys = listOf("group-08"),
+                liveKeys = listOf("group-09"),
+                values = mapOf("group-08" to historicalRows, "group-09" to listOf("already-live")),
+                preferExisting = { it.isNotEmpty() },
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalRoomRemountsOntoLiveSibling() {
         val listed = setOf("group-09")
         assertEquals(

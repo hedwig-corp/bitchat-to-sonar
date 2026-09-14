@@ -521,6 +521,23 @@ internal fun remountFoldedOpenChatId(
     return if (live in listedChatIds) live else openChatId
 }
 
+/** Copy an open-chat host map from a hidden 0.8 id onto the live sibling. */
+internal fun <V> remountFoldedOpenValues(
+    historicalKeys: List<String>,
+    liveKeys: List<String>,
+    values: Map<String, V>,
+    preferExisting: (V) -> Boolean = { true },
+): Map<String, V> {
+    val incoming = historicalKeys.firstNotNullOfOrNull { values[it] } ?: return values
+    var next = values
+    for (live in liveKeys) {
+        val existing = next[live]
+        if (existing != null && preferExisting(existing)) continue
+        next = next + (live to incoming)
+    }
+    return next
+}
+
 /** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
 internal fun promotedFoldedMutes(
     previousIds: Set<String>,
@@ -12435,6 +12452,24 @@ class SonarAppState(private val scope: CoroutineScope) {
         moveSendEchoes(open.id, live)
         retainedTranscriptByChat[open.id]?.let { retainedTranscriptByChat[live] = it }
         retainedTranscriptByChat.remove(open.id)
+        remountFoldedOpenValues(
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+            values = transcriptWindows,
+            preferExisting = { it.rows.isNotEmpty() },
+        ).let { remounted ->
+            transcriptWindows.clear()
+            transcriptWindows.putAll(remounted)
+        }
+        remountFoldedOpenValues(
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+            values = freshCanonicalByGroup,
+            preferExisting = { it.isNotEmpty() },
+        ).let { remounted ->
+            freshCanonicalByGroup.clear()
+            freshCanonicalByGroup.putAll(remounted)
+        }
         openChatUnread[open.id]?.let { openChatUnread = openChatUnread - open.id + (live to it) }
         openChatUnreadAnchor[open.id]?.let { openChatUnreadAnchor = openChatUnreadAnchor - open.id + (live to it) }
         openChatJumpMessageId[open.id]?.let {

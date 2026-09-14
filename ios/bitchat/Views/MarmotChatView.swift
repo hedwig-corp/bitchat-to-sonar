@@ -2913,6 +2913,27 @@ final class MarmotChatModel: ObservableObject {
         localTranscriptPreservesOlderEdgeGroups.insert(groupId)
     }
 
+    /// After FFI hides a folded 0.8 room, keep the in-memory page, older-edge
+    /// pin, and load-older cursor on the live sibling so remount does not snap
+    /// an open recovered transcript back to the newest page.
+    func remountFoldedLocalTranscriptWindow(from historicalGroupId: String, onto liveGroupId: String) {
+        guard historicalGroupId != liveGroupId else { return }
+        if messagesByGroup[liveGroupId]?.contains(where: { !Self.isLocalTranscriptEcho($0) }) != true,
+           let historical = messagesByGroup[historicalGroupId],
+           historical.contains(where: { !Self.isLocalTranscriptEcho($0) }) {
+            messagesByGroup[liveGroupId] = historical
+        }
+        if localTranscriptCursorByGroup[liveGroupId] == nil {
+            localTranscriptCursorByGroup[liveGroupId] = localTranscriptCursorByGroup[historicalGroupId]
+        }
+        if localTranscriptHasOlderByGroup[liveGroupId] == nil {
+            localTranscriptHasOlderByGroup[liveGroupId] = localTranscriptHasOlderByGroup[historicalGroupId]
+        }
+        if localTranscriptPreservesOlderEdgeGroups.contains(historicalGroupId) {
+            localTranscriptPreservesOlderEdgeGroups.insert(liveGroupId)
+        }
+    }
+
     private static func isLocalTranscriptEcho(_ message: MarmotService.MarmotMessage) -> Bool {
         message.id.hasPrefix(optimisticIDPrefix) || message.id.hasPrefix(failedOptimisticIDPrefix)
     }

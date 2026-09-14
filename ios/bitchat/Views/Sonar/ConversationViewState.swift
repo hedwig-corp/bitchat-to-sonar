@@ -407,6 +407,10 @@ final class ConversationViewState: ObservableObject {
 
     var isActive: Bool { rebuildSubscription.isAttached }
 
+    /// True when the render window has left the newest page (scrolled up /
+    /// older-edge pin). Remount must keep this so `openedDM` cannot snap back.
+    var isPinnedToOlderEdge: Bool { needsNewestReload }
+
     /// Follow store invalidations while this conversation is on screen. The
     /// synchronous rebuild is what makes reopen paint current: a retained
     /// transcript stopped following the store when the chat was closed.
@@ -423,6 +427,24 @@ final class ConversationViewState: ObservableObject {
     /// Stop following store invalidations. `messages` is kept for reopen paint.
     func deactivate() {
         rebuildSubscription.detach()
+    }
+
+    /// After an MDK 0.8→0.9 remount, keep the scrolled window / older-edge pin
+    /// on the live sibling. `conversationId` is immutable, so the host creates
+    /// a new state keyed by the live id and copies this window onto it.
+    func adoptOpenWindow(from other: ConversationViewState) {
+        visibleMessageLimit = other.visibleMessageLimit
+        sourceMessageLimit = other.sourceMessageLimit
+        meshNewestOffset = other.meshNewestOffset
+        paymentNewestOffset = other.paymentNewestOffset
+        callNewestOffset = other.callNewestOffset
+        needsNewestReload = other.needsNewestReload
+        lastMeshMessageCount = other.lastMeshMessageCount
+        lastPaymentActivityCount = other.lastPaymentActivityCount
+        lastCallRecordCount = other.lastCallRecordCount
+        renderState = other.renderState
+        hasOlderMessages = other.hasOlderMessages
+        isLoadingOlder = false
     }
 
     /// Coalesce rebuild requests: at most one queued build at a time. A change
