@@ -962,6 +962,23 @@ internal fun foldFamilySourceNeedsNewestPage(
     return groupId !in pagedGroupIds && cachedRowCount <= 0
 }
 
+/** Already sitting on listed live: remountFoldedOpenChatId is a no-op.
+ *  Still newest-page hist so an empty 0.9 room is not stuck on “Say hi”.
+ *  iOS `pageUnpagedHiddenFoldFamily`. */
+internal fun shouldPageHiddenFoldFamilyForOpenLive(
+    openChatId: String,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+): Boolean = hiddenFoldFamilyNeedsPage(openChatId, historicalFolds, pagedGroupIds)
+
+/** Load-older pages missing family windows first, then used to bail when
+ *  the painted feed was empty — empty live rooms never mount that list.
+ *  Publish the family window instead. iOS `dmMsgs` unions immediately. */
+internal fun loadOlderEmptyPaintShouldPublishFamily(
+    paintedCount: Int,
+    familyRowCount: Int,
+): Boolean = paintedCount <= 0 && familyRowCount > 0
+
 /** True when any fold-family id still has an older local page, or when the
  *  unioned host cache itself overflows the painted page.
  *  `unpagedHiddenSibling` is the persist-folds window: host remounted
@@ -12831,7 +12848,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
 
-        val oldestVisible = conversationTranscriptRows.firstOrNull() ?: return false
+        val oldestVisible = conversationTranscriptRows.firstOrNull()
+        if (oldestVisible == null) {
+            val familyRows = groupIds.flatMap { transcriptWindows[it]?.rows.orEmpty() }
+            if (!loadOlderEmptyPaintShouldPublishFamily(0, familyRows.size)) return false
+            refreshConversationRows(familyRows, chatId, generation)
+            return conversationTranscriptRows.isNotEmpty()
+        }
         val peerId = chatId.takeIf(::isMeshChat)?.let(::meshPeerId)
         var sourcesReady = false
         for (attempt in 0..<3) {
@@ -14160,6 +14183,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         activeCall?.let { call ->
             val live = liveFor(call.chatId)
             if (live != call.chatId) activeCall = call.copy(chatId = live)
+        }
+        pageHiddenFoldFamilyForOpenLiveChat()
+    }
+
+    /** Persist-folds remounts hist onto an already-open live transcript
+     *  without swapping the nav id or re-running openChat. Newest-page
+     *  the hidden sibling — iOS `pageUnpagedHiddenFoldFamily`. */
+    private fun pageHiddenFoldFamilyForOpenLiveChat() {
+        val sc = screen as? Screen.Chat ?: return
+        if (isMeshChat(sc.id)) return
+        if (!shouldPageHiddenFoldFamilyForOpenLive(
+                sc.id,
+                historicalFoldMap,
+                transcriptWindows.keys,
+            )
+        ) return
+        val chatId = sc.id
+        scope.launch {
+            val merged = marmotMessagesPageForChat(chatId)
+            if (chatId !in transcriptSessionChatIds() ||
+                (screen as? Screen.Chat)?.id !in transcriptSessionChatIds()
+            ) return@launch
+            setCurrentVisibleMessages(
+                chatId,
+                withSendEchoes(chatId, mergePendingMediaUploads(chatId, merged)),
+            )
         }
     }
 

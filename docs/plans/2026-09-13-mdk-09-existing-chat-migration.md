@@ -1126,6 +1126,17 @@ recovered history. Take `max(tsSecs)` and `latestByChat`. iOS
 Pins: `ConversationFoldTest.snapshotLatestFollowsPersistedFoldOntoLiveSibling`,
 `SonarConversationFoldTests` `snLocalLatestTsForChat`.
 
+Compose already-open live remount hole closed after this commit:
+`remountFoldedOpenChat` only swapped nav when the open id was hist.
+Sitting on an empty listed 0.9 room skipped the hidden sibling page,
+so the UI stayed on “Say hi” until the 30s heartbeat.
+`pageHiddenFoldFamilyForOpenLiveChat` newest-pages hist (iOS
+`pageUnpagedHiddenFoldFamily`); empty load-older publishes the family
+window instead of bailing. Pins:
+`ConversationFoldTest.hasOlderForFoldFamilyReadsHiddenSibling`
+(`shouldPageHiddenFoldFamilyForOpenLive`,
+`loadOlderEmptyPaintShouldPublishFamily`).
+
 Persist-folds already-open live load-older hole closed after this commit:
 host remounts hist onto an already-open live transcript without
 re-running `openedDM`. Home hydrate then drops the hist cache key and

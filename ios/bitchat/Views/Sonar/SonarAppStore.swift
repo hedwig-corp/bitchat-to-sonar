@@ -9239,7 +9239,8 @@ final class SonarAppStore: ObservableObject {
     /// Newest-page hidden 0.8 siblings that have never been paged. Host
     /// remount drops the hist cache key; paging maps keep hist once it has
     /// a cursor / hasOlder entry, so this is not a tight loop on summaries.
-    /// Compose `refreshTranscriptGroupWindow` for a missing family id.
+    /// Compose `pageHiddenFoldFamilyForOpenLiveChat` /
+    /// `shouldPageHiddenFoldFamilyForOpenLive`.
     @MainActor
     private func pageUnpagedHiddenFoldFamily(for groupId: String) async {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]

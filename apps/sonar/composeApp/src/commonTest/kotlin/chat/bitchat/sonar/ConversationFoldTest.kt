@@ -915,6 +915,23 @@ class ConversationFoldTest {
         assertFalse(foldFamilySourceNeedsNewestPage("group-09", setOf("group-09"), cachedRowCount = 0))
         assertFalse(foldFamilySourceNeedsNewestPage("group-09", emptySet(), cachedRowCount = 20))
         assertTrue(
+            shouldPageHiddenFoldFamilyForOpenLive(
+                "group-09",
+                folds,
+                setOf("group-09"),
+            ),
+        )
+        assertFalse(
+            shouldPageHiddenFoldFamilyForOpenLive(
+                "group-09",
+                folds,
+                setOf("group-08", "group-09"),
+            ),
+        )
+        assertTrue(loadOlderEmptyPaintShouldPublishFamily(paintedCount = 0, familyRowCount = 30))
+        assertFalse(loadOlderEmptyPaintShouldPublishFamily(paintedCount = 0, familyRowCount = 0))
+        assertFalse(loadOlderEmptyPaintShouldPublishFamily(paintedCount = 5, familyRowCount = 30))
+        assertTrue(
             hasOlderForFoldFamily(
                 "group-09",
                 mapOf("group-08" to false, "group-09" to false),
