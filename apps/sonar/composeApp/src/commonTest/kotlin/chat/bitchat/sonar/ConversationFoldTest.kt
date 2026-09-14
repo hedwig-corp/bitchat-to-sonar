@@ -1369,6 +1369,18 @@ class ConversationFoldTest {
         )
         assertTrue("group-08" in notificationSuppressIds(listOf("group-09"), folds))
         assertFalse("group-08" in listOf("group-09"))
+        assertEquals(
+            setOf("group-09", "group-08"),
+            notificationClearIds("group-09", emptyList(), folds),
+        )
+        assertEquals(
+            setOf("mesh:peer", "group-09", "group-08"),
+            notificationClearIds("mesh:peer", listOf("group-09"), folds),
+        )
+        assertEquals(
+            setOf("group-09"),
+            notificationClearIds("group-09", emptyList(), emptyMap()),
+        )
         val mesh = meshNotificationSuppressIds("group-09", "mesh:peer", folds)
         assertTrue("group-08" in mesh)
         assertTrue("group-09" in mesh)

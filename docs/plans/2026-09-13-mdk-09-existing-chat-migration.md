@@ -851,6 +851,14 @@ family on the host map (core already did); `openChat` /
 `refreshOpenDm` use `transcriptGroupIds`. iOS `markConversationRead`
 clears the same family keys.
 
+Shade-clear hole: Compose `clearNotificationsForChat` walked listed
+transcript ids but not their hidden 0.8 siblings (mesh rows especially).
+iOS `clearNotificationsForConversation` walked listed 1:1 duplicates
+only. A pre-fold banner keyed on hist stayed in the shade after the
+live row opened. `notificationClearIds` / `snNotificationClearIds`
+expand the fold family (and `marmot:` aliases on iOS). Mute lookup
+walks family of transcript ids the same way.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

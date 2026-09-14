@@ -910,6 +910,33 @@ func snMeshNotificationSuppressIds(
     return out
 }
 
+/// Shade-clear keys for one conversation after a fold. Opening the live
+/// row must dismiss a banner still keyed on the hidden 0.8 id (Compose
+/// `notificationClearIds`).
+func snNotificationClearIds(
+    conversationId: String,
+    relatedIds: [String],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> Set<String> {
+    var out = Set<String>()
+    func insert(_ id: String) {
+        guard !id.isEmpty else { return }
+        out.insert(id)
+        let bare = snBareMarmotGroupId(id, prefix: prefix)
+        guard !bare.isEmpty else { return }
+        out.insert(bare)
+        out.insert(prefix + bare)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+            out.insert(alias)
+            out.insert(prefix + alias)
+        }
+    }
+    insert(conversationId)
+    for id in relatedIds { insert(id) }
+    return out
+}
+
 func snRetainedTranscriptForChat<Message>(
     chatId: String,
     retainedByChat: [String: [Message]],
@@ -11740,7 +11767,14 @@ final class SonarAppStore: ObservableObject {
                 ids.insert(Self.marmotIDPrefix + mapped)
             }
         }
-        NotificationService.shared.clearNotifications(forConversationIds: ids)
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        NotificationService.shared.clearNotifications(
+            forConversationIds: snNotificationClearIds(
+                conversationId: conversationId,
+                relatedIds: Array(ids),
+                historicalFolds: folds
+            )
+        )
     }
 
     func pop() {

@@ -1135,6 +1135,17 @@ internal fun notificationSuppressIds(
     return out.toList()
 }
 
+/** Shade / mute keys for one conversation after a fold.
+ *  Opening the live row must dismiss a banner still keyed on the hidden 0.8 id. */
+internal fun notificationClearIds(
+    chatId: String,
+    relatedIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+): Set<String> = SonarNotificationHandoff.conversationIdsToClear(
+    chatId,
+    notificationSuppressIds(listOf(chatId) + relatedIds, historicalFolds),
+)
+
 /** Mesh-folded White Noise notify: suppress the live group, the mesh row,
  *  and the hidden 0.8 sibling so sitting in recovered history does not ring. */
 internal fun meshNotificationSuppressIds(
@@ -6019,6 +6030,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         addAll(directMarmotChatIds(chatId))
         addAll(transcriptGroupIds(chatId))
         addAll(foldFamilyIds(chatId, historicalFoldMap))
+        for (id in directMarmotChatIds(chatId) + transcriptGroupIds(chatId)) {
+            addAll(foldFamilyIds(id, historicalFoldMap))
+        }
         foldedGroupPeerIds[chatId]?.let { add(meshChatId(it)) }
         if (isMeshChat(chatId)) {
             meshPeerAliases(meshPeerId(chatId)).forEach { add(meshChatId(it)) }
@@ -6227,7 +6241,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         Notifier.clearConversations(
-            SonarNotificationHandoff.conversationIdsToClear(chatId, related)
+            notificationClearIds(chatId, related, historicalFoldMap)
         )
     }
 

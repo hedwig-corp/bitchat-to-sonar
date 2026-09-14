@@ -516,6 +516,23 @@ struct SonarConversationFoldTests {
             )).isSuperset(of: ["group-08", "group-09", "mesh:peer"])
         )
         #expect(
+            snNotificationClearIds(
+                conversationId: "marmot:group-09",
+                relatedIds: [],
+                historicalFolds: ["group-08": "group-09"]
+            ).isSuperset(of: [
+                "marmot:group-09", "group-09",
+                "marmot:group-08", "group-08",
+            ])
+        )
+        #expect(
+            snNotificationClearIds(
+                conversationId: "mesh:peer",
+                relatedIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ).isSuperset(of: ["mesh:peer", "group-09", "group-08", "marmot:group-08"])
+        )
+        #expect(
             snTranscriptSourceIds(
                 groupId: "group-09",
                 listedDirectIds: ["group-09"],
