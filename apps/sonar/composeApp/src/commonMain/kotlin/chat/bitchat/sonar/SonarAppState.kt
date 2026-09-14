@@ -739,6 +739,26 @@ internal fun remountFoldedNavStack(
     }
 }
 
+/** Path remount must see the same live target as open-chat remount.
+ *  Persist-folds can still be empty when FFI already hid hist.
+ *  iOS `snPathRemountLiveTarget`. */
+internal fun pathRemountLiveTarget(
+    id: String,
+    persistedFolds: Map<String, String>,
+    knownLiveTargets: Map<String, String>,
+): String? {
+    val bare = id.removePrefix("marmot:").trim()
+    persistedFolds[bare]?.takeIf { it.isNotBlank() && it != bare }?.let { return it }
+    knownLiveTargets[bare]?.takeIf { it.isNotBlank() }?.let { return it }
+    knownLiveTargets[id]?.takeIf { it.isNotBlank() }?.let { return it }
+    return persistedFolds[bare]
+}
+
+internal fun pathRemountShouldMergeFolds(
+    pathIds: Collection<String>,
+    persistedFolds: Map<String, String>,
+): Boolean = pathIds.any { firstOpenShouldMergeFolds(it, persistedFolds) }
+
 /**
  * Wake mute / FGS banners: merge the host fold blob with FFI
  * `fold_aliases`. FFI wins per historical id — same shape as

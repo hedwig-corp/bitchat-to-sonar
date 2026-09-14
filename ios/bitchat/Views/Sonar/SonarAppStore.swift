@@ -565,6 +565,41 @@ func snRemountFoldedPath(
     }
 }
 
+/// Path remount must see the same live target as open-chat remount.
+/// Persist-folds can still be empty when FFI already hid hist.
+/// Compose `pathRemountLiveTarget`.
+func snPathRemountLiveTarget(
+    id: String,
+    persistedFolds: [String: String],
+    knownLiveTargets: [String: String]
+) -> String? {
+    let bare = snBareMarmotGroupId(id)
+    if let live = persistedFolds[bare], !live.isEmpty, live != bare { return live }
+    if let live = knownLiveTargets[bare], !live.isEmpty { return live }
+    if let live = knownLiveTargets[id], !live.isEmpty { return live }
+    return persistedFolds[bare]
+}
+
+func snPathConversationIds(_ path: [SonarRoute]) -> [String] {
+    path.compactMap { route in
+        switch route {
+        case .dm(let id), .groupInfo(let id), .call(let id, _):
+            return id
+        case .contactProfile(let id, _):
+            return id
+        default:
+            return nil
+        }
+    }
+}
+
+func snPathRemountShouldMergeFolds(
+    pathIds: [String],
+    persistedFolds: [String: String]
+) -> Bool {
+    pathIds.contains { snFirstOpenShouldMergeFolds(seedId: $0, persistedFolds: persistedFolds) }
+}
+
 /// Wake mute / gap-recovery banners: FFI `fold_aliases` over a stale
 /// or empty host blob. Compose `wakeMuteHistoricalFolds`.
 func snWakeMuteHistoricalFolds(
@@ -10151,8 +10186,12 @@ final class SonarAppStore: ObservableObject {
     @MainActor
     private func remountFoldedOpenChatIfNeeded() async {
         let listed = Set(marmot.groups.map(\.id))
+        var knownLiveTargets: [String: String] = [:]
         defer {
-            remountFoldedNavigationPath(listedGroupIds: listed)
+            remountFoldedNavigationPath(
+                listedGroupIds: listed,
+                knownLiveTargets: knownLiveTargets
+            )
             syncViewingUnreadGroups()
         }
         guard let openId = currentDMId, let groupId = marmotGroupId(openId) else { return }
@@ -10162,6 +10201,18 @@ final class SonarAppStore: ObservableObject {
             listedGroupIds: listed,
             liveFoldTarget: live
         )
+        if remounted != groupId {
+            knownLiveTargets[groupId] = remounted
+            knownLiveTargets[snBareMarmotGroupId(openId)] = remounted
+        } else if let live, !live.isEmpty, live != groupId {
+            knownLiveTargets[groupId] = live
+            knownLiveTargets[snBareMarmotGroupId(openId)] = live
+        }
+        let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let pathIds = snPathConversationIds(path) + [openId, groupId]
+        if snPathRemountShouldMergeFolds(pathIds: pathIds, persistedFolds: blob) {
+            _ = await adoptMergedActionFolds(for: pathIds)
+        }
         guard remounted != groupId else {
             // Already sitting on live. Persist-folds remounts hist onto this
             // id without re-running openedDM — still newest-page the hidden
@@ -10278,14 +10329,20 @@ final class SonarAppStore: ObservableObject {
     /// Rewrite group-info / contact-profile / call / buried DM routes after
     /// FFI hides a folded 0.8 id. Transcript remount still copies host state
     /// when the open route is a DM.
-    private func remountFoldedNavigationPath(listedGroupIds: Set<String>) {
+    private func remountFoldedNavigationPath(
+        listedGroupIds: Set<String>,
+        knownLiveTargets: [String: String] = [:]
+    ) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let next = snRemountFoldedPath(
             path: path,
             listedGroupIds: listedGroupIds
         ) { id in
-            let bare = snBareMarmotGroupId(id)
-            return folds[bare]
+            snPathRemountLiveTarget(
+                id: id,
+                persistedFolds: folds,
+                knownLiveTargets: knownLiveTargets
+            )
         }
         if next != path {
             path = next
@@ -10294,7 +10351,11 @@ final class SonarAppStore: ObservableObject {
             let remounted = snRemountFoldedConversationId(
                 call.convId,
                 listedGroupIds: listedGroupIds,
-                liveFoldTarget: folds[snBareMarmotGroupId(call.convId)]
+                liveFoldTarget: snPathRemountLiveTarget(
+                    id: call.convId,
+                    persistedFolds: folds,
+                    knownLiveTargets: knownLiveTargets
+                )
             )
             if remounted != call.convId {
                 activeCall = SNActiveCall(

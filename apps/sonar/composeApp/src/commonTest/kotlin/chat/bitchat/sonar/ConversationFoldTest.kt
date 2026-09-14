@@ -670,6 +670,46 @@ class ConversationFoldTest {
                 ),
             ) { id -> if (id == "group-08") "group-09" else id },
         )
+        assertTrue(
+            pathRemountShouldMergeFolds(
+                pathIds = listOf("marmot:group-08", "marmot:group-09"),
+                persistedFolds = emptyMap(),
+            ),
+        )
+        assertFalse(
+            pathRemountShouldMergeFolds(
+                pathIds = listOf("marmot:group-08"),
+                persistedFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "group-09",
+            pathRemountLiveTarget(
+                id = "marmot:group-08",
+                persistedFolds = emptyMap(),
+                knownLiveTargets = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "group-09",
+            pathRemountLiveTarget(
+                id = "marmot:group-08",
+                persistedFolds = mapOf("group-08" to "group-09"),
+                knownLiveTargets = emptyMap(),
+            ),
+        )
+        assertEquals(
+            listOf(Screen.GroupInfo("group-09")),
+            remountFoldedNavStack(
+                listOf(Screen.GroupInfo("group-08")),
+            ) { id ->
+                pathRemountLiveTarget(
+                    id = id,
+                    persistedFolds = emptyMap(),
+                    knownLiveTargets = mapOf("group-08" to "group-09"),
+                ) ?: id
+            },
+        )
         val stub = notificationOpenChat("group-09", emptyList())
         assertEquals("group-09", stub.id)
         assertEquals("", stub.name)

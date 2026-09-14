@@ -139,6 +139,55 @@ struct SonarConversationFoldTests {
             ]
         )
         #expect(
+            snPathConversationIds([
+                .dm("marmot:group-08"),
+                .groupInfo("marmot:group-08"),
+                .contactProfile("marmot:group-08", "Ada"),
+                .call("marmot:group-08", video: false),
+                .nearby,
+            ]) == [
+                "marmot:group-08",
+                "marmot:group-08",
+                "marmot:group-08",
+                "marmot:group-08",
+            ]
+        )
+        #expect(snPathRemountShouldMergeFolds(
+            pathIds: ["marmot:group-08", "marmot:group-09"],
+            persistedFolds: [:]
+        ))
+        #expect(!snPathRemountShouldMergeFolds(
+            pathIds: ["marmot:group-08"],
+            persistedFolds: ["group-08": "group-09"]
+        ))
+        #expect(
+            snPathRemountLiveTarget(
+                id: "marmot:group-08",
+                persistedFolds: [:],
+                knownLiveTargets: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            snPathRemountLiveTarget(
+                id: "marmot:group-08",
+                persistedFolds: ["group-08": "group-09"],
+                knownLiveTargets: [:]
+            ) == "group-09"
+        )
+        #expect(
+            snRemountFoldedPath(
+                path: [.groupInfo("marmot:group-08")],
+                listedGroupIds: ["group-09"],
+                liveFoldTarget: { id in
+                    snPathRemountLiveTarget(
+                        id: id,
+                        persistedFolds: [:],
+                        knownLiveTargets: ["group-08": "group-09"]
+                    )
+                }
+            ) == [.groupInfo("marmot:group-09")]
+        )
+        #expect(
             snNotificationOpenGroupId(
                 tappedGroupId: "group-08",
                 liveFoldTarget: "group-09"
