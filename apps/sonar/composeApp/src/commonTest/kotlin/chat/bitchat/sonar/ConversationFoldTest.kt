@@ -1132,6 +1132,8 @@ class ConversationFoldTest {
             TRANSCRIPT_RETAINED_ROWS,
             quotedMessageRevealLimit("r1", retained),
         )
+        assertTrue(shouldSettleQuotedJump(parentInFeed = true))
+        assertFalse(shouldSettleQuotedJump(parentInFeed = false))
     }
 
     @Test

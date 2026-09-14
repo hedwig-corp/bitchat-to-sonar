@@ -763,6 +763,11 @@ internal fun quotedMessageRevealLimit(
     return maxOf(pageSize, cached.size - idx).coerceAtMost(retainedRows)
 }
 
+/** Keep a Jump target until the parent is in the painted feed.
+ *  Soft-fail must not clear it: 0.8 remainder / family reveal can still
+ *  admit the row. iOS `snShouldSettleQuotedJump`. */
+internal fun shouldSettleQuotedJump(parentInFeed: Boolean): Boolean = parentInFeed
+
 /** True when any fold-family id still has an older local page, or when the
  *  unioned host cache itself overflows the painted page. */
 internal fun hasOlderForFoldFamily(

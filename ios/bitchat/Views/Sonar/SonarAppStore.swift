@@ -587,6 +587,13 @@ func snQuotedMessageRevealLimit<Message>(
     return min(retainedRows, max(pageSize, cached.count - idx))
 }
 
+/// Keep a Jump target until the parent is in the painted feed.
+/// Soft-fail must not clear it: 0.8 remainder / family reveal can still
+/// admit the row. Compose `shouldSettleQuotedJump`.
+func snShouldSettleQuotedJump(parentInFeed: Bool) -> Bool {
+    parentInFeed
+}
+
 /// True when any fold-family id still has an older local page, or when the
 /// unioned host cache itself overflows the painted page. Promote copies
 /// the hist flag onto live asynchronously; first paint of the live row

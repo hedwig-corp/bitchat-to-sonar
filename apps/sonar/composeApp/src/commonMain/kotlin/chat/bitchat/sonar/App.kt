@@ -1604,7 +1604,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         listState.scrollToItem(idx)
                         needsLiveEdgeOpen = false
                         didInitialScroll = true
-                        state.clearOpenChatJump(screen.id)
+                        if (shouldSettleQuotedJump(jumpIdx >= 0)) {
+                            state.clearOpenChatJump(screen.id)
+                        }
                     }
                 }
             } else {
@@ -1624,7 +1626,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     is TranscriptOpenAction.Jump -> {
                         needsLiveEdgeOpen = false
                         didInitialScroll = true
-                        state.clearOpenChatJump(screen.id)
+                        // Keep the target: the retry effect below scrolls when
+                        // remainder / family reveal admits the parent.
                     }
                 }
             }
@@ -1660,10 +1663,20 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         if (!didInitialScroll) return@LaunchedEffect
         val jumpId = state.openChatJumpMessageId[screen.id] ?: return@LaunchedEffect
         val jumpIdx = feed.indexOfFirst { transcriptFeedKey(it) == jumpId }
-        if (jumpIdx < 0) return@LaunchedEffect
+        if (jumpIdx < 0) {
+            // Parent not painted yet. Pull one older local page (including
+            // 0.8 remainder) so this effect can retry when feed.size grows.
+            val added = state.loadOlderMessages(screen.id)
+            if (!added) {
+                state.clearOpenChatJump(screen.id)
+            }
+            return@LaunchedEffect
+        }
         val idx = chatFeedListIndexForFeedRow(listItems, jumpIdx).coerceAtLeast(0)
         listState.scrollToItem(idx)
-        state.clearOpenChatJump(screen.id)
+        if (shouldSettleQuotedJump(true)) {
+            state.clearOpenChatJump(screen.id)
+        }
     }
 
     // Load one local cursor page when the reader reaches the top. Capture a

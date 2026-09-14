@@ -234,6 +234,8 @@ struct TranscriptScrollPolicyTests {
                 expectedNewestDate: nil, lastExpectedNewestDate: nil
             )
         )
+        #expect(TranscriptScrollPolicy.shouldSettleJump(parentVisible: true))
+        #expect(!TranscriptScrollPolicy.shouldSettleJump(parentVisible: false))
     }
 
     /// A resting offset above `minY` is the blank-chat shape: with a short-feed

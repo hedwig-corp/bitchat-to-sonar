@@ -79,8 +79,9 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     /// Runs on the UIKit update path before `apply` — use for app render-context
     /// sync so SwiftUI `body` stays side-effect free.
     var prepareForUpdate: (() -> Void)?
-    /// Invoked once after a Jump open-action is applied (hit or soft-fail) so
-    /// the app can clear its one-shot jump target (#372).
+    /// Invoked after a Jump open-action hits the painted entries so the app
+    /// can clear its one-shot jump target (#372). Soft-fail must not settle:
+    /// 0.8 remainder / family reveal can still admit the parent.
     var onJumpSettled: (() -> Void)?
     /// O(1) app-owned content revision. While it (and the open-action inputs)
     /// are unchanged, apply skips the O(n) snapshot rebuild — composer
@@ -447,6 +448,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         )
         let previousUnread = self.unreadCountAtOpen
         let previousJump = self.jumpMessageId
+        let previousEntries = self.entries
         self.entries = entries
         self.unreadCountAtOpen = unreadCountAtOpen
         self.expectedNewestDate = expectedNewestDate
@@ -465,6 +467,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             didInitialScroll = true
         } else if previousJump != jumpMessageId, jumpMessageId != nil {
             applyOpenAction(transcriptOpenAction)
+        } else if let jump = jumpMessageId,
+                  entries.contains(where: { $0.id == jump }),
+                  !previousEntries.contains(where: { $0.id == jump }) {
+            applyOpenAction(.jump(id: jump))
         } else if !hadAnchor, unreadAnchorId != nil {
             applyOpenAction(.unreadDivider)
         } else if previousUnread != unreadCountAtOpen {
@@ -714,8 +720,13 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                 guard let self else { return }
                 if let indexPath = self.dataSource?.indexPath(for: .message(id)) {
                     self.collectionView.scrollToItem(at: indexPath, at: .top, animated: false)
+                    if TranscriptScrollPolicy.shouldSettleJump(parentVisible: true) {
+                        self.onJumpSettled?()
+                    }
                 } else {
                     // Soft-fail: id not in the newest local page — unread/live-edge.
+                    // Keep the jump; remainder / family reveal / load-older
+                    // can still admit the parent.
                     let fallback = TranscriptScrollPolicy.openAction(
                         unreadAnchorId: self.unreadAnchorId,
                         unreadCountAtOpen: self.unreadCountAtOpen,
@@ -723,8 +734,22 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                         jumpId: nil
                     )
                     self.applyOpenAction(fallback)
+                    if let loadOlder, !self.isLoadingOlder {
+                        self.isLoadingOlder = true
+                        Task { @MainActor in
+                            defer { self.isLoadingOlder = false }
+                            while let jump = self.jumpMessageId,
+                                  self.dataSource?.indexPath(for: .message(jump)) == nil {
+                                let added = await loadOlder()
+                                if !added { break }
+                            }
+                            if let jump = self.jumpMessageId,
+                               self.dataSource?.indexPath(for: .message(jump)) != nil {
+                                self.applyOpenAction(.jump(id: jump))
+                            }
+                        }
+                    }
                 }
-                self.onJumpSettled?()
             }
         }
     }

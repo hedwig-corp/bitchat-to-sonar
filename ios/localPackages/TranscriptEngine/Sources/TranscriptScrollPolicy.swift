@@ -136,6 +136,12 @@ public enum TranscriptScrollPolicy {
             && expectedNewestDate == lastExpectedNewestDate
     }
 
+    /// Keep a Jump target until the parent is in the painted entries.
+    /// Soft-fail must not settle: remainder / family reveal can still admit it.
+    public static func shouldSettleJump(parentVisible: Bool) -> Bool {
+        parentVisible
+    }
+
     public static func insetFollowDecision(
         wasAtTail: Bool,
         userScrolling: Bool,

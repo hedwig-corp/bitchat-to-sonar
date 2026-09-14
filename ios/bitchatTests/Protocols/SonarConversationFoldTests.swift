@@ -869,6 +869,8 @@ struct SonarConversationFoldTests {
                 idOf: { $0 }
             ) == 500
         )
+        #expect(snShouldSettleQuotedJump(parentInFeed: true))
+        #expect(!snShouldSettleQuotedJump(parentInFeed: false))
         #expect(
             snFoldFamilyPagingCursor(
                 groupId: "group-09",
