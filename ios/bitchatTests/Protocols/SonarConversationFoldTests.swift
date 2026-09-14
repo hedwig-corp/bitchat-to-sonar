@@ -369,6 +369,24 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ) == ["group-08"]
         )
+        #expect(
+            Set(snMutedFoldKeys(
+                groupIdHex: "group-09",
+                historicalFolds: ["group-08": "group-09"]
+            )) == [
+                "group-08", "marmot:group-08",
+                "group-09", "marmot:group-09",
+            ]
+        )
+        #expect(
+            Set(snMutedFoldKeys(
+                groupIdHex: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            )) == [
+                "group-08", "marmot:group-08",
+                "group-09", "marmot:group-09",
+            ]
+        )
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-08", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])

@@ -491,7 +491,10 @@ tap onto the live sibling even before that id is listed),
 `snRemountClearsRecoveredWaitingFlag`),
 `ConversationFoldTest.deleteAfterFoldDropsTheHiddenHistoricalSibling`,
 `SonarConversationFoldTests` (same asserts on `snFoldFamilyIds` /
-`snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds`). A recovered room with no
+`snPurgedHistoricalFolds` / `snPrunedOrphanedHistoricalFolds` /
+`snMutedFoldKeys` — iOS gap-recovery and the central local-notification
+gate walk the fold family so a mute stored on the 0.8 id still silences
+a live 0.9 banner). A recovered room with no
 live MLS group can still be deleted: Leave degrades to a local family purge. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`

@@ -670,7 +670,15 @@ enum SonarPushProcessor {
             if kind == .call { continue }
             // Per-chat mute: unread still accrues, no banner. Same NSE
             // fail-open backstop as the drain path above.
-            if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) {
+            let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(
+                UserDefaults(suiteName: SonarChatMuteStore.appGroupId)
+            )
+            if SonarChatMuteStore.shared.isMuted(
+                anyOf: snMutedFoldKeys(
+                    groupIdHex: summary.groupIdHex,
+                    historicalFolds: folds
+                )
+            ) {
                 await removeDeliveredNSEOwnedBanners(
                     messageIdHex: nil,
                     conversationId: summary.groupIdHex.isEmpty ? nil : "marmot:" + summary.groupIdHex

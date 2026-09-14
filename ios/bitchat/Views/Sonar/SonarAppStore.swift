@@ -583,6 +583,23 @@ func snFoldFamilyIds(
     return family
 }
 
+/// Mute keys a foreground / gap-recovery banner must check so a mute
+/// stored on the recovered 0.8 id still silences a live 0.9 push.
+func snMutedFoldKeys(
+    groupIdHex: String,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> [String] {
+    var keys: [String] = []
+    for alias in snFoldFamilyIds(id: groupIdHex, historicalFolds: historicalFolds) {
+        keys.append(alias)
+        if !alias.hasPrefix(prefix) {
+            keys.append(prefix + alias)
+        }
+    }
+    return keys
+}
+
 /// Drop host fold bindings whose historical or live id was just deleted.
 func snPurgedHistoricalFolds(
     _ folds: [String: String],
