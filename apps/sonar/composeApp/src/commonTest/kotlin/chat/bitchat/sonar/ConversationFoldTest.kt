@@ -502,6 +502,47 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun foldedHistoricalMuteMovesOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            mapOf("group-08" to 50L, "group-09" to 50L),
+            promotedFoldedMutes(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                mutes = mapOf("group-08" to 50L),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 50L, "group-09" to 80L),
+            promotedFoldedMutes(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                mutes = mapOf("group-08" to 50L, "group-09" to 80L),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 50L),
+            promotedFoldedMutes(
+                previousIds = setOf("group-08"),
+                currentIds = setOf("group-08"),
+                mutes = mapOf("group-08" to 50L),
+                liveFoldTarget = folds::get,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 50L, "group-09" to 50L),
+            promotedFoldedMutes(
+                previousIds = emptySet(),
+                currentIds = setOf("group-09"),
+                mutes = mapOf("group-08" to 50L),
+                liveFoldTarget = folds::get,
+            ),
+        )
+    }
+
+    @Test
     fun recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect() {
         val ownRaw = ByteArray(32) { 1 }
         val peerRaw = ByteArray(32) { 2 }

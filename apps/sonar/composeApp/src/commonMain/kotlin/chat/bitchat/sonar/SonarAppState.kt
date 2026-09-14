@@ -519,6 +519,25 @@ internal fun remountFoldedOpenChatId(
     return if (live in listedChatIds) live else openChatId
 }
 
+/** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
+internal fun promotedFoldedMutes(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    mutes: Map<String, Long>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, Long> {
+    var next = mutes
+    for (historical in previousIds + mutes.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val until = mutes[historical] ?: continue
+        val existing = next[live]
+        next = next + (live to maxOf(existing ?: until, until))
+    }
+    return next
+}
+
 internal enum class RecoveredChatResumeUi { Live, WaitingForPeerUpdate }
 
 internal fun recoveredChatResumeUi(
@@ -12046,6 +12065,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             latestSecs = { hydration.latestByChat[it] ?: 0L },
             previousOrder = previousOrder,
         )
+        promoteFoldedMutes(previousOrder.toSet(), chats.mapTo(hashSetOf()) { it.id })
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12058,6 +12078,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
         resolvePendingMarmotChats()
         remountFoldedOpenChat()
+    }
+
+    private fun promoteFoldedMutes(previousIds: Set<String>, currentIds: Set<String>) {
+        val next = promotedFoldedMutes(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            mutes = mutedUntilByChat,
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+        if (next != mutedUntilByChat) {
+            mutedUntilByChat = next
+            persistMutes()
+        }
     }
 
     /** FFI `groups()` hides a folded 0.8 room. If the user is sitting in that

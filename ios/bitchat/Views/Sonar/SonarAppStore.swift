@@ -284,6 +284,22 @@ func snRemountFoldedOpenGroupId(
     return live
 }
 
+/// Historical group ids that disappeared because they folded onto a listed live id.
+func snPromotedFoldedMutePairs(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    muteKeys: Set<String> = [],
+    liveFoldTarget: (String) -> String?
+) -> [(historical: String, live: String)] {
+    let candidates = previousGroupIds.union(muteKeys).subtracting(currentGroupIds)
+    return candidates.compactMap { historical in
+        guard let live = liveFoldTarget(historical), currentGroupIds.contains(live) else {
+            return nil
+        }
+        return (historical, live)
+    }
+}
+
 func snMarmotSendNeedsPeerUpdate(_ error: String) -> Bool {
     let lower = error.lowercased()
     return lower.contains("no key package")
@@ -1451,6 +1467,9 @@ final class SonarAppStore: ObservableObject {
     /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
     /// while the encrypted transcript is keyed by the Marmot MLS group id.
     private var marmotGroupIdsByConversationId: [String: String] = [:]
+    /// Last FFI `groups()` ids, used to copy a recovered-chat mute onto the
+    /// live sibling when the historical row disappears after resume.
+    private var lastMarmotGroupIds: Set<String> = []
     /// Our optional BIP-353 payment address ("" = unset, TLV omitted).
     @Published private(set) var bip353: String
     /// Lifecycle of the unified handle claim (name@sonarprivacy.xyz). The
@@ -2231,10 +2250,14 @@ final class SonarAppStore: ObservableObject {
         }
         marmot.$groups
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.resolvePendingSecureChats()
+            .sink { [weak self] groups in
+                guard let self else { return }
+                let current = Set(groups.map(\.id))
+                self.resolvePendingSecureChats()
                 Task { @MainActor in
-                    await self?.remountFoldedOpenChatIfNeeded()
+                    await self.promoteFoldedMutes(from: self.lastMarmotGroupIds, to: current)
+                    self.lastMarmotGroupIds = current
+                    await self.remountFoldedOpenChatIfNeeded()
                 }
             }
             .store(in: &cancellables)
@@ -7008,6 +7031,50 @@ final class SonarAppStore: ObservableObject {
         }
         flushPendingDirectMarmot(npub: npub, groupId: groupId, realId: realId)
         openedDM(realId, marmotGroupId: groupId)
+    }
+
+    /// Copy a mute from a hidden 0.8 row onto the live 0.9 sibling.
+    @MainActor
+    private func promoteFoldedMutes(from previous: Set<String>, to current: Set<String>) async {
+        var muteGroupIds = Set<String>()
+        for key in SonarChatMuteStore.shared.mutedUntil.keys {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                muteGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                muteGroupIds.insert(key.lowercased())
+            }
+        }
+        var targets: [String: String] = [:]
+        for historical in previous.union(muteGroupIds).subtracting(current) {
+            if let live = await marmot.liveFoldTarget(groupId: historical) {
+                targets[historical] = live
+            }
+        }
+        let pairs = snPromotedFoldedMutePairs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            muteKeys: muteGroupIds,
+            liveFoldTarget: { targets[$0] }
+        )
+        for pair in pairs {
+            let historicalKeys = [
+                pair.historical,
+                Self.marmotIDPrefix + pair.historical
+            ]
+            guard let until = SonarChatMuteStore.shared.muteEnd(anyOf: historicalKeys) else {
+                continue
+            }
+            let liveId = Self.marmotIDPrefix + pair.live
+            let liveUntil = SonarChatMuteStore.shared.muteEnd(anyOf: muteKeys(forChatId: liveId))
+            SonarChatMuteStore.shared.mute(
+                keys: muteKeys(forChatId: liveId),
+                until: max(until, liveUntil ?? until)
+            )
+        }
+        if !pairs.isEmpty {
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
     }
 
     /// FFI `groups()` hides a folded 0.8 room. If the user is sitting in that

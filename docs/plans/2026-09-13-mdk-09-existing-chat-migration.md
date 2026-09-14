@@ -187,6 +187,7 @@ Guarded by:
 - `account_backup::write_read_package_files_roundtrips_outbox_and_sync`
 - `marmot::historical_fold_tests::historical_fold_survives_account_backup_restore`
 - `ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
+- `ConversationFoldTest.foldedHistoricalMuteMovesOntoLiveSibling`
 - `e2e::recovered_08_group_resumes_on_a_new_09_group_through_a_relay`
   (also pins `live_fold_target_hex` after the home-list hide)
 
@@ -349,7 +350,9 @@ stays one room row — hosts paint `chats()` / `groups()`, not the index.
 If the user is sitting in that recovered transcript when resume lands,
 Compose and iOS remount the open chat id onto `live_fold_target` so
 member/title lookups do not miss the hidden row; in-flight send still
-resolves through the fold map. A pending welcome with
+resolves through the fold map. A mute on the recovered id is copied onto
+the live sibling when the historical row disappears, so resume does not
+start notifying a chat the user already silenced. A pending welcome with
 `member_count > 2` never uses `start_dm` even if only the welcomer is
 known — that would fold the room onto a 1:1. `maybe_fold_new_group`
 (new DM with the same known peer) is the same hazard and must skip
