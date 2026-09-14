@@ -1570,6 +1570,26 @@ class ConversationFoldTest {
             "group-08",
             resolvedOpenGroupId("group-09", setOf("group-08"), folds),
         )
+        assertEquals(
+            "group-09",
+            resolvedOpenGroupId(
+                "group-08",
+                setOf("group-09"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "group-other",
+            resolvedOpenGroupId(
+                "group-other",
+                setOf("group-09"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

@@ -363,13 +363,26 @@ func snListedOrFoldedSiblingGroupId(
 func snResolvedOpenGroupId(
     groupId: String,
     listedGroupIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String {
-    snListedOrFoldedSiblingGroupId(
+    if let listed = snListedOrFoldedSiblingGroupId(
         groupId: groupId,
         listedGroupIds: listedGroupIds,
         historicalFolds: historicalFolds
-    ) ?? groupId
+    ) {
+        return listed
+    }
+    for id in snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id)
+        if listedGroupIds.contains(bare) { return bare }
+    }
+    return groupId
 }
 
 /// Bare MLS id whether the tap carried `marmot:` or not.
@@ -8132,12 +8145,18 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Persist-fold remap so catch-up / load / send hit the listed live id.
+    /// Empty wake-mute persist still remaps via the remount pair so the
+    /// painted hist pane keeps title / send / call on the listed sibling.
     private func resolvedOpenGroupId(_ groupId: String) -> String {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let opened = openedConversationId ?? pendingMarmotRouteReplacement?.realId
+        let pane = openedConversationPaneId ?? pendingMarmotRouteReplacement?.pendingId
         return snResolvedOpenGroupId(
             groupId: groupId,
             listedGroupIds: Set(marmot.groups.map(\.id)),
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 

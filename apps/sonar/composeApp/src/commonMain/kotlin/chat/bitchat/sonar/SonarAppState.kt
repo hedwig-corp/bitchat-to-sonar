@@ -633,6 +633,8 @@ internal fun resolvedOpenGroupId(
     groupId: String,
     listedGroupIds: Set<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String {
     if (groupId in listedGroupIds) return groupId
     historicalFolds[groupId]
@@ -641,6 +643,14 @@ internal fun resolvedOpenGroupId(
     historicalFolds.entries
         .firstOrNull { it.value == groupId && it.key.isNotBlank() && it.key != groupId && it.key in listedGroupIds }
         ?.let { return it.key }
+    for (id in remountPairConversationIds(
+        conversationId = groupId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        if (bare in listedGroupIds) return bare
+    }
     return groupId
 }
 
@@ -11338,10 +11348,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun resolveMarmotGroupId(chatId: String): String? {
         if (chatId.startsWith(PENDING_MARMOT_CHAT_PREFIX) || chatId.startsWith(PENDING_MARMOT_GROUP_PREFIX)) return null
         if (!isMeshChat(chatId)) {
+            val (opened, pane) = remountPairForOpenChat(chatId)
             return resolvedOpenGroupId(
                 chatId,
                 chats.mapTo(hashSetOf()) { it.id },
                 historicalFoldMap,
+                opened,
+                pane,
             )
         }
         val raw = npubRawFor(meshPeerId(chatId)) ?: return null

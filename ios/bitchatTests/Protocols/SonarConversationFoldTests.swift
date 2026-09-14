@@ -297,6 +297,24 @@ struct SonarConversationFoldTests {
             ) == "group-09"
         )
         #expect(
+            snResolvedOpenGroupId(
+                groupId: "group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snResolvedOpenGroupId(
+                groupId: "group-other",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "group-other"
+        )
+        #expect(
             snPersistedLiveFoldTarget(
                 tappedGroupId: "marmot:group-08",
                 historicalFolds: ["group-08": "group-09"]
