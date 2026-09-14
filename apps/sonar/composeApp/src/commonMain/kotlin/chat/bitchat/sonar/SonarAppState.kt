@@ -909,6 +909,80 @@ internal fun foldFamilyIds(
     return family.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
+/** Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id. */
+internal fun conversationChangeTargetId(
+    changedId: String,
+    listedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+): String {
+    if (changedId.isBlank()) return changedId
+    if (changedId in listedIds) return changedId
+    val live = historicalFolds[changedId]
+    if (!live.isNullOrBlank() && live != changedId && live in listedIds) return live
+    return foldFamilyIds(changedId, historicalFolds).firstOrNull { it in listedIds }
+        ?: changedId
+}
+
+/** Chat ids that may still hold in-flight media after a hist→live promote. */
+internal fun pendingMediaUploadLookupIds(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+): List<String> {
+    val family = foldFamilyIds(chatId, historicalFolds)
+    return if (family.isEmpty()) listOf(chatId) else family.toList()
+}
+
+/** Store in-flight media on the live sibling so hist-keyed send closures still find it. */
+internal fun pendingMediaUploadStoreId(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+): String {
+    val live = historicalFolds[chatId]
+    if (!live.isNullOrBlank() && live != chatId) return live
+    return historicalFolds.entries.firstOrNull { it.value == chatId }?.value ?: chatId
+}
+
+/** Read a draft from the open id or its hidden 0.8 sibling after a fold. */
+internal fun composerDraftForChat(
+    chatId: String,
+    drafts: Map<String, String>,
+    historicalFolds: Map<String, String>,
+): String {
+    drafts[chatId]?.takeIf { it.isNotEmpty() }?.let { return it }
+    for (id in foldFamilyIds(chatId, historicalFolds)) {
+        if (id == chatId) continue
+        drafts[id]?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return ""
+}
+
+/** Write the draft onto [chatId] and drop leftover family keys so a clear cannot resurrect hist text. */
+internal fun composerDraftsAfterEdit(
+    drafts: Map<String, String>,
+    chatId: String,
+    text: String,
+    historicalFolds: Map<String, String>,
+): Map<String, String> {
+    var next = drafts
+    for (id in foldFamilyIds(chatId, historicalFolds)) {
+        if (id != chatId && id in next) next = next - id
+    }
+    return updatedComposerDrafts(next, chatId, text)
+}
+
+/** Latest trill cooldown across the fold family. */
+internal fun trillCooldownUntilMsForChat(
+    chatId: String,
+    cooldownUntilMs: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Long {
+    var latest = 0L
+    for (id in foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }) {
+        latest = maxOf(latest, cooldownUntilMs[id] ?: 0L)
+    }
+    return latest
+}
+
 /** Ids that count as "this chat is open" for banner suppression after a fold.
  *  Scan stays on listed ids so a bak remainder cannot replay recovered
  *  history as never-seen. Suppression must include the hidden 0.8 sibling
@@ -3543,11 +3617,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val composerDrafts = mutableStateMapOf<String, String>()
     private val composerReplyByChat = mutableStateMapOf<String, SonarReplyRef>()
 
-    fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
+    fun composerDraft(chatId: String): String =
+        composerDraftForChat(chatId, composerDrafts.toMap(), historicalFoldMap)
 
     fun composerReply(chatId: String): SonarReplyRef? {
         if (!sonarReplyUiEnabled()) return null
-        return composerReplyByChat[chatId]
+        composerReplyByChat[chatId]?.let { return it }
+        for (id in foldFamilyIds(chatId, historicalFoldMap)) {
+            if (id == chatId) continue
+            composerReplyByChat[id]?.let { return it }
+        }
+        return null
     }
 
     fun beginReply(chatId: String, message: SonarMsg, preview: String, author: String? = null) {
@@ -3563,20 +3643,29 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun cancelReply(chatId: String) {
-        composerReplyByChat.remove(chatId)
+        for (id in foldFamilyIds(chatId, historicalFoldMap).ifEmpty { setOf(chatId) }) {
+            composerReplyByChat.remove(id)
+        }
     }
 
     fun jumpToQuotedMessage(chatId: String, parentId: String) {
         openChatJumpMessageId = openChatJumpMessageId + (chatId to parentId)
     }
 
-    private fun consumeComposerReply(chatId: String): SonarReplyRef? =
-        composerReplyByChat.remove(chatId)
+    private fun consumeComposerReply(chatId: String): SonarReplyRef? {
+        val family = foldFamilyIds(chatId, historicalFoldMap).ifEmpty { setOf(chatId) }
+        val reply = composerReplyByChat[chatId]
+            ?: family.firstNotNullOfOrNull { composerReplyByChat[it] }
+        for (id in family) composerReplyByChat.remove(id)
+        return reply
+    }
 
     fun setComposerDraft(chatId: String, text: String) {
         val current = composerDrafts.toMap()
-        val next = updatedComposerDrafts(current, chatId, text)
+        val next = composerDraftsAfterEdit(current, chatId, text, historicalFoldMap)
         if (next == current) return
+        val stale = current.keys - next.keys
+        for (id in stale) composerDrafts.remove(id)
         if (!next.containsKey(chatId)) {
             composerDrafts.remove(chatId)
         } else {
@@ -5785,7 +5874,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val trillAlertThrottle = TrillAlertThrottle()
 
     fun canSendTrill(chatId: String): Boolean =
-        SonarClock.monotonicMillis() >= (trillCooldownUntilMs[chatId] ?: 0L)
+        SonarClock.monotonicMillis() >= trillCooldownUntilMsForChat(
+            chatId,
+            trillCooldownUntilMs,
+            historicalFoldMap,
+        )
 
     /** Send a nudge through the exact same path a text message takes (local
      *  echo, transport auto-pick, outbox). The sender's own send also triggers
@@ -7997,9 +8090,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  reuse the local plaintext/bytes that are already held for that row. */
     fun retryMessage(chatId: String, message: SonarMsg) {
         if (marmotAccountMutationSuspended || !sonarCanRetryMessage(message)) return
-        val mediaUploads = pendingMediaUploads[chatId]
-            ?.filter { it.message.id == message.id }
-            .orEmpty()
+        val mediaUploads = pendingMediaUploadsAcrossFamily(chatId)
+            .filter { it.message.id == message.id }
         if (mediaUploads.isNotEmpty()) {
             retryPendingMedia(chatId, message.id)
             return
@@ -8034,7 +8126,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         chatId: String,
         pendingId: String,
     ) {
-        val pending = pendingMediaUploads[chatId] ?: return
+        val pending = pendingMediaUploadBucket(chatId) ?: return
         val matchingIndices = pending.indices.filter { pending[it].message.id == pendingId }
         val firstIndex = matchingIndices.firstOrNull() ?: return
         val retryState =
@@ -8678,14 +8770,16 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  per-attachment entry is appended so each reconciles independently. */
     private fun rememberPendingMediaUploads(chatId: String, uploads: List<PendingMediaUpload>) {
         if (uploads.isEmpty()) return
-        val pending = pendingMediaUploads.getOrPut(chatId) { mutableListOf() }
+        val storeId = pendingMediaUploadStoreId(chatId, historicalFoldMap)
+        val pending = pendingMediaUploads.getOrPut(storeId) { mutableListOf() }
         val ids = uploads.mapTo(mutableSetOf()) { it.message.id }
         pending.removeAll { it.message.id in ids }
         pending += uploads
+        if (storeId != chatId) pendingMediaUploads.remove(chatId)
     }
 
     private fun markPendingMediaCompleted(chatId: String, pendingId: String) {
-        val pending = pendingMediaUploads[chatId] ?: return
+        val pending = pendingMediaUploadBucket(chatId) ?: return
         // An album shares one echo message across N per-attachment entries —
         // mark every entry so each reconciles against the canonical message.
         for (index in pending.indices) {
@@ -8696,8 +8790,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun pendingMediaUploadsAcrossFamily(chatId: String): List<PendingMediaUpload> =
+        pendingMediaUploadLookupIds(chatId, historicalFoldMap)
+            .flatMap { pendingMediaUploads[it].orEmpty() }
+
+    /** The bucket that still holds this chat's in-flight media after a fold promote. */
+    private fun pendingMediaUploadBucket(chatId: String): MutableList<PendingMediaUpload>? {
+        for (id in pendingMediaUploadLookupIds(chatId, historicalFoldMap)) {
+            pendingMediaUploads[id]?.let { return it }
+        }
+        return null
+    }
+
     private fun markPendingMediaFailed(chatId: String, pendingId: String) {
-        val pending = pendingMediaUploads[chatId] ?: return
+        val pending = pendingMediaUploadBucket(chatId) ?: return
         for (index in pending.indices) {
             if (pending[index].message.id == pendingId) {
                 val upload = pending[index]
@@ -8707,7 +8813,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun mergePendingMediaUploads(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
-        val pending = pendingMediaUploads[chatId] ?: return published.sortedBy { it.tsSecs }
+        val lookupIds = pendingMediaUploadLookupIds(chatId, historicalFoldMap)
+        val pending = lookupIds.flatMap { pendingMediaUploads[it].orEmpty() }
+        if (pending.isEmpty()) return published.sortedBy { it.tsSecs }
         // Track matched entries INDIVIDUALLY, not by message id: an album's N
         // attachments share one echo message id, so removing by id would drop the
         // whole echo (and its not-yet-cached siblings) the instant one attachment
@@ -8733,11 +8841,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (ok) matchedUrls += upload.pendingUrl
         }
         val survivors = pending.filterNot { it.pendingUrl in matchedUrls }
+        val storeId = pendingMediaUploadStoreId(chatId, historicalFoldMap)
+        for (id in lookupIds) {
+            if (id != storeId) pendingMediaUploads.remove(id)
+        }
         if (survivors.isEmpty()) {
+            pendingMediaUploads.remove(storeId)
             pendingMediaUploads.remove(chatId)
             return published.sortedBy { it.tsSecs }
         }
-        pendingMediaUploads[chatId] = survivors.toMutableList()
+        pendingMediaUploads[storeId] = survivors.toMutableList()
         // Distinct by id: an album echo appears once per surviving attachment.
         val survivorMessages = survivors.map { it.message }.distinctBy { it.id }.map { msg ->
             val progress = mediaUploadProgress[msg.id]
@@ -12762,6 +12875,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         promoteFoldedScanState(previousOrder.toSet(), listedIds)
         promoteFoldedPendingEchoes(previousOrder.toSet(), listedIds)
         promoteFoldedInFlightSends(previousOrder.toSet(), listedIds)
+        promoteFoldedPendingMediaPreviews()
         if (localCoreReady || started || loadedChats.isNotEmpty()) {
             persistChatSnapshot()
         }
@@ -12865,6 +12979,27 @@ class SonarAppState(private val scope: CoroutineScope) {
         for ((id, ids) in nextSeen) {
             val seen = notificationSeenMessageIds.getOrPut(id) { LinkedHashSet() }
             seen.addAll(ids)
+        }
+        val nextStaged = promotedFoldedPendingMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = stagedChangedPages,
+            liveFoldTarget = liveFoldTarget,
+            idOf = { it.id },
+        )
+        if (nextStaged != stagedChangedPages) {
+            stagedChangedPages.clear()
+            stagedChangedPages.putAll(nextStaged)
+        }
+        val nextFailed = promotedFoldedValues(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            values = failedChangedPageReads.associateWith { true },
+            liveFoldTarget = liveFoldTarget,
+        ).keys
+        if (nextFailed != failedChangedPageReads) {
+            failedChangedPageReads.clear()
+            failedChangedPageReads.addAll(nextFailed)
         }
     }
 
@@ -13081,6 +13216,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val nextStack = remountFoldedNavStack(stack, ::liveFor)
         if (nextStack != stack) stack = nextStack
+        activeCall?.let { call ->
+            val live = liveFor(call.chatId)
+            if (live != call.chatId) activeCall = call.copy(chatId = live)
+        }
+    }
+
+    /** Preview sheet can stay up across a fold that remounts the open chat,
+     *  or after a notification tap already swapped the id to live. */
+    private fun promoteFoldedPendingMediaPreviews() {
+        if (pendingMediaPreviews.isEmpty()) return
+        val next = pendingMediaPreviews.map { preview ->
+            val live = historicalFoldMap[preview.chatId] ?: return@map preview
+            if (live.isBlank() || live == preview.chatId) preview
+            else preview.copy(chatId = live)
+        }
+        if (next != pendingMediaPreviews) pendingMediaPreviews = next
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)
@@ -13111,21 +13262,31 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // immediately so a call rings / pay processes / the open
                 // transcript updates without waiting for the heartbeat.
                 refreshChats()
+                // Remainder / fold-alias ticks name the hidden 0.8 id. Stage
+                // and process against the listed live sibling so housekeeping
+                // cannot drop the page and in-flight call/pay rows land on
+                // a chat FFI still lists.
+                val targetId = conversationChangeTargetId(
+                    groupIdHex,
+                    chats.mapTo(hashSetOf()) { it.id },
+                    historicalFoldMap,
+                )
                 val freshChangedMessages = runCatching {
-                    SonarCore.messagesPage(groupIdHex, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+                    SonarCore.messagesPage(targetId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
                 }.getOrNull()
                 val changedMessages = if (freshChangedMessages == null ||
                     (!started && freshChangedMessages.isEmpty())
                 ) {
-                    chatSnapshotMessagesByChat[groupIdHex]
+                    chatSnapshotMessagesByChat[targetId]
                         .orEmpty()
+                        .ifEmpty { chatSnapshotMessagesByChat[groupIdHex].orEmpty() }
                         .takeLast(BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
                 } else {
                     freshChangedMessages
                 }
-                val visibleChangedMessages = visibleMessagesForChat(groupIdHex, changedMessages)
-                processPayLines(groupIdHex, visibleChangedMessages)
-                processCallLines(groupIdHex, visibleChangedMessages)
+                val visibleChangedMessages = visibleMessagesForChat(targetId, changedMessages)
+                processPayLines(targetId, visibleChangedMessages)
+                processCallLines(targetId, visibleChangedMessages)
                 // Hand the page to housekeeping before requesting it. That pass
                 // owns the shared scan watermark so call/pay and notification
                 // consumers cannot race by independently marking work complete.
@@ -13133,14 +13294,19 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // but never counts as a successful read of this change. Only a
                 // fresh core page may advance the shared scan watermark.
                 if (freshChangedMessages != null) {
-                    stagedChangedPages[groupIdHex] = freshChangedMessages
-                    failedChangedPageReads.remove(groupIdHex)
+                    stagedChangedPages[targetId] = freshChangedMessages
+                    failedChangedPageReads.remove(targetId)
+                    if (targetId != groupIdHex) {
+                        stagedChangedPages.remove(groupIdHex)
+                        failedChangedPageReads.remove(groupIdHex)
+                    }
                 } else {
                     // Supersede any older staged page. The next housekeeping
                     // pass must read the newer invalidation from core before it
                     // is allowed to advance this chat's watermark.
-                    stagedChangedPages.remove(groupIdHex)
-                    failedChangedPageReads.add(groupIdHex)
+                    stagedChangedPages.remove(targetId)
+                    failedChangedPageReads.add(targetId)
+                    if (targetId != groupIdHex) stagedChangedPages.remove(groupIdHex)
                 }
                 (screen as? Screen.Chat)?.let { sc ->
                     if (!isMeshChat(sc.id) && (

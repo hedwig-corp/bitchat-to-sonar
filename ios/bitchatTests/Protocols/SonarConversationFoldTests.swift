@@ -512,6 +512,34 @@ struct SonarConversationFoldTests {
             ) == ["group-08"]
         )
         #expect(
+            snConversationChangeTargetId(
+                changedGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            snPendingUploadLookupGroupIds(
+                groupId: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snComposerDraft(
+                chatId: "marmot:group-09",
+                drafts: ["marmot:group-08": "hello from 0.8"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == "hello from 0.8"
+        )
+        #expect(
+            snComposerDraftsAfterEdit(
+                drafts: ["marmot:group-08": "hello from 0.8"],
+                chatId: "marmot:group-09",
+                text: "",
+                historicalFolds: ["group-08": "group-09"]
+            ).isEmpty
+        )
+        #expect(
             snPaymentActivityPeerKeys(
                 conversationId: "marmot:group-09",
                 historicalFolds: ["group-08": "group-09"]

@@ -718,6 +718,64 @@ func snConversationRefreshIds(
     return listedFamily.sorted()
 }
 
+/// Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id.
+func snConversationChangeTargetId(
+    changedGroupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String]
+) -> String {
+    snConversationRefreshIds(
+        changedGroupId: changedGroupId,
+        listedGroupIds: listedGroupIds,
+        historicalFolds: historicalFolds
+    ).first ?? changedGroupId
+}
+
+/// Group ids that may still hold in-flight upload bytes after a hist→live remount.
+func snPendingUploadLookupGroupIds(
+    groupId: String,
+    historicalFolds: [String: String]
+) -> [String] {
+    let family = snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
+    return family.isEmpty ? [groupId] : family.sorted()
+}
+
+/// Read a draft from the open id or its hidden 0.8 sibling after a fold.
+func snComposerDraft(
+    chatId: String,
+    drafts: [String: String],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> String {
+    if let draft = drafts[chatId], !draft.isEmpty { return draft }
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+        for key in [alias, prefix + alias] where key != chatId {
+            if let draft = drafts[key], !draft.isEmpty { return draft }
+        }
+    }
+    return ""
+}
+
+/// Write the draft onto `chatId` and drop leftover family keys so a clear
+/// cannot resurrect hist text.
+func snComposerDraftsAfterEdit(
+    drafts: [String: String],
+    chatId: String,
+    text: String,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> [String: String] {
+    var next = drafts
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+        for key in [alias, prefix + alias] where key != chatId {
+            next[key] = nil
+        }
+    }
+    return snUpdatedComposerDrafts(drafts: next, chatId: chatId, text: text)
+}
+
 /// Rewrite a pending-upload cache key off a hidden 0.8 group id.
 /// Keys are `groupId + US + filename + …`; only the group prefix moves.
 func snRemountedPendingUploadMediaKey(
@@ -2159,14 +2217,23 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var composerDraftHasText: [String: Bool] = [:]
 
     func composerDraft(for chatId: String) -> String {
-        composerDrafts[chatId] ?? ""
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snComposerDraft(chatId: chatId, drafts: composerDrafts, historicalFolds: folds)
     }
 
     static var replyUIEnabled: Bool { snReplyUIEnabled() }
 
     func composerReply(for chatId: String) -> SNReplyRef? {
         guard Self.replyUIEnabled else { return nil }
-        return composerReplyByChat[chatId]
+        if let reply = composerReplyByChat[chatId] { return reply }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let bare = snBareMarmotGroupId(chatId)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: folds) {
+            for key in [alias, Self.marmotIDPrefix + alias] where key != chatId {
+                if let reply = composerReplyByChat[key] { return reply }
+            }
+        }
+        return nil
     }
 
     func beginReply(chatId: String, to message: SNMessage) {
@@ -2193,6 +2260,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     func cancelReply(chatId: String) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let bare = snBareMarmotGroupId(chatId)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: folds) {
+            composerReplyByChat[alias] = nil
+            composerReplyByChat[Self.marmotIDPrefix + alias] = nil
+        }
         composerReplyByChat[chatId] = nil
     }
 
@@ -2202,8 +2275,18 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func consumeComposerReply(for chatId: String) -> SNReplyRef? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let bare = snBareMarmotGroupId(chatId)
+        let family = snFoldFamilyIds(id: bare, historicalFolds: folds)
         let reply = composerReplyByChat[chatId]
+            ?? family.compactMap({
+                composerReplyByChat[$0] ?? composerReplyByChat[Self.marmotIDPrefix + $0]
+            }).first
         composerReplyByChat[chatId] = nil
+        for alias in family {
+            composerReplyByChat[alias] = nil
+            composerReplyByChat[Self.marmotIDPrefix + alias] = nil
+        }
         return reply
     }
 
@@ -2216,9 +2299,21 @@ final class SonarAppStore: ObservableObject {
     }
 
     func setComposerDraft(_ text: String, for chatId: String) {
-        let nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        var nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
+        let bare = snBareMarmotGroupId(chatId)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: folds) {
+            for key in [alias, Self.marmotIDPrefix + alias] where key != chatId {
+                nextFlags[key] = nil
+            }
+        }
         if nextFlags != composerDraftHasText { composerDraftHasText = nextFlags }
-        let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
+        let next = snComposerDraftsAfterEdit(
+            drafts: composerDrafts,
+            chatId: chatId,
+            text: text,
+            historicalFolds: folds
+        )
         guard next != composerDrafts else { return }
         composerDrafts = next
     }
@@ -2862,6 +2957,7 @@ final class SonarAppStore: ObservableObject {
                     await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedPendingEchoes(from: self.lastMarmotGroupIds, to: current)
+                    self.promoteFoldedPendingMediaPreviews()
                     await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedVerified(from: self.lastMarmotGroupIds, to: current)
                     await self.promoteFoldedScanWatermarks(from: self.lastMarmotGroupIds, to: current)
@@ -8225,6 +8321,27 @@ final class SonarAppStore: ObservableObject {
         if next != path {
             path = next
         }
+        if let call = activeCall {
+            let remounted = snRemountFoldedConversationId(
+                call.convId,
+                listedGroupIds: listedGroupIds,
+                liveFoldTarget: folds[snBareMarmotGroupId(call.convId)]
+            )
+            if remounted != call.convId {
+                activeCall = SNActiveCall(
+                    callId: call.callId,
+                    convId: remounted,
+                    signalingVia: call.signalingVia,
+                    peerName: call.peerName,
+                    video: call.video,
+                    incoming: call.incoming,
+                    phase: call.phase,
+                    connectedSecs: call.connectedSecs,
+                    muted: call.muted,
+                    speakerOn: call.speakerOn
+                )
+            }
+        }
     }
 
     /// Move in-flight send echoes off a hidden 0.8 conversation id.
@@ -8702,6 +8819,63 @@ final class SonarAppStore: ObservableObject {
         [groupId, filename, mime, caption].joined(separator: "\u{1f}")
     }
 
+    /// After a hist→live remount the cache key prefix moves. In-flight
+    /// mark/forget/cache still pass the id captured at send start.
+    private func pendingUploadMediaCacheKey(
+        groupId: String,
+        filename: String,
+        mime: String,
+        caption: String
+    ) -> String {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        for alias in snPendingUploadLookupGroupIds(groupId: groupId, historicalFolds: folds) {
+            let key = Self.pendingUploadMediaKey(
+                groupId: alias,
+                filename: filename,
+                mime: mime,
+                caption: caption
+            )
+            if pendingUploadMediaCache[key] != nil { return key }
+        }
+        let store = folds[groupId]
+            ?? folds[snBareMarmotGroupId(groupId)]
+            ?? groupId
+        return Self.pendingUploadMediaKey(
+            groupId: store,
+            filename: filename,
+            mime: mime,
+            caption: caption
+        )
+    }
+
+    /// Preview sheet can stay up across a fold that remounts the open chat,
+    /// or after a notification tap already swapped the id to live.
+    @MainActor
+    private func promoteFoldedPendingMediaPreviews() {
+        guard !pendingMediaPreviews.isEmpty else { return }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        guard !folds.isEmpty else { return }
+        let next = pendingMediaPreviews.map { preview -> PendingMediaPreview in
+            let bare = snBareMarmotGroupId(preview.peerId)
+            guard let live = folds[bare] ?? folds[preview.peerId],
+                  !live.isEmpty, live != bare, live != preview.peerId
+            else { return preview }
+            let liveId = preview.peerId.hasPrefix(Self.marmotIDPrefix)
+                ? Self.marmotIDPrefix + live
+                : live
+            return PendingMediaPreview(
+                peerId: liveId,
+                tempURL: preview.tempURL,
+                filename: preview.filename,
+                mime: preview.mime,
+                caption: preview.caption
+            )
+        }
+        if next.map(\.peerId) != pendingMediaPreviews.map(\.peerId) {
+            pendingMediaPreviews = next
+        }
+    }
+
     /// Keep in-flight upload bytes when resume folds the recovered id away.
     private func remountFoldedPendingUploadMedia(from historical: String, onto live: String) {
         guard historical != live, !historical.isEmpty, !live.isEmpty else { return }
@@ -8725,7 +8899,12 @@ final class SonarAppStore: ObservableObject {
         localURL: String,
         data: Data
     ) {
-        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        let key = pendingUploadMediaCacheKey(
+            groupId: groupId,
+            filename: filename,
+            mime: mime,
+            caption: caption
+        )
         let existingMediaURLs = Set(
             marmot.messagesByGroup[groupId, default: []]
                 .flatMap { $0.media.map(\.url) }
@@ -8752,7 +8931,12 @@ final class SonarAppStore: ObservableObject {
         caption: String,
         localURL: String
     ) {
-        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        let key = pendingUploadMediaCacheKey(
+            groupId: groupId,
+            filename: filename,
+            mime: mime,
+            caption: caption
+        )
         guard var pending = pendingUploadMediaCache[key],
               let index = pending.firstIndex(where: { $0.localURL == localURL }),
               pending[index].completedOrder == nil else { return }
@@ -8768,7 +8952,12 @@ final class SonarAppStore: ObservableObject {
         caption: String,
         localURL: String
     ) {
-        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        let key = pendingUploadMediaCacheKey(
+            groupId: groupId,
+            filename: filename,
+            mime: mime,
+            caption: caption
+        )
         guard var pending = pendingUploadMediaCache[key] else { return }
         pending.removeAll { $0.localURL == localURL }
         if pending.isEmpty {
@@ -8785,7 +8974,7 @@ final class SonarAppStore: ObservableObject {
             for message in messages where message.isMine {
                 for media in message.media
                     where !media.url.hasPrefix(Self.pendingMediaURLPrefix) && mediaImageCache[media.url] == nil {
-                    let key = Self.pendingUploadMediaKey(
+                    let key = pendingUploadMediaCacheKey(
                         groupId: groupId,
                         filename: media.filename,
                         mime: media.mimeType,

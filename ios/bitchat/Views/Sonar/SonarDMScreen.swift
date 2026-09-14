@@ -126,7 +126,7 @@ struct SonarDMScreenContent: View {
         hasher.combine(peerId)
         hasher.combine(peer.name)
         hasher.combine(transport.rawValue)
-        hasher.combine(store.composerDraftHasText[peerId] ?? false)
+        hasher.combine(!store.composerDraft(for: peerId).isEmpty)
         // Cheap roster identity — npub + cached display name only. Building
         // full `SNMentionCandidate` (bech32 suffix) on every store-driven body
         // reintroduces the cost R-042 moved out of keystrokes.

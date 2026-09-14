@@ -772,6 +772,19 @@ NSE could keep treating a deleted recovered room as folded. Compose
 already persists the purged blob (`forgetHistoricalFolds`).
 `snPersistHistoricalFolds` writes both stores.
 
+In-flight send-closure hole closed after this commit: promote
+moved pending media / drafts onto the live sibling, but hist-keyed
+send / retry / merge and `composerDraft(live)` still looked only at
+the hidden 0.8 id. Notification remaps onto live before promote, so a
+typed draft or in-flight photo disappeared. Lookups now walk the fold
+family; `conversationChangeTargetId` / `snConversationChangeTargetId`
+stage remainder ticks on the listed live id. Pins:
+`ConversationFoldTest.pendingMediaUploadLookupWalksFoldFamily`,
+`ConversationFoldTest.composerDraftReadAndClearWalkFoldFamily`,
+`ConversationFoldTest.conversationChangeTargetPrefersListedLiveSibling`,
+`SonarConversationFoldTests` `snPendingUploadLookupGroupIds` /
+`snComposerDraft` / `snConversationChangeTargetId`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

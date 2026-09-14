@@ -807,6 +807,85 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun conversationChangeTargetPrefersListedLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            "group-09",
+            conversationChangeTargetId(
+                changedId = "group-08",
+                listedIds = setOf("group-09"),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            "group-09",
+            conversationChangeTargetId(
+                changedId = "group-09",
+                listedIds = setOf("group-09"),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            "group-08",
+            conversationChangeTargetId(
+                changedId = "group-08",
+                listedIds = emptySet(),
+                historicalFolds = folds,
+            ),
+        )
+    }
+
+    @Test
+    fun pendingMediaUploadLookupWalksFoldFamily() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            setOf("group-08", "group-09"),
+            pendingMediaUploadLookupIds("group-08", folds).toSet(),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            pendingMediaUploadLookupIds("group-09", folds).toSet(),
+        )
+        assertEquals("group-09", pendingMediaUploadStoreId("group-08", folds))
+        assertEquals("group-09", pendingMediaUploadStoreId("group-09", folds))
+        assertEquals("group-08", pendingMediaUploadStoreId("group-08", emptyMap()))
+    }
+
+    @Test
+    fun composerDraftReadAndClearWalkFoldFamily() {
+        val folds = mapOf("group-08" to "group-09")
+        val drafts = mapOf("group-08" to "hello from 0.8")
+        assertEquals("hello from 0.8", composerDraftForChat("group-09", drafts, folds))
+        assertEquals("hello from 0.8", composerDraftForChat("group-08", drafts, folds))
+        assertEquals("", composerDraftForChat("group-09", drafts, emptyMap()))
+        assertEquals(
+            mapOf("group-09" to "hello from 0.8"),
+            composerDraftsAfterEdit(drafts, "group-09", "hello from 0.8", folds),
+        )
+        assertEquals(
+            emptyMap(),
+            composerDraftsAfterEdit(drafts, "group-09", "", folds),
+        )
+    }
+
+    @Test
+    fun trillCooldownReadsHiddenHistoricalSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            80L,
+            trillCooldownUntilMsForChat("group-09", mapOf("group-08" to 80L), folds),
+        )
+        assertEquals(
+            90L,
+            trillCooldownUntilMsForChat(
+                "group-09",
+                mapOf("group-08" to 80L, "group-09" to 90L),
+                folds,
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalComposerDraftMovesOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         assertEquals(
