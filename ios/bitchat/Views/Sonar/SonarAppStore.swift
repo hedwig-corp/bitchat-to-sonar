@@ -1830,6 +1830,20 @@ func snNewestPageShouldMergeFamilyWindow(
     return hiddenSiblingHasRows || hasFoldFamily
 }
 
+/// Empty newest page is not proof the conversation is empty.
+/// Before persist-folds, a recovered 0.8 id answers `[]` from the 0.9
+/// engine; replacing first-open extract wipes history. Compose
+/// `transcriptReadIsUntrusted`.
+func snTranscriptReadIsUntrusted<Message>(
+    fetched: [Message]?,
+    coreStarted: Bool,
+    knownLatestSecs: UInt64
+) -> Bool {
+    guard let fetched else { return true }
+    if !fetched.isEmpty { return false }
+    return !coreStarted || knownLatestSecs > 0
+}
+
 /// Read a draft from the open id or its hidden 0.8 sibling after a fold.
 func snComposerDraft(
     chatId: String,

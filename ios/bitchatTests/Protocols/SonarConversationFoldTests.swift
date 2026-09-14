@@ -1204,6 +1204,41 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snTranscriptReadIsUntrusted(
+                fetched: [String](),
+                coreStarted: true,
+                knownLatestSecs: 1_700_000
+            )
+        )
+        #expect(
+            snTranscriptReadIsUntrusted(
+                fetched: nil as [String]?,
+                coreStarted: true,
+                knownLatestSecs: 0
+            )
+        )
+        #expect(
+            snTranscriptReadIsUntrusted(
+                fetched: [String](),
+                coreStarted: false,
+                knownLatestSecs: 0
+            )
+        )
+        #expect(
+            !snTranscriptReadIsUntrusted(
+                fetched: [String](),
+                coreStarted: true,
+                knownLatestSecs: 0
+            )
+        )
+        #expect(
+            !snTranscriptReadIsUntrusted(
+                fetched: ["row"],
+                coreStarted: true,
+                knownLatestSecs: 1_700_000
+            )
+        )
+        #expect(
             snNewestPageShouldMergeFamilyWindow(
                 existingCanonicalCount: 40,
                 hiddenSiblingHasRows: true,

@@ -1382,6 +1382,13 @@ now union the FFI page with the host cache
 (`publishedMediaScanRows` / `snPublishedMediaScanRows`). Pin:
 `ConversationFoldTest.publishedMediaUrlsIncludeHiddenHistoricalSibling`.
 
+iOS `loadLocalPage(.newestPage)` used to replace first-open extract
+when a recovered 0.8 id answered `[]` and persist-folds had not
+bound the family yet (`snNewestPageShouldMergeFamilyWindow` is false
+without folds). Compose already keeps that window via
+`transcriptReadIsUntrusted`. iOS now uses the same helper. Pin:
+`SonarConversationFoldTests` `snTranscriptReadIsUntrusted`.
+
 Catch-up / media hist-id hole closed after this commit:
 `prefer_catchup_group` looked up the raw MLS hex in `engine.groups()`.
 A recovered 0.8 id is hidden after fold, so opening that row (snapshot

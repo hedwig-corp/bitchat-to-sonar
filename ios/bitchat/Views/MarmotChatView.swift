@@ -2659,6 +2659,18 @@ final class MarmotChatModel: ObservableObject {
             let familyHasOlder = familyIds.contains {
                 localTranscriptHasOlderByGroup[$0] == true
             }
+            let existingLatestSecs = existingCanonical
+                .map { UInt64(max(0, $0.createdAt.timeIntervalSince1970)) }
+                .max() ?? 0
+            let summaryLatestSecs = familyIds
+                .compactMap { conversationSummariesByGroup[$0]?.latestAt.timeIntervalSince1970 }
+                .map { UInt64(max(0, $0)) }
+                .max() ?? 0
+            let newestPageUntrusted = snTranscriptReadIsUntrusted(
+                fetched: page,
+                coreStarted: true,
+                knownLatestSecs: max(existingLatestSecs, summaryLatestSecs)
+            )
             let canonical: [MarmotService.MarmotMessage]
             if shouldPreserveHistoricalWindow {
                 let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
@@ -2701,6 +2713,12 @@ final class MarmotChatModel: ObservableObject {
                     previousHasOlder: familyHasOlder,
                     hasFoldFamily: hasFoldFamily
                 )
+            } else if newestPageUntrusted, !existingCanonical.isEmpty {
+                // Folded 0.8 id / pre-start empty page. Compose
+                // `transcriptReadIsUntrusted` keeps the painted extract.
+                canonical = existingCanonical
+                localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
+                localTranscriptHasOlderByGroup[groupId] = true
             } else {
                 let oldestPageDate = page.map(\.createdAt).min()
                 // Returning from a historical cache window must replace it with a
