@@ -533,6 +533,15 @@ internal fun remountFoldedOpenChatId(
     return if (live in listedChatIds) live else openChatId
 }
 
+/** Shade taps remapped onto a live sibling must open even before `chats()`
+ *  lists that id. Default not-direct so a recovered room cannot fold as a 1:1. */
+internal fun notificationOpenChat(
+    remappedChatId: String,
+    listedChats: List<SonarChat>,
+): SonarChat =
+    listedChats.firstOrNull { it.id == remappedChatId }
+        ?: SonarChat(id = remappedChatId, name = "", members = emptyList(), isDirect = false)
+
 /** Copy an open-chat host map from a hidden 0.8 id onto the live sibling. */
 internal fun <V> remountFoldedOpenValues(
     historicalKeys: List<String>,
@@ -5805,7 +5814,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             is SonarNotificationOpenTarget.MeshPeer ->
                 openDm(target.peerId, meshPeerName(target.peerId), jumpMessageId = jumpMessageId)
             is SonarNotificationOpenTarget.Chat -> {
-                val chat = chats.firstOrNull { it.id == target.chatId } ?: return false
+                val chat = notificationOpenChat(target.chatId, chats)
                 openChat(chat, jumpMessageId = jumpMessageId)
                 if (conversationId != target.chatId) {
                     clearNotificationsForChat(conversationId)

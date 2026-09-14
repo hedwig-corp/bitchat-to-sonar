@@ -100,13 +100,24 @@ class SonarNotificationHandoffTest {
                 liveFoldTargets = mapOf("group-08" to "group-09"),
             ),
         )
-        assertNull(
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("missing-live"),
             SonarNotificationHandoff.resolveOpenTarget(
                 conversationId = "group-08",
                 knownChatIds = setOf("group-09"),
                 foldedGroupPeerIds = emptyMap(),
                 foldedGroupIds = emptySet(),
                 liveFoldTargets = mapOf("group-08" to "missing-live"),
+            ),
+        )
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("group-09"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "group-08",
+                knownChatIds = emptySet(),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = mapOf("group-08" to "group-09"),
             ),
         )
     }

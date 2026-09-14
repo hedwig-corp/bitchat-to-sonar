@@ -80,8 +80,9 @@ object SonarNotificationHandoff {
 
     /**
      * Resolve a notification conversation id onto a real open target.
-     * Returns null when the id is not yet known locally — callers should
-     * refresh and retry instead of inventing a blank chat screen.
+     * A persisted hist→live remap opens the live sibling even when that
+     * id is not in [knownChatIds] yet (cold start / FFI hide). Unknown
+     * ids without a fold still return null so callers can refresh/retry.
      */
     fun resolveOpenTarget(
         conversationId: String,
@@ -95,6 +96,11 @@ object SonarNotificationHandoff {
         foldedGroupPeerIds[id]?.takeIf { it.isNotBlank() }?.let {
             return SonarNotificationOpenTarget.MeshPeer(it)
         }
+        conversationIdAliases(id).firstNotNullOfOrNull { alias ->
+            liveFoldTargets[alias]?.takeIf { it.isNotBlank() && it != id && it != alias }
+        }?.let { live ->
+            return SonarNotificationOpenTarget.Chat(live)
+        }
         if (id in knownChatIds) {
             if (id in foldedGroupIds) {
                 foldedGroupPeerIds[id]?.takeIf { it.isNotBlank() }?.let {
@@ -102,11 +108,6 @@ object SonarNotificationHandoff {
                 }
             }
             return SonarNotificationOpenTarget.Chat(id)
-        }
-        conversationIdAliases(id).firstNotNullOfOrNull { alias ->
-            liveFoldTargets[alias]?.takeIf { it in knownChatIds }
-        }?.let { live ->
-            return SonarNotificationOpenTarget.Chat(live)
         }
         if (id.startsWith(MESH_CHAT_PREFIX)) {
             val peerId = id.removePrefix(MESH_CHAT_PREFIX)

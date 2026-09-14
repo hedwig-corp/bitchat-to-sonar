@@ -403,7 +403,10 @@ tap whose payload still names the hidden 0.8 id remaps onto
 `live_fold_target` instead of toasting that the chat is gone. Cold start
 does that from the persisted hist→live blob (`sonar.historicalFolds` /
 `sonar.historicalFolds.v1`) when FFI is not up yet — a shade tap must
-not wait on `connect()` to open a chat the snapshot already listed. Persisted
+not wait on `connect()` to open a chat the snapshot already listed.
+Compose now remaps and opens that live id even when it is not yet in
+`chats()` (iOS already did via `snNotificationOpenGroupId` / `openDM`).
+A stub row is not-direct so a recovered room cannot fold as a 1:1. Persisted
 call-log rows on the hidden id are merged onto the live sibling so resume
 does not drop the recovered call history. A safety-number verify on the
 hidden id is copied onto the live sibling so resume does not drop the
@@ -452,6 +455,10 @@ chat stays silent when the next push names the live 0.9 id. Pins:
 `client::tests::send_text_rejects_dropped_group`,
 `ConversationFoldTest.foldedHistoricalPendingMediaUploadsMoveOntoLiveSibling`,
 `SonarNotificationHandoffTest.notificationLiveFoldTargetsUsesPersistedBlobWhenFfiIsDown`,
+`SonarNotificationHandoffTest.resolveOpenTargetRemapsFoldedHistoricalIdOntoLiveSibling`
+(remap even when the live id is not in `knownChatIds`),
+`ConversationFoldTest.foldedHistoricalRoomRemountsOntoLiveSibling`
+(`notificationOpenChat` synthesizes a not-direct stub),
 `SonarConversationFoldTests` (`snNotificationLiveFoldTarget` remaps a
 shade tap from the persisted blob when FFI is down),
 `marmot::historical_fold_tests::recovered_08_media_decrypts_with_stored_exporter_secret`
@@ -499,8 +506,7 @@ Stay draft until:
 
 ## Local gates last verified
 
-Re-run on this cloud agent after the waiting-banner live-sibling fix
-(Compose `ConversationFoldTest` + `SonarNotificationHandoffTest` green).
+Re-run on this cloud agent after the unlisted-live notification open.
 Rust core gates last verified on `e218e2f0`.
 
 | Gate | Result |
