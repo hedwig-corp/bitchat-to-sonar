@@ -262,4 +262,21 @@ class HomeMessageRowsTest {
         )
         assertNull(hydrationTargetId("group-08", setOf("group-09"), emptyMap()))
     }
+
+    @Test
+    fun foldedHistoricalPageHydratesOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        val histRow = SonarMsg("hist-msg", "peer", "recovered page", false, 80L, viaInternet = true)
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("group-09"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = emptyList(),
+            pages = listOf(SonarRecentTranscriptPage("group-08", 80L, listOf(histRow))),
+            historicalFolds = folds,
+        )
+        assertEquals(listOf(histRow), hydration.messagesByChat["group-09"])
+        assertEquals(80L, hydration.latestByChat["group-09"])
+        assertTrue(hydration.messagesByChat["group-08"].isNullOrEmpty())
+    }
 }

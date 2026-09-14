@@ -658,6 +658,22 @@ struct SonarConversationFoldTests {
         )
         #expect(keptLive["group-09"]?.latestContent == "already on live")
         #expect(
+            snFoldFamilyCachedMessages(
+                groupId: "group-09",
+                messagesByGroup: ["group-08": ["keep this chat"]],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0 }
+            ) == ["keep this chat"]
+        )
+        #expect(
+            snFoldFamilyCachedMessages(
+                groupId: "group-09",
+                messagesByGroup: ["group-09": ["already on live"], "group-08": ["keep this chat"]],
+                historicalFolds: ["group-08": "group-09"],
+                idOf: { $0 }
+            ) == ["already on live", "keep this chat"]
+        )
+        #expect(
             snConversationRefreshIds(
                 changedGroupId: "group-08",
                 listedGroupIds: ["group-09"],

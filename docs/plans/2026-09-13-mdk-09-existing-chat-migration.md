@@ -876,6 +876,18 @@ Pins: `HomeMessageRowsTest.foldedHistoricalSummaryHydratesOntoLiveSibling`,
 `SonarConversationFoldTests` `snHydrationTargetGroupId` /
 `snRemountedConversationSummaries`.
 
+iOS page / groups hole: Compose collapses FFI chats on every refresh and
+remounts leftover hist pages onto live. iOS only collapsed the cold-start
+snapshot, then `loadLocalSummaries` published raw `groups()` and keyed
+pages on `page.groupId`. Persist-folds before core fold could show a dual
+home row, leave recovered messages on the hidden id, and let
+`loadLocalPage(.newestPage)` replace the live window with an empty/new
+0.9 page. `publishedGroups` collapses every FFI assign; pages remount via
+the hydration target; `snFoldFamilyCachedMessages` seeds open/home from
+the hidden sibling. Pins:
+`HomeMessageRowsTest.foldedHistoricalPageHydratesOntoLiveSibling`,
+`SonarConversationFoldTests` `snFoldFamilyCachedMessages`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

@@ -1003,6 +1003,25 @@ func snRemountedConversationSummaries(
     return out
 }
 
+/// Union leftover hist pages onto the listed live id so first paint / open
+/// does not read an empty `messagesByGroup[live]` while recovered rows still
+/// sit on the hidden 0.8 key (Compose `hydrateLocalConversationRows` pages).
+func snFoldFamilyCachedMessages<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String
+) -> [Message] {
+    var out = messagesByGroup[groupId] ?? []
+    for alias in snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds).sorted() {
+        guard alias != groupId, let incoming = messagesByGroup[alias], !incoming.isEmpty else {
+            continue
+        }
+        out = snMergedFoldedMessageLists(historical: incoming, live: out, idOf: idOf)
+    }
+    return out
+}
+
 func snRetainedTranscriptForChat<Message>(
     chatId: String,
     retainedByChat: [String: [Message]],
