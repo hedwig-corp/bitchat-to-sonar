@@ -954,6 +954,62 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun snapshotLatestFollowsPersistedFoldOntoLiveSibling() {
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(
+            mapOf("group-08" to 1_700_000_000L, "group-09" to 1_700_000_000L),
+            snapshotLatestAfterHistoricalFolds(
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 1_700_000_000L, "group-09" to 1_700_000_100L),
+            snapshotLatestAfterHistoricalFolds(
+                latestByChat = mapOf("group-08" to 1_700_000_000L, "group-09" to 1_700_000_100L),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 1_700_000_200L, "group-09" to 1_700_000_200L),
+            snapshotLatestAfterHistoricalFolds(
+                latestByChat = mapOf("group-08" to 1_700_000_200L, "group-09" to 1_700_000_050L),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            mapOf("group-09" to 9L),
+            snapshotLatestAfterHistoricalFolds(
+                latestByChat = mapOf("group-09" to 9L),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            "group-09",
+            persistedLiveFoldTarget("group-08", folds),
+        )
+        assertNull(persistedLiveFoldTarget("group-09", folds))
+        assertEquals(
+            1_700_000_000L,
+            localLatestTsForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = folds,
+            ),
+        )
+        assertEquals(
+            0L,
+            localLatestTsForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = emptyMap(),
+            ),
+        )
+    }
+
+    @Test
     fun foldedHistoricalSnapshotMessagesMoveOntoLiveSibling() {
         val folds = mapOf("group-08" to "group-09")
         val historical = listOf(

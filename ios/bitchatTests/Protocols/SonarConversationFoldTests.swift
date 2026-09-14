@@ -584,6 +584,50 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ).isEmpty
         )
+        #expect(snPersistedLiveFoldTarget(groupId: "group-08", historicalFolds: ["group-08": "group-09"]) == "group-09")
+        #expect(snPersistedLiveFoldTarget(groupId: "group-09", historicalFolds: ["group-08": "group-09"]) == nil)
+        #expect(
+            snResolvedLiveFoldTarget(
+                groupId: "group-08",
+                historicalFolds: ["group-08": "group-09"],
+                ffiLiveFoldTarget: nil
+            ) == "group-09"
+        )
+        #expect(
+            snResolvedLiveFoldTarget(
+                groupId: "group-08",
+                historicalFolds: [:],
+                ffiLiveFoldTarget: "group-09"
+            ) == "group-09"
+        )
+        #expect(
+            snSnapshotLatestAfterHistoricalFolds(
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08": 1_700_000_000, "group-09": 1_700_000_000]
+        )
+        #expect(
+            snSnapshotLatestAfterHistoricalFolds(
+                latestByChat: ["group-08": 1_700_000_200, "group-09": 1_700_000_050],
+                historicalFolds: ["group-08": "group-09"]
+            )["group-09"] == 1_700_000_200
+        )
+        #expect(
+            snLocalLatestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: ["group-08": "group-09"]
+            ) == 1_700_000_000
+        )
+        #expect(
+            snLocalLatestTsForChat(
+                chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: [:]
+            ) == 0
+        )
         #expect(snFoldedSiblingHasMore(historicalHasMore: true, liveHasMore: false))
         #expect(snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: true))
         #expect(!snFoldedSiblingHasMore(historicalHasMore: false, liveHasMore: false))

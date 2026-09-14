@@ -952,6 +952,54 @@ internal fun collapsedFoldedSnapshotChats(
     }
 }
 
+/** Persisted hist→live binding. Usable before FFI `liveFoldTarget` is ready. */
+internal fun persistedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+): String? = historicalFolds[groupId]?.takeIf { it.isNotBlank() && it != groupId }
+
+/**
+ * Copy a hidden 0.8 snapshot timestamp onto the live sibling.
+ *
+ * First paint collapses the hist row but the metadata blob still keys latest
+ * on that id. Without this, `localLatestTs(live)` is 0 and the recovered chat
+ * sinks under every other row (or persist writes live=0 and the next cold
+ * start cannot recover recency until core summaries arrive).
+ */
+internal fun snapshotLatestAfterHistoricalFolds(
+    latestByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Map<String, Long> {
+    if (historicalFolds.isEmpty() || latestByChat.isEmpty()) return latestByChat
+    var next = latestByChat
+    for ((historical, live) in historicalFolds) {
+        if (live.isBlank() || live == historical) continue
+        val incoming = latestByChat[historical] ?: continue
+        if (incoming <= 0L) continue
+        val existing = next[live] ?: 0L
+        if (incoming > existing) next = next + (live to incoming)
+    }
+    return next
+}
+
+/** Newest local timestamp across the fold family (hidden 0.8 sibling included). */
+internal fun localLatestTsForChat(
+    chatId: String,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    latestByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+): Long {
+    var latest = 0L
+    val ids = foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }
+    for (id in ids) {
+        val ts = messagesByChat[id]?.lastOrNull()?.tsSecs
+            ?: latestByChat[id]
+            ?: 0L
+        if (ts > latest) latest = ts
+    }
+    return latest
+}
+
 /** Every recovered sibling that must leave with [id] on delete / leave. */
 internal fun foldFamilyIds(
     id: String,
@@ -1606,7 +1654,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob).let { (chats, messages) ->
         collapsedFoldedSnapshotChats(chats, initialHistoricalFolds) to messages
     }
-    private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob)
+    private val initialChatSnapshotLatest = snapshotLatestAfterHistoricalFolds(
+        decodeChatSnapshotLatest(initialChatSnapshotBlob),
+        initialHistoricalFolds,
+    )
     private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
     private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
         .mapTo(hashSetOf()) { it.id }
@@ -1673,9 +1724,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var chatSnapshotLatestByChat: Map<String, Long> = initialChatSnapshotLatest
 
     private fun localLatestTs(chatId: String): Long =
-        chatSnapshotMessagesByChat[chatId]?.lastOrNull()?.tsSecs
-            ?: chatSnapshotLatestByChat[chatId]
-            ?: 0L
+        localLatestTsForChat(
+            chatId,
+            chatSnapshotMessagesByChat,
+            chatSnapshotLatestByChat,
+            historicalFoldMap,
+        )
     /** Pending 1:1 secure chats keyed by local id (`npub:…`). Value carries
      *  the peer npub plus [PendingMarmotDirect.createdAtSecs] so the Home list
      *  can sort by creation time (iOS `pending.createdAt` / `dmRows` parity)
@@ -3634,6 +3688,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         historicalFoldMap.putAll(next)
         persistHistoricalFolds()
     }
+
+    private fun resolvedLiveFoldTarget(id: String): String? =
+        persistedLiveFoldTarget(id, historicalFoldMap)
+            ?: runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
 
     private fun rememberHistoricalFolds(previousIds: Set<String>, currentIds: Set<String>) {
         var changed = false
@@ -12858,7 +12916,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             encodeChatSnapshot(
                 chats,
                 chatSnapshotMessagesByChat,
-                chatSnapshotLatestByChat,
+                snapshotLatestAfterHistoricalFolds(chatSnapshotLatestByChat, historicalFoldMap),
                 includeIsDirect = includeIsDirect,
             ),
         )
@@ -12943,20 +13001,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         rememberHistoricalFolds(previousOrder.toSet(), loadedOrCached.mapTo(hashSetOf()) { it.id })
         val localChats = collapsedFoldedSnapshotChats(loadedOrCached, historicalFoldMap)
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
-        val liveFoldTarget = { id: String ->
-            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
-        }
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
         val existingMessages = promotedFoldedSnapshotMessages(
             previousIds = previousOrder.toSet(),
             currentIds = activeIds,
             messagesByChat = chatSnapshotMessagesByChat,
             liveFoldTarget = liveFoldTarget,
         )
-        val existingLatest = promotedFoldedValues(
-            previousIds = previousOrder.toSet(),
-            currentIds = activeIds,
-            values = chatSnapshotLatestByChat,
-            liveFoldTarget = liveFoldTarget,
+        val existingLatest = snapshotLatestAfterHistoricalFolds(
+            promotedFoldedValues(
+                previousIds = previousOrder.toSet(),
+                currentIds = activeIds,
+                values = chatSnapshotLatestByChat,
+                liveFoldTarget = liveFoldTarget,
+            ),
+            historicalFoldMap,
         )
         val summaries = if (localChats.isEmpty()) emptyList() else runCatching {
             SonarCore.conversationSummaries()
@@ -13025,7 +13084,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             previousIds = previousIds,
             currentIds = currentIds,
             mutes = mutedUntilByChat,
-            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+            liveFoldTarget = ::resolvedLiveFoldTarget,
         )
         if (next != mutedUntilByChat) {
             mutedUntilByChat = next
@@ -13034,9 +13093,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun promoteFoldedComposerState(previousIds: Set<String>, currentIds: Set<String>) {
-        val liveFoldTarget = { id: String ->
-            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
-        }
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
         val nextDrafts = promotedFoldedComposerDrafts(
             previousIds = previousIds,
             currentIds = currentIds,
@@ -13062,9 +13119,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun promoteFoldedScanState(previousIds: Set<String>, currentIds: Set<String>) {
-        val liveFoldTarget = { id: String ->
-            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
-        }
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
         val nextMarks = promotedFoldedScanMarks(
             previousIds = previousIds,
             currentIds = currentIds,
@@ -13131,10 +13186,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             previousIds = previousIds,
             currentIds = currentIds,
             verifiedIds = recovered,
-            liveFoldTarget = { id ->
-                historicalFoldMap[id]
-                    ?: runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
-            },
+            liveFoldTarget = ::resolvedLiveFoldTarget,
         )
         if (next == verifiedChatIds) return
         for (id in next - verifiedChatIds) {
@@ -13149,7 +13201,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             previousIds = previousIds,
             currentIds = currentIds,
             callLogs = callLogs.mapValues { it.value.toList() },
-            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+            liveFoldTarget = ::resolvedLiveFoldTarget,
         )
         if (next == callLogs.mapValues { it.value.toList() }) return
         for ((id, records) in next) {
@@ -13163,7 +13215,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             previousIds = previousIds,
             currentIds = currentIds,
             messagesByChat = pendingSendEchoes.mapValues { it.value.toList() },
-            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+            liveFoldTarget = ::resolvedLiveFoldTarget,
             idOf = { it.id },
         )
         if (next != pendingSendEchoes.mapValues { it.value.toList() }) {
@@ -13176,7 +13228,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             previousIds = previousIds,
             currentIds = currentIds,
             values = trillCooldownUntilMs,
-            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+            liveFoldTarget = ::resolvedLiveFoldTarget,
         )
         if (nextTrill != trillCooldownUntilMs) {
             trillCooldownUntilMs = nextTrill
@@ -13187,9 +13239,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  fold lands after the user leaves. Echoes already promote above; these
      *  queues must move too or Send finishes against a chat FFI no longer lists. */
     private fun promoteFoldedInFlightSends(previousIds: Set<String>, currentIds: Set<String>) {
-        val liveFoldTarget = { id: String ->
-            runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
-        }
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
         val nextUploads = promotedFoldedPendingMediaUploads(
             previousIds = previousIds,
             currentIds = currentIds,
@@ -13227,7 +13277,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         fun liveFor(id: String) = remountFoldedOpenChatId(
             openChatId = id,
             listedChatIds = listed,
-            liveFoldTarget = runCatching { SonarCore.liveFoldTarget(id) }.getOrNull(),
+            liveFoldTarget = resolvedLiveFoldTarget(id),
         )
         val open = stack.filterIsInstance<Screen.Chat>().firstOrNull { liveFor(it.id) != it.id }
         if (open != null) {
@@ -13349,10 +13399,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  after the user already left. Reopen of the live row must paint that
      *  frame immediately — iOS promotes `messagesByGroup` the same way. */
     private fun promoteFoldedRetainedTranscripts(previousIds: Set<String>, currentIds: Set<String>) {
-        val liveFoldTarget = { id: String ->
-            historicalFoldMap[id]
-                ?: runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
-        }
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
         val nextRetained = promotedFoldedSnapshotMessages(
             previousIds = previousIds,
             currentIds = currentIds,

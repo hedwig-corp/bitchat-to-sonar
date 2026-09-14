@@ -739,6 +739,62 @@ func snCollapsedFoldedSnapshotGroups<Group>(
     }
 }
 
+/// Persisted hist→live binding. Usable before FFI `liveFoldTarget` is ready.
+func snPersistedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: [String: String]
+) -> String? {
+    guard let live = historicalFolds[groupId], !live.isEmpty, live != groupId else {
+        return nil
+    }
+    return live
+}
+
+func snResolvedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: [String: String],
+    ffiLiveFoldTarget: String?
+) -> String? {
+    snPersistedLiveFoldTarget(groupId: groupId, historicalFolds: historicalFolds)
+        ?? ffiLiveFoldTarget.flatMap { live in
+            live.isEmpty || live == groupId ? nil : live
+        }
+}
+
+/// Copy a hidden 0.8 snapshot timestamp onto the live sibling (Compose
+/// `snapshotLatestAfterHistoricalFolds`).
+func snSnapshotLatestAfterHistoricalFolds(
+    latestByChat: [String: Int64],
+    historicalFolds: [String: String]
+) -> [String: Int64] {
+    if historicalFolds.isEmpty || latestByChat.isEmpty { return latestByChat }
+    var next = latestByChat
+    for (historical, live) in historicalFolds {
+        guard !live.isEmpty, live != historical else { continue }
+        guard let incoming = latestByChat[historical], incoming > 0 else { continue }
+        if incoming > (next[live] ?? 0) {
+            next[live] = incoming
+        }
+    }
+    return next
+}
+
+/// Newest local timestamp across the fold family (hidden 0.8 sibling included).
+func snLocalLatestTsForChat(
+    chatId: String,
+    messagesByChat: [String: [Int64]],
+    latestByChat: [String: Int64],
+    historicalFolds: [String: String]
+) -> Int64 {
+    let ids = snFoldFamilyIds(id: chatId, historicalFolds: historicalFolds)
+    var latest: Int64 = 0
+    for id in ids {
+        let ts = messagesByChat[id]?.last ?? latestByChat[id] ?? 0
+        if ts > latest { latest = ts }
+    }
+    return latest
+}
+
 /// Every recovered sibling that must leave with `id` on delete / leave.
 func snFoldFamilyIds(
     id: String,
@@ -6098,11 +6154,18 @@ final class SonarAppStore: ObservableObject {
     private func latestMarmotMessage(
         in groups: [MarmotService.MarmotGroup]
     ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         var latest: (groupId: String, message: MarmotService.MarmotMessage)?
         for group in groups {
-            guard let message = marmot.homeRowMessage(groupId: group.id) else { continue }
-            if latest == nil || message.createdAt > latest!.message.createdAt {
-                latest = (group.id, message)
+            for alias in snFoldFamilyIds(id: group.id, historicalFolds: folds) {
+                guard let message = snMarmotHomeRowMessage(
+                    loaded: marmot.messagesByGroup[alias]?.last,
+                    summary: marmot.conversationSummariesByGroup[alias]
+                        ?? marmot.conversationSummariesByGroup[group.id]
+                ) else { continue }
+                if latest == nil || message.createdAt > latest!.message.createdAt {
+                    latest = (group.id, message)
+                }
             }
         }
         return latest
@@ -6112,8 +6175,8 @@ final class SonarAppStore: ObservableObject {
         in groups: [MarmotService.MarmotGroup]
     ) -> MarmotService.MarmotGroup? {
         groups.sorted { lhs, rhs in
-            let lhsDate = marmot.homeRowMessage(groupId: lhs.id)?.createdAt ?? .distantPast
-            let rhsDate = marmot.homeRowMessage(groupId: rhs.id)?.createdAt ?? .distantPast
+            let lhsDate = latestMarmotMessage(in: [lhs])?.message.createdAt ?? .distantPast
+            let rhsDate = latestMarmotMessage(in: [rhs])?.message.createdAt ?? .distantPast
             if lhsDate != rhsDate { return lhsDate > rhsDate }
             let lhsVerified = marmotVerified[lhs.id] ?? false
             let rhsVerified = marmotVerified[rhs.id] ?? false
@@ -6588,7 +6651,7 @@ final class SonarAppStore: ObservableObject {
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
-            let last = marmot.homeRowMessage(groupId: group.id)
+            let last = latestMarmotMessage(in: [group])?.message
             guard marmot.isDirectGroup(group) else {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
@@ -7900,6 +7963,17 @@ final class SonarAppStore: ObservableObject {
         openedDM(realId, marmotGroupId: groupId)
     }
 
+    /// Persisted folds first so a promote before FFI `liveFoldTarget` still
+    /// remounts host state onto the live sibling (Compose `persistedLiveFoldTarget`).
+    private func resolvedLiveFoldTarget(for groupId: String) async -> String? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snResolvedLiveFoldTarget(
+            groupId: groupId,
+            historicalFolds: folds,
+            ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId)
+        )
+    }
+
     /// Copy a mute from a hidden 0.8 row onto the live 0.9 sibling.
     @MainActor
     private func promoteFoldedMutes(from previous: Set<String>, to current: Set<String>) async {
@@ -7913,7 +7987,7 @@ final class SonarAppStore: ObservableObject {
         }
         var targets: [String: String] = [:]
         for historical in previous.union(muteGroupIds).subtracting(current) {
-            if let live = await marmot.liveFoldTarget(groupId: historical) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
         }
@@ -7957,7 +8031,7 @@ final class SonarAppStore: ObservableObject {
         }
         var targets: [String: String] = [:]
         for historical in previous.union(extraGroupIds).subtracting(current) {
-            if let live = await marmot.liveFoldTarget(groupId: historical) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
         }
@@ -8012,7 +8086,7 @@ final class SonarAppStore: ObservableObject {
         extraGroupIds.subtract(current)
         var targets: [String: String] = [:]
         for historical in extraGroupIds {
-            if let live = await marmot.liveFoldTarget(groupId: historical) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
         }
@@ -8048,7 +8122,7 @@ final class SonarAppStore: ObservableObject {
         extraGroupIds.subtract(current)
         var targets: [String: String] = [:]
         for historical in extraGroupIds {
-            if let live = await marmot.liveFoldTarget(groupId: historical) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
         }
@@ -8123,7 +8197,7 @@ final class SonarAppStore: ObservableObject {
         }
         var targets: [String: String] = [:]
         for historical in previous.union(verifiedGroupIds).subtracting(current) {
-            if let live = await marmot.liveFoldTarget(groupId: historical) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
         }
@@ -8155,7 +8229,7 @@ final class SonarAppStore: ObservableObject {
         extra.subtract(current)
         var targets: [String: String] = [:]
         for historical in extra {
-            if let live = await marmot.liveFoldTarget(groupId: historical) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
         }
@@ -8180,7 +8254,7 @@ final class SonarAppStore: ObservableObject {
         var liveById: [String: String] = [:]
         var aliasesById: [String: [String]] = [:]
         for id in listed {
-            if let live = await marmot.liveFoldTarget(groupId: id) {
+            if let live = await resolvedLiveFoldTarget(for: id) {
                 liveById[id] = live
             }
             aliasesById[id] = await marmot.foldAliases(groupId: id)
@@ -8302,7 +8376,7 @@ final class SonarAppStore: ObservableObject {
         }
         var targets: [String: String] = [:]
         for historical in previous.union(extra).subtracting(current) {
-            if let live = await marmot.liveFoldTarget(groupId: historical) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
         }
@@ -8336,7 +8410,7 @@ final class SonarAppStore: ObservableObject {
             syncViewingUnreadGroups()
         }
         guard let openId = currentDMId, let groupId = marmotGroupId(openId) else { return }
-        let live = await marmot.liveFoldTarget(groupId: groupId)
+        let live = await resolvedLiveFoldTarget(for: groupId)
         let remounted = snRemountFoldedOpenGroupId(
             openGroupId: groupId,
             listedGroupIds: listed,
