@@ -489,6 +489,16 @@ internal fun encodeChatSnapshot(
         }
     }
 
+/** True when the blob still has leftover non-chat lines (old message bodies). */
+internal fun chatSnapshotNeedsMetadataRewrite(blob: String): Boolean =
+    blob.lineSequence().any { it.isNotBlank() && !it.startsWith("c\t") }
+
+/** True when at least one chat row already persisted `isDirect`. */
+internal fun chatSnapshotHasIsDirect(blob: String): Boolean =
+    blob.lineSequence().any { line ->
+        line.startsWith("c\t") && line.split('\t').size >= 6
+    }
+
 internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String, List<SonarMsg>>> {
     val chats = mutableListOf<SonarChat>()
     blob.lineSequence().forEach { line ->

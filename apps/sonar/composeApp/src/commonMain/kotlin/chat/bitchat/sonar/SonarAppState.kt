@@ -975,11 +975,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val profileMissedAt = mutableMapOf<String, Long>()
 
     init {
-        if (initialChatSnapshotBlob.isNotEmpty()) {
-            // Strip leftover plaintext bodies from older blobs. Do not write
-            // isDirect — a missing flag must stay missing until groups()
-            // returns or invented false becomes durable across a failed connect.
-            persistChatSnapshot(includeIsDirect = false)
+        if (chatSnapshotNeedsMetadataRewrite(initialChatSnapshotBlob)) {
+            // Strip leftover plaintext bodies. Keep isDirect only when the
+            // source blob already had it — otherwise a good 6-field snapshot
+            // would be rewritten to 5 fields on every cold start.
+            persistChatSnapshot(includeIsDirect = chatSnapshotHasIsDirect(initialChatSnapshotBlob))
         }
     }
 

@@ -386,6 +386,24 @@ class ConversationFoldTest {
         val decoded = decodeChatSnapshot(stripped).first.single()
         assertFalse(decoded.isDirect)
         assertEquals(mapOf(room.id to 9L), decodeChatSnapshotLatest(stripped))
+        assertFalse(chatSnapshotNeedsMetadataRewrite(stripped))
+        assertFalse(chatSnapshotHasIsDirect(stripped))
+    }
+
+    @Test
+    fun modernSnapshotDoesNotNeedStartupRewrite() {
+        val dm = SonarChat(id = "bob-dm", name = "bob dm", members = listOf("npub1me", "npub1bob"))
+        val room = SonarChat(
+            id = "pending-room",
+            name = "pending room",
+            members = listOf("npub1me", "npub1bob"),
+            isDirect = false,
+        )
+        val modern = encodeChatSnapshot(listOf(dm, room), emptyMap(), mapOf(dm.id to 2L, room.id to 1L))
+        assertFalse(chatSnapshotNeedsMetadataRewrite(modern))
+        assertTrue(chatSnapshotHasIsDirect(modern))
+        assertFalse(chatSnapshotNeedsMetadataRewrite("c\tid\tname\t\t0\n"))
+        assertTrue(chatSnapshotNeedsMetadataRewrite("c\tid\tname\t\t0\nm\told-body\n"))
     }
 
     @Test
