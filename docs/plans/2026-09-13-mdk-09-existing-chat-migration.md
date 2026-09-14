@@ -486,6 +486,10 @@ permanently urgent),
 (`is_known_group_member` / `share_push_token_with_groups` walk recovered
 0.8 members so a peer can share a wake token before either side resumes),
 `client::tests::push_token_share_from_left_recovered_peer_is_rejected`,
+`client::tests::resume_staged_media_rejects_dropped_group`,
+`client::tests::resume_staged_media_on_recovered_chat_uses_resolve_send_group`
+(in-flight media staged on a recovered 0.8 id goes through
+`resolve_send_group` instead of encrypting against a dead MLS exporter),
 `invite_link::tests::fold_family_unions_historical_invite_sidecar`,
 `account_backup::tests::write_read_package_files_roundtrips_invite_sidecar`
 (v2 backup packs `.sonar-invites.json` so nsec restore keeps minted
@@ -560,7 +564,7 @@ push-token membership, and invite-mint backup dirty. Prior HEAD
 
 | Gate | Result |
 | --- | --- |
-| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 187 passed |
+| `--lib` `--` `mdk08_migrate` `historical_fold` `account_backup` `client::tests` | 189 passed |
 | `--test persistence` | 30 passed |
 | `--test group_invites` | 17 passed |
 | `--test failed_events` | 1 passed |

@@ -5204,6 +5204,12 @@ impl SonarClient {
         group_id: &GroupId,
         observer: Option<&dyn MediaUploadObserver>,
     ) -> Result<()> {
+        // Staging can still name a recovered 0.8 id (upgrade mid-upload, or a
+        // host that staged from the open conversation). Encrypting against
+        // that id fails — there is no live MLS exporter. Resume onto the
+        // live sibling the same way `send_media_multi` does.
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
         if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
             return Err(Error::MediaUploadCancelled);
         }
@@ -9170,6 +9176,88 @@ mod tests {
         assert!(
             !crate::account_backup::load_backup_policy(&db_path).dirty,
             "inbound join request must not make the account backup urgent"
+        );
+    }
+
+    fn stage_tiny_jpeg(client: &SonarClient, id: &str, group_id: &GroupId) {
+        client
+            .media_staging
+            .lock()
+            .unwrap()
+            .stage(
+                id.to_string(),
+                id.to_string(),
+                hex::encode(group_id.as_slice()),
+                String::new(),
+                String::new(),
+                vec![("a.jpg".into(), "image/jpeg".into(), vec![0xFF, 0xD8, 0xFF])],
+                1,
+            )
+            .expect("stage in-memory jpeg");
+    }
+
+    fn staged_last_error(client: &SonarClient, id: &str) -> String {
+        client
+            .media_staging
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|entry| entry.last_error.clone())
+            .expect("staged entry failed")
+    }
+
+    /// An in-flight upload left on a chat the user already left must not
+    /// resume as a new 0.9 group.
+    #[tokio::test]
+    async fn resume_staged_media_rejects_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x16u8; 32]);
+        client.engine.purge_fold_family(&group_id);
+        stage_tiny_jpeg(&client, "resume08drop", &group_id);
+        client
+            .resume_pending_media_uploads(None)
+            .await
+            .expect("resume reports attempts");
+        let err = staged_last_error(&client, "resume08drop");
+        assert!(
+            err.contains("this chat was deleted"),
+            "deleted chat must not resume media: {err}"
+        );
+    }
+
+    /// Staging that still names the recovered 0.8 id must hit
+    /// `resolve_send_group` (no live MLS exporter on that id) instead of
+    /// failing as a generic missing-group encrypt.
+    #[tokio::test]
+    async fn resume_staged_media_on_recovered_chat_uses_resolve_send_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x08u8; 32]);
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(1),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: "old hello".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: true,
+            delivery_state: crate::marmot::DeliveryState::Sent,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old hello"),
+            reply: None,
+        });
+        stage_tiny_jpeg(&client, "resume08hist", &historical);
+        client
+            .resume_pending_media_uploads(None)
+            .await
+            .expect("resume reports attempts");
+        let err = staged_last_error(&client, "resume08hist");
+        assert!(
+            err.contains("cannot send until the other members update"),
+            "recovered media resume must go through resolve_send_group: {err}"
         );
     }
 
