@@ -3116,13 +3116,25 @@ impl MarmotEngine {
             .unwrap_or(0)
     }
 
+    /// Newest peer-authored chat row on this live MLS id only.
+    ///
+    /// Catch-up `since` must not use folded 0.8 hist. A recovered transcript
+    /// can be days newer than unread 0.9 traffic from a peer who upgraded
+    /// first; a family floor would skip those events past the 1h lookback.
     pub fn latest_remote_chat_message_secs(&self, group_id: &GroupId) -> Option<u64> {
         let me = self.identity.public_key();
-        self.transcript_for_family(group_id)
+        self.transcript_for(group_id)
             .into_iter()
             .filter(|m| m.sender != me)
             .map(|m| m.created_at.as_secs())
             .max()
+    }
+
+    /// True when this live MLS id has no locally stored chat rows.
+    /// Folded 0.8 hist must not count — empty-transcript repair has to
+    /// full-backfill a new 0.9 sibling that only has recovered history.
+    pub fn live_chat_page_empty(&self, group_id: &GroupId) -> bool {
+        self.transcript_for(group_id).is_empty()
     }
 
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {

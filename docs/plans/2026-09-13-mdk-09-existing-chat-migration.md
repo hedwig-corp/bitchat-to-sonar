@@ -1606,6 +1606,13 @@ Two incoming matching welcomes can still leave a second empty live
 group; that fold stays on the first
 (`incoming_09_named_pair_second_welcome_does_not_steal_fold`).
 
+Catch-up floors and empty-transcript repair used `messages_page`,
+which unions folded hist. A new 0.9 sibling that only has recovered
+0.8 rows looked already-paged, skipped full backfill, and used the
+hist timestamp as `since` — missing 0.9 traffic older than the last
+0.8 message (peer upgraded first). Scan live MLS rows only. Pin:
+`client::tests::catchup_and_empty_backfill_ignore_folded_hist_transcript`.
+
 Still missing here: device 0.8 in-place upgrade, White Noise iOS interop, cold-start `t0→t4`.
 
 First-paint host hole closed after `21ddc90e`: Compose `encodeChatSnapshot`

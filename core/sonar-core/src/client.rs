@@ -6084,11 +6084,16 @@ impl SonarClient {
         let Ok(groups) = engine.groups() else {
             return HashSet::new();
         };
+        // Live MLS rows only. `messages_page` unions folded hist, which
+        // would hide a new 0.9 sibling that still needs a full backfill.
         groups
             .into_iter()
-            .filter_map(|group| match engine.messages_page(&group.id, 1, 0) {
-                Ok(page) if page.is_empty() => engine.nostr_h_tag_hex(&group.id).ok().flatten(),
-                _ => None,
+            .filter_map(|group| {
+                if engine.live_chat_page_empty(&group.id) {
+                    engine.nostr_h_tag_hex(&group.id).ok().flatten()
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -6097,6 +6102,8 @@ impl SonarClient {
         if self.initial_backfill_scanned.swap(true, Ordering::Relaxed) {
             return;
         }
+        self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         let mut set = self.initial_empty_transcript_backfills.lock().unwrap();
         *set = Self::empty_transcript_group_ids(&self.engine);
     }
@@ -6123,11 +6130,9 @@ impl SonarClient {
         groups
             .into_iter()
             .filter_map(|group| {
-                let has_local_chat = engine
-                    .messages_page(&group.id, 1, 0)
-                    .map(|page| !page.is_empty())
-                    .unwrap_or(false);
-                if !has_local_chat {
+                // Live 0.9 rows only. Folded hist must not mark the group
+                // "already paged" or raise `since` past unread 0.9 traffic.
+                if engine.live_chat_page_empty(&group.id) {
                     return None;
                 }
                 let floor = engine
@@ -6146,6 +6151,8 @@ impl SonarClient {
         {
             return;
         }
+        self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         let mut queue = self.initial_group_message_catchups.lock().unwrap();
         *queue =
             Self::group_message_catchup_queue(Self::group_message_catchup_floors(&self.engine));
@@ -11267,6 +11274,110 @@ mod tests {
         assert_eq!(
             floors.get(&nostr_group_id_hex).copied(),
             Some(bob_message_secs)
+        );
+    }
+
+    /// Folded 0.8 hist must not count as a live 0.9 page. Family union would
+    /// skip empty-transcript backfill and raise catch-up `since` past unread
+    /// 0.9 traffic from a peer who upgraded first.
+    #[tokio::test]
+    async fn catchup_and_empty_backfill_ignore_folded_hist_transcript() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x08u8; 16]);
+        const HIST_REMOTE_SECS: u64 = 9_000_000_000;
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(21),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(HIST_REMOTE_SECS),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live)
+        );
+        assert!(
+            !bob.engine
+                .messages_page(&live, 1, 0)
+                .expect("family page")
+                .is_empty(),
+            "sanity: messages_page(live) unions hist"
+        );
+        let h = bob
+            .engine
+            .nostr_h_tag_hex(&live)
+            .expect("routing")
+            .expect("founding group has nostr routing");
+
+        let empty = SonarClient::empty_transcript_group_ids(&bob.engine);
+        assert!(
+            empty.contains(&h),
+            "folded hist must not hide an empty live group from full backfill: {empty:?}"
+        );
+        let floors = SonarClient::group_message_catchup_floors(&bob.engine);
+        assert!(
+            !floors.contains_key(&h),
+            "empty live must not enter catch-up with a hist floor: {floors:?}"
+        );
+
+        alice
+            .merge_pending_commit(&creation.group.id)
+            .await
+            .expect("alice merges pending commit");
+        let alice_event = alice
+            .create_text_message(&creation.group.id, "0.9 after upgrade")
+            .await
+            .expect("alice creates 0.9 message");
+        let live_remote_secs = alice_event.created_at.as_secs();
+        assert!(live_remote_secs < HIST_REMOTE_SECS);
+        assert!(matches!(
+            bob.engine
+                .process_incoming(&alice_event)
+                .await
+                .expect("bob stores 0.9 message"),
+            Incoming::Message(_)
+        ));
+
+        let empty_after = SonarClient::empty_transcript_group_ids(&bob.engine);
+        assert!(
+            !empty_after.contains(&h),
+            "a live 0.9 row must leave empty-transcript repair"
+        );
+        let floors_after = SonarClient::group_message_catchup_floors(&bob.engine);
+        assert_eq!(
+            floors_after.get(&h).copied(),
+            Some(live_remote_secs),
+            "catch-up floor must be the live 0.9 remote, not folded hist {HIST_REMOTE_SECS}"
         );
     }
 
