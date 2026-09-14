@@ -1515,6 +1515,12 @@ the published live id (add unread, max latest/count). After
 `copy_summary` hist unread is 0 so a second remount cannot double-count.
 Pin: `client::tests::conversation_summaries_remount_hidden_hist_without_copy_summary`.
 
+Remount onto an existing live row left SQL order (`latest_at=0` at the
+bottom). First-tip / unread-fallback that trust published order kept a
+newer unrelated chat in front. Re-sort after any hist remount, not only
+when synthesizing a missing live row. Pin:
+`client::tests::conversation_summaries_reorder_after_hidden_hist_latest_remount`.
+
 NSE unread-fallback and host wake-delta still keyed the published live
 id only. After hide a 0.8 `conversation_id` / `group_id` hint missed
 the remounted tip and fell through to an unrelated unread chat; a

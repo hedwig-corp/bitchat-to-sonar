@@ -7899,7 +7899,7 @@ impl SonarClient {
             return;
         }
         let idx = idx.lock().unwrap();
-        let mut synthesized = false;
+        let mut remounted = false;
         for (historical, live) in pairs {
             if live == historical {
                 continue;
@@ -7914,6 +7914,7 @@ impl SonarClient {
             }
             if let Some(live_summary) = summaries.iter_mut().find(|s| s.group_id_hex == live_hex) {
                 Self::remount_hist_fields_onto_live(live_summary, &hist);
+                remounted = true;
                 continue;
             }
             if self.engine.is_dropped(&live) || !self.engine.is_live_group(&live).unwrap_or(false) {
@@ -7922,10 +7923,17 @@ impl SonarClient {
             let mut published = hist.clone();
             published.group_id_hex = live_hex;
             summaries.push(published);
-            synthesized = true;
+            remounted = true;
         }
-        if synthesized {
-            summaries.sort_by(|a, b| b.latest_at_secs.cmp(&a.latest_at_secs));
+        // SQL order used live latest_at 0. Remounting hist newest onto that
+        // existing row must re-sort or NSE / first-tip fallback keep a
+        // newer unrelated chat in front.
+        if remounted {
+            summaries.sort_by(|a, b| {
+                b.latest_at_secs
+                    .cmp(&a.latest_at_secs)
+                    .then_with(|| a.group_id_hex.cmp(&b.group_id_hex))
+            });
         }
     }
 
@@ -9547,6 +9555,54 @@ mod tests {
             after_copy[0].message_count >= 3,
             "hist count must still remount after copy_summary leaves live count stale"
         );
+    }
+
+    /// `summaries_ordered` ranks live `latest_at=0` below an unrelated chat.
+    /// Remounting hist newest onto that existing live row must re-sort so
+    /// first-tip / NSE fallback do not keep the unrelated chat in front.
+    #[tokio::test]
+    async fn conversation_summaries_reorder_after_hidden_hist_latest_remount() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let other = GroupId::new([0x0au8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        let other_hex = hex::encode(other.as_slice());
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live_hex, "", "", "", 0, true, false)
+                .unwrap();
+            idx.upsert_summary(&other_hex, "bob", "newer other", "bob", 50, false, true)
+                .unwrap();
+        }
+        client.engine.record_historical_fold(&historical, &live);
+
+        let summaries = client.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            2,
+            "folded hist stays hidden: {summaries:?}"
+        );
+        assert_eq!(
+            summaries[0].group_id_hex, live_hex,
+            "remounted hist latest_at must lead SQL order: {summaries:?}"
+        );
+        assert_eq!(summaries[0].latest_at_secs, 100);
+        assert_eq!(summaries[1].group_id_hex, other_hex);
+        assert_eq!(summaries[1].latest_at_secs, 50);
     }
 
     /// A stale send aimed at a chat the user already left must fail closed
