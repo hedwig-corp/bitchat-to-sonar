@@ -3895,7 +3895,9 @@ private struct MacDMTranscript: View {
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
                 unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
-                expectedNewestDate: store.expectedNewestMessageDate(peerId)
+                expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
+                onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
             )
         }
     }

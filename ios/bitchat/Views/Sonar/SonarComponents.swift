@@ -1727,6 +1727,10 @@ struct SNMsgList: View {
     /// this — hydration can publish one transport leg before the folded White
     /// Noise groups merge in, and the missing rows are exactly the unread ones.
     var expectedNewestDate: Date? = nil
+    /// Search / quote / notification jump. Wins over unread/live-edge.
+    var jumpMessageId: String? = nil
+    /// Cleared only after the parent is painted (remainder / family reveal).
+    var onJumpSettled: (() -> Void)? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -1795,8 +1799,30 @@ struct SNMsgList: View {
         SNTranscriptScrollPolicy.openAction(
             unreadAnchorId: unreadAnchorId,
             unreadCountAtOpen: unreadCountAtOpen,
-            unreadAnchorAbandoned: unreadAnchorAbandoned
+            unreadAnchorAbandoned: unreadAnchorAbandoned,
+            jumpId: jumpMessageId
         )
+    }
+
+    private func applyQuotedJump(proxy: ScrollViewProxy) {
+        guard let jump = jumpMessageId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !jump.isEmpty else { return }
+        if msgs.contains(where: { $0.id == jump }) {
+            needsLiveEdgeOpen = false
+            isNearBottom = false
+            tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
+            proxy.scrollTo(jump, anchor: .top)
+            if SNTranscriptScrollPolicy.shouldSettleJump(parentVisible: true) {
+                onJumpSettled?()
+            }
+            return
+        }
+        guard let loadOlder, !isLoadingOlder else { return }
+        isLoadingOlder = true
+        Task {
+            _ = await loadOlder()
+            await MainActor.run { isLoadingOlder = false }
+        }
     }
 
     /// The [unreadCountAtOpen]-th non-mine message from the tail — core
@@ -2143,14 +2169,14 @@ struct SNMsgList: View {
                         DispatchQueue.main.async {
                             snapFullyReadOpen(proxy: proxy)
                         }
-                    case .jump(let id):
-                        needsLiveEdgeOpen = false
-                        isNearBottom = false
-                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
+                    case .jump:
                         DispatchQueue.main.async {
-                            proxy.scrollTo(id, anchor: .top)
+                            applyQuotedJump(proxy: proxy)
                         }
                     }
+                }
+                .onChange(of: jumpMessageId) { _ in
+                    applyQuotedJump(proxy: proxy)
                 }
                 .onChange(of: unreadCountAtOpen) { _ in
                     // Capture settled (was nil → 0 or N). Drive open from
@@ -2171,13 +2197,8 @@ struct SNMsgList: View {
                         DispatchQueue.main.async {
                             snapFullyReadOpen(proxy: proxy)
                         }
-                    case .jump(let id):
-                        needsLiveEdgeOpen = false
-                        isNearBottom = false
-                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(id, anchor: .top)
-                        }
+                    case .jump:
+                        applyQuotedJump(proxy: proxy)
                     }
                 }
                 .onChange(of: messageRevision) { _ in
@@ -2214,6 +2235,10 @@ struct SNMsgList: View {
                     if let unreadCountAtOpen, unreadCountAtOpen > 0,
                        unreadAnchorId == nil, !unreadAnchorAbandoned
                     {
+                        return
+                    }
+                    if jumpMessageId != nil {
+                        applyQuotedJump(proxy: proxy)
                         return
                     }
                     // Fully-read open recovery: re-snap across hydration and

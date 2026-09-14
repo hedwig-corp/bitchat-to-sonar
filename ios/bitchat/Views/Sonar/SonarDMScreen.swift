@@ -300,7 +300,9 @@ struct SonarDMScreenContent: View {
                     // (and openedDM's read-marking) existed. Nil = unset —
                     // do not coerce to 0 (false live-edge chase).
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
-                    expectedNewestDate: store.expectedNewestMessageDate(peerId)
+                    expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                    jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
+                    onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
                 )
                 dmComposer
             }
