@@ -762,6 +762,36 @@ class ConversationFoldTest {
                 knownLiveTargets = emptyMap(),
             ),
         )
+        // Persist-other must not hide this remount. After hop, iPhone
+        // can still push group-info from the painted hist pane.
+        assertEquals(
+            "group-09",
+            pathRemountLiveTarget(
+                id = "marmot:group-08",
+                persistedFolds = mapOf("other-08" to "other-09"),
+                knownLiveTargets = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            null,
+            pathRemountLiveTarget(
+                id = "marmot:group-08",
+                persistedFolds = mapOf("other-08" to "other-09"),
+                knownLiveTargets = emptyMap(),
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            pathRemountLiveTarget(
+                id = "marmot:group-08",
+                persistedFolds = mapOf("group-08" to "stale-09"),
+                knownLiveTargets = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertEquals(
             listOf(Screen.GroupInfo("group-09")),
             remountFoldedNavStack(

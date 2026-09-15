@@ -706,16 +706,27 @@ func snRemountFoldedPath(
 
 /// Path remount must see the same live target as open-chat remount.
 /// Persist-folds can still be empty when FFI already hid hist.
+/// After hop, iPhone can still push group-info / call from the
+/// painted hist pane; persist-other must not hide this remount.
 /// Compose `pathRemountLiveTarget`.
 func snPathRemountLiveTarget(
     id: String,
     persistedFolds: [String: String],
-    knownLiveTargets: [String: String]
+    knownLiveTargets: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String? {
     let bare = snBareMarmotGroupId(id)
     if let live = persistedFolds[bare], !live.isEmpty, live != bare { return live }
     if let live = knownLiveTargets[bare], !live.isEmpty { return live }
     if let live = knownLiveTargets[id], !live.isEmpty { return live }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: persistedFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if let live = folds[bare], !live.isEmpty, live != bare { return live }
+    if let live = folds[id], !live.isEmpty, live != id { return live }
     return persistedFolds[bare]
 }
 
@@ -11944,6 +11955,7 @@ final class SonarAppStore: ObservableObject {
         preserveIds: Set<String> = []
     ) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         let next = snRemountFoldedPath(
             path: path,
             listedGroupIds: listedGroupIds,
@@ -11951,7 +11963,9 @@ final class SonarAppStore: ObservableObject {
                 snPathRemountLiveTarget(
                     id: id,
                     persistedFolds: folds,
-                    knownLiveTargets: knownLiveTargets
+                    knownLiveTargets: knownLiveTargets,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
             },
             preserveIds: preserveIds
@@ -11966,7 +11980,9 @@ final class SonarAppStore: ObservableObject {
                 liveFoldTarget: snPathRemountLiveTarget(
                     id: call.convId,
                     persistedFolds: folds,
-                    knownLiveTargets: knownLiveTargets
+                    knownLiveTargets: knownLiveTargets,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
             )
             if remounted != call.convId {

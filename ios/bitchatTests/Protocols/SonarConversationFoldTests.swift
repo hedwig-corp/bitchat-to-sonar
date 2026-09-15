@@ -174,6 +174,33 @@ struct SonarConversationFoldTests {
                 knownLiveTargets: [:]
             ) == "group-09"
         )
+        // Persist-other must not hide this remount. After hop, iPhone
+        // can still push group-info from the painted hist pane.
+        #expect(
+            snPathRemountLiveTarget(
+                id: "marmot:group-08",
+                persistedFolds: ["other-08": "other-09"],
+                knownLiveTargets: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snPathRemountLiveTarget(
+                id: "marmot:group-08",
+                persistedFolds: ["other-08": "other-09"],
+                knownLiveTargets: [:]
+            ) == nil
+        )
+        #expect(
+            snPathRemountLiveTarget(
+                id: "marmot:group-08",
+                persistedFolds: ["group-08": "stale-09"],
+                knownLiveTargets: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "stale-09"
+        )
         #expect(
             snRemountFoldedPath(
                 path: [.groupInfo("marmot:group-08")],

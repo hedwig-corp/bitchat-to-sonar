@@ -799,16 +799,27 @@ internal fun remountFoldedNavStack(
 
 /** Path remount must see the same live target as open-chat remount.
  *  Persist-folds can still be empty when FFI already hid hist.
+ *  After hop, iPhone can still push group-info / call from the
+ *  painted hist pane; persist-other must not hide this remount.
  *  iOS `snPathRemountLiveTarget`. */
 internal fun pathRemountLiveTarget(
     id: String,
     persistedFolds: Map<String, String>,
     knownLiveTargets: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String? {
     val bare = id.removePrefix("marmot:").trim()
     persistedFolds[bare]?.takeIf { it.isNotBlank() && it != bare }?.let { return it }
     knownLiveTargets[bare]?.takeIf { it.isNotBlank() }?.let { return it }
     knownLiveTargets[id]?.takeIf { it.isNotBlank() }?.let { return it }
+    val folds = remountPairHistoricalFolds(
+        persistedFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    folds[bare]?.takeIf { it.isNotBlank() && it != bare }?.let { return it }
+    folds[id]?.takeIf { it.isNotBlank() && it != id }?.let { return it }
     return persistedFolds[bare]
 }
 
