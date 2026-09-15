@@ -2302,7 +2302,14 @@ internal fun notificationOpenShouldJump(
     val open = openId.removePrefix("marmot:").trim()
     val incoming = incomingId.removePrefix("marmot:").trim()
     if (open.isEmpty() || incoming.isEmpty()) return false
-    if (conversationsMatchFoldFamily(open, incoming, historicalFolds)) return true
+    if (conversationsMatchFoldFamily(
+            open,
+            incoming,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+    ) return true
     val pair = remountPairConversationIds(
         openId,
         openedConversationId,
@@ -3348,7 +3355,14 @@ internal fun pendingMediaPreviewBelongsToChat(
     if (openedConversationIdMatches(previewChatId, screenId)) return true
     val previewBare = previewChatId.removePrefix("marmot:")
     val screenBare = screenId.removePrefix("marmot:")
-    if (conversationsMatchFoldFamily(previewBare, screenBare, historicalFolds)) return true
+    if (conversationsMatchFoldFamily(
+            previewBare,
+            screenBare,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+    ) return true
     if (openedConversationIdMatches(previewChatId, openedConversationId) &&
         openedConversationIdMatches(screenId, openedConversationPaneId)
     ) {
@@ -9362,7 +9376,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun unmuteChat(chatId: String) {
         val now = SonarClock.nowSecs()
         val folds = mergeActionHistoricalFolds(listOf(chatId) + muteIdsFor(chatId))
-        val family = muteIdsFor(chatId) + foldFamilyIds(chatId, folds)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val family = muteIdsFor(chatId) + foldFamilyIds(chatId, folds, opened, pane)
         mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) - family
         persistMutes()
         adoptActionHistoricalFolds(folds)

@@ -5736,7 +5736,13 @@ final class MarmotChatModel: ObservableObject {
     /// the next cold-start snapshot can resurrect a deleted room.
     func dropGroupFromLocalState(_ groupId: String) {
         let folds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
-        let family = snFoldFamilyIds(id: groupId, historicalFolds: folds)
+        let remount = remountOpenedAndPane()
+        let family = snFoldFamilyIds(
+            id: groupId,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
         groups.removeAll { family.contains($0.id) }
         for id in family {
             messagesByGroup[id] = nil

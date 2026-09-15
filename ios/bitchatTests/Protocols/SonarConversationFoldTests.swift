@@ -401,6 +401,15 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snConversationsMatchFoldFamily(
+                left: "marmot:group-09",
+                right: "marmot:group-08",
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )
+        )
+        #expect(
             snGroupInfoShouldReloadPending(
                 openGroupInfoChatId: "marmot:group-09",
                 changedId: "group-08",
@@ -1458,6 +1467,15 @@ struct SonarConversationFoldTests {
         #expect(
             snOpenChatUnreadPublishId(
                 capturedFor: "marmot:group-08",
+                openIds: ["marmot:group-09"],
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snOpenChatUnreadPublishId(
+                capturedFor: "marmot:group-08",
                 openIds: ["marmot:other"],
                 historicalFolds: [:],
                 openedConversationId: "marmot:group-09",
@@ -2333,6 +2351,13 @@ struct SonarConversationFoldTests {
             incomingId: "marmot:other",
             historicalFolds: ["group-08": "group-09"]
         ))
+        #expect(snNotificationOpenShouldJump(
+            openId: "marmot:group-09",
+            incomingId: "marmot:group-08",
+            historicalFolds: ["other-08": "other-09"],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ))
         #expect(snCurrentOpenConversationId(
             pathDMId: nil,
             openedConversationId: "marmot:group-08"
@@ -2584,6 +2609,13 @@ struct SonarConversationFoldTests {
             openedConversationId: nil,
             openedConversationPaneId: nil,
             historicalFolds: [:]
+        ))
+        #expect(snPendingMediaPreviewBelongsToChat(
+            previewPeerId: "marmot:group-09",
+            chatId: "marmot:group-08",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08",
+            historicalFolds: ["other-08": "other-09"]
         ))
         #expect(
             snPromotedFoldedPendingMediaPreviewPeerId(

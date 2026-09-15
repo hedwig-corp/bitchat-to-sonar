@@ -1467,6 +1467,16 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        assertTrue(
+            notificationOpenShouldJump(
+                openId = "marmot:group-09",
+                incomingId = "marmot:group-08",
+                historicalFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+            "unrelated persist-folds still jump via remount pair",
+        )
     }
 
     @Test
@@ -1667,6 +1677,16 @@ class ConversationFoldTest {
                 screenId = "marmot:group-09",
                 historicalFolds = emptyMap(),
             ),
+        )
+        assertTrue(
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = "marmot:group-09",
+                screenId = "marmot:group-08",
+                historicalFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+            "unrelated persist-folds still keep the remounted preview",
         )
         assertEquals(
             "marmot:group-09",
@@ -5432,6 +5452,16 @@ class ConversationFoldTest {
         assertTrue(conversationsMatchFoldFamily("group-09", "group-09", folds))
         assertFalse(conversationsMatchFoldFamily("group-08", "other", folds))
         assertFalse(conversationsMatchFoldFamily("group-08", "group-09", emptyMap()))
+        assertTrue(
+            conversationsMatchFoldFamily(
+                "group-09",
+                "group-08",
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "unrelated persist-folds still match this remount pair",
+        )
         assertTrue(
             groupInfoShouldReloadPending(
                 openGroupInfoChatId = "group-09",

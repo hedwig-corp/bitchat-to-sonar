@@ -197,6 +197,17 @@ class UnreadCountsTest {
             ),
             "empty persist must still publish onto remounted live",
         )
+        assertEquals(
+            "group-09",
+            openChatUnreadPublishId(
+                capturedFor = "group-08",
+                stackChatIds = listOf("group-09"),
+                historicalFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "unrelated persist-folds still publish onto remounted live",
+        )
         assertNull(
             openChatUnreadPublishId(
                 capturedFor = "group-08",

@@ -461,7 +461,9 @@ func snPendingMediaPreviewBelongsToChat(
     if snConversationsMatchFoldFamily(
         left: previewPeerId,
         right: chatId,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ) { return true }
     if snOpenedConversationIdMatches(previewPeerId, openedConversationId)
         && snOpenedConversationIdMatches(chatId, openedConversationPaneId) {
@@ -486,7 +488,12 @@ func snConversationsMatchFoldFamily(
     let rightBare = snBareMarmotGroupId(right, prefix: prefix)
     if leftBare == rightBare { return true }
     if snOpenedConversationIdMatches(left, right) { return true }
-    if snFoldFamilyIds(id: leftBare, historicalFolds: historicalFolds).contains(rightBare) {
+    if snFoldFamilyIds(
+        id: leftBare,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).contains(rightBare) {
         return true
     }
     let remount = snRemountPairConversationIds(
@@ -1229,7 +1236,13 @@ func snOpenChatUnreadPublishId(
     openedConversationPaneId: String? = nil
 ) -> String? {
     if let family = openIds.first(where: {
-        snConversationsMatchFoldFamily(left: $0, right: capturedFor, historicalFolds: historicalFolds)
+        snConversationsMatchFoldFamily(
+            left: $0,
+            right: capturedFor,
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
     }) {
         return family
     }
@@ -2177,7 +2190,9 @@ func snNotificationOpenShouldJump(
     if snConversationsMatchFoldFamily(
         left: openId,
         right: incomingId,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ) { return true }
     let pair = snRemountPairConversationIds(
         conversationId: openId,
