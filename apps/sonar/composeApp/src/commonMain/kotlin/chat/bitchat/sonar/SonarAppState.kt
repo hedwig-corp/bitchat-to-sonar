@@ -558,7 +558,11 @@ internal fun preferredFoldedDirectMarmotChatId(
 }
 
 /** 1:1 row for [peerNpub], ignoring recovered/live rooms that currently list
- *  only that peer. Persist/FFI/remount live wins among duplicate DMs. */
+ *  only that peer. Persist/FFI/remount live wins among duplicate DMs.
+ *  Empty persist+remount+FFI newest-sorts so contact-profile Message
+ *  keeps recovered hist (iOS `preferredDirectMarmotGroup`). First-listed
+ *  used to open live when `chats()` listed it first — empty transcript
+ *  on first-resume. */
 internal fun directMarmotChatIdForPeer(
     chats: List<SonarChat>,
     ownNpub: String,
@@ -567,6 +571,7 @@ internal fun directMarmotChatIdForPeer(
     openedConversationId: String? = null,
     openedConversationPaneId: String? = null,
     ffiHistoricalFolds: Map<String, String> = emptyMap(),
+    latestSecs: (String) -> Long = { 0L },
 ): String? {
     val peer = canonicalProfileKey(peerNpub)
     if (peer.isBlank()) return null
@@ -577,7 +582,13 @@ internal fun directMarmotChatIdForPeer(
         openedConversationId = openedConversationId,
         openedConversationPaneId = openedConversationPaneId,
         ffiHistoricalFolds = ffiHistoricalFolds,
-    ) ?: matches.firstOrNull()?.id
+    ) ?: preferredDirectMarmotChatId(
+        matches.map { it.id },
+        latestSecs,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
 }
 
 internal fun marmotNotificationGroupName(chat: SonarChat, paintedTitle: String? = null): String? {
@@ -6666,8 +6677,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun isDirectMarmotChat(chat: SonarChat): Boolean =
         directMarmotPeerKey(chat, npub) != null
 
-    /** Contact-profile Message / call / pay target. Persist/remount live
-     *  wins among duplicate 1:1s so a recovered hist row is not reopened. */
+    /** Contact-profile Message / call / pay target. Persist/FFI/remount
+     *  live wins among duplicate 1:1s so a recovered hist row is not
+     *  reopened after remount. Empty persist+remount+FFI newest-sorts
+     *  so first-resume keeps hist (iOS `preferredDirectMarmotGroup`). */
     fun directChatIdForPeer(peerNpub: String): String? {
         val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
         val peer = canonicalProfileKey(peerNpub)
@@ -6683,6 +6696,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             openedConversationId = opened,
             openedConversationPaneId = pane,
             ffiHistoricalFolds = ffi,
+            latestSecs = ::expectedNewestTsForOpenChat,
         )
     }
 

@@ -9296,6 +9296,8 @@ final class SonarAppStore: ObservableObject {
 
     /// Contact-profile 1:1 only. Home-row `preferredDirectMarmotGroup` stays
     /// persist+remount so paint never waits on FFI. Persist hist→stale wins.
+    /// Empty persist+remount+FFI newest-sorts hist so Message keeps the
+    /// recovered transcript (Compose `directMarmotChatIdForPeer`).
     func contactDirectMarmotGroup(
         forNpub npub: String,
         ffiHistoricalFolds: [String: String] = [:]

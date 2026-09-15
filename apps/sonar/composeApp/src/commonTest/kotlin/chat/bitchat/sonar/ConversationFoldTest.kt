@@ -6044,6 +6044,19 @@ class ConversationFoldTest {
                 ownNpub,
                 peerNpub,
                 mapOf("other-08" to "other-09"),
+                latestSecs = { if (it == "group-08") 2L else 1L },
+            ),
+        )
+        // Live listed first: first-listed used to open the empty 0.9
+        // row on first-resume. Newest-sort keeps recovered hist.
+        assertEquals(
+            "group-08",
+            directMarmotChatIdForPeer(
+                listOf(liveDm, histDm),
+                ownNpub,
+                peerNpub,
+                mapOf("other-08" to "other-09"),
+                latestSecs = { if (it == "group-08") 2L else 1L },
             ),
         )
         assertEquals("pending room", marmotNotificationGroupName(pendingRoom))

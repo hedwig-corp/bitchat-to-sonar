@@ -581,6 +581,15 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["other-08": "other-09"]
             ) == "zzz-08"
         )
+        // Contact-profile Message: live listed first still newest-sorts
+        // hist on first-resume (Compose `directMarmotChatIdForPeer`).
+        #expect(
+            snPreferredDirectMarmotGroupId(
+                groupIds: ["group-09", "zzz-08"],
+                latestSecs: ["zzz-08": 2, "group-09": 1],
+                historicalFolds: ["other-08": "other-09"]
+            ) == "zzz-08"
+        )
         #expect(
             snPreferredDirectMarmotGroupId(
                 groupIds: ["group-08", "stale-09", "group-09"],
