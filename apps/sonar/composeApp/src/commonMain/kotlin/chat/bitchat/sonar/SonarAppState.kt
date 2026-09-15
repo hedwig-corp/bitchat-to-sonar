@@ -1330,6 +1330,53 @@ internal fun unreadCountAtOpenWritten(
     return next
 }
 
+/** Frozen unread-anchor row id on any remount / fold-family key.
+ *  After remount Compose hops `Screen.Chat.id` to live; a hist-only
+ *  write would vanish, and a live-only leave would leave hist for
+ *  the next open. iOS has no host-anchor map — the divider lives on
+ *  the transcript host. */
+internal fun unreadAnchorAtOpen(
+    chatId: String,
+    anchors: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        anchors[id]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return null
+}
+
+/** Stamp or clear the unread-anchor row on every remount / fold-family
+ *  key. `null` clears. iOS `snUnreadCountAtOpenWritten` is the count
+ *  twin; this is the Compose host-anchor twin of [quotedJumpWritten]. */
+internal fun unreadAnchorAtOpenWritten(
+    chatId: String,
+    anchorId: String?,
+    anchors: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, String> {
+    val trimmed = anchorId?.trim().orEmpty()
+    var next = anchors
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        next = if (trimmed.isEmpty()) next - id else next + (id to trimmed)
+    }
+    return next
+}
+
 /** Ids that have had a trusted FFI newest/cursor page.
  *  Seeded `transcriptWindows` keys and remounted host-cache copies are
  *  not paging keys — passing those made hist look paged before
@@ -4347,7 +4394,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (folds != beforeFolds) persistHistoricalFolds()
         val ids = transcriptGroupIds(chatId)
         val (opened, pane) = remountPairForOpenChat(chatId)
-        openChatUnreadAnchor = openChatUnreadAnchor - chatId
+        openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+            chatId,
+            null,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         openChatJumpMessageId = if (jumpMessageId != null) {
             quotedJumpWritten(
                 chatId,
@@ -4412,6 +4466,29 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
     }
 
+    fun openChatUnreadAnchorFor(chatId: String): String? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return unreadAnchorAtOpen(
+            chatId,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
+    fun rememberOpenChatUnreadAnchor(chatId: String, anchorKey: String) {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+            chatId,
+            anchorKey,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
     private fun publishCapturedOpenUnread(capturedFor: String, unread: Long) {
         val (opened, pane) = remountPairForOpenChat(capturedFor)
         val stackChatIds = stack.mapNotNull { (it as? Screen.Chat)?.id }
@@ -4449,7 +4526,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             opened,
             pane,
         )
-        openChatUnreadAnchor = openChatUnreadAnchor - chatId
+        openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+            chatId,
+            null,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         openChatJumpMessageId = quotedJumpCleared(
             chatId,
             openChatJumpMessageId,
@@ -10149,9 +10233,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         // (Signal adapter retention), before we clear the live [messages] list.
         (popped as? Screen.Chat)?.let {
             retainOpenTranscript(it.id, messages)
-            openChatUnread = openChatUnread - it.id
-            openChatUnreadAnchor = openChatUnreadAnchor - it.id
             val (opened, pane) = remountPairForOpenChat(it.id)
+            openChatUnread = unreadCountAtOpenWritten(
+                it.id,
+                null,
+                openChatUnread,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+            openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+                it.id,
+                null,
+                openChatUnreadAnchor,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
             openChatJumpMessageId = quotedJumpCleared(
                 it.id,
                 openChatJumpMessageId,

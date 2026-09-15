@@ -1584,6 +1584,110 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun leaveClearsUnreadAtOpenRemountPair() {
+        val stamped = unreadCountAtOpenWritten(
+            chatId = "marmot:group-09",
+            count = 3L,
+            unreadAtOpen = emptyMap(),
+            historicalFolds = emptyMap(),
+            openedConversationId = "marmot:group-09",
+            openedConversationPaneId = "marmot:group-08",
+        )
+        val liveOnlyLeave = stamped - "marmot:group-09"
+        assertEquals(
+            3L,
+            unreadCountAtOpen(
+                chatId = "marmot:group-09",
+                unreadAtOpen = liveOnlyLeave,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        val cleared = unreadCountAtOpenWritten(
+            chatId = "marmot:group-09",
+            count = null,
+            unreadAtOpen = stamped,
+            historicalFolds = emptyMap(),
+            openedConversationId = "marmot:group-09",
+            openedConversationPaneId = "marmot:group-08",
+        )
+        assertNull(
+            unreadCountAtOpen(
+                chatId = "marmot:group-09",
+                unreadAtOpen = cleared,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertNull(
+            unreadCountAtOpen(
+                chatId = "marmot:group-08",
+                unreadAtOpen = cleared,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        val stampedAnchor = unreadAnchorAtOpenWritten(
+            chatId = "marmot:group-09",
+            anchorId = "row-oldest-unread",
+            anchors = emptyMap(),
+            historicalFolds = emptyMap(),
+            openedConversationId = "marmot:group-09",
+            openedConversationPaneId = "marmot:group-08",
+        )
+        assertEquals(
+            "row-oldest-unread",
+            unreadAnchorAtOpen(
+                chatId = "marmot:group-08",
+                anchors = stampedAnchor,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        val liveOnlyAnchorLeave = stampedAnchor - "marmot:group-09"
+        assertEquals(
+            "row-oldest-unread",
+            unreadAnchorAtOpen(
+                chatId = "marmot:group-09",
+                anchors = liveOnlyAnchorLeave,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        val clearedAnchor = unreadAnchorAtOpenWritten(
+            chatId = "marmot:group-09",
+            anchorId = null,
+            anchors = stampedAnchor,
+            historicalFolds = emptyMap(),
+            openedConversationId = "marmot:group-09",
+            openedConversationPaneId = "marmot:group-08",
+        )
+        assertNull(
+            unreadAnchorAtOpen(
+                chatId = "marmot:group-09",
+                anchors = clearedAnchor,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertNull(
+            unreadAnchorAtOpen(
+                chatId = "marmot:group-08",
+                anchors = clearedAnchor,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+    }
+
+    @Test
     fun remountLocalHydratingIdsStaysEmptyWhenHistWasNotHydrating() {
         assertEquals(
             emptySet(),

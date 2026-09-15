@@ -1107,7 +1107,9 @@ func snUnreadCountAtOpen(
 
 /// Stamp open-time unread onto every remount / fold-family key so a
 /// capture that lands on hist is visible after Mac hops to live.
-/// `nil` clears. Compose `unreadCountAtOpenWritten`.
+/// `nil` clears the remount pair — Leave / `closedDM` must use that so
+/// a hist leftover cannot resurrect the divider. Compose
+/// `unreadCountAtOpenWritten`.
 func snUnreadCountAtOpenWritten(
     conversationId: String,
     count: UInt64?,
@@ -13573,6 +13575,33 @@ final class SonarAppStore: ObservableObject {
             openedConversationId: openedConversationId,
             openedConversationPaneId: openedConversationPaneId
         ) {
+            // Clear remount-pair unread / jump *before* dropping opened ids —
+            // a live-only subtract leaves hist, and the next open walks the
+            // pair / fold family back onto that leftover divider.
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let (opened, pane) = remountOpenedAndPane()
+            unreadCountAtOpenByDM = snUnreadCountAtOpenWritten(
+                conversationId: id,
+                count: nil,
+                unreadAtOpen: unreadCountAtOpenByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            jumpMessageIdAtOpenByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: jumpMessageIdAtOpenByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            pendingJumpMessageIdByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: pendingJumpMessageIdByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
             openedConversationId = nil
             openedConversationPaneId = nil
         }

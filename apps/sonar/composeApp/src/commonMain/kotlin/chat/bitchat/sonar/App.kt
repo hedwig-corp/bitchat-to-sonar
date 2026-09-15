@@ -1406,7 +1406,7 @@ private fun rememberChatTranscriptViewport(
     // (already marked read in core) cannot drift the divider down. The frozen
     // ID persists in state so back-revealing this chat reuses it verbatim.
     var unreadAnchorId by remember(transcriptSessionKey) {
-        mutableStateOf(state.openChatUnreadAnchor[screen.id])
+        mutableStateOf(state.openChatUnreadAnchorFor(screen.id))
     }
     var userScrolled by remember(transcriptSessionKey) { mutableStateOf(false) }
     val unreadAnchorIndex = unreadAnchorId
@@ -1505,7 +1505,7 @@ private fun rememberChatTranscriptViewport(
         }
         val anchorKey = transcriptFeedKey(feed[anchor])
         unreadAnchorId = anchorKey
-        state.openChatUnreadAnchor = state.openChatUnreadAnchor + (screen.id to anchorKey)
+        state.rememberOpenChatUnreadAnchor(screen.id, anchorKey)
         if (!userScrolled) {
             withFrameNanos { }
             val items = buildChatFeedListItems(feed, anchor)

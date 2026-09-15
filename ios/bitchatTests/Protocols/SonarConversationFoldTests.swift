@@ -1901,6 +1901,45 @@ struct SonarConversationFoldTests {
             openedConversationId: "marmot:group-09",
             openedConversationPaneId: "marmot:group-08"
         ) == "marmot:other")
+        let stampedUnreadAtOpen = snUnreadCountAtOpenWritten(
+            conversationId: "marmot:group-09",
+            count: 3,
+            unreadAtOpen: [:],
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        )
+        var liveOnlyUnreadLeave = stampedUnreadAtOpen
+        liveOnlyUnreadLeave["marmot:group-09"] = nil
+        #expect(snUnreadCountAtOpen(
+            conversationId: "marmot:group-09",
+            unreadAtOpen: liveOnlyUnreadLeave,
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == 3)
+        let clearedUnreadAtOpen = snUnreadCountAtOpenWritten(
+            conversationId: "marmot:group-09",
+            count: nil,
+            unreadAtOpen: stampedUnreadAtOpen,
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        )
+        #expect(snUnreadCountAtOpen(
+            conversationId: "marmot:group-09",
+            unreadAtOpen: clearedUnreadAtOpen,
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == nil)
+        #expect(snUnreadCountAtOpen(
+            conversationId: "marmot:group-08",
+            unreadAtOpen: clearedUnreadAtOpen,
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == nil)
         #expect(snMacConversationPaneIdentity(
             selectionId: "marmot:group-09",
             openedConversationId: "marmot:group-09",
