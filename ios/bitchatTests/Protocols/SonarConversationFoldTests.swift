@@ -444,6 +444,38 @@ struct SonarConversationFoldTests {
                 openedConversationPaneId: "group-08"
             ) == "stale-09"
         )
+        // Duplicate 1:1s: first-listed / newest-latest_at pick hist.
+        // Persist-other must not hide this remount.
+        #expect(
+            snPreferredFoldedDirectMarmotGroupId(
+                groupIds: ["group-08", "group-09"],
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snPreferredFoldedDirectMarmotGroupId(
+                groupIds: ["group-08", "group-09"],
+                historicalFolds: ["other-08": "other-09"]
+            ) == nil
+        )
+        #expect(
+            snPreferredFoldedDirectMarmotGroupId(
+                groupIds: ["group-08", "stale-09", "group-09"],
+                historicalFolds: ["group-08": "stale-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "stale-09"
+        )
+        #expect(
+            snPreferredFoldedDirectMarmotGroupId(
+                groupIds: ["group-08"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == nil
+        )
         #expect(
             snPersistedLiveFoldTarget(
                 tappedGroupId: "marmot:group-08",

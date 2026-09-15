@@ -3642,6 +3642,36 @@ func snRemountPairHistoricalFolds(
     return next
 }
 
+/// Prefer persist/remount live among duplicate 1:1 ids. Newest-`latest_at`
+/// and first-listed both pick recovered hist after remount (hist keeps
+/// the transcript; live is empty or ties). Contact-profile Message /
+/// `preferredDirectMarmotGroup` then send against hist while FFI still
+/// lists it. Empty persist-folds without a remount pair stay nil so
+/// first-resume newest-sort is unchanged. Compose
+/// `preferredFoldedDirectMarmotChatId`.
+func snPreferredFoldedDirectMarmotGroupId(
+    groupIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    let ids = groupIds.map { snBareMarmotGroupId($0) }.filter { !$0.isEmpty }
+    guard ids.count > 1 else { return nil }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    guard !folds.isEmpty else { return nil }
+    for id in ids {
+        let live = snBareMarmotGroupId(folds[id] ?? "")
+        if !live.isEmpty, live != id, ids.contains(where: { snOpenedConversationIdMatches($0, live) }) {
+            return ids.first(where: { snOpenedConversationIdMatches($0, live) })
+        }
+    }
+    return nil
+}
+
 /// Rewrite a staged preview onto the live sibling. Empty persist-folds
 /// still use the remount pair so confirmSendPreview does not send
 /// against a hist id FFI no longer lists.
@@ -9389,7 +9419,17 @@ final class SonarAppStore: ObservableObject {
     private func preferredDirectMarmotGroup(
         in groups: [MarmotService.MarmotGroup]
     ) -> MarmotService.MarmotGroup? {
-        groups.sorted { lhs, rhs in
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        if let preferredId = snPreferredFoldedDirectMarmotGroupId(
+            groupIds: groups.map(\.id),
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ), let match = groups.first(where: { $0.id == preferredId }) {
+            return match
+        }
+        return groups.sorted { lhs, rhs in
             let lhsDate = latestMarmotMessage(in: [lhs])?.message.createdAt ?? .distantPast
             let rhsDate = latestMarmotMessage(in: [rhs])?.message.createdAt ?? .distantPast
             if lhsDate != rhsDate { return lhsDate > rhsDate }

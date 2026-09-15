@@ -2329,6 +2329,40 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        // Duplicate 1:1s: first-listed / newest-latest_at pick hist.
+        // Persist-other must not hide this remount.
+        assertEquals(
+            "group-09",
+            preferredFoldedDirectMarmotChatId(
+                listOf("group-08", "group-09"),
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertNull(
+            preferredFoldedDirectMarmotChatId(
+                listOf("group-08", "group-09"),
+                mapOf("other-08" to "other-09"),
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            preferredFoldedDirectMarmotChatId(
+                listOf("group-08", "stale-09", "group-09"),
+                mapOf("group-08" to "stale-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertNull(
+            preferredFoldedDirectMarmotChatId(
+                listOf("group-08"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test
@@ -5810,6 +5844,28 @@ class ConversationFoldTest {
             directMarmotPeerKey(dm, ownNpub),
         )
         assertEquals(dm.id, directMarmotChatIdForPeer(listOf(pendingRoom, dm), ownNpub, peerNpub))
+        val histDm = dm.copy(id = "group-08")
+        val liveDm = dm.copy(id = "group-09")
+        assertEquals(
+            "group-09",
+            directMarmotChatIdForPeer(
+                listOf(histDm, liveDm),
+                ownNpub,
+                peerNpub,
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "group-08",
+            directMarmotChatIdForPeer(
+                listOf(histDm, liveDm),
+                ownNpub,
+                peerNpub,
+                mapOf("other-08" to "other-09"),
+            ),
+        )
         assertEquals("pending room", marmotNotificationGroupName(pendingRoom))
         assertEquals(null, marmotNotificationGroupName(dm))
         assertEquals(

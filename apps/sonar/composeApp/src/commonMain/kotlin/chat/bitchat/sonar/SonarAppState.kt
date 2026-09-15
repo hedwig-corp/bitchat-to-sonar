@@ -512,16 +512,55 @@ internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     return others.singleOrNull()
 }
 
+/** Prefer persist/remount live among duplicate 1:1 ids. Newest-`latest_at`
+ *  and first-listed both pick recovered hist after remount (hist keeps
+ *  the transcript; live is empty or ties). Contact-profile Message /
+ *  iOS `preferredDirectMarmotGroup` then send against hist while FFI
+ *  still lists it. Empty persist-folds without a remount pair stay
+ *  null so first-resume newest-sort is unchanged. iOS
+ *  `snPreferredFoldedDirectMarmotGroupId`. */
+internal fun preferredFoldedDirectMarmotChatId(
+    candidateIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    val ids = candidateIds.map { it.removePrefix("marmot:").trim() }.filter { it.isNotBlank() }
+    if (ids.size <= 1) return null
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return null
+    for (id in ids) {
+        val live = folds[id]?.removePrefix("marmot:")?.trim().orEmpty()
+        if (live.isNotEmpty() && live != id && ids.any { openedConversationIdMatches(it, live) }) {
+            return ids.first { openedConversationIdMatches(it, live) }
+        }
+    }
+    return null
+}
+
 /** 1:1 row for [peerNpub], ignoring recovered/live rooms that currently list
- *  only that peer. */
+ *  only that peer. Persist/remount live wins among duplicate DMs. */
 internal fun directMarmotChatIdForPeer(
     chats: List<SonarChat>,
     ownNpub: String,
     peerNpub: String,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String? {
     val peer = canonicalProfileKey(peerNpub)
     if (peer.isBlank()) return null
-    return chats.firstOrNull { directMarmotPeerKey(it, ownNpub) == peer }?.id
+    val matches = chats.filter { directMarmotPeerKey(it, ownNpub) == peer }
+    return preferredFoldedDirectMarmotChatId(
+        matches.map { it.id },
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    ) ?: matches.firstOrNull()?.id
 }
 
 internal fun marmotNotificationGroupName(chat: SonarChat, paintedTitle: String? = null): String? {
@@ -6549,6 +6588,20 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun isDirectMarmotChat(chat: SonarChat): Boolean =
         directMarmotPeerKey(chat, npub) != null
+
+    /** Contact-profile Message / call / pay target. Persist/remount live
+     *  wins among duplicate 1:1s so a recovered hist row is not reopened. */
+    fun directChatIdForPeer(peerNpub: String): String? {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        return directMarmotChatIdForPeer(
+            chats,
+            npub,
+            peerNpub,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     private fun directMarmotPeerKey(chat: SonarChat): String? =
         directMarmotPeerKey(chat, npub)

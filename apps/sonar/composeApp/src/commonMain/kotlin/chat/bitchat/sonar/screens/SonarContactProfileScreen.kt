@@ -45,7 +45,6 @@ import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.canonicalProfileKey
-import chat.bitchat.sonar.directMarmotChatIdForPeer
 import chat.bitchat.sonar.sharedGroupsWithContact
 import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.ui.SNIcon
@@ -91,14 +90,16 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
 
     // When opened from group info with an npub (or mesh with a known npub),
     // resolve to the 1:1 DM chat id so verifyInfo/isVerified/canCall work.
-    val effectiveChatId = remember(screen.chatId, peerNpub, state.chats.size) {
+    // Do not remember(chats.size): remount/persist-folds can prefer live
+    // without changing the listed count.
+    val effectiveChatId = run {
         val resolvedNpub = when {
             screen.chatId.startsWith("npub1") -> canonicalProfileKey(screen.chatId)
             peerNpub != null -> peerNpub
             else -> null
         }
         if (resolvedNpub != null) {
-            directMarmotChatIdForPeer(state.chats, state.npub, resolvedNpub)
+            state.directChatIdForPeer(resolvedNpub)
                 ?: screen.chatId
         } else {
             screen.chatId
