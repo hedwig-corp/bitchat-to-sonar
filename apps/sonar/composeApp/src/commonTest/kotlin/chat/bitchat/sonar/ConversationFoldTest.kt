@@ -543,6 +543,36 @@ class ConversationFoldTest {
                 ffiHistoricalFolds = mapOf("zzz-08" to "group-09"),
             ),
         )
+        // startChat / marmotGroupForNpub: remount live wins without FFI.
+        // Empty persist without remount stays newest-sort.
+        assertEquals(
+            "group-09",
+            preferredDirectMarmotChatId(
+                listOf("zzz-08", "group-09"),
+                { if (it == "zzz-08") 2L else 1L },
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "zzz-08",
+            ),
+        )
+        assertEquals(
+            "zzz-08",
+            preferredDirectMarmotChatId(
+                listOf("zzz-08", "group-09"),
+                { if (it == "zzz-08") 2L else 1L },
+                mapOf("other-08" to "other-09"),
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            preferredDirectMarmotChatId(
+                listOf("group-08", "stale-09", "group-09"),
+                { if (it == "group-09") 2L else 1L },
+                mapOf("group-08" to "stale-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

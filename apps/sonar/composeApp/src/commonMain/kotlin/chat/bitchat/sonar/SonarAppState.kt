@@ -630,6 +630,27 @@ internal fun marmotSendTargetGroupId(
         ffiHistoricalFolds = ffiHistoricalFolds,
     ) ?: duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
 
+/** Persist+remount live among duplicate 1:1s, else newest-`latest_at`.
+ *  No FFI — startChat / existence checks must not wait. Empty persist
+ *  without a remount pair stays newest-sort so first-resume is unchanged.
+ *  iOS `preferredDirectMarmotGroup`. */
+internal fun preferredDirectMarmotChatId(
+    candidateIds: Collection<String>,
+    latestSecs: (String) -> Long,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    val ids = candidateIds.map { it.removePrefix("marmot:").trim() }.filter { it.isNotBlank() }
+    if (ids.isEmpty()) return null
+    return preferredFoldedDirectMarmotChatId(
+        ids,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    ) ?: ids.maxWithOrNull(compareBy(latestSecs).thenBy { it })
+}
+
 /** Shared groups on a contact profile. Callers must pass the collapsed
  *  home list — raw [SonarChat] rows still include folded 0.8 hist. */
 internal fun sharedGroupsWithContact(
@@ -15836,11 +15857,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun marmotGroupForNpub(npubRaw: ByteArray): SonarChat? =
         preferredDirectMarmotChat(marmotGroupsForNpub(npubRaw))
 
-    private fun preferredDirectMarmotChat(groups: List<SonarChat>): SonarChat? =
-        groups.maxWithOrNull(
-            compareBy<SonarChat> { expectedNewestTsForOpenChat(it.id) }
-                .thenBy { it.id }
-        )
+    private fun preferredDirectMarmotChat(groups: List<SonarChat>): SonarChat? {
+        val open = activeTranscriptChatId.orEmpty()
+        val (opened, pane) = remountPairForOpenChat(open)
+        val preferredId = preferredDirectMarmotChatId(
+            groups.map { it.id },
+            { expectedNewestTsForOpenChat(it) },
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ) ?: return null
+        return groups.firstOrNull { openedConversationIdMatches(it.id, preferredId) }
+            ?: groups.firstOrNull { it.id == preferredId }
+    }
 
     private suspend fun latestCursorPage(groupId: String): List<SonarMsg>? = runCatching {
         SonarCore.messagesCursorPage(
