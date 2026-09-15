@@ -654,6 +654,18 @@ class ConversationFoldTest {
         assertEquals("standup", remapped.name)
         assertEquals(listOf("npub1a", "npub1b"), remapped.members)
         assertFalse(remapped.isDirect)
+        val remountedOpen = notificationOpenChat(
+            "group-09",
+            listOf(historical),
+            emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("group-09", remountedOpen.id)
+        assertEquals("standup", remountedOpen.name)
+        val stubWithoutPair = notificationOpenChat("group-09", listOf(historical), emptyMap())
+        assertEquals("group-09", stubWithoutPair.id)
+        assertEquals("", stubWithoutPair.name)
         assertEquals(
             remapped,
             listedOrFoldedSiblingChat(

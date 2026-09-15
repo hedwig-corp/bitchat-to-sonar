@@ -687,8 +687,15 @@ internal fun notificationOpenChat(
     remappedChatId: String,
     listedChats: List<SonarChat>,
     historicalFolds: Map<String, String> = emptyMap(),
-): SonarChat = listedOrFoldedSiblingChat(remappedChatId, listedChats, historicalFolds)
-    ?: SonarChat(id = remappedChatId, name = "", members = emptyList(), isDirect = false)
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): SonarChat = listedOrFoldedSiblingChat(
+    remappedChatId,
+    listedChats,
+    historicalFolds,
+    openedConversationId = openedConversationId,
+    openedConversationPaneId = openedConversationPaneId,
+) ?: SonarChat(id = remappedChatId, name = "", members = emptyList(), isDirect = false)
 
 /** After `chats()` lists the remapped row, replace a stub "Group chat" title.
  *  Do not replace a recovered room name with the generic placeholder if the
@@ -3345,7 +3352,13 @@ internal fun conversationsMatchFoldFamily(
 ): Boolean {
     if (left.isBlank() || right.isBlank()) return false
     if (left == right || openedConversationIdMatches(left, right)) return true
-    if (foldFamilyIds(left, historicalFolds).contains(right)) return true
+    if (foldFamilyIds(
+            left,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        ).contains(right)
+    ) return true
     val remount = remountPairConversationIds(
         conversationId = left,
         openedConversationId = openedConversationId,
@@ -9604,7 +9617,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                     return true
                 }
-                val chat = notificationOpenChat(target.chatId, chats, historicalFoldMap)
+                val chat = notificationOpenChat(
+                    target.chatId,
+                    chats,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
                 openChat(chat, jumpMessageId = jumpMessageId)
                 if (conversationId != target.chatId) {
                     clearNotificationsForChat(conversationId)
@@ -17257,7 +17276,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (open != null) {
             val live = liveFor(open.id)
             val liveChat = chats.firstOrNull { it.id == live }
-            ?: notificationOpenChat(live, chats, historicalFoldMap)
+            ?: notificationOpenChat(
+                live,
+                chats,
+                historicalFoldMap,
+                openedConversationId = live,
+                openedConversationPaneId = open.id,
+            )
         moveSendEchoes(open.id, live)
         trillCooldownUntilMs = remountFoldedOpenValues(
             historicalKeys = listOf(open.id),
