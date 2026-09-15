@@ -492,6 +492,42 @@ struct SonarConversationFoldTests {
                 openedConversationPaneId: "marmot:group-08"
             ).isEmpty
         )
+        #expect(
+            snComposerRepliesAfterBegin(
+                replies: [:],
+                chatId: "marmot:group-08",
+                reply: "reply-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )["marmot:group-09"] == "reply-08"
+        )
+        #expect(
+            snComposerRepliesAfterBegin(
+                replies: [:],
+                chatId: "marmot:group-08",
+                reply: "reply-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )["marmot:group-08"] == "reply-08"
+        )
+        #expect(
+            snComposerReply(
+                chatId: "marmot:group-09",
+                replies: snComposerRepliesAfterBegin(
+                    replies: [:],
+                    chatId: "marmot:group-08",
+                    reply: "reply-08",
+                    historicalFolds: [:],
+                    openedConversationId: "marmot:group-09",
+                    openedConversationPaneId: "marmot:group-08"
+                ),
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "reply-08"
+        )
         // Persist-folds + `setComposerDraft("", hist)` family-clears live.
         // Remount must copy, not clear, or the iPhone hist pane loses the draft.
         #expect(

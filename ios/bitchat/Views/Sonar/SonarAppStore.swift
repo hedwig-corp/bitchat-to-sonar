@@ -2999,6 +2999,34 @@ func snComposerReply<Reply>(
     return nil
 }
 
+/// Stamp a new reply chip onto every remount / fold-family key. After
+/// remount iPhone still paints hist; a hist-only write would vanish when
+/// persist-folds family-clears hist or Mac reads live. Compose
+/// `composerRepliesAfterBegin`.
+func snComposerRepliesAfterBegin<Reply>(
+    replies: [String: Reply],
+    chatId: String,
+    reply: Reply,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: Reply] {
+    var next = replies
+    var keys = snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    )
+    if keys.isEmpty { keys.insert(chatId) }
+    for key in keys {
+        next[key] = reply
+    }
+    return next
+}
+
 /// Drop the reply chip from every remount / fold sibling so send / cancel
 /// cannot leave a live leftover that persist-folds later resurrects.
 /// Compose `composerRepliesAfterClear`.
@@ -4745,13 +4773,22 @@ final class SonarAppStore: ObservableObject {
             previewSource = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         let fallback = String(localized: "chat.reply.fallback", defaultValue: "Message")
-        composerReplyByChat[chatId] = SNReplyRef(
-            parentId: message.id,
-            parentNpub: message.senderNpub,
-            author: message.mine
-                ? String(localized: "chat.reply.you", defaultValue: "You")
-                : message.author,
-            preview: previewSource.isEmpty ? fallback : String(previewSource.prefix(140))
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        composerReplyByChat = snComposerRepliesAfterBegin(
+            replies: composerReplyByChat,
+            chatId: chatId,
+            reply: SNReplyRef(
+                parentId: message.id,
+                parentNpub: message.senderNpub,
+                author: message.mine
+                    ? String(localized: "chat.reply.you", defaultValue: "You")
+                    : message.author,
+                preview: previewSource.isEmpty ? fallback : String(previewSource.prefix(140))
+            ),
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 

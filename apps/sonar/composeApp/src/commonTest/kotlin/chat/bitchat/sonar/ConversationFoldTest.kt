@@ -2735,6 +2735,26 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        val begun = composerRepliesAfterBegin(
+            emptyMap(),
+            "group-08",
+            "reply-08",
+            emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("reply-08", begun["group-08"])
+        assertEquals("reply-08", begun["group-09"])
+        assertEquals(
+            "reply-08",
+            composerReplyForChat(
+                "group-09",
+                begun,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertNull(
             composerReplyForChat(
                 "group-other",

@@ -2612,6 +2612,31 @@ internal fun <Reply> composerReplyForChat(
     return null
 }
 
+/** Stamp a new reply chip onto every remount / fold-family key. After
+ *  remount Compose hops `Screen.Chat.id` to live; a hist-only write
+ *  would vanish when persist-folds family-clears hist.
+ *  iOS `snComposerRepliesAfterBegin`. */
+internal fun <Reply> composerRepliesAfterBegin(
+    replies: Map<String, Reply>,
+    chatId: String,
+    reply: Reply,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Reply> {
+    var next = replies
+    val keys = paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }
+    for (id in keys) {
+        next = next + (id to reply)
+    }
+    return next
+}
+
 /** Drop the reply chip from every remount / fold sibling so send / cancel
  *  cannot leave a leftover that persist-folds later resurrects.
  *  iOS `snComposerRepliesAfterClear`. */
@@ -6164,12 +6189,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!sonarCanReply(message)) return
         val trimmed = preview.trim()
         if (trimmed.isEmpty()) return
-        composerReplyByChat[chatId] = SonarReplyRef(
-            parentId = message.id,
-            parentNpub = message.senderNpub.takeIf { it.startsWith("npub1") },
-            author = author?.trim()?.takeIf { it.isNotEmpty() },
-            preview = trimmed.take(140),
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val stamped = composerRepliesAfterBegin(
+            composerReplyByChat.toMap(),
+            chatId,
+            SonarReplyRef(
+                parentId = message.id,
+                parentNpub = message.senderNpub.takeIf { it.startsWith("npub1") },
+                author = author?.trim()?.takeIf { it.isNotEmpty() },
+                preview = trimmed.take(140),
+            ),
+            historicalFoldMap,
+            opened,
+            pane,
         )
+        for ((id, reply) in stamped) {
+            composerReplyByChat[id] = reply
+        }
     }
 
     fun cancelReply(chatId: String) {
