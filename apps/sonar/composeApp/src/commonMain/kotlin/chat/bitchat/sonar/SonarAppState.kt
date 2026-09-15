@@ -3254,10 +3254,35 @@ internal fun <V> removePendingMessagesForChat(
     }
 }
 
+/** Hist echo + live canonical after remount, including empty persist-folds.
+ *  iOS `snEchoReconcileFamilyIds`. */
+internal fun echoReconcileFamilyIds(
+    echoGroupId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val out = linkedSetOf<String>()
+    if (echoGroupId.isNotBlank()) out += echoGroupId
+    out.addAll(foldFamilyIds(echoGroupId, historicalFolds))
+    for (id in remountPairConversationIds(
+        conversationId = echoGroupId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank()) {
+            out += bare
+            out.addAll(foldFamilyIds(bare, historicalFolds))
+        }
+    }
+    return out
+}
+
 /** Fresh canonical rows that can fulfill an in-flight send echo.
  *  First-resume send echoes on the recovered 0.8 id; the relay copy
- *  lands on the live 0.9 sibling. Walk the fold family or the echo
- *  stays "Sending" forever beside the real row.
+ *  lands on the live 0.9 sibling. Walk the fold family or the remount
+ *  pair, or the echo stays "Sending" forever beside the real row.
  *  iOS `snOptimisticFreshCanonicalRows`. */
 internal fun <V> optimisticFreshCanonicalRows(
     echoGroupId: String,
@@ -3266,8 +3291,15 @@ internal fun <V> optimisticFreshCanonicalRows(
     historicalFolds: Map<String, String>,
     isLocalEcho: (V) -> Boolean,
     idOf: (V) -> String,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<V> {
-    val family = foldFamilyIds(echoGroupId, historicalFolds).ifEmpty { setOf(echoGroupId) }
+    val family = echoReconcileFamilyIds(
+        echoGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     val seen = linkedSetOf<String>()
     val out = ArrayList<V>()
     fun addAll(rows: List<V>) {
@@ -3294,13 +3326,20 @@ internal fun <V> transcriptsAfterOptimisticReconcile(
     visible: List<V>,
     historicalFolds: Map<String, String>,
     idOf: (V) -> String,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, List<V>> {
     val survivors = survivorIds.toSet()
     val fulfilled = pendingIds.filterNot { it in survivors }.toSet()
     val next = messagesByGroup.toMutableMap()
     next[echoGroupId] = visible
     if (fulfilled.isEmpty()) return next
-    val family = foldFamilyIds(echoGroupId, historicalFolds).ifEmpty { setOf(echoGroupId) }
+    val family = echoReconcileFamilyIds(
+        echoGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     for (sibling in family) {
         if (sibling == echoGroupId) continue
         val rows = next[sibling] ?: continue
@@ -3345,10 +3384,18 @@ internal fun optimisticPendingLookupIds(
     echoId: String,
     pendingByGroup: Map<String, Collection<String>>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Set<String> {
     val out = linkedSetOf<String>()
-    if (sendGroupId.isNotBlank()) out += sendGroupId
-    out.addAll(foldFamilyIds(sendGroupId, historicalFolds))
+    out.addAll(
+        echoReconcileFamilyIds(
+            sendGroupId,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        ),
+    )
     for ((key, ids) in pendingByGroup) {
         if (echoId.isNotBlank() && echoId in ids) out += key
     }
@@ -3363,10 +3410,23 @@ internal fun optimisticPendingStoreId(
     echoId: String,
     pendingByGroup: Map<String, Collection<String>>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String {
     historicalFolds[sendGroupId]?.takeIf { it.isNotBlank() && it != sendGroupId }?.let { return it }
     for ((key, ids) in pendingByGroup) {
         if (key != sendGroupId && echoId.isNotBlank() && echoId in ids) return key
+    }
+    val openedBare = openedConversationId?.removePrefix("marmot:")?.trim().orEmpty()
+    if (openedBare.isNotBlank() &&
+        !openedConversationIdMatches(openedBare, sendGroupId) &&
+        remountPairConversationIds(
+            sendGroupId,
+            openedConversationId,
+            openedConversationPaneId,
+        ).any { openedConversationIdMatches(it, openedConversationId) }
+    ) {
+        return openedBare
     }
     return foldFamilyIds(sendGroupId, historicalFolds).firstOrNull { it != sendGroupId }
         ?: sendGroupId
@@ -11594,7 +11654,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             openedConversationPaneId = pane,
         )
         val openId = (screen as? Screen.Chat)?.id
-        if (openId != null && conversationsMatchFoldFamily(openId, chatId, historicalFoldMap)) {
+        if (openId != null && conversationsMatchFoldFamily(
+                openId,
+                chatId,
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        ) {
             messages = messages.filterNot { it.id == echoId }
         }
     }
@@ -16989,10 +17056,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
                 (screen as? Screen.Chat)?.let { sc ->
+                    val (openedChat, paneChat) = remountPairForOpenChat(sc.id)
                     if (!isMeshChat(sc.id) && (
                         sc.id == groupIdHex ||
                             isSameDirectMarmotChat(sc.id, groupIdHex) ||
-                            conversationsMatchFoldFamily(sc.id, groupIdHex, historicalFoldMap)
+                            conversationsMatchFoldFamily(
+                                sc.id,
+                                groupIdHex,
+                                historicalFoldMap,
+                                openedConversationId = openedChat,
+                                openedConversationPaneId = paneChat,
+                            )
                     )) {
                         val mergedMessages = marmotMessagesPageForChat(sc.id)
                         setCurrentVisibleMessages(

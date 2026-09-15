@@ -594,6 +594,10 @@ final class MarmotChatModel: ObservableObject {
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
+    /// Remount pair so first-resume echoes on hist still see live canonical
+    /// rows while persist-folds are empty.
+    private var remountOpenedConversationId: String?
+    private var remountOpenedConversationPaneId: String?
     /// Canonical rows that predate each optimistic echo in the local transcript.
     /// They must not be mistaken for the relay copy of a later identical send.
     private var preexistingCanonicalMessageIDsByOptimisticID: [String: Set<String>] = [:]
@@ -3354,6 +3358,10 @@ final class MarmotChatModel: ObservableObject {
                 liveGroupId: pair.live,
                 idOf: { $0.id }
             )
+            rememberRemountPair(
+                openedConversationId: pair.live,
+                openedConversationPaneId: pair.historical
+            )
         }
     }
 
@@ -3387,6 +3395,27 @@ final class MarmotChatModel: ObservableObject {
             liveGroupId: liveGroupId,
             idOf: { $0.id }
         )
+        rememberRemountPair(
+            openedConversationId: liveGroupId,
+            openedConversationPaneId: historicalGroupId
+        )
+    }
+
+    func rememberRemountPair(openedConversationId: String?, openedConversationPaneId: String?) {
+        remountOpenedConversationId = openedConversationId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        remountOpenedConversationPaneId = openedConversationPaneId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if remountOpenedConversationId?.isEmpty == true {
+            remountOpenedConversationId = nil
+        }
+        if remountOpenedConversationPaneId?.isEmpty == true {
+            remountOpenedConversationPaneId = nil
+        }
+    }
+
+    func remountOpenedAndPane() -> (opened: String?, pane: String?) {
+        (remountOpenedConversationId, remountOpenedConversationPaneId)
     }
 
     private static func isLocalTranscriptEcho(_ message: MarmotService.MarmotMessage) -> Bool {
@@ -4142,7 +4171,9 @@ final class MarmotChatModel: ObservableObject {
                 cachedRowsByGroup: merged,
                 historicalFolds: folds,
                 isLocalEcho: Self.isLocalTranscriptEcho,
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: remountOpenedConversationId,
+                openedConversationPaneId: remountOpenedConversationPaneId
             )
             let reconciliation = Self.reconciledOptimisticMessages(
                 source: byGroup[groupId] ?? [],
@@ -4165,7 +4196,9 @@ final class MarmotChatModel: ObservableObject {
                 survivorIds: reconciliation.survivors.map(\.id),
                 visible: reconciliation.visible,
                 historicalFolds: folds,
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: remountOpenedConversationId,
+                openedConversationPaneId: remountOpenedConversationPaneId
             )
         }
         return merged
@@ -4283,7 +4316,9 @@ final class MarmotChatModel: ObservableObject {
             sendGroupId: groupId,
             echoId: id,
             pendingByGroup: pendingOptimisticIdsByGroup(),
-            historicalFolds: historicalFoldsMap()
+            historicalFolds: historicalFoldsMap(),
+            openedConversationId: remountOpenedConversationId,
+            openedConversationPaneId: remountOpenedConversationPaneId
         )
         for key in keys {
             pendingOptimistic[key]?.removeAll { $0.id == id }
@@ -4304,7 +4339,9 @@ final class MarmotChatModel: ObservableObject {
             sendGroupId: sendGroupId,
             echoId: echoId,
             pendingByGroup: pendingOptimisticIdsByGroup(),
-            historicalFolds: historicalFoldsMap()
+            historicalFolds: historicalFoldsMap(),
+            openedConversationId: remountOpenedConversationId,
+            openedConversationPaneId: remountOpenedConversationPaneId
         )
         pendingOptimistic[storeId, default: []].append(failed)
         messagesByGroup[storeId, default: []].append(failed)
@@ -4645,7 +4682,9 @@ final class MarmotChatModel: ObservableObject {
             sendGroupId: groupId,
             echoId: messageId,
             pendingByGroup: pendingOptimisticIdsByGroup(),
-            historicalFolds: historicalFoldsMap()
+            historicalFolds: historicalFoldsMap(),
+            openedConversationId: remountOpenedConversationId,
+            openedConversationPaneId: remountOpenedConversationPaneId
         )
         for key in keys {
             pendingOptimistic[key]?.removeAll { $0.id == messageId }
@@ -4753,11 +4792,14 @@ final class MarmotChatModel: ObservableObject {
                 // moved on; only the user-visible failure row and errorText are
                 // skipped for retired work.
                 model.clearMediaUploadListener(echo.id)
+                let remount = model.remountOpenedAndPane()
                 let failedStoreId = snOptimisticPendingStoreId(
                     sendGroupId: groupId,
                     echoId: echo.id,
                     pendingByGroup: model.pendingOptimisticIdsByGroup(),
-                    historicalFolds: model.historicalFoldsMap()
+                    historicalFolds: model.historicalFoldsMap(),
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
                 model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
@@ -4876,11 +4918,14 @@ final class MarmotChatModel: ObservableObject {
                 // moved on; only the user-visible failure row and errorText are
                 // skipped for retired work.
                 model.clearMediaUploadListener(echo.id)
+                let remount = model.remountOpenedAndPane()
                 let failedStoreId = snOptimisticPendingStoreId(
                     sendGroupId: groupId,
                     echoId: echo.id,
                     pendingByGroup: model.pendingOptimisticIdsByGroup(),
-                    historicalFolds: model.historicalFoldsMap()
+                    historicalFolds: model.historicalFoldsMap(),
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
                 model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
@@ -5748,6 +5793,8 @@ final class MarmotChatModel: ObservableObject {
         unreadSuppressGroupIds = []
         viewingUnreadGroupIds = []
         pendingOptimistic = [:]
+        remountOpenedConversationId = nil
+        remountOpenedConversationPaneId = nil
         preexistingCanonicalMessageIDsByOptimisticID = [:]
         localTranscriptCursorByGroup = [:]
         localTranscriptHasOlderByGroup = [:]

@@ -1731,6 +1731,18 @@ struct SonarConversationFoldTests {
                 echoGroupId: "group-08",
                 freshRowsByGroup: ["group-09": ["canonical-09"]],
                 cachedRowsByGroup: ["group-08": ["optimistic-1"]],
+                historicalFolds: [:],
+                isLocalEcho: { $0.hasPrefix("optimistic-") },
+                idOf: { $0 },
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["canonical-09"]
+        )
+        #expect(
+            snOptimisticFreshCanonicalRows(
+                echoGroupId: "group-08",
+                freshRowsByGroup: ["group-09": ["canonical-09"]],
+                cachedRowsByGroup: ["group-08": ["optimistic-1"]],
                 historicalFolds: ["group-08": "group-09"],
                 isLocalEcho: { $0.hasPrefix("optimistic-") },
                 idOf: { $0 }
@@ -1750,6 +1762,22 @@ struct SonarConversationFoldTests {
         )
         #expect(stripped["group-08"] == ["canonical-09"])
         #expect(stripped["group-09"] == ["canonical-09"])
+        let remountStripped = snTranscriptsAfterOptimisticReconcile(
+            echoGroupId: "group-09",
+            messagesByGroup: [
+                "group-08": ["optimistic-1"],
+                "group-09": ["canonical-09", "optimistic-1"]
+            ],
+            pendingIds: ["optimistic-1"],
+            survivorIds: [],
+            visible: ["canonical-09"],
+            historicalFolds: [:],
+            idOf: { $0 },
+            openedConversationId: "group-09",
+            openedConversationPaneId: "group-08"
+        )
+        #expect(!(remountStripped["group-08"] ?? []).contains("optimistic-1"))
+        #expect(remountStripped["group-09"] == ["canonical-09"])
         #expect(
             snRemountedOptimisticPending(
                 pendingByGroup: ["group-08": ["optimistic-1"]],
@@ -1798,6 +1826,36 @@ struct SonarConversationFoldTests {
                 pendingByGroup: ["group-08": ["optimistic-1"]],
                 historicalFolds: [:]
             ) == "group-08"
+        )
+        #expect(
+            snOptimisticPendingLookupIds(
+                sendGroupId: "group-08",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-08": ["optimistic-1"]],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == Set(["group-08", "group-09"])
+        )
+        #expect(
+            snOptimisticPendingStoreId(
+                sendGroupId: "group-08",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-08": ["optimistic-1"]],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snOptimisticPendingStoreId(
+                sendGroupId: "group-09",
+                echoId: "optimistic-1",
+                pendingByGroup: ["group-09": ["optimistic-1"]],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
         )
         #expect(snConversationOpenShouldMergeFolds(
             openId: "marmot:group-08",

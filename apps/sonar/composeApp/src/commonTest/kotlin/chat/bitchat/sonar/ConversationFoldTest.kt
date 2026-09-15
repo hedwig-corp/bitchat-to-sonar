@@ -1147,7 +1147,8 @@ class ConversationFoldTest {
             tsSecs = 101L,
         )
         val isEcho = { row: SonarMsg -> row.id.startsWith("optimistic-") }
-        // conversationChanged names live; persist-folds empty ⇒ no family.
+        // conversationChanged names live; persist-folds empty ⇒ no family
+        // until the remount pair is supplied.
         assertEquals(
             emptyList(),
             optimisticFreshCanonicalRows(
@@ -1158,6 +1159,19 @@ class ConversationFoldTest {
                 isLocalEcho = isEcho,
                 idOf = { it.id },
             ),
+        )
+        assertEquals(
+            listOf("canonical-09"),
+            optimisticFreshCanonicalRows(
+                echoGroupId = "group-08",
+                freshRowsByGroup = mapOf("group-09" to listOf(live)),
+                cachedRowsByGroup = mapOf("group-08" to listOf(echo)),
+                historicalFolds = emptyMap(),
+                isLocalEcho = isEcho,
+                idOf = { it.id },
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ).map { it.id },
         )
         assertEquals(
             listOf("canonical-09"),
@@ -1184,6 +1198,22 @@ class ConversationFoldTest {
         )
         assertEquals(listOf("canonical-09"), stripped["group-08"]!!.map { it.id })
         assertEquals(listOf("canonical-09"), stripped["group-09"]!!.map { it.id })
+        val remountStripped = transcriptsAfterOptimisticReconcile(
+            echoGroupId = "group-09",
+            messagesByGroup = mapOf(
+                "group-08" to listOf(echo),
+                "group-09" to listOf(live, echo),
+            ),
+            pendingIds = listOf(echo.id),
+            survivorIds = emptyList(),
+            visible = listOf(live),
+            historicalFolds = emptyMap(),
+            idOf = { it.id },
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertTrue(remountStripped["group-08"].orEmpty().none { it.id == echo.id })
+        assertEquals(listOf("canonical-09"), remountStripped["group-09"]!!.map { it.id })
         assertEquals(
             mapOf("group-09" to listOf(echo)),
             remountedOptimisticPending(
@@ -1253,6 +1283,39 @@ class ConversationFoldTest {
                 echoId = "optimistic-1",
                 pendingByGroup = mapOf("group-08" to listOf("optimistic-1")),
                 historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            optimisticPendingLookupIds(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = mapOf("group-08" to listOf("optimistic-1")),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "group-09",
+            optimisticPendingStoreId(
+                sendGroupId = "group-08",
+                echoId = "optimistic-1",
+                pendingByGroup = mapOf("group-08" to listOf("optimistic-1")),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "group-09",
+            optimisticPendingStoreId(
+                sendGroupId = "group-09",
+                echoId = "optimistic-1",
+                pendingByGroup = mapOf("group-09" to listOf("optimistic-1")),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ),
         )
     }

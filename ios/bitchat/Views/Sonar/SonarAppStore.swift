@@ -2667,10 +2667,35 @@ func snFoldFamilyCachedMessages<Message>(
     return out
 }
 
+/// Hist echo + live canonical after remount, including empty persist-folds.
+/// Compose `echoReconcileFamilyIds`.
+func snEchoReconcileFamilyIds(
+    echoGroupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    var out = Set<String>()
+    if !echoGroupId.isEmpty { out.insert(echoGroupId) }
+    out.formUnion(snFoldFamilyIds(id: echoGroupId, historicalFolds: historicalFolds))
+    for id in snRemountPairConversationIds(
+        conversationId: echoGroupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id)
+        if !bare.isEmpty {
+            out.insert(bare)
+            out.formUnion(snFoldFamilyIds(id: bare, historicalFolds: historicalFolds))
+        }
+    }
+    return out
+}
+
 /// Fresh canonical rows that can fulfill an in-flight send echo.
 /// First-resume send echoes on the recovered 0.8 id; the relay copy
-/// lands on the live 0.9 sibling. Walk the fold family or the echo
-/// stays "Sending" forever beside the real row.
+/// lands on the live 0.9 sibling. Walk the fold family or the remount
+/// pair, or the echo stays "Sending" forever beside the real row.
 /// Compose `optimisticFreshCanonicalRows`.
 func snOptimisticFreshCanonicalRows<Message>(
     echoGroupId: String,
@@ -2678,10 +2703,16 @@ func snOptimisticFreshCanonicalRows<Message>(
     cachedRowsByGroup: [String: [Message]],
     historicalFolds: [String: String],
     isLocalEcho: (Message) -> Bool,
-    idOf: (Message) -> String
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [Message] {
-    let family = snFoldFamilyIds(id: echoGroupId, historicalFolds: historicalFolds)
-    let ids = family.isEmpty ? [echoGroupId] : family.sorted()
+    let ids = snEchoReconcileFamilyIds(
+        echoGroupId: echoGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).sorted()
     var seen = Set<String>()
     var out: [Message] = []
     func addAll(_ rows: [Message]) {
@@ -2700,6 +2731,7 @@ func snOptimisticFreshCanonicalRows<Message>(
 
 /// After a hist echo is fulfilled by a live sibling, drop that echo from
 /// every family transcript so `dmMsgs` does not show Sending + Sent.
+/// Empty persist-folds still strip the remounted hist pane.
 /// Compose `transcriptsAfterOptimisticReconcile`.
 func snTranscriptsAfterOptimisticReconcile<Message>(
     echoGroupId: String,
@@ -2708,14 +2740,21 @@ func snTranscriptsAfterOptimisticReconcile<Message>(
     survivorIds: [String],
     visible: [Message],
     historicalFolds: [String: String],
-    idOf: (Message) -> String
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String: [Message]] {
     let survivors = Set(survivorIds)
     let fulfilled = Set(pendingIds.filter { !survivors.contains($0) })
     var next = messagesByGroup
     next[echoGroupId] = visible
     guard !fulfilled.isEmpty else { return next }
-    let family = snFoldFamilyIds(id: echoGroupId, historicalFolds: historicalFolds)
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: echoGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     for sibling in family where sibling != echoGroupId {
         guard let rows = next[sibling] else { continue }
         let stripped = rows.filter { !fulfilled.contains(idOf($0)) }
@@ -2765,11 +2804,16 @@ func snOptimisticPendingLookupIds(
     sendGroupId: String,
     echoId: String,
     pendingByGroup: [String: [String]],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Set<String> {
-    var out = Set<String>()
-    if !sendGroupId.isEmpty { out.insert(sendGroupId) }
-    out.formUnion(snFoldFamilyIds(id: sendGroupId, historicalFolds: historicalFolds))
+    var out = snEchoReconcileFamilyIds(
+        echoGroupId: sendGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     if !echoId.isEmpty {
         for (key, ids) in pendingByGroup where ids.contains(echoId) {
             out.insert(key)
@@ -2785,7 +2829,9 @@ func snOptimisticPendingStoreId(
     sendGroupId: String,
     echoId: String,
     pendingByGroup: [String: [String]],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String {
     if let live = historicalFolds[sendGroupId], !live.isEmpty, live != sendGroupId {
         return live
@@ -2794,6 +2840,16 @@ func snOptimisticPendingStoreId(
         for (key, ids) in pendingByGroup where key != sendGroupId && ids.contains(echoId) {
             return key
         }
+    }
+    let openedBare = snBareMarmotGroupId(openedConversationId ?? "")
+    if !openedBare.isEmpty,
+       !snOpenedConversationIdMatches(openedBare, sendGroupId),
+       snRemountPairConversationIds(
+            conversationId: sendGroupId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+       ).contains(where: { snOpenedConversationIdMatches($0, openedConversationId) }) {
+        return openedBare
     }
     return snFoldFamilyIds(id: sendGroupId, historicalFolds: historicalFolds)
         .first(where: { $0 != sendGroupId })
@@ -11354,6 +11410,10 @@ final class SonarAppStore: ObservableObject {
             [openId, groupId, openedConversationPaneId].compactMap { $0 }.filter { !$0.isEmpty }
         )
         openedConversationId = realId
+        marmot.rememberRemountPair(
+            openedConversationId: realId,
+            openedConversationPaneId: openedConversationPaneId
+        )
         // Keep `openedConversationPaneId` on hist. iPhone NavigationStack
         // stays on `.dm(hist)` so the painted pane is not remade. Mac hops
         // selection to live while `.id` stays hist. Same publish as
@@ -13471,6 +13531,10 @@ final class SonarAppStore: ObservableObject {
         )
         openedConversationId = remounted.opened
         openedConversationPaneId = remounted.pane
+        marmot.rememberRemountPair(
+            openedConversationId: remounted.opened,
+            openedConversationPaneId: remounted.pane
+        )
         conversationViewStates[id]?.activate()
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
@@ -13681,6 +13745,10 @@ final class SonarAppStore: ObservableObject {
             )
             openedConversationId = nil
             openedConversationPaneId = nil
+            marmot.rememberRemountPair(
+                openedConversationId: nil,
+                openedConversationPaneId: nil
+            )
         }
         if clearPendingReplacement {
             pendingMarmotRouteReplacement = nil
@@ -15864,6 +15932,10 @@ final class SonarAppStore: ObservableObject {
         openedConversationId = nil
         openedConversationPaneId = nil
         pendingMarmotRouteReplacement = nil
+        marmot.rememberRemountPair(
+            openedConversationId: nil,
+            openedConversationPaneId: nil
+        )
         deletedOpenConversationTick &+= 1
     }
 
