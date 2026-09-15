@@ -1792,6 +1792,15 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == nil
         )
+        #expect(
+            snHydrationTargetGroupId(
+                sourceId: "group-08",
+                activeGroupIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
         let remountedExtract = (1...80).map { "hist-\($0)" }
         #expect(snHydrationHasRealTranscriptRows(rows: remountedExtract, idOf: { $0 }))
         #expect(!snHydrationHasRealTranscriptRows(rows: ["summary:group-09:200:1"], idOf: { $0 }))

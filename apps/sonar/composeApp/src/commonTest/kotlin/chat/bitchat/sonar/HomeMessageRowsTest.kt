@@ -340,6 +340,49 @@ class HomeMessageRowsTest {
             hydrationTargetId("group-09", setOf("group-09"), folds),
         )
         assertNull(hydrationTargetId("group-08", setOf("group-09"), emptyMap()))
+        assertEquals(
+            "group-09",
+            hydrationTargetId(
+                "group-08",
+                setOf("group-09"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        val remountHydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("group-09"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = emptyList(),
+            pages = listOf(
+                SonarRecentTranscriptPage(
+                    "group-08",
+                    80L,
+                    listOf(SonarMsg("hist-msg", "peer", "recovered page", false, 80L, viaInternet = true)),
+                ),
+            ),
+            historicalFolds = emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("recovered page", remountHydration.messagesByChat["group-09"]?.single()?.content)
+        assertEquals(80L, remountHydration.latestByChat["group-09"])
+        val emptyHydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("group-09"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = emptyList(),
+            pages = listOf(
+                SonarRecentTranscriptPage(
+                    "group-08",
+                    80L,
+                    listOf(SonarMsg("hist-msg", "peer", "recovered page", false, 80L, viaInternet = true)),
+                ),
+            ),
+            historicalFolds = emptyMap(),
+        )
+        assertTrue(emptyHydration.messagesByChat["group-09"].isNullOrEmpty())
     }
 
     @Test

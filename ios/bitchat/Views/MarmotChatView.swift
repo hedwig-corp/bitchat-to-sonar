@@ -3174,8 +3174,8 @@ final class MarmotChatModel: ObservableObject {
             let listed = publishedGroups(groups)
             let activeGroupIds = Set(listed.map(\.id))
             let folds = historicalFoldsMap()
+            let remount = remountOpenedAndPane()
             if SNUnreadCounts.shouldPublish(summaries), let summaries {
-                let remount = self.remountOpenedAndPane()
                 self.conversationSummariesByGroup = snRemountedConversationSummaries(
                     summaries: summaries,
                     activeGroupIds: activeGroupIds,
@@ -3193,7 +3193,15 @@ final class MarmotChatModel: ObservableObject {
                 previousGroupIds: Set(messagesByGroup.keys),
                 currentGroupIds: activeGroupIds,
                 messagesByGroup: messagesByGroup,
-                liveFoldTarget: { snPersistedLiveFoldTarget(groupId: $0, historicalFolds: folds) },
+                liveFoldTarget: {
+                    snResolvedLiveFoldTarget(
+                        groupId: $0,
+                        historicalFolds: folds,
+                        ffiLiveFoldTarget: nil,
+                        openedConversationId: remount.opened,
+                        openedConversationPaneId: remount.pane
+                    )
+                },
                 idOf: { $0.id }
             )
             var freshRowsByGroup: [String: [MarmotService.MarmotMessage]] = [:]
@@ -3201,7 +3209,9 @@ final class MarmotChatModel: ObservableObject {
                 guard let target = snHydrationTargetGroupId(
                     sourceId: page.groupId,
                     activeGroupIds: activeGroupIds,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 ) else { continue }
                 if let existingFresh = freshRowsByGroup[target] {
                     freshRowsByGroup[target] = Self.mergeMessages(

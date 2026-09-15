@@ -101,14 +101,26 @@ internal fun hydrateMergedPageRows(
     incoming: List<SonarMsg>,
 ): List<SonarMsg> = mergeAllTranscriptRows(existing.withoutSyntheticSummaryRows() + incoming)
 
-/** Listed live id that should receive a hidden 0.8 summary / page. */
+/** Listed live id that should receive a hidden 0.8 summary / page.
+ *  Empty persist-folds still walk the remount pair so a hist-keyed
+ *  `recentMessagePages` / index row lands on live before wake-mute.
+ *  iOS `snHydrationTargetGroupId`. */
 internal fun hydrationTargetId(
     sourceId: String,
     activeChatIds: Set<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String? {
     if (sourceId in activeChatIds) return sourceId
-    val live = historicalFolds[sourceId]?.takeIf { it.isNotBlank() && it != sourceId }
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val bare = sourceId.removePrefix("marmot:")
+    val live = folds[bare]?.takeIf { it.isNotBlank() && it != bare }
+        ?: folds[sourceId]?.takeIf { it.isNotBlank() && it != sourceId }
     return live?.takeIf { it in activeChatIds }
 }
 
@@ -119,10 +131,17 @@ internal fun hydrateLocalConversationRows(
     summaries: List<SonarConversationSummary>,
     pages: List<SonarRecentTranscriptPage>,
     historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): LocalConversationHydration {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     val messages = existingMessagesByChat.filterKeys { it in activeChatIds }.toMutableMap()
     val latest = existingLatestByChat.filterKeys { it in activeChatIds }.toMutableMap()
-    for ((historical, live) in historicalFolds) {
+    for ((historical, live) in folds) {
         if (live !in activeChatIds) continue
         val incoming = existingMessagesByChat[historical].orEmpty()
         if (incoming.isNotEmpty()) {
@@ -135,7 +154,13 @@ internal fun hydrateLocalConversationRows(
     }
 
     for (summary in summaries) {
-        val target = hydrationTargetId(summary.groupIdHex, activeChatIds, historicalFolds)
+        val target = hydrationTargetId(
+            summary.groupIdHex,
+            activeChatIds,
+            folds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
             ?: continue
         if (summary.latestAtSecs <= 0L) continue
         val existing = messages[target].orEmpty()
@@ -176,7 +201,13 @@ internal fun hydrateLocalConversationRows(
     }
 
     for (page in pages) {
-        val target = hydrationTargetId(page.chatId, activeChatIds, historicalFolds) ?: continue
+        val target = hydrationTargetId(
+            page.chatId,
+            activeChatIds,
+            folds,
+            openedConversationId,
+            openedConversationPaneId,
+        ) ?: continue
         if (page.messages.isEmpty()) continue
         val existingTs = latest[target] ?: 0L
         val pageTs = page.latestTsSecs.takeIf { it > 0L } ?: page.messages.maxOf { it.tsSecs }

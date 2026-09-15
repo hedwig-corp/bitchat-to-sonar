@@ -2751,12 +2751,20 @@ func snNotificationClearIds(
 func snHydrationTargetGroupId(
     sourceId: String,
     activeGroupIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String? {
     if activeGroupIds.contains(sourceId) { return sourceId }
-    guard let live = historicalFolds[sourceId], !live.isEmpty, live != sourceId else {
-        return nil
-    }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let bare = snBareMarmotGroupId(sourceId)
+    guard let live = folds[bare] ?? folds[sourceId],
+          !live.isEmpty, live != bare, live != sourceId
+    else { return nil }
     return activeGroupIds.contains(live) ? live : nil
 }
 
@@ -2809,7 +2817,9 @@ func snRemountedConversationSummaries(
         guard let target = snHydrationTargetGroupId(
             sourceId: summary.groupIdHex,
             activeGroupIds: activeGroupIds,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
         ) else { continue }
         let remounted = summary.groupIdHex == target
             ? summary

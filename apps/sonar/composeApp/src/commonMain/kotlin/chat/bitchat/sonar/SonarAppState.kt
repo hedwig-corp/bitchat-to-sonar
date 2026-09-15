@@ -17064,6 +17064,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             summaries = conversationSummaryByChat.values.toList(),
             pages = pages,
             historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
 
         // Publish one coherent local snapshot. Previously `chats = loadedChats`
