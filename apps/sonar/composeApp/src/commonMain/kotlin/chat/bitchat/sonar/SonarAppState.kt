@@ -2071,6 +2071,28 @@ internal fun persistedLiveFoldTarget(
     historicalFolds: Map<String, String>,
 ): String? = historicalFolds[groupId]?.takeIf { it.isNotBlank() && it != groupId }
 
+/** Persist-folds, then FFI, then the open remount pair. Empty persist-folds
+ *  without a remount pair stay null so promote* cannot invent a family-of-one.
+ *  iOS `snResolvedLiveFoldTarget`. */
+internal fun resolvedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    ffiLiveFoldTarget: String? = null,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    persistedLiveFoldTarget(groupId, historicalFolds)?.let { return it }
+    ffiLiveFoldTarget?.takeIf { it.isNotBlank() && it != groupId }?.let { return it }
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val bare = groupId.removePrefix("marmot:")
+    return folds[bare]?.takeIf { it.isNotBlank() && it != bare && it != groupId }
+        ?: folds[groupId]?.takeIf { it.isNotBlank() && it != groupId }
+}
+
 /**
  * Copy a hidden 0.8 snapshot timestamp onto the live sibling.
  *
@@ -6795,9 +6817,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         persistHistoricalFolds()
     }
 
-    private fun resolvedLiveFoldTarget(id: String): String? =
-        persistedLiveFoldTarget(id, historicalFoldMap)
-            ?: runCatching { SonarCore.liveFoldTarget(id) }.getOrNull()
+    private fun resolvedLiveFoldTarget(id: String): String? {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        return resolvedLiveFoldTarget(
+            groupId = id,
+            historicalFolds = historicalFoldMap,
+            ffiLiveFoldTarget = runCatching { SonarCore.liveFoldTarget(id) }.getOrNull(),
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     private fun rememberHistoricalFolds(previousIds: Set<String>, currentIds: Set<String>) {
         var changed = false

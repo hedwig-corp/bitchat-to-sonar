@@ -1745,12 +1745,29 @@ func snPersistedLiveFoldTarget(
 func snResolvedLiveFoldTarget(
     groupId: String,
     historicalFolds: [String: String],
-    ffiLiveFoldTarget: String?
+    ffiLiveFoldTarget: String?,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String? {
-    snPersistedLiveFoldTarget(groupId: groupId, historicalFolds: historicalFolds)
-        ?? ffiLiveFoldTarget.flatMap { live in
-            live.isEmpty || live == groupId ? nil : live
-        }
+    if let persisted = snPersistedLiveFoldTarget(
+        groupId: groupId,
+        historicalFolds: historicalFolds
+    ) {
+        return persisted
+    }
+    if let live = ffiLiveFoldTarget, !live.isEmpty, live != groupId {
+        return live
+    }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let bare = snBareMarmotGroupId(groupId)
+    guard let live = folds[bare] ?? folds[groupId],
+          !live.isEmpty, live != bare, live != groupId
+    else { return nil }
+    return live
 }
 
 /// Copy a hidden 0.8 snapshot timestamp onto the live sibling (Compose
@@ -11186,10 +11203,13 @@ final class SonarAppStore: ObservableObject {
     /// remounts host state onto the live sibling (Compose `persistedLiveFoldTarget`).
     private func resolvedLiveFoldTarget(for groupId: String) async -> String? {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         return snResolvedLiveFoldTarget(
             groupId: groupId,
             historicalFolds: folds,
-            ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId)
+            ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId),
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
     }
 

@@ -3028,6 +3028,31 @@ struct SonarConversationFoldTests {
             ) == "group-09"
         )
         #expect(
+            snResolvedLiveFoldTarget(
+                groupId: "group-08",
+                historicalFolds: [:],
+                ffiLiveFoldTarget: nil,
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snResolvedLiveFoldTarget(
+                groupId: "group-08",
+                historicalFolds: [:],
+                ffiLiveFoldTarget: nil
+            ) == nil
+        )
+        #expect(
+            snResolvedLiveFoldTarget(
+                groupId: "group-08",
+                historicalFolds: ["group-08": "group-09"],
+                ffiLiveFoldTarget: nil,
+                openedConversationId: "other-live",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
             snSnapshotLatestAfterHistoricalFolds(
                 latestByChat: ["group-08": 1_700_000_000],
                 historicalFolds: ["group-08": "group-09"]
@@ -4041,6 +4066,35 @@ struct SonarConversationFoldTests {
                 latestByChat: ["group-09": historicalMark],
                 scannedWatermark: promotedMarks
             ).isEmpty
+        )
+        let remountMarks = snPromotedFoldedScanMarks(
+            previousGroupIds: ["group-08", "group-09"],
+            currentGroupIds: ["group-09"],
+            watermarks: ["group-08": historicalMark],
+            liveFoldTarget: {
+                snResolvedLiveFoldTarget(
+                    groupId: $0,
+                    historicalFolds: [:],
+                    ffiLiveFoldTarget: nil,
+                    openedConversationId: "group-09",
+                    openedConversationPaneId: "group-08"
+                )
+            }
+        )
+        #expect(remountMarks["group-09"] == historicalMark)
+        #expect(
+            snPromotedFoldedScanMarks(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                watermarks: ["group-08": historicalMark],
+                liveFoldTarget: {
+                    snResolvedLiveFoldTarget(
+                        groupId: $0,
+                        historicalFolds: [:],
+                        ffiLiveFoldTarget: nil
+                    )
+                }
+            )["group-09"] == nil
         )
         #expect(snMarmotSendNeedsPeerUpdate("no key package found on relays for npub1abc"))
         #expect(snMarmotSendUserMessage("no key package found on relays for npub1abc") == "Waiting for them to update Sonar")

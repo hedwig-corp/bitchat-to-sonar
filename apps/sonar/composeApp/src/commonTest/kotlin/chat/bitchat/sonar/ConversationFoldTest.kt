@@ -4243,6 +4243,70 @@ class ConversationFoldTest {
                 liveFoldTarget = folds::get,
             ),
         )
+        val remountTarget = { id: String ->
+            resolvedLiveFoldTarget(
+                groupId = id,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            )
+        }
+        assertEquals("group-09", remountTarget("group-08"))
+        assertEquals(
+            "group-09",
+            resolvedLiveFoldTarget(
+                groupId = "group-08",
+                historicalFolds = mapOf("group-08" to "group-09"),
+                openedConversationId = "other-live",
+                openedConversationPaneId = "group-08",
+            ),
+            "persist-folds win over remount pair",
+        )
+        assertEquals(
+            "group-09",
+            resolvedLiveFoldTarget(
+                groupId = "group-08",
+                historicalFolds = emptyMap(),
+                ffiLiveFoldTarget = "group-09",
+            ),
+        )
+        assertNull(
+            resolvedLiveFoldTarget(
+                groupId = "group-08",
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to historical, "group-09" to historical),
+            promotedFoldedScanMarks(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                watermarks = mapOf("group-08" to historical),
+                liveFoldTarget = remountTarget,
+            ),
+        )
+        assertEquals(
+            mapOf("group-09" to listOf("already", "uploading")),
+            promotedFoldedPendingMediaUploads(
+                previousIds = setOf("group-08"),
+                currentIds = setOf("group-09"),
+                uploads = mapOf(
+                    "group-08" to listOf("uploading"),
+                    "group-09" to listOf("already"),
+                ),
+                liveFoldTarget = remountTarget,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to listOf("uploading")),
+            promotedFoldedPendingMediaUploads(
+                previousIds = setOf("group-08"),
+                currentIds = setOf("group-09"),
+                uploads = mapOf("group-08" to listOf("uploading")),
+                liveFoldTarget = { resolvedLiveFoldTarget(it, emptyMap()) },
+            ),
+            "empty persist-folds without remount pair stay hist",
+        )
     }
 
     @Test
