@@ -539,7 +539,8 @@ struct SonarConversationFoldTests {
         )
         #expect(
             // Text / media / sticker / payment / internet call / mesh-folded
-            // sendOverMarmot share this remap (resolvedMarmotOutboundGroupId).
+            // sendOverMarmot / retryDm share this remap
+            // (resolvedMarmotOutboundGroupId).
             snMarmotSendTargetGroupId(
                 openGroupId: "zzz-08",
                 duplicateGroupIds: ["zzz-08", "group-09"],

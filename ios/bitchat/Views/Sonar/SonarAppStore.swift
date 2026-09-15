@@ -11149,24 +11149,44 @@ final class SonarAppStore: ObservableObject {
     /// reuse the content already retained for that exact bubble.
     func retryDm(_ id: String, message: SNMessage) {
         guard snCanRetryFailedMessage(message) else { return }
-        let groupId = message.media.first?.groupId
+        let persistGroupId = message.media.first?.groupId
             ?? marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
 
-        if let groupId,
+        if let persistGroupId,
            MarmotChatModel.isFailedOptimisticMessageId(message.id),
            !message.media.isEmpty {
-            retryFailedMedia(message, groupId: groupId)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let groupId = await self.resolvedMarmotOutboundGroupId(id, fallback: persistGroupId)
+                    ?? persistGroupId
+                self.retryFailedMedia(message, groupId: groupId)
+            }
             return
         }
 
-        if let groupId, snIsFailedOptimisticStickerMessage(message) {
-            retryFailedSticker(message, groupId: groupId)
+        if let persistGroupId, snIsFailedOptimisticStickerMessage(message) {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let groupId = await self.resolvedMarmotOutboundGroupId(id, fallback: persistGroupId)
+                    ?? persistGroupId
+                self.retryFailedSticker(message, groupId: groupId)
+            }
             return
         }
 
         if message.id.hasPrefix("echo-") {
-            retryFailedPendingText(id, message: message, groupId: groupId)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let groupId: String?
+                if let persistGroupId {
+                    groupId = await self.resolvedMarmotOutboundGroupId(id, fallback: persistGroupId)
+                        ?? persistGroupId
+                } else {
+                    groupId = nil
+                }
+                self.retryFailedPendingText(id, message: message, groupId: groupId)
+            }
             return
         }
 
@@ -11304,7 +11324,8 @@ final class SonarAppStore: ObservableObject {
         }
         if let profile = resolvedSonarProfile(id) {
             if let group = marmotGroup(forNpub: profile.npub) {
-                return await marmot.send(lines, to: group.id)
+                let groupId = await resolvedMarmotOutboundGroupId(id, fallback: group.id) ?? group.id
+                return await marmot.send(lines, to: groupId)
             }
             marmot.connectIfNeeded()
             guard let groupId = await marmot.startChatReturningId(with: profile.npub) else { return false }

@@ -530,6 +530,8 @@ class ConversationFoldTest {
                 ffiHistoricalFolds = mapOf("alias-08" to "group-09"),
             ),
         )
+        // Retry of a failed optimistic row uses the same remap as first
+        // send (Compose retryPendingMedia / retrySendEcho; iOS retryDm).
         // Mesh-folded sendOverMarmot: newest-sort picks hist (transcript
         // lives there). Persist-wins FFI still names live.
         assertEquals(

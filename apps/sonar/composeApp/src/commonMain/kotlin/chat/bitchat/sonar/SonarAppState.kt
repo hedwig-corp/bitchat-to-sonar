@@ -12173,12 +12173,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val uploads = matchingIndices.map { pending[it] }
         scope.launch {
-            val groupId = resolveMarmotSendTargetGroupId(chatId)
-            if (groupId == null) {
-                markPendingMediaFailed(chatId, pendingId)
-                toast = "This media is no longer available to retry."
-                return@launch
-            }
+        // Persist-wins FFI — same live as first send. iOS retryDm remaps
+        // optimistic media / sticker / echo the same way.
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
+        if (groupId == null) {
+            markPendingMediaFailed(chatId, pendingId)
+            toast = "This media is no longer available to retry."
+            return@launch
+        }
             val listener = MediaUploadControl { id, fraction ->
                 noteMediaUploadProgress(id, fraction)
             }
@@ -12299,6 +12301,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
         val groupId = resolveMarmotSendTargetGroupId(chatId)
         if (groupId != null) {
+            // Persist-wins FFI — same live as first send / iOS retryDm.
             scope.launch {
                 try {
                     sendQueuedMarmotContent(groupId, content, source.reply)
