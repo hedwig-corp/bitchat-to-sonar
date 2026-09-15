@@ -9381,6 +9381,16 @@ final class SonarAppStore: ObservableObject {
         return marmotGroups(forNpub: peer).count > 1
     }
 
+    /// Mesh-folded `sendOverMarmot` / sticker / pending flush. Persist+remount
+    /// first; persist-wins FFI when more than one 1:1 is listed.
+    private func resolvedMarmotOutboundGroupId(forNpub npub: String) async -> String? {
+        guard let persist = marmotGroup(forNpub: npub) else { return nil }
+        return await resolvedMarmotOutboundGroupId(
+            Self.marmotIDPrefix + persist.id,
+            fallback: persist.id
+        )
+    }
+
     func recoveredChatWaitingForPeerUpdate(_ id: String) -> Bool {
         let groupId = marmotGroupId(id)
         let groups: [MarmotService.MarmotGroup]
@@ -11346,6 +11356,19 @@ final class SonarAppStore: ObservableObject {
 
     private func sendOverMarmotSticker(npub: String, packCoordinate: String, sticker: StickerInfo) {
         if let group = marmotGroup(forNpub: npub) {
+            if directMarmotHasDuplicateSiblings(group.id) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let groupId = await self.resolvedMarmotOutboundGroupId(forNpub: npub) ?? group.id
+                    self.marmot.sendSticker(
+                        groupId: groupId,
+                        packCoordinate: packCoordinate,
+                        shortcode: sticker.shortcode,
+                        plaintextSha256: sticker.sha256
+                    )
+                }
+                return
+            }
             marmot.sendSticker(
                 groupId: group.id,
                 packCoordinate: packCoordinate,
@@ -11365,6 +11388,14 @@ final class SonarAppStore: ObservableObject {
 
     private func sendOverMarmot(_ text: String, npub: String, reply: MarmotService.MarmotReplyRef? = nil) {
         if let group = marmotGroup(forNpub: npub) {
+            if directMarmotHasDuplicateSiblings(group.id) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let groupId = await self.resolvedMarmotOutboundGroupId(forNpub: npub) ?? group.id
+                    self.marmot.send(text, to: groupId, reply: reply)
+                }
+                return
+            }
             marmot.send(text, to: group.id, reply: reply)
             return
         }
@@ -12729,16 +12760,19 @@ final class SonarAppStore: ObservableObject {
     private func flushPendingMarmotSends() {
         guard !pendingMarmotSends.isEmpty else { return }
         for (npub, sends) in pendingMarmotSends {
-            guard let group = marmotGroup(forNpub: npub) else { continue }
+            guard marmotGroup(forNpub: npub) != nil else { continue }
             pendingMarmotSends[npub] = nil
             Task { @MainActor in
+                let groupId = await resolvedMarmotOutboundGroupId(forNpub: npub)
+                    ?? marmotGroup(forNpub: npub)?.id
+                guard let groupId else { return }
                 for send in sends {
                     // Await real send outcome without creating a second optimistic.
                     // Clear the mesh echo only once a folded canonical row exists.
-                    let ok = await sendQueuedMarmotContent(send.text, to: group.id, reply: send.reply)
+                    let ok = await sendQueuedMarmotContent(send.text, to: groupId, reply: send.reply)
                     guard !send.chatId.isEmpty, !send.messageId.isEmpty else { continue }
                     if ok {
-                        await clearMeshEchoWhenCanonical(send: send, groupId: group.id)
+                        await clearMeshEchoWhenCanonical(send: send, groupId: groupId)
                     } else {
                         failMeshMarmotSendEcho(send)
                         objectWillChange.send()

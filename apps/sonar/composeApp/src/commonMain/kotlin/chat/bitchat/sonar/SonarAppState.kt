@@ -13096,6 +13096,29 @@ class SonarAppState(private val scope: CoroutineScope) {
             { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
         )
 
+    /** Mesh-folded sendOverMarmot / sticker / pending flush / outbox /
+     *  call-by-npub. Persist/newest first, then persist-wins FFI so a
+     *  recovered hist sibling is not published against. Do not persist.
+     *  iOS `resolvedMarmotOutboundGroupId`. */
+    private fun outboundMarmotGroupIdForNpub(
+        npubRaw: ByteArray,
+        openChatId: String,
+    ): String? {
+        val groups = marmotGroupsForNpub(npubRaw)
+        val persist = preferredDirectMarmotChat(groups) ?: return null
+        val (opened, pane) = remountPairForOpenChat(openChatId)
+        val ids = groups.map { it.id }
+        return marmotSendTargetGroupId(
+            persist.id,
+            ids,
+            ::localLatestTs,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffiFoldsForDirectIds(ids),
+        )
+    }
+
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
     private fun resolveMarmotGroupId(chatId: String): String? {
@@ -14369,7 +14392,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendCallOverMarmot(peerId: String, npubRaw: ByteArray, text: String): Boolean {
         return try {
             refreshChats()
-            val groupId = marmotGroupForNpub(npubRaw)?.id ?: run {
+            val groupId = outboundMarmotGroupIdForNpub(npubRaw, meshChatId(peerId)) ?: run {
                 if (!awaitRelayConnection()) return false
                 runMarmotAccountOperation { SonarCore.startChat(npubRaw.toHexLower()) }
             }.also {
@@ -14912,13 +14935,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         reply: SonarReplyRef? = null,
     ) {
         val chatId = meshChatId(peerId)
-        val group = marmotGroupForNpub(npubRaw)
-        if (group != null) {
+        val groupId = outboundMarmotGroupIdForNpub(npubRaw, chatId)
+        if (groupId != null) {
             val echo = createSendEcho(chatId, text, reply = reply)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 runMarmotSendWithBestEffortReconciliation(
-                    send = { sendMarmotTextOrdered(group.id, text, reply) },
+                    send = { sendMarmotTextOrdered(groupId, text, reply) },
                     onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                     reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
                     onSendFailure = { error ->
@@ -14945,14 +14968,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     ) {
         val chatId = meshChatId(peerId)
         val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-        val group = marmotGroupForNpub(npubRaw)
-        if (group != null) {
+        val groupId = outboundMarmotGroupIdForNpub(npubRaw, chatId)
+        if (groupId != null) {
             val echo = createSendEcho(chatId, encoded)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 runMarmotSendWithBestEffortReconciliation(
                     send = {
-                        sendMarmotStickerOrdered(group.id, packCoordinate, sticker.shortcode, sticker.sha256)
+                        sendMarmotStickerOrdered(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
                     },
                     onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                     reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
@@ -15054,7 +15077,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         for ((npubHex, sends) in pendingMarmotSends.toMap()) {
             if (socialState.isBlockedNostr(npubHex)) continue
             if (pendingMarmotFlushJobs[npubHex]?.isActive == true) continue
-            val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
+            val openId = sends.firstOrNull()?.meshChatId.orEmpty()
+            val groupId = outboundMarmotGroupIdForNpub(npubHex.hexToBytesOrEmpty(), openId) ?: continue
             pendingMarmotSends.remove(npubHex)
             val job = scope.launch {
                 var drainedQueueEmpty = false
@@ -15064,7 +15088,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         val echo = pendingSendEchoes[send.meshChatId]
                             ?.firstOrNull { it.id == send.echoId }
                         runMarmotSendWithBestEffortReconciliation(
-                            send = { sendQueuedMarmotContent(group.id, send.text, send.reply) },
+                            send = { sendQueuedMarmotContent(groupId, send.text, send.reply) },
                             onSendAccepted = {
                                 if (echo != null) markSendEchoAccepted(send.meshChatId, echo.id)
                             },
@@ -15218,7 +15242,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {
-        marmotGroupForNpub(npubRaw)?.id?.let { return it }
+        outboundMarmotGroupIdForNpub(npubRaw, meshChatId(peerId))?.let { return it }
         if (!SonarCore.isRelayConnected()) {
             startRelayConnection()
             return null

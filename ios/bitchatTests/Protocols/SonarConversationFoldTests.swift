@@ -538,8 +538,8 @@ struct SonarConversationFoldTests {
             ) == "stale-09"
         )
         #expect(
-            // Text / media / sticker / payment / internet call share this
-            // remap (resolvedMarmotOutboundGroupId).
+            // Text / media / sticker / payment / internet call / mesh-folded
+            // sendOverMarmot share this remap (resolvedMarmotOutboundGroupId).
             snMarmotSendTargetGroupId(
                 openGroupId: "zzz-08",
                 duplicateGroupIds: ["zzz-08", "group-09"],
@@ -553,6 +553,14 @@ struct SonarConversationFoldTests {
                 duplicateGroupIds: ["zzz-08", "group-09"],
                 latestSecs: ["zzz-08": 2, "group-09": 1]
             ) == "zzz-08"
+        )
+        #expect(
+            snMarmotSendTargetGroupId(
+                openGroupId: "mesh:peer",
+                duplicateGroupIds: ["zzz-08", "group-09"],
+                latestSecs: ["zzz-08": 2, "group-09": 1],
+                ffiHistoricalFolds: ["zzz-08": "group-09"]
+            ) == "group-09"
         )
         #expect(
             snPersistedLiveFoldTarget(

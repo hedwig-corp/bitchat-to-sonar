@@ -530,6 +530,17 @@ class ConversationFoldTest {
                 ffiHistoricalFolds = mapOf("alias-08" to "group-09"),
             ),
         )
+        // Mesh-folded sendOverMarmot: newest-sort picks hist (transcript
+        // lives there). Persist-wins FFI still names live.
+        assertEquals(
+            "group-09",
+            marmotSendTargetGroupId(
+                openChatId = "mesh:peer",
+                duplicateGroupIds = listOf("zzz-08", "group-09"),
+                latestSecs = { if (it == "zzz-08") 2L else 1L },
+                ffiHistoricalFolds = mapOf("zzz-08" to "group-09"),
+            ),
+        )
     }
 
     @Test
