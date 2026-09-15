@@ -1005,6 +1005,8 @@ struct SonarConversationFoldTests {
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-08", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])
+        // loadOlderDM wanted-set must pass remount or hist stays out
+        // of the page walk when persist-folds are still empty.
         #expect(
             snFoldFamilyIds(
                 id: "group-09",
