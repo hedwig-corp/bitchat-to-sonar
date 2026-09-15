@@ -10187,7 +10187,12 @@ final class SonarAppStore: ObservableObject {
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let remount = remountOpenedAndPane()
-        let family = Set(snFoldFamilyIds(id: snBareMarmotGroupId(seed), historicalFolds: folds))
+        let family = Set(snFoldFamilyIds(
+            id: snBareMarmotGroupId(seed),
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ))
         let wanted = groupIDs.union(family)
         for group in localTranscriptGroups(for: id) where wanted.contains(group.id) {
             let before = snFoldFamilyCanonicalMessageIDs(
