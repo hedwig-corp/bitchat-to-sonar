@@ -2056,11 +2056,19 @@ internal fun notificationOpenShouldJump(
     openId: String,
     incomingId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     val open = openId.removePrefix("marmot:").trim()
     val incoming = incomingId.removePrefix("marmot:").trim()
     if (open.isEmpty() || incoming.isEmpty()) return false
-    return conversationsMatchFoldFamily(open, incoming, historicalFolds)
+    if (conversationsMatchFoldFamily(open, incoming, historicalFolds)) return true
+    val pair = remountPairConversationIds(
+        openId,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    return pair.any { openedConversationIdMatches(it, incomingId) }
 }
 
 /** Mac split-view `present:` skips `push`, so `path` has no `.dm`.
@@ -2768,12 +2776,26 @@ internal fun trillCooldownUntilMsWritten(
 internal fun notificationSuppressIds(
     listedIds: Collection<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<String> {
     val out = linkedSetOf<String>()
-    for (id in listedIds) {
-        if (id.isBlank()) continue
-        out += id
-        out.addAll(foldFamilyIds(id, historicalFolds))
+    for (listed in listedIds) {
+        if (listed.isBlank()) continue
+        for (id in remountPairConversationIds(
+            listed,
+            openedConversationId,
+            openedConversationPaneId,
+        )) {
+            if (id.isBlank()) continue
+            out += id
+            out.addAll(foldFamilyIds(id, historicalFolds))
+            val bare = id.removePrefix("marmot:")
+            if (bare.isNotBlank() && bare != id) {
+                out += bare
+                out.addAll(foldFamilyIds(bare, historicalFolds))
+            }
+        }
     }
     return out.toList()
 }
@@ -2784,9 +2806,16 @@ internal fun notificationClearIds(
     chatId: String,
     relatedIds: Collection<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Set<String> = SonarNotificationHandoff.conversationIdsToClear(
     chatId,
-    notificationSuppressIds(listOf(chatId) + relatedIds, historicalFolds),
+    notificationSuppressIds(
+        listOf(chatId) + relatedIds,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ),
 )
 
 /** Mesh-folded White Noise notify: suppress the live group, the mesh row,
@@ -2795,7 +2824,14 @@ internal fun meshNotificationSuppressIds(
     groupId: String,
     meshId: String,
     historicalFolds: Map<String, String>,
-): List<String> = notificationSuppressIds(listOf(groupId, meshId), historicalFolds)
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> = notificationSuppressIds(
+    listOf(groupId, meshId),
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+)
 
 /** Marmot ids whose unread / transcript belong to the open chat after a fold.
  *  Listed 1:1 duplicates plus the hidden 0.8 sibling. */
@@ -4599,7 +4635,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val beforeFolds = historicalFoldMap.toMap()
         val folds = mergeActionHistoricalFolds(groupIds)
         adoptActionHistoricalFolds(folds)
-        val marked = notificationSuppressIds(groupIds, folds).toSet()
+        val openId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = openId?.let { remountPairForOpenChat(it) } ?: (null to null)
+        val marked = notificationSuppressIds(groupIds, folds, opened, pane).toSet()
         unreadSuppressGroupIds.addAll(marked)
         unreadByChat = unreadByChat - marked
         if (folds != beforeFolds) persistHistoricalFolds()
@@ -9034,7 +9072,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun isConversationOpen(chatId: String): Boolean {
         val openId = (screen as? Screen.Chat)?.id ?: return false
         if (openId == chatId) return true
-        return notificationOpenShouldJump(openId, chatId, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(openId)
+        return notificationOpenShouldJump(
+            openId,
+            chatId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     /** Desktop sidebar / home-list can tap the listed live row while the
@@ -9048,7 +9093,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             adoptActionHistoricalFolds(folds)
             if (folds != before) persistHistoricalFolds()
         }
-        if (!notificationOpenShouldJump(openId, incomingId, historicalFoldMap)) return false
+        val (opened, pane) = remountPairForOpenChat(openId)
+        if (!notificationOpenShouldJump(
+                openId,
+                incomingId,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+        ) return false
         jumpOnOpenNotificationConversation(openId, incomingId, jumpMessageId)
         return true
     }
@@ -9061,6 +9114,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         summaryByChat: Map<String, SonarConversationSummary>,
     ) {
         val openChatId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = openChatId?.let { remountPairForOpenChat(it) } ?: (null to null)
         val knownChatIds = chats.map { it.id }.toSet()
         val snapshot = visibleChats.filter { it.id in knownChatIds }
         for (c in snapshot) {
@@ -9068,7 +9122,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notifyChatIfNew(
                 c,
                 scanIds = chatIds,
-                suppressIds = notificationSuppressIds(chatIds, historicalFoldMap),
+                suppressIds = notificationSuppressIds(chatIds, historicalFoldMap, opened, pane),
                 openChatId = openChatId,
                 idKey = c.id,
                 title = chatTitle(c),
@@ -9088,7 +9142,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notifyChatIfNew(
                 c,
                 scanIds = listOf(groupId),
-                suppressIds = meshNotificationSuppressIds(groupId, meshId, historicalFoldMap),
+                suppressIds = meshNotificationSuppressIds(groupId, meshId, historicalFoldMap, opened, pane),
                 openChatId = openChatId,
                 idKey = meshId,
                 title = meshPeerName(peerId),

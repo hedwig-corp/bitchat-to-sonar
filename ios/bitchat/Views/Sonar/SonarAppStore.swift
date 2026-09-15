@@ -1938,13 +1938,21 @@ func snConversationOpenShouldMergeFolds(
 func snNotificationOpenShouldJump(
     openId: String,
     incomingId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
-    snConversationsMatchFoldFamily(
+    if snConversationsMatchFoldFamily(
         left: openId,
         right: incomingId,
         historicalFolds: historicalFolds
+    ) { return true }
+    let pair = snRemountPairConversationIds(
+        conversationId: openId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     )
+    return pair.contains(where: { snOpenedConversationIdMatches($0, incomingId) })
 }
 
 /// Mac split-view `present:` skips `push`, so `path` has no `.dm`.
@@ -2416,14 +2424,22 @@ func snPendingUploadStoreGroupId(
 func snMeshNotificationSuppressIds(
     groupId: String,
     meshId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     var out: [String] = []
     var seen = Set<String>()
-    for id in [groupId, meshId] where !id.isEmpty {
-        if seen.insert(id).inserted { out.append(id) }
-        for alias in snFoldFamilyIds(id: id, historicalFolds: historicalFolds) {
-            if seen.insert(alias).inserted { out.append(alias) }
+    for listed in [groupId, meshId] where !listed.isEmpty {
+        for id in snRemountPairConversationIds(
+            conversationId: listed,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ) where !id.isEmpty {
+            if seen.insert(id).inserted { out.append(id) }
+            for alias in snFoldFamilyIds(id: id, historicalFolds: historicalFolds) {
+                if seen.insert(alias).inserted { out.append(alias) }
+            }
         }
     }
     return out
@@ -2436,6 +2452,8 @@ func snNotificationClearIds(
     conversationId: String,
     relatedIds: [String],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> Set<String> {
     var out = Set<String>()
@@ -2451,7 +2469,13 @@ func snNotificationClearIds(
             out.insert(prefix + alias)
         }
     }
-    insert(conversationId)
+    for id in snRemountPairConversationIds(
+        conversationId: conversationId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        insert(id)
+    }
     for id in relatedIds { insert(id) }
     return out
 }
@@ -14866,6 +14890,17 @@ final class SonarAppStore: ObservableObject {
     /// aliases of the same person, not only exact string equality.
     func isConversationOpen(_ conversationId: String) -> Bool {
         guard let openId = currentDMId else { return false }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        if snNotificationOpenShouldJump(
+            openId: openId,
+            incomingId: conversationId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
+            return true
+        }
         return conversationsMatchForNotification(openId, conversationId)
     }
 
@@ -15216,11 +15251,14 @@ final class SonarAppStore: ObservableObject {
             }
         }
         let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
         NotificationService.shared.clearNotifications(
             forConversationIds: snNotificationClearIds(
                 conversationId: conversationId,
                 relatedIds: Array(ids),
-                historicalFolds: persisted
+                historicalFolds: persisted,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             )
         )
         let seed = marmotGroupId(conversationId) ?? conversationId

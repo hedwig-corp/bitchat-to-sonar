@@ -1303,6 +1303,15 @@ class ConversationFoldTest {
                 historicalFolds = emptyMap(),
             ),
         )
+        assertTrue(
+            notificationOpenShouldJump(
+                openId = "marmot:group-09",
+                incomingId = "marmot:group-08",
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
         // After FFI merge, Jump instead of openChat(live) remount.
         assertTrue(
             notificationOpenShouldJump(
@@ -3696,6 +3705,23 @@ class ConversationFoldTest {
         assertEquals(
             listOf("group-09"),
             notificationSuppressIds(listOf("group-09"), emptyMap()),
+        )
+        assertTrue(
+            "group-08" in notificationSuppressIds(
+                listOf("group-09"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            "marmot:group-08" in notificationClearIds(
+                "marmot:group-09",
+                emptyList(),
+                emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
         )
         assertTrue("group-08" in notificationSuppressIds(listOf("group-09"), folds))
         assertFalse("group-08" in listOf("group-09"))

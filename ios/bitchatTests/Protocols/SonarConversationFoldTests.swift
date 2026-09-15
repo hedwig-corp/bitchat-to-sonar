@@ -989,6 +989,15 @@ struct SonarConversationFoldTests {
             snNotificationClearIds(
                 conversationId: "group-09",
                 relatedIds: [],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ).isSuperset(of: ["group-09", "group-08"])
+        )
+        #expect(
+            snNotificationClearIds(
+                conversationId: "group-09",
+                relatedIds: [],
                 historicalFolds: wakeFolds
             ).isSuperset(of: ["group-09", "group-08"])
         )
@@ -1762,6 +1771,13 @@ struct SonarConversationFoldTests {
             openId: "marmot:group-08",
             incomingId: "marmot:group-09",
             historicalFolds: [:]
+        ))
+        #expect(snNotificationOpenShouldJump(
+            openId: "marmot:group-09",
+            incomingId: "marmot:group-08",
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
         ))
         #expect(snNotificationOpenShouldJump(
             openId: "marmot:group-08",
