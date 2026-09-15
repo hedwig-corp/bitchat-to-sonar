@@ -4453,6 +4453,48 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        assertEquals(
+            emptyList(),
+            pendingJoinRequestsAcrossRemount(
+                previousChatId = "group-08",
+                nextChatId = "group-09",
+                requests = cachedRequests,
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            cachedRequests,
+            pendingJoinRequestsAcrossRemount(
+                previousChatId = "group-08",
+                nextChatId = "group-09",
+                requests = cachedRequests,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            cachedRequests,
+            pendingJoinRequestsAcrossRemount(
+                previousChatId = "group-09",
+                nextChatId = "group-08",
+                requests = cachedRequests,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            emptyList(),
+            pendingJoinRequestsAcrossRemount(
+                previousChatId = "group-08",
+                nextChatId = "other-room",
+                requests = cachedRequests,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test
@@ -4513,6 +4555,58 @@ class ConversationFoldTest {
                 openGroupInfoChatId = null,
                 changedId = "group-08",
                 historicalFolds = folds,
+            ),
+        )
+        assertFalse(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = "group-08",
+                changedId = "group-09",
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = "group-08",
+                changedId = "group-09",
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = "group-09",
+                changedId = "group-08",
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertFalse(
+            groupInfoShouldReloadPending(
+                openGroupInfoChatId = "group-08",
+                changedId = "other",
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            conversationsMatchFoldFamily(
+                "group-08",
+                "group-09",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertFalse(
+            conversationsMatchFoldFamily(
+                "group-08",
+                "other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ),
         )
         assertEquals(emptyMap(), purgedHistoricalFolds(folds, setOf("group-09")))

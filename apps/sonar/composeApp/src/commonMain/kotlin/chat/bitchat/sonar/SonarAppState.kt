@@ -1852,9 +1852,18 @@ internal fun pendingJoinRequestsAcrossRemount(
     nextChatId: String,
     requests: List<SonarJoinRequest>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<SonarJoinRequest> {
     if (previousChatId.isBlank() || nextChatId.isBlank()) return requests
-    if (conversationsMatchFoldFamily(previousChatId, nextChatId, historicalFolds)) {
+    if (conversationsMatchFoldFamily(
+            previousChatId,
+            nextChatId,
+            historicalFolds,
+            openedConversationId = openedConversationId,
+            openedConversationPaneId = openedConversationPaneId,
+        )
+    ) {
         return requests
     }
     return emptyList()
@@ -3032,27 +3041,45 @@ internal fun pendingMediaPreviewBelongsToChat(
     return false
 }
 
-/** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
+/** Same recovered conversation under either the hidden 0.8 or live 0.9 id.
+ *  Empty persist-folds still match the remount pair so group-info / pending
+ *  joins stay on the painted hist pane. iOS `snConversationsMatchFoldFamily`. */
 internal fun conversationsMatchFoldFamily(
     left: String,
     right: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     if (left.isBlank() || right.isBlank()) return false
-    if (left == right) return true
-    return foldFamilyIds(left, historicalFolds).contains(right)
+    if (left == right || openedConversationIdMatches(left, right)) return true
+    if (foldFamilyIds(left, historicalFolds).contains(right)) return true
+    val remount = remountPairConversationIds(
+        conversationId = left,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    return remount.size > 1 && remount.any { openedConversationIdMatches(it, right) }
 }
 
 /** Open group-info must reload pending joins when `conversationChanged`
- *  names this room or its hidden 0.8 sibling. iOS
- *  `snGroupInfoShouldReloadPending`. */
+ *  names this room, its hidden 0.8 sibling, or the remount pair.
+ *  iOS `snGroupInfoShouldReloadPending`. */
 internal fun groupInfoShouldReloadPending(
     openGroupInfoChatId: String?,
     changedId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     val open = openGroupInfoChatId?.takeIf { it.isNotBlank() } ?: return false
-    return conversationsMatchFoldFamily(open, changedId, historicalFolds)
+    return conversationsMatchFoldFamily(
+        open,
+        changedId,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
 }
 
 /** Painted hist id plus remounted live id. Wake-mute persist only writes
@@ -5975,12 +6002,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         previousChatId: String,
         nextChatId: String,
         requests: List<SonarJoinRequest>,
-    ): List<SonarJoinRequest> = pendingJoinRequestsAcrossRemount(
-        previousChatId = previousChatId,
-        nextChatId = nextChatId,
-        requests = requests,
-        historicalFolds = historicalFoldMap,
-    )
+    ): List<SonarJoinRequest> {
+        val (opened, pane) = remountPairForOpenChat(nextChatId).let { pair ->
+            if (pair.first != null || pair.second != null) pair
+            else remountPairForOpenChat(previousChatId)
+        }
+        return pendingJoinRequestsAcrossRemount(
+            previousChatId = previousChatId,
+            nextChatId = nextChatId,
+            requests = requests,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     fun hasDirectPaymentRoute(chatId: String): Boolean {
         if (directPaymentOffer(chatId) != null) return true
@@ -16934,8 +16969,21 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (targetId != groupIdHex) stagedChangedPages.remove(groupIdHex)
                 }
                 (screen as? Screen.GroupInfo)?.let { info ->
-                    if (groupInfoShouldReloadPending(info.chatId, groupIdHex, historicalFoldMap) ||
-                        groupInfoShouldReloadPending(info.chatId, targetId, historicalFoldMap)
+                    val (opened, pane) = remountPairForOpenChat(info.chatId)
+                    if (groupInfoShouldReloadPending(
+                            info.chatId,
+                            groupIdHex,
+                            historicalFoldMap,
+                            openedConversationId = opened,
+                            openedConversationPaneId = pane,
+                        ) ||
+                        groupInfoShouldReloadPending(
+                            info.chatId,
+                            targetId,
+                            historicalFoldMap,
+                            openedConversationId = opened,
+                            openedConversationPaneId = pane,
+                        )
                     ) {
                         groupInfoPendingRevision++
                     }

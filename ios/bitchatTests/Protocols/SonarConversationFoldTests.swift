@@ -402,6 +402,58 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            !snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: "marmot:group-08",
+                changedId: "group-09",
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: "marmot:group-08",
+                changedId: "group-09",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )
+        )
+        #expect(
+            snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: "marmot:group-09",
+                changedId: "group-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )
+        )
+        #expect(
+            !snGroupInfoShouldReloadPending(
+                openGroupInfoChatId: "marmot:group-08",
+                changedId: "other",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )
+        )
+        #expect(
+            snConversationsMatchFoldFamily(
+                left: "marmot:group-08",
+                right: "marmot:group-09",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )
+        )
+        #expect(
+            !snConversationsMatchFoldFamily(
+                left: "marmot:group-08",
+                right: "marmot:other",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            )
+        )
+        #expect(
             snRemountFoldedOpenValues(
                 historicalKeys: ["marmot:group-08", "group-08"],
                 liveKeys: ["marmot:group-09", "group-09"],
@@ -3526,6 +3578,44 @@ struct SonarConversationFoldTests {
                 requests: requests,
                 historicalFolds: folds
             ) == requests
+        )
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "marmot:group-08",
+                nextChatId: "marmot:group-09",
+                requests: requests,
+                historicalFolds: [:]
+            ).isEmpty
+        )
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "marmot:group-08",
+                nextChatId: "marmot:group-09",
+                requests: requests,
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == requests
+        )
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "marmot:group-09",
+                nextChatId: "marmot:group-08",
+                requests: requests,
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == requests
+        )
+        #expect(
+            snPendingJoinRequestsAcrossRemount(
+                previousChatId: "marmot:group-08",
+                nextChatId: "marmot:other-room",
+                requests: requests,
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ).isEmpty
         )
     }
 

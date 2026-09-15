@@ -461,21 +461,37 @@ func snConversationsMatchFoldFamily(
     left: String,
     right: String,
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> Bool {
     let leftBare = snBareMarmotGroupId(left, prefix: prefix)
     let rightBare = snBareMarmotGroupId(right, prefix: prefix)
     if leftBare == rightBare { return true }
-    return snFoldFamilyIds(id: leftBare, historicalFolds: historicalFolds).contains(rightBare)
+    if snOpenedConversationIdMatches(left, right) { return true }
+    if snFoldFamilyIds(id: leftBare, historicalFolds: historicalFolds).contains(rightBare) {
+        return true
+    }
+    let remount = snRemountPairConversationIds(
+        conversationId: left,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return remount.count > 1 && remount.contains(where: {
+        snOpenedConversationIdMatches($0, right)
+    })
 }
 
 /// Persist-folds remounts group-info `hist → live`. A view identity
 /// change must not drop recovered requests before the live probe.
+/// Empty persist-folds still keep the remount pair.
 func snPendingJoinRequestsAcrossRemount<Request>(
     previousChatId: String,
     nextChatId: String,
     requests: [Request],
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> [Request] {
     if previousChatId.isEmpty || nextChatId.isEmpty { return requests }
@@ -483,6 +499,8 @@ func snPendingJoinRequestsAcrossRemount<Request>(
         left: previousChatId,
         right: nextChatId,
         historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
         prefix: prefix
     ) {
         return requests
@@ -491,12 +509,14 @@ func snPendingJoinRequestsAcrossRemount<Request>(
 }
 
 /// Open group-info must reload pending joins when `conversationChanged`
-/// names this room or its hidden 0.8 sibling. Compose
+/// names this room, its hidden 0.8 sibling, or the remount pair. Compose
 /// `groupInfoShouldReloadPending`.
 func snGroupInfoShouldReloadPending(
     openGroupInfoChatId: String?,
     changedId: String,
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> Bool {
     guard let open = openGroupInfoChatId, !open.isEmpty, !changedId.isEmpty else {
@@ -506,6 +526,8 @@ func snGroupInfoShouldReloadPending(
         left: open,
         right: changedId,
         historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
         prefix: prefix
     )
 }
@@ -8678,6 +8700,7 @@ final class SonarAppStore: ObservableObject {
         painted: [JoinRequestInfo] = []
     ) -> [JoinRequestInfo] {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
         guard let cache = pendingJoinRequestsCache else { return painted }
         if cache.chatId.isEmpty || chatId.isEmpty {
             return cache.requests
@@ -8685,7 +8708,9 @@ final class SonarAppStore: ObservableObject {
         if snConversationsMatchFoldFamily(
             left: cache.chatId,
             right: chatId,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         ) {
             return cache.requests
         }
