@@ -3503,9 +3503,17 @@ func snRecoveredChatHasLiveFoldSibling(
     chatId: String,
     listedDuplicateCount: Int,
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> Bool {
     if listedDuplicateCount > 1 { return true }
+    let remount = snRemountPairConversationIds(
+        conversationId: chatId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if remount.count > 1 { return true }
     let bare = snBareMarmotGroupId(chatId, prefix: prefix)
     guard !bare.isEmpty else { return false }
     if let live = historicalFolds[bare] ?? historicalFolds[chatId],
@@ -8627,7 +8635,13 @@ final class SonarAppStore: ObservableObject {
             groups = []
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
         let family = snFoldFamilyIds(id: groupId ?? id, historicalFolds: folds)
+            + Set(snRemountPairConversationIds(
+                conversationId: groupId ?? id,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            ))
         let flagged = recoveredChatNeedsUpdate.contains(id)
             || groupId.map { recoveredChatNeedsUpdate.contains($0) } == true
             || family.contains(where: {
@@ -8638,7 +8652,9 @@ final class SonarAppStore: ObservableObject {
             hasLiveFoldSibling: snRecoveredChatHasLiveFoldSibling(
                 chatId: groupId ?? id,
                 listedDuplicateCount: groups.count,
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
             ),
             keyPackageMissing: flagged
         )

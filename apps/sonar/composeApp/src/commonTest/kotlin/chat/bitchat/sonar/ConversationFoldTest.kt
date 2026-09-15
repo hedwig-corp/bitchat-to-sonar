@@ -4753,6 +4753,24 @@ class ConversationFoldTest {
         assertTrue(
             recoveredChatHasLiveFoldSibling(
                 chatId = "group-08",
+                listedDuplicateCount = 1,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertFalse(
+            recoveredChatHasLiveFoldSibling(
+                chatId = "group-other",
+                listedDuplicateCount = 1,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            recoveredChatHasLiveFoldSibling(
+                chatId = "group-08",
                 listedDuplicateCount = 2,
                 historicalFolds = emptyMap(),
             ),

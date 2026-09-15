@@ -3488,9 +3488,17 @@ internal fun recoveredChatHasLiveFoldSibling(
     chatId: String,
     listedDuplicateCount: Int,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     if (listedDuplicateCount > 1) return true
     if (chatId.isBlank()) return false
+    val remount = remountPairConversationIds(
+        chatId,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (remount.size > 1) return true
     val live = historicalFolds[chatId]
     if (!live.isNullOrBlank() && live != chatId) return true
     return historicalFolds.values.any { it == chatId }
@@ -5918,12 +5926,16 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun recoveredChatWaitingForPeerUpdate(chatId: String): Boolean {
         val groups = duplicateDirectMarmotChats(chatId)
+        val (opened, pane) = remountPairForOpenChat(chatId)
         val hasLiveSibling = recoveredChatHasLiveFoldSibling(
             chatId = chatId,
             listedDuplicateCount = groups.size,
             historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
-        val family = foldFamilyIds(chatId, historicalFoldMap)
+        val family = foldFamilyIds(chatId, historicalFoldMap) +
+            remountPairConversationIds(chatId, opened, pane)
         val flagged = chatId in recoveredChatNeedsUpdate ||
             groups.any { it.id in recoveredChatNeedsUpdate } ||
             family.any { it in recoveredChatNeedsUpdate }

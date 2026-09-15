@@ -3377,6 +3377,24 @@ struct SonarConversationFoldTests {
         #expect(
             snRecoveredChatHasLiveFoldSibling(
                 chatId: "group-08",
+                listedDuplicateCount: 1,
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            !snRecoveredChatHasLiveFoldSibling(
+                chatId: "group-other",
+                listedDuplicateCount: 1,
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            snRecoveredChatHasLiveFoldSibling(
+                chatId: "group-08",
                 listedDuplicateCount: 2,
                 historicalFolds: [:]
             )
