@@ -2533,6 +2533,19 @@ internal fun newestPageShouldMergeFamilyWindow(
     return hiddenSiblingHasRows || hasFoldFamily
 }
 
+/** Remount copies a pinned hist window onto live. An in-flight or
+ *  follow-up newest page on that just-pinned live must merge in place
+ *  — not replace+unpin. Explicit scroll-to-bottom still unpins.
+ *  Do not treat every newestPage+pinned as preserve: reopen-at-tail
+ *  would stay stuck on the historical cursor.
+ *  iOS `snNewestPageShouldPreserveRemountedPin`. */
+internal fun newestPageShouldPreserveRemountedPin(
+    isNewestPage: Boolean,
+    pinnedToOlderEdge: Boolean,
+    remountCopiedPinOntoTarget: Boolean,
+    explicitNewestReload: Boolean,
+): Boolean = isNewestPage && pinnedToOlderEdge && remountCopiedPinOntoTarget && !explicitNewestReload
+
 /** Read a draft from the open id or its hidden 0.8 sibling after a fold. */
 internal fun composerDraftForChat(
     chatId: String,

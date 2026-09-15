@@ -2090,8 +2090,8 @@ func snClosedDMShouldSkipFoldRemountHop(
     // Only the hist disappear caused by a path hop onto live. A user
     // leave while the painted route is still hist must still close.
     return snOpenedConversationIdMatches(closingId, replacement.pendingId)
-        && snOpenedConversationIdMatches(pathDMId, replacement.realId)
-        && snOpenedConversationIdMatches(openedConversationId, replacement.realId)
+        && snOpenedConversationIdMatches(replacement.realId, pathDMId)
+        && snOpenedConversationIdMatches(replacement.realId, openedConversationId)
 }
 
 /// Keep the empty-pane spinner on live when remount cancels hist hydrate.
@@ -2897,6 +2897,22 @@ func snNewestPageShouldMergeFamilyWindow(
 ) -> Bool {
     guard existingCanonicalCount > 0, !pinnedToOlderEdge else { return false }
     return hiddenSiblingHasRows || hasFoldFamily
+}
+
+/// Remount copies a pinned hist window onto live. An in-flight or
+/// follow-up `.newestPage` on that just-pinned live must merge in place
+/// — not replace+unpin. Explicit scroll-to-bottom
+/// (`loadNewestLocalPageWhenAvailable`) still unpins.
+/// Do not treat every newestPage+pinned as preserve: reopen-at-tail
+/// would stay stuck on the historical cursor.
+/// Compose `newestPageShouldPreserveRemountedPin`.
+func snNewestPageShouldPreserveRemountedPin(
+    isNewestPage: Bool,
+    pinnedToOlderEdge: Bool,
+    remountCopiedPinOntoTarget: Bool,
+    explicitNewestReload: Bool
+) -> Bool {
+    isNewestPage && pinnedToOlderEdge && remountCopiedPinOntoTarget && !explicitNewestReload
 }
 
 /// Empty newest page is not proof the conversation is empty.

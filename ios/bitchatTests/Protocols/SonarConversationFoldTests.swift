@@ -2228,6 +2228,38 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snNewestPageShouldPreserveRemountedPin(
+                isNewestPage: true,
+                pinnedToOlderEdge: true,
+                remountCopiedPinOntoTarget: true,
+                explicitNewestReload: false
+            )
+        )
+        #expect(
+            !snNewestPageShouldPreserveRemountedPin(
+                isNewestPage: true,
+                pinnedToOlderEdge: true,
+                remountCopiedPinOntoTarget: true,
+                explicitNewestReload: true
+            )
+        )
+        #expect(
+            !snNewestPageShouldPreserveRemountedPin(
+                isNewestPage: true,
+                pinnedToOlderEdge: true,
+                remountCopiedPinOntoTarget: false,
+                explicitNewestReload: false
+            )
+        )
+        #expect(
+            !snNewestPageShouldPreserveRemountedPin(
+                isNewestPage: true,
+                pinnedToOlderEdge: false,
+                remountCopiedPinOntoTarget: true,
+                explicitNewestReload: false
+            )
+        )
+        #expect(
             !snNewestPageShouldMergeFamilyWindow(
                 existingCanonicalCount: 40,
                 hiddenSiblingHasRows: false,

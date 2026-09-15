@@ -2547,6 +2547,38 @@ class ConversationFoldTest {
                 pinnedToOlderEdge = false,
             ),
         )
+        assertTrue(
+            newestPageShouldPreserveRemountedPin(
+                isNewestPage = true,
+                pinnedToOlderEdge = true,
+                remountCopiedPinOntoTarget = true,
+                explicitNewestReload = false,
+            ),
+        )
+        assertFalse(
+            newestPageShouldPreserveRemountedPin(
+                isNewestPage = true,
+                pinnedToOlderEdge = true,
+                remountCopiedPinOntoTarget = true,
+                explicitNewestReload = true,
+            ),
+        )
+        assertFalse(
+            newestPageShouldPreserveRemountedPin(
+                isNewestPage = true,
+                pinnedToOlderEdge = true,
+                remountCopiedPinOntoTarget = false,
+                explicitNewestReload = false,
+            ),
+        )
+        assertFalse(
+            newestPageShouldPreserveRemountedPin(
+                isNewestPage = true,
+                pinnedToOlderEdge = false,
+                remountCopiedPinOntoTarget = true,
+                explicitNewestReload = false,
+            ),
+        )
         assertEquals(
             hist,
             firstOpenFoldFamilySeedRows(hist + listOf(

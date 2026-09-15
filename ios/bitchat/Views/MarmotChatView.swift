@@ -630,6 +630,9 @@ final class MarmotChatModel: ObservableObject {
     /// refreshes must preserve their older edge or they can create a gap behind
     /// the cursor while an older-page read is suspended.
     private var localTranscriptPreservesOlderEdgeGroups: Set<String> = []
+    /// Live ids that received a remount-copied older-edge pin. A follow-up
+    /// `.newestPage` must preserve until an explicit scroll-to-bottom unpins.
+    private var remountCopiedOlderEdgePins: Set<String> = []
     /// Serializes outgoing sends so rapid-fire messages arrive in order.
     private var sendChain: Task<Void, Never>?
     /** Deletion increments this generation and awaits the tail task. Tasks
@@ -2655,7 +2658,8 @@ final class MarmotChatModel: ObservableObject {
     func loadLocalPage(
         groupId: String,
         mode: LocalTranscriptLoadMode,
-        hydrateMetadata: Bool = true
+        hydrateMetadata: Bool = true,
+        explicitNewestReload: Bool = false
     ) async -> Bool {
         guard localTranscriptLoadingGroups.insert(groupId).inserted else { return false }
         defer { localTranscriptLoadingGroups.remove(groupId) }
@@ -2685,8 +2689,17 @@ final class MarmotChatModel: ObservableObject {
             }
             let existingCanonical = existing.filter { !Self.isLocalTranscriptEcho($0) }
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
-            let shouldPreserveHistoricalWindow = mode == .preserveHistoricalWindow
-                && !existingCanonical.isEmpty
+            let remountPreserve = snNewestPageShouldPreserveRemountedPin(
+                isNewestPage: mode == .newestPage,
+                pinnedToOlderEdge: localTranscriptPreservesOlderEdgeGroups.contains(groupId),
+                remountCopiedPinOntoTarget: remountCopiedOlderEdgePins.contains(groupId),
+                explicitNewestReload: explicitNewestReload
+            )
+            let shouldPreserveHistoricalWindow = remountPreserve
+                || (
+                    mode == .preserveHistoricalWindow
+                    && !existingCanonical.isEmpty
+                )
             let hasFoldFamily = familyIds.contains { $0 != groupId }
             let shouldMergeFamilyWindow = snNewestPageShouldMergeFamilyWindow(
                 existingCanonicalCount: existingCanonical.count,
@@ -2989,8 +3002,13 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func loadNewestLocalPageWhenAvailable(groupId: String) async -> Bool {
+        remountCopiedOlderEdgePins.remove(groupId)
         for attempt in 0..<Self.localTranscriptBusyRetryLimit {
-            if await loadLocalPage(groupId: groupId, mode: .newestPage) { return true }
+            if await loadLocalPage(
+                groupId: groupId,
+                mode: .newestPage,
+                explicitNewestReload: true
+            ) { return true }
             guard localTranscriptLoadingGroups.contains(groupId),
                   attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
             do {
@@ -3361,6 +3379,7 @@ final class MarmotChatModel: ObservableObject {
         )
         if localTranscriptPreservesOlderEdgeGroups.contains(historicalGroupId) {
             localTranscriptPreservesOlderEdgeGroups.insert(liveGroupId)
+            remountCopiedOlderEdgePins.insert(liveGroupId)
         }
         pendingOptimistic = snRemountedOptimisticPending(
             pendingByGroup: pendingOptimistic,
@@ -5572,6 +5591,7 @@ final class MarmotChatModel: ObservableObject {
             localTranscriptHasOlderByGroup[id] = nil
             localTranscriptLoadingGroups.remove(id)
             localTranscriptPreservesOlderEdgeGroups.remove(id)
+            remountCopiedOlderEdgePins.remove(id)
             unreadByGroup[id] = nil
         }
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
@@ -5733,6 +5753,7 @@ final class MarmotChatModel: ObservableObject {
         localTranscriptHasOlderByGroup = [:]
         localTranscriptLoadingGroups = []
         localTranscriptPreservesOlderEdgeGroups = []
+        remountCopiedOlderEdgePins = []
         descriptorBolt12Offer = nil
         profilesByNpub = [:]
         profileFetches = []

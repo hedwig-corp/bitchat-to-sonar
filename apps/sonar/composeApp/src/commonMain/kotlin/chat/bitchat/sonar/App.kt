@@ -1324,11 +1324,24 @@ internal fun TranscriptTailPinning(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+private data class ChatTranscriptViewport(
+    val sessionKey: String,
+    val feed: List<Any>,
+    val listItems: List<ChatFeedListItem>,
+    val listState: LazyListState,
+    val phase2Host: Boolean,
+    val isPrependingOrUnreadPending: () -> Boolean,
+    val unreadAnchorPending: () -> Boolean,
+)
+
+/** Remount/unread/list locals live here so ChatScreen stays under ART's
+ *  256-register verify limit. iOS keeps the same session + unread-at-open
+ *  helpers on the store. */
 @Composable
-private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
-    val s = sonar
-    val scope = rememberCoroutineScope()
+private fun rememberChatTranscriptViewport(
+    state: SonarAppState,
+    screen: Screen.Chat,
+): ChatTranscriptViewport {
     val transcriptSessionHolder = remember { mutableStateOf(screen.id) }
     val transcriptSessionKey = state.remountTranscriptSessionKey(
         transcriptSessionHolder.value,
@@ -1336,53 +1349,6 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     )
     if (transcriptSessionHolder.value != transcriptSessionKey) {
         transcriptSessionHolder.value = transcriptSessionKey
-    }
-    val draft = state.composerDraft(screen.id)
-    var emojiTray by remember { mutableStateOf(false) }
-    var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
-    var paySheet by remember { mutableStateOf(false) }
-    var verifySheet by remember { mutableStateOf(false) }
-    var addSheet by remember { mutableStateOf(false) }
-    var addPeopleSheet by remember { mutableStateOf(false) }
-    var removePeopleSheet by remember { mutableStateOf(false) }
-    var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
-    // Album opened fullscreen: the message's media + the tapped start index.
-    var mediaGallery by remember { mutableStateOf<Pair<List<SonarMedia>, Int>?>(null) }
-    var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
-    val mediaActions = rememberMediaActions()
-    val pickPhoto = rememberPhotoPicker { items, rejectedTooLarge ->
-        if (rejectedTooLarge > 0) {
-            state.toast = if (rejectedTooLarge == 1) {
-                "Video is too large to send (max 25 MB)."
-            } else {
-                "$rejectedTooLarge videos are too large to send (max 25 MB)."
-            }
-        }
-        if (items.isNotEmpty()) state.stageMediaPreviews(screen.id, items)
-    }
-    // Voice-note recorder (hold the mic to record; drag left to cancel).
-    val recorder = remember { VoiceRecorder() }
-    var recording by remember { mutableStateOf(false) }
-    var recElapsed by remember { mutableStateOf(0) }
-    var recLevel by remember { mutableStateOf(0f) }
-    var recDragX by remember { mutableStateOf(0f) }
-    val recScope = rememberCoroutineScope()
-    LaunchedEffect(recording) {
-        while (recording) {
-            recElapsed = recorder.elapsed(); recLevel = recorder.level()
-            kotlinx.coroutines.delay(80)
-        }
-    }
-    // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
-    fun openPaySheetOrRetry() {
-        scope.launch {
-            val message = state.paymentDetailsUnavailableMessage(screen.id)
-            if (message != null) state.toast = message else paySheet = true
-        }
-    }
-    LaunchedEffect(screen.id) {
-        state.refreshDescriptorForChat(screen.id)
-        if (screen.pay) openPaySheetOrRetry()
     }
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically. Memoized on its inputs: the
@@ -1773,6 +1739,75 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             key = transcriptSessionKey,
             isPrepending = { isPrepending || unreadAnchorPending() },
         )
+    }
+    return ChatTranscriptViewport(
+        sessionKey = transcriptSessionKey,
+        feed = feed,
+        listItems = listItems,
+        listState = listState,
+        phase2Host = phase2Host,
+        isPrependingOrUnreadPending = { isPrepending || unreadAnchorPending() },
+        unreadAnchorPending = { unreadAnchorPending() },
+    )
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
+    val s = sonar
+    val scope = rememberCoroutineScope()
+    val viewport = rememberChatTranscriptViewport(state, screen)
+    val transcriptSessionKey = viewport.sessionKey
+    val feed = viewport.feed
+    val listItems = viewport.listItems
+    val listState = viewport.listState
+    val phase2Host = viewport.phase2Host
+    val draft = state.composerDraft(screen.id)
+    var emojiTray by remember { mutableStateOf(false) }
+    var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
+    var paySheet by remember { mutableStateOf(false) }
+    var verifySheet by remember { mutableStateOf(false) }
+    var addSheet by remember { mutableStateOf(false) }
+    var addPeopleSheet by remember { mutableStateOf(false) }
+    var removePeopleSheet by remember { mutableStateOf(false) }
+    var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
+    // Album opened fullscreen: the message's media + the tapped start index.
+    var mediaGallery by remember { mutableStateOf<Pair<List<SonarMedia>, Int>?>(null) }
+    var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
+    val mediaActions = rememberMediaActions()
+    val pickPhoto = rememberPhotoPicker { items, rejectedTooLarge ->
+        if (rejectedTooLarge > 0) {
+            state.toast = if (rejectedTooLarge == 1) {
+                "Video is too large to send (max 25 MB)."
+            } else {
+                "$rejectedTooLarge videos are too large to send (max 25 MB)."
+            }
+        }
+        if (items.isNotEmpty()) state.stageMediaPreviews(screen.id, items)
+    }
+    // Voice-note recorder (hold the mic to record; drag left to cancel).
+    val recorder = remember { VoiceRecorder() }
+    var recording by remember { mutableStateOf(false) }
+    var recElapsed by remember { mutableStateOf(0) }
+    var recLevel by remember { mutableStateOf(0f) }
+    var recDragX by remember { mutableStateOf(0f) }
+    val recScope = rememberCoroutineScope()
+    LaunchedEffect(recording) {
+        while (recording) {
+            recElapsed = recorder.elapsed(); recLevel = recorder.level()
+            kotlinx.coroutines.delay(80)
+        }
+    }
+    // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
+    fun openPaySheetOrRetry() {
+        scope.launch {
+            val message = state.paymentDetailsUnavailableMessage(screen.id)
+            if (message != null) state.toast = message else paySheet = true
+        }
+    }
+    LaunchedEffect(screen.id) {
+        state.refreshDescriptorForChat(screen.id)
+        if (screen.pay) openPaySheetOrRetry()
     }
     val currentChat = state.listedChat(screen.id)
     val isGroup = state.isMultiMemberChat(screen.id)
@@ -2256,8 +2291,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             TranscriptPhase2HostScaffold(
                 listState = listState,
                 listKey = transcriptSessionKey,
-                isPrepending = { isPrepending || unreadAnchorPending() },
-                suppressPin = { unreadAnchorPending() },
+                isPrepending = viewport.isPrependingOrUnreadPending,
+                suppressPin = viewport.unreadAnchorPending,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 listContent = { bottomInset ->
                     ChatFeedList(Modifier.fillMaxSize(), bottomInset)
