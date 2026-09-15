@@ -782,12 +782,45 @@ func snWakeMuteHistoricalFolds(
 }
 
 /// Copy a mute stored on a hidden 0.8 id onto its live sibling so the
-/// next blob-only wake gate matches without another FFI lookup.
+/// next blob-only wake gate matches without another FFI lookup. Empty
+/// persist-folds still use the remount pair so a hist mute lands on
+/// live before wake-mute writes the blob. Compose
+/// `promotedFoldedMutesFromFolds`.
+func snPromotedFoldedMutesFromFolds(
+    mutes: [String: TimeInterval],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String: TimeInterval] {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if mutes.isEmpty || folds.isEmpty { return mutes }
+    var next = mutes
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        guard let until = mutes[historical] else { continue }
+        let existing = next[live]
+        next[live] = max(existing ?? until, until)
+    }
+    return next
+}
+
+/// Persist-rewrite a mute stored on a hidden 0.8 id onto its live sibling.
 @discardableResult
 func snPromoteMutedFoldSiblings(
     folds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> Bool {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: folds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     var changed = false
     for (historical, live) in folds {
         guard !live.isEmpty, live != historical else { continue }
@@ -11392,7 +11425,7 @@ final class SonarAppStore: ObservableObject {
             // Heal an App Group mirror that missed a mid-session delete.
             shared.set(map, forKey: Keys.historicalFolds)
         }
-        promoteMutesFromHistoricalFolds(map)
+        promoteMutesFromHistoricalFolds(map, remount: remountOpenedAndPane())
         promotePaymentActivitiesFromHistoricalFolds(map)
     }
 
@@ -11421,8 +11454,17 @@ final class SonarAppStore: ObservableObject {
 
     /// A mute stored on the recovered 0.8 id must also cover the live 0.9
     /// sibling so killed-app NSE / push can match before the next refresh.
+    /// Empty persist-folds still walk the remount pair.
     @MainActor
-    private func promoteMutesFromHistoricalFolds(_ folds: [String: String]) {
+    private func promoteMutesFromHistoricalFolds(
+        _ folds: [String: String],
+        remount: (opened: String?, pane: String?) = (nil, nil)
+    ) {
+        let folds = snRemountPairHistoricalFolds(
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
         guard !folds.isEmpty else { return }
         var changed = false
         for (historical, live) in folds {
@@ -11645,6 +11687,12 @@ final class SonarAppStore: ObservableObject {
         )
         openedConversationId = realId
         marmot.rememberRemountPair(
+            openedConversationId: realId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+        let persistedFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        _ = snPromoteMutedFoldSiblings(
+            folds: persistedFolds,
             openedConversationId: realId,
             openedConversationPaneId: openedConversationPaneId
         )

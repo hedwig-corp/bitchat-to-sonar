@@ -994,6 +994,34 @@ struct SonarConversationFoldTests {
                 "group-other", "marmot:group-other",
             ]
         )
+        #expect(
+            snPromotedFoldedMutesFromFolds(
+                mutes: ["group-08": 50],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-08": 50, "group-09": 50]
+        )
+        #expect(
+            snPromotedFoldedMutesFromFolds(
+                mutes: ["group-08": 50],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08": 50, "group-09": 50]
+        )
+        #expect(
+            snPromotedFoldedMutesFromFolds(
+                mutes: ["group-08": 50],
+                historicalFolds: [:]
+            ) == ["group-08": 50]
+        )
+        #expect(
+            snPromotedFoldedMutesFromFolds(
+                mutes: ["group-08": 50, "group-09": 80],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-08": 50, "group-09": 80]
+        )
         #expect(snLeaveFamilyCorePurgeIds(leaveId: "group-09", historicalFolds: wakeFolds) == ["group-08"])
         #expect(snLeaveFamilyCorePurgeIds(leaveId: "group-09", historicalFolds: [:]).isEmpty)
         #expect(

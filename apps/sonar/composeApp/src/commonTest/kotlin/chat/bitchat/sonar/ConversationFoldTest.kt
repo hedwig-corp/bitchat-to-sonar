@@ -877,6 +877,31 @@ class ConversationFoldTest {
             ),
         )
         assertEquals(
+            mapOf("group-08" to 50L, "group-09" to 50L),
+            promotedFoldedMutesFromFolds(
+                mutes = mapOf("group-08" to 50L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 50L),
+            promotedFoldedMutesFromFolds(
+                mutes = mapOf("group-08" to 50L),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 50L, "group-09" to 80L),
+            promotedFoldedMutesFromFolds(
+                mutes = mapOf("group-08" to 50L, "group-09" to 80L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
             setOf("group-08", "group-09"),
             muteConversationIds(
                 "group-08",

@@ -1669,14 +1669,24 @@ internal fun retainedScanChatIds(
 }
 
 /** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
-/** Copy a mute from every hidden 0.8 row onto its live sibling. */
+/** Copy a mute from every hidden 0.8 row onto its live sibling. Empty
+ *  persist-folds still use the remount pair so a hist mute lands on
+ *  live before wake-mute writes the blob. iOS
+ *  `snPromotedFoldedMutesFromFolds`. */
 internal fun promotedFoldedMutesFromFolds(
     mutes: Map<String, Long>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, Long> {
-    if (mutes.isEmpty() || historicalFolds.isEmpty()) return mutes
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (mutes.isEmpty() || folds.isEmpty()) return mutes
     var next = mutes
-    for ((historical, live) in historicalFolds) {
+    for ((historical, live) in folds) {
         if (live.isBlank() || live == historical) continue
         val until = mutes[historical] ?: continue
         val existing = next[live]
@@ -6635,7 +6645,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             HISTORICAL_FOLDS_BLOB_KEY,
             encodeGroupFoldMap(historicalFoldMap),
         )
-        val next = promotedFoldedMutesFromFolds(mutedUntilByChat, historicalFoldMap)
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val next = promotedFoldedMutesFromFolds(
+            mutedUntilByChat,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         if (next != mutedUntilByChat) {
             mutedUntilByChat = next
             persistMutes()
@@ -17197,6 +17213,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (activeTranscriptChatId == open.id || open.id in transcriptSessionAliases) {
             transcriptSessionAliases = transcriptSessionAliases + open.id + live
             activeTranscriptChatId = live
+        }
+        val remountedMutes = promotedFoldedMutesFromFolds(
+            mutedUntilByChat,
+            historicalFoldMap,
+            openedConversationId = live,
+            openedConversationPaneId = open.id,
+        )
+        if (remountedMutes != mutedUntilByChat) {
+            mutedUntilByChat = remountedMutes
+            persistMutes()
         }
         // Hist-only: live must still newest-page hidden siblings.
         // iOS also suppresses live because `onAppear` re-runs `openedDM`.
