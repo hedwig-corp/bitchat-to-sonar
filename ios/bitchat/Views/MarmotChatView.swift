@@ -2321,12 +2321,15 @@ final class MarmotChatModel: ObservableObject {
         snFoldFamilyIds(id: groupIdHex, historicalFolds: folds).forEach {
             pushWakeNotifiedGroupIds.insert($0)
         }
+        let remount = remountOpenedAndPane()
         if let match = Self.pushWakeLatestIncoming(
             in: snFoldFamilyCachedMessages(
                 groupId: groupIdHex,
                 messagesByGroup: messagesByGroup,
                 historicalFolds: folds,
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             ),
             matchingPreview: content
         ) {
@@ -2337,12 +2340,15 @@ final class MarmotChatModel: ObservableObject {
     /// True when push wake already bannered the current unread tip for this group.
     func pushWakeAlreadyNotifiedLatest(groupIdHex: String, content: String) -> Bool {
         let folds = historicalFoldsMap()
+        let remount = remountOpenedAndPane()
         guard let match = Self.pushWakeLatestIncoming(
             in: snFoldFamilyCachedMessages(
                 groupId: groupIdHex,
                 messagesByGroup: messagesByGroup,
                 historicalFolds: folds,
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             ),
             matchingPreview: content
         ) else { return false }
@@ -2697,11 +2703,14 @@ final class MarmotChatModel: ObservableObject {
             )
             let page = Array(rawPage.prefix(Self.localTranscriptPageLimit))
             let folds = historicalFoldsMap()
+            let remount = remountOpenedAndPane()
             let existing = snFoldFamilyCachedMessages(
                 groupId: groupId,
                 messagesByGroup: messagesByGroup,
                 historicalFolds: folds,
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
             let familyIds = snFoldFamilyIds(
                 id: groupId,
@@ -3243,12 +3252,15 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func homeRowMessage(groupId: String) -> MarmotService.MarmotMessage? {
-        snMarmotHomeRowMessage(
+        let remount = remountOpenedAndPane()
+        return snMarmotHomeRowMessage(
             loaded: snFoldFamilyCachedMessages(
                 groupId: groupId,
                 messagesByGroup: messagesByGroup,
                 historicalFolds: historicalFoldsMap(),
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             ).last,
             summary: conversationSummariesByGroup[groupId]
         )

@@ -2102,6 +2102,26 @@ class ConversationFoldTest {
             listOf(live),
             foldFamilyCachedMessages("group-09", byChat, emptyMap()) { it.id },
         )
+        assertEquals(
+            listOf("m-09", "m-08"),
+            foldFamilyCachedMessages(
+                "group-09",
+                byChat,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ) { it.id }.map { it.id },
+        )
+        assertEquals(
+            emptyList(),
+            foldFamilyCachedMessages(
+                "group-other",
+                byChat,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ) { it.id },
+        )
     }
 
     @Test

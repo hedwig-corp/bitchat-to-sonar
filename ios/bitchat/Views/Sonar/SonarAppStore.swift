@@ -3022,14 +3022,18 @@ func snFoldFamilyCanonicalMessageIDs<Message>(
     groupId: String,
     messagesByGroup: [String: [Message]],
     historicalFolds: [String: String],
-    idOf: (Message) -> String
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Set<String> {
     Set(
         snFoldFamilyCachedMessages(
             groupId: groupId,
             messagesByGroup: messagesByGroup,
             historicalFolds: historicalFolds,
-            idOf: idOf
+            idOf: idOf,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
         ).map(idOf)
     )
 }
@@ -3167,7 +3171,9 @@ func snDMHasLocalMarmotPaint<Message>(
     listedGroupIds: [String],
     messagesByGroup: [String: [Message]],
     historicalFolds: [String: String],
-    idOf: (Message) -> String
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     let ids = listedGroupIds.isEmpty ? [groupId] : listedGroupIds
     if ids.contains(where: { !(messagesByGroup[$0] ?? []).isEmpty }) { return true }
@@ -3175,7 +3181,9 @@ func snDMHasLocalMarmotPaint<Message>(
         groupId: groupId,
         messagesByGroup: messagesByGroup,
         historicalFolds: historicalFolds,
-        idOf: idOf
+        idOf: idOf,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ).isEmpty
 }
 
@@ -10005,6 +10013,7 @@ final class SonarAppStore: ObservableObject {
             _ = await adoptMergedActionFolds(for: [id, seed])
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         let family = Set(snFoldFamilyIds(id: snBareMarmotGroupId(seed), historicalFolds: folds))
         let wanted = groupIDs.union(family)
         for group in localTranscriptGroups(for: id) where wanted.contains(group.id) {
@@ -10012,7 +10021,9 @@ final class SonarAppStore: ObservableObject {
                 groupId: group.id,
                 messagesByGroup: marmot.messagesByGroup,
                 historicalFolds: folds,
-                idOf: { $0.id }
+                idOf: { $0.id },
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
             if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
                 marmotStagedPageRescanIds.insert(group.id)
@@ -10022,7 +10033,9 @@ final class SonarAppStore: ObservableObject {
                         groupId: group.id,
                         messagesByGroup: marmot.messagesByGroup,
                         historicalFolds: folds,
-                        idOf: { $0.id }
+                        idOf: { $0.id },
+                        openedConversationId: remount.opened,
+                        openedConversationPaneId: remount.pane
                     )
                 )
             }
@@ -13596,7 +13609,9 @@ final class SonarAppStore: ObservableObject {
             listedGroupIds: groups.map(\.id),
             messagesByGroup: marmot.messagesByGroup,
             historicalFolds: folds,
-            idOf: { $0.id }
+            idOf: { $0.id },
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
     }
 

@@ -1768,11 +1768,19 @@ internal fun <V> foldFamilyCachedMessages(
     groupId: String,
     messagesByChat: Map<String, List<V>>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
     idOf: (V) -> String,
 ): List<V> {
     var out = messagesByChat[groupId].orEmpty()
-    for (alias in foldFamilyIds(groupId, historicalFolds).sorted()) {
-        if (alias == groupId) continue
+    for (alias in transcriptSourceIds(
+        groupId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(alias, groupId)) continue
         val incoming = messagesByChat[alias].orEmpty()
         if (incoming.isEmpty()) continue
         out = mergedFoldedMessageLists(incoming, out, idOf)
@@ -1786,11 +1794,15 @@ internal fun <V> foldFamilyCanonicalMessageIds(
     groupId: String,
     messagesByChat: Map<String, List<V>>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
     idOf: (V) -> String,
 ): Set<String> = foldFamilyCachedMessages(
     groupId,
     messagesByChat,
     historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
     idOf,
 ).mapTo(linkedSetOf()) { idOf(it) }
 
@@ -6139,9 +6151,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         else source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
 
     /** Host snapshot rows for the open id plus its hidden 0.8 sibling. */
-    private fun snapshotMessagesForChat(chatId: String): List<SonarMsg> =
-        foldFamilyCachedMessages(chatId, chatSnapshotMessagesByChat, historicalFoldMap) { it.id }
-            .sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+    private fun snapshotMessagesForChat(chatId: String): List<SonarMsg> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return foldFamilyCachedMessages(
+            chatId,
+            chatSnapshotMessagesByChat,
+            historicalFoldMap,
+            opened,
+            pane,
+        ) { it.id }.sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+    }
 
     /** Keep the full family-unioned host cache in the source window so first
      *  paint takeLast(page) cannot hide recovered 0.8 rows or disable load-older. */
