@@ -3430,6 +3430,30 @@ internal fun remountPairHistoricalFolds(
     return mapOf(hist to live)
 }
 
+/** Rewrite a staged preview onto the live sibling. Empty persist-folds
+ *  still use the remount pair so confirmSendPreview does not send
+ *  against a hist id FFI no longer lists.
+ *  iOS `snPromotedFoldedPendingMediaPreviewPeerId`. */
+internal fun promotedFoldedPendingMediaPreviewChatId(
+    previewChatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    prefix: String = "marmot:",
+): String {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return previewChatId
+    val bare = previewChatId.removePrefix(prefix)
+    val live = folds[bare] ?: folds[previewChatId] ?: return previewChatId
+    if (live.isBlank() || live == bare || live == previewChatId) return previewChatId
+    val liveBare = live.removePrefix(prefix)
+    return if (previewChatId.startsWith(prefix)) prefix + liveBare else liveBare
+}
+
 /** Key new call-log rows on the remounted live sibling. Remount already
  *  moved hist rows onto live; a call placed from a still-hist id must
  *  not write a second hist bucket that home-row counts miss while
@@ -17390,6 +17414,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             persistMutes()
         }
         promoteFoldedPaymentActivitiesFromFolds()
+        promoteFoldedPendingMediaPreviews()
         // Hist-only: live must still newest-page hidden siblings.
         // iOS also suppresses live because `onAppear` re-runs `openedDM`.
         suppressOpenedHydrateIds = suppressOpenedHydrateIds + remountOpeningHydrateKeys(
@@ -17495,13 +17520,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Preview sheet can stay up across a fold that remounts the open chat,
-     *  or after a notification tap already swapped the id to live. */
+     *  or after a notification tap already swapped the id to live. Empty
+     *  persist-folds still walk the remount pair. */
     private fun promoteFoldedPendingMediaPreviews() {
         if (pendingMediaPreviews.isEmpty()) return
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
         val next = pendingMediaPreviews.map { preview ->
-            val live = historicalFoldMap[preview.chatId] ?: return@map preview
-            if (live.isBlank() || live == preview.chatId) preview
-            else preview.copy(chatId = live)
+            preview.copy(
+                chatId = promotedFoldedPendingMediaPreviewChatId(
+                    preview.chatId,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
+            )
         }
         if (next != pendingMediaPreviews) pendingMediaPreviews = next
     }

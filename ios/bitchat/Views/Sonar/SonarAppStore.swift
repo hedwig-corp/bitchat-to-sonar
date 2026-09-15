@@ -3482,6 +3482,30 @@ func snRemountPairHistoricalFolds(
     return [hist: live]
 }
 
+/// Rewrite a staged preview onto the live sibling. Empty persist-folds
+/// still use the remount pair so confirmSendPreview does not send
+/// against a hist id FFI no longer lists.
+/// Compose `promotedFoldedPendingMediaPreviewChatId`.
+func snPromotedFoldedPendingMediaPreviewPeerId(
+    peerId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let bare = snBareMarmotGroupId(peerId, prefix: prefix)
+    guard let live = folds[bare] ?? folds[peerId],
+          !live.isEmpty, live != bare, live != peerId
+    else { return peerId }
+    let liveBare = snBareMarmotGroupId(live, prefix: prefix)
+    return peerId.hasPrefix(prefix) ? prefix + liveBare : liveBare
+}
+
 /// Key new call-log rows on the remounted live sibling. Remount already
 /// moved hist rows onto live; a call placed from the painted hist pane
 /// must not write a second hist bucket that home-row counts miss while
@@ -11796,6 +11820,7 @@ final class SonarAppStore: ObservableObject {
             persistedFolds,
             remount: (realId, openedConversationPaneId)
         )
+        promoteFoldedPendingMediaPreviews()
         // Keep `openedConversationPaneId` on hist. iPhone NavigationStack
         // stays on `.dm(hist)` so the painted pane is not remade. Mac hops
         // selection to live while `.id` stays hist. Same publish as
@@ -12443,20 +12468,21 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Preview sheet can stay up across a fold that remounts the open chat,
-    /// or after a notification tap already swapped the id to live.
+    /// or after a notification tap already swapped the id to live. Empty
+    /// persist-folds still walk the remount pair.
     @MainActor
     private func promoteFoldedPendingMediaPreviews() {
         guard !pendingMediaPreviews.isEmpty else { return }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        guard !folds.isEmpty else { return }
+        let remount = remountOpenedAndPane()
         let next = pendingMediaPreviews.map { preview -> PendingMediaPreview in
-            let bare = snBareMarmotGroupId(preview.peerId)
-            guard let live = folds[bare] ?? folds[preview.peerId],
-                  !live.isEmpty, live != bare, live != preview.peerId
-            else { return preview }
-            let liveId = preview.peerId.hasPrefix(Self.marmotIDPrefix)
-                ? Self.marmotIDPrefix + live
-                : live
+            let liveId = snPromotedFoldedPendingMediaPreviewPeerId(
+                peerId: preview.peerId,
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
+            guard liveId != preview.peerId else { return preview }
             return PendingMediaPreview(
                 peerId: liveId,
                 tempURL: preview.tempURL,

@@ -2488,6 +2488,34 @@ struct SonarConversationFoldTests {
             openedConversationPaneId: nil,
             historicalFolds: [:]
         ))
+        #expect(
+            snPromotedFoldedPendingMediaPreviewPeerId(
+                peerId: "marmot:group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snPromotedFoldedPendingMediaPreviewPeerId(
+                peerId: "marmot:group-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snPromotedFoldedPendingMediaPreviewPeerId(
+                peerId: "marmot:group-08",
+                historicalFolds: [:]
+            ) == "marmot:group-08"
+        )
+        #expect(
+            snPromotedFoldedPendingMediaPreviewPeerId(
+                peerId: "marmot:group-09",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "marmot:group-09"
+        )
         #expect(snClosedDMShouldClearOpened(
             closingId: "marmot:group-08",
             openedConversationId: "marmot:group-09",

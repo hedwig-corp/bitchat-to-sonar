@@ -1668,6 +1668,38 @@ class ConversationFoldTest {
                 historicalFolds = emptyMap(),
             ),
         )
+        assertEquals(
+            "marmot:group-09",
+            promotedFoldedPendingMediaPreviewChatId(
+                previewChatId = "marmot:group-08",
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "marmot:group-09",
+            promotedFoldedPendingMediaPreviewChatId(
+                previewChatId = "marmot:group-08",
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            "marmot:group-08",
+            promotedFoldedPendingMediaPreviewChatId(
+                previewChatId = "marmot:group-08",
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            "marmot:group-09",
+            promotedFoldedPendingMediaPreviewChatId(
+                previewChatId = "marmot:group-09",
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
     }
 
     @Test
