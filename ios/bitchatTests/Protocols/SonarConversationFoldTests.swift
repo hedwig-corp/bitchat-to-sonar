@@ -2829,6 +2829,28 @@ struct SonarConversationFoldTests {
             )["group-09"] == 1_700_000_200
         )
         #expect(
+            snSnapshotLatestAfterHistoricalFolds(
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: [:]
+            ) == ["group-08": 1_700_000_000]
+        )
+        #expect(
+            snSnapshotLatestAfterHistoricalFolds(
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-08": 1_700_000_000, "group-09": 1_700_000_000]
+        )
+        #expect(
+            snSnapshotLatestAfterHistoricalFolds(
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: [:],
+                openedConversationId: "group-other",
+                openedConversationPaneId: "group-else"
+            ) == ["group-08": 1_700_000_000]
+        )
+        #expect(
             snLocalLatestTsForChat(
                 chatId: "group-09",
                 messagesByChat: [:],

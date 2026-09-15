@@ -3425,6 +3425,31 @@ class ConversationFoldTest {
             ),
         )
         assertEquals(
+            mapOf("group-08" to 1_700_000_000L),
+            snapshotLatestAfterHistoricalFolds(
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 1_700_000_000L, "group-09" to 1_700_000_000L),
+            snapshotLatestAfterHistoricalFolds(
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to 1_700_000_000L),
+            snapshotLatestAfterHistoricalFolds(
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-other",
+                openedConversationPaneId = "group-else",
+            ),
+        )
+        assertEquals(
             "group-09",
             persistedLiveFoldTarget("group-08", folds),
         )

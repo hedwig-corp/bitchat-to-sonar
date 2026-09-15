@@ -2025,10 +2025,18 @@ internal fun persistedLiveFoldTarget(
 internal fun snapshotLatestAfterHistoricalFolds(
     latestByChat: Map<String, Long>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, Long> {
-    if (historicalFolds.isEmpty() || latestByChat.isEmpty()) return latestByChat
+    if (latestByChat.isEmpty()) return latestByChat
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return latestByChat
     var next = latestByChat
-    for ((historical, live) in historicalFolds) {
+    for ((historical, live) in folds) {
         if (live.isBlank() || live == historical) continue
         val incoming = latestByChat[historical] ?: continue
         if (incoming <= 0L) continue
@@ -16650,12 +16658,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistChatSnapshot(includeIsDirect: Boolean = true) {
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
         SonarCore.saveBlob(
             CHAT_SNAPSHOT_BLOB_KEY,
             encodeChatSnapshot(
                 chats,
                 chatSnapshotMessagesByChat,
-                snapshotLatestAfterHistoricalFolds(chatSnapshotLatestByChat, historicalFoldMap),
+                snapshotLatestAfterHistoricalFolds(
+                    chatSnapshotLatestByChat,
+                    historicalFoldMap,
+                    opened,
+                    pane,
+                ),
                 includeIsDirect = includeIsDirect,
             ),
         )
@@ -16751,6 +16766,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             messagesByChat = chatSnapshotMessagesByChat,
             liveFoldTarget = liveFoldTarget,
         )
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
         val existingLatest = snapshotLatestAfterHistoricalFolds(
             promotedFoldedValues(
                 previousIds = previousOrder.toSet(),
@@ -16759,6 +16776,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 liveFoldTarget = liveFoldTarget,
             ),
             historicalFoldMap,
+            opened,
+            pane,
         )
         val summaries = if (localChats.isEmpty()) {
             emptyList()

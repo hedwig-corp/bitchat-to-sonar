@@ -1683,11 +1683,19 @@ func snResolvedLiveFoldTarget(
 /// `snapshotLatestAfterHistoricalFolds`).
 func snSnapshotLatestAfterHistoricalFolds(
     latestByChat: [String: Int64],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String: Int64] {
-    if historicalFolds.isEmpty || latestByChat.isEmpty { return latestByChat }
+    if latestByChat.isEmpty { return latestByChat }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if folds.isEmpty { return latestByChat }
     var next = latestByChat
-    for (historical, live) in historicalFolds {
+    for (historical, live) in folds {
         guard !live.isEmpty, live != historical else { continue }
         guard let incoming = latestByChat[historical], incoming > 0 else { continue }
         if incoming > (next[live] ?? 0) {
