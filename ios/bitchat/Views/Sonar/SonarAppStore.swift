@@ -11886,6 +11886,11 @@ final class SonarAppStore: ObservableObject {
             openedConversationId: realId,
             openedConversationPaneId: openedConversationPaneId
         )
+        // openedDM cleared hist-only before this remount pair existed.
+        // Live shade from a background tap then stays up while the
+        // user is already in the recovered room. Compose remount hop
+        // and willPresent walk the same remount family.
+        clearNotificationsForConversation(realId)
         let persistedFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         _ = snPromoteMutedFoldSiblings(
             folds: persistedFolds,

@@ -1318,6 +1318,25 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"]
             ).isSuperset(of: ["mesh:peer", "group-09", "group-08", "marmot:group-08"])
         )
+        // Persist-other must not hide this remount. Remount hop /
+        // willPresent consume the incoming live id; hist shade stays
+        // unless the remount pair is walked.
+        #expect(
+            snNotificationClearIds(
+                conversationId: "group-09",
+                relatedIds: [],
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ).isSuperset(of: ["group-09", "group-08"])
+        )
+        #expect(
+            !snNotificationClearIds(
+                conversationId: "group-09",
+                relatedIds: [],
+                historicalFolds: ["other-08": "other-09"]
+            ).contains("group-08")
+        )
         #expect(
             snTranscriptSourceIds(
                 groupId: "group-09",

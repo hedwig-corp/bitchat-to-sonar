@@ -4485,6 +4485,26 @@ class ConversationFoldTest {
             setOf("group-09"),
             notificationClearIds("group-09", emptyList(), emptyMap()),
         )
+        // Persist-other must not hide this remount. Remount hop /
+        // willPresent consume the incoming live id; hist shade stays
+        // unless the remount pair is walked.
+        val persistOther = mapOf("other-08" to "other-09")
+        assertTrue(
+            "group-08" in notificationClearIds(
+                "group-09",
+                emptyList(),
+                persistOther,
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertFalse(
+            "group-08" in notificationClearIds(
+                "group-09",
+                emptyList(),
+                persistOther,
+            ),
+        )
         val mesh = meshNotificationSuppressIds("group-09", "mesh:peer", folds)
         assertTrue("group-08" in mesh)
         assertTrue("group-09" in mesh)

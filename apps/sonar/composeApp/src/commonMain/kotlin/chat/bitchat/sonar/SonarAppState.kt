@@ -17491,6 +17491,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 s
             }
         }
+        // openedDM / openChat cleared hist-only before this remount
+        // pair existed. Live shade from a background tap then stays
+        // up while the user is already in the recovered room.
+        // iOS remount hop + willPresent use the same remount family.
+        clearNotificationsForChat(live)
         // iOS remount calls refreshWhenConnected on the live sibling.
         // Opening the recovered 0.8 id catch-up'd a group FFI no longer lists.
         if (live.isNotBlank()) {
