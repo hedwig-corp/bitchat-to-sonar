@@ -2513,6 +2513,23 @@ class ConversationFoldTest {
                 mapOf("group-08" to "group-09"),
             ),
         )
+        assertNull(
+            foldFamilyPagingCursor(
+                "group-09",
+                mapOf("group-08" to "cursor-08"),
+                emptyMap(),
+            ),
+        )
+        assertEquals(
+            "cursor-08",
+            foldFamilyPagingCursor(
+                "group-09",
+                mapOf("group-08" to "cursor-08"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test
@@ -3428,6 +3445,28 @@ class ConversationFoldTest {
                 messagesByChat = emptyMap(),
                 latestByChat = mapOf("group-08" to 1_700_000_000L),
                 historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            1_700_000_000L,
+            localLatestTsForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            0L,
+            localLatestTsForChat(
+                chatId = "group-other",
+                messagesByChat = emptyMap(),
+                latestByChat = mapOf("group-08" to 1_700_000_000L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ),
         )
         val newestFirstExtract = (80 downTo 1).map { n ->
@@ -4423,6 +4462,46 @@ class ConversationFoldTest {
         assertEquals(50L, keptLatest["group-09"])
         assertEquals(80L, keptCounts["group-08"])
         assertEquals(80L, keptCounts["group-09"])
+        val remountKept = conversationMessageCountsFromSummaries(
+            summaries = listOf(liveHidden),
+            previous = mapOf("group-08" to 80L),
+            historicalFolds = emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals(80L, remountKept["group-08"])
+        assertEquals(80L, remountKept["group-09"])
+        assertEquals(
+            mapOf("group-09" to 0L),
+            conversationMessageCountsFromSummaries(
+                summaries = listOf(liveHidden),
+                previous = mapOf("group-08" to 80L),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            emptyMap(),
+            conversationMessageCountsFromSummaries(
+                summaries = emptyList(),
+                previous = mapOf("group-08" to 80L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "empty success still clears",
+        )
+        assertEquals(
+            mapOf("group-08" to "group-09"),
+            remountPairHistoricalFolds(
+                emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            emptyMap(),
+            remountPairHistoricalFolds(emptyMap()),
+        )
         assertEquals(
             emptyMap(),
             conversationLatestAtFromSummaries(

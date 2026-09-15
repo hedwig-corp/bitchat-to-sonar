@@ -2843,11 +2843,14 @@ final class MarmotChatModel: ObservableObject {
             // that the transcript-page snapshot above did not have.
             let latestFolds = historicalFoldsMap()
             if SNUnreadCounts.shouldPublish(summaries), let summaries {
+                let remount = self.remountOpenedAndPane()
                 self.conversationSummariesByGroup = snRemountedConversationSummaries(
                     summaries: summaries,
                     activeGroupIds: activeGroupIds,
                     historicalFolds: latestFolds,
-                    previous: self.conversationSummariesByGroup
+                    previous: self.conversationSummariesByGroup,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
                 self.publishUnread(from: summaries)
             }
@@ -3132,11 +3135,14 @@ final class MarmotChatModel: ObservableObject {
             let activeGroupIds = Set(listed.map(\.id))
             let folds = historicalFoldsMap()
             if SNUnreadCounts.shouldPublish(summaries), let summaries {
+                let remount = self.remountOpenedAndPane()
                 self.conversationSummariesByGroup = snRemountedConversationSummaries(
                     summaries: summaries,
                     activeGroupIds: activeGroupIds,
                     historicalFolds: folds,
-                    previous: self.conversationSummariesByGroup
+                    previous: self.conversationSummariesByGroup,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
             }
             // All service reads above suspend. Snapshot the live dictionary only

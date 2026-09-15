@@ -964,10 +964,18 @@ internal fun remountFoldedSummaryIndex(
     next: Map<String, Long>,
     previous: Map<String, Long>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, Long> {
-    if (next.isEmpty() || historicalFolds.isEmpty()) return next
+    if (next.isEmpty()) return next
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return next
     var out = next
-    for ((historical, live) in historicalFolds) {
+    for ((historical, live) in folds) {
         if (live.isBlank() || live == historical) continue
         val histValue = maxOf(out[historical] ?: 0L, previous[historical] ?: 0L)
         if (histValue <= 0L) continue
@@ -985,12 +993,16 @@ internal fun conversationMessageCountsFromSummaries(
     summaries: List<SonarConversationSummary>?,
     previous: Map<String, Long>,
     historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, Long> {
     if (summaries == null) return previous
     return remountFoldedSummaryIndex(
         summaries.associate { it.groupIdHex to it.messageCount },
         previous,
         historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
     )
 }
 
@@ -1001,12 +1013,16 @@ internal fun conversationLatestAtFromSummaries(
     summaries: List<SonarConversationSummary>?,
     previous: Map<String, Long>,
     historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, Long> {
     if (summaries == null) return previous
     return remountFoldedSummaryIndex(
         summaries.associate { it.groupIdHex to it.latestAtSecs },
         previous,
         historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
     )
 }
 
@@ -1018,12 +1034,19 @@ internal fun conversationSummariesByChat(
     summaries: List<SonarConversationSummary>?,
     previous: Map<String, SonarConversationSummary>,
     historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, SonarConversationSummary> {
     if (summaries == null) return previous
     if (summaries.isEmpty()) return emptyMap()
     var out = summaries.associateBy { it.groupIdHex }
-    if (historicalFolds.isEmpty()) return out
-    for ((historical, live) in historicalFolds) {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return out
+    for ((historical, live) in folds) {
         if (live.isBlank() || live == historical) continue
         val hist = out[historical] ?: previous[historical] ?: continue
         if (!homeRowSummaryKnownNonEmpty(hist)) continue
@@ -1085,6 +1108,8 @@ internal fun expectedNewestTsForChat(
         messagesByChat,
         latestByChat,
         historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
     )
     val index = ids.maxOfOrNull { summaryLatestByChat[it] ?: 0L } ?: 0L
     return maxOf(snapshot, persistSnapshot, index)
@@ -1169,10 +1194,18 @@ internal fun <T> foldFamilyPagingCursor(
     groupId: String,
     cursorsById: Map<String, T>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): T? {
     cursorsById[groupId]?.let { return it }
-    for (alias in foldFamilyIds(groupId, historicalFolds).sorted()) {
-        if (alias == groupId) continue
+    for (alias in transcriptSourceIds(
+        groupId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(alias, groupId)) continue
         cursorsById[alias]?.let { return it }
     }
     return null
@@ -2014,9 +2047,17 @@ internal fun localLatestTsForChat(
     messagesByChat: Map<String, List<SonarMsg>>,
     latestByChat: Map<String, Long>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Long {
     var latest = 0L
-    val ids = foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }
+    val ids = transcriptSourceIds(
+        chatId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { listOf(chatId) }
     for (id in ids) {
         val messageTs = messagesByChat[id]?.maxOfOrNull { it.tsSecs } ?: 0L
         val ts = maxOf(messageTs, latestByChat[id] ?: 0L)
@@ -2077,8 +2118,16 @@ internal fun latestHomeRowForChat(
     messagesByChat: Map<String, List<SonarMsg>>,
     summaryByChat: Map<String, SonarConversationSummary>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): SonarMsg? {
-    val ids = foldFamilyIds(chatId, historicalFolds).ifEmpty { setOf(chatId) }
+    val ids = transcriptSourceIds(
+        chatId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { listOf(chatId) }
     return ids.mapNotNull { id ->
         homeRowMessage(
             loaded = latestHomeRowMessage(messagesByChat[id].orEmpty()),
@@ -3267,6 +3316,23 @@ internal fun remountPairConversationIds(
     return ids
 }
 
+/** Persist-folds sidecar, or the open remount pair as hist→live when
+ *  wake-mute has not written yet. Empty persist-folds without a remount
+ *  pair stay empty. iOS `snRemountPairHistoricalFolds`. */
+internal fun remountPairHistoricalFolds(
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, String> {
+    if (historicalFolds.isNotEmpty()) return historicalFolds
+    val live = openedConversationId?.trim()?.removePrefix("marmot:").orEmpty()
+    val hist = openedConversationPaneId?.trim()?.removePrefix("marmot:").orEmpty()
+    if (live.isEmpty() || hist.isEmpty() || openedConversationIdMatches(live, hist)) {
+        return emptyMap()
+    }
+    return mapOf(hist to live)
+}
+
 /** Key new call-log rows on the remounted live sibling. Remount already
  *  moved hist rows onto live; a call placed from a still-hist id must
  *  not write a second hist bucket that home-row counts miss while
@@ -4243,20 +4309,28 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var conversationIndexVersion = 0
 
     private fun rememberConversationSummaryIndex(summaries: List<SonarConversationSummary>?) {
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
         val nextCounts = conversationMessageCountsFromSummaries(
             summaries,
             conversationMessageCountByChat,
             historicalFoldMap,
+            opened,
+            pane,
         )
         val nextLatest = conversationLatestAtFromSummaries(
             summaries,
             conversationLatestAtByChat,
             historicalFoldMap,
+            opened,
+            pane,
         )
         val nextSummaries = conversationSummariesByChat(
             summaries,
             conversationSummaryByChat,
             historicalFoldMap,
+            opened,
+            pane,
         )
         if (nextCounts !== conversationMessageCountByChat ||
             nextLatest !== conversationLatestAtByChat ||
@@ -4269,13 +4343,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         conversationSummaryByChat = nextSummaries
     }
 
-    private fun localLatestTs(chatId: String): Long =
-        localLatestTsForChat(
+    private fun localLatestTs(chatId: String): Long {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return localLatestTsForChat(
             chatId,
             chatSnapshotMessagesByChat,
             chatSnapshotLatestByChat,
             historicalFoldMap,
+            opened,
+            pane,
         )
+    }
     /** Pending 1:1 secure chats keyed by local id (`npub:…`). Value carries
      *  the peer npub plus [PendingMarmotDirect.createdAtSecs] so the Home list
      *  can sort by creation time (iOS `pending.createdAt` / `dmRows` parity)
@@ -15744,6 +15822,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                             window.rows.firstOrNull()?.let { id to it }
                         }.toMap(),
                         historicalFoldMap,
+                        opened,
+                        pane,
                     )
                     ?: continue
 
@@ -15822,11 +15902,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
+            val (opened, pane) = remountPairForOpenChat(group.id)
             val msg = latestHomeRowForChat(
                 chatId = group.id,
                 messagesByChat = chatSnapshotMessagesByChat,
                 summaryByChat = conversationSummaryByChat,
                 historicalFolds = historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
             val current = latest
             if (msg != null && (current == null || msg.tsSecs > current.tsSecs ||

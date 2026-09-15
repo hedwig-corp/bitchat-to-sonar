@@ -1371,11 +1371,18 @@ func snFoldFamilyHasOlder(
 func snFoldFamilyPagingCursor<Cursor>(
     groupId: String,
     cursorsByGroup: [String: Cursor],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Cursor? {
     if let cursor = cursorsByGroup[groupId] { return cursor }
-    for alias in snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds).sorted()
-    where alias != groupId {
+    for alias in snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) where !snOpenedConversationIdMatches(alias, groupId) {
         if let cursor = cursorsByGroup[alias] { return cursor }
     }
     return nil
@@ -1704,9 +1711,17 @@ func snLocalLatestTsForChat(
     chatId: String,
     messagesByChat: [String: [Int64]],
     latestByChat: [String: Int64],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Int64 {
-    let ids = snFoldFamilyIds(id: chatId, historicalFolds: historicalFolds)
+    let ids = snTranscriptSourceIds(
+        groupId: chatId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     var latest: Int64 = 0
     for id in ids {
         // Fold merge does not sort. `last` can be the oldest remounted 0.8
@@ -1749,7 +1764,9 @@ func snExpectedNewestTsForChat(
         chatId: chatId,
         messagesByChat: messagesByChat,
         latestByChat: latestByChat,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     )
     let index = ids.map { summaryLatestByChat[$0] ?? 0 }.max() ?? 0
     return max(snapshot, persistSnapshot, index)
@@ -2669,14 +2686,21 @@ func snRemountedConversationSummaries(
     summaries: [MarmotService.ConversationSummary],
     activeGroupIds: Set<String>,
     historicalFolds: [String: String],
-    previous: [String: MarmotService.ConversationSummary] = [:]
+    previous: [String: MarmotService.ConversationSummary] = [:],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String: MarmotService.ConversationSummary] {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     var out: [String: MarmotService.ConversationSummary] = [:]
     for summary in summaries {
         guard let target = snHydrationTargetGroupId(
             sourceId: summary.groupIdHex,
             activeGroupIds: activeGroupIds,
-            historicalFolds: historicalFolds
+            historicalFolds: folds
         ) else { continue }
         let remounted = summary.groupIdHex == target
             ? summary
@@ -2700,7 +2724,7 @@ func snRemountedConversationSummaries(
     // not drop the previous hist newest. Empty success still clears.
     // Compose `remountFoldedSummaryIndex`.
     guard !out.isEmpty else { return out }
-    for (historical, live) in historicalFolds {
+    for (historical, live) in folds {
         guard !live.isEmpty, live != historical else { continue }
         guard let hist = out[historical] ?? previous[historical] else { continue }
         let histSecs = hist.latestAt.timeIntervalSince1970
@@ -3339,6 +3363,23 @@ func snRemountPairConversationIds(
         add(openedConversationPaneId)
     }
     return ids
+}
+
+/// Persist-folds sidecar, or the open remount pair as hist→live when
+/// wake-mute has not written yet. Empty persist-folds without a remount
+/// pair stay empty. Compose `remountPairHistoricalFolds`.
+func snRemountPairHistoricalFolds(
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String: String] {
+    if !historicalFolds.isEmpty { return historicalFolds }
+    let live = snBareMarmotGroupId(openedConversationId ?? "")
+    let hist = snBareMarmotGroupId(openedConversationPaneId ?? "")
+    guard !live.isEmpty, !hist.isEmpty, !snOpenedConversationIdMatches(live, hist) else {
+        return [:]
+    }
+    return [hist: live]
 }
 
 /// Key new call-log rows on the remounted live sibling. Remount already

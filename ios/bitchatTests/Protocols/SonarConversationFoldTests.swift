@@ -1735,6 +1735,32 @@ struct SonarConversationFoldTests {
         #expect(keptHist["group-09"]?.latestAt == histPreview.latestAt)
         #expect(keptHist["group-09"]?.latestContent == "keep this chat")
         #expect(keptHist["group-09"]?.unreadCount == 0)
+        let remountKeptHist = snRemountedConversationSummaries(
+            summaries: [liveHidden],
+            activeGroupIds: ["group-09"],
+            historicalFolds: [:],
+            previous: ["group-08": histPreview],
+            openedConversationId: "group-09",
+            openedConversationPaneId: "group-08"
+        )
+        #expect(remountKeptHist["group-08"]?.latestAt == histPreview.latestAt)
+        #expect(remountKeptHist["group-09"]?.latestAt == histPreview.latestAt)
+        #expect(
+            snRemountedConversationSummaries(
+                summaries: [liveHidden],
+                activeGroupIds: ["group-09"],
+                historicalFolds: [:],
+                previous: ["group-08": histPreview]
+            )["group-08"] == nil
+        )
+        #expect(
+            snRemountPairHistoricalFolds(
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-08": "group-09"]
+        )
+        #expect(snRemountPairHistoricalFolds(historicalFolds: [:]).isEmpty)
         #expect(
             snRemountedConversationSummaries(
                 summaries: [],
@@ -2821,6 +2847,26 @@ struct SonarConversationFoldTests {
         #expect(
             snLocalLatestTsForChat(
                 chatId: "group-09",
+                messagesByChat: [:],
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == 1_700_000_000
+        )
+        #expect(
+            snLocalLatestTsForChat(
+                chatId: "group-other",
+                messagesByChat: [:],
+                latestByChat: ["group-08": 1_700_000_000],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == 0
+        )
+        #expect(
+            snLocalLatestTsForChat(
+                chatId: "group-09",
                 messagesByChat: ["group-09": Array((1...80).reversed().map(Int64.init))],
                 latestByChat: [:],
                 historicalFolds: ["group-08": "group-09"]
@@ -3410,6 +3456,22 @@ struct SonarConversationFoldTests {
                 cursorsByGroup: ["group-08": "cursor-08", "group-09": "cursor-09"],
                 historicalFolds: ["group-08": "group-09"]
             ) == "cursor-09"
+        )
+        #expect(
+            snFoldFamilyPagingCursor(
+                groupId: "group-09",
+                cursorsByGroup: ["group-08": "cursor-08"],
+                historicalFolds: [:]
+            ) == nil
+        )
+        #expect(
+            snFoldFamilyPagingCursor(
+                groupId: "group-09",
+                cursorsByGroup: ["group-08": "cursor-08"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "cursor-08"
         )
         #expect(
             snPromotedFoldedPagingFlags(
