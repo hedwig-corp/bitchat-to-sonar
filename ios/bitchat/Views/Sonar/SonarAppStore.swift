@@ -1855,16 +1855,26 @@ func snExpectedNewestTsForChat(
 }
 
 /// Every recovered sibling that must leave with `id` on delete / leave.
+/// Empty persist-folds still use the remount pair so newest-page /
+/// unread-divider / seed-window treat hist+live as one family before
+/// wake-mute writes the blob. Compose `foldFamilyIds`.
 func snFoldFamilyIds(
     id: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Set<String> {
     guard !id.isEmpty else { return [] }
-    let live = historicalFolds[id]
-        ?? historicalFolds.first(where: { $0.value == id })?.value
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let live = folds[id]
+        ?? folds.first(where: { $0.value == id })?.value
         ?? id
     var family: Set<String> = [id, live]
-    for (historical, target) in historicalFolds {
+    for (historical, target) in folds {
         if historical == id || target == id || historical == live || target == live {
             family.insert(historical)
             family.insert(target)

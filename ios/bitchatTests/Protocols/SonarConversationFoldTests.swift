@@ -987,6 +987,30 @@ struct SonarConversationFoldTests {
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-08", historicalFolds: ["group-08": "group-09"]) == ["group-08", "group-09"])
         #expect(snFoldFamilyIds(id: "group-09", historicalFolds: [:]) == ["group-09"])
+        #expect(
+            snFoldFamilyIds(
+                id: "group-09",
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snFoldFamilyIds(
+                id: "group-08",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snFoldFamilyIds(
+                id: "group-other",
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-other"]
+        )
         let wakeFolds = snWakeMuteHistoricalFolds(
             persisted: [:],
             listedIds: ["group-09"],

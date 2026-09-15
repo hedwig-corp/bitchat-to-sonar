@@ -5158,6 +5158,47 @@ class ConversationFoldTest {
         assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-09", folds))
         assertEquals(setOf("group-08", "group-09"), foldFamilyIds("group-08", folds))
         assertEquals(setOf("group-09"), foldFamilyIds("group-09", emptyMap()))
+        assertEquals(
+            setOf("group-08", "group-09"),
+            foldFamilyIds(
+                "group-09",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            foldFamilyIds(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-other"),
+            foldFamilyIds(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            newestPageFamilyHasOlder(
+                existingCount = 20,
+                incomingCount = 2,
+                rawPageCount = 2,
+                previousHasOlder = false,
+                hasFoldFamily = foldFamilyIds(
+                    "group-09",
+                    emptyMap(),
+                    openedConversationId = "group-09",
+                    openedConversationPaneId = "group-08",
+                ).any { it != "group-09" },
+            ),
+        )
         assertTrue(conversationsMatchFoldFamily("group-08", "group-09", folds))
         assertTrue(conversationsMatchFoldFamily("group-09", "group-08", folds))
         assertTrue(conversationsMatchFoldFamily("group-09", "group-09", folds))

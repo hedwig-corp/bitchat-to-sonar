@@ -2201,17 +2201,27 @@ internal fun latestHomeRowForChat(
 internal fun foldedMeshRowTs(latestMessageTs: Long?, localLatestTs: Long): Long =
     maxOf(latestMessageTs ?: 0L, localLatestTs)
 
-/** Every recovered sibling that must leave with [id] on delete / leave. */
+/** Every recovered sibling that must leave with [id] on delete / leave.
+ *  Empty persist-folds still use the remount pair so newest-page /
+ *  unread-divider / seed-window treat hist+live as one family before
+ *  wake-mute writes the blob. iOS `snFoldFamilyIds`. */
 internal fun foldFamilyIds(
     id: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Set<String> {
     if (id.isBlank()) return emptySet()
-    val live = historicalFolds[id]
-        ?: historicalFolds.entries.firstOrNull { it.value == id }?.value
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    val live = folds[id]
+        ?: folds.entries.firstOrNull { it.value == id }?.value
         ?: id
     val family = linkedSetOf(id, live)
-    for ((historical, target) in historicalFolds) {
+    for ((historical, target) in folds) {
         if (historical == id || target == id || historical == live || target == live) {
             family += historical
             family += target
@@ -5115,8 +5125,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         openedDMShouldSkipHydrate(chatId, hydratedTranscripts)
 
     /** Hidden 0.8 sibling exists — first Marmot paint may be live-only. */
-    fun chatHasFoldFamily(chatId: String): Boolean =
-        foldFamilyIds(chatId, historicalFoldMap).size > 1
+    fun chatHasFoldFamily(chatId: String): Boolean {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return foldFamilyIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).size > 1
+    }
 
     /** Viewport remember key that stays on hist when remount hops to live. */
     fun remountTranscriptSessionKey(previousKey: String, screenId: String): String {
@@ -6223,7 +6240,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             ),
         )
         val window = TranscriptGroupWindow(rows = rows, hasMore = hasMore)
-        for (id in foldFamilyIds(chatId, historicalFoldMap).ifEmpty { setOf(chatId) }) {
+        for (id in foldFamilyIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).ifEmpty { setOf(chatId) }) {
             transcriptWindows[id] = window
         }
     }
@@ -9634,9 +9656,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         // After FFI hides a folded 0.8 id it leaves knownChatIds. Keep
         // fold-family watermarks so a later historical remainder tick cannot
         // replay recovered history as never-seen.
-        val retainIds = knownChatIds.flatMapTo(hashSetOf()) { id ->
-            foldFamilyIds(id, historicalFoldMap) + id
-        }
+        val retainIds = retainedScanChatIds(
+            knownChatIds,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         notificationSeenMessageIds.keys.retainAll(retainIds)
         notificationLatestSecs.keys.retainAll(retainIds)
     }
@@ -15457,13 +15482,19 @@ class SonarAppState(private val scope: CoroutineScope) {
             newest = newest,
             pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
         )
+        val (opened, pane) = remountPairForOpenChat(sessionChatId)
         val hasMore = newestPageFamilyHasOlder(
             existingCount = current?.rows.orEmpty().size,
             incomingCount = newest.size,
             rawPageCount = page.size,
             previousHasOlder = current?.hasMore == true
                 || unboundedCount > TRANSCRIPT_RETAINED_ROWS,
-            hasFoldFamily = foldFamilyIds(groupId, historicalFoldMap).any { it != groupId },
+            hasFoldFamily = foldFamilyIds(
+                groupId,
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            ).any { it != groupId },
         )
         transcriptWindows[groupId] = TranscriptGroupWindow(
             rows = merged,
@@ -17535,8 +17566,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                         // ids here so viewing-suppress matches a remainder
                         // tick that still names the hidden 0.8 sibling.
                         markGroupsRead(
-                            (directMarmotChatIds(sc.id) + foldFamilyIds(sc.id, historicalFoldMap))
-                                .distinct(),
+                            (
+                                directMarmotChatIds(sc.id) +
+                                    foldFamilyIds(
+                                        sc.id,
+                                        historicalFoldMap,
+                                        openedConversationId = openedChat,
+                                        openedConversationPaneId = paneChat,
+                                    )
+                                ).distinct(),
                         )
                     } else if (isMeshChat(sc.id) && conversationChangeShouldRefreshOpenMesh(
                             openMeshChatId = sc.id,

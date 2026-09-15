@@ -2318,10 +2318,15 @@ final class MarmotChatModel: ObservableObject {
     /// Record that push wake bannered the latest unread advance for a group.
     func notePushWakeNotified(groupIdHex: String, content: String) {
         let folds = historicalFoldsMap()
-        snFoldFamilyIds(id: groupIdHex, historicalFolds: folds).forEach {
+        let remount = remountOpenedAndPane()
+        snFoldFamilyIds(
+            id: groupIdHex,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ).forEach {
             pushWakeNotifiedGroupIds.insert($0)
         }
-        let remount = remountOpenedAndPane()
         if let match = Self.pushWakeLatestIncoming(
             in: snFoldFamilyCachedMessages(
                 groupId: groupIdHex,
@@ -2714,7 +2719,9 @@ final class MarmotChatModel: ObservableObject {
             )
             let familyIds = snFoldFamilyIds(
                 id: groupId,
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
             let hiddenSiblingHasRows = familyIds.contains {
                 $0 != groupId &&
