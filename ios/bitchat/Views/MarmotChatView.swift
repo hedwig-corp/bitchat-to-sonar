@@ -3732,6 +3732,7 @@ final class MarmotChatModel: ObservableObject {
             unreadSuppressGroupIds,
             summaries: tuples
         )
+        let remount = remountOpenedAndPane()
         unreadByGroup = summaries.isEmpty
             ? [:]
             : SNUnreadCounts.remountFoldedUnread(
@@ -3740,7 +3741,9 @@ final class MarmotChatModel: ObservableObject {
                     suppressing: unreadSuppressGroupIds.union(viewingUnreadGroupIds)
                 ),
                 previous: unreadByGroup,
-                historicalFolds: historicalFoldsMap()
+                historicalFolds: historicalFoldsMap(),
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
     }
 

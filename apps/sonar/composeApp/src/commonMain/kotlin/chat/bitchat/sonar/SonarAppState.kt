@@ -17709,6 +17709,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         unreadSuppressGroupIds.clear()
         unreadSuppressGroupIds.addAll(pruned)
+        val (opened, pane) = remountPairForOpenChat(
+            (screen as? Screen.Chat)?.id ?: activeTranscriptChatId ?: "",
+        )
         unreadByChat = if (summaries.isEmpty()) {
             emptyMap()
         } else {
@@ -17716,6 +17719,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds),
                 unreadByChat,
                 historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
         }
         rememberConversationSummaryIndex(summaries)

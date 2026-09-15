@@ -3871,6 +3871,22 @@ class ConversationFoldTest {
             remountFoldedUnread(emptyMap(), histUnread, folds),
             "uncleared hist unread still remounts — mark-read must subtract the FFI family first",
         )
+        assertEquals(
+            mapOf("group-08" to 4L),
+            remountFoldedUnread(
+                emptyMap(),
+                histUnread,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "empty persist-folds still keep hist unread via remount pair",
+        )
+        assertEquals(
+            emptyMap<String, Long>(),
+            remountFoldedUnread(emptyMap(), histUnread, emptyMap()),
+            "empty persist-folds without remount pair stay next",
+        )
         assertNull(
             openChatUnreadFromCache(listOf("group-09"), histUnread),
             "live-only open ids miss hist unread when the fold blob is empty",

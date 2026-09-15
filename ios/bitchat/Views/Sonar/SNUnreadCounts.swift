@@ -49,16 +49,25 @@ enum SNUnreadCounts {
 
     /// `conversation_summaries()` hides folded hist. Keep the previous hist
     /// badge only while live unread is still 0 — after `copy_summary` live
-    /// already holds the sum. Empty success still clears.
+    /// already holds the sum. Empty persist-folds still walk the remount
+    /// pair so a live-only probe cannot drop the recovered badge before
+    /// wake-mute writes the blob. Empty success still clears.
     /// Compose `remountFoldedUnread`.
     static func remountFoldedUnread(
         next: [String: UInt64],
         previous: [String: UInt64],
-        historicalFolds: [String: String]
+        historicalFolds: [String: String],
+        openedConversationId: String? = nil,
+        openedConversationPaneId: String? = nil
     ) -> [String: UInt64] {
-        guard !historicalFolds.isEmpty else { return next }
+        let folds = snRemountPairHistoricalFolds(
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+        guard !folds.isEmpty else { return next }
         var out = next
-        for (historical, live) in historicalFolds {
+        for (historical, live) in folds {
             guard !live.isEmpty, live != historical else { continue }
             guard out[historical] == nil else { continue }
             let histUnread = previous[historical] ?? 0

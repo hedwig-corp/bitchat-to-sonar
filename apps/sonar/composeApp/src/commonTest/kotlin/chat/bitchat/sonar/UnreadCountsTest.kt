@@ -243,6 +243,33 @@ class UnreadCountsTest {
             remountFoldedUnread(emptyMap(), previous, folds),
             "live-only unread 0 publishes an empty map and must keep hist",
         )
+        assertEquals(
+            mapOf("group-08" to 4L),
+            remountFoldedUnread(
+                emptyMap(),
+                previous,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "empty persist-folds still keep hist unread via remount pair",
+        )
+        assertEquals(
+            emptyMap<String, Long>(),
+            remountFoldedUnread(emptyMap(), previous, emptyMap()),
+            "empty persist-folds without remount pair stay next",
+        )
+        assertEquals(
+            mapOf("group-09" to 4L),
+            remountFoldedUnread(
+                mapOf("group-09" to 4L),
+                previous,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "copy_summary already on live — remount pair must not double-count hist",
+        )
     }
 
     @Test

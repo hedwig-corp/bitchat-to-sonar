@@ -134,18 +134,27 @@ internal fun unreadCountsFromSummaries(
  * 0 — after `copy_summary` live already holds the sum, so keeping hist
  * would double-count. Callers clear on empty summaries (a live-only
  * unread-0 probe publishes an empty map and must keep hist).
+ * Empty persist-folds still walk the remount pair so a live-only probe
+ * cannot drop the recovered badge before wake-mute writes the blob.
  * iOS `SNUnreadCounts.remountFoldedUnread`.
  */
 internal fun remountFoldedUnread(
     next: Map<String, Long>,
     previous: Map<String, Long>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Map<String, Long> {
     // A live-only probe with unread 0 publishes an empty map (zeros are
     // omitted). That is not empty success — callers clear on `summaries.isEmpty()`.
-    if (historicalFolds.isEmpty()) return next
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return next
     var out = next
-    for ((historical, live) in historicalFolds) {
+    for ((historical, live) in folds) {
         if (live.isBlank() || live == historical) continue
         if (historical in next) continue
         val histUnread = previous[historical] ?: 0L
