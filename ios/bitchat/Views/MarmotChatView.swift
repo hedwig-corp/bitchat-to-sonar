@@ -3291,13 +3291,16 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private func publishedGroups(_ groups: [MarmotService.MarmotGroup]) -> [MarmotService.MarmotGroup] {
-        snCollapsedFoldedSnapshotGroups(
+        let remount = remountOpenedAndPane()
+        return snCollapsedFoldedSnapshotGroups(
             groups: groups,
             id: { $0.id },
             historicalFolds: historicalFoldsMap(),
             mergeHiddenIntoLive: { live, historical in
                 snCollapsedFoldDisplayGroup(live: live, historical: historical)
-            }
+            },
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
     }
 

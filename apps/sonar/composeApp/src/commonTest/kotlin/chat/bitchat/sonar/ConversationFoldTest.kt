@@ -3894,6 +3894,46 @@ class ConversationFoldTest {
             listed,
             retainedScanChatIds(listed, mapOf("other-08" to "other-09")),
         )
+        assertEquals(
+            listed,
+            retainedScanChatIds(listed, emptyMap()),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            retainedScanChatIds(
+                listed,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listed,
+            retainedScanChatIds(
+                listed,
+                emptyMap(),
+                openedConversationId = "group-other",
+                openedConversationPaneId = "group-else",
+            ),
+        )
+        val historical = SonarChat(id = "group-08", name = "room", members = listOf("npub1a"), isDirect = false)
+        val live = SonarChat(id = "group-09", name = "room", members = listOf("npub1a"), isDirect = false)
+        assertEquals(
+            listOf("group-08", "group-09"),
+            collapsedFoldedSnapshotChats(
+                chats = listOf(historical, live),
+                historicalFolds = emptyMap(),
+            ).map { it.id },
+        )
+        assertEquals(
+            listOf("group-09"),
+            collapsedFoldedSnapshotChats(
+                chats = listOf(historical, live),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ).map { it.id },
+        )
     }
 
     @Test

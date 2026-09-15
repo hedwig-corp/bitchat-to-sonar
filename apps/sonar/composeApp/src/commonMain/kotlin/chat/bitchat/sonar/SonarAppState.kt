@@ -1645,15 +1645,25 @@ internal fun promotedFoldedPagingFlags(
     return next
 }
 
-/** Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide. */
+/** Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide.
+ *  Empty persist-folds still union the remount pair so a missed promote
+ *  cannot drop recovered history into unseen and re-banner it.
+ *  iOS `snRetainedScanChatIds`. */
 internal fun retainedScanChatIds(
     listedIds: Set<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Set<String> {
-    if (historicalFolds.isEmpty()) return listedIds
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return listedIds
     val out = listedIds.toMutableSet()
     for (id in listedIds) {
-        out.addAll(foldFamilyIds(id, historicalFolds))
+        out.addAll(foldFamilyIds(id, folds))
     }
     return out
 }
@@ -1990,19 +2000,26 @@ internal fun pendingJoinRequestsAcrossRemount(
 internal fun collapsedFoldedSnapshotChats(
     chats: List<SonarChat>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<SonarChat> {
-    if (historicalFolds.isEmpty()) return chats
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return chats
     val ids = chats.mapTo(hashSetOf()) { it.id }
     val byId = chats.associateBy { it.id }
     val mergedByLive = HashMap<String, SonarChat>()
     for (chat in chats) {
-        val liveId = historicalFolds[chat.id] ?: continue
+        val liveId = folds[chat.id] ?: continue
         if (liveId == chat.id || liveId !in ids) continue
         val current = mergedByLive[liveId] ?: byId.getValue(liveId)
         mergedByLive[liveId] = collapsedFoldDisplayChat(current, chat)
     }
     return chats.mapNotNull { chat ->
-        val liveId = historicalFolds[chat.id]
+        val liveId = folds[chat.id]
         if (liveId != null && liveId != chat.id && liveId in ids) return@mapNotNull null
         mergedByLive[chat.id] ?: chat
     }
@@ -16757,7 +16774,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         // the host blob was wiped (previous account) and family walks would
         // otherwise miss the restored sidecar for one refresh cycle.
         rememberHistoricalFolds(previousOrder.toSet(), loadedOrCached.mapTo(hashSetOf()) { it.id })
-        val localChats = collapsedFoldedSnapshotChats(loadedOrCached, historicalFoldMap)
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
+        val localChats = collapsedFoldedSnapshotChats(
+            loadedOrCached,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
         val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
         val existingMessages = promotedFoldedSnapshotMessages(
@@ -16766,8 +16790,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             messagesByChat = chatSnapshotMessagesByChat,
             liveFoldTarget = liveFoldTarget,
         )
-        val remountChat = activeTranscriptChatId
-        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
         val existingLatest = snapshotLatestAfterHistoricalFolds(
             promotedFoldedValues(
                 previousIds = previousOrder.toSet(),
@@ -17691,7 +17713,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Prune watermarks for chats that no longer exist, but keep hidden
         // 0.8 siblings so a missed promote cannot drop recovered history
         // into "unseen" and re-banner it.
-        val retainScanIds = retainedScanChatIds(latestByChat.keys, historicalFoldMap)
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
+        val retainScanIds = retainedScanChatIds(
+            latestByChat.keys,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         scanWatermark.keys.retainAll(retainScanIds)
         stagedChangedPages.keys.retainAll(retainScanIds)
         failedChangedPageReads.retainAll(retainScanIds)

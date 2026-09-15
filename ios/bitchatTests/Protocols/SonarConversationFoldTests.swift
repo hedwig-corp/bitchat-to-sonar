@@ -664,6 +664,38 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == ["group-09"]
         )
+        #expect(
+            snRetainedScanChatIds(
+                listedIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snRetainedScanChatIds(
+                listedIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "group-other",
+                openedConversationPaneId: "group-else"
+            ) == ["group-09"]
+        )
+        #expect(
+            snCollapsedFoldedSnapshotGroups(
+                groups: ["group-08", "group-09"],
+                id: { $0 },
+                historicalFolds: [:]
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snCollapsedFoldedSnapshotGroups(
+                groups: ["group-08", "group-09"],
+                id: { $0 },
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-09"]
+        )
         // Notification / deep-link ids stay on the hidden 0.8 row until remap.
         #expect(
             snRemountFoldedOpenGroupId(

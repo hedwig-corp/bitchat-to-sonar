@@ -1436,12 +1436,19 @@ func snPromotedFoldedPagingCursors<Cursor>(
 /// Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide.
 func snRetainedScanChatIds(
     listedIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Set<String> {
-    if historicalFolds.isEmpty { return listedIds }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if folds.isEmpty { return listedIds }
     var out = listedIds
     for id in listedIds {
-        out.formUnion(snFoldFamilyIds(id: id, historicalFolds: historicalFolds))
+        out.formUnion(snFoldFamilyIds(id: id, historicalFolds: folds))
     }
     return out
 }
@@ -1629,8 +1636,15 @@ func snCollapsedFoldedSnapshotGroups<Group>(
     groups: [Group],
     id: (Group) -> String,
     historicalFolds: [String: String],
-    mergeHiddenIntoLive: ((Group, Group) -> Group)? = nil
+    mergeHiddenIntoLive: ((Group, Group) -> Group)? = nil,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [Group] {
+    let historicalFolds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     if historicalFolds.isEmpty { return groups }
     let ids = Set(groups.map(id))
     var byId: [String: Group] = [:]
