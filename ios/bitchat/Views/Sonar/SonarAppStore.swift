@@ -3587,28 +3587,49 @@ func snMutedFoldKeys(
 /// `leaveFamilyCorePurgeIds`.
 func snLeaveFamilyCorePurgeIds(
     leaveId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     let leave = leaveId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !leave.isEmpty else { return [] }
-    return snFoldFamilyIds(id: leave, historicalFolds: historicalFolds)
-        .filter { !$0.isEmpty && $0 != leave }
-        .sorted()
+    return Array(Set(
+        snEchoReconcileFamilyIds(
+            echoGroupId: leave,
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+        .map { snBareMarmotGroupId($0) }
+        .filter { !$0.isEmpty && !snOpenedConversationIdMatches($0, leave) }
+    )).sorted()
 }
 
 /// Listed Marmot ids plus their persist-folds siblings. Mesh-folded DM
 /// delete must `deleteGroup` the hidden 0.8 id, not only the listed live
-/// group. Compose `deletedConversationCorePurgeIds`.
+/// group. Empty persist-folds still union the remount pair.
+/// Compose `deletedConversationCorePurgeIds`.
 func snDeletedConversationCorePurgeIds(
     listedIds: [String],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     var out = Set<String>()
     for id in listedIds {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { continue }
         out.insert(trimmed)
-        out.formUnion(snFoldFamilyIds(id: trimmed, historicalFolds: historicalFolds))
+        for alias in snEchoReconcileFamilyIds(
+            echoGroupId: trimmed,
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ) {
+            if !alias.isEmpty { out.insert(alias) }
+            let bare = snBareMarmotGroupId(alias)
+            if !bare.isEmpty { out.insert(bare) }
+        }
     }
     return out.filter { !$0.isEmpty }.sorted()
 }
@@ -16087,6 +16108,10 @@ final class SonarAppStore: ObservableObject {
 
         if let groupId = marmotGroupId(id) {
             let shouldLeave = isMultiMemberMarmotGroupId(id)
+            // Capture before hopMacOpenConversationSelection: remount can
+            // hop live while persist-folds are still empty, and the pair
+            // is the only name host leave has for the hidden 0.8 sibling.
+            let remount = remountOpenedAndPane()
             // A deduped direct row can represent several duplicate Marmot groups
             // for the same peer; delete the whole set so hidden duplicates don't
             // resurface after the next refresh. After an MDK 0.8→0.9 resume the
@@ -16094,7 +16119,12 @@ final class SonarAppStore: ObservableObject {
             // can resurrect a deleted room.
             let blobFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
-            let family = snFoldFamilyIds(id: groupId, historicalFolds: blobFolds)
+            let family = snEchoReconcileFamilyIds(
+                echoGroupId: groupId,
+                historicalFolds: blobFolds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            ).map { snBareMarmotGroupId($0) }.filter { !$0.isEmpty }
             let groupIds = Array(Set((matching.isEmpty ? [groupId] : matching) + family))
             let nextFolds = snPurgedHistoricalFolds(blobFolds, deletedIds: Set(groupIds))
             if nextFolds != blobFolds {
@@ -16118,11 +16148,15 @@ final class SonarAppStore: ObservableObject {
                 let folds = await mergedActionHistoricalFolds(for: groupId)
                 let mergedPurge = snLeaveFamilyCorePurgeIds(
                     leaveId: groupId,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
                 let mergedDelete = snDeletedConversationCorePurgeIds(
                     listedIds: groupIds,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
                 for gid in mergedDelete where !groupIds.contains(gid) {
                     discardRetainedConversation(gid)
@@ -16158,6 +16192,7 @@ final class SonarAppStore: ObservableObject {
 
         // Mesh / Sonar peer: erase mesh transcript and every folded WN leg.
         chatViewModel.deleteConversation(with: PeerID(str: id))
+        let remount = remountOpenedAndPane()
         let foldedGroups: [MarmotService.MarmotGroup]
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let meshPurgeIds: [String]
@@ -16165,7 +16200,9 @@ final class SonarAppStore: ObservableObject {
             foldedGroups = marmotGroups(forNpub: profile.npub)
             meshPurgeIds = snDeletedConversationCorePurgeIds(
                 listedIds: foldedGroups.map(\.id),
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
             for gid in meshPurgeIds {
                 discardRetainedConversation(gid)
@@ -16201,7 +16238,9 @@ final class SonarAppStore: ObservableObject {
                     purge.formUnion(
                         snDeletedConversationCorePurgeIds(
                             listedIds: [group.id],
-                            historicalFolds: folds
+                            historicalFolds: folds,
+                            openedConversationId: remount.opened,
+                            openedConversationPaneId: remount.pane
                         )
                     )
                 }

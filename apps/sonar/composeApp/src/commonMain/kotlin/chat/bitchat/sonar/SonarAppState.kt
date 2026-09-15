@@ -3605,31 +3605,52 @@ internal fun <V> updatePendingMessagesForChat(
 
 /** Hidden 0.8 ids core `leave_group(live)` will not purge when persist-folds
  *  landed before `fold_family`. Hosts must `deleteChat` these after leave or
- *  the next cold start resurrects the room. iOS `snLeaveFamilyCorePurgeIds`. */
+ *  the next cold start resurrects the room. Empty persist-folds still union
+ *  the remount pair. iOS `snLeaveFamilyCorePurgeIds`. */
 internal fun leaveFamilyCorePurgeIds(
     leaveId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<String> {
     val leave = leaveId.trim()
     if (leave.isEmpty()) return emptyList()
-    return foldFamilyIds(leave, historicalFolds)
-        .filter { it.isNotBlank() && it != leave }
+    return echoReconcileFamilyIds(
+        leave,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).map { it.removePrefix("marmot:") }
+        .filter { it.isNotBlank() && !openedConversationIdMatches(it, leave) }
+        .distinct()
         .sorted()
 }
 
 /** Listed Marmot ids plus their persist-folds siblings. Mesh-folded DM
  *  delete must `deleteChat` the hidden 0.8 id, not only the listed live
- *  group. iOS `snDeletedConversationCorePurgeIds`. */
+ *  group. Empty persist-folds still union the remount pair.
+ *  iOS `snDeletedConversationCorePurgeIds`. */
 internal fun deletedConversationCorePurgeIds(
     listedIds: Collection<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<String> {
     val out = linkedSetOf<String>()
     for (id in listedIds) {
         val trimmed = id.trim()
         if (trimmed.isEmpty()) continue
         out += trimmed
-        out.addAll(foldFamilyIds(trimmed, historicalFolds))
+        for (alias in echoReconcileFamilyIds(
+            trimmed,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )) {
+            val bare = alias.removePrefix("marmot:")
+            if (bare.isNotBlank()) out += bare
+            if (alias.isNotBlank()) out += alias
+        }
     }
     return out.filter { it.isNotBlank() }.sorted()
 }
@@ -10634,6 +10655,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val isGroup = listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
+        // Capture before endTranscriptSession: remount can hop live
+        // while persist-folds are still empty, and the pair is the only
+        // name host leave has for the hidden 0.8 sibling.
+        val (opened, pane) = remountPairForOpenChat(chatId)
         // A deduped direct row can represent several duplicate Marmot groups for
         // the same peer; delete the whole set so hidden duplicates don't resurface.
         // After an MDK 0.8→0.9 resume the hidden 0.8 sibling must leave too,
@@ -10644,14 +10669,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         adoptActionHistoricalFolds(folds)
         val deleteIds = (
             if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
-            ) + foldFamilyIds(chatId, folds)
+            ) + echoReconcileFamilyIds(chatId, folds, opened, pane)
+                .map { it.removePrefix("marmot:") }
+                .filter { it.isNotBlank() }
         val deleteIdSet = deleteIds.toSet()
         val wasOpen = stack.any { screen ->
             deletedConversationShouldClearScreen(screen, chatId, deleteIdSet)
         }
-        // Capture before forget: persist-folds sidecar is the only name
-        // core leave has for the hidden 0.8 sibling.
-        val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, folds)
+        val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, folds, opened, pane)
         forgetHistoricalFolds(deleteIdSet)
         chats = chats.filterNot { it.id in deleteIdSet }
         chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it !in deleteIdSet }
@@ -10713,8 +10738,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             ).distinctBy { it.id }
         val meshFolds = mergeActionHistoricalFolds(foldedGroups.map { it.id })
         adoptActionHistoricalFolds(meshFolds)
+        val remountChat = activeTranscriptChatId ?: chatId
+        val (opened, pane) = remountPairForOpenChat(remountChat)
         val foldedGroupIdsToDelete = foldedGroups.flatMapTo(hashSetOf()) { group ->
-            foldFamilyIds(group.id, meshFolds) + group.id
+            echoReconcileFamilyIds(group.id, meshFolds, opened, pane)
+                .map { it.removePrefix("marmot:") }
+                .filter { it.isNotBlank() } + group.id
         }
         val deleteIdSet = deletedMeshConversationPurgeIds(
             aliases.map(::meshChatId) + chatId,
@@ -10777,6 +10806,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             val purgeIds = deletedConversationCorePurgeIds(
                 foldedGroupIdsToDelete,
                 meshFolds,
+                opened,
+                pane,
             )
             for (id in purgeIds) {
                 runCatching { SonarCore.deleteChat(id) }

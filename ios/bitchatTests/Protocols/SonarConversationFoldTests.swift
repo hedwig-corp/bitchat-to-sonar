@@ -965,6 +965,38 @@ struct SonarConversationFoldTests {
         #expect(snLeaveFamilyCorePurgeIds(leaveId: "group-09", historicalFolds: wakeFolds) == ["group-08"])
         #expect(snLeaveFamilyCorePurgeIds(leaveId: "group-09", historicalFolds: [:]).isEmpty)
         #expect(
+            snLeaveFamilyCorePurgeIds(
+                leaveId: "group-09",
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-08"]
+        )
+        #expect(
+            snLeaveFamilyCorePurgeIds(
+                leaveId: "group-09",
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08"]
+        )
+        #expect(
+            snLeaveFamilyCorePurgeIds(
+                leaveId: "group-08",
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-09"]
+        )
+        #expect(
+            snLeaveFamilyCorePurgeIds(
+                leaveId: "group-other",
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ).isEmpty
+        )
+        #expect(
             snDeletedConversationCorePurgeIds(
                 listedIds: ["group-09"],
                 historicalFolds: wakeFolds
@@ -975,6 +1007,22 @@ struct SonarConversationFoldTests {
                 listedIds: ["group-09"],
                 historicalFolds: [:]
             ) == ["group-09"]
+        )
+        #expect(
+            snDeletedConversationCorePurgeIds(
+                listedIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snDeletedConversationCorePurgeIds(
+                listedIds: ["group-other"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-other"]
         )
         #expect(
             Set(snConversationReadGroupIds(groupId: "group-09", historicalFolds: wakeFolds))

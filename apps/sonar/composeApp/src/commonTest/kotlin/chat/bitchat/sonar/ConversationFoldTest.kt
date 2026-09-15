@@ -1785,6 +1785,75 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun leavePurgesHistSiblingViaRemountPair() {
+        assertEquals(emptyList(), leaveFamilyCorePurgeIds("group-09", emptyMap()))
+        assertEquals(
+            listOf("group-09"),
+            deletedConversationCorePurgeIds(listOf("group-09"), emptyMap()),
+        )
+        assertEquals(
+            listOf("group-08"),
+            leaveFamilyCorePurgeIds(
+                "group-09",
+                emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-08"),
+            leaveFamilyCorePurgeIds(
+                "group-09",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-09"),
+            leaveFamilyCorePurgeIds(
+                "group-08",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            emptyList(),
+            leaveFamilyCorePurgeIds(
+                "group-other",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-08", "group-09"),
+            deletedConversationCorePurgeIds(
+                listOf("group-09"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-other"),
+            deletedConversationCorePurgeIds(
+                listOf("group-other"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        val folds = mapOf("group-08" to "group-09")
+        assertEquals(listOf("group-08"), leaveFamilyCorePurgeIds("group-09", folds))
+        assertEquals(
+            listOf("group-08", "group-09"),
+            deletedConversationCorePurgeIds(listOf("group-09"), folds),
+        )
+    }
+
+    @Test
     fun remountLocalHydratingIdsStaysEmptyWhenHistWasNotHydrating() {
         assertEquals(
             emptySet(),
