@@ -2137,12 +2137,22 @@ internal fun remountStableTranscriptSessionKey(
     previousKey: String?,
     screenId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String {
     val screen = screenId.trim()
     if (screen.isEmpty()) return previousKey?.trim().orEmpty()
     val previous = previousKey?.trim().orEmpty()
     if (previous.isEmpty()) return screen
     if (openedDMShouldSkipHydrate(screen, setOf(previous))) return previous
+    val remountPair = remountPairConversationIds(
+        previous,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (remountPair.size > 1 && remountPair.any { openedConversationIdMatches(it, screen) }) {
+        return previous
+    }
     val previousBare = previous.removePrefix("marmot:")
     val screenBare = screen.removePrefix("marmot:")
     if (previousBare.isNotEmpty() && screenBare.isNotEmpty()) {
@@ -4538,8 +4548,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         foldFamilyIds(chatId, historicalFoldMap).size > 1
 
     /** Viewport remember key that stays on hist when remount hops to live. */
-    fun remountTranscriptSessionKey(previousKey: String, screenId: String): String =
-        remountStableTranscriptSessionKey(previousKey, screenId, historicalFoldMap)
+    fun remountTranscriptSessionKey(previousKey: String, screenId: String): String {
+        val (opened, pane) = remountPairForOpenChat(screenId)
+        return remountStableTranscriptSessionKey(
+            previousKey,
+            screenId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
 
     /** Newest known local timestamp across the fold family (index + snapshot).
      *  Home-list recency, unread retire, and extract-keep must use this —

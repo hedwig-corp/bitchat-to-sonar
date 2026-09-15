@@ -1553,6 +1553,34 @@ class ConversationFoldTest {
                 historicalFolds = mapOf("group-08" to "group-09"),
             ),
         )
+        assertEquals(
+            "group-09",
+            remountStableTranscriptSessionKey(
+                previousKey = "group-08",
+                screenId = "group-09",
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            "group-08",
+            remountStableTranscriptSessionKey(
+                previousKey = "group-08",
+                screenId = "group-09",
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "marmot:other",
+            remountStableTranscriptSessionKey(
+                previousKey = "marmot:group-08",
+                screenId = "marmot:other",
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
     }
 
     @Test

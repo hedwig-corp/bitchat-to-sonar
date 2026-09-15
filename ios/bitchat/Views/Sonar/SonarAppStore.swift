@@ -2033,7 +2033,9 @@ func snRemountMarksTranscriptHydrated(
 func snRemountStableTranscriptSessionKey(
     previousKey: String?,
     screenId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String {
     let screen = screenId.trimmingCharacters(in: .whitespacesAndNewlines)
     if screen.isEmpty {
@@ -2042,6 +2044,15 @@ func snRemountStableTranscriptSessionKey(
     let previous = previousKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     if previous.isEmpty { return screen }
     if snOpenedDMShouldSkipHydrate(openingId: screen, suppressedIds: [previous]) {
+        return previous
+    }
+    let remountPair = snRemountPairConversationIds(
+        conversationId: previous,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if remountPair.count > 1,
+       remountPair.contains(where: { snOpenedConversationIdMatches($0, screen) }) {
         return previous
     }
     let previousBare = snBareMarmotGroupId(previous)

@@ -1882,6 +1882,25 @@ struct SonarConversationFoldTests {
             screenId: "marmot:other",
             historicalFolds: ["group-08": "group-09"]
         ) == "marmot:other")
+        #expect(snRemountStableTranscriptSessionKey(
+            previousKey: "marmot:group-08",
+            screenId: "marmot:group-09",
+            historicalFolds: [:]
+        ) == "marmot:group-09")
+        #expect(snRemountStableTranscriptSessionKey(
+            previousKey: "marmot:group-08",
+            screenId: "marmot:group-09",
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == "marmot:group-08")
+        #expect(snRemountStableTranscriptSessionKey(
+            previousKey: "marmot:group-08",
+            screenId: "marmot:other",
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == "marmot:other")
         #expect(snMacConversationPaneIdentity(
             selectionId: "marmot:group-09",
             openedConversationId: "marmot:group-09",
