@@ -2450,15 +2450,20 @@ final class MarmotChatModel: ObservableObject {
     /// already open and typable while this runs in the background.
     func scheduleBlankTranscriptRecovery(groupId: String, storeReadable: Bool) {
         let folds = historicalFoldsMap()
+        let remount = remountOpenedAndPane()
         let pagingIds = snTranscriptSourceIds(
             groupId: groupId,
             listedDirectIds: [],
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         if snBlankTranscriptFamilyRendered(
             groupId: groupId,
             messagesByGroup: messagesByGroup,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         ) { return }
         let counts = Dictionary(
             uniqueKeysWithValues: conversationSummariesByGroup.map { ($0.key, $0.value.messageCount) }
@@ -2472,7 +2477,9 @@ final class MarmotChatModel: ObservableObject {
             groupId: groupId,
             messageCountByGroup: counts,
             latestAtByGroup: latestAt,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         let listed = Set(groups.map(\.id))
         let sourcesResolved = pagingIds.contains { listed.contains($0) }
@@ -2509,7 +2516,9 @@ final class MarmotChatModel: ObservableObject {
                 if snBlankTranscriptFamilyRendered(
                     groupId: groupId,
                     messagesByGroup: self.messagesByGroup,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 ) { return }
                 // Transcript-only: the metadata hydrate must not run ten times.
                 // Keep the result: `loadLocalPage` returns false when it threw
@@ -2533,7 +2542,9 @@ final class MarmotChatModel: ObservableObject {
                 if snBlankTranscriptFamilyRendered(
                     groupId: groupId,
                     messagesByGroup: self.messagesByGroup,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 ) { return }
                 // Stop once the conversation is provably readable AND empty —
                 // otherwise a genuinely empty chat burns the whole budget on
@@ -2554,7 +2565,9 @@ final class MarmotChatModel: ObservableObject {
                         groupId: groupId,
                         messageCountByGroup: counts,
                         latestAtByGroup: latestAt,
-                        historicalFolds: folds
+                        historicalFolds: folds,
+                        openedConversationId: remount.opened,
+                        openedConversationPaneId: remount.pane
                     ),
                     storeReadable: storeReadable,
                     sourcesResolved: pagingIds.contains { listed.contains($0) }

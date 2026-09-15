@@ -944,7 +944,15 @@ internal fun blankTranscriptKnownNonEmpty(
     latestByChat: Map<String, Long>,
     messageCountByChat: Map<String, Long>,
     historicalFolds: Map<String, String>,
-): Boolean = transcriptSourceIds(chatId, emptyList(), historicalFolds).any { id ->
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean = transcriptSourceIds(
+    chatId,
+    emptyList(),
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).any { id ->
     (latestByChat[id] ?: 0L) > 0L || (messageCountByChat[id] ?: 0L) > 0L
 }
 
@@ -1089,8 +1097,15 @@ internal fun familyTranscriptNeedsNetworkBackfill(
     chatId: String,
     messagesByChat: Map<String, List<*>>,
     historicalFolds: Map<String, String>,
-): Boolean = transcriptSourceIds(chatId, emptyList(), historicalFolds)
-    .all { messagesByChat[it].isNullOrEmpty() }
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean = transcriptSourceIds(
+    chatId,
+    emptyList(),
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).all { messagesByChat[it].isNullOrEmpty() }
 
 /** Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
  *  Comparing overflow to the 500-row retained cap hid bak remainder after
@@ -15304,11 +15319,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 put(id, maxOf(localLatestTs(id), conversationLatestAtByChat[id] ?: 0L))
             }
         }
+        val (opened, pane) = remountPairForOpenChat(chatId)
         return blankTranscriptKnownNonEmpty(
             chatId,
             latestByChat = latest,
             messageCountByChat = conversationMessageCountByChat,
             historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
     }
 

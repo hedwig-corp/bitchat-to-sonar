@@ -872,12 +872,16 @@ func snBlankTranscriptKnownNonEmpty(
     groupId: String,
     messageCountByGroup: [String: UInt64],
     latestAtByGroup: [String: TimeInterval] = [:],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     snTranscriptSourceIds(
         groupId: groupId,
         listedDirectIds: [],
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ).contains {
         (messageCountByGroup[$0] ?? 0) > 0 || (latestAtByGroup[$0] ?? 0) > 0
     }
@@ -885,31 +889,41 @@ func snBlankTranscriptKnownNonEmpty(
 
 /// Family cache already has rows — do not start blank recovery, and
 /// treat a live-only empty `messagesByGroup[live]` as painted.
+/// Empty persist-folds still union the remount pair.
 func snBlankTranscriptFamilyRendered<Message>(
     groupId: String,
     messagesByGroup: [String: [Message]],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     snTranscriptSourceIds(
         groupId: groupId,
         listedDirectIds: [],
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ).contains { !(messagesByGroup[$0] ?? []).isEmpty }
 }
 
 /// First-open must not wait on relay when any fold-family cache already
 /// has rows. A live-only empty 0.9 row after resume used to keep the
 /// hydrating spinner up while recovered 0.8 history sat on hist.
+/// Empty persist-folds still union the remount pair.
 /// Compose `familyTranscriptNeedsNetworkBackfill`.
 func snFamilyTranscriptNeedsNetworkBackfill<Message>(
     groupId: String,
     messagesByGroup: [String: [Message]],
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     !snBlankTranscriptFamilyRendered(
         groupId: groupId,
         messagesByGroup: messagesByGroup,
-        historicalFolds: historicalFolds
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     )
 }
 
@@ -13779,14 +13793,18 @@ final class SonarAppStore: ObservableObject {
                 Task { await self.marmot.preferCatchupGroup(hydratedGroupId) }
             }
             let folds = (self.defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let remount = self.remountOpenedAndPane()
             let needsHistoryBackfill = hydratedGroupId.map {
                 // Live 0.9 is empty after resume; leftover hist cache is
                 // already paint. Do not wait on relay for that. Compose
                 // blank recovery uses `blankTranscriptKnownNonEmpty`.
+                // Empty persist-folds still union the remount pair.
                 snFamilyTranscriptNeedsNetworkBackfill(
                     groupId: $0,
                     messagesByGroup: self.marmot.messagesByGroup,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
             } ?? false
             if !needsHistoryBackfill {

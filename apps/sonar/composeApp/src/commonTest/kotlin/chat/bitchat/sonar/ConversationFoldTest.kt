@@ -4276,6 +4276,42 @@ class ConversationFoldTest {
                 emptyMap(),
             ),
         )
+        assertFalse(
+            familyTranscriptNeedsNetworkBackfill(
+                "group-09",
+                mapOf("group-08" to listOf("old from 0.8")),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            familyTranscriptNeedsNetworkBackfill(
+                "group-other",
+                mapOf("group-08" to listOf("old from 0.8")),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertFalse(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = emptyMap(),
+                messageCountByChat = mapOf("group-08" to 80L),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(
+            blankTranscriptKnownNonEmpty(
+                chatId = "group-09",
+                latestByChat = emptyMap(),
+                messageCountByChat = mapOf("group-08" to 80L),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertTrue(
             familyTranscriptNeedsNetworkBackfill(
                 "group-09",

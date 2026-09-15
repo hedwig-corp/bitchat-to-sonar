@@ -1536,6 +1536,49 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            !snFamilyTranscriptNeedsNetworkBackfill(
+                groupId: "group-09",
+                messagesByGroup: ["group-08": ["old from 0.8"]],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            snFamilyTranscriptNeedsNetworkBackfill(
+                groupId: "group-other",
+                messagesByGroup: ["group-08": ["old from 0.8"]],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            snBlankTranscriptFamilyRendered(
+                groupId: "group-09",
+                messagesByGroup: ["group-08": ["old from 0.8"]],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            !snBlankTranscriptKnownNonEmpty(
+                groupId: "group-09",
+                messageCountByGroup: ["group-08": 80],
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snBlankTranscriptKnownNonEmpty(
+                groupId: "group-09",
+                messageCountByGroup: ["group-08": 80],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
             snFamilyTranscriptNeedsNetworkBackfill(
                 groupId: "group-09",
                 messagesByGroup: [:],
