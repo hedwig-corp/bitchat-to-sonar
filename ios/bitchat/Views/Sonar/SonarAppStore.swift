@@ -3698,13 +3698,15 @@ func snMarmotSendTargetGroupId(
     latestSecs: [String: Int64],
     historicalFolds: [String: String] = [:],
     openedConversationId: String? = nil,
-    openedConversationPaneId: String? = nil
+    openedConversationPaneId: String? = nil,
+    ffiHistoricalFolds: [String: String] = [:]
 ) -> String {
     if let preferred = snPreferredFoldedDirectMarmotGroupId(
         groupIds: duplicateGroupIds,
         historicalFolds: historicalFolds,
         openedConversationId: openedConversationId,
-        openedConversationPaneId: openedConversationPaneId
+        openedConversationPaneId: openedConversationPaneId,
+        ffiHistoricalFolds: ffiHistoricalFolds
     ) {
         return preferred
     }
@@ -9311,12 +9313,27 @@ final class SonarAppStore: ObservableObject {
         (pendingMarmotNpub(for: id) != nil && marmotGroupId(id) == nil) || isPendingMarmotGroup(id)
     }
 
-    func marmotSendTargetGroupId(_ id: String) -> String? {
+    func marmotSendTargetGroupId(
+        _ id: String,
+        ffiHistoricalFolds: [String: String] = [:]
+    ) -> String? {
         guard let groupId = marmotGroupId(id) else { return nil }
         guard let group = marmotGroup(byId: groupId),
               let peer = directMarmotPeerKey(in: group)
         else { return groupId }
-        return preferredDirectMarmotGroup(in: marmotGroups(forNpub: peer))?.id ?? groupId
+        let groups = marmotGroups(forNpub: peer)
+        let persist = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        if let preferredId = snPreferredFoldedDirectMarmotGroupId(
+            groupIds: groups.map(\.id),
+            historicalFolds: persist,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane,
+            ffiHistoricalFolds: ffiHistoricalFolds
+        ), let match = groups.first(where: { $0.id == preferredId }) {
+            return match.id
+        }
+        return preferredDirectMarmotGroup(in: groups)?.id ?? groupId
     }
 
     /// Sticker / media / payment / call must use the same live duplicate as text.
@@ -11042,10 +11059,22 @@ final class SonarAppStore: ObservableObject {
             return
         }
         if let groupId = marmotSendTargetGroupId(id) {
-            marmot.send(text, to: groupId, reply: marmotReply, onFailure: { [weak self] in
+            let onFailure: () -> Void = { [weak self] in
                 guard let self else { return }
                 self.noteRecoveredChatSendFailure(id, error: self.marmot.errorText ?? "")
-            })
+            }
+            if let group = marmotGroup(byId: groupId),
+               let peer = directMarmotPeerKey(in: group),
+               marmotGroups(forNpub: peer).count > 1 {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let ffi = await self.ffiFoldsForDirectNpub(peer)
+                    let target = self.marmotSendTargetGroupId(id, ffiHistoricalFolds: ffi) ?? groupId
+                    self.marmot.send(text, to: target, reply: marmotReply, onFailure: onFailure)
+                }
+                return
+            }
+            marmot.send(text, to: groupId, reply: marmotReply, onFailure: onFailure)
             return
         }
         if let pendingNpub = pendingMarmotNpub(for: id) {

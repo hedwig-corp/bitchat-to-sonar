@@ -620,12 +620,14 @@ internal fun marmotSendTargetGroupId(
     historicalFolds: Map<String, String> = emptyMap(),
     openedConversationId: String? = null,
     openedConversationPaneId: String? = null,
+    ffiHistoricalFolds: Map<String, String> = emptyMap(),
 ): String =
     preferredFoldedDirectMarmotChatId(
         duplicateGroupIds,
         historicalFolds,
         openedConversationId = openedConversationId,
         openedConversationPaneId = openedConversationPaneId,
+        ffiHistoricalFolds = ffiHistoricalFolds,
     ) ?: duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
 
 /** Shared groups on a contact profile. Callers must pass the collapsed
@@ -6627,11 +6629,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val candidateIds = chats.mapNotNull { chat ->
             chat.id.takeIf { directMarmotPeerKey(chat, npub) == peer }
         }
-        val ffi = historicalFoldsFromAliases(
-            candidateIds,
-            { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
-            { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
-        )
+        val ffi = ffiFoldsForDirectIds(candidateIds)
         return directMarmotChatIdForPeer(
             chats,
             npub,
@@ -12064,13 +12062,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         val echo = createSendEcho(chatId, t, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
         val (opened, pane) = remountPairForOpenChat(chatId)
+        val sendDuplicates = directMarmotChatIds(chatId)
         val sendTarget = marmotSendTargetGroupId(
             chatId,
-            directMarmotChatIds(chatId),
+            sendDuplicates,
             ::localLatestTs,
             historicalFoldMap,
             openedConversationId = opened,
             openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffiFoldsForDirectIds(sendDuplicates),
         )
         scope.launch {
             runMarmotSendWithBestEffortReconciliation(
@@ -13073,15 +13073,26 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun resolveMarmotSendTargetGroupId(chatId: String): String? {
         val open = resolveMarmotGroupId(chatId) ?: return null
         val (opened, pane) = remountPairForOpenChat(chatId)
+        val duplicates = directMarmotChatIds(chatId)
         return marmotSendTargetGroupId(
             open,
-            directMarmotChatIds(chatId),
+            duplicates,
             ::localLatestTs,
             historicalFoldMap,
             openedConversationId = opened,
             openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffiFoldsForDirectIds(duplicates),
         )
     }
+
+    /** In-memory FFI hist→live for send / contact-profile. Do not persist —
+     *  empty-family merge must not cache a family-of-one. */
+    private fun ffiFoldsForDirectIds(candidateIds: Collection<String>): Map<String, String> =
+        historicalFoldsFromAliases(
+            candidateIds,
+            { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
 
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */

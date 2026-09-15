@@ -497,6 +497,25 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        // Open hist from home before remount hop: persist empty, remount
+        // nil, hist latest wins newest-sort. FFI still names live.
+        assertEquals(
+            "group-09",
+            marmotSendTargetGroupId(
+                openChatId = "zzz-08",
+                duplicateGroupIds = listOf("zzz-08", "group-09"),
+                latestSecs = { if (it == "zzz-08") 2L else 1L },
+                ffiHistoricalFolds = mapOf("zzz-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            "zzz-08",
+            marmotSendTargetGroupId(
+                openChatId = "zzz-08",
+                duplicateGroupIds = listOf("zzz-08", "group-09"),
+                latestSecs = { if (it == "zzz-08") 2L else 1L },
+            ),
+        )
     }
 
     @Test
