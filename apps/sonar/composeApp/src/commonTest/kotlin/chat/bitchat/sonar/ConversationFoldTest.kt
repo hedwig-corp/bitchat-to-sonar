@@ -4214,6 +4214,15 @@ class ConversationFoldTest {
         assertTrue(
             verifiedForFoldFamily(
                 chatId = "group-09",
+                verifiedIds = setOf("group-08"),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            verifiedForFoldFamily(
+                chatId = "group-09",
                 verifiedIds = setOf("group-09"),
                 historicalFolds = folds,
             ),

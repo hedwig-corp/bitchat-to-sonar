@@ -15401,10 +15401,13 @@ final class SonarAppStore: ObservableObject {
                         ? String(key.dropFirst(Self.marmotIDPrefix.count))
                         : key
                 })
+                let remount = remountOpenedAndPane()
                 return snVerifiedForFoldFamily(
                     groupId: groupId,
                     verifiedIds: verifiedIds,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
             }
             return hasVerifiedMarmotGroup(in: groups)
@@ -15807,10 +15810,13 @@ final class SonarAppStore: ObservableObject {
             return true
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         return snConversationsMatchFoldFamily(
             left: left,
             right: right,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
     }
 

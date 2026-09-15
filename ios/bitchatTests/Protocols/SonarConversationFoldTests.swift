@@ -1790,6 +1790,15 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snVerifiedForFoldFamily(
+                groupId: "group-09",
+                verifiedIds: Set(["group-08"]),
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
             snHydrationTargetGroupId(
                 sourceId: "group-08",
                 activeGroupIds: ["group-09"],
