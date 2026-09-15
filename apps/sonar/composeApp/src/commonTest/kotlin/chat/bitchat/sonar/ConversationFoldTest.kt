@@ -4587,6 +4587,17 @@ class ConversationFoldTest {
             listOf("group-09"),
             meshFoldTranscriptSourceIds(listOf("group-09"), emptyMap()),
         )
+        // refreshOpenDm / marmotMessagesForPeer must pass remount or a
+        // mesh-folded remainder stays out of the WN merge.
+        assertEquals(
+            listOf("group-09", "group-08"),
+            meshFoldTranscriptSourceIds(
+                listOf("group-09"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertEquals(
             emptyList(),
             meshFoldTranscriptSourceIds(emptyList(), folds),

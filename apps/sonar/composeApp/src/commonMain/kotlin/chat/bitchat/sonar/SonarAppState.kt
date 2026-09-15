@@ -15783,10 +15783,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
+        val (opened, pane) = remountPairForOpenChat(sessionChatId)
         val groupIds = meshFoldTranscriptSourceIds(
             groups.map { it.id },
             historicalFoldMap,
             resolveMarmotGroupId(sessionChatId),
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         ).ifEmpty { groups.map { it.id } }
         val merged = ArrayList<SonarMsg>()
         for (groupId in groupIds) {
