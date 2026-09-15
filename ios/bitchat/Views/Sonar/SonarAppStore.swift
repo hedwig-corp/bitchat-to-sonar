@@ -15640,17 +15640,22 @@ final class SonarAppStore: ObservableObject {
             clearNotificationsForConversation(id)
             clearNotificationsForConversation(liveId)
             if let jump {
+                let remount = remountOpenedAndPane()
                 pendingJumpMessageIdByDM = snQuotedJumpWritten(
                     conversationId: liveId,
                     parentId: jump,
                     jumps: pendingJumpMessageIdByDM,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
                 jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
                     conversationId: liveId,
                     parentId: jump,
                     jumps: jumpMessageIdAtOpenByDM,
-                    historicalFolds: folds
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
                 )
                 objectWillChange.send()
             }
@@ -15686,17 +15691,22 @@ final class SonarAppStore: ObservableObject {
         parentId: String,
         folds: [String: String]
     ) {
+        let remount = remountOpenedAndPane()
         pendingJumpMessageIdByDM = snQuotedJumpWritten(
             conversationId: conversationId,
             parentId: parentId,
             jumps: pendingJumpMessageIdByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
             conversationId: conversationId,
             parentId: parentId,
             jumps: jumpMessageIdAtOpenByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         objectWillChange.send()
     }
@@ -15705,15 +15715,20 @@ final class SonarAppStore: ObservableObject {
     /// the open action so later transcript updates do not re-jump.
     func clearJumpMessageIdAtOpen(_ id: String) {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         let nextJump = snQuotedJumpCleared(
             conversationId: id,
             jumps: jumpMessageIdAtOpenByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         let nextPending = snQuotedJumpCleared(
             conversationId: id,
             jumps: pendingJumpMessageIdByDM,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         guard nextJump != jumpMessageIdAtOpenByDM || nextPending != pendingJumpMessageIdByDM else { return }
         jumpMessageIdAtOpenByDM = nextJump
@@ -15867,15 +15882,20 @@ final class SonarAppStore: ObservableObject {
         if case .dm(let id)? = path.last {
             setUnreadCountAtOpen(id, count: nil)
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let remount = remountOpenedAndPane()
             jumpMessageIdAtOpenByDM = snQuotedJumpCleared(
                 conversationId: id,
                 jumps: jumpMessageIdAtOpenByDM,
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
             pendingJumpMessageIdByDM = snQuotedJumpCleared(
                 conversationId: id,
                 jumps: pendingJumpMessageIdByDM,
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
         }
         if !path.isEmpty { path.removeLast() }

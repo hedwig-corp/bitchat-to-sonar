@@ -3686,6 +3686,9 @@ struct SonarConversationFoldTests {
                 openedConversationPaneId: "marmot:group-08"
             ) == "parent-08"
         )
+        // Already-open shade tap / writeOpenConversationJump / pop /
+        // clearJumpMessageIdAtOpen must pass remount — persist-folds
+        // can still be empty while iPhone paints hist.
         #expect(
             snQuotedJumpWritten(
                 conversationId: "marmot:group-08",
