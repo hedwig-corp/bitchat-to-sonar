@@ -414,6 +414,25 @@ class HomeMessageRowsTest {
                 historicalFolds = mapOf("group-08" to "group-09"),
             )?.content,
         )
+        assertEquals(
+            "keep this chat",
+            latestHomeRowForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                summaryByChat = mapOf("group-08" to summary.copy(groupIdHex = "group-08")),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            )?.content,
+        )
+        assertNull(
+            latestHomeRowForChat(
+                chatId = "group-09",
+                messagesByChat = emptyMap(),
+                summaryByChat = mapOf("group-08" to summary.copy(groupIdHex = "group-08")),
+                historicalFolds = emptyMap(),
+            ),
+        )
     }
 
     @Test

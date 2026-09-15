@@ -3141,10 +3141,26 @@ internal fun transcriptSourceIds(
         val bare = id.removePrefix("marmot:")
         if (bare.isNotBlank()) out += bare
     }
-    out.addAll(foldFamilyIds(chatId, historicalFolds))
+    out.addAll(
+        foldFamilyIds(
+            chatId,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        ),
+    )
     for (id in remount) {
         val bare = id.removePrefix("marmot:")
-        if (bare.isNotBlank()) out.addAll(foldFamilyIds(bare, historicalFolds))
+        if (bare.isNotBlank()) {
+            out.addAll(
+                foldFamilyIds(
+                    bare,
+                    historicalFolds,
+                    openedConversationId,
+                    openedConversationPaneId,
+                ),
+            )
+        }
     }
     return out.toList()
 }
@@ -8968,19 +8984,28 @@ class SonarAppState(private val scope: CoroutineScope) {
         return rows.associate { chat ->
             val pending = isPendingSecureChat(chat.id)
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)
-            val unreadIds = transcriptSourceIds(chat.id, ids, historicalFoldMap)
-            val newest = if (pending) null else ids
-                .mapNotNull { id ->
-                    homeRowMessage(
-                        loaded = latestHomeRowMessage(
-                            visibleMessagesForChat(id, snapshotMessagesForChat(id)),
-                        ),
-                        summary = foldFamilyIds(id, historicalFoldMap)
-                            .mapNotNull { conversationSummaryByChat[it] }
-                            .maxByOrNull { it.latestAtSecs },
-                    )
-                }
-                .maxByOrNull { it.tsSecs }
+            val (opened, pane) = remountPairForOpenChat(chat.id)
+            val unreadIds = transcriptSourceIds(
+                chat.id,
+                ids,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+            val newest = if (pending) {
+                null
+            } else {
+                latestHomeRowForChat(
+                    chatId = chat.id,
+                    messagesByChat = unreadIds.associateWith { id ->
+                        visibleMessagesForChat(id, snapshotMessagesForChat(id))
+                    },
+                    summaryByChat = conversationSummaryByChat,
+                    historicalFolds = historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
+            }
             chat.id to MarmotRowModel(
                 id = chat.id,
                 title = chatTitle(chat),

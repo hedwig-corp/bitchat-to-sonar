@@ -308,6 +308,30 @@ func snMarmotHomeRowSummaryKnownNonEmpty(
 /// Home-only projection of the core conversation index. Transcript pages stay
 /// bounded and authoritative; a synthetic row is used only when the summary is
 /// newer than the loaded page (or that group is outside the page window).
+/// Newest index preview across a fold family. Empty persist-folds still
+/// use the remount pair so a hist `latest_at` paints the live home row
+/// before wake-mute writes the blob. Compose `latestHomeRowForChat`.
+func snHomeRowSummaryForChat(
+    groupId: String,
+    summaries: [String: MarmotService.ConversationSummary],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> MarmotService.ConversationSummary? {
+    let ids = snFoldFamilyIds(
+        id: groupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return ids.compactMap { summaries[$0] }.max { lhs, rhs in
+        if lhs.latestAt == rhs.latestAt {
+            return lhs.messageCount < rhs.messageCount
+        }
+        return lhs.latestAt < rhs.latestAt
+    }
+}
+
 func snMarmotHomeRowMessage(
     loaded: MarmotService.MarmotMessage?,
     summary: MarmotService.ConversationSummary?
@@ -3260,16 +3284,23 @@ final class MarmotChatModel: ObservableObject {
 
     func homeRowMessage(groupId: String) -> MarmotService.MarmotMessage? {
         let remount = remountOpenedAndPane()
+        let folds = historicalFoldsMap()
         return snMarmotHomeRowMessage(
             loaded: snFoldFamilyCachedMessages(
                 groupId: groupId,
                 messagesByGroup: messagesByGroup,
-                historicalFolds: historicalFoldsMap(),
+                historicalFolds: folds,
                 idOf: { $0.id },
                 openedConversationId: remount.opened,
                 openedConversationPaneId: remount.pane
             ).last,
-            summary: conversationSummariesByGroup[groupId]
+            summary: snHomeRowSummaryForChat(
+                groupId: groupId,
+                summaries: conversationSummariesByGroup,
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
         )
     }
 

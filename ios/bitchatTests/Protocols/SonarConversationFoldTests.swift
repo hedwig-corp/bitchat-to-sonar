@@ -1622,6 +1622,39 @@ struct SonarConversationFoldTests {
             unreadCount: 0
         )
         #expect(!snMarmotHomeRowSummaryKnownNonEmpty(emptyLatest))
+        let histSummary = MarmotService.ConversationSummary(
+            groupIdHex: "group-08",
+            name: "",
+            latestContent: "keep this chat",
+            latestSenderNpub: "npub1peer",
+            latestAt: Date(timeIntervalSince1970: 50),
+            latestMine: false,
+            messageCount: 80,
+            unreadCount: 4
+        )
+        #expect(
+            snHomeRowSummaryForChat(
+                groupId: "group-09",
+                summaries: ["group-08": histSummary],
+                historicalFolds: ["group-08": "group-09"]
+            )?.latestContent == "keep this chat"
+        )
+        #expect(
+            snHomeRowSummaryForChat(
+                groupId: "group-09",
+                summaries: ["group-08": histSummary],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )?.latestContent == "keep this chat"
+        )
+        #expect(
+            snHomeRowSummaryForChat(
+                groupId: "group-09",
+                summaries: ["group-08": histSummary],
+                historicalFolds: [:]
+            ) == nil
+        )
         #expect(snMarmotHomeRowMessage(loaded: nil, summary: emptyLatest) == nil)
         #expect(
             snBlankTranscriptFamilyRendered(

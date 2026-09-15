@@ -9177,9 +9177,15 @@ final class SonarAppStore: ObservableObject {
         in groups: [MarmotService.MarmotGroup]
     ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         var latest: (groupId: String, message: MarmotService.MarmotMessage)?
         for group in groups {
-            for alias in snFoldFamilyIds(id: group.id, historicalFolds: folds) {
+            for alias in snFoldFamilyIds(
+                id: group.id,
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            ) {
                 guard let message = snMarmotHomeRowMessage(
                     loaded: marmot.messagesByGroup[alias]?.max(by: {
                         if $0.createdAt == $1.createdAt { return $0.id < $1.id }
