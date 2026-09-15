@@ -464,6 +464,39 @@ class ConversationFoldTest {
                 latestSecs = { if (it == live.id) 2L else 1L },
             ),
         )
+        // Remount-walked latest ties hist+live; hist id can still win
+        // thenBy. Persist-other must not hide this remount.
+        assertEquals(
+            "group-09",
+            marmotSendTargetGroupId(
+                openChatId = "zzz-08",
+                duplicateGroupIds = listOf("zzz-08", "group-09"),
+                latestSecs = { if (it == "zzz-08") 2L else 1L },
+                historicalFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "zzz-08",
+            ),
+        )
+        assertEquals(
+            "zzz-08",
+            marmotSendTargetGroupId(
+                openChatId = "zzz-08",
+                duplicateGroupIds = listOf("zzz-08", "group-09"),
+                latestSecs = { if (it == "zzz-08") 2L else 1L },
+                historicalFolds = mapOf("other-08" to "other-09"),
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            marmotSendTargetGroupId(
+                openChatId = "group-08",
+                duplicateGroupIds = listOf("group-08", "stale-09", "group-09"),
+                latestSecs = { if (it == "group-09") 2L else 1L },
+                historicalFolds = mapOf("group-08" to "stale-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

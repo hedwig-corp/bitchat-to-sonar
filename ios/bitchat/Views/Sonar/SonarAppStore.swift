@@ -3672,6 +3672,33 @@ func snPreferredFoldedDirectMarmotGroupId(
     return nil
 }
 
+/// Compose `marmotSendTargetGroupId`: prefer persist/remount live among
+/// duplicate 1:1s, then newest-`latest_at` / id. Empty persist-folds
+/// without a remount pair stay newest-sort so first-resume is unchanged.
+func snMarmotSendTargetGroupId(
+    openGroupId: String,
+    duplicateGroupIds: [String],
+    latestSecs: [String: Int64],
+    historicalFolds: [String: String] = [:],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    if let preferred = snPreferredFoldedDirectMarmotGroupId(
+        groupIds: duplicateGroupIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        return preferred
+    }
+    return duplicateGroupIds.max { lhs, rhs in
+        let left = latestSecs[snBareMarmotGroupId(lhs)] ?? latestSecs[lhs] ?? 0
+        let right = latestSecs[snBareMarmotGroupId(rhs)] ?? latestSecs[rhs] ?? 0
+        if left != right { return left < right }
+        return lhs < rhs
+    } ?? openGroupId
+}
+
 /// Rewrite a staged preview onto the live sibling. Empty persist-folds
 /// still use the remount pair so confirmSendPreview does not send
 /// against a hist id FFI no longer lists.

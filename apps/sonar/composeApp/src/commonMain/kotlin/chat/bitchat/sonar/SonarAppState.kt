@@ -589,14 +589,27 @@ internal fun wakeNotificationNames(
     )
 }
 
-/** After an MDK 0.8→0.9 resume, send to the newest duplicate group so the
- *  recovered row stays the history bucket and the live 0.9 group takes traffic. */
+/** After an MDK 0.8→0.9 resume, send to the live duplicate so the recovered
+ *  row stays the history bucket. Newest-`latest_at` and `thenBy id` both
+ *  pick hist after remount: hist keeps the transcript, and remount-walked
+ *  [localLatestTsForChat] ties hist+live so lexicographic id is a coin
+ *  flip. Prefer persist/remount live among 1:1 candidates. Empty
+ *  persist-folds without a remount pair stay newest-sort so first-resume
+ *  is unchanged. iOS `preferredDirectMarmotGroup`. */
 internal fun marmotSendTargetGroupId(
     openChatId: String,
     duplicateGroupIds: List<String>,
     latestSecs: (String) -> Long,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String =
-    duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
+    preferredFoldedDirectMarmotChatId(
+        duplicateGroupIds,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    ) ?: duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
 
 /** Shared groups on a contact profile. Callers must pass the collapsed
  *  home list — raw [SonarChat] rows still include folded 0.8 hist. */
@@ -12023,10 +12036,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val echo = createSendEcho(chatId, t, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
+        val (opened, pane) = remountPairForOpenChat(chatId)
         val sendTarget = marmotSendTargetGroupId(
             chatId,
             directMarmotChatIds(chatId),
             ::localLatestTs,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
         scope.launch {
             runMarmotSendWithBestEffortReconciliation(
@@ -13028,7 +13045,15 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  text send already uses. */
     private fun resolveMarmotSendTargetGroupId(chatId: String): String? {
         val open = resolveMarmotGroupId(chatId) ?: return null
-        return marmotSendTargetGroupId(open, directMarmotChatIds(chatId), ::localLatestTs)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return marmotSendTargetGroupId(
+            open,
+            directMarmotChatIds(chatId),
+            ::localLatestTs,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
     }
 
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
