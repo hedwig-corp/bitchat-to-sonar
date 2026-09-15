@@ -854,6 +854,38 @@ struct SonarConversationFoldTests {
             ) == ["group-08", "group-09"]
         )
         #expect(
+            snRecoveredVerifiedIdsFromFolds(
+                folds: ["group-08": "group-09"],
+                verifiedIds: ["group-08"],
+                historicalBlobVerified: { _ in false }
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snRecoveredVerifiedIdsFromFolds(
+                folds: [:],
+                verifiedIds: ["group-08"],
+                historicalBlobVerified: { _ in false },
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snRecoveredVerifiedIdsFromFolds(
+                folds: [:],
+                verifiedIds: [],
+                historicalBlobVerified: { $0 == "group-08" },
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-08", "group-09"]
+        )
+        #expect(
+            snRecoveredVerifiedIdsFromFolds(
+                folds: [:],
+                verifiedIds: ["group-08"],
+                historicalBlobVerified: { _ in false }
+            ) == ["group-08"]
+        )
+        #expect(
             snCollapsedFoldedSnapshotGroups(
                 groups: ["group-08", "group-09"],
                 id: { $0 },

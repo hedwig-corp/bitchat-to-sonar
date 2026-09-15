@@ -1882,12 +1882,22 @@ internal fun <V> promotedFoldedComposerReplies(
 
 /** When FFI hides a folded 0.8 row, keep its safety-number verify on the live sibling. */
 /** Recover a verify flag left on a hidden 0.8 id after resume. Blobs have no
- *  enumeration, so probe only the hist→live pairs we already persisted. */
+ *  enumeration, so probe only the hist→live pairs we already persisted.
+ *  Empty persist-folds still use the remount pair so a hist verify
+ *  stamps live before the blob is rewritten. iOS
+ *  `snRecoveredVerifiedIdsFromFolds`. */
 internal fun recoveredVerifiedIdsFromFolds(
     folds: Map<String, String>,
     verifiedIds: Set<String>,
     historicalBlobVerified: (String) -> Boolean,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Set<String> {
+    val folds = remountPairHistoricalFolds(
+        folds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
     var next = verifiedIds
     for ((historical, live) in folds) {
         if (live.isBlank() || live == historical) continue
@@ -17011,10 +17021,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun promoteFoldedVerified(previousIds: Set<String>, currentIds: Set<String>) {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
         val recovered = recoveredVerifiedIdsFromFolds(
             folds = historicalFoldMap.toMap(),
             verifiedIds = verifiedChatIds.toSet(),
             historicalBlobVerified = { id -> SonarCore.loadBlob("verified.$id") == "1" },
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
         val next = promotedFoldedVerifiedIds(
             previousIds = previousIds,

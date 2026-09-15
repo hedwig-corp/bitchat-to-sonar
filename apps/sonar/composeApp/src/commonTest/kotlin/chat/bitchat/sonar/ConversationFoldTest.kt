@@ -4008,6 +4008,34 @@ class ConversationFoldTest {
                 historicalBlobVerified = { false },
             ),
         )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            recoveredVerifiedIdsFromFolds(
+                folds = emptyMap(),
+                verifiedIds = setOf("group-08"),
+                historicalBlobVerified = { false },
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            recoveredVerifiedIdsFromFolds(
+                folds = emptyMap(),
+                verifiedIds = emptySet(),
+                historicalBlobVerified = { it == "group-08" },
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertEquals(
+            setOf("group-08"),
+            recoveredVerifiedIdsFromFolds(
+                folds = emptyMap(),
+                verifiedIds = setOf("group-08"),
+                historicalBlobVerified = { false },
+            ),
+        )
     }
 
     @Test

@@ -1596,6 +1596,33 @@ func snPromotedFoldedMessagesByGroup<Message>(
     return next
 }
 
+/// Recover a verify flag left on a hidden 0.8 id after resume. Empty
+/// persist-folds still use the remount pair so a hist verify stamps
+/// live before the blob is rewritten. Compose
+/// `recoveredVerifiedIdsFromFolds`.
+func snRecoveredVerifiedIdsFromFolds(
+    folds: [String: String],
+    verifiedIds: Set<String>,
+    historicalBlobVerified: (String) -> Bool,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: folds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    var next = verifiedIds
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        if next.contains(historical) || historicalBlobVerified(historical) {
+            next.insert(historical)
+            next.insert(live)
+        }
+    }
+    return next
+}
+
 /// When FFI hides a folded 0.8 row, keep its safety-number verify on the live sibling.
 func snPromotedFoldedVerifiedIds(
     previousGroupIds: Set<String>,
@@ -11318,8 +11345,23 @@ final class SonarAppStore: ObservableObject {
                 verifiedGroupIds.insert(key.lowercased())
             }
         }
-        var targets: [String: String] = [:]
-        for historical in previous.union(verifiedGroupIds).subtracting(current) {
+        let remount = remountOpenedAndPane()
+        let persistedFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let recovered = snRecoveredVerifiedIdsFromFolds(
+            folds: persistedFolds,
+            verifiedIds: verifiedGroupIds,
+            historicalBlobVerified: { id in
+                marmotVerified[id] == true || marmotVerified[Self.marmotIDPrefix + id] == true
+            },
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        var targets: [String: String] = snRemountPairHistoricalFolds(
+            historicalFolds: persistedFolds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        for historical in previous.union(recovered).subtracting(current) {
             if let live = await resolvedLiveFoldTarget(for: historical) {
                 targets[historical] = live
             }
@@ -11327,7 +11369,7 @@ final class SonarAppStore: ObservableObject {
         let next = snPromotedFoldedVerifiedIds(
             previousGroupIds: previous,
             currentGroupIds: current,
-            verifiedIds: verifiedGroupIds,
+            verifiedIds: recovered,
             liveFoldTarget: { targets[$0] }
         )
         var changed = false
