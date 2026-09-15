@@ -3749,6 +3749,36 @@ struct SonarConversationFoldTests {
             ) == ["group-08": true, "group-09": true]
         )
         #expect(
+            snPromotedFoldedPagingFlags(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                flags: ["group-08": true],
+                liveFoldTarget: {
+                    snResolvedLiveFoldTarget(
+                        groupId: $0,
+                        historicalFolds: [:],
+                        ffiLiveFoldTarget: nil,
+                        openedConversationId: "group-09",
+                        openedConversationPaneId: "group-08"
+                    )
+                }
+            )["group-09"] == true
+        )
+        #expect(
+            snPromotedFoldedPagingFlags(
+                previousGroupIds: ["group-08", "group-09"],
+                currentGroupIds: ["group-09"],
+                flags: ["group-08": true],
+                liveFoldTarget: {
+                    snResolvedLiveFoldTarget(
+                        groupId: $0,
+                        historicalFolds: [:],
+                        ffiLiveFoldTarget: nil
+                    )
+                }
+            )["group-09"] == nil
+        )
+        #expect(
             snPromotedFoldedPagingCursors(
                 previousGroupIds: ["group-08"],
                 currentGroupIds: ["group-09"],

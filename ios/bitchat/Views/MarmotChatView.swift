@@ -3189,19 +3189,20 @@ final class MarmotChatModel: ObservableObject {
             // after they finish, then merge each result into that latest state in
             // one main-actor segment. A summary refresh can therefore never
             // publish a stale dictionary over a page/open/new-message update.
+            let remountLiveTarget: (String) -> String? = {
+                snResolvedLiveFoldTarget(
+                    groupId: $0,
+                    historicalFolds: folds,
+                    ffiLiveFoldTarget: nil,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
+            }
             var byGroup = snPromotedFoldedMessagesByGroup(
                 previousGroupIds: Set(messagesByGroup.keys),
                 currentGroupIds: activeGroupIds,
                 messagesByGroup: messagesByGroup,
-                liveFoldTarget: {
-                    snResolvedLiveFoldTarget(
-                        groupId: $0,
-                        historicalFolds: folds,
-                        ffiLiveFoldTarget: nil,
-                        openedConversationId: remount.opened,
-                        openedConversationPaneId: remount.pane
-                    )
-                },
+                liveFoldTarget: remountLiveTarget,
                 idOf: { $0.id }
             )
             var freshRowsByGroup: [String: [MarmotService.MarmotMessage]] = [:]
@@ -3257,7 +3258,7 @@ final class MarmotChatModel: ObservableObject {
             promoteFoldedLocalTranscriptPaging(
                 from: Set(messagesByGroup.keys),
                 to: activeGroupIds,
-                liveFoldTarget: { snPersistedLiveFoldTarget(groupId: $0, historicalFolds: folds) }
+                liveFoldTarget: remountLiveTarget
             )
             if SNUnreadCounts.shouldPublish(summaries), let summaries {
                 self.publishUnread(from: summaries)

@@ -4018,6 +4018,33 @@ class ConversationFoldTest {
                 liveFoldTarget = { if (it == "group-08") "group-09" else null },
             ),
         )
+        val remountTarget = { id: String ->
+            resolvedLiveFoldTarget(
+                groupId = id,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            )
+        }
+        assertEquals(
+            mapOf("group-08" to true, "group-09" to true),
+            promotedFoldedPagingFlags(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                flags = mapOf("group-08" to true),
+                liveFoldTarget = remountTarget,
+            ),
+        )
+        assertEquals(
+            mapOf("group-08" to true),
+            promotedFoldedPagingFlags(
+                previousIds = setOf("group-08", "group-09"),
+                currentIds = setOf("group-09"),
+                flags = mapOf("group-08" to true),
+                liveFoldTarget = { resolvedLiveFoldTarget(it, emptyMap()) },
+            ),
+            "empty persist-folds without remount pair stay hist",
+        )
     }
 
     @Test
