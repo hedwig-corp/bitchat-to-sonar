@@ -804,6 +804,70 @@ class ConversationFoldTest {
                 ) ?: id
             },
         )
+        // After remount hop, iPhone still paints hist and can push
+        // group-info / contact-profile from that pane. A new push must
+        // remap onto live. Persist-other must not hide this remount.
+        assertEquals(
+            "marmot:group-09",
+            pushedConversationRouteId(
+                "marmot:group-08",
+                persistedFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "marmot:group-08",
+            pushedConversationRouteId(
+                "marmot:group-08",
+                persistedFolds = mapOf("other-08" to "other-09"),
+            ),
+        )
+        assertEquals(
+            "marmot:stale-09",
+            pushedConversationRouteId(
+                "marmot:group-08",
+                persistedFolds = mapOf("group-08" to "stale-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            Screen.GroupInfo("marmot:group-09"),
+            remountPushedScreen(
+                Screen.GroupInfo("marmot:group-08"),
+                persistedFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            Screen.ContactProfile("marmot:group-09", "Ada"),
+            remountPushedScreen(
+                Screen.ContactProfile("marmot:group-08", "Ada"),
+                persistedFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            Screen.Chat("marmot:group-08", "Ada"),
+            remountPushedScreen(
+                Screen.Chat("marmot:group-08", "Ada"),
+                persistedFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            Screen.Call("marmot:group-08", "Ada", false),
+            remountPushedScreen(
+                Screen.Call("marmot:group-08", "Ada", false),
+                persistedFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertTrue(
             deletedConversationClearsOpen(
                 openId = "marmot:group-08",

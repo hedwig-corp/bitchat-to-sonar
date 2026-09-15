@@ -730,6 +730,67 @@ func snPathRemountLiveTarget(
     return persistedFolds[bare]
 }
 
+/// After remount hop, iPhone still paints `.dm(hist)` and can push
+/// group-info / contact-profile from that pane. Path remount already
+/// rewrote routes that were on the stack at hop; a new push must remap
+/// the same way. Persist hist→stale still wins (R-045). Empty without
+/// a remount pair stays hist. Do not remount `.dm` — the painted pane
+/// stays hist. Compose `pushedConversationRouteId`.
+func snPushedConversationRouteId(
+    id: String,
+    persistedFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    guard let live = snPathRemountLiveTarget(
+        id: id,
+        persistedFolds: persistedFolds,
+        knownLiveTargets: [:],
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ), !live.isEmpty else {
+        return id
+    }
+    let bare = snBareMarmotGroupId(id, prefix: prefix)
+    let liveBare = snBareMarmotGroupId(live, prefix: prefix)
+    if liveBare.isEmpty || liveBare == bare { return id }
+    if id.hasPrefix(prefix) { return prefix + liveBare }
+    return liveBare
+}
+
+/// Remap group-info / contact-profile onto live. Leave `.dm` / `.call`
+/// alone — the painted pane stays hist; `activeCall.convId` stays hist
+/// so BLE signaling still resolves. Compose `remountPushedScreen`.
+func snRemountPushedRoute(
+    _ route: SonarRoute,
+    persistedFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> SonarRoute {
+    switch route {
+    case .groupInfo(let id):
+        return .groupInfo(snPushedConversationRouteId(
+            id: id,
+            persistedFolds: persistedFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ))
+    case .contactProfile(let id, let name):
+        return .contactProfile(
+            snPushedConversationRouteId(
+                id: id,
+                persistedFolds: persistedFolds,
+                openedConversationId: openedConversationId,
+                openedConversationPaneId: openedConversationPaneId
+            ),
+            name
+        )
+    default:
+        return route
+    }
+}
+
 func snPathConversationIds(_ path: [SonarRoute]) -> [String] {
     path.compactMap { route in
         switch route {
@@ -15503,6 +15564,17 @@ final class SonarAppStore: ObservableObject {
     // MARK: Navigation
 
     func push(_ route: SonarRoute) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        // After remount hop, iPhone still paints `.dm(hist)` and can
+        // push group-info / contact-profile from that pane. Remap those
+        // onto live. `.dm` / `.call` stay on the painted id.
+        let route = snRemountPushedRoute(
+            route,
+            persistedFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
         if case .dm(let id) = route, currentDMId != id {
             cleanupPreviewTempFiles()
         }

@@ -823,6 +823,59 @@ internal fun pathRemountLiveTarget(
     return persistedFolds[bare]
 }
 
+/** After remount hop, iPhone still paints hist and can push group-info
+ *  / contact-profile from that pane. Path remount already rewrote routes
+ *  that were on the stack at hop; a new push must remap the same way.
+ *  Persist hist→stale still wins (R-045). Empty without a remount pair
+ *  stays hist. Do not remount `Screen.Chat` — the painted pane stays hist.
+ *  iOS `snPushedConversationRouteId`. */
+internal fun pushedConversationRouteId(
+    id: String,
+    persistedFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    val live = pathRemountLiveTarget(
+        id = id,
+        persistedFolds = persistedFolds,
+        knownLiveTargets = emptyMap(),
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    ) ?: return id
+    val bare = id.removePrefix("marmot:").trim()
+    val liveBare = live.removePrefix("marmot:").trim()
+    if (liveBare.isEmpty() || liveBare == bare) return id
+    return if (id.startsWith("marmot:")) "marmot:$liveBare" else liveBare
+}
+
+/** Remap group-info / contact-profile onto live. Leave Chat / Call /
+ *  other routes alone — Chat pane identity stays hist; Call keeps the
+ *  painted id so BLE signaling still resolves. iOS `snRemountPushedRoute`. */
+internal fun remountPushedScreen(
+    screen: Screen,
+    persistedFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Screen {
+    fun remap(id: String) = pushedConversationRouteId(
+        id,
+        persistedFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    return when (screen) {
+        is Screen.GroupInfo -> {
+            val live = remap(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        is Screen.ContactProfile -> {
+            val live = remap(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        else -> screen
+    }
+}
+
 internal fun pathRemountShouldMergeFolds(
     pathIds: Collection<String>,
     persistedFolds: Map<String, String>,
@@ -4624,14 +4677,27 @@ class SonarAppState(private val scope: CoroutineScope) {
     var chatOpenBenchMark: kotlin.time.TimeSource.Monotonic.ValueTimeMark? = null
 
     fun push(s: Screen) {
-        if (s is Screen.Chat && (screen as? Screen.Chat)?.id != s.id) {
+        val routeId = when (s) {
+            is Screen.GroupInfo -> s.chatId
+            is Screen.ContactProfile -> s.chatId
+            else -> null
+        }
+        val next = if (routeId == null) {
+            s
+        } else {
+            val fromRoute = remountPairForOpenChat(routeId)
+            val fromOpen = remountPairForOpenChat((screen as? Screen.Chat)?.id.orEmpty())
+            val (opened, pane) = if (fromRoute.first != null) fromRoute else fromOpen
+            remountPushedScreen(s, historicalFoldMap, opened, pane)
+        }
+        if (next is Screen.Chat && (screen as? Screen.Chat)?.id != next.id) {
             cleanupPreviewTempFiles()
             if (sonarBenchMarkersEnabled) {
                 chatOpenBenchMark = kotlin.time.TimeSource.Monotonic.markNow()
             }
         }
-        if (callOverlay && s is Screen.Call) return
-        stack = stack + s
+        if (callOverlay && next is Screen.Call) return
+        stack = stack + next
     }
 
     /**

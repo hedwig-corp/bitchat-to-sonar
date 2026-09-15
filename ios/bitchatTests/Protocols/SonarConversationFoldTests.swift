@@ -214,6 +214,63 @@ struct SonarConversationFoldTests {
                 }
             ) == [.groupInfo("marmot:group-09")]
         )
+        // After remount hop, iPhone still paints hist and can push
+        // group-info / contact-profile from that pane. A new push must
+        // remap onto live. Persist-other must not hide this remount.
+        #expect(
+            snPushedConversationRouteId(
+                id: "marmot:group-08",
+                persistedFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snPushedConversationRouteId(
+                id: "marmot:group-08",
+                persistedFolds: ["other-08": "other-09"]
+            ) == "marmot:group-08"
+        )
+        #expect(
+            snPushedConversationRouteId(
+                id: "marmot:group-08",
+                persistedFolds: ["group-08": "stale-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "marmot:stale-09"
+        )
+        #expect(
+            snRemountPushedRoute(
+                .groupInfo("marmot:group-08"),
+                persistedFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == .groupInfo("marmot:group-09")
+        )
+        #expect(
+            snRemountPushedRoute(
+                .contactProfile("marmot:group-08", "Ada"),
+                persistedFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == .contactProfile("marmot:group-09", "Ada")
+        )
+        #expect(
+            snRemountPushedRoute(
+                .dm("marmot:group-08"),
+                persistedFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == .dm("marmot:group-08")
+        )
+        #expect(
+            snRemountPushedRoute(
+                .call("marmot:group-08", video: false),
+                persistedFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == .call("marmot:group-08", video: false)
+        )
         #expect(snDeletedConversationClearsOpen(
             openId: "marmot:group-08",
             deletedId: "marmot:group-09",
