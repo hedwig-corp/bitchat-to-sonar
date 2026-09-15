@@ -360,6 +360,24 @@ struct SonarConversationFoldTests {
             ) == nil
         )
         #expect(
+            snNotificationLiveFoldTarget(
+                tappedGroupId: "group-08",
+                ffiLiveFoldTarget: nil,
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snNotificationLiveFoldTarget(
+                tappedGroupId: "group-08",
+                ffiLiveFoldTarget: nil,
+                historicalFolds: ["group-08": "stale-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "stale-09"
+        )
+        #expect(
             snConversationsMatchFoldFamily(
                 left: "marmot:group-08",
                 right: "marmot:group-09",

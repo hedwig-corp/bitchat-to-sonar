@@ -159,6 +159,36 @@ class SonarNotificationHandoffTest {
                 ffiLiveFoldTarget = null,
             ),
         )
+        val fromRemount = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = "marmot:group-08",
+            persistedFolds = emptyMap(),
+            ffiLiveFoldTarget = null,
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("group-09", fromRemount["group-08"])
+        assertEquals("group-09", fromRemount["marmot:group-08"])
+        assertEquals(
+            SonarNotificationOpenTarget.Chat("group-09"),
+            SonarNotificationHandoff.resolveOpenTarget(
+                conversationId = "marmot:group-08",
+                knownChatIds = setOf("group-09"),
+                foldedGroupPeerIds = emptyMap(),
+                foldedGroupIds = emptySet(),
+                liveFoldTargets = fromRemount,
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            SonarNotificationHandoff.notificationLiveFoldTargets(
+                conversationId = "group-08",
+                persistedFolds = mapOf("group-08" to "stale-09"),
+                ffiLiveFoldTarget = null,
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            )["group-08"],
+            "persist-folds win over remount pair",
+        )
     }
 
     @Test

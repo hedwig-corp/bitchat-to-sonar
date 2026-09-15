@@ -45,11 +45,16 @@ object SonarNotificationHandoff {
      * Cold-start shade taps still name the hidden 0.8 id. FFI
      * `liveFoldTarget` is empty until the engine is up, but the host already
      * persisted hist→live in [sonar.historicalFolds]. FFI wins when present.
+     * Mid-session remount (persist-folds still empty) walks the remount
+     * pair last. NSE / killed-app omit remount and stay persist-only.
+     * iOS `snNotificationLiveFoldTarget`.
      */
     fun notificationLiveFoldTargets(
         conversationId: String,
         persistedFolds: Map<String, String>,
         ffiLiveFoldTarget: String?,
+        openedConversationId: String? = null,
+        openedConversationPaneId: String? = null,
     ): Map<String, String> {
         val aliases = conversationIdAliases(conversationId)
         if (aliases.isEmpty()) return emptyMap()
@@ -63,6 +68,17 @@ object SonarNotificationHandoff {
             persistedFolds[alias]?.let { remember(it) }
         }
         ffiLiveFoldTarget?.trim()?.takeIf { it.isNotEmpty() }?.let { remember(it) }
+        if (targets.isNotEmpty()) return targets
+        val folds = remountPairHistoricalFolds(
+            persistedFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+        for (alias in aliases) {
+            val bare = alias.removePrefix("marmot:")
+            folds[bare]?.let { remember(it) }
+            folds[alias]?.let { remember(it) }
+        }
         return targets
     }
 

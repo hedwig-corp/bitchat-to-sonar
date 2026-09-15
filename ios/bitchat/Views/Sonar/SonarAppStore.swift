@@ -414,20 +414,37 @@ func snPersistedLiveFoldTarget(
     return nil
 }
 
-/// FFI wins when the engine is up; otherwise the host blob.
+/// FFI wins when the engine is up; otherwise the host blob. Mid-session
+/// remount (persist-folds still empty) walks the remount pair last.
+/// NSE / killed-app omit remount and stay persist-only.
+/// Compose `notificationLiveFoldTargets`.
 func snNotificationLiveFoldTarget(
     tappedGroupId: String,
     ffiLiveFoldTarget: String?,
     historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
     prefix: String = "marmot:"
 ) -> String? {
     if let ffi = ffiLiveFoldTarget?.trimmingCharacters(in: .whitespacesAndNewlines),
        !ffi.isEmpty {
         return snBareMarmotGroupId(ffi, prefix: prefix)
     }
-    return snPersistedLiveFoldTarget(
+    if let persisted = snPersistedLiveFoldTarget(
         tappedGroupId: tappedGroupId,
         historicalFolds: historicalFolds,
+        prefix: prefix
+    ) {
+        return persisted
+    }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return snPersistedLiveFoldTarget(
+        tappedGroupId: tappedGroupId,
+        historicalFolds: folds,
         prefix: prefix
     )
 }
@@ -15582,10 +15599,13 @@ final class SonarAppStore: ObservableObject {
 
         func resolve() async -> (folds: [String: String], remounted: String, listed: Set<String>) {
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let remount = remountOpenedAndPane()
             let live = snNotificationLiveFoldTarget(
                 tappedGroupId: groupId,
                 ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId),
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
             let remounted = snNotificationOpenGroupId(
                 tappedGroupId: groupId,
@@ -15716,9 +15736,13 @@ final class SonarAppStore: ObservableObject {
             return (id, nil)
         }
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
-        if let live = snPersistedLiveFoldTarget(
+        let remount = remountOpenedAndPane()
+        if let live = snNotificationLiveFoldTarget(
             tappedGroupId: marmotGroupId(id) ?? id,
-            historicalFolds: folds
+            ffiLiveFoldTarget: nil,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         ) {
             if let row = dmRows.first(where: {
                 $0.marmotGroupId == live || $0.id == Self.marmotIDPrefix + live

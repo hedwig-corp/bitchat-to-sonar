@@ -9601,10 +9601,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         val foldLookup = conversationId.removePrefix("marmot:")
         val liveFold = runCatching { SonarCore.liveFoldTarget(foldLookup) }.getOrNull()
             ?: runCatching { SonarCore.liveFoldTarget(conversationId) }.getOrNull()
+        val openId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = openId?.let { remountPairForOpenChat(it) }
+            ?: remountPairForOpenChat(activeTranscriptChatId ?: "")
         val liveFoldTargets = SonarNotificationHandoff.notificationLiveFoldTargets(
             conversationId = conversationId,
             persistedFolds = historicalFoldMap,
             ffiLiveFoldTarget = liveFold,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
         val target = SonarNotificationHandoff.resolveOpenTarget(
             conversationId = conversationId,
@@ -9613,8 +9618,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = foldedGroupIds,
             liveFoldTargets = liveFoldTargets,
         ) ?: return false
-        val openId = (screen as? Screen.Chat)?.id
-        val (opened, pane) = openId?.let { remountPairForOpenChat(it) } ?: (null to null)
         // Viewing recovered hist + tap live: persist-folds can still be
         // empty, so resolve would `openChat(live)` and remount. Merge
         // first (same gate as willPresent), then Jump in place.
