@@ -1388,16 +1388,27 @@ internal fun pagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>): Set<String
 
 /** Newest-page these hidden siblings before cursor-paging. Walk listed
  *  live ids only — passing hist would newest-page a remounted live
- *  extract and snap. iOS `loadOlderLocalPage` hidden-sibling preflight. */
+ *  extract and snap. Empty persist-folds still union the remount pair.
+ *  iOS `loadOlderLocalPage` hidden-sibling preflight. */
 internal fun loadOlderHiddenSiblingsNeedingNewestPage(
     listedLiveIds: Collection<String>,
     historicalFolds: Map<String, String>,
     pagedGroupIds: Set<String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<String> {
     val out = linkedSetOf<String>()
     for (listed in listedLiveIds) {
         if (listed.isBlank()) continue
-        out.addAll(hiddenFoldFamilyIdsNeedingPage(listed, historicalFolds, pagedGroupIds))
+        out.addAll(
+            hiddenFoldFamilyIdsNeedingPage(
+                listed,
+                historicalFolds,
+                pagedGroupIds,
+                openedConversationId,
+                openedConversationPaneId,
+            ),
+        )
     }
     return out.sorted()
 }
@@ -1405,14 +1416,22 @@ internal fun loadOlderHiddenSiblingsNeedingNewestPage(
 /** After hidden siblings have a newest page, older-page each sibling that
  *  still has remainder — with that sibling's own cursor. Persist-folds
  *  live FFI has no hist rows; paging live with a borrowed hist cursor
- *  returns empty and bak stays stuck. iOS `snLoadOlderFamilyPageIds`. */
+ *  returns empty and bak stays stuck. Empty persist-folds still union
+ *  the remount pair. iOS `snLoadOlderFamilyPageIds`. */
 internal fun loadOlderFamilyPageIds(
     openGroupId: String,
     historicalFolds: Map<String, String>,
     hasOlderByGroup: Map<String, Boolean>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<String> {
     if (openGroupId.isBlank()) return emptyList()
-    val family = foldFamilyIds(openGroupId, historicalFolds)
+    val family = echoReconcileFamilyIds(
+        openGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     val ids = if (family.isEmpty()) listOf(openGroupId) else family.toList()
     return ids.filter { hasOlderByGroup[it] == true }.sorted()
 }
@@ -1420,38 +1439,65 @@ internal fun loadOlderFamilyPageIds(
 /** Wait for a fold-family sibling that is already paging, not only the
  *  listed live id. Persist-folds load-older on live while hist is
  *  newest-paging returns false immediately if we only watch [openGroupId].
+ *  Empty persist-folds still union the remount pair.
  *  iOS `snLoadOlderBusyRetryShouldWait`. */
 internal fun loadOlderBusyRetryShouldWait(
     openGroupId: String,
     loadingGroupIds: Set<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     val open = openGroupId.trim()
     if (open.isEmpty() || loadingGroupIds.isEmpty()) return false
-    val family = foldFamilyIds(open, historicalFolds).ifEmpty { setOf(open) }
-    return family.any { it in loadingGroupIds }
+    val family = echoReconcileFamilyIds(
+        open,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(open) }
+    return family.any { sibling ->
+        sibling in loadingGroupIds ||
+            loadingGroupIds.any { openedConversationIdMatches(sibling, it) }
+    }
 }
 
 /** Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
  *  hist onto live and drops the hist cache key; paging maps keep hist
- *  once it has been paged. iOS `snHiddenFoldFamilyNeedsPage`. */
+ *  once it has been paged. Empty persist-folds still union the remount
+ *  pair so an empty 0.9 room is not stuck on “Say hi”. Never newest-page
+ *  the remounted live extract (R-045). iOS `snHiddenFoldFamilyNeedsPage`. */
 internal fun hiddenFoldFamilyNeedsPage(
     groupId: String,
     historicalFolds: Map<String, String>,
     pagedGroupIds: Set<String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean = hiddenFoldFamilyIdsNeedingPage(
     groupId,
     historicalFolds,
     pagedGroupIds,
+    openedConversationId,
+    openedConversationPaneId,
 ).isNotEmpty()
 
 internal fun hiddenFoldFamilyIdsNeedingPage(
     groupId: String,
     historicalFolds: Map<String, String>,
     pagedGroupIds: Set<String>,
-): List<String> = foldFamilyIds(groupId, historicalFolds)
-    .filter { it != groupId && it !in pagedGroupIds }
-    .sorted()
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> = echoReconcileFamilyIds(
+    groupId,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).filter { sibling ->
+    !openedConversationIdMatches(sibling, groupId) &&
+        sibling !in pagedGroupIds &&
+        pagedGroupIds.none { openedConversationIdMatches(sibling, it) } &&
+        !openedConversationIdMatches(sibling, openedConversationId)
+}.sorted()
 
 /** This source has no paging key and no cached rows. Newest-page it
  *  (iOS `snFoldFamilySourceNeedsNewestPage`). A remounted live id with
@@ -1468,16 +1514,27 @@ internal fun foldFamilySourceNeedsNewestPage(
  *  Still newest-page hist so an empty 0.9 room is not stuck on “Say hi”.
  *  A mesh route id (`mesh:<peer>`) is not a fold-family key — pass
  *  [familySourceIds] from `transcriptGroupIds` / `meshFoldTranscriptSourceIds`.
+ *  Empty persist-folds still union the remount pair.
  *  iOS `pageUnpagedHiddenFoldFamily` resolves `marmotGroupId` first. */
 internal fun shouldPageHiddenFoldFamilyForOpenLive(
     openChatId: String,
     historicalFolds: Map<String, String>,
     pagedGroupIds: Set<String>,
     familySourceIds: Collection<String> = emptyList(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean = (listOf(openChatId) + familySourceIds)
     .filter { it.isNotBlank() }
     .distinct()
-    .any { hiddenFoldFamilyNeedsPage(it, historicalFolds, pagedGroupIds) }
+    .any {
+        hiddenFoldFamilyNeedsPage(
+            it,
+            historicalFolds,
+            pagedGroupIds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+    }
 
 /** Load-older pages missing family windows first, then used to bail when
  *  the painted feed was empty — empty live rooms never mount that list.
@@ -1490,7 +1547,8 @@ internal fun loadOlderEmptyPaintShouldPublishFamily(
 /** True when any fold-family id still has an older local page, or when the
  *  unioned host cache itself overflows the painted page.
  *  `unpagedHiddenSibling` is the persist-folds window: host remounted
- *  onto live before hist had a newest page (R-045 — do not invent a fold). */
+ *  onto live before hist had a newest page (R-045 — do not invent a fold).
+ *  Empty persist-folds still union the remount pair. */
 internal fun hasOlderForFoldFamily(
     groupId: String,
     hasMoreById: Map<String, Boolean>,
@@ -1498,11 +1556,23 @@ internal fun hasOlderForFoldFamily(
     cachedCount: Int = 0,
     pageSize: Int = 0,
     unpagedHiddenSibling: Boolean = false,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     if (unpagedHiddenSibling) return true
     if (foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)) return true
-    return foldFamilyIds(groupId, historicalFolds).ifEmpty { setOf(groupId) }
-        .any { hasMoreById[it] == true }
+    return echoReconcileFamilyIds(
+        groupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(groupId) }
+        .any { sibling ->
+            hasMoreById[sibling] == true ||
+                hasMoreById.entries.any {
+                    it.value && openedConversationIdMatches(sibling, it.key)
+                }
+        }
 }
 
 /** Promote load-older flags from a hidden 0.8 id onto the listed live sibling. */
@@ -5895,12 +5965,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun seedFoldFamilyTranscriptWindows(chatId: String, snapshot: List<SonarMsg>) {
         val rows = firstOpenFoldFamilySeedRows(snapshot)
         if (rows.isEmpty()) return
+        val (opened, pane) = remountPairForOpenChat(chatId)
         val hasMore = seededFoldFamilyTranscriptHasMore(
             cachedCount = rows.size,
             familyHasOlder = hasOlderForFoldFamily(
                 chatId,
                 transcriptWindows.mapValues { it.value.hasMore },
                 historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             ),
         )
         val window = TranscriptGroupWindow(rows = rows, hasMore = hasMore)
@@ -15340,7 +15413,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun transcriptWindowHasMore(groupId: String): Boolean {
         val window = transcriptWindows[groupId]
-        val cachedCount = foldFamilyIds(groupId, historicalFoldMap).ifEmpty { setOf(groupId) }
+        val (opened, pane) = remountPairForOpenChat(groupId)
+        val cachedCount = echoReconcileFamilyIds(
+            groupId,
+            historicalFoldMap,
+            opened,
+            pane,
+        ).ifEmpty { setOf(groupId) }
             .flatMap { transcriptWindows[it]?.rows.orEmpty() }
             .distinctBy { it.id }
             .size
@@ -15355,7 +15434,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     groupId,
                     historicalFoldMap,
                     pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys),
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
                 ),
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
     }
 
@@ -15458,6 +15541,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
         val groupIds = transcriptGroupIds(chatId)
         val folds = historicalFoldMap
+        val (opened, pane) = remountPairForOpenChat(chatId)
         var busyWait = 0
         while (
             busyWait < 21 &&
@@ -15465,6 +15549,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 chatId,
                 transcriptWindows.filter { it.value.loadingOlder }.keys,
                 folds,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
         ) {
             delay(50)
@@ -15477,6 +15563,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             groupIds.filter { it in listed },
             historicalFoldMap,
             paged,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )) {
             refreshTranscriptGroupWindow(sibling, chatId, generation)
             if (!isCurrentTranscriptSession(chatId, generation)) return false
@@ -16891,11 +16979,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun pageHiddenFoldFamilyForOpenLiveChat() {
         val sc = screen as? Screen.Chat ?: return
         val familyIds = transcriptGroupIds(sc.id)
+        val (opened, pane) = remountPairForOpenChat(sc.id)
         if (!shouldPageHiddenFoldFamilyForOpenLive(
                 sc.id,
                 historicalFoldMap,
                 pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys),
                 familyIds,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
         ) return
         val chatId = sc.id

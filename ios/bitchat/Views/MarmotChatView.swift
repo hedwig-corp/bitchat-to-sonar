@@ -2885,10 +2885,13 @@ final class MarmotChatModel: ObservableObject {
         ) {
             return await loadLocalPage(groupId: groupId, mode: .newestPage)
         }
+        let remount = remountOpenedAndPane()
         let unpaged = snLoadOlderHiddenSiblingsNeedingNewestPage(
             listedLiveIds: [groupId],
             historicalFolds: folds,
-            pagedGroupIds: paged
+            pagedGroupIds: paged,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         var addedHidden = false
         for sibling in unpaged {
@@ -2913,7 +2916,9 @@ final class MarmotChatModel: ObservableObject {
         let pageIds = snLoadOlderFamilyPageIds(
             openGroupId: groupId,
             historicalFolds: folds,
-            hasOlderByGroup: localTranscriptHasOlderByGroup
+            hasOlderByGroup: localTranscriptHasOlderByGroup,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         var addedAny = false
         for sibling in pageIds {
@@ -2998,10 +3003,13 @@ final class MarmotChatModel: ObservableObject {
     func loadOlderLocalPageWhenAvailable(groupId: String) async -> Bool {
         for attempt in 0..<Self.localTranscriptBusyRetryLimit {
             if await loadOlderLocalPage(groupId: groupId) { return true }
+            let remount = remountOpenedAndPane()
             guard snLoadOlderBusyRetryShouldWait(
                 openGroupId: groupId,
                 loadingGroupIds: localTranscriptLoadingGroups,
-                historicalFolds: historicalFoldsMap()
+                historicalFolds: historicalFoldsMap(),
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             ), attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
             do {
                 try await Task.sleep(nanoseconds: 50_000_000)
@@ -3040,6 +3048,7 @@ final class MarmotChatModel: ObservableObject {
 
     func hasOlderLocalMessages(groupId: String) -> Bool {
         let folds = historicalFoldsMap()
+        let remount = remountOpenedAndPane()
         return snFoldFamilyHasOlder(
             groupId: groupId,
             hasOlderByGroup: localTranscriptHasOlderByGroup,
@@ -3047,8 +3056,12 @@ final class MarmotChatModel: ObservableObject {
             unpagedHiddenSibling: snHiddenFoldFamilyNeedsPage(
                 groupId: groupId,
                 historicalFolds: folds,
-                pagedGroupIds: pagedLocalTranscriptGroupIds()
-            )
+                pagedGroupIds: pagedLocalTranscriptGroupIds(),
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            ),
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
     }
 

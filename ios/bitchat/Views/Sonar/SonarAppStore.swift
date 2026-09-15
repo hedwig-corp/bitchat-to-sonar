@@ -1191,15 +1191,23 @@ func snPagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>) -> Set<String> {
 /// After hidden siblings have a newest page, older-page each sibling that
 /// still has remainder — with that sibling's own cursor. Persist-folds
 /// live FFI has no hist rows; paging live with a borrowed hist cursor
-/// returns empty and bak stays stuck. Compose `loadOlderFamilyPageIds`.
+/// returns empty and bak stays stuck. Empty persist-folds still union
+/// the remount pair. Compose `loadOlderFamilyPageIds`.
 func snLoadOlderFamilyPageIds(
     openGroupId: String,
     historicalFolds: [String: String],
-    hasOlderByGroup: [String: Bool]
+    hasOlderByGroup: [String: Bool],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     let trimmed = openGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return [] }
-    let family = snFoldFamilyIds(id: trimmed, historicalFolds: historicalFolds)
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: trimmed,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     let ids = family.isEmpty ? [trimmed] : Array(family)
     return ids.filter { hasOlderByGroup[$0] == true }.sorted()
 }
@@ -1207,33 +1215,49 @@ func snLoadOlderFamilyPageIds(
 /// Wait for a fold-family sibling that is already paging, not only the
 /// listed live id. Persist-folds load-older on live while hist is
 /// newest-paging returns false immediately if we only watch `openGroupId`.
+/// Empty persist-folds still union the remount pair.
 /// Compose `loadOlderBusyRetryShouldWait`.
 func snLoadOlderBusyRetryShouldWait(
     openGroupId: String,
     loadingGroupIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     let open = openGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !open.isEmpty, !loadingGroupIds.isEmpty else { return false }
-    let family = snFoldFamilyIds(id: open, historicalFolds: historicalFolds)
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: open,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     let ids = family.isEmpty ? [open] : Array(family)
-    return ids.contains { loadingGroupIds.contains($0) }
+    return ids.contains { sibling in
+        loadingGroupIds.contains(sibling) ||
+            loadingGroupIds.contains(where: { snOpenedConversationIdMatches(sibling, $0) })
+    }
 }
 
 /// Newest-page these hidden siblings before cursor-paging. Walk listed
 /// live ids only — passing hist would newest-page a remounted live
-/// extract and snap. Compose `loadOlderHiddenSiblingsNeedingNewestPage`.
+/// extract and snap. Empty persist-folds still union the remount pair.
+/// Compose `loadOlderHiddenSiblingsNeedingNewestPage`.
 func snLoadOlderHiddenSiblingsNeedingNewestPage(
     listedLiveIds: [String],
     historicalFolds: [String: String],
-    pagedGroupIds: Set<String>
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     var out = Set<String>()
     for listed in listedLiveIds where !listed.isEmpty {
         out.formUnion(snHiddenFoldFamilyIdsNeedingPage(
             groupId: listed,
             historicalFolds: historicalFolds,
-            pagedGroupIds: pagedGroupIds
+            pagedGroupIds: pagedGroupIds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
         ))
     }
     return out.sorted()
@@ -1242,28 +1266,46 @@ func snLoadOlderHiddenSiblingsNeedingNewestPage(
 /// Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
 /// hist onto live and drops the hist cache key; cursor / hasOlder maps
 /// keep hist once it has been paged, so a missing paging key means
-/// extract 21–80 and bak are still only in the DB. Compose
-/// `hiddenFoldFamilyNeedsPage`.
+/// extract 21–80 and bak are still only in the DB. Empty persist-folds
+/// still union the remount pair so an empty 0.9 room is not stuck on
+/// “Say hi”. Never newest-page the remounted live extract (R-045).
+/// Compose `hiddenFoldFamilyNeedsPage`.
 func snHiddenFoldFamilyNeedsPage(
     groupId: String,
     historicalFolds: [String: String],
-    pagedGroupIds: Set<String>
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     !snHiddenFoldFamilyIdsNeedingPage(
         groupId: groupId,
         historicalFolds: historicalFolds,
-        pagedGroupIds: pagedGroupIds
+        pagedGroupIds: pagedGroupIds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     ).isEmpty
 }
 
 func snHiddenFoldFamilyIdsNeedingPage(
     groupId: String,
     historicalFolds: [String: String],
-    pagedGroupIds: Set<String>
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
-    snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
-        .filter { $0 != groupId && !pagedGroupIds.contains($0) }
-        .sorted()
+    snEchoReconcileFamilyIds(
+        echoGroupId: groupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    .filter { sibling in
+        !snOpenedConversationIdMatches(sibling, groupId) &&
+            !pagedGroupIds.contains(sibling) &&
+            !pagedGroupIds.contains(where: { snOpenedConversationIdMatches(sibling, $0) }) &&
+            !snOpenedConversationIdMatches(sibling, openedConversationId)
+    }
+    .sorted()
 }
 
 /// This source has no paging key and no cached rows. Newest-page it
@@ -1289,14 +1331,25 @@ func snFoldFamilyHasOlder(
     historicalFolds: [String: String],
     cachedCount: Int = 0,
     pageSize: Int = 0,
-    unpagedHiddenSibling: Bool = false
+    unpagedHiddenSibling: Bool = false,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     if unpagedHiddenSibling { return true }
     if snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize) {
         return true
     }
-    let ids = [groupId] + snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
-    return ids.contains { hasOlderByGroup[$0] == true }
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: groupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let ids = family.isEmpty ? [groupId] : Array(family)
+    return ids.contains { sibling in
+        hasOlderByGroup[sibling] == true ||
+            hasOlderByGroup.contains(where: { $0.value && snOpenedConversationIdMatches(sibling, $0.key) })
+    }
 }
 
 /// Prefer this id's load-older cursor; fall back to a hidden sibling so
@@ -11303,10 +11356,13 @@ final class SonarAppStore: ObservableObject {
     @MainActor
     private func pageUnpagedHiddenFoldFamily(for groupId: String) async {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         let unpaged = snHiddenFoldFamilyIdsNeedingPage(
             groupId: groupId,
             historicalFolds: folds,
-            pagedGroupIds: marmot.pagedLocalTranscriptGroupIds()
+            pagedGroupIds: marmot.pagedLocalTranscriptGroupIds(),
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         for sibling in unpaged {
             _ = await marmot.loadLocalPage(groupId: sibling, mode: .newestPage)

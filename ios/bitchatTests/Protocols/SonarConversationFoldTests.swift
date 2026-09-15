@@ -2888,6 +2888,69 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            snHiddenFoldFamilyNeedsPage(
+                groupId: "group-09",
+                historicalFolds: [:],
+                pagedGroupIds: ["group-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            snHiddenFoldFamilyIdsNeedingPage(
+                groupId: "group-09",
+                historicalFolds: [:],
+                pagedGroupIds: ["group-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08"]
+        )
+        #expect(
+            snHiddenFoldFamilyIdsNeedingPage(
+                groupId: "group-08",
+                historicalFolds: [:],
+                pagedGroupIds: ["group-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ).isEmpty
+        )
+        #expect(
+            snLoadOlderHiddenSiblingsNeedingNewestPage(
+                listedLiveIds: ["group-09"],
+                historicalFolds: [:],
+                pagedGroupIds: ["group-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08"]
+        )
+        #expect(
+            snLoadOlderFamilyPageIds(
+                openGroupId: "group-09",
+                historicalFolds: [:],
+                hasOlderByGroup: ["group-08": true],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08"]
+        )
+        #expect(
+            snLoadOlderBusyRetryShouldWait(
+                openGroupId: "group-09",
+                loadingGroupIds: ["group-08"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            snFoldFamilyHasOlder(
+                groupId: "group-09",
+                hasOlderByGroup: ["group-08": true],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
             snFoldFamilySourceNeedsNewestPage(
                 groupId: "group-08",
                 pagedGroupIds: ["group-09"],

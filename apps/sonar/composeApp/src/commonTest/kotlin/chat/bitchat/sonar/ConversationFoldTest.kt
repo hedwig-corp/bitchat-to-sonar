@@ -2118,6 +2118,76 @@ class ConversationFoldTest {
         )
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", folds, setOf("group-08", "group-09")))
         assertFalse(hiddenFoldFamilyNeedsPage("group-09", emptyMap(), setOf("group-09")))
+        // Empty persist-folds: remount pair still newest-pages hist bak so
+        // an empty 0.9 room is not stuck on “Say hi”. Never newest-page
+        // remounted live extract (R-045).
+        assertTrue(
+            hiddenFoldFamilyNeedsPage(
+                "group-09",
+                emptyMap(),
+                setOf("group-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-08"),
+            hiddenFoldFamilyIdsNeedingPage(
+                "group-09",
+                emptyMap(),
+                setOf("group-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            emptyList<String>(),
+            hiddenFoldFamilyIdsNeedingPage(
+                "group-08",
+                emptyMap(),
+                setOf("group-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-08"),
+            loadOlderHiddenSiblingsNeedingNewestPage(
+                listOf("group-09"),
+                emptyMap(),
+                setOf("group-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            listOf("group-08"),
+            loadOlderFamilyPageIds(
+                "group-09",
+                emptyMap(),
+                mapOf("group-08" to true),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            loadOlderBusyRetryShouldWait(
+                "group-09",
+                setOf("group-08"),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            hasOlderForFoldFamily(
+                "group-09",
+                mapOf("group-08" to true),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertTrue(foldFamilySourceNeedsNewestPage("group-08", setOf("group-09"), cachedRowCount = 0))
         assertFalse(foldFamilySourceNeedsNewestPage("group-09", setOf("group-09"), cachedRowCount = 0))
         assertFalse(foldFamilySourceNeedsNewestPage("group-09", emptySet(), cachedRowCount = 20))
@@ -2156,6 +2226,22 @@ class ConversationFoldTest {
                 "mesh:peer",
                 folds,
                 setOf("group-09"),
+            ),
+        )
+        assertFalse(
+            shouldPageHiddenFoldFamilyForOpenLive(
+                "group-09",
+                emptyMap(),
+                setOf("group-09"),
+            ),
+        )
+        assertTrue(
+            shouldPageHiddenFoldFamilyForOpenLive(
+                "group-09",
+                emptyMap(),
+                setOf("group-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ),
         )
         assertTrue(loadOlderEmptyPaintShouldPublishFamily(paintedCount = 0, familyRowCount = 30))
