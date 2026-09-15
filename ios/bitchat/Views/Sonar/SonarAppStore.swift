@@ -3693,6 +3693,35 @@ func snRemountedPaymentPeerKey(
     return liveKey
 }
 
+/// Persist-rewrite conversation-scoped payment peerKeys from every hidden
+/// 0.8 id onto its live sibling. Empty persist-folds still use the
+/// remount pair so a hist-keyed ledger row lands on live before
+/// wake-mute writes the blob. Compose `remountedPaymentActivitiesFromFolds`.
+func snRemountedPaymentPeerKeysFromFolds(
+    peerKeys: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return peerKeys.map { key in
+        var next = key
+        for (historical, live) in folds {
+            guard !live.isEmpty, live != historical else { continue }
+            next = snRemountedPaymentPeerKey(
+                peerKey: next,
+                historicalKeys: [historical],
+                liveKey: live
+            )
+        }
+        return next
+    }
+}
+
 /// Mute keys a foreground / gap-recovery banner must check so a mute
 /// stored on the recovered 0.8 id still silences a live 0.9 push.
 /// Empty persist-folds still union the remount pair so a mute from the
@@ -11468,13 +11497,22 @@ final class SonarAppStore: ObservableObject {
             shared.set(map, forKey: Keys.historicalFolds)
         }
         promoteMutesFromHistoricalFolds(map, remount: remountOpenedAndPane())
-        promotePaymentActivitiesFromHistoricalFolds(map)
+        promotePaymentActivitiesFromHistoricalFolds(map, remount: remountOpenedAndPane())
     }
 
     /// Persist-rewrite 0.8-keyed wallet rows onto the live sibling. Always
     /// runs so already-folded testers remount on the next `groups()` sink.
+    /// Empty persist-folds still walk the remount pair.
     @MainActor
-    private func promotePaymentActivitiesFromHistoricalFolds(_ folds: [String: String]) {
+    private func promotePaymentActivitiesFromHistoricalFolds(
+        _ folds: [String: String],
+        remount: (opened: String?, pane: String?) = (nil, nil)
+    ) {
+        let folds = snRemountPairHistoricalFolds(
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
         guard !folds.isEmpty else { return }
         var changed = false
         for (historical, live) in folds {
@@ -11737,6 +11775,10 @@ final class SonarAppStore: ObservableObject {
             folds: persistedFolds,
             openedConversationId: realId,
             openedConversationPaneId: openedConversationPaneId
+        )
+        promotePaymentActivitiesFromHistoricalFolds(
+            persistedFolds,
+            remount: (realId, openedConversationPaneId)
         )
         // Keep `openedConversationPaneId` on hist. iPhone NavigationStack
         // stays on `.dm(hist)` so the painted pane is not remade. Mac hops

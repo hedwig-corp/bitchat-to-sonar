@@ -3866,6 +3866,34 @@ struct SonarConversationFoldTests {
                 liveKey: "marmot:group-09"
             ) == "unify:peer"
         )
+        #expect(
+            snRemountedPaymentPeerKeysFromFolds(
+                peerKeys: ["group-08", "group-09", "wallet", "unify:peer"],
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09", "group-09", "wallet", "unify:peer"]
+        )
+        #expect(
+            snRemountedPaymentPeerKeysFromFolds(
+                peerKeys: ["group-08", "group-09", "wallet", "unify:peer"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-09", "group-09", "wallet", "unify:peer"]
+        )
+        #expect(
+            snRemountedPaymentPeerKeysFromFolds(
+                peerKeys: ["group-08", "group-09", "wallet", "unify:peer"],
+                historicalFolds: [:]
+            ) == ["group-08", "group-09", "wallet", "unify:peer"]
+        )
+        #expect(
+            snRemountedPaymentPeerKeysFromFolds(
+                peerKeys: ["group-08", "wallet"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["group-09", "wallet"]
+        )
         #expect(snPurgedHistoricalFolds(["group-08": "group-09"], deletedIds: ["group-09"]).isEmpty)
         #expect(
             snPurgedHistoricalFolds(["group-08": "group-09"], deletedIds: ["unrelated"])

@@ -1015,6 +1015,39 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        val activities = listOf(historical, live, wallet, unify)
+        assertEquals(
+            listOf(historical.copy(peerKey = "group-09"), live, wallet, unify),
+            remountedPaymentActivitiesFromFolds(
+                activities = activities,
+                historicalFolds = mapOf("group-08" to "group-09"),
+            ),
+        )
+        assertEquals(
+            listOf(historical.copy(peerKey = "group-09"), live, wallet, unify),
+            remountedPaymentActivitiesFromFolds(
+                activities = activities,
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            activities,
+            remountedPaymentActivitiesFromFolds(
+                activities = activities,
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            listOf(historical.copy(peerKey = "group-09"), live, wallet, unify),
+            remountedPaymentActivitiesFromFolds(
+                activities = activities,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
     }
 
     @Test

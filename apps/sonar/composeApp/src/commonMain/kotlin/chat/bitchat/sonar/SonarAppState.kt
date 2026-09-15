@@ -28,6 +28,7 @@ import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.wallet.paymentDestinationHash
+import chat.bitchat.sonar.wallet.remountedPaymentActivities
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -3473,6 +3474,29 @@ internal fun paymentActivityPeerKeys(
     return keys.filterTo(linkedSetOf()) { it.isNotBlank() }
 }
 
+/** Persist-rewrite conversation-scoped payment rows from every hidden
+ *  0.8 id onto its live sibling. Empty persist-folds still use the
+ *  remount pair so a hist-keyed ledger row lands on live before
+ *  wake-mute writes the blob. iOS `snRemountedPaymentPeerKeysFromFolds`. */
+internal fun remountedPaymentActivitiesFromFolds(
+    activities: List<SonarPaymentActivity>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<SonarPaymentActivity> {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    var next = activities
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        next = remountedPaymentActivities(listOf(historical), live, next)
+    }
+    return next
+}
+
 /**
  * Call-log rows for the open id plus its hidden 0.8 sibling. Promote copies
  * hist onto live asynchronously; first paint of the live transcript must
@@ -6671,7 +6695,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Persist-rewrite 0.8-keyed wallet rows onto the live sibling. */
     private fun promoteFoldedPaymentActivitiesFromFolds() {
-        for ((historical, live) in historicalFoldMap) {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val folds = remountPairHistoricalFolds(
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        for ((historical, live) in folds) {
             if (live.isBlank() || live == historical) continue
             PaymentActivityStore.remountPeerKeys(listOf(historical), live)
         }
@@ -17237,6 +17267,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             mutedUntilByChat = remountedMutes
             persistMutes()
         }
+        promoteFoldedPaymentActivitiesFromFolds()
         // Hist-only: live must still newest-page hidden siblings.
         // iOS also suppresses live because `onAppear` re-runs `openedDM`.
         suppressOpenedHydrateIds = suppressOpenedHydrateIds + remountOpeningHydrateKeys(
