@@ -3435,21 +3435,27 @@ internal fun remountPairConversationIds(
     return ids
 }
 
-/** Persist-folds sidecar, or the open remount pair as hist→live when
- *  wake-mute has not written yet. Empty persist-folds without a remount
- *  pair stay empty. iOS `snRemountPairHistoricalFolds`. */
+/** Persist-folds sidecar, plus the open remount pair as hist→live when
+ *  wake-mute has not written that pair yet. Persist already mapping
+ *  [hist] wins (R-045). A first-resume blob for another chat must not
+ *  hide this remount — empty persist-folds without a remount pair stay
+ *  empty. iOS `snRemountPairHistoricalFolds`. */
 internal fun remountPairHistoricalFolds(
     historicalFolds: Map<String, String>,
     openedConversationId: String? = null,
     openedConversationPaneId: String? = null,
 ): Map<String, String> {
-    if (historicalFolds.isNotEmpty()) return historicalFolds
     val live = openedConversationId?.trim()?.removePrefix("marmot:").orEmpty()
     val hist = openedConversationPaneId?.trim()?.removePrefix("marmot:").orEmpty()
-    if (live.isEmpty() || hist.isEmpty() || openedConversationIdMatches(live, hist)) {
-        return emptyMap()
+    val pair = if (live.isEmpty() || hist.isEmpty() || openedConversationIdMatches(live, hist)) {
+        emptyMap()
+    } else {
+        mapOf(hist to live)
     }
-    return mapOf(hist to live)
+    if (pair.isEmpty()) return historicalFolds
+    if (historicalFolds.isEmpty()) return pair
+    if (historicalFolds.containsKey(hist)) return historicalFolds
+    return historicalFolds + pair
 }
 
 /** Rewrite a staged preview onto the live sibling. Empty persist-folds

@@ -378,6 +378,15 @@ struct SonarConversationFoldTests {
             ) == "stale-09"
         )
         #expect(
+            snNotificationLiveFoldTarget(
+                tappedGroupId: "group-08",
+                ffiLiveFoldTarget: nil,
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
             snConversationsMatchFoldFamily(
                 left: "marmot:group-08",
                 right: "marmot:group-09",
@@ -1030,6 +1039,14 @@ struct SonarConversationFoldTests {
                 openedConversationId: "group-09",
                 openedConversationPaneId: "group-08"
             ) == ["group-other"]
+        )
+        #expect(
+            snFoldFamilyIds(
+                id: "group-09",
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08", "group-09"]
         )
         let wakeFolds = snWakeMuteHistoricalFolds(
             persisted: [:],
@@ -1849,6 +1866,15 @@ struct SonarConversationFoldTests {
                 openedConversationPaneId: "group-08"
             ) == "group-09"
         )
+        #expect(
+            snHydrationTargetGroupId(
+                sourceId: "group-08",
+                activeGroupIds: ["group-09"],
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
         let remountedExtract = (1...80).map { "hist-\($0)" }
         #expect(snHydrationHasRealTranscriptRows(rows: remountedExtract, idOf: { $0 }))
         #expect(!snHydrationHasRealTranscriptRows(rows: ["summary:group-09:200:1"], idOf: { $0 }))
@@ -1983,6 +2009,20 @@ struct SonarConversationFoldTests {
             ) == ["group-08": "group-09"]
         )
         #expect(snRemountPairHistoricalFolds(historicalFolds: [:]).isEmpty)
+        #expect(
+            snRemountPairHistoricalFolds(
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["other-08": "other-09", "group-08": "group-09"]
+        )
+        #expect(
+            snRemountPairHistoricalFolds(
+                historicalFolds: ["group-08": "stale-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08": "stale-09"]
+        )
         #expect(
             snRemountedConversationSummaries(
                 summaries: [],
@@ -3106,6 +3146,15 @@ struct SonarConversationFoldTests {
                 historicalFolds: ["group-08": "group-09"],
                 ffiLiveFoldTarget: nil,
                 openedConversationId: "other-live",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snResolvedLiveFoldTarget(
+                groupId: "group-08",
+                historicalFolds: ["other-08": "other-09"],
+                ffiLiveFoldTarget: nil,
+                openedConversationId: "group-09",
                 openedConversationPaneId: "group-08"
             ) == "group-09"
         )

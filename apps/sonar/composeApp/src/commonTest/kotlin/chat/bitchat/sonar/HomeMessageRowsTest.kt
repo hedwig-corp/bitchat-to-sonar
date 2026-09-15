@@ -350,6 +350,17 @@ class HomeMessageRowsTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        assertEquals(
+            "group-09",
+            hydrationTargetId(
+                "group-08",
+                setOf("group-09"),
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "unrelated persist-folds still hydrate hist pages onto this remount",
+        )
         val remountHydration = hydrateLocalConversationRows(
             activeChatIds = setOf("group-09"),
             existingMessagesByChat = emptyMap(),

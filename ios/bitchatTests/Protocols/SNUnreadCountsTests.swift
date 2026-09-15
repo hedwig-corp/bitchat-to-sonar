@@ -99,6 +99,15 @@ struct SNUnreadCountsTests {
         )
         #expect(
             SNUnreadCounts.remountFoldedUnread(
+                next: [:],
+                previous: previous,
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08": 4]
+        )
+        #expect(
+            SNUnreadCounts.remountFoldedUnread(
                 next: ["group-09": 4],
                 previous: previous,
                 historicalFolds: [:],

@@ -4313,6 +4313,16 @@ class ConversationFoldTest {
             ),
         )
         assertEquals(
+            "group-09",
+            resolvedLiveFoldTarget(
+                groupId = "group-08",
+                historicalFolds = mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "unrelated persist-folds still remount this hist via the open pair",
+        )
+        assertEquals(
             mapOf("group-08" to historical, "group-09" to historical),
             promotedFoldedScanMarks(
                 previousIds = setOf("group-08", "group-09"),
@@ -4854,6 +4864,24 @@ class ConversationFoldTest {
             remountPairHistoricalFolds(emptyMap()),
         )
         assertEquals(
+            mapOf("other-08" to "other-09", "group-08" to "group-09"),
+            remountPairHistoricalFolds(
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+            "a first-resume blob for another chat must not hide this remount",
+        )
+        assertEquals(
+            mapOf("group-08" to "stale-09"),
+            remountPairHistoricalFolds(
+                mapOf("group-08" to "stale-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "persist-folds already mapping hist win over remount pair",
+        )
+        assertEquals(
             emptyMap(),
             conversationLatestAtFromSummaries(
                 summaries = emptyList(),
@@ -5374,6 +5402,16 @@ class ConversationFoldTest {
                 openedConversationId = "group-09",
                 openedConversationPaneId = "group-08",
             ),
+        )
+        assertEquals(
+            setOf("group-08", "group-09"),
+            foldFamilyIds(
+                "group-09",
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "unrelated persist-folds still union this remount pair",
         )
         assertTrue(
             newestPageFamilyHasOlder(

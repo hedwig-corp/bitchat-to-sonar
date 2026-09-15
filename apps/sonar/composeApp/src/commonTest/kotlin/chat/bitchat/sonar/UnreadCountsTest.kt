@@ -260,6 +260,17 @@ class UnreadCountsTest {
             "empty persist-folds without remount pair stay next",
         )
         assertEquals(
+            mapOf("group-08" to 4L),
+            remountFoldedUnread(
+                emptyMap(),
+                previous,
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "unrelated persist-folds still keep hist unread via remount pair",
+        )
+        assertEquals(
             mapOf("group-09" to 4L),
             remountFoldedUnread(
                 mapOf("group-09" to 4L),

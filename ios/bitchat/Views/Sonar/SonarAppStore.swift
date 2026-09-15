@@ -3509,21 +3509,30 @@ func snRemountPairConversationIds(
     return ids
 }
 
-/// Persist-folds sidecar, or the open remount pair as hist→live when
-/// wake-mute has not written yet. Empty persist-folds without a remount
-/// pair stay empty. Compose `remountPairHistoricalFolds`.
+/// Persist-folds sidecar, plus the open remount pair as hist→live when
+/// wake-mute has not written that pair yet. Persist already mapping
+/// `hist` wins (R-045). A first-resume blob for another chat must not
+/// hide this remount — empty persist-folds without a remount pair stay
+/// empty. Compose `remountPairHistoricalFolds`.
 func snRemountPairHistoricalFolds(
     historicalFolds: [String: String],
     openedConversationId: String? = nil,
     openedConversationPaneId: String? = nil
 ) -> [String: String] {
-    if !historicalFolds.isEmpty { return historicalFolds }
     let live = snBareMarmotGroupId(openedConversationId ?? "")
     let hist = snBareMarmotGroupId(openedConversationPaneId ?? "")
-    guard !live.isEmpty, !hist.isEmpty, !snOpenedConversationIdMatches(live, hist) else {
-        return [:]
+    let pair: [String: String]
+    if live.isEmpty || hist.isEmpty || snOpenedConversationIdMatches(live, hist) {
+        pair = [:]
+    } else {
+        pair = [hist: live]
     }
-    return [hist: live]
+    if pair.isEmpty { return historicalFolds }
+    if historicalFolds.isEmpty { return pair }
+    if historicalFolds[hist] != nil { return historicalFolds }
+    var next = historicalFolds
+    next.merge(pair) { existing, _ in existing }
+    return next
 }
 
 /// Rewrite a staged preview onto the live sibling. Empty persist-folds

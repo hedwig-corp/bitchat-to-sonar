@@ -189,6 +189,15 @@ class SonarNotificationHandoffTest {
             )["group-08"],
             "persist-folds win over remount pair",
         )
+        val fromUnrelatedPersist = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = "marmot:group-08",
+            persistedFolds = mapOf("other-08" to "other-09"),
+            ffiLiveFoldTarget = null,
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals("group-09", fromUnrelatedPersist["group-08"])
+        assertEquals("group-09", fromUnrelatedPersist["marmot:group-08"])
     }
 
     @Test
