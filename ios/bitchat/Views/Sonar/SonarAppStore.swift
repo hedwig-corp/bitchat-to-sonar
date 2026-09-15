@@ -11921,6 +11921,9 @@ final class SonarAppStore: ObservableObject {
         #endif
         conversationViewStates[realId]?.activate()
         rememberMarmotGroup(remounted, forConversationId: realId)
+        // Compose remount hop markGroupsRead after the remount pair
+        // exists. conversationChanged can race before hop and miss
+        // live unread while the user is already in the recovered room.
         markMarmotGroupsRead(matchingGroupId: remounted)
         syncViewingUnreadGroups()
         Task {

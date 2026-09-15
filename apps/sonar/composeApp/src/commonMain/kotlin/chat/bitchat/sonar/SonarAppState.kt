@@ -17496,6 +17496,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         // up while the user is already in the recovered room.
         // iOS remount hop + willPresent use the same remount family.
         clearNotificationsForChat(live)
+        // iOS remount hop calls markMarmotGroupsRead after
+        // rememberRemountPair. conversationChanged can race before
+        // this hop, so live unread stays on the home row.
+        val (opened, pane) = remountPairForOpenChat(live)
+        markGroupsRead(
+            transcriptSourceIds(
+                live,
+                directMarmotChatIds(live),
+                historicalFoldMap,
+                opened,
+                pane,
+            ).ifEmpty { listOf(live) },
+        )
         // iOS remount calls refreshWhenConnected on the live sibling.
         // Opening the recovered 0.8 id catch-up'd a group FFI no longer lists.
         if (live.isNotBlank()) {

@@ -2181,6 +2181,17 @@ struct SonarConversationFoldTests {
             openedConversationId: "group-09",
             openedConversationPaneId: "group-08"
         ))
+        // Persist-other must not hide this remount. Remount hop
+        // mark-reads after the pair exists; conversationChanged can
+        // race before hop and miss live unread.
+        #expect(snViewingConversationShouldMarkRead(
+            viewingGroupIds: ["group-08"],
+            changedGroupId: "group-09",
+            refreshId: "group-09",
+            historicalFolds: ["other-08": "other-09"],
+            openedConversationId: "group-09",
+            openedConversationPaneId: "group-08"
+        ))
         // First-resume send echoes on hist; the relay copy lands on live.
         #expect(
             snOptimisticFreshCanonicalRows(
