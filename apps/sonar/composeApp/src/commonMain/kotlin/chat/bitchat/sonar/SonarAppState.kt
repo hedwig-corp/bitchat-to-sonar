@@ -6412,8 +6412,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             openedConversationId = opened,
             openedConversationPaneId = pane,
         )
-        val family = foldFamilyIds(chatId, historicalFoldMap) +
-            remountPairConversationIds(chatId, opened, pane)
+        val family = foldFamilyIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ) + remountPairConversationIds(chatId, opened, pane)
         val flagged = chatId in recoveredChatNeedsUpdate ||
             groups.any { it.id in recoveredChatNeedsUpdate } ||
             family.any { it in recoveredChatNeedsUpdate }
@@ -9244,7 +9248,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             ),
         )
         for (id in directMarmotChatIds(chatId) + transcriptGroupIds(chatId)) {
-            addAll(foldFamilyIds(id, historicalFoldMap))
+            addAll(
+                foldFamilyIds(
+                    id,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
+            )
         }
         foldedGroupPeerIds[chatId]?.let { add(meshChatId(it)) }
         if (isMeshChat(chatId)) {
@@ -9479,8 +9490,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (meshChatId(peerId) == chatId) add(groupId)
             }
         }
+        val openId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = remountPairForOpenChat(openId ?: chatId)
         Notifier.clearConversations(
-            notificationClearIds(chatId, related, historicalFoldMap)
+            notificationClearIds(
+                chatId,
+                related,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
         )
     }
 
@@ -9529,6 +9548,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             liveFoldTargets = liveFoldTargets,
         ) ?: return false
         val openId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = openId?.let { remountPairForOpenChat(it) } ?: (null to null)
         // Viewing recovered hist + tap live: persist-folds can still be
         // empty, so resolve would `openChat(live)` and remount. Merge
         // first (same gate as willPresent), then Jump in place.
@@ -9544,7 +9564,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             is SonarNotificationOpenTarget.MeshPeer -> {
                 val meshId = meshChatId(target.peerId)
                 if (openId != null &&
-                    (openId == meshId || notificationOpenShouldJump(openId, meshId, historicalFoldMap))
+                    (
+                        openId == meshId ||
+                            notificationOpenShouldJump(
+                                openId,
+                                meshId,
+                                historicalFoldMap,
+                                opened,
+                                pane,
+                            )
+                        )
                 ) {
                     jumpOnOpenNotificationConversation(openId, conversationId, jumpMessageId)
                     return true
@@ -9553,8 +9582,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             is SonarNotificationOpenTarget.Chat -> {
                 val alreadyOpen = openId != null && (
-                    notificationOpenShouldJump(openId, conversationId, historicalFoldMap) ||
-                        notificationOpenShouldJump(openId, target.chatId, historicalFoldMap)
+                    notificationOpenShouldJump(
+                        openId,
+                        conversationId,
+                        historicalFoldMap,
+                        opened,
+                        pane,
+                    ) ||
+                        notificationOpenShouldJump(
+                            openId,
+                            target.chatId,
+                            historicalFoldMap,
+                            opened,
+                            pane,
+                        )
                     )
                 if (alreadyOpen) {
                     jumpOnOpenNotificationConversation(openId, conversationId, jumpMessageId)

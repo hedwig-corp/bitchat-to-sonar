@@ -15766,11 +15766,14 @@ final class SonarAppStore: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let folds = await self.adoptMergedActionFolds(for: [conversationId, seed])
+                let remount = self.remountOpenedAndPane()
                 NotificationService.shared.clearNotifications(
                     forConversationIds: snNotificationClearIds(
                         conversationId: conversationId,
                         relatedIds: Array(ids),
-                        historicalFolds: folds
+                        historicalFolds: folds,
+                        openedConversationId: remount.opened,
+                        openedConversationPaneId: remount.pane
                     )
                 )
             }
