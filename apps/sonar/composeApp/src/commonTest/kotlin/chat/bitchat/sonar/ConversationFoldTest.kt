@@ -2500,6 +2500,82 @@ class ConversationFoldTest {
                 historicalFolds = folds,
             ),
         )
+        assertEquals(
+            listOf("group-08"),
+            conversationRefreshIds(
+                changedId = "group-08",
+                listedIds = setOf("group-09"),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            listOf("group-08", "group-09"),
+            conversationRefreshIds(
+                changedId = "group-08",
+                listedIds = setOf("group-09"),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertFalse(
+            conversationRefreshShouldLoadPage(
+                refreshId = "group-08",
+                listedIds = setOf("group-09"),
+                cachedIds = emptySet(),
+                changedId = "group-08",
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertTrue(
+            conversationRefreshShouldLoadPage(
+                refreshId = "group-08",
+                listedIds = setOf("group-09"),
+                cachedIds = emptySet(),
+                changedId = "group-08",
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "group-08",
+            conversationChangeTargetId(
+                changedId = "group-08",
+                listedIds = setOf("group-09"),
+                historicalFolds = emptyMap(),
+            ),
+        )
+        assertEquals(
+            "group-09",
+            conversationChangeTargetId(
+                changedId = "group-08",
+                listedIds = setOf("group-09"),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertTrue(
+            viewingConversationShouldMarkRead(
+                viewingGroupIds = setOf("group-08"),
+                changedId = "group-09",
+                refreshId = "group-09",
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertFalse(
+            viewingConversationShouldMarkRead(
+                viewingGroupIds = setOf("other"),
+                changedId = "group-09",
+                refreshId = "group-09",
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

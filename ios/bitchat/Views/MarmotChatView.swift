@@ -2599,11 +2599,14 @@ final class MarmotChatModel: ObservableObject {
                     ? await self.mergedConversationRefreshFolds(for: changedList)
                     : blobFolds
                 let listed = Set(self.groups.map(\.id))
+                let remount = self.remountOpenedAndPane()
                 for changedGroupId in groups {
                     let refreshIds = snConversationRefreshIds(
                         changedGroupId: changedGroupId,
                         listedGroupIds: listed,
-                        historicalFolds: folds
+                        historicalFolds: folds,
+                        openedConversationId: remount.opened,
+                        openedConversationPaneId: remount.pane
                     )
                     var deferredChanged = false
                     let cached = Set(self.messagesByGroup.keys)
@@ -2617,7 +2620,9 @@ final class MarmotChatModel: ObservableObject {
                             listedGroupIds: listed,
                             cachedGroupIds: cached,
                             changedGroupId: changedGroupId,
-                            historicalFolds: folds
+                            historicalFolds: folds,
+                            openedConversationId: remount.opened,
+                            openedConversationPaneId: remount.pane
                         ) {
                             _ = await self.loadLocalPage(
                                 groupId: refreshId,
@@ -2636,7 +2641,9 @@ final class MarmotChatModel: ObservableObject {
                             viewingGroupIds: self.viewingUnreadGroupIds,
                             changedGroupId: changedGroupId,
                             refreshId: refreshId,
-                            historicalFolds: folds
+                            historicalFolds: folds,
+                            openedConversationId: remount.opened,
+                            openedConversationPaneId: remount.pane
                         ) {
                             self.markConversationRead(groupId: refreshId)
                         }

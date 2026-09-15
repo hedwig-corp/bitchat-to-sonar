@@ -1689,6 +1689,22 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:]
             ) == ["group-09"]
         )
+        #expect(
+            snConversationRefreshIds(
+                changedGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:]
+            ) == ["group-08"]
+        )
+        #expect(
+            snConversationRefreshIds(
+                changedGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-08", "group-09"]
+        )
         #expect(snConversationRefreshShouldMergeFolds(
             changedGroupIds: ["group-09"],
             persistedFolds: [:]
@@ -1714,6 +1730,22 @@ struct SonarConversationFoldTests {
             changedGroupId: "group-09",
             refreshId: "group-09",
             historicalFolds: [:]
+        ))
+        #expect(snViewingConversationShouldMarkRead(
+            viewingGroupIds: ["group-08"],
+            changedGroupId: "group-09",
+            refreshId: "group-09",
+            historicalFolds: [:],
+            openedConversationId: "group-09",
+            openedConversationPaneId: "group-08"
+        ))
+        #expect(!snViewingConversationShouldMarkRead(
+            viewingGroupIds: ["other"],
+            changedGroupId: "group-09",
+            refreshId: "group-09",
+            historicalFolds: [:],
+            openedConversationId: "group-09",
+            openedConversationPaneId: "group-08"
         ))
         // First-resume send echoes on hist; the relay copy lands on live.
         #expect(
@@ -2269,6 +2301,42 @@ struct SonarConversationFoldTests {
                 changedGroupId: "group-08",
                 listedGroupIds: ["group-09"],
                 historicalFolds: ["group-08": "group-09"]
+            ) == "group-09"
+        )
+        #expect(
+            !snConversationRefreshShouldLoadPage(
+                refreshId: "group-08",
+                listedGroupIds: ["group-09"],
+                cachedGroupIds: [],
+                changedGroupId: "group-08",
+                historicalFolds: [:]
+            )
+        )
+        #expect(
+            snConversationRefreshShouldLoadPage(
+                refreshId: "group-08",
+                listedGroupIds: ["group-09"],
+                cachedGroupIds: [],
+                changedGroupId: "group-08",
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
+            snConversationChangeTargetId(
+                changedGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:]
+            ) == "group-08"
+        )
+        #expect(
+            snConversationChangeTargetId(
+                changedGroupId: "group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
             ) == "group-09"
         )
         #expect(

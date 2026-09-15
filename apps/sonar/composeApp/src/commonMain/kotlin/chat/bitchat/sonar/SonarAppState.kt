@@ -2364,13 +2364,17 @@ internal fun viewingConversationShouldMarkRead(
     changedId: String,
     refreshId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     if (changedId.isBlank() && refreshId.isBlank()) return false
     if (refreshId.isNotBlank() && refreshId in viewingGroupIds) return true
     if (changedId.isNotBlank() && changedId in viewingGroupIds) return true
-    val family = foldFamilyIds(
+    val family = echoReconcileFamilyIds(
         changedId.ifBlank { refreshId },
         historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
     )
     return viewingGroupIds.any { it in family }
 }
@@ -2379,9 +2383,16 @@ internal fun conversationRefreshIds(
     changedId: String,
     listedIds: Set<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<String> {
     if (changedId.isBlank()) return emptyList()
-    val family = foldFamilyIds(changedId, historicalFolds)
+    val family = echoReconcileFamilyIds(
+        changedId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     val listedFamily = family.filter { it in listedIds }.sorted()
     val out = ArrayList(if (listedFamily.isEmpty()) listOf(changedId) else listedFamily)
     if (changedId !in out) out += changedId
@@ -2390,31 +2401,50 @@ internal fun conversationRefreshIds(
 
 /** Hidden 0.8 remainder ticks are unlisted and may have no host cache
  *  key after remount. Still page them — do not treat that as a brand-new
- *  group. iOS `snConversationRefreshShouldLoadPage`. */
+ *  group. Empty persist-folds still union the remount pair.
+ *  iOS `snConversationRefreshShouldLoadPage`. */
 internal fun conversationRefreshShouldLoadPage(
     refreshId: String,
     listedIds: Set<String>,
     cachedIds: Set<String>,
     changedId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     if (refreshId in listedIds || refreshId in cachedIds) return true
-    val family = foldFamilyIds(changedId, historicalFolds)
+    val family = echoReconcileFamilyIds(
+        changedId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     if (refreshId !in family) return false
     // Only the hidden sibling of a listed live — not a brand-new group.
     return family.any { it in listedIds && it != refreshId }
 }
 
-/** Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id. */
+/** Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id.
+ *  Empty persist-folds still remap via the remount pair. */
 internal fun conversationChangeTargetId(
     changedId: String,
     listedIds: Set<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String {
     if (changedId.isBlank()) return changedId
     if (changedId in listedIds) return changedId
     val live = historicalFolds[changedId]
     if (!live.isNullOrBlank() && live != changedId && live in listedIds) return live
+    for (id in remountPairConversationIds(
+        conversationId = changedId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank() && bare != changedId && bare in listedIds) return bare
+    }
     return foldFamilyIds(changedId, historicalFolds).firstOrNull { it in listedIds }
         ?: changedId
 }
@@ -16968,15 +16998,20 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // cannot drop the page and in-flight call/pay rows land on
                 // a chat FFI still lists.
                 val listedIds = chats.mapTo(hashSetOf()) { it.id }
+                val (opened, pane) = remountPairForOpenChat(groupIdHex)
                 val targetId = conversationChangeTargetId(
                     groupIdHex,
                     listedIds,
                     historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
                 )
                 val refreshIds = conversationRefreshIds(
                     groupIdHex,
                     listedIds,
                     historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
                 )
                 val cachedIds = chatSnapshotMessagesByChat.keys
                 for (refreshId in refreshIds) {
@@ -16987,6 +17022,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                             cachedIds,
                             groupIdHex,
                             historicalFoldMap,
+                            openedConversationId = opened,
+                            openedConversationPaneId = pane,
                         )
                     ) {
                         continue

@@ -2302,25 +2302,40 @@ func snViewingConversationShouldMarkRead(
     viewingGroupIds: Set<String>,
     changedGroupId: String,
     refreshId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     if changedGroupId.isEmpty && refreshId.isEmpty { return false }
     if !refreshId.isEmpty && viewingGroupIds.contains(refreshId) { return true }
     if !changedGroupId.isEmpty && viewingGroupIds.contains(changedGroupId) { return true }
     let seed = changedGroupId.isEmpty ? refreshId : changedGroupId
-    let family = snFoldFamilyIds(id: seed, historicalFolds: historicalFolds)
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: seed,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     return viewingGroupIds.contains(where: { family.contains($0) })
 }
 
 /// Ids whose local transcript window must reload for one `conversationChanged`.
-/// Compose `conversationRefreshIds`.
+/// Empty persist-folds still union the remount pair. Compose
+/// `conversationRefreshIds`.
 func snConversationRefreshIds(
     changedGroupId: String,
     listedGroupIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [String] {
     guard !changedGroupId.isEmpty else { return [] }
-    let family = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: changedGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     let listedFamily = family.filter { listedGroupIds.contains($0) }
     var out = listedFamily.isEmpty ? [changedGroupId] : listedFamily.sorted()
     if !out.contains(changedGroupId) {
@@ -2331,32 +2346,52 @@ func snConversationRefreshIds(
 
 /// Hidden 0.8 remainder ticks are unlisted and may have no host cache key
 /// after remount. Still `loadLocalPage` them — do not treat that as a
-/// brand-new group (`loadLocalSummaries`). Compose
-/// `conversationRefreshShouldLoadPage`.
+/// brand-new group (`loadLocalSummaries`). Empty persist-folds still
+/// union the remount pair. Compose `conversationRefreshShouldLoadPage`.
 func snConversationRefreshShouldLoadPage(
     refreshId: String,
     listedGroupIds: Set<String>,
     cachedGroupIds: Set<String>,
     changedGroupId: String,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     if listedGroupIds.contains(refreshId) || cachedGroupIds.contains(refreshId) {
         return true
     }
-    let family = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: changedGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
     guard family.contains(refreshId) else { return false }
     // Only the hidden sibling of a listed live — not a brand-new group.
     return family.contains { listedGroupIds.contains($0) && $0 != refreshId }
 }
 
 /// Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id.
+/// Empty persist-folds still remap via the remount pair.
 func snConversationChangeTargetId(
     changedGroupId: String,
     listedGroupIds: Set<String>,
-    historicalFolds: [String: String]
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> String {
     guard !changedGroupId.isEmpty else { return changedGroupId }
     if listedGroupIds.contains(changedGroupId) { return changedGroupId }
+    let remount = snRemountPairConversationIds(
+        conversationId: changedGroupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if let live = remount
+        .map({ snBareMarmotGroupId($0) })
+        .first(where: { !$0.isEmpty && $0 != changedGroupId && listedGroupIds.contains($0) }) {
+        return live
+    }
     let listedFamily = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
         .filter { listedGroupIds.contains($0) }
     return listedFamily.sorted().first ?? changedGroupId
