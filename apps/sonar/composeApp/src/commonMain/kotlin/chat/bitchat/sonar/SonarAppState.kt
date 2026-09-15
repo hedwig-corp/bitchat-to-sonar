@@ -2719,6 +2719,28 @@ internal fun remountPairOpenedPane(
     return opened to pane
 }
 
+/** Background FFI hide of a folded 0.8 room must not invent a remount
+ *  pair from home, and must not clobber the open remount with another
+ *  conversation's hist→live. Upgrade can hide A, B, C in one refresh;
+ *  iOS `promoteFoldedLocalTranscriptPaging` used to `rememberRemountPair`
+ *  for every promoted pair — last write won — so `directGroup` /
+ *  `startChatReturningId` newest-sorted the open DM back onto hist.
+ *  Compose remount is the open transcript only (`remountPairForOpenChat`).
+ *  iOS `snPromoteShouldReplaceRemountPair`. */
+internal fun promoteShouldReplaceRemountPair(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    historical: String,
+    live: String,
+): Boolean {
+    val opened = openedConversationId?.trim().orEmpty()
+    if (opened.isEmpty()) return false
+    return openedConversationIdMatches(historical, openedConversationId) ||
+        openedConversationIdMatches(live, openedConversationId) ||
+        openedConversationIdMatches(historical, openedConversationPaneId) ||
+        openedConversationIdMatches(live, openedConversationPaneId)
+}
+
 /** Leave / delete that ends the remounted open must drop the leftover
  *  route replacement. Skip-hop `closedDM(hist)` during Mac selection hop
  *  must keep it. iOS `snClosedDMShouldClearPendingRouteReplacement`. */
@@ -5503,7 +5525,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
     }
 
-    /** Live / hist remount pair while this chat is the open transcript. */
+    /** Live / hist remount pair while this chat is the open transcript.
+     *  Promote of other hidden 0.8 siblings must not rewrite this pair
+     *  (`promoteShouldReplaceRemountPair`). */
     private fun remountPairForOpenChat(chatId: String): Pair<String?, String?> {
         val live = activeTranscriptChatId?.takeIf { it.isNotBlank() } ?: return null to null
         if (!openedConversationIdMatches(chatId, live) && chatId !in transcriptSessionAliases) {

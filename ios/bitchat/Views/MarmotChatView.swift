@@ -3461,10 +3461,21 @@ final class MarmotChatModel: ObservableObject {
                 liveGroupId: pair.live,
                 idOf: { $0.id }
             )
-            rememberRemountPair(
-                openedConversationId: pair.live,
-                openedConversationPaneId: pair.historical
-            )
+            // Paging / echoes move for every hidden sibling. Remount
+            // stays the open conversation — a background promote of B
+            // must not clobber A's pair (`directGroup` reads this).
+            let remount = remountOpenedAndPane()
+            if snPromoteShouldReplaceRemountPair(
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane,
+                historical: pair.historical,
+                live: pair.live
+            ) {
+                rememberRemountPair(
+                    openedConversationId: pair.live,
+                    openedConversationPaneId: remount.pane ?? pair.historical
+                )
+            }
         }
     }
 
@@ -6035,6 +6046,8 @@ final class MarmotChatModel: ObservableObject {
         // there) or live when `groups()` listed it first — so
         // `startChatReturningId` opened the recovered row while the user
         // was already remounted, or skipped hist on first-resume.
+        // Promote of other hidden 0.8 siblings must not rewrite this
+        // remount pair (`snPromoteShouldReplaceRemountPair`).
         // No FFI — existence / startChat must not wait. Store
         // `marmotGroup(forNpub:)` / Compose `preferredDirectMarmotChatId`.
         let remount = remountOpenedAndPane()

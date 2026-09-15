@@ -2561,6 +2561,28 @@ func snRemountPairOpenedPane(
     )
 }
 
+/// Background FFI hide of a folded 0.8 room must not invent a remount
+/// pair from home, and must not clobber the open remount with another
+/// conversation's hist→live. Upgrade can hide A, B, C in one refresh;
+/// `promoteFoldedLocalTranscriptPaging` used to `rememberRemountPair`
+/// for every promoted pair — last write won — so `directGroup` /
+/// `startChatReturningId` newest-sorted the open DM back onto hist.
+/// Compose remount is the open transcript only (`remountPairForOpenChat`).
+/// Compose `promoteShouldReplaceRemountPair`.
+func snPromoteShouldReplaceRemountPair(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    historical: String,
+    live: String
+) -> Bool {
+    let opened = openedConversationId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !opened.isEmpty else { return false }
+    if snOpenedConversationIdMatches(historical, openedConversationId) { return true }
+    if snOpenedConversationIdMatches(live, openedConversationId) { return true }
+    if snOpenedConversationIdMatches(historical, openedConversationPaneId) { return true }
+    return snOpenedConversationIdMatches(live, openedConversationPaneId)
+}
+
 /// Leave / delete that ends the remounted open must drop the leftover
 /// route replacement. Skip-hop `closedDM(hist)` during Mac selection hop
 /// must keep it. Compose `closedDMShouldClearPendingRouteReplacement`.

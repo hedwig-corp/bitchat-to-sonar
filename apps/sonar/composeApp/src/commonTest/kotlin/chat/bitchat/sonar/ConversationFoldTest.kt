@@ -573,6 +573,41 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        // Upgrade can hide A, B, C in one FFI refresh. Promote must
+        // keep the open remount and must not invent one from home —
+        // otherwise startChat newest-sorts the open DM onto hist.
+        assertFalse(
+            promoteShouldReplaceRemountPair(
+                openedConversationId = null,
+                openedConversationPaneId = null,
+                historical = "zzz-08",
+                live = "group-09",
+            ),
+        )
+        assertFalse(
+            promoteShouldReplaceRemountPair(
+                openedConversationId = "group-09",
+                openedConversationPaneId = "zzz-08",
+                historical = "other-08",
+                live = "other-09",
+            ),
+        )
+        assertTrue(
+            promoteShouldReplaceRemountPair(
+                openedConversationId = "group-09",
+                openedConversationPaneId = "zzz-08",
+                historical = "zzz-08",
+                live = "group-09",
+            ),
+        )
+        assertTrue(
+            promoteShouldReplaceRemountPair(
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = null,
+                historical = "zzz-08",
+                live = "group-09",
+            ),
+        )
     }
 
     @Test
