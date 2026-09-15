@@ -4604,6 +4604,15 @@ class ConversationFoldTest {
             mediaFetchGroupIds("group-09", emptyMap()),
         )
         assertEquals(
+            listOf("group-09", "group-08"),
+            mediaFetchGroupIds(
+                "group-09",
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
             emptyList(),
             mediaFetchGroupIds("", folds),
         )
@@ -5137,6 +5146,16 @@ class ConversationFoldTest {
                 groupId = "group-09",
                 historicalFolds = emptyMap(),
                 pageForId = { liveOnly },
+            ),
+        )
+        assertEquals(
+            setOf("https://blossom.example/old.jpg"),
+            publishedMediaUrlsFromFamilyPages(
+                groupId = "group-09",
+                historicalFolds = emptyMap(),
+                pageForId = { id -> if (id == "group-08") listOf(histPhoto) else liveOnly },
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ),
         )
         val cachedHist = listOf(histPhoto)

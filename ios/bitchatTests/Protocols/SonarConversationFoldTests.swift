@@ -1530,6 +1530,14 @@ struct SonarConversationFoldTests {
         )
         #expect(
             snMediaFetchGroupIds(
+                startGroupId: "group-09",
+                historicalFolds: [:],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["group-09", "group-08"]
+        )
+        #expect(
+            snMediaFetchGroupIds(
                 startGroupId: "",
                 historicalFolds: ["group-08": "group-09"]
             ).isEmpty
@@ -1580,6 +1588,17 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:],
                 pageForId: { _ in liveOnly }
             ).isEmpty
+        )
+        #expect(
+            snPublishedMediaUrlsFromFamilyPages(
+                startGroupId: "group-09",
+                historicalFolds: [:],
+                pageForId: { id in
+                    id == "group-08" ? [recoveredAttachment] : liveOnly
+                },
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == ["https://blossom.example/old.jpg"]
         )
         #expect(
             snPublishedMediaScanRows(

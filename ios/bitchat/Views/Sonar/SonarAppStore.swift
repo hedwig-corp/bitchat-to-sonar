@@ -12593,7 +12593,9 @@ final class SonarAppStore: ObservableObject {
             startGroupId: groupId,
             historicalFolds: folds,
             pageForId: { pages[$0] ?? [] },
-            pendingPrefix: Self.pendingMediaURLPrefix
+            pendingPrefix: Self.pendingMediaURLPrefix,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 
@@ -12612,6 +12614,7 @@ final class SonarAppStore: ObservableObject {
             caption: caption
         )
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         let cached = snPublishedMediaUrlsFromFamilyPages(
             startGroupId: groupId,
             historicalFolds: folds,
@@ -12620,7 +12623,9 @@ final class SonarAppStore: ObservableObject {
                     ?? marmot.messagesByGroup[snBareMarmotGroupId(id)]
                     ?? []
             },
-            pendingPrefix: Self.pendingMediaURLPrefix
+            pendingPrefix: Self.pendingMediaURLPrefix,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         // Page hidden siblings before sendMedia so a later remainder tick
         // cannot present a recovered isMine URL that was missing from cache.
