@@ -6028,7 +6028,32 @@ final class MarmotChatModel: ObservableObject {
 
     func directGroup(forNpub peerNpub: String) -> MarmotService.MarmotGroup? {
         let target = SNMarmotProfileCache.canonicalKey(peerNpub)
-        return groups.first { snDirectMarmotPeerKey(for: $0, ownNpub: npub) == target }
+        let matches = groups.filter { snDirectMarmotPeerKey(for: $0, ownNpub: npub) == target }
+        guard !matches.isEmpty else { return nil }
+        // Persist+remount live among duplicate 1:1s, else newest-`latest_at`.
+        // First-listed used to return hist after remount (transcript stays
+        // there) or live when `groups()` listed it first — so
+        // `startChatReturningId` opened the recovered row while the user
+        // was already remounted, or skipped hist on first-resume.
+        // No FFI — existence / startChat must not wait. Store
+        // `marmotGroup(forNpub:)` / Compose `preferredDirectMarmotChatId`.
+        let remount = remountOpenedAndPane()
+        var latestSecs: [String: Int64] = [:]
+        for group in matches {
+            let summarySecs = conversationSummariesByGroup[group.id]?.latestAt.timeIntervalSince1970 ?? 0
+            let loadedSecs = messagesByGroup[group.id]?.map(\.createdAt.timeIntervalSince1970).max() ?? 0
+            latestSecs[group.id] = Int64(max(summarySecs, loadedSecs))
+        }
+        if let preferredId = snPreferredDirectMarmotGroupId(
+            groupIds: matches.map(\.id),
+            latestSecs: latestSecs,
+            historicalFolds: historicalFoldsMap(),
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ), let match = matches.first(where: { $0.id == preferredId }) {
+            return match
+        }
+        return matches.first
     }
 
     private func dropResolvedPendingDirectChats() {

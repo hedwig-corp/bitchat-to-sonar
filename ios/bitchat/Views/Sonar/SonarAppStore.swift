@@ -3719,7 +3719,8 @@ func snMarmotSendTargetGroupId(
 }
 
 /// Persist+remount live among duplicate 1:1s, else newest-`latest_at`.
-/// No FFI — startChat / existence checks must not wait. Compose
+/// No FFI — startChat / existence checks must not wait. Call site:
+/// `MarmotChatModel.directGroup(forNpub:)`. Compose
 /// `preferredDirectMarmotChatId`.
 func snPreferredDirectMarmotGroupId(
     groupIds: [String],

@@ -563,6 +563,8 @@ struct SonarConversationFoldTests {
                 ffiHistoricalFolds: ["zzz-08": "group-09"]
             ) == "group-09"
         )
+        // MarmotChatModel.directGroup / startChatReturningId: remount live
+        // wins without FFI. Empty persist without remount stays newest-sort.
         #expect(
             snPreferredDirectMarmotGroupId(
                 groupIds: ["zzz-08", "group-09"],
