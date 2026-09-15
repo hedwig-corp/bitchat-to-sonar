@@ -416,6 +416,34 @@ struct SonarConversationFoldTests {
                 openedConversationPaneId: "marmot:group-08"
             ) == "group-other"
         )
+        // canManageGroup remounts listedChat so hist still looks
+        // manageable; FFI admin must remap onto listed live.
+        // Persist-other must not hide this remount.
+        #expect(
+            snMarmotAdminGroupId(
+                groupId: "marmot:group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "group-09"
+        )
+        #expect(
+            snMarmotAdminGroupId(
+                groupId: "marmot:group-08",
+                listedGroupIds: ["group-09"],
+                historicalFolds: ["other-08": "other-09"]
+            ) == "group-08"
+        )
+        #expect(
+            snMarmotAdminGroupId(
+                groupId: "group-08",
+                listedGroupIds: ["stale-09", "group-09"],
+                historicalFolds: ["group-08": "stale-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == "stale-09"
+        )
         #expect(
             snPersistedLiveFoldTarget(
                 tappedGroupId: "marmot:group-08",

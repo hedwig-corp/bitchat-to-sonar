@@ -2298,6 +2298,37 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        // canManageGroup remounts listedChat so hist still looks
+        // manageable; FFI admin must remap onto listed live.
+        // Persist-other must not hide this remount.
+        assertEquals(
+            "group-09",
+            marmotAdminGroupId(
+                "marmot:group-08",
+                setOf("group-09"),
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "group-08",
+            marmotAdminGroupId(
+                "marmot:group-08",
+                setOf("group-09"),
+                mapOf("other-08" to "other-09"),
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            marmotAdminGroupId(
+                "group-08",
+                setOf("stale-09", "group-09"),
+                mapOf("group-08" to "stale-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

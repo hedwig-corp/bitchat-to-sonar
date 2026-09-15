@@ -655,6 +655,24 @@ internal fun resolvedOpenGroupId(
     return groupId
 }
 
+/** FFI group-admin / leave target. `listedOrFoldedSiblingChat` keeps the
+ *  open hist id so the painted pane is not remade; `canManageGroup` then
+ *  looks manageable while `pendingJoinRequests(hist)` misses the listed
+ *  live group. iOS `marmotGroupId`. */
+internal fun marmotAdminGroupId(
+    chatId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String = resolvedOpenGroupId(
+    chatId.removePrefix("marmot:").ifBlank { chatId },
+    listedGroupIds,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+)
+
 internal fun listedOrFoldedSiblingChat(
     chatId: String,
     listedChats: List<SonarChat>,
@@ -11134,6 +11152,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             deletedConversationShouldClearScreen(screen, chatId, deleteIdSet)
         }
         val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, folds, opened, pane)
+        // Capture before endTranscriptSession nils remount: FFI leave
+        // must hit the listed live group, not the painted hist id.
+        val adminGroupId = adminGroupIdFor(chatId)
         forgetHistoricalFolds(deleteIdSet)
         chats = chats.filterNot { it.id in deleteIdSet }
         chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it !in deleteIdSet }
@@ -11166,7 +11187,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 if (isGroup) {
-                    SonarCore.leaveGroup(chatId)
+                    SonarCore.leaveGroup(adminGroupId)
                     // Persist-folds: core leave only purges fold_aliases.
                     for (id in familyPurgeIds) {
                         runCatching { SonarCore.deleteChat(id) }
@@ -12973,6 +12994,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val raw = npubRawFor(meshPeerId(chatId)) ?: return null
         return marmotGroupForNpub(raw)?.id
+    }
+
+    /** FFI group-admin / leave target. `listedChat` keeps hist identity;
+     *  this remaps onto the listed live sibling. iOS `marmotGroupId`. */
+    private fun adminGroupIdFor(chatId: String): String {
+        val fromChat = remountPairForOpenChat(chatId)
+        val fromInfo = remountPairForOpenChat((screen as? Screen.GroupInfo)?.chatId.orEmpty())
+        val fromOpen = remountPairForOpenChat((screen as? Screen.Chat)?.id.orEmpty())
+        val (opened, pane) = when {
+            fromChat.first != null -> fromChat
+            fromInfo.first != null -> fromInfo
+            else -> fromOpen
+        }
+        return marmotAdminGroupId(
+            chatId,
+            chats.mapTo(hashSetOf()) { it.id },
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     private fun meshMediaUrl(peerId: String, messageId: String, filename: String): String =
@@ -15286,7 +15327,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                SonarCore.addGroupMembers(chatId, cleanMembers)
+                SonarCore.addGroupMembers(adminGroupIdFor(chatId), cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId))))
@@ -15308,7 +15349,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (cleanMembers.isEmpty()) return
         scope.launch {
             try {
-                SonarCore.removeGroupMembers(chatId, cleanMembers)
+                SonarCore.removeGroupMembers(adminGroupIdFor(chatId), cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId))))
@@ -15326,7 +15367,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                val token = SonarCore.createInviteLink(chatId, groupName)
+                val token = SonarCore.createInviteLink(adminGroupIdFor(chatId), groupName)
                 onResult(token)
             } catch (e: Throwable) {
                 toast = marmotInviteUserMessage(e.message.orEmpty())
@@ -15344,7 +15385,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         scope.launch {
-            val loaded = runCatching { SonarCore.pendingJoinRequests(chatId) }
+            val loaded = runCatching { SonarCore.pendingJoinRequests(adminGroupIdFor(chatId)) }
                 .onFailure { toast = "couldn't load join requests: ${it.message}" }
                 .getOrNull()
             onResult(pendingJoinRequestsOrCached(loaded, cached))
@@ -15364,7 +15405,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                SonarCore.approveJoinRequest(chatId, requesterNpub)
+                SonarCore.approveJoinRequest(adminGroupIdFor(chatId), requesterNpub)
                 refreshChats()
                 toast = "Member added"
                 onDone()
@@ -15383,7 +15424,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                SonarCore.declineJoinRequest(chatId, requesterNpub)
+                SonarCore.declineJoinRequest(adminGroupIdFor(chatId), requesterNpub)
                 toast = "Request declined"
                 onDone()
             } catch (e: Throwable) {

@@ -390,6 +390,26 @@ func snResolvedOpenGroupId(
     return groupId
 }
 
+/// FFI group-admin / leave target. `listedOrFoldedSibling` keeps the
+/// painted hist id; `marmotGroupId` already remaps onto the listed live
+/// sibling so add/remove/invite/pending/leave hit `engine.groups()`.
+/// Compose `marmotAdminGroupId`.
+func snMarmotAdminGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    snResolvedOpenGroupId(
+        groupId: snBareMarmotGroupId(groupId),
+        listedGroupIds: listedGroupIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+}
+
 /// Bare MLS id whether the tap carried `marmot:` or not.
 func snBareMarmotGroupId(_ id: String, prefix: String = "marmot:") -> String {
     id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : id
