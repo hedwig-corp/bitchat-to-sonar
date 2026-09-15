@@ -2462,14 +2462,26 @@ func snConversationChangeShouldRefreshOpenMesh(
     changedGroupId: String,
     historicalFolds: [String: String],
     peerIdForGroup: (String) -> String?,
-    meshChatId: (String) -> String
+    meshChatId: (String) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> Bool {
     guard !openMeshChatId.isEmpty, !changedGroupId.isEmpty else { return false }
     if let peerId = peerIdForGroup(changedGroupId), openMeshChatId == meshChatId(peerId) {
         return true
     }
-    for id in snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds) where id != changedGroupId {
+    for id in snEchoReconcileFamilyIds(
+        echoGroupId: changedGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) where !snOpenedConversationIdMatches(id, changedGroupId) {
         if let peerId = peerIdForGroup(id), openMeshChatId == meshChatId(peerId) {
+            return true
+        }
+        let bare = snBareMarmotGroupId(id)
+        if !bare.isEmpty, bare != id, let peerId = peerIdForGroup(bare),
+           openMeshChatId == meshChatId(peerId) {
             return true
         }
     }
@@ -2966,12 +2978,20 @@ func snRetainedTranscriptForChat<Message>(
     chatId: String,
     retainedByChat: [String: [Message]],
     historicalFolds: [String: String],
-    prefix: String = "marmot:"
+    prefix: String = "marmot:",
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [Message] {
     if let rows = retainedByChat[chatId], !rows.isEmpty { return rows }
     let bare = snBareMarmotGroupId(chatId, prefix: prefix)
-    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
-        for key in [alias, prefix + alias] where key != chatId {
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: bare,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for alias in family {
+        for key in [alias, prefix + alias] where !snOpenedConversationIdMatches(key, chatId) {
             if let rows = retainedByChat[key], !rows.isEmpty { return rows }
         }
     }
@@ -2987,12 +3007,20 @@ func snFirstOpenFamilyRetainedRows<Message>(
     retainedByChat: [String: [Message]],
     historicalFolds: [String: String],
     idOf: (Message) -> String,
-    prefix: String = "marmot:"
+    prefix: String = "marmot:",
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [Message] {
     let bare = snBareMarmotGroupId(chatId, prefix: prefix)
     var ids: [String] = [chatId]
     var seen: Set<String> = [chatId]
-    for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: bare,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for alias in family {
         for key in [alias, prefix + alias] where seen.insert(key).inserted {
             ids.append(key)
         }
@@ -3015,13 +3043,17 @@ func snFirstOpenTranscriptPaintRows<Message>(
     retainedByChat: [String: [Message]],
     snapshotPaint: [Message],
     historicalFolds: [String: String],
-    idOf: (Message) -> String
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
 ) -> [Message] {
     let retained = snFirstOpenFamilyRetainedRows(
         chatId: chatId,
         retainedByChat: retainedByChat,
         historicalFolds: historicalFolds,
-        idOf: idOf
+        idOf: idOf,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
     )
     if retained.isEmpty { return snapshotPaint }
     if snapshotPaint.isEmpty { return retained }
@@ -13445,10 +13477,13 @@ final class SonarAppStore: ObservableObject {
                 state.messages.isEmpty ? nil : (key, state.messages)
             }
         )
+        let remount = remountOpenedAndPane()
         if !snRetainedTranscriptForChat(
             chatId: id,
             retainedByChat: retainedMessages,
-            historicalFolds: folds
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         ).isEmpty {
             return true
         }

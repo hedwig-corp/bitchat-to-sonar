@@ -2723,6 +2723,28 @@ class ConversationFoldTest {
                 meshChatId = ::meshId,
             ),
         )
+        // Persist-folds prune the hist→peer map. Empty folds miss the live
+        // sibling unless the remount pair is supplied.
+        assertFalse(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-a",
+                changedGroupId = "group-08",
+                historicalFolds = emptyMap(),
+                peerIdForGroup = peerByGroup::get,
+                meshChatId = ::meshId,
+            ),
+        )
+        assertTrue(
+            conversationChangeShouldRefreshOpenMesh(
+                openMeshChatId = "mesh:peer-a",
+                changedGroupId = "group-08",
+                historicalFolds = emptyMap(),
+                peerIdForGroup = peerByGroup::get,
+                meshChatId = ::meshId,
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test
@@ -2790,6 +2812,16 @@ class ConversationFoldTest {
         assertEquals(historical, retainedTranscriptForChat("group-09", retained, folds))
         assertEquals(historical, retainedTranscriptForChat("group-08", retained, folds))
         assertEquals(emptyList(), retainedTranscriptForChat("group-09", retained, emptyMap()))
+        assertEquals(
+            historical,
+            retainedTranscriptForChat(
+                "group-09",
+                retained,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
         assertTrue(firstOpenShouldMergeFolds("group-09", emptyMap()))
         assertTrue(firstOpenShouldMergeFolds("marmot:group-09", emptyMap()))
         assertFalse(firstOpenShouldMergeFolds("group-09", folds))
@@ -2854,10 +2886,32 @@ class ConversationFoldTest {
         )
         assertEquals(
             listOf(historical.single(), liveLeave.single()),
+            firstOpenTranscriptPaintRows(
+                "group-09",
+                mapOf("group-09" to liveLeave, "group-08" to historical),
+                liveLeave,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "remount pair still unions hist-keyed leave-paint before FFI merge",
+        )
+        assertEquals(
+            listOf(historical.single(), liveLeave.single()),
             firstOpenFamilyRetainedRows(
                 "group-09",
                 mapOf("group-09" to liveLeave, "group-08" to historical),
                 folds,
+            ).sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id }),
+        )
+        assertEquals(
+            listOf(historical.single(), liveLeave.single()),
+            firstOpenFamilyRetainedRows(
+                "group-09",
+                mapOf("group-09" to liveLeave, "group-08" to historical),
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
             ).sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id }),
         )
         assertTrue(firstOpenHasLocalTranscriptPaint(emptyList(), snapshot))

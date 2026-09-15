@@ -2532,12 +2532,23 @@ internal fun conversationChangeShouldRefreshOpenMesh(
     historicalFolds: Map<String, String>,
     peerIdForGroup: (String) -> String?,
     meshChatId: (String) -> String,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     if (openMeshChatId.isBlank() || changedGroupId.isBlank()) return false
     peerIdForGroup(changedGroupId)?.let { if (openMeshChatId == meshChatId(it)) return true }
-    for (id in foldFamilyIds(changedGroupId, historicalFolds)) {
-        if (id == changedGroupId) continue
+    for (id in echoReconcileFamilyIds(
+        changedGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(id, changedGroupId)) continue
+        val bare = id.removePrefix("marmot:")
         peerIdForGroup(id)?.let { if (openMeshChatId == meshChatId(it)) return true }
+        if (bare.isNotBlank() && bare != id) {
+            peerIdForGroup(bare)?.let { if (openMeshChatId == meshChatId(it)) return true }
+        }
     }
     return false
 }
@@ -2596,16 +2607,29 @@ internal fun pendingMediaUploadStoreId(
     return historicalFolds.entries.firstOrNull { it.value == chatId }?.value ?: chatId
 }
 
-/** Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold. */
+/** Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold.
+ *  Empty persist-folds still union the remount pair so a remounted live
+ *  reopen sees hist-keyed leave-paint before FFI merge. */
 internal fun retainedTranscriptForChat(
     chatId: String,
     retainedByChat: Map<String, List<SonarMsg>>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<SonarMsg> {
     retainedByChat[chatId]?.takeIf { it.isNotEmpty() }?.let { return it }
-    for (id in foldFamilyIds(chatId, historicalFolds)) {
-        if (id == chatId) continue
+    for (id in echoReconcileFamilyIds(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(id, chatId)) continue
         retainedByChat[id]?.takeIf { it.isNotEmpty() }?.let { return it }
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank() && bare != id) {
+            retainedByChat[bare]?.takeIf { it.isNotEmpty() }?.let { return it }
+        }
     }
     return emptyList()
 }
@@ -2620,14 +2644,26 @@ internal fun firstOpenFoldFamilySeedRows(snapshot: List<SonarMsg>): List<SonarMs
 /** Union leave-paint across the fold family. A short live 0.9 leave-frame
  *  must not hide recovered 0.8 rows still keyed on the hidden sibling.
  *  `retainedTranscriptForChat` is first-hit (any paint exists); first-open
- *  paint has to keep every family window. iOS `snFirstOpenFamilyRetainedRows`. */
+ *  paint has to keep every family window. Empty persist-folds still union
+ *  the remount pair. iOS `snFirstOpenFamilyRetainedRows`. */
 internal fun firstOpenFamilyRetainedRows(
     chatId: String,
     retainedByChat: Map<String, List<SonarMsg>>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<SonarMsg> {
     val ids = linkedSetOf(chatId)
-    ids += foldFamilyIds(chatId, historicalFolds)
+    for (id in echoReconcileFamilyIds(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        ids += id
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank()) ids += bare
+    }
     var merged: List<SonarMsg> = emptyList()
     for (id in ids) {
         val rows = retainedByChat[id]?.takeIf { it.isNotEmpty() } ?: continue
@@ -2648,8 +2684,16 @@ internal fun firstOpenTranscriptPaintRows(
     retainedByChat: Map<String, List<SonarMsg>>,
     snapshotPaint: List<SonarMsg>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): List<SonarMsg> {
-    val retained = firstOpenFamilyRetainedRows(chatId, retainedByChat, historicalFolds)
+    val retained = firstOpenFamilyRetainedRows(
+        chatId,
+        retainedByChat,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
     val snapshot = snapshotPaint.withoutSyntheticSummaryRows()
     if (retained.isEmpty()) return snapshot
     if (snapshot.isEmpty()) return retained
@@ -6032,13 +6076,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Prefer last leave paint, else snapshot — never open on empty when we can avoid it. */
-    private fun firstOpenTranscriptPaint(chatId: String, snapshotPaint: List<SonarMsg>): List<SonarMsg> =
-        firstOpenTranscriptPaintRows(
+    private fun firstOpenTranscriptPaint(chatId: String, snapshotPaint: List<SonarMsg>): List<SonarMsg> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return firstOpenTranscriptPaintRows(
             chatId,
             retainedTranscriptByChat,
             snapshotPaint,
             historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
+    }
 
     /**
      * Signal-Android list bind: warm disk thumbs into [MediaImageMemoryCache]
@@ -10190,15 +10238,24 @@ class SonarAppState(private val scope: CoroutineScope) {
         // no leave-frame. After a fold the leave frame may still be keyed
         // on the hidden historical id; walk the family so first paint is
         // not empty.
+        val (opened, pane) = remountPairForOpenChat(chat.id)
         val openSnapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
         val openUnion = firstOpenTranscriptPaintRows(
             chat.id,
             retainedTranscriptByChat,
             openSnapshot,
             historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
         if (firstOpenHasLocalTranscriptPaint(
-                retainedTranscriptForChat(chat.id, retainedTranscriptByChat, historicalFoldMap),
+                retainedTranscriptForChat(
+                    chat.id,
+                    retainedTranscriptByChat,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
                 openSnapshot,
             )
         ) {
@@ -10295,6 +10352,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // 0.9 + mesh tail; union remounted WN family rows so first paint
         // cannot hide recovered 0.8 history. iOS `rebuildNow` already
         // unions via `dmMsgs`.
+        val (opened, pane) = remountPairForOpenChat(id)
         val familySnapshot = mergeAllTranscriptRows(
             meshWhiteNoiseSeed(id) + snapshotMessagesForChat(id),
         )
@@ -10303,9 +10361,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             retainedTranscriptByChat,
             familySnapshot,
             historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
         if (firstOpenHasLocalTranscriptPaint(
-                retainedTranscriptForChat(id, retainedTranscriptByChat, historicalFoldMap),
+                retainedTranscriptForChat(
+                    id,
+                    retainedTranscriptByChat,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
                 familySnapshot,
             )
         ) {
@@ -17216,6 +17282,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                             historicalFolds = historicalFoldMap,
                             peerIdForGroup = { peerIdForMarmotGroup(it) },
                             meshChatId = ::meshChatId,
+                            openedConversationId = openedChat,
+                            openedConversationPaneId = paneChat,
                         )
                     ) {
                         refreshOpenDm(meshPeerId(sc.id))

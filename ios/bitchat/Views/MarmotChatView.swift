@@ -3585,9 +3585,12 @@ final class MarmotChatModel: ObservableObject {
 
     func markConversationRead(groupId: String) {
         let blobFolds = (defaults.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         let blobIds = snConversationReadGroupIds(
             groupId: groupId,
-            historicalFolds: blobFolds
+            historicalFolds: blobFolds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
         )
         for id in blobIds {
             unreadSuppressGroupIds.insert(id)
@@ -3614,7 +3617,9 @@ final class MarmotChatModel: ObservableObject {
             )
             let ids = snConversationReadGroupIds(
                 groupId: groupId,
-                historicalFolds: folds
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
             )
             for id in ids {
                 unreadSuppressGroupIds.insert(id)

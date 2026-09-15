@@ -2376,6 +2376,26 @@ struct SonarConversationFoldTests {
             )
         )
         #expect(
+            !snConversationChangeShouldRefreshOpenMesh(
+                openMeshChatId: "mesh:peer-a",
+                changedGroupId: "group-08",
+                historicalFolds: [:],
+                peerIdForGroup: { $0 == "group-09" ? "peer-a" : nil },
+                meshChatId: { "mesh:\($0)" }
+            )
+        )
+        #expect(
+            snConversationChangeShouldRefreshOpenMesh(
+                openMeshChatId: "mesh:peer-a",
+                changedGroupId: "group-08",
+                historicalFolds: [:],
+                peerIdForGroup: { $0 == "group-09" ? "peer-a" : nil },
+                meshChatId: { "mesh:\($0)" },
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            )
+        )
+        #expect(
             snPendingUploadLookupGroupIds(
                 groupId: "group-08",
                 historicalFolds: ["group-08": "group-09"]
@@ -2439,6 +2459,15 @@ struct SonarConversationFoldTests {
                 retainedByChat: ["marmot:group-08": ["old from 0.8"]],
                 historicalFolds: [:]
             ).isEmpty
+        )
+        #expect(
+            snRetainedTranscriptForChat(
+                chatId: "marmot:group-09",
+                retainedByChat: ["marmot:group-08": ["old from 0.8"]],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == ["old from 0.8"]
         )
         #expect(snFirstOpenShouldMergeFolds(seedId: "group-09", persistedFolds: [:]))
         #expect(snFirstOpenShouldMergeFolds(seedId: "marmot:group-09", persistedFolds: [:]))
@@ -2509,6 +2538,22 @@ struct SonarConversationFoldTests {
                 historicalFolds: [:],
                 idOf: { $0 }
             ) == ["new 0.9"]
+        )
+        #expect(
+            Set(
+                snFirstOpenTranscriptPaintRows(
+                    chatId: "group-09",
+                    retainedByChat: [
+                        "group-09": ["new 0.9"],
+                        "group-08": ["old from 0.8"],
+                    ],
+                    snapshotPaint: ["new 0.9"],
+                    historicalFolds: [:],
+                    idOf: { $0 },
+                    openedConversationId: "group-09",
+                    openedConversationPaneId: "group-08"
+                )
+            ) == ["new 0.9", "old from 0.8"]
         )
         #expect(snFirstOpenHasLocalTranscriptPaint(retained: [String](), familyCached: ["old from 0.8"]))
         #expect(snFirstOpenHasLocalTranscriptPaint(retained: ["leave"], familyCached: [String]()))
