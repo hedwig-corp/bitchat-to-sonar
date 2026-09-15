@@ -3073,6 +3073,22 @@ struct SonarConversationFoldTests {
             ) == nil
         )
         #expect(
+            snTrillCooldownUntil(
+                conversationId: "marmot:group-09",
+                cooldownUntilByChat: snTrillCooldownWritten(
+                    conversationId: "marmot:group-08",
+                    until: histTrill,
+                    cooldownUntilByChat: [:],
+                    historicalFolds: [:],
+                    openedConversationId: "marmot:group-09",
+                    openedConversationPaneId: "marmot:group-08"
+                ),
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == histTrill
+        )
+        #expect(
             snPaymentActivityPeerKeys(
                 conversationId: "group-08",
                 historicalFolds: ["group-08": "group-09"]

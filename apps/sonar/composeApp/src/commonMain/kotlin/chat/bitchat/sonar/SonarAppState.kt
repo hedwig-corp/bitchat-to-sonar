@@ -2680,6 +2680,30 @@ internal fun trillCooldownUntilMsForChat(
     return latest
 }
 
+/** Stamp sender cooldown onto every remount / fold-family key. After remount
+ *  a hist-only write is invisible on live while persist-folds are empty.
+ *  iOS `snTrillCooldownWritten`. */
+internal fun trillCooldownUntilMsWritten(
+    chatId: String,
+    untilMs: Long,
+    cooldownUntilMs: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    var next = cooldownUntilMs
+    val keys = paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }
+    for (id in keys) {
+        next = next + (id to untilMs)
+    }
+    return next
+}
+
 /** Ids that count as "this chat is open" for banner suppression after a fold.
  *  Scan stays on listed ids so a bak remainder cannot replay recovered
  *  history as never-seen. Suppression must include the hidden 0.8 sibling
@@ -8624,8 +8648,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock to send a nudge"
             return
         }
-        trillCooldownUntilMs = trillCooldownUntilMs +
-            (chatId to SonarClock.monotonicMillis() + TRILL_SEND_COOLDOWN_MS)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        trillCooldownUntilMs = trillCooldownUntilMsWritten(
+            chatId,
+            SonarClock.monotonicMillis() + TRILL_SEND_COOLDOWN_MS,
+            trillCooldownUntilMs,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         send(chatId, TrillLine(randomTrillId()).encoded())
         triggerTrillBuzz()
     }

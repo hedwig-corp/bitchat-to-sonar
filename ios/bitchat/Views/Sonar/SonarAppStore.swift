@@ -3197,6 +3197,33 @@ func snTrillCooldownUntil(
     return latest
 }
 
+/// Stamp sender cooldown onto every remount / fold-family key. After remount
+/// iPhone still paints hist; a hist-only write is invisible on live while
+/// persist-folds are empty. Compose `trillCooldownUntilMsWritten`.
+func snTrillCooldownWritten(
+    conversationId: String,
+    until: Date,
+    cooldownUntilByChat: [String: Date],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: Date] {
+    var next = cooldownUntilByChat
+    var keys = snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    )
+    if keys.isEmpty { keys.insert(conversationId) }
+    for key in keys {
+        next[key] = until
+    }
+    return next
+}
+
 /// Call-log rows for the open id plus its hidden 0.8 sibling. Promote copies
 /// hist onto live asynchronously; first paint of the live transcript must
 /// still show recovered calls before that rewrite lands.
@@ -14203,8 +14230,19 @@ final class SonarAppStore: ObservableObject {
     /// the per-chat sender cooldown.
     func sendTrill(_ id: String) {
         guard canSendTrill(id) else { return }
-        trillCooldownUntilByChat[chatAlertKey(id)] =
-            Date().addingTimeInterval(SonarTrillPolicy.cooldownSeconds)
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        let until = Date().addingTimeInterval(SonarTrillPolicy.cooldownSeconds)
+        var next = snTrillCooldownWritten(
+            conversationId: id,
+            until: until,
+            cooldownUntilByChat: trillCooldownUntilByChat,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        next[chatAlertKey(id)] = until
+        trillCooldownUntilByChat = next
         sendDm(id, SonarTrillMessage(id: SonarTrillMessage.makeID()).encoded())
         // The sender's own send triggers the local buzz (MSN behaviour).
         triggerTrillBuzz()

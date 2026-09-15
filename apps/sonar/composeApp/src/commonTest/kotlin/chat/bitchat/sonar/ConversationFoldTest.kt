@@ -2799,6 +2799,26 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        val stamped = trillCooldownUntilMsWritten(
+            "group-08",
+            80L,
+            emptyMap(),
+            emptyMap(),
+            openedConversationId = "group-09",
+            openedConversationPaneId = "group-08",
+        )
+        assertEquals(80L, stamped["group-08"])
+        assertEquals(80L, stamped["group-09"])
+        assertEquals(
+            80L,
+            trillCooldownUntilMsForChat(
+                "group-09",
+                stamped,
+                emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test
