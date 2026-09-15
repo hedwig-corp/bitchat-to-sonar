@@ -3642,23 +3642,40 @@ func snRemountPairHistoricalFolds(
     return next
 }
 
-/// Prefer persist/remount live among duplicate 1:1 ids. Newest-`latest_at`
-/// and first-listed both pick recovered hist after remount (hist keeps
-/// the transcript; live is empty or ties). Contact-profile Message /
-/// `preferredDirectMarmotGroup` then send against hist while FFI still
-/// lists it. Empty persist-folds without a remount pair stay nil so
-/// first-resume newest-sort is unchanged. Compose
-/// `preferredFoldedDirectMarmotChatId`.
+/// Persist-wins merge of host folds + FFI `fold_aliases`. Contact-profile
+/// 1:1 resolution from a remounted group has a remount pair that is not
+/// the DM; FFI still knows hist→live for the peer's 1:1s. Persist
+/// hist→stale still wins (R-045). Wake-mute stays FFI-wins.
+/// Compose `persistThenFfiHistoricalFolds`.
+func snPersistThenFfiHistoricalFolds(
+    persisted: [String: String],
+    ffi: [String: String]
+) -> [String: String] {
+    if ffi.isEmpty { return persisted }
+    if persisted.isEmpty { return ffi }
+    var next = persisted
+    for (historical, live) in ffi where next[historical] == nil {
+        next[historical] = live
+    }
+    return next
+}
+
+/// Prefer persist/FFI/remount live among duplicate 1:1 ids.
+/// Compose `preferredFoldedDirectMarmotChatId`.
 func snPreferredFoldedDirectMarmotGroupId(
     groupIds: [String],
     historicalFolds: [String: String],
     openedConversationId: String? = nil,
-    openedConversationPaneId: String? = nil
+    openedConversationPaneId: String? = nil,
+    ffiHistoricalFolds: [String: String] = [:]
 ) -> String? {
     let ids = groupIds.map { snBareMarmotGroupId($0) }.filter { !$0.isEmpty }
     guard ids.count > 1 else { return nil }
     let folds = snRemountPairHistoricalFolds(
-        historicalFolds: historicalFolds,
+        historicalFolds: snPersistThenFfiHistoricalFolds(
+            persisted: historicalFolds,
+            ffi: ffiHistoricalFolds
+        ),
         openedConversationId: openedConversationId,
         openedConversationPaneId: openedConversationPaneId
     )
@@ -9223,6 +9240,46 @@ final class SonarAppStore: ObservableObject {
     func marmotGroup(forNpub npub: String) -> MarmotService.MarmotGroup? {
         let target = SNMarmotProfileCache.canonicalKey(npub)
         return preferredDirectMarmotGroup(in: marmotGroups(forNpub: target))
+    }
+
+    /// Contact-profile 1:1 only. Home-row `preferredDirectMarmotGroup` stays
+    /// persist+remount so paint never waits on FFI. Persist hist→stale wins.
+    func contactDirectMarmotGroup(
+        forNpub npub: String,
+        ffiHistoricalFolds: [String: String] = [:]
+    ) -> MarmotService.MarmotGroup? {
+        let target = SNMarmotProfileCache.canonicalKey(npub)
+        let groups = marmotGroups(forNpub: target)
+        let persist = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        if let preferredId = snPreferredFoldedDirectMarmotGroupId(
+            groupIds: groups.map(\.id),
+            historicalFolds: persist,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane,
+            ffiHistoricalFolds: ffiHistoricalFolds
+        ), let match = groups.first(where: { $0.id == preferredId }) {
+            return match
+        }
+        return preferredDirectMarmotGroup(in: groups)
+    }
+
+    func ffiFoldsForDirectNpub(_ npub: String) async -> [String: String] {
+        let groups = marmotGroups(forNpub: npub)
+        let listed = groups.map(\.id)
+        var aliasesById: [String: [String]] = [:]
+        var liveById: [String: String] = [:]
+        for id in listed {
+            aliasesById[id] = await marmot.foldAliases(groupId: id)
+            if let live = await marmot.liveFoldTarget(groupId: id) {
+                liveById[id] = live
+            }
+        }
+        return snHistoricalFoldsFromAliases(
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
     }
 
     private func marmotGroups(forNpub npub: String) -> [MarmotService.MarmotGroup] {

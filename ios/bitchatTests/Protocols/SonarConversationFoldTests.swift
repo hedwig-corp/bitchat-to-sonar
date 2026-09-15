@@ -476,6 +476,39 @@ struct SonarConversationFoldTests {
                 openedConversationPaneId: "group-08"
             ) == nil
         )
+        // Contact-profile from a remounted group: remount pair is not the DM.
+        #expect(
+            snPreferredFoldedDirectMarmotGroupId(
+                groupIds: ["dm-08", "dm-09"],
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08",
+                ffiHistoricalFolds: ["dm-08": "dm-09"]
+            ) == "dm-09"
+        )
+        #expect(
+            snPreferredFoldedDirectMarmotGroupId(
+                groupIds: ["dm-08", "dm-09"],
+                historicalFolds: ["other-08": "other-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08"
+            ) == nil
+        )
+        #expect(
+            snPreferredFoldedDirectMarmotGroupId(
+                groupIds: ["dm-08", "stale-09", "dm-09"],
+                historicalFolds: ["dm-08": "stale-09"],
+                openedConversationId: "group-09",
+                openedConversationPaneId: "group-08",
+                ffiHistoricalFolds: ["dm-08": "dm-09"]
+            ) == "stale-09"
+        )
+        #expect(
+            snPersistThenFfiHistoricalFolds(
+                persisted: ["dm-08": "stale-09"],
+                ffi: ["dm-08": "dm-09", "other-08": "other-09"]
+            ) == ["dm-08": "stale-09", "other-08": "other-09"]
+        )
         #expect(
             snMarmotSendTargetGroupId(
                 openGroupId: "zzz-08",

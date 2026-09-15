@@ -2396,6 +2396,42 @@ class ConversationFoldTest {
                 openedConversationPaneId = "group-08",
             ),
         )
+        // Contact-profile from a remounted group: remount pair is not the DM.
+        assertEquals(
+            "dm-09",
+            preferredFoldedDirectMarmotChatId(
+                listOf("dm-08", "dm-09"),
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+                ffiHistoricalFolds = mapOf("dm-08" to "dm-09"),
+            ),
+        )
+        assertNull(
+            preferredFoldedDirectMarmotChatId(
+                listOf("dm-08", "dm-09"),
+                mapOf("other-08" to "other-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
+        assertEquals(
+            "stale-09",
+            preferredFoldedDirectMarmotChatId(
+                listOf("dm-08", "stale-09", "dm-09"),
+                mapOf("dm-08" to "stale-09"),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+                ffiHistoricalFolds = mapOf("dm-08" to "dm-09"),
+            ),
+        )
+        assertEquals(
+            mapOf("dm-08" to "stale-09", "other-08" to "other-09"),
+            persistThenFfiHistoricalFolds(
+                mapOf("dm-08" to "stale-09"),
+                mapOf("dm-08" to "dm-09", "other-08" to "other-09"),
+            ),
+        )
     }
 
     @Test

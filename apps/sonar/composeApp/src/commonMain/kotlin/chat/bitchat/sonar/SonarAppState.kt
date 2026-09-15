@@ -512,11 +512,25 @@ internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
     return others.singleOrNull()
 }
 
-/** Prefer persist/remount live among duplicate 1:1 ids. Newest-`latest_at`
+/** Persist-wins merge of host folds + FFI `fold_aliases`. Contact-profile
+ *  1:1 resolution from a remounted **group** has a remount pair that is
+ *  not the DM; FFI still knows hist→live for the peer's 1:1s. Persist
+ *  hist→stale still wins (R-045). Wake-mute stays FFI-wins.
+ *  iOS `snPersistThenFfiHistoricalFolds`. */
+internal fun persistThenFfiHistoricalFolds(
+    persisted: Map<String, String>,
+    ffi: Map<String, String>,
+): Map<String, String> {
+    if (ffi.isEmpty()) return persisted
+    if (persisted.isEmpty()) return ffi
+    return persisted + ffi.filterKeys { it !in persisted }
+}
+
+/** Prefer persist/FFI/remount live among duplicate 1:1 ids. Newest-`latest_at`
  *  and first-listed both pick recovered hist after remount (hist keeps
  *  the transcript; live is empty or ties). Contact-profile Message /
  *  iOS `preferredDirectMarmotGroup` then send against hist while FFI
- *  still lists it. Empty persist-folds without a remount pair stay
+ *  still lists it. Empty persist-folds without FFI or a remount pair stay
  *  null so first-resume newest-sort is unchanged. iOS
  *  `snPreferredFoldedDirectMarmotGroupId`. */
 internal fun preferredFoldedDirectMarmotChatId(
@@ -524,11 +538,12 @@ internal fun preferredFoldedDirectMarmotChatId(
     historicalFolds: Map<String, String>,
     openedConversationId: String? = null,
     openedConversationPaneId: String? = null,
+    ffiHistoricalFolds: Map<String, String> = emptyMap(),
 ): String? {
     val ids = candidateIds.map { it.removePrefix("marmot:").trim() }.filter { it.isNotBlank() }
     if (ids.size <= 1) return null
     val folds = remountPairHistoricalFolds(
-        historicalFolds,
+        persistThenFfiHistoricalFolds(historicalFolds, ffiHistoricalFolds),
         openedConversationId = openedConversationId,
         openedConversationPaneId = openedConversationPaneId,
     )
@@ -543,7 +558,7 @@ internal fun preferredFoldedDirectMarmotChatId(
 }
 
 /** 1:1 row for [peerNpub], ignoring recovered/live rooms that currently list
- *  only that peer. Persist/remount live wins among duplicate DMs. */
+ *  only that peer. Persist/FFI/remount live wins among duplicate DMs. */
 internal fun directMarmotChatIdForPeer(
     chats: List<SonarChat>,
     ownNpub: String,
@@ -551,6 +566,7 @@ internal fun directMarmotChatIdForPeer(
     historicalFolds: Map<String, String> = emptyMap(),
     openedConversationId: String? = null,
     openedConversationPaneId: String? = null,
+    ffiHistoricalFolds: Map<String, String> = emptyMap(),
 ): String? {
     val peer = canonicalProfileKey(peerNpub)
     if (peer.isBlank()) return null
@@ -560,6 +576,7 @@ internal fun directMarmotChatIdForPeer(
         historicalFolds,
         openedConversationId = openedConversationId,
         openedConversationPaneId = openedConversationPaneId,
+        ffiHistoricalFolds = ffiHistoricalFolds,
     ) ?: matches.firstOrNull()?.id
 }
 
@@ -6606,6 +6623,15 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  wins among duplicate 1:1s so a recovered hist row is not reopened. */
     fun directChatIdForPeer(peerNpub: String): String? {
         val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val peer = canonicalProfileKey(peerNpub)
+        val candidateIds = chats.mapNotNull { chat ->
+            chat.id.takeIf { directMarmotPeerKey(chat, npub) == peer }
+        }
+        val ffi = historicalFoldsFromAliases(
+            candidateIds,
+            { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
         return directMarmotChatIdForPeer(
             chats,
             npub,
@@ -6613,6 +6639,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             historicalFoldMap,
             openedConversationId = opened,
             openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffi,
         )
     }
 
