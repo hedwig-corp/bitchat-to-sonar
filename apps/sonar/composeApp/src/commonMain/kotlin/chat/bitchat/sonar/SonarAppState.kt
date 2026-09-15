@@ -13069,7 +13069,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Newest live duplicate for outbound Marmot traffic. Hist remaps via
      *  [resolveMarmotGroupId]; two live 0.9 siblings pick the same target
-     *  text send already uses. */
+     *  text send already uses. Media / sticker / payment / internet call
+     *  signaling share this helper. Persist-wins FFI; do not persist.
+     *  iOS `resolvedMarmotOutboundGroupId`. */
     private fun resolveMarmotSendTargetGroupId(chatId: String): String? {
         val open = resolveMarmotGroupId(chatId) ?: return null
         val (opened, pane) = remountPairForOpenChat(chatId)

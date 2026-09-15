@@ -499,6 +499,9 @@ class ConversationFoldTest {
         )
         // Open hist from home before remount hop: persist empty, remount
         // nil, hist latest wins newest-sort. FFI still names live.
+        // Text, media, sticker, payment, and internet call signaling
+        // share this remap (Compose resolveMarmotSendTargetGroupId /
+        // iOS resolvedMarmotOutboundGroupId).
         assertEquals(
             "group-09",
             marmotSendTargetGroupId(
@@ -514,6 +517,17 @@ class ConversationFoldTest {
                 openChatId = "zzz-08",
                 duplicateGroupIds = listOf("zzz-08", "group-09"),
                 latestSecs = { if (it == "zzz-08") 2L else 1L },
+            ),
+        )
+        // Mesh-media internet fallback: conversation id is not mapped,
+        // alias-found hist is the persist target. FFI still names live.
+        assertEquals(
+            "group-09",
+            marmotSendTargetGroupId(
+                openChatId = "alias-08",
+                duplicateGroupIds = listOf("alias-08", "group-09"),
+                latestSecs = { if (it == "alias-08") 2L else 1L },
+                ffiHistoricalFolds = mapOf("alias-08" to "group-09"),
             ),
         )
     }

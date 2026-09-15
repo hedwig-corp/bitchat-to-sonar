@@ -9336,12 +9336,49 @@ final class SonarAppStore: ObservableObject {
         return preferredDirectMarmotGroup(in: groups)?.id ?? groupId
     }
 
-    /// Sticker / media / payment / call must use the same live duplicate as text.
-    private func marmotOutboundGroupId(_ id: String) -> String? {
-        if let groupId = marmotSendTargetGroupId(id) { return groupId }
+    /// Sticker / media / payment / internet call signaling must use the
+    /// same live duplicate as text. Persist+remount first; pass FFI so a
+    /// recovered hist opened from home (empty persist, no remount) still
+    /// publishes against live. Do not persist the merge.
+    /// Compose `resolveMarmotSendTargetGroupId`.
+    private func marmotOutboundGroupId(
+        _ id: String,
+        ffiHistoricalFolds: [String: String] = [:]
+    ) -> String? {
+        if let groupId = marmotSendTargetGroupId(id, ffiHistoricalFolds: ffiHistoricalFolds) {
+            return groupId
+        }
         guard let profile = resolvedSonarProfile(id) else { return nil }
-        return preferredDirectMarmotGroup(in: marmotGroups(forNpub: profile.npub))?.id
-            ?? marmotGroup(forNpub: profile.npub)?.id
+        return contactDirectMarmotGroup(
+            forNpub: profile.npub,
+            ffiHistoricalFolds: ffiHistoricalFolds
+        )?.id
+    }
+
+    /// Persist+remount first. When more than one 1:1 is listed, merge
+    /// persist-wins FFI. `fallback` is an alias-found group when the
+    /// conversation id itself is not yet mapped (mesh-media internet
+    /// fallback). Compose `resolveMarmotSendTargetGroupId`.
+    private func resolvedMarmotOutboundGroupId(
+        _ id: String,
+        fallback: String? = nil
+    ) async -> String? {
+        guard let groupId = marmotOutboundGroupId(id) ?? fallback else { return nil }
+        guard let group = marmotGroup(byId: groupId),
+              let peer = directMarmotPeerKey(in: group),
+              marmotGroups(forNpub: peer).count > 1
+        else { return groupId }
+        let ffi = await ffiFoldsForDirectNpub(peer)
+        return marmotOutboundGroupId(id, ffiHistoricalFolds: ffi)
+            ?? marmotSendTargetGroupId(groupId, ffiHistoricalFolds: ffi)
+            ?? groupId
+    }
+
+    private func directMarmotHasDuplicateSiblings(_ groupId: String) -> Bool {
+        guard let group = marmotGroup(byId: groupId),
+              let peer = directMarmotPeerKey(in: group)
+        else { return false }
+        return marmotGroups(forNpub: peer).count > 1
     }
 
     func recoveredChatWaitingForPeerUpdate(_ id: String) -> Bool {
@@ -11251,7 +11288,8 @@ final class SonarAppStore: ObservableObject {
             for line in lines { chatViewModel.sendPrivateMessage(line, to: peer) }
             return true
         }
-        if let groupId = marmotOutboundGroupId(id) {
+        if marmotOutboundGroupId(id) != nil {
+            guard let groupId = await resolvedMarmotOutboundGroupId(id) else { return false }
             return await marmot.send(lines, to: groupId)
         }
         if let profile = resolvedSonarProfile(id) {
@@ -11276,13 +11314,17 @@ final class SonarAppStore: ObservableObject {
             chatViewModel.sendPrivateMessage(content, to: PeerID(str: route))
             return
         }
-        if let groupId = marmotOutboundGroupId(id) {
-            marmot.sendSticker(
-                groupId: groupId,
-                packCoordinate: packCoordinate,
-                shortcode: sticker.shortcode,
-                plaintextSha256: sticker.sha256
-            )
+        if marmotOutboundGroupId(id) != nil {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let groupId = await self.resolvedMarmotOutboundGroupId(id) else { return }
+                self.marmot.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: packCoordinate,
+                    shortcode: sticker.shortcode,
+                    plaintextSha256: sticker.sha256
+                )
+            }
             return
         }
         if let pendingNpub = pendingMarmotNpub(for: id) {
@@ -13220,21 +13262,17 @@ final class SonarAppStore: ObservableObject {
             sendImageOverMesh(PeerID(str: route), data: data)
             return
         }
-        let groupId: String?
-        if let gid = marmotOutboundGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else {
+        guard marmotOutboundGroupId(id) != nil else {
             showToast("Couldn't send the image — the secure chat isn't ready yet.")
             return
         }
         let pendingURL = Self.pendingMediaURL()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else {
+                self.showToast("Couldn't send the image — the secure chat isn't ready yet.")
+                return
+            }
             await self.rememberPendingUploadMedia(
                 groupId: gid,
                 filename: filename,
@@ -13303,15 +13341,7 @@ final class SonarAppStore: ObservableObject {
             }
             return
         }
-        let groupId: String?
-        if let gid = marmotOutboundGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else { return }
+        guard marmotOutboundGroupId(id) != nil else { return }
         // One pending-echo entry per attachment; the canonical album message
         // reconciles each media item against its filename-keyed cache entry.
         var albumItems: [MarmotService.MediaAlbumItem] = []
@@ -13327,6 +13357,7 @@ final class SonarAppStore: ObservableObject {
         }
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else { return }
             for (item, pendingURL) in zip(items, pendingURLs) {
                 await self.rememberPendingUploadMedia(
                     groupId: gid,
@@ -13386,19 +13417,12 @@ final class SonarAppStore: ObservableObject {
             // refusing while a perfectly good encrypted route exists.
         }
 
-        let groupId: String?
-        if let gid = marmotOutboundGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else { return false }
+        guard marmotOutboundGroupId(id) != nil else { return false }
 
         let pendingURL = Self.pendingMediaURL()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else { return }
             await self.rememberPendingUploadMedia(
                 groupId: gid,
                 filename: safeName,
@@ -13448,21 +13472,17 @@ final class SonarAppStore: ObservableObject {
             return
         }
         guard let data = try? Data(contentsOf: url) else { return }
-        let groupId: String?
-        if let gid = marmotOutboundGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else {
+        guard marmotOutboundGroupId(id) != nil else {
             showToast("Couldn't send the voice note — the secure chat isn't ready yet.")
             return
         }
         let pendingURL = Self.pendingMediaURL()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else {
+                self.showToast("Couldn't send the voice note — the secure chat isn't ready yet.")
+                return
+            }
             await self.rememberPendingUploadMedia(
                 groupId: gid,
                 filename: url.lastPathComponent,
@@ -13510,10 +13530,6 @@ final class SonarAppStore: ObservableObject {
         let mime = packet.mimeType ?? "application/octet-stream"
         let key = canonicalPeerKey(peerID)
         var groupId = marmotOutboundGroupId(key)
-        if groupId == nil, let profile = resolvedSonarProfile(key) {
-            groupId = preferredDirectMarmotGroup(in: marmotGroups(forNpub: profile.npub))?.id
-                ?? marmotGroup(forNpub: profile.npub)?.id
-        }
         if groupId == nil {
             for alias in meshPeerAliases(for: key) {
                 if let gid = marmotGroupId(alias) { groupId = gid; break }
@@ -13524,10 +13540,11 @@ final class SonarAppStore: ObservableObject {
                 }
             }
         }
-        guard let gid = groupId else { return false }
+        guard let fallback = groupId else { return false }
         let pendingURL = Self.pendingMediaURL()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            let gid = await self.resolvedMarmotOutboundGroupId(key, fallback: fallback) ?? fallback
             await self.rememberPendingUploadMedia(
                 groupId: gid,
                 filename: filename,
@@ -16581,6 +16598,14 @@ final class SonarAppStore: ObservableObject {
             return sent
         case .internet:
             if let groupId = callMarmotGroupId(convId) {
+                if directMarmotHasDuplicateSiblings(groupId) {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        let target = await self.resolvedMarmotOutboundGroupId(convId) ?? groupId
+                        self.marmot.send(line, to: target)
+                    }
+                    return true
+                }
                 marmot.send(line, to: groupId)
                 return true
             }

@@ -538,6 +538,8 @@ struct SonarConversationFoldTests {
             ) == "stale-09"
         )
         #expect(
+            // Text / media / sticker / payment / internet call share this
+            // remap (resolvedMarmotOutboundGroupId).
             snMarmotSendTargetGroupId(
                 openGroupId: "zzz-08",
                 duplicateGroupIds: ["zzz-08", "group-09"],
