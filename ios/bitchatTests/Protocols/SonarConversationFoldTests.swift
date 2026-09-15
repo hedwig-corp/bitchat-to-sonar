@@ -2016,6 +2016,20 @@ struct SonarConversationFoldTests {
             openedConversationPaneId: "marmot:group-08",
             historicalFolds: ["group-08": "group-09"]
         ))
+        #expect(snPendingMediaPreviewBelongsToChat(
+            previewPeerId: "marmot:group-08",
+            chatId: "marmot:group-09",
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08",
+            historicalFolds: [:]
+        ))
+        #expect(!snPendingMediaPreviewBelongsToChat(
+            previewPeerId: "marmot:group-08",
+            chatId: "marmot:group-09",
+            openedConversationId: nil,
+            openedConversationPaneId: nil,
+            historicalFolds: [:]
+        ))
         #expect(snClosedDMShouldClearOpened(
             closingId: "marmot:group-08",
             openedConversationId: "marmot:group-09",

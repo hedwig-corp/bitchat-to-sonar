@@ -2968,17 +2968,32 @@ internal fun verifiedForFoldFamily(
     openedConversationPaneId,
 ).any { it in verifiedIds }
 
-/** Preview sheet stays up when remount rewrites chatId to live.
+/** Preview sheet stays up when remount rewrites chatId to live while
+ *  the painted pane is still hist (or Compose hops the other way).
+ *  Empty persist-folds still union the remount pair.
  *  iOS `snPendingMediaPreviewBelongsToChat`. */
 internal fun pendingMediaPreviewBelongsToChat(
     previewChatId: String,
     screenId: String,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): Boolean {
     if (openedConversationIdMatches(previewChatId, screenId)) return true
     val previewBare = previewChatId.removePrefix("marmot:")
     val screenBare = screenId.removePrefix("marmot:")
-    return conversationsMatchFoldFamily(previewBare, screenBare, historicalFolds)
+    if (conversationsMatchFoldFamily(previewBare, screenBare, historicalFolds)) return true
+    if (openedConversationIdMatches(previewChatId, openedConversationId) &&
+        openedConversationIdMatches(screenId, openedConversationPaneId)
+    ) {
+        return true
+    }
+    if (openedConversationIdMatches(previewChatId, openedConversationPaneId) &&
+        openedConversationIdMatches(screenId, openedConversationId)
+    ) {
+        return true
+    }
+    return false
 }
 
 /** Same recovered conversation under either the hidden 0.8 or live 0.9 id. */
@@ -11633,14 +11648,32 @@ class SonarAppState(private val scope: CoroutineScope) {
     var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
     private var mediaPreviewGeneration = 0L
 
-    fun pendingMediaPreviewsMatching(chatId: String): List<PendingMediaPreview> =
-        pendingMediaPreviews.filter {
+    fun pendingMediaPreviewsMatching(chatId: String): List<PendingMediaPreview> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return pendingMediaPreviews.filter {
             pendingMediaPreviewBelongsToChat(
                 previewChatId = it.chatId,
                 screenId = chatId,
                 historicalFolds = historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
             )
         }
+    }
+
+    /** Stage / publish may start on hist and finish after Compose hops to
+     *  live. Empty persist-folds still accept the remount pair. */
+    private fun pendingMediaStageBelongsToOpenChat(chatId: String): Boolean {
+        val openId = (screen as? Screen.Chat)?.id ?: return false
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return pendingMediaPreviewBelongsToChat(
+            previewChatId = chatId,
+            screenId = openId,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     private fun nextMediaPreviewGeneration(): Long {
         mediaPreviewGeneration += 1
@@ -11673,7 +11706,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  written to temp files off the UI thread (Signal-style: full quality
      *  until send confirmation); the batch replaces prior staged previews. */
     fun stageMediaPreviews(chatId: String, items: List<PickedPhoto>) {
-        if ((screen as? Screen.Chat)?.id != chatId || items.isEmpty()) return
+        if (!pendingMediaStageBelongsToOpenChat(chatId) || items.isEmpty()) return
         val generation = nextMediaPreviewGeneration()
         val previous = pendingMediaPreviews
         pendingMediaPreviews = emptyList()
@@ -11702,7 +11735,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "Couldn't prepare media."
                 return@launch
             }
-            if (mediaPreviewGeneration != generation || (screen as? Screen.Chat)?.id != chatId) {
+            if (mediaPreviewGeneration != generation || !pendingMediaStageBelongsToOpenChat(chatId)) {
                 withContext(Dispatchers.IO) { for (p in written) deleteTempMediaFile(p.tempPath) }
                 return@launch
             }
@@ -11721,11 +11754,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
+            val (opened, pane) = remountPairForOpenChat(chatId)
             pendingMediaPreviews.filterNot {
                 pendingMediaPreviewBelongsToChat(
                     previewChatId = it.chatId,
                     screenId = chatId,
                     historicalFolds = historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
                 )
             }
         }
@@ -11794,11 +11830,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
+            val (opened, pane) = remountPairForOpenChat(chatId)
             pendingMediaPreviews.filterNot {
                 pendingMediaPreviewBelongsToChat(
                     previewChatId = it.chatId,
                     screenId = chatId,
                     historicalFolds = historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
                 )
             }
         }

@@ -5161,7 +5161,7 @@ final class SonarAppStore: ObservableObject {
         _ peerId: String,
         items: [(payload: PendingMediaPayload, filename: String, mime: String)]
     ) {
-        guard currentDMId == peerId, !items.isEmpty else {
+        guard pendingMediaStageBelongsToOpenChat(peerId), !items.isEmpty else {
             // Never staged — drop any picker-owned temp files so a video
             // picked right before navigating away doesn't orphan on disk.
             Task.detached(priority: .utility) {
@@ -5204,7 +5204,7 @@ final class SonarAppStore: ObservableObject {
                 showToast("Couldn't prepare media.")
                 return
             }
-            guard mediaPreviewGeneration == generation, currentDMId == peerId else {
+            guard mediaPreviewGeneration == generation, pendingMediaStageBelongsToOpenChat(peerId) else {
                 Task.detached(priority: .utility) {
                     for (url, _, _) in written { Self.deleteTempMediaFile(url) }
                 }
@@ -5214,6 +5214,18 @@ final class SonarAppStore: ObservableObject {
                 PendingMediaPreview(peerId: peerId, tempURL: $0.0, filename: $0.1, mime: $0.2)
             }
         }
+    }
+
+    private func pendingMediaStageBelongsToOpenChat(_ peerId: String) -> Bool {
+        guard let openId = currentDMId else { return false }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snPendingMediaPreviewBelongsToChat(
+            previewPeerId: peerId,
+            chatId: openId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            historicalFolds: folds
+        )
     }
 
     func pendingMediaPreviewsMatching(_ chatId: String) -> [PendingMediaPreview] {

@@ -1501,6 +1501,31 @@ class ConversationFoldTest {
                 historicalFolds = mapOf("group-08" to "group-09"),
             ),
         )
+        assertTrue(
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = "marmot:group-09",
+                screenId = "marmot:group-08",
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertTrue(
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = "marmot:group-08",
+                screenId = "marmot:group-09",
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        assertFalse(
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = "marmot:group-08",
+                screenId = "marmot:group-09",
+                historicalFolds = emptyMap(),
+            ),
+        )
     }
 
     @Test
