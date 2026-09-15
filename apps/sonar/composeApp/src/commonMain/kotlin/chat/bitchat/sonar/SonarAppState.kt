@@ -1287,6 +1287,49 @@ internal fun quotedJumpCleared(
     return next
 }
 
+/** Open-time unread stored on any remount / fold-family key. After remount
+ *  Compose hops `Screen.Chat.id` to live while a hist capture may still
+ *  be in flight. iOS `snUnreadCountAtOpen`. */
+internal fun unreadCountAtOpen(
+    chatId: String,
+    unreadAtOpen: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Long? {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        unreadAtOpen[id]?.let { return it }
+    }
+    return null
+}
+
+/** Stamp open-time unread onto every remount / fold-family key.
+ *  `null` clears. iOS `snUnreadCountAtOpenWritten`. */
+internal fun unreadCountAtOpenWritten(
+    chatId: String,
+    count: Long?,
+    unreadAtOpen: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    var next = unreadAtOpen
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        next = if (count == null) next - id else next + (id to count)
+    }
+    return next
+}
+
 /** Ids that have had a trusted FFI newest/cursor page.
  *  Seeded `transcriptWindows` keys and remounted host-cache copies are
  *  not paging keys — passing those made hist look paged before
@@ -4256,12 +4299,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val cached = openChatUnreadFromCache(ids, unreadByChat)
         if (cached != null || ids.isEmpty()) {
-            openChatUnread = openChatUnread + (chatId to (cached ?: 0L))
+            openChatUnread = unreadCountAtOpenWritten(
+                chatId,
+                cached ?: 0L,
+                openChatUnread,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
             markGroupsRead(ids)
             return
         }
         // Leave unset until the index probe settles.
-        openChatUnread = openChatUnread - chatId
+        openChatUnread = unreadCountAtOpenWritten(
+            chatId,
+            null,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         scope.launch {
             val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
             rememberConversationSummaryIndex(summaries)
@@ -4272,15 +4329,38 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    fun openChatUnreadFor(chatId: String): Long? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return unreadCountAtOpen(
+            chatId,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
     private fun publishCapturedOpenUnread(capturedFor: String, unread: Long) {
+        val (opened, pane) = remountPairForOpenChat(capturedFor)
         val stackChatIds = stack.mapNotNull { (it as? Screen.Chat)?.id }
         val key = openChatUnreadPublishId(
             capturedFor = capturedFor,
             stackChatIds = stackChatIds,
             historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         ) ?: return
-        if (openChatUnread[key] != null) return
-        openChatUnread = openChatUnread + (key to unread)
+        if (unreadCountAtOpen(key, openChatUnread, historicalFoldMap, opened, pane) != null) {
+            return
+        }
+        openChatUnread = unreadCountAtOpenWritten(
+            key,
+            unread,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     /** Give up on a pending unread divider for this open: the transcript is
@@ -4288,9 +4368,16 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  is a filtered control line). Settles to 0 so open policy becomes
      *  live-edge and tail following resumes. */
     fun retireOpenChatUnread(chatId: String) {
-        openChatUnread = openChatUnread + (chatId to 0L)
-        openChatUnreadAnchor = openChatUnreadAnchor - chatId
         val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatUnread = unreadCountAtOpenWritten(
+            chatId,
+            0L,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        openChatUnreadAnchor = openChatUnreadAnchor - chatId
         openChatJumpMessageId = quotedJumpCleared(
             chatId,
             openChatJumpMessageId,

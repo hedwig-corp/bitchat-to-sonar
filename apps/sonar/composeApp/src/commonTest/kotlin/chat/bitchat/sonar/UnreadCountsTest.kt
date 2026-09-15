@@ -186,6 +186,26 @@ class UnreadCountsTest {
             ),
             "popped / other-room probe must not publish",
         )
+        assertEquals(
+            "group-09",
+            openChatUnreadPublishId(
+                capturedFor = "group-08",
+                stackChatIds = listOf("group-09"),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+            "empty persist must still publish onto remounted live",
+        )
+        assertNull(
+            openChatUnreadPublishId(
+                capturedFor = "group-08",
+                stackChatIds = listOf("other"),
+                historicalFolds = emptyMap(),
+                openedConversationId = "group-09",
+                openedConversationPaneId = "group-08",
+            ),
+        )
     }
 
     @Test

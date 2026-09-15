@@ -1109,6 +1109,47 @@ struct SonarConversationFoldTests {
         )
         #expect(openRemountFallback.opened == "marmot:group-09")
         #expect(openRemountFallback.pane == "marmot:group-08")
+        let unreadOnHist: [String: UInt64] = ["marmot:group-08": 3]
+        let stampedUnread = snUnreadCountAtOpenWritten(
+            conversationId: "marmot:group-08",
+            count: 3,
+            unreadAtOpen: [:],
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        )
+        #expect(snUnreadCountAtOpen(
+            conversationId: "marmot:group-09",
+            unreadAtOpen: unreadOnHist,
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == 3)
+        #expect(snUnreadCountAtOpen(
+            conversationId: "marmot:group-09",
+            unreadAtOpen: stampedUnread,
+            historicalFolds: [:],
+            openedConversationId: "marmot:group-09",
+            openedConversationPaneId: "marmot:group-08"
+        ) == 3)
+        #expect(
+            snOpenChatUnreadPublishId(
+                capturedFor: "marmot:group-08",
+                openIds: ["marmot:group-09"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == "marmot:group-09"
+        )
+        #expect(
+            snOpenChatUnreadPublishId(
+                capturedFor: "marmot:group-08",
+                openIds: ["marmot:other"],
+                historicalFolds: [:],
+                openedConversationId: "marmot:group-09",
+                openedConversationPaneId: "marmot:group-08"
+            ) == nil
+        )
         #expect(
             snConversationReadGroupIds(
                 groupId: "group-09",

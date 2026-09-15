@@ -265,7 +265,7 @@ struct SonarDMScreenContent: View {
                     onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
-                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                    unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
                     familyHasOlder: store.canLoadOlderDM(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
@@ -300,7 +300,7 @@ struct SonarDMScreenContent: View {
                     // Captured by push() at navigation time, before this screen
                     // (and openedDM's read-marking) existed. Nil = unset —
                     // do not coerce to 0 (false live-edge chase).
-                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                    unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
                     familyHasOlder: store.canLoadOlderDM(peerId),
                     jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),

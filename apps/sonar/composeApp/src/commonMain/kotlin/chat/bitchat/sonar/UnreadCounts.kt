@@ -72,9 +72,19 @@ internal fun openChatUnreadPublishId(
     capturedFor: String,
     stackChatIds: Collection<String>,
     historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
 ): String? {
     stackChatIds.firstOrNull { id ->
         conversationsMatchFoldFamily(id, capturedFor, historicalFolds)
+    }?.let { return it }
+    val pair = remountPairConversationIds(
+        conversationId = capturedFor,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    stackChatIds.firstOrNull { stackId ->
+        pair.any { openedConversationIdMatches(it, stackId) }
     }?.let { return it }
     return capturedFor.takeIf { stackChatIds.isEmpty() }
 }

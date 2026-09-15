@@ -3919,7 +3919,7 @@ private struct MacDMTranscript: View {
                 onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
-                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
                 familyHasOlder: store.canLoadOlderDM(peerId),
                 jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
@@ -3992,7 +3992,7 @@ private struct MacCollectionHostDM<Composer: View>: View {
                 onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
-                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
                 familyHasOlder: store.canLoadOlderDM(peerId),
                 jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
@@ -4062,7 +4062,7 @@ private struct MacSpikeADMHost<Composer: View>: View {
                 onRetry: { store.retryDm(peerId, message: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
-                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId] ?? 0,
+                unreadCountAtOpen: store.unreadCountAtOpen(for: peerId) ?? 0,
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
                 composer: composer
             )

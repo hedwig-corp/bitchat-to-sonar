@@ -1472,7 +1472,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         val feedAnchor = unreadAnchorId
             ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
             ?.takeIf { it >= 0 }
-            ?: firstUnreadTranscriptIndex(feed, state.openChatUnread[screen.id] ?: 0L)
+            ?: firstUnreadTranscriptIndex(feed, state.openChatUnreadFor(screen.id) ?: 0L)
                 .takeIf { feedCaughtUp(feed) }
             ?: -1
         val items = buildChatFeedListItems(feed, feedAnchor)
@@ -1488,7 +1488,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Phase 2 flagged host drives open from [TranscriptOpenAction] only.
     val transcriptOpenAction = TranscriptScrollPolicy.resolveOpenAction(
         unreadAnchorId = unreadAnchorId,
-        unreadCountAtOpen = state.openChatUnread[screen.id],
+        unreadCountAtOpen = state.openChatUnreadFor(screen.id),
         jumpMessageId = state.jumpMessageIdForChat(screen.id),
     )
     val phase2Host = SonarTranscriptPolicyHost.isEnabled()
@@ -1511,8 +1511,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Freeze the unread anchor on the first CAUGHT-UP feed that can resolve
     // it, and re-resolve only if its row vanishes (a snapshot row replaced by
     // the canonical DB page) before the user scrolls.
-    LaunchedEffect(transcriptSessionKey, feed, state.openChatUnread[screen.id]) {
-        val unreadAtOpen = state.openChatUnread[screen.id] ?: 0L
+    LaunchedEffect(transcriptSessionKey, feed, state.openChatUnreadFor(screen.id)) {
+        val unreadAtOpen = state.openChatUnreadFor(screen.id) ?: 0L
         if (unreadAtOpen <= 0L || feed.isEmpty()) return@LaunchedEffect
         val current = unreadAnchorId
         if (current != null && feed.any { transcriptFeedKey(it) == current }) return@LaunchedEffect
@@ -1563,7 +1563,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // pending anchor owns the next programmatic scroll, so tail-following must
     // not race it to the bottom when the White Noise leg merges in.
     fun unreadAnchorPending(): Boolean {
-        val count = state.openChatUnread[screen.id]
+        val count = state.openChatUnreadFor(screen.id)
         if (userScrolled) return false
         // Only settled unread (>0) without a divider owns the next scroll.
         // Unset capture is provisional live edge (keep pinning).
@@ -1573,7 +1573,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // White Noise leg in, which can insert only OLDER rows. That leaves the
     // newest key untouched while shifting every index — the tail moves and the
     // viewport is left showing older content until something re-anchors it.
-    LaunchedEffect(transcriptSessionKey, newestFeedKey, feed.size, state.openChatUnread[screen.id]) {
+    LaunchedEffect(transcriptSessionKey, newestFeedKey, feed.size, state.openChatUnreadFor(screen.id)) {
         if (feed.isEmpty()) return@LaunchedEffect
         val hydrated = feedCaughtUp(feed)
         // Settled unread takes over from provisional live edge. Do NOT force

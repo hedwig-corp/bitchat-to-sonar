@@ -1081,6 +1081,83 @@ func snQuotedJumpCleared(
     return next
 }
 
+/// Open-time unread stored on any remount / fold-family key. After remount
+/// iPhone still paints hist while Mac / Compose hop to live — a single-id
+/// write is invisible on the other sibling while persist-folds are empty.
+/// Compose `unreadCountAtOpen`.
+func snUnreadCountAtOpen(
+    conversationId: String,
+    unreadAtOpen: [String: UInt64],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> UInt64? {
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        if let count = unreadAtOpen[key] { return count }
+    }
+    return nil
+}
+
+/// Stamp open-time unread onto every remount / fold-family key so a
+/// capture that lands on hist is visible after Mac hops to live.
+/// `nil` clears. Compose `unreadCountAtOpenWritten`.
+func snUnreadCountAtOpenWritten(
+    conversationId: String,
+    count: UInt64?,
+    unreadAtOpen: [String: UInt64],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: UInt64] {
+    var next = unreadAtOpen
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        next[key] = count
+    }
+    return next
+}
+
+/// After remount, publish a hist capture onto the still-open live id
+/// even when persist-folds are empty. Empty stack keeps `capturedFor`.
+/// Compose `openChatUnreadPublishId`.
+func snOpenChatUnreadPublishId(
+    capturedFor: String,
+    openIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    if let family = openIds.first(where: {
+        snConversationsMatchFoldFamily(left: $0, right: capturedFor, historicalFolds: historicalFolds)
+    }) {
+        return family
+    }
+    let pair = snRemountPairConversationIds(
+        conversationId: capturedFor,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if let remounted = openIds.first(where: { openId in
+        pair.contains(where: { snOpenedConversationIdMatches($0, openId) })
+    }) {
+        return remounted
+    }
+    return openIds.isEmpty ? capturedFor : nil
+}
+
 /// Ids that have had a trusted FFI newest/cursor page.
 /// Seeded cache keys are not paging keys. Compose `pagedFoldFamilyGroupIds`.
 func snPagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>) -> Set<String> {
@@ -4692,6 +4769,18 @@ final class SonarAppStore: ObservableObject {
 
     /// Jump parent for the open transcript. Walks hist / live / `marmot:`
     /// aliases so remount cannot hide a recovered 0.8 quote.
+    func unreadCountAtOpen(for conversationId: String) -> UInt64? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snUnreadCountAtOpen(
+            conversationId: conversationId,
+            unreadAtOpen: unreadCountAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
     func jumpMessageIdAtOpen(for conversationId: String) -> String? {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let (opened, pane) = remountOpenedAndPane()
@@ -12887,9 +12976,16 @@ final class SonarAppStore: ObservableObject {
     /// `SNMsgList` keeps the provisional live edge (`?? 0` was the
     /// alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
-        unreadCountAtOpenByDM[id] = nil
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let (opened, pane) = remountOpenedAndPane()
+        unreadCountAtOpenByDM = snUnreadCountAtOpenWritten(
+            conversationId: id,
+            count: nil,
+            unreadAtOpen: unreadCountAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
         if let jump = snQuotedJumpParentId(
             conversationId: id,
             jumps: pendingJumpMessageIdByDM,
@@ -12924,14 +13020,14 @@ final class SonarAppStore: ObservableObject {
         let groupId = marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else {
-            unreadCountAtOpenByDM[id] = 0
+            setUnreadCountAtOpen(id, count: 0)
             return
         }
         let blobIds = transcriptSourceIds(forGroupId: groupId)
         let hasCachedEntry = blobIds.contains { marmot.unreadByGroup[$0] != nil }
         let cached = blobIds.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
         if hasCachedEntry || cached > 0 {
-            unreadCountAtOpenByDM[id] = cached
+            setUnreadCountAtOpen(id, count: cached)
             return
         }
         Task { [weak self] in
@@ -12947,14 +13043,36 @@ final class SonarAppStore: ObservableObject {
             )
             let familyHit = ids.contains { self.marmot.unreadByGroup[$0] != nil }
             let familyCached = ids.reduce(UInt64(0)) { $0 + (self.marmot.unreadByGroup[$1] ?? 0) }
+            let unread: UInt64?
             if familyHit || familyCached > 0 {
-                self.unreadCountAtOpenByDM[id] = familyCached
-                return
+                unread = familyCached
+            } else {
+                unread = await self.marmot.unreadCount(forGroups: ids)
             }
-            if let unread = await self.marmot.unreadCount(forGroups: ids) {
-                self.unreadCountAtOpenByDM[id] = unread
-            }
+            guard let unread else { return }
+            let openIds = [opened, pane, self.currentDMId].compactMap { $0 }
+            guard let publishId = snOpenChatUnreadPublishId(
+                capturedFor: id,
+                openIds: openIds,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            ) else { return }
+            self.setUnreadCountAtOpen(publishId, count: unread)
         }
+    }
+
+    private func setUnreadCountAtOpen(_ id: String, count: UInt64?) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        unreadCountAtOpenByDM = snUnreadCountAtOpenWritten(
+            conversationId: id,
+            count: count,
+            unreadAtOpen: unreadCountAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     /// Newest known message date across the DM's folded groups (index +
@@ -14983,7 +15101,7 @@ final class SonarAppStore: ObservableObject {
         // The unread divider lives while its chat is on the stack; leaving the
         // chat retires it so a later reopen (already marked read) starts clean.
         if case .dm(let id)? = path.last {
-            unreadCountAtOpenByDM[id] = nil
+            setUnreadCountAtOpen(id, count: nil)
             let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             jumpMessageIdAtOpenByDM = snQuotedJumpCleared(
                 conversationId: id,

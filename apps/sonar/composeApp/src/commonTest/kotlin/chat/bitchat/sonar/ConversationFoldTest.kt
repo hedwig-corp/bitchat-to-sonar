@@ -1417,6 +1417,35 @@ class ConversationFoldTest {
             "marmot:group-08" to "marmot:group-08",
             openedDMRemountOpenedPane(openingId = "marmot:group-08"),
         )
+        val unreadOnHist = mapOf("marmot:group-08" to 3L)
+        assertEquals(
+            3L,
+            unreadCountAtOpen(
+                chatId = "marmot:group-09",
+                unreadAtOpen = unreadOnHist,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
+        val stamped = unreadCountAtOpenWritten(
+            chatId = "marmot:group-08",
+            count = 3L,
+            unreadAtOpen = emptyMap(),
+            historicalFolds = emptyMap(),
+            openedConversationId = "marmot:group-09",
+            openedConversationPaneId = "marmot:group-08",
+        )
+        assertEquals(
+            3L,
+            unreadCountAtOpen(
+                chatId = "marmot:group-09",
+                unreadAtOpen = stamped,
+                historicalFolds = emptyMap(),
+                openedConversationId = "marmot:group-09",
+                openedConversationPaneId = "marmot:group-08",
+            ),
+        )
     }
 
     @Test
