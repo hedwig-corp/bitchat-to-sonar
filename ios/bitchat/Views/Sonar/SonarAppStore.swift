@@ -9254,7 +9254,7 @@ final class SonarAppStore: ObservableObject {
         let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
         let (opened, pane) = remountOpenedAndPane()
         let family = snFoldFamilyIds(id: groupId ?? id, historicalFolds: folds)
-            + Set(snRemountPairConversationIds(
+            .union(snRemountPairConversationIds(
                 conversationId: groupId ?? id,
                 openedConversationId: opened,
                 openedConversationPaneId: pane
