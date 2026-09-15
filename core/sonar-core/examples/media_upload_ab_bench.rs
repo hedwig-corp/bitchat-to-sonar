@@ -21,13 +21,13 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{self, StreamExt};
-use mdk_core::encrypted_media::EncryptedMediaUpload;
-use mdk_storage_traits::GroupId;
 use nostr::Url;
 use nostr_blossom::prelude::*;
 use nostr_relay_builder::MockRelay;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
+use sonar_core::media_crypto::EncryptedMediaUpload;
+use sonar_core::GroupId;
 
 static IMPROVED_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -108,11 +108,19 @@ async fn main() {
     let scenarios = [
         Scenario {
             name: "single_256KiB",
-            items: vec![(vec![0xABu8; 256 * 1024], "application/octet-stream", "a.bin".into())],
+            items: vec![(
+                vec![0xABu8; 256 * 1024],
+                "application/octet-stream",
+                "a.bin".into(),
+            )],
         },
         Scenario {
             name: "single_2MiB",
-            items: vec![(vec![0xCDu8; 2 * 1024 * 1024], "application/octet-stream", "b.bin".into())],
+            items: vec![(
+                vec![0xCDu8; 2 * 1024 * 1024],
+                "application/octet-stream",
+                "b.bin".into(),
+            )],
         },
         Scenario {
             name: "album_5x512KiB",
@@ -330,9 +338,7 @@ fn spawn_mock_blossom(put_delay: Duration) -> String {
             let Ok(mut stream) = stream else { continue };
             let store = store.clone();
             let base = base_for_thread.clone();
-            std::thread::spawn(move || {
-                handle_blossom_conn(&mut stream, &store, &base, put_delay)
-            });
+            std::thread::spawn(move || handle_blossom_conn(&mut stream, &store, &base, put_delay));
         }
     });
     std::thread::sleep(Duration::from_millis(20));
@@ -396,9 +402,8 @@ fn handle_blossom_conn(
         let _ = stream.write_all(resp.as_bytes());
         let _ = stream.flush();
     } else {
-        let _ = stream.write_all(
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         let _ = stream.flush();
     }
 }

@@ -1727,6 +1727,13 @@ struct SNMsgList: View {
     /// this — hydration can publish one transport leg before the folded White
     /// Noise groups merge in, and the missing rows are exactly the unread ones.
     var expectedNewestDate: Date? = nil
+    /// True when bak / a hidden 0.8 sibling may still hold unread rows.
+    /// Compose `familyHasOlderForOpenChat`. Must not abandon the divider.
+    var familyHasOlder: Bool = false
+    /// Search / quote / notification jump. Wins over unread/live-edge.
+    var jumpMessageId: String? = nil
+    /// Cleared only after the parent is painted (remainder / family reveal).
+    var onJumpSettled: (() -> Void)? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -1795,8 +1802,37 @@ struct SNMsgList: View {
         SNTranscriptScrollPolicy.openAction(
             unreadAnchorId: unreadAnchorId,
             unreadCountAtOpen: unreadCountAtOpen,
-            unreadAnchorAbandoned: unreadAnchorAbandoned
+            unreadAnchorAbandoned: unreadAnchorAbandoned,
+            jumpId: jumpMessageId
         )
+    }
+
+    private func applyQuotedJump(proxy: ScrollViewProxy) {
+        guard let jump = jumpMessageId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !jump.isEmpty else { return }
+        if msgs.contains(where: { $0.id == jump }) {
+            needsLiveEdgeOpen = false
+            isNearBottom = false
+            tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
+            proxy.scrollTo(jump, anchor: .top)
+            if SNTranscriptScrollPolicy.shouldSettleJump(parentVisible: true) {
+                onJumpSettled?()
+            }
+            return
+        }
+        guard let loadOlder, !isLoadingOlder else { return }
+        isLoadingOlder = true
+        Task {
+            let added = await loadOlder()
+            await MainActor.run {
+                isLoadingOlder = false
+                // Empty first bak page is not exhaustion. Compose
+                // `shouldClearQuotedJumpAfterMiss`.
+                if snShouldClearQuotedJumpAfterMiss(added: added, parentVisible: false) {
+                    onJumpSettled?()
+                }
+            }
+        }
     }
 
     /// The [unreadCountAtOpen]-th non-mine message from the tail — core
@@ -1824,7 +1860,16 @@ struct SNMsgList: View {
         unreadAnchorId = anchor
         if anchor == nil {
             // Caught-up feed cannot place a divider — fall back to live edge
-            // (agent/control-only unread budgets). Hosts must start open recovery.
+            // (agent/control-only unread budgets) only once bak / hidden 0.8
+            // remainder cannot still own the unread incoming rows.
+            let feedNewest = msgs.compactMap(\.sortDate).max()
+            guard SNUnreadCounts.shouldRetireOpenUnread(
+                unreadAtOpen: unreadCountAtOpen,
+                anchorFound: false,
+                feedNewest: feedNewest,
+                expectedNewest: expectedNewestDate,
+                familyHasOlder: familyHasOlder
+            ) else { return }
             unreadAnchorAbandoned = true
         }
     }
@@ -2143,14 +2188,14 @@ struct SNMsgList: View {
                         DispatchQueue.main.async {
                             snapFullyReadOpen(proxy: proxy)
                         }
-                    case .jump(let id):
-                        needsLiveEdgeOpen = false
-                        isNearBottom = false
-                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
+                    case .jump:
                         DispatchQueue.main.async {
-                            proxy.scrollTo(id, anchor: .top)
+                            applyQuotedJump(proxy: proxy)
                         }
                     }
+                }
+                .onChange(of: jumpMessageId) { _ in
+                    applyQuotedJump(proxy: proxy)
                 }
                 .onChange(of: unreadCountAtOpen) { _ in
                     // Capture settled (was nil → 0 or N). Drive open from
@@ -2171,13 +2216,8 @@ struct SNMsgList: View {
                         DispatchQueue.main.async {
                             snapFullyReadOpen(proxy: proxy)
                         }
-                    case .jump(let id):
-                        needsLiveEdgeOpen = false
-                        isNearBottom = false
-                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(id, anchor: .top)
-                        }
+                    case .jump:
+                        applyQuotedJump(proxy: proxy)
                     }
                 }
                 .onChange(of: messageRevision) { _ in
@@ -2214,6 +2254,10 @@ struct SNMsgList: View {
                     if let unreadCountAtOpen, unreadCountAtOpen > 0,
                        unreadAnchorId == nil, !unreadAnchorAbandoned
                     {
+                        return
+                    }
+                    if jumpMessageId != nil {
+                        applyQuotedJump(proxy: proxy)
                         return
                     }
                     // Fully-read open recovery: re-snap across hydration and
@@ -2940,7 +2984,7 @@ struct SNMediaBubble: View {
             // so the bubble skips the single-item load path.
             guard !isDeck, let item else { return }
             let transfer = pipeline.state(item)
-            failed = transfer.phase == .failed
+            failed = transfer.phase == .failed || transfer.phase == .unavailable
             guard transfer.phase == .available else { return }
             if keepThumb { return }
             if item.isImage, !(item.isGif) {
@@ -3036,21 +3080,32 @@ struct SNMediaBubble: View {
                     .overlay {
                         if failed {
                             VStack(spacing: 8) {
-                                Text(verbatim: "Couldn't load image")
+                                Text(verbatim: pipeline.state(item).phase == .unavailable
+                                     ? "Older attachment"
+                                     : "Couldn't load image")
                                     .font(SonarTheme.uiFont(size: 12))
                                     .foregroundColor(SonarTheme.text3)
-                                Button {
-                                    if pipeline.state(item).phase == .failed {
-                                        pipeline.request(item)
-                                    } else {
-                                        loadAttempt += 1
+                                if pipeline.state(item).phase == .unavailable {
+                                    Text(verbatim: pipeline.state(item).userMessage
+                                         ?? SNRecoveredLegacyMediaCopy)
+                                        .font(SonarTheme.uiFont(size: 11))
+                                        .foregroundColor(SonarTheme.text3)
+                                        .multilineTextAlignment(.center)
+                                        .padding(.horizontal, 10)
+                                } else {
+                                    Button {
+                                        if pipeline.state(item).phase == .failed {
+                                            pipeline.request(item)
+                                        } else {
+                                            loadAttempt += 1
+                                        }
+                                    } label: {
+                                        Text(verbatim: "Retry")
+                                            .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                            .foregroundColor(SonarTheme.accent)
                                     }
-                                } label: {
-                                    Text(verbatim: "Retry")
-                                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                                        .foregroundColor(SonarTheme.accent)
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
                             }
                         } else if pipeline.state(item).phase == .notDownloaded {
                             VStack(spacing: 6) {
@@ -3144,6 +3199,9 @@ struct SNMediaBubble: View {
         case .failed:
             Image(systemName: "exclamationmark.circle")
                 .foregroundColor(.red)
+        case .unavailable:
+            Image(systemName: "minus")
+                .foregroundColor(SonarTheme.text3)
         }
     }
 
@@ -3156,6 +3214,8 @@ struct SNMediaBubble: View {
             return "Downloading"
         case .available: return fallback
         case .failed: return "Download failed · tap to retry"
+        case .unavailable:
+            return transfer.userMessage ?? SNRecoveredLegacyMediaCopy
         }
     }
 
@@ -3165,6 +3225,8 @@ struct SNMediaBubble: View {
             pipeline.request(item)
         case .downloading:
             pipeline.cancel(item)
+        case .unavailable:
+            break
         case .available:
             if item.isImage {
                 viewerOpen = true
@@ -3251,7 +3313,7 @@ private struct SNMediaCardImage: View {
                     thumb = nil
                 }
                 let transfer = pipeline.state(item)
-                failed = transfer.phase == .failed
+                failed = transfer.phase == .failed || transfer.phase == .unavailable
                 guard transfer.phase == .available else { return }
                 if keepThumb { return }
                 if item.isGif {
@@ -3318,18 +3380,26 @@ private struct SNMediaCardImage: View {
                 .fill(SonarTheme.surface2)
                 .overlay {
                     if failed, dim == 0 {
-                        Button {
-                            if pipeline.state(item).phase == .failed {
-                                pipeline.request(item)
-                            } else {
-                                loadAttempt += 1
+                        if pipeline.state(item).phase == .unavailable {
+                            Text(verbatim: "Older attachment")
+                                .font(SonarTheme.uiFont(size: 11))
+                                .foregroundColor(SonarTheme.text3)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 8)
+                        } else {
+                            Button {
+                                if pipeline.state(item).phase == .failed {
+                                    pipeline.request(item)
+                                } else {
+                                    loadAttempt += 1
+                                }
+                            } label: {
+                                Text(verbatim: "Retry")
+                                    .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                                    .foregroundColor(SonarTheme.accent)
                             }
-                        } label: {
-                            Text(verbatim: "Retry")
-                                .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                                .foregroundColor(SonarTheme.accent)
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     } else if pipeline.state(item).phase == .notDownloaded, dim == 0 {
                         Image(systemName: "arrow.down.circle")
                             .font(.system(size: 24, weight: .medium))
@@ -3463,6 +3533,8 @@ private struct SNMediaDeck: View {
             pipeline.request(item)
         case .downloading:
             pipeline.cancel(item)
+        case .unavailable:
+            break
         case .available:
             onOpen(index)
         }
@@ -4255,6 +4327,8 @@ struct SNAudioBubble: View {
                     onRequest()
                 case .downloading:
                     onCancel()
+                case .unavailable:
+                    break
                 case .available:
                     player.toggle(bytes)
                 }
@@ -4312,6 +4386,10 @@ struct SNAudioBubble: View {
                     .foregroundColor(color)
             case .failed:
                 Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(color)
+            case .unavailable:
+                Image(systemName: "minus")
                     .font(.system(size: 13, weight: .bold))
                     .foregroundColor(color)
             }

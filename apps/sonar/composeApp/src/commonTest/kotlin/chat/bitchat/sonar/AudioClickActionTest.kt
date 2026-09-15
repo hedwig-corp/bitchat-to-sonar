@@ -70,6 +70,10 @@ class AudioClickActionTest {
                 AudioAction.CancelDownload,
                 audioClickAction(MediaTransferPhase.Downloading, reason, hasBytes = false, playing = false),
             )
+            assertEquals(
+                AudioAction.Nothing,
+                audioClickAction(MediaTransferPhase.Unavailable, reason, hasBytes = false, playing = false),
+            )
         }
     }
 }

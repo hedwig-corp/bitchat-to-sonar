@@ -59,6 +59,30 @@ fun paymentDestinationHash(destination: String): String =
         .joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }
 
 /**
+ * Rewrite conversation-scoped payment rows from a hidden 0.8 id onto the
+ * live 0.9 sibling. Wallet-wide (`wallet`) and Unify (`unify:`) keys stay
+ * put — those are not Marmot conversation ids.
+ */
+fun remountedPaymentActivities(
+    historicalKeys: Collection<String>,
+    liveKey: String,
+    activities: List<SonarPaymentActivity>,
+): List<SonarPaymentActivity> {
+    if (liveKey.isBlank()) return activities
+    val hist = historicalKeys.filter { it.isNotBlank() && it != liveKey }.toSet()
+    if (hist.isEmpty()) return activities
+    return activities.map { activity ->
+        if (activity.peerKey == "wallet" || activity.peerKey.startsWith("unify:")) {
+            activity
+        } else if (activity.peerKey in hist) {
+            activity.copy(peerKey = liveKey)
+        } else {
+            activity
+        }
+    }
+}
+
+/**
  * Persisted ledger of direct wallet payment activity, keyed by activity id.
  * Mirrors iOS `SonarPaymentActivityLedger`: `recordPending` is idempotent
  * (same id records once), `markPaid`/`markFailed` only update existing rows.
@@ -87,6 +111,27 @@ class SonarPaymentActivityLedger(blob: String = "") {
 
     fun activities(peerKey: String): List<SonarPaymentActivity> =
         sorted().filter { it.peerKey == peerKey }
+
+    /** Chat-scoped reads after a 0.8→0.9 fold must union the fold family so
+     *  a missed remount still finds rows keyed by the hidden 0.8 id. */
+    fun activities(peerKeys: Collection<String>): List<SonarPaymentActivity> {
+        val keys = peerKeys.filter { it.isNotBlank() }.toSet()
+        if (keys.isEmpty()) return emptyList()
+        return sorted().filter { it.peerKey in keys }
+    }
+
+    /**
+     * Rewrite conversation-scoped rows from a hidden 0.8 id onto the live
+     * 0.9 sibling. Wallet / Unify keys stay put — those are not chat ids.
+     */
+    fun remountPeerKeys(historicalKeys: Collection<String>, liveKey: String): Boolean {
+        if (liveKey.isBlank()) return false
+        val next = remountedPaymentActivities(historicalKeys, liveKey, entries.values.toList())
+        if (next == entries.values.toList()) return false
+        entries.clear()
+        for (activity in next) entries[activity.id] = activity
+        return true
+    }
 
     /** Records a new activity. Returns false (and changes nothing) when an
      *  entry with the same id already exists — idempotent like iOS. */
@@ -326,6 +371,18 @@ object PaymentActivityStore {
 
     fun activities(peerKey: String): List<SonarPaymentActivity> =
         lock.withLock { ledger().activities(peerKey) }
+
+    fun activities(peerKeys: Collection<String>): List<SonarPaymentActivity> =
+        lock.withLock { ledger().activities(peerKeys) }
+
+    fun remountPeerKeys(historicalKeys: Collection<String>, liveKey: String): Boolean {
+        val changed = lock.withLock {
+            if (!ledger().remountPeerKeys(historicalKeys, liveKey)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
+    }
 
     fun get(id: String): SonarPaymentActivity? = lock.withLock { ledger().get(id) }
 

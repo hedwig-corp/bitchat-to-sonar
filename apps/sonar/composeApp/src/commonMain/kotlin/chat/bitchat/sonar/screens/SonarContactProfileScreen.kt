@@ -45,6 +45,7 @@ import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.canonicalProfileKey
+import chat.bitchat.sonar.sharedGroupsWithContact
 import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -79,7 +80,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
         } else if (screen.chatId.startsWith("npub1")) {
             canonicalProfileKey(screen.chatId)
         } else {
-            val chat = state.chats.firstOrNull { it.id == screen.chatId }
+            val chat = state.listedChat(screen.chatId)
             val mine = canonicalProfileKey(state.npub)
             chat?.members
                 ?.map { canonicalProfileKey(it) }
@@ -89,18 +90,17 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
 
     // When opened from group info with an npub (or mesh with a known npub),
     // resolve to the 1:1 DM chat id so verifyInfo/isVerified/canCall work.
-    val effectiveChatId = remember(screen.chatId, peerNpub, state.chats.size) {
+    // Do not remember(chats.size): remount/persist-folds can prefer live
+    // without changing the listed count.
+    val effectiveChatId = run {
         val resolvedNpub = when {
             screen.chatId.startsWith("npub1") -> canonicalProfileKey(screen.chatId)
             peerNpub != null -> peerNpub
             else -> null
         }
         if (resolvedNpub != null) {
-            val mine = canonicalProfileKey(state.npub)
-            state.chats.firstOrNull { chat ->
-                val members = chat.members.map { canonicalProfileKey(it) }
-                members.size == 2 && mine in members && resolvedNpub in members
-            }?.id ?: screen.chatId
+            state.directChatIdForPeer(resolvedNpub)
+                ?: screen.chatId
         } else {
             screen.chatId
         }
@@ -137,16 +137,14 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
 
     // Find shared groups: multi-member groups where both the local user and this
     // contact are members.
-    val sharedGroups = remember(state.chats.size, peerNpub) {
-        if (peerNpub == null) emptyList()
-        else {
-            val mine = canonicalProfileKey(state.npub)
-            state.chats.filter { chat ->
-                state.isMultiMemberChat(chat.id) &&
-                    chat.members.any { canonicalProfileKey(it) == mine } &&
-                    chat.members.any { canonicalProfileKey(it) == peerNpub }
-            }
-        }
+    val sharedGroups = remember(state.visibleChats, peerNpub) {
+        val npub = peerNpub ?: return@remember emptyList()
+        sharedGroupsWithContact(
+            chats = state.visibleChats,
+            ownNpub = state.npub,
+            peerNpub = npub,
+            isMultiMember = { chat -> state.isMultiMemberChat(chat.id) },
+        )
     }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
@@ -210,7 +208,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                             return@ActionCircle
                         }
                         if (effectiveChatId != screen.chatId) {
-                            val dmChat = state.chats.firstOrNull { it.id == effectiveChatId }
+                            val dmChat = state.listedChat(effectiveChatId)
                             if (dmChat != null) state.openChat(dmChat)
                             else state.back()
                         } else {

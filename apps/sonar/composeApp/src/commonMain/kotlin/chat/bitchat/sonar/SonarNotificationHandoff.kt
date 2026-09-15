@@ -42,20 +42,80 @@ object SonarNotificationHandoff {
             .mapTo(linkedSetOf()) { notificationId(it) }
 
     /**
+     * Cold-start shade taps still name the hidden 0.8 id. FFI
+     * `liveFoldTarget` is empty until the engine is up, but the host already
+     * persisted hist→live in [sonar.historicalFolds]. FFI wins when present.
+     * Mid-session remount (persist-folds still empty) walks the remount
+     * pair last. NSE / killed-app omit remount and stay persist-only.
+     * iOS `snNotificationLiveFoldTarget`.
+     */
+    fun notificationLiveFoldTargets(
+        conversationId: String,
+        persistedFolds: Map<String, String>,
+        ffiLiveFoldTarget: String?,
+        openedConversationId: String? = null,
+        openedConversationPaneId: String? = null,
+    ): Map<String, String> {
+        val aliases = conversationIdAliases(conversationId)
+        if (aliases.isEmpty()) return emptyMap()
+        val targets = linkedMapOf<String, String>()
+        fun remember(live: String) {
+            val dest = live.trim().removePrefix("marmot:").trim()
+            if (dest.isEmpty()) return
+            for (from in aliases) targets[from] = dest
+        }
+        for (alias in aliases) {
+            persistedFolds[alias]?.let { remember(it) }
+        }
+        ffiLiveFoldTarget?.trim()?.takeIf { it.isNotEmpty() }?.let { remember(it) }
+        if (targets.isNotEmpty()) return targets
+        val folds = remountPairHistoricalFolds(
+            persistedFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+        for (alias in aliases) {
+            val bare = alias.removePrefix("marmot:")
+            folds[bare]?.let { remember(it) }
+            folds[alias]?.let { remember(it) }
+        }
+        return targets
+    }
+
+    /** Bare hex plus optional `marmot:` prefix so either tap shape remaps. */
+    fun conversationIdAliases(conversationId: String): Set<String> {
+        val trimmed = conversationId.trim()
+        if (trimmed.isEmpty()) return emptySet()
+        val bare = trimmed.removePrefix("marmot:")
+        return buildSet {
+            add(trimmed)
+            if (bare.isNotEmpty()) add(bare)
+            if (bare.isNotEmpty() && !trimmed.startsWith("marmot:")) add("marmot:$bare")
+        }
+    }
+
+    /**
      * Resolve a notification conversation id onto a real open target.
-     * Returns null when the id is not yet known locally — callers should
-     * refresh and retry instead of inventing a blank chat screen.
+     * A persisted hist→live remap opens the live sibling even when that
+     * id is not in [knownChatIds] yet (cold start / FFI hide). Unknown
+     * ids without a fold still return null so callers can refresh/retry.
      */
     fun resolveOpenTarget(
         conversationId: String,
         knownChatIds: Set<String>,
         foldedGroupPeerIds: Map<String, String>,
         foldedGroupIds: Set<String>,
+        liveFoldTargets: Map<String, String> = emptyMap(),
     ): SonarNotificationOpenTarget? {
         val id = conversationId.trim()
         if (id.isEmpty()) return null
         foldedGroupPeerIds[id]?.takeIf { it.isNotBlank() }?.let {
             return SonarNotificationOpenTarget.MeshPeer(it)
+        }
+        conversationIdAliases(id).firstNotNullOfOrNull { alias ->
+            liveFoldTargets[alias]?.takeIf { it.isNotBlank() && it != id && it != alias }
+        }?.let { live ->
+            return SonarNotificationOpenTarget.Chat(live)
         }
         if (id in knownChatIds) {
             if (id in foldedGroupIds) {

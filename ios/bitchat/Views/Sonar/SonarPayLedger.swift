@@ -296,6 +296,27 @@ struct SonarPaymentActivity: Codable, Equatable, Identifiable {
         self.failure = failure
         self.preimage = preimage
     }
+
+    /// Copy this row onto a remounted conversation id after a 0.8→0.9 fold.
+    func remounted(onto livePeerKey: String) -> SonarPaymentActivity {
+        SonarPaymentActivity(
+            id: id,
+            kind: kind,
+            peerKey: livePeerKey,
+            peerName: peerName,
+            direction: direction,
+            sats: sats,
+            via: via,
+            createdAt: createdAt,
+            destinationHash: destinationHash,
+            status: status,
+            walletPaymentId: walletPaymentId,
+            feesSats: feesSats,
+            settledAt: settledAt,
+            failure: failure,
+            preimage: preimage
+        )
+    }
 }
 
 final class SonarPaymentActivityLedger: ObservableObject {
@@ -338,6 +359,38 @@ final class SonarPaymentActivityLedger: ObservableObject {
 
     func activities(peerKey: String) -> [SonarPaymentActivity] {
         sorted.filter { $0.peerKey == peerKey }
+    }
+
+    /// Chat-scoped reads after a 0.8→0.9 fold must union the fold family so
+    /// a missed remount still finds rows keyed by the hidden 0.8 id.
+    func activities(peerKeys: Set<String>) -> [SonarPaymentActivity] {
+        guard !peerKeys.isEmpty else { return [] }
+        return sorted.filter { peerKeys.contains($0.peerKey) }
+    }
+
+    /// Persist-rewrite conversation-scoped rows from hidden 0.8 ids onto the
+    /// live 0.9 sibling. Wallet / Unify keys stay put.
+    @discardableResult
+    func remountPeerKeys(historicalKeys: Set<String>, onto liveKey: String) -> Bool {
+        guard !liveKey.isEmpty else { return false }
+        let hist = Set(historicalKeys.filter { !$0.isEmpty && $0 != liveKey })
+        guard !hist.isEmpty else { return false }
+        var changed = false
+        for (id, activity) in entries {
+            let nextKey = snRemountedPaymentPeerKey(
+                peerKey: activity.peerKey,
+                historicalKeys: hist,
+                liveKey: liveKey
+            )
+            guard nextKey != activity.peerKey else { continue }
+            entries[id] = activity.remounted(onto: nextKey)
+            changed = true
+        }
+        if changed {
+            sortedCache = nil
+            persist()
+        }
+        return changed
     }
 
     @discardableResult

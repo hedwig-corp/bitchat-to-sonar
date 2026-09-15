@@ -103,6 +103,10 @@ enum SonarNSEDecoratePolicy {
     /// `SonarChatMuteStore` as write-through; JSON-encoded `[String: Date]`).
     /// Single declaration — `SonarChatMuteStore.defaultsKey` aliases this.
     static let mutesUserDefaultsKey = "sonar.chat.mutes.v1"
+    /// App Group mirror of host `sonar.historicalFolds.v1` so a muted 0.8
+    /// recovered chat still silences pushes that arrive on the live 0.9 id
+    /// before (or without) a foreground mute promotion.
+    static let historicalFoldsUserDefaultsKey = "sonar.historicalFolds.v1"
 
     /// Equivalent lookup keys for one raw conversation key, so the check
     /// works whichever id shape a path carries (see docs/CHAT-TYPES.md):
@@ -135,14 +139,62 @@ enum SonarNSEDecoratePolicy {
     /// Directness is judged with `meaningfulGroupName`, not `.isEmpty`,
     /// because `enrichEmptyContentPreviews` can backfill a DM with the
     /// "Sonar agent DM" placeholder.
+    static func foldFamilyIds(id: String, historicalFolds: [String: String]) -> Set<String> {
+        guard !id.isEmpty else { return [] }
+        let live = historicalFolds[id]
+            ?? historicalFolds.first(where: { $0.value == id })?.value
+            ?? id
+        var family: Set<String> = [id, live]
+        for (historical, target) in historicalFolds {
+            if historical == id || target == id || historical == live || target == live {
+                family.insert(historical)
+                family.insert(target)
+            }
+        }
+        return family.filter { !$0.isEmpty }
+    }
+
+    static func decodeHistoricalFolds(_ defaults: UserDefaults?) -> [String: String] {
+        (defaults?.dictionary(forKey: historicalFoldsUserDefaultsKey) as? [String: String]) ?? [:]
+    }
+
+    /// Merge the App Group hist→live blob with FFI `fold_aliases`.
+    /// FFI wins per historical id — same shape as notification tap
+    /// (`snNotificationLiveFoldTarget`). A first-resume live sibling can
+    /// exist in core before the host blob is rewritten; wake mute must
+    /// still see the recovered 0.8 mute key.
+    static func mergeWakeMuteFolds(
+        persisted: [String: String],
+        listedIds: [String],
+        foldAliases: (String) -> [String],
+        liveFoldTarget: (String) -> String?
+    ) -> [String: String] {
+        var merged = persisted
+        for id in listedIds {
+            guard let live = liveFoldTarget(id), !live.isEmpty else { continue }
+            for alias in foldAliases(id) where !alias.isEmpty && alias != live {
+                merged[alias] = live
+            }
+        }
+        return merged
+    }
+
+    static func persistHistoricalFolds(_ map: [String: String], to defaults: UserDefaults?) {
+        defaults?.set(map, forKey: historicalFoldsUserDefaultsKey)
+    }
+
     static func mutedLookupCandidates(
         groupIdHex: String,
         senderNpub: String,
-        groupName: String
+        groupName: String,
+        historicalFolds: [String: String] = [:]
     ) -> [String] {
         var keys: [String] = []
         if !groupIdHex.isEmpty {
             keys += normalizedMuteCandidates(groupIdHex)
+            for alias in foldFamilyIds(id: groupIdHex, historicalFolds: historicalFolds) {
+                keys += normalizedMuteCandidates(alias)
+            }
         }
         let isDirectChat = meaningfulGroupName(groupName) == nil
         if isDirectChat, !senderNpub.isEmpty {
@@ -176,13 +228,15 @@ enum SonarNSEDecoratePolicy {
         senderNpub: String,
         groupName: String,
         mutes: [String: Date],
-        now: Date
+        now: Date,
+        historicalFolds: [String: String] = [:]
     ) -> Bool {
         guard !mutes.isEmpty else { return false }
         return mutedLookupCandidates(
             groupIdHex: groupIdHex,
             senderNpub: senderNpub,
-            groupName: groupName
+            groupName: groupName,
+            historicalFolds: historicalFolds
         )
         .contains { key in (mutes[key] ?? .distantPast) > now }
     }
@@ -193,14 +247,16 @@ enum SonarNSEDecoratePolicy {
         senderNpub: String,
         groupName: String,
         mutesJSON: Data?,
-        now: Date
+        now: Date,
+        historicalFolds: [String: String] = [:]
     ) -> Bool {
         isMuted(
             groupIdHex: groupIdHex,
             senderNpub: senderNpub,
             groupName: groupName,
             mutes: decodeMutes(mutesJSON),
-            now: now
+            now: now,
+            historicalFolds: historicalFolds
         )
     }
 
@@ -298,16 +354,22 @@ enum SonarNSEDecoratePolicy {
     }
 
     /// Prefer a push-hinted group when present so unread fallback does not
-    /// banner an unrelated stale tip.
+    /// banner an unrelated stale tip. After hist hide the published tip is
+    /// the live id; a 0.8 conversation_id / group_id hint must still match.
     static func filterUnreadTips(
         groupIdHexes: [String],
-        hintGroupIdHex: String?
+        hintGroupIdHex: String?,
+        historicalFolds: [String: String] = [:]
     ) -> [String] {
         let hint = hintGroupIdHex?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard let hint, !hint.isEmpty else { return groupIdHexes }
-        let matched = groupIdHexes.filter { $0.lowercased() == hint }
+        let matched = groupIdHexes.filter { id in
+            let family = foldFamilyIds(id: id, historicalFolds: historicalFolds)
+            return id.lowercased() == hint
+                || family.contains(where: { $0.lowercased() == hint })
+        }
         return matched.isEmpty ? groupIdHexes : matched
     }
 

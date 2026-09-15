@@ -1324,57 +1324,31 @@ internal fun TranscriptTailPinning(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+private data class ChatTranscriptViewport(
+    val sessionKey: String,
+    val feed: List<Any>,
+    val listItems: List<ChatFeedListItem>,
+    val listState: LazyListState,
+    val phase2Host: Boolean,
+    val isPrependingOrUnreadPending: () -> Boolean,
+    val unreadAnchorPending: () -> Boolean,
+)
+
+/** Remount/unread/list locals live here so ChatScreen stays under ART's
+ *  256-register verify limit. iOS keeps the same session + unread-at-open
+ *  helpers on the store. */
 @Composable
-private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
-    val s = sonar
-    val scope = rememberCoroutineScope()
-    val draft = state.composerDraft(screen.id)
-    var emojiTray by remember { mutableStateOf(false) }
-    var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
-    var paySheet by remember { mutableStateOf(false) }
-    var verifySheet by remember { mutableStateOf(false) }
-    var addSheet by remember { mutableStateOf(false) }
-    var addPeopleSheet by remember { mutableStateOf(false) }
-    var removePeopleSheet by remember { mutableStateOf(false) }
-    var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
-    // Album opened fullscreen: the message's media + the tapped start index.
-    var mediaGallery by remember { mutableStateOf<Pair<List<SonarMedia>, Int>?>(null) }
-    var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
-    val mediaActions = rememberMediaActions()
-    val pickPhoto = rememberPhotoPicker { items, rejectedTooLarge ->
-        if (rejectedTooLarge > 0) {
-            state.toast = if (rejectedTooLarge == 1) {
-                "Video is too large to send (max 25 MB)."
-            } else {
-                "$rejectedTooLarge videos are too large to send (max 25 MB)."
-            }
-        }
-        if (items.isNotEmpty()) state.stageMediaPreviews(screen.id, items)
-    }
-    // Voice-note recorder (hold the mic to record; drag left to cancel).
-    val recorder = remember { VoiceRecorder() }
-    var recording by remember { mutableStateOf(false) }
-    var recElapsed by remember { mutableStateOf(0) }
-    var recLevel by remember { mutableStateOf(0f) }
-    var recDragX by remember { mutableStateOf(0f) }
-    val recScope = rememberCoroutineScope()
-    LaunchedEffect(recording) {
-        while (recording) {
-            recElapsed = recorder.elapsed(); recLevel = recorder.level()
-            kotlinx.coroutines.delay(80)
-        }
-    }
-    // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
-    fun openPaySheetOrRetry() {
-        scope.launch {
-            val message = state.paymentDetailsUnavailableMessage(screen.id)
-            if (message != null) state.toast = message else paySheet = true
-        }
-    }
-    LaunchedEffect(screen.id) {
-        state.refreshDescriptorForChat(screen.id)
-        if (screen.pay) openPaySheetOrRetry()
+private fun rememberChatTranscriptViewport(
+    state: SonarAppState,
+    screen: Screen.Chat,
+): ChatTranscriptViewport {
+    val transcriptSessionHolder = remember { mutableStateOf(screen.id) }
+    val transcriptSessionKey = state.remountTranscriptSessionKey(
+        transcriptSessionHolder.value,
+        screen.id,
+    )
+    if (transcriptSessionHolder.value != transcriptSessionKey) {
+        transcriptSessionHolder.value = transcriptSessionKey
     }
     // Transcript feed = chat messages (pay control lines collapsed) + mocked
     // call-log records, merged chronologically. Memoized on its inputs: the
@@ -1406,6 +1380,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
     }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
+    val oldestFeedKey = feed.firstOrNull()?.let(::transcriptFeedKey)
+    val quotedJumpRetry = quotedJumpRetryToken(feed.size, oldestFeedKey, newestFeedKey)
     val currentFeed by rememberUpdatedState(feed)
     // Debug-only SONAR_BENCH marker (issue #305): time from the chat-open push
     // to the end of the transcript's first composed frame. Parsed by
@@ -1429,10 +1405,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // row ID at first computation so messages arriving while the chat is open
     // (already marked read in core) cannot drift the divider down. The frozen
     // ID persists in state so back-revealing this chat reuses it verbatim.
-    var unreadAnchorId by remember(screen.id) {
-        mutableStateOf(state.openChatUnreadAnchor[screen.id])
+    var unreadAnchorId by remember(transcriptSessionKey) {
+        mutableStateOf(state.openChatUnreadAnchorFor(screen.id))
     }
-    var userScrolled by remember(screen.id) { mutableStateOf(false) }
+    var userScrolled by remember(transcriptSessionKey) { mutableStateOf(false) }
     val unreadAnchorIndex = unreadAnchorId
         ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
         ?: -1
@@ -1445,21 +1421,24 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // a beat later, which can add OLDER rows — shifting every index and moving
     // the tail. A timestamp comparison cannot detect this (a nearby peer's BLE
     // rows are newer than anything in the White-Noise-only index), so ask the
-    // store whether hydration actually finished. A pure Marmot open needs no
-    // gate: its first paint is the complete snapshot, and waiting for the
-    // async page would turn the instant unread anchor into a visible
-    // tail-then-divider snap.
+    // store whether hydration actually finished. A folded Marmot open is the
+    // same shape: first paint can be a short live 0.9 page while recovered
+    // 0.8 unread still sits on the hidden sibling. Waiting for hydrate there
+    // avoids retiring the divider on an incomplete snapshot.
     fun feedCaughtUp(rows: List<Any>): Boolean =
         rows.isNotEmpty() &&
-            (!screen.id.startsWith("mesh:") || state.isTranscriptHydrated(screen.id))
+            (
+                (!screen.id.startsWith("mesh:") && !state.chatHasFoldFamily(screen.id)) ||
+                    state.isTranscriptHydrated(screen.id)
+            )
     // Open pinned at the first unread row, or at the newest row for a read
     // chat (Signal parity): start the list state there so the first frame
     // never shows the wrong page and then visibly jumps.
-    val listState = remember(screen.id) {
+    val listState = remember(transcriptSessionKey) {
         val feedAnchor = unreadAnchorId
             ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
             ?.takeIf { it >= 0 }
-            ?: firstUnreadTranscriptIndex(feed, state.openChatUnread[screen.id] ?: 0L)
+            ?: firstUnreadTranscriptIndex(feed, state.openChatUnreadFor(screen.id) ?: 0L)
                 .takeIf { feedCaughtUp(feed) }
             ?: -1
         val items = buildChatFeedListItems(feed, feedAnchor)
@@ -1475,31 +1454,31 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // Phase 2 flagged host drives open from [TranscriptOpenAction] only.
     val transcriptOpenAction = TranscriptScrollPolicy.resolveOpenAction(
         unreadAnchorId = unreadAnchorId,
-        unreadCountAtOpen = state.openChatUnread[screen.id],
-        jumpMessageId = state.openChatJumpMessageId[screen.id],
+        unreadCountAtOpen = state.openChatUnreadFor(screen.id),
+        jumpMessageId = state.jumpMessageIdForChat(screen.id),
     )
     val phase2Host = SonarTranscriptPolicyHost.isEnabled()
-    var isNearBottom by remember(screen.id) { mutableStateOf(true) }
-    var didInitialScroll by remember(screen.id) { mutableStateOf(false) }
-    var didLeaveTail by remember(screen.id) { mutableStateOf(false) }
-    var isPrepending by remember(screen.id) { mutableStateOf(false) }
+    var isNearBottom by remember(transcriptSessionKey) { mutableStateOf(true) }
+    var didInitialScroll by remember(transcriptSessionKey) { mutableStateOf(false) }
+    var didLeaveTail by remember(transcriptSessionKey) { mutableStateOf(false) }
+    var isPrepending by remember(transcriptSessionKey) { mutableStateOf(false) }
     // Fully-read / provisional-live-edge open: keep re-anchoring across
     // hydration index shifts until the newest row is actually on screen.
     // Without this, agent DMs land mid-history after older rows prepend.
-    var needsLiveEdgeOpen by remember(screen.id) {
+    var needsLiveEdgeOpen by remember(transcriptSessionKey) {
         mutableStateOf(transcriptOpenAction == TranscriptOpenAction.LiveEdge)
     }
 
     // The divider must not resurrect or re-scroll once the reader takes over.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         listState.interactionSource.interactions.first { it is DragInteraction.Start }
         userScrolled = true
     }
     // Freeze the unread anchor on the first CAUGHT-UP feed that can resolve
     // it, and re-resolve only if its row vanishes (a snapshot row replaced by
     // the canonical DB page) before the user scrolls.
-    LaunchedEffect(screen.id, feed) {
-        val unreadAtOpen = state.openChatUnread[screen.id] ?: 0L
+    LaunchedEffect(transcriptSessionKey, feed, state.openChatUnreadFor(screen.id)) {
+        val unreadAtOpen = state.openChatUnreadFor(screen.id) ?: 0L
         if (unreadAtOpen <= 0L || feed.isEmpty()) return@LaunchedEffect
         val current = unreadAnchorId
         if (current != null && feed.any { transcriptFeedKey(it) == current }) return@LaunchedEffect
@@ -1507,16 +1486,26 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         if (!feedCaughtUp(feed)) return@LaunchedEffect
         val anchor = firstUnreadTranscriptIndex(feed, unreadAtOpen)
         if (anchor < 0) {
-            // The caught-up feed cannot place a divider (e.g. every unread
-            // event is a filtered ☎CALL/⚡PAY control line). Retire the pending
-            // unread state, or unreadAnchorPending() would suppress tail
-            // following for the rest of this open.
+            // Control-only unread can retire once the fold family is truly
+            // caught up. A short live 0.9 page must not settle 0 while bak /
+            // hidden 0.8 rows (or a newer index timestamp) are still missing.
+            // iOS waits on `expectedNewestDate` before abandoning.
+            if (!shouldRetireOpenChatUnread(
+                    unreadAtOpen = unreadAtOpen,
+                    anchorIndex = anchor,
+                    feedNewestTsSecs = feedNewestTsSecs(feed),
+                    expectedNewestTsSecs = state.expectedNewestTsForOpenChat(screen.id),
+                    familyHasOlder = state.familyHasOlderForOpenChat(screen.id),
+                )
+            ) {
+                return@LaunchedEffect
+            }
             state.retireOpenChatUnread(screen.id)
             return@LaunchedEffect
         }
         val anchorKey = transcriptFeedKey(feed[anchor])
         unreadAnchorId = anchorKey
-        state.openChatUnreadAnchor = state.openChatUnreadAnchor + (screen.id to anchorKey)
+        state.rememberOpenChatUnreadAnchor(screen.id, anchorKey)
         if (!userScrolled) {
             withFrameNanos { }
             val items = buildChatFeedListItems(feed, anchor)
@@ -1526,7 +1515,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // Observe the position independently of transcript publication. A newly
     // appended row follows only when the user was already reading the tail.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         snapshotFlow {
             val info = listState.layoutInfo
             val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
@@ -1540,7 +1529,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // pending anchor owns the next programmatic scroll, so tail-following must
     // not race it to the bottom when the White Noise leg merges in.
     fun unreadAnchorPending(): Boolean {
-        val count = state.openChatUnread[screen.id]
+        val count = state.openChatUnreadFor(screen.id)
         if (userScrolled) return false
         // Only settled unread (>0) without a divider owns the next scroll.
         // Unset capture is provisional live edge (keep pinning).
@@ -1550,7 +1539,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // White Noise leg in, which can insert only OLDER rows. That leaves the
     // newest key untouched while shifting every index — the tail moves and the
     // viewport is left showing older content until something re-anchors it.
-    LaunchedEffect(screen.id, newestFeedKey, feed.size, state.openChatUnread[screen.id]) {
+    LaunchedEffect(transcriptSessionKey, newestFeedKey, feed.size, state.openChatUnreadFor(screen.id)) {
         if (feed.isEmpty()) return@LaunchedEffect
         val hydrated = feedCaughtUp(feed)
         // Settled unread takes over from provisional live edge. Do NOT force
@@ -1604,7 +1593,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         listState.scrollToItem(idx)
                         needsLiveEdgeOpen = false
                         didInitialScroll = true
-                        state.clearOpenChatJump(screen.id)
+                        if (shouldSettleQuotedJump(jumpIdx >= 0)) {
+                            state.clearOpenChatJump(screen.id)
+                        }
                     }
                 }
             } else {
@@ -1624,7 +1615,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     is TranscriptOpenAction.Jump -> {
                         needsLiveEdgeOpen = false
                         didInitialScroll = true
-                        state.clearOpenChatJump(screen.id)
+                        // Keep the target: the retry effect below scrolls when
+                        // remainder / family reveal admits the parent.
                     }
                 }
             }
@@ -1656,20 +1648,32 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // Quote tap after the transcript has already opened: the open-path
     // LaunchedEffect above only runs while `didInitialScroll` is false.
-    LaunchedEffect(screen.id, state.openChatJumpMessageId[screen.id], feed.size, didInitialScroll) {
+    LaunchedEffect(transcriptSessionKey, state.jumpMessageIdForChat(screen.id), quotedJumpRetry, didInitialScroll) {
         if (!didInitialScroll) return@LaunchedEffect
-        val jumpId = state.openChatJumpMessageId[screen.id] ?: return@LaunchedEffect
+        val jumpId = state.jumpMessageIdForChat(screen.id) ?: return@LaunchedEffect
         val jumpIdx = feed.indexOfFirst { transcriptFeedKey(it) == jumpId }
-        if (jumpIdx < 0) return@LaunchedEffect
+        if (jumpIdx < 0) {
+            // Parent not painted yet. Pull one older local page (including
+            // 0.8 remainder) so this effect can retry when the painted
+            // window slides — size-only keys miss a 500-row bak page.
+            val added = state.loadOlderMessages(screen.id)
+            state.revealQuotedJumpIfCached(screen.id)
+            if (shouldClearQuotedJumpAfterMiss(added = added, parentInFeed = false)) {
+                state.clearOpenChatJump(screen.id)
+            }
+            return@LaunchedEffect
+        }
         val idx = chatFeedListIndexForFeedRow(listItems, jumpIdx).coerceAtLeast(0)
         listState.scrollToItem(idx)
-        state.clearOpenChatJump(screen.id)
+        if (shouldSettleQuotedJump(true)) {
+            state.clearOpenChatJump(screen.id)
+        }
     }
 
     // Load one local cursor page when the reader reaches the top. Capture a
     // stable visible message and pixel offset, then restore it after prepend so
     // the existing content does not jump under the reader's finger.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         snapshotFlow {
             didInitialScroll && listState.layoutInfo.totalItemsCount > 0 &&
                 listState.firstVisibleItemIndex <= 2
@@ -1699,7 +1703,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     // A 500-row window can move away from the tail. Reaching its bottom after
     // the reader has left the tail resets to a fresh bounded newest page.
-    LaunchedEffect(screen.id, listState) {
+    LaunchedEffect(transcriptSessionKey, listState) {
         snapshotFlow {
             didInitialScroll && didLeaveTail && state.canLoadNewestMessages(screen.id) &&
                 listState.layoutInfo.totalItemsCount > 0 &&
@@ -1732,11 +1736,80 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     if (!phase2Host) {
         TranscriptTailPinning(
             listState,
-            key = screen.id,
+            key = transcriptSessionKey,
             isPrepending = { isPrepending || unreadAnchorPending() },
         )
     }
-    val currentChat = state.chats.firstOrNull { it.id == screen.id }
+    return ChatTranscriptViewport(
+        sessionKey = transcriptSessionKey,
+        feed = feed,
+        listItems = listItems,
+        listState = listState,
+        phase2Host = phase2Host,
+        isPrependingOrUnreadPending = { isPrepending || unreadAnchorPending() },
+        unreadAnchorPending = { unreadAnchorPending() },
+    )
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
+    val s = sonar
+    val scope = rememberCoroutineScope()
+    val viewport = rememberChatTranscriptViewport(state, screen)
+    val transcriptSessionKey = viewport.sessionKey
+    val feed = viewport.feed
+    val listItems = viewport.listItems
+    val listState = viewport.listState
+    val phase2Host = viewport.phase2Host
+    val draft = state.composerDraft(screen.id)
+    var emojiTray by remember { mutableStateOf(false) }
+    var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
+    var paySheet by remember { mutableStateOf(false) }
+    var verifySheet by remember { mutableStateOf(false) }
+    var addSheet by remember { mutableStateOf(false) }
+    var addPeopleSheet by remember { mutableStateOf(false) }
+    var removePeopleSheet by remember { mutableStateOf(false) }
+    var mediaViewer by remember { mutableStateOf<SonarMedia?>(null) }
+    // Album opened fullscreen: the message's media + the tapped start index.
+    var mediaGallery by remember { mutableStateOf<Pair<List<SonarMedia>, Int>?>(null) }
+    var previewPackCoordinate by remember { mutableStateOf<String?>(null) }
+    val mediaActions = rememberMediaActions()
+    val pickPhoto = rememberPhotoPicker { items, rejectedTooLarge ->
+        if (rejectedTooLarge > 0) {
+            state.toast = if (rejectedTooLarge == 1) {
+                "Video is too large to send (max 25 MB)."
+            } else {
+                "$rejectedTooLarge videos are too large to send (max 25 MB)."
+            }
+        }
+        if (items.isNotEmpty()) state.stageMediaPreviews(screen.id, items)
+    }
+    // Voice-note recorder (hold the mic to record; drag left to cancel).
+    val recorder = remember { VoiceRecorder() }
+    var recording by remember { mutableStateOf(false) }
+    var recElapsed by remember { mutableStateOf(0) }
+    var recLevel by remember { mutableStateOf(0f) }
+    var recDragX by remember { mutableStateOf(0f) }
+    val recScope = rememberCoroutineScope()
+    LaunchedEffect(recording) {
+        while (recording) {
+            recElapsed = recorder.elapsed(); recLevel = recorder.level()
+            kotlinx.coroutines.delay(80)
+        }
+    }
+    // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
+    fun openPaySheetOrRetry() {
+        scope.launch {
+            val message = state.paymentDetailsUnavailableMessage(screen.id)
+            if (message != null) state.toast = message else paySheet = true
+        }
+    }
+    LaunchedEffect(screen.id) {
+        state.refreshDescriptorForChat(screen.id)
+        if (screen.pay) openPaySheetOrRetry()
+    }
+    val currentChat = state.listedChat(screen.id)
     val isGroup = state.isMultiMemberChat(screen.id)
     val canManageGroup = state.canManageGroup(screen.id)
     // Hoisted out of the row loop: resolving it costs a bech32 decode per group
@@ -2176,6 +2249,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     bold = "Out of range", rest = " — messages will wait until you meet again"
                 )
             }
+        } else if (state.recoveredChatWaitingForPeerUpdate(screen.id)) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
+                bold = "Waiting for them to update Sonar",
+                rest = " — this chat’s history is here; internet send needs their new version",
+            )
         } else if (verified) {
             chat.bitchat.sonar.ui.SNBanner(
                 icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
@@ -2211,9 +2290,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             // Phase 2: owned pad + IME overlay; Pin+Lockstep; top-align (not reverseLayout).
             TranscriptPhase2HostScaffold(
                 listState = listState,
-                listKey = screen.id,
-                isPrepending = { isPrepending || unreadAnchorPending() },
-                suppressPin = { unreadAnchorPending() },
+                listKey = transcriptSessionKey,
+                isPrepending = viewport.isPrependingOrUnreadPending,
+                suppressPin = viewport.unreadAnchorPending,
                 modifier = Modifier.weight(1f).fillMaxWidth(),
                 listContent = { bottomInset ->
                     ChatFeedList(Modifier.fillMaxSize(), bottomInset)
@@ -2246,7 +2325,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             modifier = Modifier.matchParentSize()
         )
     }
-    val chatPreviews = state.pendingMediaPreviews.filter { it.chatId == screen.id }
+    val chatPreviews = state.pendingMediaPreviewsMatching(screen.id)
     if (chatPreviews.isNotEmpty()) {
         val previewKey = chatPreviews.joinToString("|") { it.tempPath }
         val loaded by androidx.compose.runtime.produceState<List<SendPreviewItem>?>(null, previewKey) {
@@ -3061,7 +3140,7 @@ private fun ReplyDecorated(
         val reply = m.reply
         val resolvedReply = if (sonarReplyUiEnabled() && reply != null) {
             val fallback = stringResource(Res.string.chat_reply_fallback)
-            val parent = state.messages.firstOrNull { it.id.equals(reply.parentId, ignoreCase = true) }
+            val parent = state.quotedParentMessage(chatId, reply.parentId)
             val paymentLabel = stringResource(Res.string.chat_reply_payment)
             val photoLabel = stringResource(Res.string.chat_reply_photo)
             val stickerLabel = stringResource(Res.string.chat_reply_sticker)
@@ -4049,6 +4128,7 @@ private fun MediaBubble(
             val load = rememberTranscriptMediaLoad(state, chatId, media, transfer)
             val decoded = (load as? TranscriptMediaLoad.Ready)?.decoded
             val failed = transfer.phase == MediaTransferPhase.Failed ||
+                transfer.phase == MediaTransferPhase.Unavailable ||
                 load is TranscriptMediaLoad.Missing
             // Signal pre-sizes media cells from stored attachment dimensions so
             // the decoded image never reflows the transcript (Signal-Android
@@ -4083,6 +4163,7 @@ private fun MediaBubble(
                                 state.requestMediaDownload(chatId, media)
                             MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
                             MediaTransferPhase.Available -> if (decoded != null) onOpen(media)
+                            MediaTransferPhase.Unavailable -> Unit
                         }
                     },
                 contentAlignment = Alignment.Center
@@ -4110,7 +4191,7 @@ private fun MediaBubble(
                         MediaMetaChip(m.tsSecs, mesh, Modifier.align(Alignment.BottomEnd).padding(8.dp))
                     }
                     decoded != null -> InlineMediaFileChip(media, transfer) { onOpen(media) }
-                    failed -> MediaUnavailable(media)
+                    failed -> MediaUnavailable(transfer)
                     showsMediaDownloadSkeleton(state, media, transfer) ->
                         MediaLoadingSkeleton(media, placeholderModifier)
                     // Locally available image still decoding: keep the bubble a
@@ -4144,6 +4225,7 @@ private fun MediaBubble(
                         state.requestMediaDownload(chatId, media)
                     MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
                     MediaTransferPhase.Available -> onOpen(media)
+                    MediaTransferPhase.Unavailable -> Unit
                 }
             }
         }
@@ -4253,6 +4335,7 @@ private fun MediaDeckCard(
     val load = rememberTranscriptMediaLoad(state, chatId, media, transfer)
     val decoded = (load as? TranscriptMediaLoad.Ready)?.decoded
     val failed = transfer.phase == MediaTransferPhase.Failed ||
+        transfer.phase == MediaTransferPhase.Unavailable ||
         load is TranscriptMediaLoad.Missing
     Box(
         modifier.clip(RoundedCornerShape(18.dp)).background(s.surface2)
@@ -4265,6 +4348,7 @@ private fun MediaDeckCard(
                                 state.requestMediaDownload(chatId, media)
                             MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
                             MediaTransferPhase.Available -> if (decoded != null) onOpen()
+                            MediaTransferPhase.Unavailable -> Unit
                         }
                     }
                 } else m
@@ -4283,7 +4367,7 @@ private fun MediaDeckCard(
                 modifier = Modifier.fillMaxSize()
             )
             decoded != null -> InlineMediaFileChip(media, transfer) { onOpen?.invoke() }
-            failed -> MediaUnavailable(media)
+            failed -> MediaUnavailable(transfer)
             showsMediaDownloadSkeleton(state, media, transfer) -> MediaLoadingSkeleton(media)
             // Locally available image still decoding: stay a quiet surface.
             else -> Spacer(Modifier.fillMaxSize())
@@ -4389,19 +4473,34 @@ private fun MediaLoadingSkeleton(
     }
 }
 
-/** Failed/unavailable media — quiet surface tile with an explicit retry
- *  affordance (the whole bubble tap retries). */
+/** Failed/unavailable media — quiet surface tile. Recovered 0.8 blobs
+ *  cannot decrypt, so they omit Retry. */
 @Composable
-private fun MediaUnavailable(media: SonarMedia) {
+private fun MediaUnavailable(transfer: MediaTransferState) {
     val s = sonar
+    val legacy = transfer.phase == MediaTransferPhase.Unavailable
     Box(
         Modifier.size(width = 216.dp, height = 150.dp).background(s.surface2),
         contentAlignment = Alignment.Center
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
             SNIcon(SNIconName.Camera, 24.dp, s.text3, weight = 1.7f)
-            Text("Media unavailable", color = s.text2, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Text("Tap to retry", color = s.accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            Text(
+                if (legacy) "Older attachment" else "Media unavailable",
+                color = s.text2,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                if (legacy) {
+                    transfer.userMessage ?: RECOVERED_LEGACY_MEDIA_COPY
+                } else {
+                    "Tap to retry"
+                },
+                color = if (legacy) s.text3 else s.accent,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
     }
 }
@@ -4537,7 +4636,9 @@ private fun InlineMediaFileChip(
             )
             Text(
                 mediaTransferLabel(transfer, media.mimeType),
-                color = if (transfer.phase == MediaTransferPhase.Failed) s.danger else s.text3,
+                color = if (transfer.phase == MediaTransferPhase.Failed ||
+                    transfer.phase == MediaTransferPhase.Unavailable
+                ) s.danger else s.text3,
                 fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -4549,6 +4650,7 @@ private fun InlineMediaFileChip(
             MediaTransferPhase.NotDownloaded -> Text("↓", color = s.accent, fontSize = 19.sp, fontWeight = FontWeight.Bold)
             MediaTransferPhase.Available -> Text("↗", color = s.accent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             MediaTransferPhase.Failed -> Text("↻", color = s.danger, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            MediaTransferPhase.Unavailable -> Text("—", color = s.text3, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         }
     }
 }
@@ -4559,6 +4661,8 @@ private fun mediaTransferLabel(transfer: MediaTransferState, fallback: String): 
         MediaTransferPhase.Downloading -> transfer.progress?.let { "Downloading ${(it * 100).toInt()}%" } ?: "Downloading"
         MediaTransferPhase.Available -> fallback
         MediaTransferPhase.Failed -> "Download failed · tap to retry"
+        MediaTransferPhase.Unavailable ->
+            transfer.userMessage ?: RECOVERED_LEGACY_MEDIA_COPY
     }
 
 @Composable
@@ -5079,6 +5183,7 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
                 MediaTransferPhase.NotDownloaded -> Text("↓", color = if (m.mine) Color.White else s.accentDeep, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 MediaTransferPhase.Downloading -> MediaTransferProgress(transfer, 24.dp)
                 MediaTransferPhase.Failed -> Text("↻", color = if (m.mine) Color.White else s.accentDeep, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                MediaTransferPhase.Unavailable -> Text("—", color = if (m.mine) Color.White else s.text3, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 MediaTransferPhase.Available -> SNIcon(
                     if (playing) SNIconName.Pause else SNIconName.Play, 14.dp,
                     (if (m.mine) Color.White else s.accentDeep)

@@ -4,13 +4,27 @@
 //! This is the M1 acceptance test: KeyPackage publication → group creation →
 //! gift-wrapped welcome → bidirectional encrypted messages.
 
+use std::sync::{Arc, Mutex};
+
 use nostr::prelude::*;
 use nostr_relay_builder::MockRelay;
 use nostr_sdk::Client as NostrClient;
 use sonar_core::client::SonarClient;
+use sonar_core::conversation_index::ConversationChangeListener;
 use sonar_core::identity::Identity;
 use sonar_core::marmot::KEY_PACKAGE_KIND;
+use sonar_core::GroupId;
 use tokio::time::{timeout, Duration};
+
+struct RecordingChangeListener {
+    changed: Mutex<Vec<String>>,
+}
+
+impl ConversationChangeListener for RecordingChangeListener {
+    fn on_conversation_changed(&self, group_id_hex: String) {
+        self.changed.lock().unwrap().push(group_id_hex);
+    }
+}
 
 #[tokio::test]
 async fn profile_publish_and_fetch_through_a_relay() {
@@ -77,7 +91,7 @@ async fn two_instances_exchange_dms_through_a_relay() {
     bob.sync().await.expect("bob syncs");
     let bob_groups = bob.groups().expect("bob groups");
     assert_eq!(bob_groups.len(), 1, "bob joined exactly one group");
-    let bob_group = &bob_groups[0].mls_group_id;
+    let bob_group = &bob_groups[0].id;
 
     let bob_view = bob.messages(bob_group).expect("bob messages");
     assert_eq!(bob_view.len(), 1);
@@ -112,7 +126,7 @@ async fn two_instances_exchange_dms_through_a_relay() {
 
     // Both sides agree on membership.
     let members = bob.groups().unwrap()[0].clone();
-    assert_eq!(members.mls_group_id, *bob_group);
+    assert_eq!(members.id, *bob_group);
 }
 
 #[tokio::test]
@@ -408,7 +422,7 @@ async fn delete_group_removes_a_single_chat_locally() {
 
     assert_eq!(alice.groups().unwrap().len(), 1);
     assert_eq!(bob.groups().unwrap().len(), 1);
-    let bob_group = bob.groups().unwrap()[0].mls_group_id.clone();
+    let bob_group = bob.groups().unwrap()[0].id.clone();
 
     // Alice deletes the chat from HER device only.
     alice
@@ -772,10 +786,13 @@ async fn republished_key_package_replaces_the_slot_and_newest_wins() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
     assert_eq!(
         all.len(),
         1,
@@ -821,10 +838,13 @@ async fn in_memory_clients_sharing_an_identity_reuse_one_slot() {
     let observer = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
         .await
         .expect("observer connects");
-    let all = timeout(Duration::from_secs(10), observer.fetch_all_key_packages(pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all key packages");
+    let all = timeout(
+        Duration::from_secs(10),
+        observer.fetch_all_key_packages(pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all key packages");
 
     assert_eq!(
         all.len(),
@@ -882,7 +902,10 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
     let stale_id = stale.id;
 
     let publisher = nostr_sdk::Client::default();
-    publisher.add_relay(url_old.clone()).await.expect("add relay B");
+    publisher
+        .add_relay(url_old.clone())
+        .await
+        .expect("add relay B");
     publisher.connect().await;
     publisher.send_event(&stale).await.expect("publish stale");
 
@@ -891,10 +914,13 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
         .await
         .expect("bob connects");
 
-    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
-        .await
-        .expect("fetch did not time out")
-        .expect("fetch all");
+    let all = timeout(
+        Duration::from_secs(10),
+        bob.fetch_all_key_packages(alice_pubkey),
+    )
+    .await
+    .expect("fetch did not time out")
+    .expect("fetch all");
     assert_eq!(all.len(), 2, "expected one candidate from each relay");
 
     let picked = timeout(Duration::from_secs(10), bob.fetch_key_package(alice_pubkey))
@@ -981,5 +1007,1874 @@ async fn profile_republish_against_empty_relay_keeps_sidecar_fields() {
         profile.picture.as_deref(),
         Some("https://example.com/pic.png"),
         "picture must survive an empty-fetch republish"
+    );
+}
+
+const MDK08_DB_KEY: [u8; 32] = [0x42; 32];
+
+/// On-disk MDK 0.8 SQLCipher store with one kind-9 chat from `peer`.
+fn write_mdk08_alice_bob_store(
+    path: &std::path::Path,
+    peer: PublicKey,
+    body: &str,
+) -> (GroupId, EventId) {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x11u8; 16];
+    let event_id = EventId::from_slice(&[0xABu8; 32]).expect("event id");
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+         VALUES (?1, ?2, 'alice & bob', 'sonar.direct-dm.v1')",
+        rusqlite::params![group_bytes.clone(), vec![0x22u8; 32]],
+    )
+    .expect("group row");
+    conn.execute(
+        "INSERT INTO messages
+            (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+             wrapper_event_id, state)
+         VALUES (?1, ?2, ?3, 9, 1_700_000_000, ?4, '[]', '{}', ?2, 'processed')",
+        rusqlite::params![
+            group_bytes.clone(),
+            event_id.as_bytes().to_vec(),
+            peer.to_bytes().to_vec(),
+            body,
+        ],
+    )
+    .expect("chat row");
+    (GroupId::new(group_bytes), event_id)
+}
+
+/// 0.8 DM where only the local user sent. The peer is in `admin_pubkeys`
+/// (the 0.8 groups table), not in kind-9 rows.
+fn write_mdk08_alice_outbound_store(
+    path: &std::path::Path,
+    local: PublicKey,
+    peer: PublicKey,
+    body: &str,
+) -> GroupId {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            admin_pubkeys TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x55u8; 16];
+    let admins = serde_json::json!([local.to_hex(), peer.to_hex()]).to_string();
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description, admin_pubkeys)
+         VALUES (?1, ?2, 'outbound only', 'sonar.direct-dm.v1', ?3)",
+        rusqlite::params![group_bytes.clone(), vec![0x66u8; 32], admins],
+    )
+    .expect("group row");
+    conn.execute(
+        "INSERT INTO messages
+            (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+             wrapper_event_id, state)
+         VALUES (?1, ?2, ?3, 9, 1_700_000_000, ?4, '[]', '{}', ?2, 'processed')",
+        rusqlite::params![
+            group_bytes.clone(),
+            vec![0xABu8; 32],
+            local.to_bytes().to_vec(),
+            body,
+        ],
+    )
+    .expect("local chat row");
+    GroupId::new(group_bytes)
+}
+
+/// Sending on a recovered 0.8 row must create a live 0.9 group, keep the old
+/// transcript, fold both ids, and deliver to a peer who already speaks 0.9.
+///
+/// This is the production pin for the flag-day resume path: decrypt-and-move
+/// is not enough; the next send has to start a new encrypted session with the
+/// same npub without splitting the person.
+#[tokio::test]
+async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, old_event) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+
+    let alice = SonarClient::connect(
+        alice_identity.clone(),
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates the 0.8 store");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    assert_eq!(
+        alice.groups().expect("live groups before resume").len(),
+        0,
+        "0.8 MLS membership is not imported"
+    );
+    let recovered = alice.historical_groups().expect("recovered conversations");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, historical);
+    let pre = alice.messages(&historical).expect("recovered transcript");
+    assert_eq!(pre.len(), 1);
+    assert_eq!(pre[0].id, old_event);
+    assert_eq!(pre[0].content, "keep this chat");
+    let pre_summaries = alice.conversation_summaries();
+    assert_eq!(
+        pre_summaries.len(),
+        1,
+        "migrated history must occupy one index row"
+    );
+    assert_eq!(pre_summaries[0].latest_content, "keep this chat");
+
+    let too_soon = alice
+        .send_text(&historical, "too soon")
+        .await
+        .expect_err("resume send needs the peer's 0.9 key package");
+    assert!(
+        too_soon.to_string().contains("no key package"),
+        "peer still on 0.8 / unpublished KP: {too_soon}"
+    );
+    assert_eq!(
+        alice.groups().expect("still no live group").len(),
+        0,
+        "a failed resume must not mint an empty 0.9 group"
+    );
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    alice
+        .send_text(&historical, "resume hello")
+        .await
+        .expect("resume send creates a live 0.9 group");
+
+    let live_groups = alice.groups().expect("live 0.9 groups");
+    assert_eq!(live_groups.len(), 1, "exactly one new 0.9 group");
+    let live = live_groups[0].id.clone();
+    assert_ne!(
+        live, historical,
+        "resume must not reuse the dead 0.8 group id"
+    );
+
+    let from_old = alice.messages(&historical).expect("historical messages");
+    let from_new = alice.messages(&live).expect("live messages");
+    assert!(
+        from_old.iter().any(|m| m.content == "keep this chat"),
+        "old transcript must survive the resume send"
+    );
+    assert!(
+        from_old.iter().any(|m| m.content == "resume hello"),
+        "new send must be readable on the recovered id"
+    );
+    assert_eq!(
+        from_old.len(),
+        from_new.len(),
+        "either id must read the same folded family"
+    );
+    assert!(
+        !from_old.iter().any(|m| m.content == "too soon"),
+        "the failed pre-KP send must not land in the transcript"
+    );
+
+    let summaries = alice.conversation_summaries();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "recovered+resumed person must occupy one conversation-index row"
+    );
+    assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+    assert!(
+        alice
+            .conversation_summary(&hex::encode(historical.as_slice()))
+            .is_some(),
+        "the recovered id must still resolve for the open chat"
+    );
+    alice.mark_conversation_read(&hex::encode(historical.as_slice()));
+    assert_eq!(
+        alice
+            .conversation_summary(&hex::encode(live.as_slice()))
+            .expect("live summary")
+            .unread_count,
+        0
+    );
+
+    let pages = alice
+        .recent_message_pages(8, 8)
+        .expect("home-list pages after resume");
+    assert_eq!(
+        pages.len(),
+        1,
+        "recovered+resumed person must occupy one home-list slot"
+    );
+    assert_eq!(pages[0].group_id, live);
+
+    bob.sync().await.expect("bob syncs welcome + message");
+    let bob_groups = bob.groups().expect("bob groups");
+    assert_eq!(bob_groups.len(), 1);
+    let bob_view = bob.messages(&bob_groups[0].id).expect("bob messages");
+    assert_eq!(bob_view.len(), 1, "bob only sees the new 0.9 traffic");
+    assert_eq!(bob_view[0].content, "resume hello");
+    assert_eq!(bob_view[0].sender, alice.identity().public_key());
+
+    drop(alice);
+    let alice2 = SonarClient::connect(alice_identity, vec![relay_url], &db_path, MDK08_DB_KEY)
+        .await
+        .expect("alice reopens the 0.9 store");
+    assert_eq!(
+        alice2.groups().expect("reopened live groups").len(),
+        1,
+        "the 0.9 group must survive process restart"
+    );
+    alice2
+        .send_text(&historical, "second resume")
+        .await
+        .expect("reopened client reuses the fold");
+    assert_eq!(
+        alice2.groups().expect("still one live group").len(),
+        1,
+        "a second send must reuse the folded 0.9 group"
+    );
+    let after_reopen = alice2.messages(&historical).expect("folded transcript");
+    assert!(after_reopen.iter().any(|m| m.content == "keep this chat"));
+    assert!(after_reopen.iter().any(|m| m.content == "resume hello"));
+    assert!(after_reopen.iter().any(|m| m.content == "second resume"));
+}
+
+/// Two first-resume sends (text+media, double-tap) must share one 0.9 group.
+/// Without `resume_mint_lock` both pass the unbound check, each mint, and
+/// `record_resume_fold` steals history onto the second.
+#[tokio::test]
+async fn recovered_08_concurrent_first_resume_sends_share_one_live_group() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, _old_event) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates the 0.8 store");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+    bob.publish_key_package().await.expect("bob publishes kp");
+
+    let (first, second) = tokio::join!(
+        alice.send_text(&historical, "resume one"),
+        alice.send_text(&historical, "resume two"),
+    );
+    first.expect("first concurrent resume send");
+    second.expect("second concurrent resume send");
+
+    let live_groups = alice.groups().expect("live 0.9 groups");
+    assert_eq!(
+        live_groups.len(),
+        1,
+        "concurrent first-resume sends must not mint a second 0.9 group: {live_groups:?}"
+    );
+    let live = live_groups[0].id.clone();
+    let family = alice.messages(&live).expect("folded family");
+    assert!(
+        family.iter().any(|m| m.content == "keep this chat"),
+        "0.8 history must stay on the single live sibling: {family:?}"
+    );
+    assert!(
+        family.iter().any(|m| m.content == "resume one"),
+        "first concurrent send must land on the same group: {family:?}"
+    );
+    assert!(
+        family.iter().any(|m| m.content == "resume two"),
+        "second concurrent send must land on the same group: {family:?}"
+    );
+    assert_eq!(
+        alice.conversation_summaries().len(),
+        1,
+        "recovered+resumed person must occupy one conversation-index row"
+    );
+}
+
+/// A recovered DM that only has local kind-9 rows must still resume using the
+/// 0.8 `admin_pubkeys` list. This is the common "I wrote first, they never
+/// replied" case — transcript senders alone cannot recover the peer.
+#[tokio::test]
+async fn recovered_08_outbound_only_chat_resumes_from_admin_pubkeys() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_outbound_store(
+        &db_path,
+        alice_identity.public_key(),
+        bob_identity.public_key(),
+        "only I sent this",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    let hist = alice
+        .historical_groups()
+        .expect("historical")
+        .into_iter()
+        .find(|g| g.id == historical)
+        .expect("outbound chat listed");
+    assert!(
+        hist.members.contains(&bob.identity().public_key()),
+        "silent peer must be a resume target"
+    );
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "resume after they update")
+        .await
+        .expect("outbound-only chat must resume");
+    assert_eq!(alice.groups().expect("live").len(), 1);
+    assert_eq!(alice.conversation_summaries().len(), 1);
+}
+
+/// A pending 0.8 send lives in `.sonar-outbox.json` keyed by the recovered
+/// MLS id. First 0.9 connect used to treat only live MLS ids as active, so
+/// `retryable_events` deleted that row and `messages()` painted the mine
+/// bubble as Sent.
+#[tokio::test]
+async fn recovered_08_pending_outbox_survives_upgrade_connect() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_outbound_store(
+        &db_path,
+        alice_identity.public_key(),
+        bob_identity.public_key(),
+        "still on the wire",
+    );
+    let message_id = EventId::from_slice(&[0xABu8; 32]).expect("event id");
+    let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
+    std::fs::write(
+        &outbox_path,
+        format!(
+            r#"{{"version":1,"entries":[{{"group_id_hex":"{}","message_id_hex":"{}","wrapper_event_id_hex":"{}","event_json":"{{}}","created_at_secs":1,"updated_at_secs":1,"attempts":0,"state":"pending","last_error":null}}]}}"#,
+            hex::encode(historical.as_slice()),
+            message_id.to_hex(),
+            message_id.to_hex(),
+        ),
+    )
+    .expect("write pending 0.8 outbox");
+
+    let alice = SonarClient::connect(alice_identity, vec![relay_url], &db_path, MDK08_DB_KEY)
+        .await
+        .expect("alice migrates");
+
+    assert_eq!(alice.groups().expect("no live 0.9 yet").len(), 0);
+    let recovered = alice.messages(&historical).expect("recovered transcript");
+    assert_eq!(recovered.len(), 1);
+    assert!(recovered[0].mine, "outbound 0.8 row must stay mine");
+    assert_eq!(
+        recovered[0].delivery_state,
+        sonar_core::marmot::DeliveryState::Failed,
+        "upgrade connect must not purge the 0.8 outbox row and lie that it sent"
+    );
+
+    let err = alice
+        .retry_message(&message_id.to_hex())
+        .await
+        .expect_err("manual retry must not republish 0.8 ciphertext");
+    assert!(
+        matches!(err, sonar_core::Error::HistoricalProtocolRetry),
+        "retry must refuse with HistoricalProtocolRetry, got {err:?}"
+    );
+    let still = alice.messages(&historical).expect("recovered after retry");
+    assert_eq!(
+        still[0].delivery_state,
+        sonar_core::marmot::DeliveryState::Failed,
+        "refusing retry must keep the outbox row so the transcript stays Failed, not Sent"
+    );
+}
+
+/// Pending 0.8 welcome, 3 members, no kind-9 rows. Used to pin resume at
+/// `send_text` → `resolve_send_group` (not just `historical_resume_is_direct`).
+fn write_mdk08_pending_room_welcome(
+    path: &std::path::Path,
+    local: PublicKey,
+    welcomer: PublicKey,
+) -> GroupId {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );
+        CREATE TABLE welcomes (
+            id BLOB PRIMARY KEY,
+            event TEXT NOT NULL,
+            mls_group_id BLOB NOT NULL,
+            nostr_group_id BLOB NOT NULL,
+            group_name TEXT NOT NULL,
+            group_description TEXT NOT NULL,
+            group_admin_pubkeys TEXT NOT NULL,
+            group_relays TEXT NOT NULL,
+            welcomer BLOB NOT NULL,
+            member_count INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x77u8; 16];
+    let admins = serde_json::json!([local.to_hex(), welcomer.to_hex()]).to_string();
+    conn.execute(
+        "INSERT INTO welcomes
+            (id, event, mls_group_id, nostr_group_id, group_name, group_description,
+             group_admin_pubkeys, group_relays, welcomer, member_count, state,
+             wrapper_event_id)
+         VALUES (?1, '{}', ?2, ?3, 'pending room', 'weekly standup', ?4, '[]', ?5, 3, 'pending', ?1)",
+        rusqlite::params![
+            vec![0xAAu8; 32],
+            group_bytes.clone(),
+            vec![0xBBu8; 32],
+            admins,
+            welcomer.to_bytes().to_vec(),
+        ],
+    )
+    .expect("pending welcome");
+    GroupId::new(group_bytes)
+}
+
+/// A 3-member pending invite must not become a DM at the real send call site.
+///
+/// `historical_resume_is_direct` alone is not enough: the old resume used
+/// `start_dm_with_key_package`, which always mints a new `sonar.direct-dm.v1`
+/// group and never calls `find_dm_group_with`. Pinning `groups().len() == 2`
+/// after resume would stay green on that path. The send must create a named
+/// room whose description is not a DM, and must not fold onto an existing 1:1
+/// with the welcomer (`maybe_fold_new_group` used to do that).
+#[tokio::test]
+async fn recovered_08_pending_room_send_creates_named_group_not_dm() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_pending_room_welcome(
+        &db_path,
+        alice_identity.public_key(),
+        bob_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    assert!(
+        !alice.engine().historical_resume_is_direct(&historical),
+        "member_count=3 must keep the pending room off the DM path"
+    );
+    bob.publish_key_package().await.expect("bob kp");
+    let bob_dm = alice
+        .start_dm(bob.identity().public_key(), "bob dm")
+        .await
+        .expect("existing 1:1 with the welcomer");
+    assert_eq!(
+        alice.groups().expect("dm only").len(),
+        1,
+        "start_dm must not mint a second live group"
+    );
+    assert!(
+        alice
+            .historical_groups()
+            .expect("historical")
+            .iter()
+            .any(|g| g.id == historical && g.name == "pending room"),
+        "creating a 1:1 with the welcomer must not swallow the pending room"
+    );
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "maybe_fold_new_group must not fold a 3-member room onto the DM"
+    );
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("idle reconcile after start_dm");
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "ensure_subscriptions must not fold a 3-member room onto the DM"
+    );
+    assert_eq!(
+        alice.conversation_summaries().len(),
+        2,
+        "pending room and the new DM are two conversation-index rows"
+    );
+
+    alice
+        .send_text(&historical, "hello room")
+        .await
+        .expect("pending room resume");
+
+    let live = alice.groups().expect("live groups");
+    assert_eq!(
+        live.len(),
+        2,
+        "resume must keep the existing DM and add a room"
+    );
+    let dm = live
+        .iter()
+        .find(|g| g.description == "sonar.direct-dm.v1")
+        .expect("existing Bob DM");
+    assert_eq!(dm.id, bob_dm);
+    let room = live
+        .iter()
+        .find(|g| g.name == "pending room")
+        .expect("resumed room keeps the 0.8 name");
+    assert_eq!(
+        room.description, "weekly standup",
+        "resume must copy the 0.8 room topic onto the live 0.9 group"
+    );
+    assert_ne!(room.id, bob_dm, "send target must not be the existing DM");
+    assert_ne!(room.id, historical);
+    assert!(
+        alice.group_is_direct(&bob_dm),
+        "hosts must still fold the real 1:1 by npub"
+    );
+    assert!(
+        !alice.group_is_direct(&historical),
+        "FFI is_direct must stay false on the recovered room id"
+    );
+    assert!(
+        !alice.group_is_direct(&room.id),
+        "the resumed 2-member live room must not look like a DM to hosts"
+    );
+
+    let on_room = alice.messages(&room.id).expect("room transcript");
+    let on_dm = alice.messages(&bob_dm).expect("dm transcript");
+    assert!(
+        on_room.iter().any(|m| m.content == "hello room"),
+        "resume send must land on the new room"
+    );
+    assert!(
+        !on_dm.iter().any(|m| m.content == "hello room"),
+        "resume send must not land on the existing 1:1"
+    );
+    assert_eq!(alice.conversation_summaries().len(), 2);
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "resumed pending room must not stay on the FFI chat list beside the live group"
+    );
+    assert_eq!(
+        alice
+            .live_fold_target_hex(&hex::encode(historical.as_slice()))
+            .as_deref(),
+        Some(hex::encode(room.id.as_slice()).as_str()),
+        "hosts remount the open historical room onto the live 0.9 group"
+    );
+}
+
+fn write_mdk08_alice_bob_carol_store(
+    path: &std::path::Path,
+    bob: PublicKey,
+    carol: PublicKey,
+) -> GroupId {
+    write_mdk08_alice_bob_carol_store_with_topic(path, bob, carol, "alice bob carol", "field notes")
+}
+
+fn write_mdk08_alice_bob_carol_store_with_topic(
+    path: &std::path::Path,
+    bob: PublicKey,
+    carol: PublicKey,
+    name: &str,
+    description: &str,
+) -> GroupId {
+    let conn = rusqlite::Connection::open(path).expect("open 0.8 file");
+    let hex_key = MDK08_DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    let group_bytes = vec![0x33u8; 16];
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![group_bytes.clone(), vec![0x44u8; 32], name, description,],
+    )
+    .expect("group row");
+    for (seed, peer, body, created_at) in [
+        (0xB1u8, bob, "bob in the room", 1_700_000_000i64),
+        (0xC1u8, carol, "carol in the room", 1_700_000_001),
+    ] {
+        let event_id = EventId::from_slice(&[seed; 32]).expect("event id");
+        conn.execute(
+            "INSERT INTO messages
+                (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+                 wrapper_event_id, state)
+             VALUES (?1, ?2, ?3, 9, ?4, ?5, '[]', '{}', ?2, 'processed')",
+            rusqlite::params![
+                group_bytes.clone(),
+                event_id.as_bytes().to_vec(),
+                peer.to_bytes().to_vec(),
+                created_at,
+                body,
+            ],
+        )
+        .expect("chat row");
+    }
+    GroupId::new(group_bytes)
+}
+
+/// A recovered 0.8 room with two peers must resume via `start_group`, not a DM.
+#[tokio::test]
+async fn recovered_08_group_resumes_on_a_new_09_group_through_a_relay() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    let recovered = alice.historical_groups().expect("recovered room");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].members.len(), 3, "alice + bob + carol");
+
+    bob.publish_key_package().await.expect("bob kp");
+    carol.publish_key_package().await.expect("carol kp");
+    alice
+        .send_text(&historical, "room is back")
+        .await
+        .expect("resume start_group");
+
+    let live = alice.groups().expect("live groups");
+    assert_eq!(live.len(), 1);
+    assert_ne!(live[0].id, historical);
+    assert_eq!(
+        live[0].description, "field notes",
+        "joined-room resume must copy the 0.8 description"
+    );
+    let members = alice.members(&live[0].id).expect("live members");
+    assert_eq!(members.len(), 3);
+
+    let from_old = alice.messages(&historical).expect("folded transcript");
+    assert!(from_old.iter().any(|m| m.content == "bob in the room"));
+    assert!(from_old.iter().any(|m| m.content == "carol in the room"));
+    assert!(from_old.iter().any(|m| m.content == "room is back"));
+    assert_eq!(alice.conversation_summaries().len(), 1);
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "FFI groups() must hide the recovered room after resume so the home list stays one row"
+    );
+    assert!(
+        !alice.is_folded_historical_group(&live[0].id),
+        "the live 0.9 room is the listed chat"
+    );
+    assert_eq!(
+        alice
+            .live_fold_target_hex(&hex::encode(historical.as_slice()))
+            .as_deref(),
+        Some(hex::encode(live[0].id.as_slice()).as_str()),
+        "hosts remount the open historical room onto the live 0.9 group"
+    );
+
+    bob.sync().await.expect("bob syncs welcome");
+    carol.sync().await.expect("carol syncs welcome");
+    let bob_invite = bob
+        .pending_group_invites()
+        .expect("bob invites")
+        .into_iter()
+        .next()
+        .expect("recovered room resume must invite bob to the new 0.9 group");
+    let carol_invite = carol
+        .pending_group_invites()
+        .expect("carol invites")
+        .into_iter()
+        .next()
+        .expect("recovered room resume must invite carol to the new 0.9 group");
+    bob.accept_group_invite(&bob_invite.id)
+        .await
+        .expect("bob accepts");
+    carol
+        .accept_group_invite(&carol_invite.id)
+        .await
+        .expect("carol accepts");
+    bob.sync().await.expect("bob syncs after accept");
+    carol.sync().await.expect("carol syncs after accept");
+    assert_eq!(bob.groups().expect("bob joined").len(), 1);
+    assert_eq!(carol.groups().expect("carol joined").len(), 1);
+    assert_eq!(
+        bob.messages(&bob.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "room is back")
+            .count(),
+        1
+    );
+    assert_eq!(
+        carol
+            .messages(&carol.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "room is back")
+            .count(),
+        1
+    );
+}
+
+/// A recovered room must stay usable when only some members have updated.
+/// The send goes to whoever published a 0.9 KeyPackage; it must not fail
+/// the whole room, and it must not fold onto a 1:1 with that one peer.
+#[tokio::test]
+async fn recovered_08_group_resumes_with_whichever_peers_have_updated() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("room resumes with the reachable member");
+
+    let live = alice.groups().expect("live groups");
+    assert_eq!(live.len(), 1);
+    let members = alice.members(&live[0].id).expect("live members");
+    assert_eq!(members.len(), 2, "alice + bob; carol is still on 0.8");
+    assert!(!members.contains(&carol.identity().public_key()));
+    assert_eq!(alice.conversation_summaries().len(), 1);
+
+    carol.sync().await.expect("carol syncs");
+    assert!(
+        carol
+            .pending_group_invites()
+            .expect("carol invites")
+            .is_empty(),
+        "carol must not be invited until they publish a 0.9 key package"
+    );
+    assert!(carol.groups().expect("carol groups").is_empty());
+
+    bob.sync().await.expect("bob syncs welcome");
+    // Two-member welcomes auto-join (same budget as a DM). The room still
+    // must not be a pending invite-only group just because carol lagged.
+    if let Some(invite) = bob.pending_group_invites().expect("bob invites").first() {
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts");
+        bob.sync().await.expect("bob syncs after accept");
+    }
+    assert_eq!(bob.groups().expect("bob joined").len(), 1);
+    assert_eq!(
+        bob.messages(&bob.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "bob already updated")
+            .count(),
+        1
+    );
+}
+
+/// After a mixed resume, a leftover 0.8 member who later publishes a 0.9
+/// KeyPackage must be invited on the next send. The first send to Bob must
+/// still succeed even if Carol has not updated yet.
+#[tokio::test]
+async fn recovered_08_group_adds_a_member_who_updates_later() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(alice.members(&live).expect("members").len(), 2);
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol.identity().public_key()),
+        "FFI groups() must still list leftover 0.8 members after remount"
+    );
+    assert_eq!(painted.len(), 3, "alice + bob + leftover carol");
+
+    carol.publish_key_package().await.expect("carol updates");
+    alice
+        .send_text(&historical, "carol caught up")
+        .await
+        .expect("late add must not block the send");
+    let members = alice.members(&live).expect("members after late add");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "carol must join the live 0.9 room once she publishes a key package"
+    );
+    assert_eq!(members.len(), 3);
+
+    carol.sync().await.expect("carol syncs invite");
+    let carol_invite = carol
+        .pending_group_invites()
+        .expect("carol invites")
+        .into_iter()
+        .next()
+        .expect("late-updating member gets a 0.9 invite");
+    carol
+        .accept_group_invite(&carol_invite.id)
+        .await
+        .expect("carol accepts");
+    carol.sync().await.expect("carol syncs after accept");
+    assert_eq!(
+        carol
+            .messages(&carol.groups().unwrap()[0].id)
+            .unwrap()
+            .iter()
+            .filter(|m| m.content == "carol caught up")
+            .count(),
+        1
+    );
+}
+
+/// Leftover members must be invited on the host idle path
+/// (`ensure_subscriptions`), not only when the local user types. First
+/// paint / sending to people already in the room must not wait on this.
+#[tokio::test]
+async fn recovered_08_group_adds_late_member_on_sync_without_a_local_send() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(alice.members(&live).expect("members").len(), 2);
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol.identity().public_key()),
+        "FFI groups() must still list leftover 0.8 members after remount"
+    );
+    assert_eq!(painted.len(), 3, "alice + bob + leftover carol");
+
+    carol.publish_key_package().await.expect("carol updates");
+    // Persistent connect() already opened live subscriptions. Hosts then
+    // poll ensure_subscriptions (not sync) on the idle path.
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("host idle reconcile");
+    let members = alice.members(&live).expect("members after idle reconcile");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "ensure_subscriptions must invite leftover members without a local send"
+    );
+
+    carol.sync().await.expect("carol syncs invite");
+    let carol_invite = carol
+        .pending_group_invites()
+        .expect("carol invites")
+        .into_iter()
+        .next()
+        .expect("late member invited on alice sync");
+    carol
+        .accept_group_invite(&carol_invite.id)
+        .await
+        .expect("carol accepts");
+    assert_eq!(carol.groups().expect("carol joined").len(), 1);
+}
+
+/// Persist-folds can remount a mixed-resume room after the core fold
+/// sidecar is gone. Idle `ensure_subscriptions` must rebuild the bind
+/// and invite leftover members — a send on the listed live id never
+/// walks the hidden hist id (`resolve_send_group` mint path).
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_refolds_mixed_resume_on_ensure_subscriptions() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "mixed resume must bind hist onto the new 0.9 room"
+    );
+
+    alice.engine().clear_historical_folds();
+    alice.clear_index_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "lost core sidecar: host persist-folds remounts without fold_aliases"
+    );
+    assert_eq!(
+        alice
+            .display_members(&live)
+            .expect("live-only roster")
+            .len(),
+        2,
+        "without a fold, FFI display_members must not invent leftover carol"
+    );
+
+    carol.publish_key_package().await.expect("carol updates");
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("idle reconcile rebuilds the lost bind");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "ensure_subscriptions must re-fold the mixed-resume room"
+    );
+    let members = alice
+        .members(&live)
+        .expect("members after lost-sidecar heal");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "rebuilt fold must invite leftover 0.8 members without a hist send"
+    );
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol.identity().public_key()),
+        "FFI groups() must list leftover carol after the bind is rebuilt"
+    );
+}
+
+/// Empty-description 0.8 rooms cannot use the topic-match heal (incoming
+/// `create_group` also has an empty desc — R-045). After a lost JSON
+/// sidecar, `ensure_subscriptions` must restore the bind recorded in the
+/// conversation index at mint time.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_refolds_empty_desc_room_from_index() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live)
+    );
+    assert!(
+        alice
+            .groups()
+            .expect("live")
+            .iter()
+            .any(|g| g.id == live && g.description.is_empty()),
+        "empty 0.8 topic must stay empty on the minted live room"
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+
+    carol.publish_key_package().await.expect("carol updates");
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("idle reconcile restores the index bind");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "empty-desc rooms must re-fold from the index, not from topic match"
+    );
+    let members = alice.members(&live).expect("members after index restore");
+    assert!(
+        members.contains(&carol.identity().public_key()),
+        "restored bind must invite leftover 0.8 members without a hist send"
+    );
+}
+
+/// Persist-folds remounts and pages live before idle reconcile. A lost
+/// JSON sidecar must not make `messages_page(live)` hist-blind — restore
+/// the recorded index bind on the first local page.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_messages_page_restores_index_bind() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    let live_only = alice
+        .engine()
+        .messages_page(&live, 80, 0)
+        .expect("engine page is live-only without fold_aliases");
+    assert!(
+        live_only.iter().all(|m| m.content != "carol in the room"),
+        "engine messages_page(live) must not invent hist rows before restore"
+    );
+
+    let page = alice
+        .messages_page(&live, 80, 0)
+        .expect("client page restores the index bind");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "first FFI page must restore the recorded bind without ensure_subscriptions"
+    );
+    assert!(
+        page.iter().any(|m| m.content == "carol in the room"),
+        "messages_page(live) must union recovered 0.8 rows after index restore"
+    );
+}
+
+/// Home list paints `conversation_summaries()` without opening a chat.
+/// A lost JSON sidecar must not re-list the recovered 0.8 row as a
+/// second conversation — restore the recorded bind before filtering.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_summaries_hide_hist_from_index() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(alice.conversation_summaries().len(), 1);
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        !alice.is_folded_historical_group(&historical),
+        "engine hide is gone until the index bind is restored"
+    );
+    let painted = alice.display_members(&live).expect("display members");
+    assert!(
+        painted.contains(&carol_identity.public_key()),
+        "group-info roster must restore the bind without opening the transcript"
+    );
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "display_members must restore the recorded bind"
+    );
+    let summaries = alice.conversation_summaries();
+    assert_eq!(
+        summaries.len(),
+        1,
+        "hist must not reappear as a second home row"
+    );
+    let hist_hex = hex::encode(historical.as_slice());
+    assert!(
+        summaries.iter().all(|s| s.group_id_hex != hist_hex),
+        "conversation_summaries must keep hiding the recovered 0.8 id"
+    );
+}
+
+/// Hosts remount from FFI `live_fold_target` / `fold_aliases` / `groups()`
+/// before `conversation_summaries`. A lost JSON sidecar must restore the
+/// recorded bind on those reads so the first home-list paint does not
+/// split one person into two chats.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_groups_and_aliases_restore_index_bind() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    let hist_hex = hex::encode(historical.as_slice());
+    let live_hex = hex::encode(live.as_slice());
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    assert_eq!(
+        alice.live_fold_target_hex(&hist_hex).as_deref(),
+        Some(live_hex.as_str()),
+        "first FFI alias query must restore the recorded bind"
+    );
+    assert!(
+        alice
+            .fold_aliases_hex(&live_hex)
+            .iter()
+            .any(|id| id == &hist_hex),
+        "fold_aliases(live) must rediscover the hidden 0.8 sibling"
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "cleared again so groups() is the only restore"
+    );
+    let _ = alice.groups().expect("groups restores the index bind");
+    assert!(
+        alice.is_folded_historical_group(&historical),
+        "groups() must hide hist on the first home-list paint"
+    );
+}
+
+/// Host persist-folds may be gone (nsec restore wiped the blob) while the
+/// conversation-index still records hist→live. Leave/delete must restore
+/// that bind before capturing `fold_aliases`, or hist stays on disk and
+/// the next `groups()` resurrects a chat the user already deleted.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_delete_live_purges_hist_from_index() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    alice
+        .delete_group(&live)
+        .await
+        .expect("delete live restores the bind and purges hist");
+    assert!(
+        alice
+            .historical_groups()
+            .expect("historical")
+            .iter()
+            .all(|g| g.id != historical),
+        "hist must not remain a recoverable conversation"
+    );
+    assert!(
+        alice.groups().expect("groups").is_empty(),
+        "deleted room must not reappear on the next home-list paint"
+    );
+}
+
+/// A recovered DM already bound to live A must stay there when a second
+/// 0.9 group with the same peer is created after the JSON sidecar is lost.
+/// `maybe_fold_new_group` used to miss `is_folded_historical_group` and
+/// `record_historical_fold` overwrote the bind — history vanished from A.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_second_dm_does_not_steal_hist() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, _) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "resume hello")
+        .await
+        .expect("resume send");
+    let live_a = alice.groups().expect("live A")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live_a)
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+
+    let live_b = alice
+        .start_group(vec![bob.identity().public_key()], "stolen")
+        .await
+        .expect("second 0.9 group with the same peer");
+    assert_ne!(live_b, live_a, "start_group must mint a distinct id");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live_a),
+        "second create must not steal hist onto the new MLS id"
+    );
+    let on_a = alice.messages(&live_a).expect("live A family");
+    assert!(
+        on_a.iter().any(|m| m.content == "keep this chat"),
+        "recovered 0.8 transcript must stay on the first live sibling"
+    );
+    let on_b = alice
+        .engine()
+        .messages(&live_b)
+        .expect("live B engine-only");
+    assert!(
+        on_b.iter().all(|m| m.content != "keep this chat"),
+        "engine messages(B) must not union hist after a steal"
+    );
+}
+
+/// Pre-migration join requests and `sinvite1` tokens still key the
+/// recovered 0.8 id. Host group-info queries the listed live sibling.
+/// After the JSON sidecar is lost, `invite_family` must restore the
+/// recorded index bind or those rows vanish until housekeeping.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_invite_family_sees_hist_requests() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+
+    let token = alice
+        .create_invite_link(&historical, "alice bob carol")
+        .expect("mint after fold remaps onto live");
+    let decoded = sonar_core::invite_link::decode_invite_token(&token).expect("decode");
+    assert_eq!(
+        decoded.group_id,
+        live.as_slice(),
+        "post-resume invite must embed the live 0.9 group id"
+    );
+    let requester = Keys::generate().public_key();
+    let stored = alice
+        .store_join_request(sonar_core::invite_link::JoinRequest {
+            requester,
+            group_id: historical.clone(),
+            secret_hash: sonar_core::invite_link::sha256(&decoded.invite_secret),
+            key_package_event_id: None,
+            key_package_d_tag: None,
+            received_at: 1,
+        })
+        .expect("store hist-keyed request");
+    assert!(
+        stored,
+        "family union must still validate a live-minted secret against hist"
+    );
+    assert_eq!(alice.pending_join_requests(&live).len(), 1);
+    assert_eq!(alice.active_invite_links(&live).len(), 1);
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    let listener = Arc::new(RecordingChangeListener {
+        changed: Mutex::new(Vec::new()),
+    });
+    alice.set_conversation_change_listener(Some(listener.clone()));
+    let second = Keys::generate().public_key();
+    let stored_again = alice
+        .store_join_request(sonar_core::invite_link::JoinRequest {
+            requester: second,
+            group_id: historical.clone(),
+            secret_hash: sonar_core::invite_link::sha256(&decoded.invite_secret),
+            key_package_event_id: None,
+            key_package_d_tag: None,
+            received_at: 2,
+        })
+        .expect("store second hist-keyed request after sidecar loss");
+    assert!(stored_again);
+    let live_hex = hex::encode(live.as_slice());
+    assert!(
+        listener
+            .changed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id == &live_hex),
+        "store on hist must wake the live sibling so group-info remounts"
+    );
+    assert_eq!(
+        alice.pending_join_requests(&live).len(),
+        2,
+        "live group-info must restore the family and see hist-keyed requests"
+    );
+    assert_eq!(
+        alice.active_invite_links(&live).len(),
+        1,
+        "live group-info must restore the family and see hist-keyed links"
+    );
+
+    let reminted = alice
+        .create_invite_link(&historical, "alice bob carol")
+        .expect("mint via hist after sidecar loss");
+    let reminted_decoded =
+        sonar_core::invite_link::decode_invite_token(&reminted).expect("decode remint");
+    assert_eq!(
+        reminted_decoded.group_id,
+        live.as_slice(),
+        "invite_mint_group must restore the bind instead of rejecting hist as unresumed"
+    );
+}
+
+/// Leftover-member / persist-folds sends may still name the recovered
+/// 0.8 id. After the JSON sidecar is lost, `resolve_send_group` must
+/// restore the recorded bind instead of minting a second 0.9 group and
+/// stealing hist via `record_resume_fold`.
+#[tokio::test]
+async fn persist_folds_lost_core_sidecar_send_on_hist_reuses_live() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "alice bob carol",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live)
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    alice
+        .send_text(&historical, "still the same room")
+        .await
+        .expect("send on hist after sidecar loss");
+    assert_eq!(
+        alice.engine().live_fold_target(&historical).as_ref(),
+        Some(&live),
+        "send on hist must reuse the first live sibling"
+    );
+    let lives = alice.groups().expect("groups");
+    assert_eq!(
+        lives.len(),
+        1,
+        "send on hist must not mint a second 0.9 room"
+    );
+    assert_eq!(lives[0].id, live);
+    let on_live = alice.messages(&live).expect("live family");
+    assert!(
+        on_live.iter().any(|m| m.content == "still the same room"),
+        "the send must land on the existing live sibling"
+    );
+}
+
+/// Empty name+desc 3-person room: partial resume mints a 2-person live
+/// group with the same empty topic. Live `group_is_direct` used to treat
+/// that as a DM, so hosts folded it onto the welcomer 1:1 (R-045).
+#[tokio::test]
+async fn persist_folds_empty_topic_room_live_is_not_direct() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store_with_topic(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+        "",
+        "",
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    assert!(
+        !alice.engine().historical_resume_is_direct(&historical),
+        "three recovered senders must keep the room off the DM resume path"
+    );
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "partial resume")
+        .await
+        .expect("resume with bob");
+    let live = alice.groups().expect("live")[0].id.clone();
+    assert!(
+        !alice.group_is_direct(&historical),
+        "recovered empty-topic room must stay a room"
+    );
+    assert!(
+        !alice.group_is_direct(&live),
+        "the 2-person live sibling must not paint as a DM"
+    );
+
+    let bob_dm = alice
+        .start_dm(bob.identity().public_key(), "bob dm")
+        .await
+        .expect("real 1:1 with bob");
+    assert_ne!(bob_dm, live, "room must not reuse the welcomer DM");
+    assert!(
+        alice.group_is_direct(&bob_dm),
+        "the real 1:1 must still fold by npub"
+    );
+    assert_eq!(
+        alice.groups().expect("room + dm").len(),
+        2,
+        "empty-topic room and the welcomer DM are two live groups"
+    );
+
+    alice.engine().clear_historical_folds();
+    assert!(
+        alice.engine().live_fold_target(&historical).is_none(),
+        "JSON sidecar lost; index still holds the recorded bind"
+    );
+    assert!(
+        !alice.group_is_direct(&live),
+        "lost sidecar must not reclassify the remounted room as a DM"
     );
 }

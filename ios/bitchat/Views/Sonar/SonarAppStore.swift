@@ -257,6 +257,4005 @@ func snFoldedDirectMarmotHomeTitle(
     isDirectGroup ? marmotProfileTitle : peerDerivedTitle
 }
 
+/// Home / header title. Recovered rooms keep their name even when only one
+/// peer is listed; the 1:1 profile path is only for `isDirect` chats.
+func snMarmotChatDisplayTitle(
+    isDirect: Bool,
+    name: String,
+    otherMemberCount: Int,
+    profileName: String?,
+    npubFallback: String
+) -> String {
+    if !isDirect || otherMemberCount != 1 {
+        return name.isEmpty ? "Group chat" : name
+    }
+    if let profileName, !profileName.isEmpty { return profileName }
+    return name.isEmpty ? npubFallback : name
+}
+
+func snMarmotSendTargetGroupId(
+    openChatId: String,
+    duplicateGroupIds: [String],
+    latestSecs: (String) -> TimeInterval
+) -> String {
+    duplicateGroupIds.max { lhs, rhs in
+        let left = latestSecs(lhs)
+        let right = latestSecs(rhs)
+        if left != right { return left < right }
+        return lhs < rhs
+    } ?? openChatId
+}
+
+let snHistoricalFoldsDefaultsKey = "sonar.historicalFolds.v1"
+
+/// Write hist→live bindings to the host defaults AND the App Group mute
+/// mirror. Leave/delete must use this so NSE cannot keep a fold the user
+/// already removed.
+func snPersistHistoricalFolds(_ map: [String: String], to defaults: UserDefaults) {
+    defaults.set(map, forKey: snHistoricalFoldsDefaultsKey)
+    UserDefaults(suiteName: SonarChatMuteStore.appGroupId)?
+        .set(map, forKey: snHistoricalFoldsDefaultsKey)
+}
+
+/// After FFI `groups()` hides a folded 0.8 room, remount the open transcript
+/// onto the live 0.9 sibling so `marmot.groups` lookups stay valid.
+func snRemountFoldedOpenGroupId(
+    openGroupId: String,
+    listedGroupIds: Set<String>,
+    liveFoldTarget: String?
+) -> String {
+    if listedGroupIds.contains(openGroupId) { return openGroupId }
+    // Same remap as `snNotificationOpenGroupId`: after FFI hides the 0.8
+    // row, waiting for the live sibling to list leaves the open transcript
+    // on a chat that is no longer in `marmot.groups`.
+    guard let live = liveFoldTarget, !live.isEmpty, live != openGroupId else {
+        return openGroupId
+    }
+    return live
+}
+
+/// Shade / deep-link taps can still name a hidden 0.8 id after resume.
+/// Remap onto `live_fold_target` even before the home list lists the live
+/// sibling so a tap cannot clear the banner and leave the user on Home.
+func snNotificationOpenGroupId(
+    tappedGroupId: String,
+    liveFoldTarget: String?
+) -> String {
+    guard let live = liveFoldTarget, !live.isEmpty, live != tappedGroupId else {
+        return tappedGroupId
+    }
+    return live
+}
+
+/// Shade taps stay open after a hist→live remap, or when either id is listed.
+/// Empty persist + FFI miss + live-only listing is not ready — refresh folds first.
+func snNotificationOpenIsReady(
+    requestedGroupId: String,
+    remounted: String,
+    listed: Set<String>
+) -> Bool {
+    remounted != requestedGroupId
+        || listed.contains(requestedGroupId)
+        || listed.contains(remounted)
+}
+
+/// Prefer the listed MLS id. If FFI hid a folded 0.8 row or has not
+/// painted the live sibling yet, return the other listed fold sibling
+/// so title / members / verify / call lookups stay valid.
+func snListedOrFoldedSiblingGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    if listedGroupIds.contains(groupId) { return groupId }
+    if let historical = historicalFolds.first(where: { $0.value == groupId && $0.key != groupId })?.key,
+       listedGroupIds.contains(historical) {
+        return historical
+    }
+    if let live = historicalFolds[groupId], live != groupId, listedGroupIds.contains(live) {
+        return live
+    }
+    for id in snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id)
+        if listedGroupIds.contains(bare) { return bare }
+        if listedGroupIds.contains(id) { return id }
+    }
+    return nil
+}
+
+/// Open / catch-up / media-send target. A stale hist mapping remaps onto
+/// the listed live sibling so `preferCatchupGroup` hits `engine.groups()`.
+func snResolvedOpenGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    if let listed = snListedOrFoldedSiblingGroupId(
+        groupId: groupId,
+        listedGroupIds: listedGroupIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        return listed
+    }
+    return groupId
+}
+
+/// FFI group-admin / leave target. `listedOrFoldedSibling` keeps the
+/// painted hist id; `marmotGroupId` already remaps onto the listed live
+/// sibling so add/remove/invite/pending/leave hit `engine.groups()`.
+/// Compose `marmotAdminGroupId`.
+func snMarmotAdminGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    snResolvedOpenGroupId(
+        groupId: snBareMarmotGroupId(groupId),
+        listedGroupIds: listedGroupIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+}
+
+/// Bare MLS id whether the tap carried `marmot:` or not.
+func snBareMarmotGroupId(_ id: String, prefix: String = "marmot:") -> String {
+    id.hasPrefix(prefix) ? String(id.dropFirst(prefix.count)) : id
+}
+
+/// Cold-start shade taps must remap from the persisted hist→live blob
+/// when FFI `liveFoldTarget` is not ready yet.
+func snPersistedLiveFoldTarget(
+    tappedGroupId: String,
+    historicalFolds: [String: String],
+    prefix: String = "marmot:"
+) -> String? {
+    let aliases = [tappedGroupId, snBareMarmotGroupId(tappedGroupId, prefix: prefix)]
+    for alias in aliases {
+        guard let live = historicalFolds[alias] ?? historicalFolds[snBareMarmotGroupId(alias, prefix: prefix)],
+              !live.isEmpty else { continue }
+        let bareLive = snBareMarmotGroupId(live, prefix: prefix)
+        if !bareLive.isEmpty, bareLive != snBareMarmotGroupId(tappedGroupId, prefix: prefix) {
+            return bareLive
+        }
+    }
+    return nil
+}
+
+/// FFI wins when the engine is up; otherwise the host blob. Mid-session
+/// remount (persist-folds still empty) walks the remount pair last.
+/// NSE / killed-app omit remount and stay persist-only.
+/// Compose `notificationLiveFoldTargets`.
+func snNotificationLiveFoldTarget(
+    tappedGroupId: String,
+    ffiLiveFoldTarget: String?,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String? {
+    if let ffi = ffiLiveFoldTarget?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !ffi.isEmpty {
+        return snBareMarmotGroupId(ffi, prefix: prefix)
+    }
+    if let persisted = snPersistedLiveFoldTarget(
+        tappedGroupId: tappedGroupId,
+        historicalFolds: historicalFolds,
+        prefix: prefix
+    ) {
+        return persisted
+    }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return snPersistedLiveFoldTarget(
+        tappedGroupId: tappedGroupId,
+        historicalFolds: folds,
+        prefix: prefix
+    )
+}
+
+/// Preview sheet stays up when remount rewrites `peerId` to live while
+/// iPhone still paints `.dm(hist)`. Compose `pendingMediaPreviewBelongsToChat`.
+func snPendingMediaPreviewBelongsToChat(
+    previewPeerId: String,
+    chatId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    historicalFolds: [String: String]
+) -> Bool {
+    if snConversationsMatchFoldFamily(
+        left: previewPeerId,
+        right: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) { return true }
+    if snOpenedConversationIdMatches(previewPeerId, openedConversationId)
+        && snOpenedConversationIdMatches(chatId, openedConversationPaneId) {
+        return true
+    }
+    if snOpenedConversationIdMatches(previewPeerId, openedConversationPaneId)
+        && snOpenedConversationIdMatches(chatId, openedConversationId) {
+        return true
+    }
+    return false
+}
+
+func snConversationsMatchFoldFamily(
+    left: String,
+    right: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Bool {
+    let leftBare = snBareMarmotGroupId(left, prefix: prefix)
+    let rightBare = snBareMarmotGroupId(right, prefix: prefix)
+    if leftBare == rightBare { return true }
+    if snOpenedConversationIdMatches(left, right) { return true }
+    if snFoldFamilyIds(
+        id: leftBare,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).contains(rightBare) {
+        return true
+    }
+    let remount = snRemountPairConversationIds(
+        conversationId: left,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return remount.count > 1 && remount.contains(where: {
+        snOpenedConversationIdMatches($0, right)
+    })
+}
+
+/// Persist-folds remounts group-info `hist → live`. A view identity
+/// change must not drop recovered requests before the live probe.
+/// Empty persist-folds still keep the remount pair.
+func snPendingJoinRequestsAcrossRemount<Request>(
+    previousChatId: String,
+    nextChatId: String,
+    requests: [Request],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [Request] {
+    if previousChatId.isEmpty || nextChatId.isEmpty { return requests }
+    if snConversationsMatchFoldFamily(
+        left: previousChatId,
+        right: nextChatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        return requests
+    }
+    return []
+}
+
+/// Open group-info must reload pending joins when `conversationChanged`
+/// names this room, its hidden 0.8 sibling, or the remount pair. Compose
+/// `groupInfoShouldReloadPending`.
+func snGroupInfoShouldReloadPending(
+    openGroupInfoChatId: String?,
+    changedId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Bool {
+    guard let open = openGroupInfoChatId, !open.isEmpty, !changedId.isEmpty else {
+        return false
+    }
+    return snConversationsMatchFoldFamily(
+        left: open,
+        right: changedId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    )
+}
+
+/// Copy an open-chat host map (unread divider, jump, window) from a hidden
+/// 0.8 id onto the live sibling so remount does not treat the chat as a
+/// fresh open.
+func snRemountFoldedOpenValues<Value>(
+    historicalKeys: [String],
+    liveKeys: [String],
+    values: [String: Value],
+    preferExisting: (Value) -> Bool = { _ in true }
+) -> [String: Value] {
+    guard let incoming = historicalKeys.compactMap({ values[$0] }).first else {
+        return values
+    }
+    var next = values
+    for live in liveKeys {
+        if let existing = next[live], preferExisting(existing) { continue }
+        next[live] = incoming
+    }
+    return next
+}
+
+/// Copy a hist composer draft onto live without family-clearing.
+/// `setComposerDraft("", hist)` after persist-folds walks the family and
+/// wipes the live copy too. iPhone still paints `.dm(hist)`, so hist keys
+/// must stay. Compose `remountComposerDrafts`.
+func snRemountComposerDrafts(
+    drafts: [String: String],
+    historicalKeys: [String],
+    liveKeys: [String]
+) -> [String: String] {
+    let nonempty = historicalKeys.filter { !(drafts[$0] ?? "").isEmpty }
+    return snRemountFoldedOpenValues(
+        historicalKeys: nonempty,
+        liveKeys: liveKeys,
+        values: drafts,
+        preferExisting: { !$0.isEmpty }
+    )
+}
+
+/// Copy the hist "has text" chrome flag onto live. Same keep-hist rule as
+/// `snRemountComposerDrafts` — a family-clear of hist must not drop live.
+func snRemountComposerDraftHasText(
+    flags: [String: Bool],
+    historicalKeys: [String],
+    liveKeys: [String]
+) -> [String: Bool] {
+    let present = historicalKeys.filter { flags[$0] == true }
+    return snRemountFoldedOpenValues(
+        historicalKeys: present,
+        liveKeys: liveKeys,
+        values: flags,
+        preferExisting: { $0 }
+    )
+}
+
+/// Rebind one open-chat id from a hidden 0.8 row onto the live sibling.
+func snRemountFoldedOpenId(
+    historicalKeys: [String],
+    liveId: String,
+    id: String
+) -> String {
+    historicalKeys.contains(id) ? liveId : id
+}
+
+/// Remount a conversation id that may carry the `marmot:` prefix.
+func snRemountFoldedConversationId(
+    _ id: String,
+    listedGroupIds: Set<String>,
+    liveFoldTarget: String?,
+    prefix: String = "marmot:"
+) -> String {
+    let bare = snBareMarmotGroupId(id, prefix: prefix)
+    let remounted = snRemountFoldedOpenGroupId(
+        openGroupId: bare,
+        listedGroupIds: listedGroupIds,
+        liveFoldTarget: liveFoldTarget
+    )
+    guard remounted != bare else { return id }
+    if id.hasPrefix(prefix) { return prefix + remounted }
+    return remounted
+}
+
+/// Painted iPhone DM route stays hist. Changing it remakes
+/// `NavigationStack` and snaps scroll. Group-info / call still hop.
+func snRemountShouldPreserveOpenTranscriptRoute(
+    routeId: String,
+    preserveIds: Set<String>
+) -> Bool {
+    if preserveIds.contains(routeId) { return true }
+    return preserveIds.contains { snOpenedConversationIdMatches(routeId, $0) }
+}
+
+/// Remount group-info / contact-profile / call / buried DM routes after
+/// FFI hides a folded 0.8 id.
+func snRemountFoldedPath(
+    path: [SonarRoute],
+    listedGroupIds: Set<String>,
+    liveFoldTarget: (String) -> String?,
+    prefix: String = "marmot:",
+    preserveIds: Set<String> = []
+) -> [SonarRoute] {
+    path.map { route in
+        switch route {
+        case .dm(let id):
+            if snRemountShouldPreserveOpenTranscriptRoute(
+                routeId: id,
+                preserveIds: preserveIds
+            ) {
+                return .dm(id)
+            }
+            return .dm(snRemountFoldedConversationId(
+                id,
+                listedGroupIds: listedGroupIds,
+                liveFoldTarget: liveFoldTarget(id),
+                prefix: prefix
+            ))
+        case .groupInfo(let id):
+            return .groupInfo(snRemountFoldedConversationId(
+                id,
+                listedGroupIds: listedGroupIds,
+                liveFoldTarget: liveFoldTarget(id),
+                prefix: prefix
+            ))
+        case .contactProfile(let id, let name):
+            return .contactProfile(
+                snRemountFoldedConversationId(
+                    id,
+                    listedGroupIds: listedGroupIds,
+                    liveFoldTarget: liveFoldTarget(id),
+                    prefix: prefix
+                ),
+                name
+            )
+        case .call(let id, let video):
+            return .call(
+                snRemountFoldedConversationId(
+                    id,
+                    listedGroupIds: listedGroupIds,
+                    liveFoldTarget: liveFoldTarget(id),
+                    prefix: prefix
+                ),
+                video: video
+            )
+        default:
+            return route
+        }
+    }
+}
+
+/// Path remount must see the same live target as open-chat remount.
+/// Persist-folds can still be empty when FFI already hid hist.
+/// After hop, iPhone can still push group-info / call from the
+/// painted hist pane; persist-other must not hide this remount.
+/// Compose `pathRemountLiveTarget`.
+func snPathRemountLiveTarget(
+    id: String,
+    persistedFolds: [String: String],
+    knownLiveTargets: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    let bare = snBareMarmotGroupId(id)
+    if let live = persistedFolds[bare], !live.isEmpty, live != bare { return live }
+    if let live = knownLiveTargets[bare], !live.isEmpty { return live }
+    if let live = knownLiveTargets[id], !live.isEmpty { return live }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: persistedFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if let live = folds[bare], !live.isEmpty, live != bare { return live }
+    if let live = folds[id], !live.isEmpty, live != id { return live }
+    return persistedFolds[bare]
+}
+
+/// After remount hop, iPhone still paints `.dm(hist)` and can push
+/// group-info / contact-profile from that pane. Path remount already
+/// rewrote routes that were on the stack at hop; a new push must remap
+/// the same way. Persist hist→stale still wins (R-045). Empty without
+/// a remount pair stays hist. Do not remount `.dm` — the painted pane
+/// stays hist. Compose `pushedConversationRouteId`.
+func snPushedConversationRouteId(
+    id: String,
+    persistedFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    guard let live = snPathRemountLiveTarget(
+        id: id,
+        persistedFolds: persistedFolds,
+        knownLiveTargets: [:],
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ), !live.isEmpty else {
+        return id
+    }
+    let bare = snBareMarmotGroupId(id, prefix: prefix)
+    let liveBare = snBareMarmotGroupId(live, prefix: prefix)
+    if liveBare.isEmpty || liveBare == bare { return id }
+    if id.hasPrefix(prefix) { return prefix + liveBare }
+    return liveBare
+}
+
+/// Remap group-info / contact-profile onto live. Leave `.dm` / `.call`
+/// alone — the painted pane stays hist; `activeCall.convId` stays hist
+/// so BLE signaling still resolves. Compose `remountPushedScreen`.
+func snRemountPushedRoute(
+    _ route: SonarRoute,
+    persistedFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> SonarRoute {
+    switch route {
+    case .groupInfo(let id):
+        return .groupInfo(snPushedConversationRouteId(
+            id: id,
+            persistedFolds: persistedFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ))
+    case .contactProfile(let id, let name):
+        return .contactProfile(
+            snPushedConversationRouteId(
+                id: id,
+                persistedFolds: persistedFolds,
+                openedConversationId: openedConversationId,
+                openedConversationPaneId: openedConversationPaneId
+            ),
+            name
+        )
+    default:
+        return route
+    }
+}
+
+func snPathConversationIds(_ path: [SonarRoute]) -> [String] {
+    path.compactMap { route in
+        switch route {
+        case .dm(let id), .groupInfo(let id), .call(let id, _):
+            return id
+        case .contactProfile(let id, _):
+            return id
+        default:
+            return nil
+        }
+    }
+}
+
+func snPathRemountShouldMergeFolds(
+    pathIds: [String],
+    persistedFolds: [String: String]
+) -> Bool {
+    pathIds.contains { snFirstOpenShouldMergeFolds(seedId: $0, persistedFolds: persistedFolds) }
+}
+
+/// Delete/leave of the listed live row must also pop group-info / call
+/// / a remounted hist pane. `marmot:` vs bare, plus purge family ids.
+/// Compose `deletedConversationClearsOpen` / `deletedConversationShouldClearScreen`.
+func snDeletedConversationIdInPurge(_ id: String, purgeIds: Set<String>) -> Bool {
+    if purgeIds.contains(id) { return true }
+    let bare = snBareMarmotGroupId(id)
+    if !bare.isEmpty && (purgeIds.contains(bare) || purgeIds.contains("marmot:" + bare)) {
+        return true
+    }
+    return false
+}
+
+/// Wipe / erase / nsec restore must hop Mac split-view off a dead
+/// DM *or* channel. Compose resets `stack` to Home. Single-chat
+/// delete already increments `deletedOpenConversationTick`.
+func snMacSelectionShouldHopAfterOpenSessionCleared(
+    isDM: Bool,
+    isChannel: Bool
+) -> Bool {
+    isDM || isChannel
+}
+
+func snDeletedConversationClearsOpen(
+    openId: String?,
+    deletedId: String,
+    purgeIds: Set<String>
+) -> Bool {
+    guard let openId, !openId.isEmpty else { return false }
+    if snOpenedConversationIdMatches(openId, deletedId) { return true }
+    return snDeletedConversationIdInPurge(openId, purgeIds: purgeIds)
+}
+
+func snDeletedConversationShouldClearRoute(
+    _ route: SonarRoute,
+    deletedId: String,
+    purgeIds: Set<String>
+) -> Bool {
+    let id: String
+    switch route {
+    case .dm(let rid), .groupInfo(let rid), .call(let rid, _):
+        id = rid
+    case .contactProfile(let rid, _):
+        id = rid
+    default:
+        return false
+    }
+    if snOpenedConversationIdMatches(id, deletedId) { return true }
+    return snDeletedConversationIdInPurge(id, purgeIds: purgeIds)
+}
+
+/// Wake mute / gap-recovery banners: FFI `fold_aliases` over a stale
+/// or empty host blob. Compose `wakeMuteHistoricalFolds`.
+func snWakeMuteHistoricalFolds(
+    persisted: [String: String],
+    listedIds: [String],
+    foldAliases: (String) -> [String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    SonarNSEDecoratePolicy.mergeWakeMuteFolds(
+        persisted: persisted,
+        listedIds: listedIds,
+        foldAliases: foldAliases,
+        liveFoldTarget: liveFoldTarget
+    )
+}
+
+/// Copy a mute stored on a hidden 0.8 id onto its live sibling so the
+/// next blob-only wake gate matches without another FFI lookup. Empty
+/// persist-folds still use the remount pair so a hist mute lands on
+/// live before wake-mute writes the blob. Compose
+/// `promotedFoldedMutesFromFolds`.
+func snPromotedFoldedMutesFromFolds(
+    mutes: [String: TimeInterval],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String: TimeInterval] {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if mutes.isEmpty || folds.isEmpty { return mutes }
+    var next = mutes
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        guard let until = mutes[historical] else { continue }
+        let existing = next[live]
+        next[live] = max(existing ?? until, until)
+    }
+    return next
+}
+
+/// Persist-rewrite a mute stored on a hidden 0.8 id onto its live sibling.
+@discardableResult
+func snPromoteMutedFoldSiblings(
+    folds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Bool {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: folds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    var changed = false
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        let historicalKeys = [historical, prefix + historical]
+        guard let until = SonarChatMuteStore.shared.muteEnd(anyOf: historicalKeys) else {
+            continue
+        }
+        let liveKeys = [live, prefix + live]
+        let liveUntil = SonarChatMuteStore.shared.muteEnd(anyOf: liveKeys)
+        if liveUntil == nil || liveUntil! < until {
+            SonarChatMuteStore.shared.mute(keys: liveKeys, until: until)
+            changed = true
+        }
+    }
+    return changed
+}
+
+/// Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`.
+func snHistoricalFoldsFromAliases(
+    listedIds: [String],
+    foldAliases: (String) -> [String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    var next: [String: String] = [:]
+    for id in listedIds {
+        guard let live = liveFoldTarget(id), !live.isEmpty else { continue }
+        for alias in foldAliases(id) where !alias.isEmpty && alias != live {
+            next[alias] = live
+        }
+    }
+    return next
+}
+
+/// After nsec restore the previous account's host fold blob must not
+/// survive, but the restored core sidecar still knows hist→live.
+/// Rebuild from listed live ids; never merge `previousAccountFolds`.
+func snHistoricalFoldsAfterAccountRestore(
+    previousAccountFolds: [String: String],
+    listedIds: [String],
+    foldAliases: (String) -> [String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    _ = previousAccountFolds
+    return snHistoricalFoldsFromAliases(
+        listedIds: listedIds,
+        foldAliases: foldAliases,
+        liveFoldTarget: liveFoldTarget
+    )
+}
+
+/// Load-older / older-edge pins must survive a fold after Leave.
+func snFoldedSiblingHasMore(historicalHasMore: Bool, liveHasMore: Bool) -> Bool {
+    historicalHasMore || liveHasMore
+}
+
+/// True when a family-unioned host cache is larger than the painted page.
+/// First paint `suffix(page)` would otherwise drop recovered 0.8 rows while
+/// every stored hasOlder flag stays false (Compose `hasRowsOlder` twin).
+func snFoldFamilyCacheHasOlderThanPage(
+    cachedCount: Int,
+    pageSize: Int = 30
+) -> Bool {
+    pageSize > 0 && cachedCount > pageSize
+}
+
+/// Seeded window / load-older gate after a fold: leftover host rows or a
+/// stored family flag both mean the live transcript still has older history.
+func snSeededFoldFamilyTranscriptHasMore(
+    cachedCount: Int,
+    pageSize: Int = 30,
+    familyHasOlder: Bool = false
+) -> Bool {
+    familyHasOlder || snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize)
+}
+
+/// Blank-transcript recovery must treat a leftover hist summary /
+/// remounted latest as proof the conversation is non-empty. `copy_summary`
+/// leaves live `message_count` at 0 on conflict; a live-only 0.9 count
+/// then skips recovery while bak remainder sat on hist.
+/// Compose `blankTranscriptKnownNonEmpty` already uses latest-or-count.
+func snBlankTranscriptKnownNonEmpty(
+    groupId: String,
+    messageCountByGroup: [String: UInt64],
+    latestAtByGroup: [String: TimeInterval] = [:],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).contains {
+        (messageCountByGroup[$0] ?? 0) > 0 || (latestAtByGroup[$0] ?? 0) > 0
+    }
+}
+
+/// Family cache already has rows — do not start blank recovery, and
+/// treat a live-only empty `messagesByGroup[live]` as painted.
+/// Empty persist-folds still union the remount pair.
+func snBlankTranscriptFamilyRendered<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).contains { !(messagesByGroup[$0] ?? []).isEmpty }
+}
+
+/// First-open must not wait on relay when any fold-family cache already
+/// has rows. A live-only empty 0.9 row after resume used to keep the
+/// hydrating spinner up while recovered 0.8 history sat on hist.
+/// Empty persist-folds still union the remount pair.
+/// Compose `familyTranscriptNeedsNetworkBackfill`.
+func snFamilyTranscriptNeedsNetworkBackfill<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    !snBlankTranscriptFamilyRendered(
+        groupId: groupId,
+        messagesByGroup: messagesByGroup,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+}
+
+/// Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
+/// Comparing overflow to the 500-row retained cap hid bak remainder after
+/// the first-paint extract (80). Home hydrate only remounts 20 rows, so
+/// cache overflow vs page-size (30) is not enough: a short live FFI page
+/// on a fold family still means extract / bak remain on hist.
+/// Compose `newestPageFamilyHasOlder`.
+func snNewestPageFamilyHasOlder(
+    existingCount: Int,
+    incomingCount: Int,
+    pageSize: Int = 30,
+    rawPageCount: Int,
+    previousHasOlder: Bool,
+    hasFoldFamily: Bool = false
+) -> Bool {
+    snSeededFoldFamilyTranscriptHasMore(
+        cachedCount: existingCount + incomingCount,
+        pageSize: pageSize,
+        familyHasOlder: previousHasOlder
+            || rawPageCount > pageSize
+            || (hasFoldFamily && existingCount > 0 && pageSize > 0 && incomingCount < pageSize)
+    )
+}
+
+/// A short/empty load-older page must not disarm a previously armed
+/// family flag. The first cursor read can land before bak remainder is
+/// copied; only a short page that admitted new rows proves this source
+/// is exhausted. Compose `loadOlderPageHasOlder`.
+func snLoadOlderPageHasOlder(
+    rawPageCount: Int,
+    pageSize: Int,
+    admittedNewRows: Bool,
+    previousHasOlder: Bool
+) -> Bool {
+    if pageSize > 0 && rawPageCount > pageSize { return true }
+    if admittedNewRows { return false }
+    return previousHasOlder
+}
+
+/// iOS `dmMsgs` formats only `sourceMessageLimit` rows per Marmot source.
+/// After persist-folds the first-paint extract (80) is already in the
+/// family cache, but load-older that re-reads the same page reports
+/// `added=false` and used to leave the rest of that extract — and bak
+/// when bak is empty — unreachable. Raise the source window to the
+/// already-loaded family count (capped at the retained budget).
+/// Compose keeps the full extract in `transcriptWindows`.
+func snCachedFoldFamilySourceLimit(
+    cachedCount: Int,
+    currentLimit: Int,
+    retainedLimit: Int
+) -> Int {
+    guard retainedLimit > 0 else { return max(0, currentLimit) }
+    return min(retainedLimit, max(currentLimit, max(0, cachedCount)))
+}
+
+/// Parent row for a quote chip. Walk the family-unioned cache, not only
+/// the painted page. Compose `quotedParentInFamilyCache`.
+func snQuotedParentInFamilyCache<Message>(
+    parentId: String,
+    familyMessages: [Message],
+    idOf: (Message) -> String
+) -> Message? {
+    let id = parentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty else { return nil }
+    return familyMessages.first { idOf($0).caseInsensitiveCompare(id) == .orderedSame }
+}
+
+/// Visible-row budget that includes `parentId` when it already sits in the
+/// family-unioned host cache. Quote-jump searches the painted suffix; a
+/// parent older than `pageSize` but still in the retained window must
+/// expand the budget instead of soft-failing. Compose `quotedMessageRevealLimit`.
+func snQuotedMessageRevealLimit<Message>(
+    parentId: String,
+    cached: [Message],
+    idOf: (Message) -> String,
+    pageSize: Int = 30,
+    retainedRows: Int = 500
+) -> Int? {
+    let id = parentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty, !cached.isEmpty, pageSize > 0, retainedRows > 0 else { return nil }
+    guard let idx = cached.firstIndex(where: { idOf($0) == id }) else { return nil }
+    return min(retainedRows, max(pageSize, cached.count - idx))
+}
+
+/// Keep a Jump target until the parent is in the painted feed.
+/// Soft-fail must not clear it: 0.8 remainder / family reveal can still
+/// admit the row. Compose `shouldSettleQuotedJump`.
+func snShouldSettleQuotedJump(parentInFeed: Bool) -> Bool {
+    parentInFeed
+}
+
+/// Quote-jump retry identity. At the 500-row cap a bak page trims the
+/// newer edge and keeps `msgs.count` constant. iOS `SNTailRevision`
+/// already keys count + tail; include the oldest id so a size-only
+/// observer still retries. Compose `quotedJumpRetryToken`.
+func snQuotedJumpRetryToken(
+    itemCount: Int,
+    oldestId: String?,
+    newestId: String? = nil
+) -> String {
+    "\(itemCount):\(oldestId ?? ""):\(newestId ?? "")"
+}
+
+/// Soft-fail after a load-older miss must keep the jump. An empty first
+/// bak page is not exhaustion. Compose `shouldClearQuotedJumpAfterMiss`.
+/// `added` is ignored on purpose — do not `if !added { clear }`.
+func snShouldClearQuotedJumpAfterMiss(added: Bool, parentVisible: Bool) -> Bool {
+    _ = added
+    return snShouldSettleQuotedJump(parentInFeed: parentVisible)
+}
+
+/// Quote-jump parent stored on any fold-family key. After remount the
+/// screen may still write `peerId` (hist / mesh) while
+/// `ConversationViewState` is live-keyed — or the reverse `marmot:` /
+/// bare pair. Compose `quotedJumpParentId`.
+func snQuotedJumpParentId(
+    conversationId: String,
+    jumps: [String: String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String? {
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        if let parent = jumps[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !parent.isEmpty {
+            return parent
+        }
+    }
+    return nil
+}
+
+/// Write the Jump parent onto every fold-family key (bare + `marmot:`).
+/// A quote tap that lands after maps were copied but before nav remount
+/// must still expand the live sibling. Empty wake-mute persist still
+/// stamps the remount pair so a hist write is visible on live.
+/// Compose `quotedJumpWritten`.
+func snQuotedJumpWritten(
+    conversationId: String,
+    parentId: String,
+    jumps: [String: String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: String] {
+    let parent = parentId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !parent.isEmpty else { return jumps }
+    var next = jumps
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        next[key] = parent
+    }
+    return next
+}
+
+/// Drop the Jump parent from every fold-family key so Leave cannot
+/// resurrect it on the live sibling. Empty persist still clears the
+/// remount pair. Compose `quotedJumpCleared`.
+func snQuotedJumpCleared(
+    conversationId: String,
+    jumps: [String: String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: String] {
+    var next = jumps
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        next[key] = nil
+    }
+    return next
+}
+
+/// Open-time unread stored on any remount / fold-family key. After remount
+/// iPhone still paints hist while Mac / Compose hop to live — a single-id
+/// write is invisible on the other sibling while persist-folds are empty.
+/// Compose `unreadCountAtOpen`.
+func snUnreadCountAtOpen(
+    conversationId: String,
+    unreadAtOpen: [String: UInt64],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> UInt64? {
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        if let count = unreadAtOpen[key] { return count }
+    }
+    return nil
+}
+
+/// Stamp open-time unread onto every remount / fold-family key so a
+/// capture that lands on hist is visible after Mac hops to live.
+/// `nil` clears the remount pair — Leave / `closedDM` must use that so
+/// a hist leftover cannot resurrect the divider. Compose
+/// `unreadCountAtOpenWritten`.
+func snUnreadCountAtOpenWritten(
+    conversationId: String,
+    count: UInt64?,
+    unreadAtOpen: [String: UInt64],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: UInt64] {
+    var next = unreadAtOpen
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        next[key] = count
+    }
+    return next
+}
+
+/// After remount, publish a hist capture onto the still-open live id
+/// even when persist-folds are empty. Empty stack keeps `capturedFor`.
+/// Compose `openChatUnreadPublishId`.
+func snOpenChatUnreadPublishId(
+    capturedFor: String,
+    openIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    if let family = openIds.first(where: {
+        snConversationsMatchFoldFamily(
+            left: $0,
+            right: capturedFor,
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+    }) {
+        return family
+    }
+    let pair = snRemountPairConversationIds(
+        conversationId: capturedFor,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if let remounted = openIds.first(where: { openId in
+        pair.contains(where: { snOpenedConversationIdMatches($0, openId) })
+    }) {
+        return remounted
+    }
+    return openIds.isEmpty ? capturedFor : nil
+}
+
+/// Ids that have had a trusted FFI newest/cursor page.
+/// Seeded cache keys are not paging keys. Compose `pagedFoldFamilyGroupIds`.
+func snPagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>) -> Set<String> {
+    Set(trustedFfiPageIds.filter { !$0.isEmpty })
+}
+
+/// After hidden siblings have a newest page, older-page each sibling that
+/// still has remainder — with that sibling's own cursor. Persist-folds
+/// live FFI has no hist rows; paging live with a borrowed hist cursor
+/// returns empty and bak stays stuck. Empty persist-folds still union
+/// the remount pair. Compose `loadOlderFamilyPageIds`.
+func snLoadOlderFamilyPageIds(
+    openGroupId: String,
+    historicalFolds: [String: String],
+    hasOlderByGroup: [String: Bool],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    let trimmed = openGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return [] }
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: trimmed,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let ids = family.isEmpty ? [trimmed] : Array(family)
+    return ids.filter { hasOlderByGroup[$0] == true }.sorted()
+}
+
+/// Wait for a fold-family sibling that is already paging, not only the
+/// listed live id. Persist-folds load-older on live while hist is
+/// newest-paging returns false immediately if we only watch `openGroupId`.
+/// Empty persist-folds still union the remount pair.
+/// Compose `loadOlderBusyRetryShouldWait`.
+func snLoadOlderBusyRetryShouldWait(
+    openGroupId: String,
+    loadingGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    let open = openGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !open.isEmpty, !loadingGroupIds.isEmpty else { return false }
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: open,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let ids = family.isEmpty ? [open] : Array(family)
+    return ids.contains { sibling in
+        loadingGroupIds.contains(sibling) ||
+            loadingGroupIds.contains(where: { snOpenedConversationIdMatches(sibling, $0) })
+    }
+}
+
+/// Newest-page these hidden siblings before cursor-paging. Walk listed
+/// live ids only — passing hist would newest-page a remounted live
+/// extract and snap. Empty persist-folds still union the remount pair.
+/// Compose `loadOlderHiddenSiblingsNeedingNewestPage`.
+func snLoadOlderHiddenSiblingsNeedingNewestPage(
+    listedLiveIds: [String],
+    historicalFolds: [String: String],
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    var out = Set<String>()
+    for listed in listedLiveIds where !listed.isEmpty {
+        out.formUnion(snHiddenFoldFamilyIdsNeedingPage(
+            groupId: listed,
+            historicalFolds: historicalFolds,
+            pagedGroupIds: pagedGroupIds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ))
+    }
+    return out.sorted()
+}
+
+/// Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
+/// hist onto live and drops the hist cache key; cursor / hasOlder maps
+/// keep hist once it has been paged, so a missing paging key means
+/// extract 21–80 and bak are still only in the DB. Empty persist-folds
+/// still union the remount pair so an empty 0.9 room is not stuck on
+/// “Say hi”. Never newest-page the remounted live extract (R-045).
+/// Compose `hiddenFoldFamilyNeedsPage`.
+func snHiddenFoldFamilyNeedsPage(
+    groupId: String,
+    historicalFolds: [String: String],
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    !snHiddenFoldFamilyIdsNeedingPage(
+        groupId: groupId,
+        historicalFolds: historicalFolds,
+        pagedGroupIds: pagedGroupIds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).isEmpty
+}
+
+func snHiddenFoldFamilyIdsNeedingPage(
+    groupId: String,
+    historicalFolds: [String: String],
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    snEchoReconcileFamilyIds(
+        echoGroupId: groupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    .filter { sibling in
+        !snOpenedConversationIdMatches(sibling, groupId) &&
+            !pagedGroupIds.contains(sibling) &&
+            !pagedGroupIds.contains(where: { snOpenedConversationIdMatches(sibling, $0) }) &&
+            !snOpenedConversationIdMatches(sibling, openedConversationId)
+    }
+    .sorted()
+}
+
+/// This source has no paging key and no cached rows. Newest-page it
+/// (Compose `refreshTranscriptGroupWindow`). A remounted live id with
+/// leftover extract rows must not take this path — that would snap.
+func snFoldFamilySourceNeedsNewestPage(
+    groupId: String,
+    pagedGroupIds: Set<String>,
+    cachedRowCount: Int
+) -> Bool {
+    return !pagedGroupIds.contains(groupId) && cachedRowCount <= 0
+}
+
+/// True when any fold-family id still has an older local page, or when the
+/// unioned host cache itself overflows the painted page. Promote copies
+/// the hist flag onto live asynchronously; first paint of the live row
+/// must still offer load-older for leftover 0.8 remainder.
+/// `unpagedHiddenSibling` is the persist-folds window: host remounted
+/// onto live before hist had a newest page (R-045 — do not invent a fold).
+func snFoldFamilyHasOlder(
+    groupId: String,
+    hasOlderByGroup: [String: Bool],
+    historicalFolds: [String: String],
+    cachedCount: Int = 0,
+    pageSize: Int = 0,
+    unpagedHiddenSibling: Bool = false,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    if unpagedHiddenSibling { return true }
+    if snFoldFamilyCacheHasOlderThanPage(cachedCount: cachedCount, pageSize: pageSize) {
+        return true
+    }
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: groupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let ids = family.isEmpty ? [groupId] : Array(family)
+    return ids.contains { sibling in
+        hasOlderByGroup[sibling] == true ||
+            hasOlderByGroup.contains(where: { $0.value && snOpenedConversationIdMatches(sibling, $0.key) })
+    }
+}
+
+/// Prefer this id's load-older cursor; fall back to a hidden sibling so
+/// an unpaged live row can still request the family remainder.
+func snFoldFamilyPagingCursor<Cursor>(
+    groupId: String,
+    cursorsByGroup: [String: Cursor],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Cursor? {
+    if let cursor = cursorsByGroup[groupId] { return cursor }
+    for alias in snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) where !snOpenedConversationIdMatches(alias, groupId) {
+        if let cursor = cursorsByGroup[alias] { return cursor }
+    }
+    return nil
+}
+
+/// Promote load-older flags from a hidden 0.8 id onto the listed live sibling.
+func snPromotedFoldedPagingFlags(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    flags: [String: Bool],
+    liveFoldTarget: (String) -> String?
+) -> [String: Bool] {
+    var next = flags
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(flags.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        next[pair.live] = snFoldedSiblingHasMore(
+            historicalHasMore: next[pair.historical] == true,
+            liveHasMore: next[pair.live] == true
+        )
+    }
+    return next
+}
+
+/// Copy a hist-only paging cursor onto the live sibling when live has none.
+func snPromotedFoldedPagingCursors<Cursor>(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    cursors: [String: Cursor],
+    liveFoldTarget: (String) -> String?
+) -> [String: Cursor] {
+    var next = cursors
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(cursors.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        if next[pair.live] == nil, let incoming = next[pair.historical] {
+            next[pair.live] = incoming
+        }
+    }
+    return next
+}
+
+/// Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide.
+func snRetainedScanChatIds(
+    listedIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if folds.isEmpty { return listedIds }
+    var out = listedIds
+    for id in listedIds {
+        out.formUnion(snFoldFamilyIds(id: id, historicalFolds: folds))
+    }
+    return out
+}
+
+/// Historical group ids that disappeared because they folded onto a listed live id.
+func snPromotedFoldedMutePairs(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    muteKeys: Set<String> = [],
+    liveFoldTarget: (String) -> String?
+) -> [(historical: String, live: String)] {
+    let candidates = previousGroupIds.union(muteKeys).subtracting(currentGroupIds)
+    return candidates.compactMap { historical in
+        guard let live = liveFoldTarget(historical), currentGroupIds.contains(live) else {
+            return nil
+        }
+        return (historical, live)
+    }
+}
+
+/// When FFI hides a folded 0.8 row, keep its in-progress draft on the live sibling.
+func snPromotedFoldedComposerDrafts(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    drafts: [String: String],
+    liveFoldTarget: (String) -> String?
+) -> [String: String] {
+    var next = drafts.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let draft = next[pair.historical], !draft.isEmpty else { continue }
+        let existing = next[pair.live] ?? ""
+        if existing.isEmpty {
+            next[pair.live] = draft
+        }
+    }
+    return next
+}
+
+/// Merge in-flight send echoes from a hidden 0.8 id onto the live sibling.
+func snPromotedFoldedPendingMessages<Message>(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    messagesByChat: [String: [Message]],
+    liveFoldTarget: (String) -> String?,
+    idOf: (Message) -> String
+) -> [String: [Message]] {
+    var next = messagesByChat.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let incoming = next[pair.historical], !incoming.isEmpty else { continue }
+        let existing = next[pair.live] ?? []
+        var seen = Set(existing.map(idOf))
+        var merged = existing
+        for message in incoming where seen.insert(idOf(message)).inserted {
+            merged.append(message)
+        }
+        next[pair.live] = merged
+    }
+    return next
+}
+
+/// Merge recovered transcript rows onto the live sibling without dropping either side.
+func snMergedFoldedMessageLists<Message>(
+    historical: [Message],
+    live: [Message],
+    idOf: (Message) -> String
+) -> [Message] {
+    if historical.isEmpty { return live }
+    if live.isEmpty { return historical }
+    var seen = Set(live.map(idOf))
+    var merged = live
+    for message in historical where seen.insert(idOf(message)).inserted {
+        merged.append(message)
+    }
+    return merged
+}
+
+/// Keep a recovered in-memory transcript window on the live sibling.
+func snPromotedFoldedMessagesByGroup<Message>(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    messagesByGroup: [String: [Message]],
+    liveFoldTarget: (String) -> String?,
+    idOf: (Message) -> String
+) -> [String: [Message]] {
+    var next = messagesByGroup.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let rows = next[pair.historical], !rows.isEmpty else { continue }
+        next[pair.live] = snMergedFoldedMessageLists(
+            historical: rows,
+            live: next[pair.live] ?? [],
+            idOf: idOf
+        )
+    }
+    return next
+}
+
+/// Recover a verify flag left on a hidden 0.8 id after resume. Empty
+/// persist-folds still use the remount pair so a hist verify stamps
+/// live before the blob is rewritten. Compose
+/// `recoveredVerifiedIdsFromFolds`.
+func snRecoveredVerifiedIdsFromFolds(
+    folds: [String: String],
+    verifiedIds: Set<String>,
+    historicalBlobVerified: (String) -> Bool,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: folds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    var next = verifiedIds
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        if next.contains(historical) || historicalBlobVerified(historical) {
+            next.insert(historical)
+            next.insert(live)
+        }
+    }
+    return next
+}
+
+/// When FFI hides a folded 0.8 row, keep its safety-number verify on the live sibling.
+func snPromotedFoldedVerifiedIds(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    verifiedIds: Set<String>,
+    liveFoldTarget: (String) -> String?
+) -> Set<String> {
+    var next = verifiedIds
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: verifiedIds,
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs where verifiedIds.contains(pair.historical) {
+        next.insert(pair.live)
+    }
+    return next
+}
+
+/// Live MLS name wins. Blank live falls back to the recovered 0.8 title
+/// so persist-folds collapse cannot turn a named room into "Group chat".
+/// Compose `collapsedFoldDisplayName` / core `display_name`.
+func snCollapsedFoldDisplayName(liveName: String, historicalName: String) -> String {
+    let live = liveName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !live.isEmpty { return live }
+    return historicalName.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Union live MLS members with the recovered 0.8 roster. Persist-folds
+/// can remount before core `fold_family`, so FFI `display_members(live)`
+/// is still live-only. Keep live order, then hist extras. Compose
+/// `collapsedFoldDisplayMembers` / core `display_members`.
+func snCollapsedFoldDisplayMembers(
+    liveMembers: [String],
+    historicalMembers: [String]
+) -> [String] {
+    var seen = Set<String>()
+    var out: [String] = []
+    for member in liveMembers + historicalMembers {
+        let trimmed = member.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        guard seen.insert(trimmed.lowercased()).inserted else { continue }
+        out.append(trimmed)
+    }
+    return out
+}
+
+/// Paint fields a remounted live row should keep from its hidden 0.8
+/// sibling. Do **not** copy `isDirect` — R-045. Compose
+/// `collapsedFoldDisplayChat`.
+func snCollapsedFoldDisplayGroup(
+    live: MarmotService.MarmotGroup,
+    historical: MarmotService.MarmotGroup
+) -> MarmotService.MarmotGroup {
+    MarmotService.MarmotGroup(
+        id: live.id,
+        name: snCollapsedFoldDisplayName(liveName: live.name, historicalName: historical.name),
+        memberNpubs: snCollapsedFoldDisplayMembers(
+            liveMembers: live.memberNpubs,
+            historicalMembers: historical.memberNpubs
+        ),
+        isDirect: live.isDirect
+    )
+}
+
+/// Drop a recovered snapshot row once its live 0.9 sibling is already listed.
+/// Persist-folds hide hist before core `fold_family`, so copy the recovered
+/// name / roster onto live when [mergeHiddenIntoLive] is supplied.
+func snCollapsedFoldedSnapshotGroups<Group>(
+    groups: [Group],
+    id: (Group) -> String,
+    historicalFolds: [String: String],
+    mergeHiddenIntoLive: ((Group, Group) -> Group)? = nil,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [Group] {
+    let historicalFolds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if historicalFolds.isEmpty { return groups }
+    let ids = Set(groups.map(id))
+    var byId: [String: Group] = [:]
+    for group in groups {
+        byId[id(group)] = group
+    }
+    var mergedByLive: [String: Group] = [:]
+    if let mergeHiddenIntoLive {
+        for group in groups {
+            let groupId = id(group)
+            guard let liveId = historicalFolds[groupId],
+                  liveId != groupId,
+                  ids.contains(liveId),
+                  let current = mergedByLive[liveId] ?? byId[liveId] else { continue }
+            mergedByLive[liveId] = mergeHiddenIntoLive(current, group)
+        }
+    }
+    return groups.compactMap { group in
+        let groupId = id(group)
+        if let liveId = historicalFolds[groupId], liveId != groupId, ids.contains(liveId) {
+            return nil
+        }
+        return mergedByLive[groupId] ?? group
+    }
+}
+
+/// Persisted hist→live binding. Usable before FFI `liveFoldTarget` is ready.
+func snPersistedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: [String: String]
+) -> String? {
+    guard let live = historicalFolds[groupId], !live.isEmpty, live != groupId else {
+        return nil
+    }
+    return live
+}
+
+func snResolvedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: [String: String],
+    ffiLiveFoldTarget: String?,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    if let persisted = snPersistedLiveFoldTarget(
+        groupId: groupId,
+        historicalFolds: historicalFolds
+    ) {
+        return persisted
+    }
+    if let live = ffiLiveFoldTarget, !live.isEmpty, live != groupId {
+        return live
+    }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let bare = snBareMarmotGroupId(groupId)
+    guard let live = folds[bare] ?? folds[groupId],
+          !live.isEmpty, live != bare, live != groupId
+    else { return nil }
+    return live
+}
+
+/// Copy a hidden 0.8 snapshot timestamp onto the live sibling (Compose
+/// `snapshotLatestAfterHistoricalFolds`).
+func snSnapshotLatestAfterHistoricalFolds(
+    latestByChat: [String: Int64],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String: Int64] {
+    if latestByChat.isEmpty { return latestByChat }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if folds.isEmpty { return latestByChat }
+    var next = latestByChat
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        guard let incoming = latestByChat[historical], incoming > 0 else { continue }
+        if incoming > (next[live] ?? 0) {
+            next[live] = incoming
+        }
+    }
+    return next
+}
+
+/// Recency a metadata snapshot must persist. Fold remount does not sort, so
+/// `last` can be the oldest recovered 0.8 extract row. Compose
+/// `chatSnapshotLatestTs` / `encodeChatSnapshot`. iOS snapshot is groups-only
+/// today; keep this as the persist contract so a later latest field cannot
+/// reintroduce the process-death hide.
+func snChatSnapshotLatestTs(messageTimestamps: [Int64], persistedLatest: Int64) -> Int64 {
+    max(messageTimestamps.max() ?? 0, persistedLatest)
+}
+
+/// Newest local timestamp across the fold family (hidden 0.8 sibling included).
+func snLocalLatestTsForChat(
+    chatId: String,
+    messagesByChat: [String: [Int64]],
+    latestByChat: [String: Int64],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Int64 {
+    let ids = snTranscriptSourceIds(
+        groupId: chatId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    var latest: Int64 = 0
+    for id in ids {
+        // Fold merge does not sort. `last` can be the oldest remounted 0.8
+        // row; take the max so dedupe cannot hide the recovered transcript.
+        // Compose `localLatestTsForChat`.
+        let messageTs = messagesByChat[id]?.max() ?? 0
+        let ts = max(messageTs, latestByChat[id] ?? 0)
+        if ts > latest { latest = ts }
+    }
+    return latest
+}
+
+/// Newest known timestamp across snapshot + remounted index latest.
+/// Snapshot-only / index-only understates a recovered 0.8 hist `latestAt`
+/// when the first live page is still short — unread retire then jumps to
+/// tail. Compose `expectedNewestTsForChat`.
+func snExpectedNewestTsForChat(
+    chatId: String,
+    messagesByChat: [String: [Int64]],
+    latestByChat: [String: Int64],
+    summaryLatestByChat: [String: Int64],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Int64 {
+    let ids = snTranscriptSourceIds(
+        groupId: chatId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    var snapshot: Int64 = 0
+    for id in ids {
+        let messageTs = messagesByChat[id]?.max() ?? 0
+        let ts = max(messageTs, latestByChat[id] ?? 0)
+        if ts > snapshot { snapshot = ts }
+    }
+    let persistSnapshot = snLocalLatestTsForChat(
+        chatId: chatId,
+        messagesByChat: messagesByChat,
+        latestByChat: latestByChat,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let index = ids.map { summaryLatestByChat[$0] ?? 0 }.max() ?? 0
+    return max(snapshot, persistSnapshot, index)
+}
+
+/// Every recovered sibling that must leave with `id` on delete / leave.
+/// Empty persist-folds still use the remount pair so newest-page /
+/// unread-divider / seed-window treat hist+live as one family before
+/// wake-mute writes the blob. Compose `foldFamilyIds`.
+func snFoldFamilyIds(
+    id: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    guard !id.isEmpty else { return [] }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let live = folds[id]
+        ?? folds.first(where: { $0.value == id })?.value
+        ?? id
+    var family: Set<String> = [id, live]
+    for (historical, target) in folds {
+        if historical == id || target == id || historical == live || target == live {
+            family.insert(historical)
+            family.insert(target)
+        }
+    }
+    family = family.filter { !$0.isEmpty }
+    return family
+}
+
+/// FFI `mark_conversation_read` ids for one open/refresh. Core only
+/// walks `engine.fold_aliases`, which are empty while persist-folds
+/// remounts before the sidecar bind. Host must mark each sibling.
+/// Compose `markGroupsRead(transcriptGroupIds)`.
+func snConversationReadGroupIds(
+    groupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    let ids = snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return ids.isEmpty ? [groupId] : ids
+}
+
+/// Marmot ids whose unread / transcript belong to the open chat after a fold.
+/// Order is stable: open id, then listed 1:1 duplicates, then remount-pair
+/// extras, then sorted family extras. Empty wake-mute persist still unions
+/// the remount pair so `marmotGroupId(hist)` → live does not drop hidden
+/// hist cache / bak unread. Compose `transcriptSourceIds`.
+func snTranscriptSourceIds(
+    groupId: String,
+    listedDirectIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    var seen = Set<String>()
+    var out: [String] = []
+    func append(_ id: String) {
+        guard !id.isEmpty, seen.insert(id).inserted else { return }
+        out.append(id)
+    }
+    append(groupId)
+    for id in listedDirectIds { append(id) }
+    let remount = snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for id in remount {
+        append(snBareMarmotGroupId(id))
+    }
+    var family = snFoldFamilyIds(id: groupId, historicalFolds: historicalFolds)
+    for id in remount {
+        family.formUnion(snFoldFamilyIds(id: snBareMarmotGroupId(id), historicalFolds: historicalFolds))
+    }
+    for id in family.sorted() {
+        append(id)
+    }
+    return out
+}
+
+/// Download/decrypt must try every fold-family id. Hosts stamp media with
+/// the painted live id; persist-folds can land before core `fold_family`,
+/// so a live-only fetch misses hist exporter secrets.
+/// Compose `mediaFetchGroupIds`.
+func snMediaFetchGroupIds(
+    startGroupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    let start = startGroupId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !start.isEmpty else { return [] }
+    var seen = Set<String>()
+    var out: [String] = []
+    for id in [start] + snTranscriptSourceIds(
+        groupId: start,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) where seen.insert(id).inserted {
+        out.append(id)
+    }
+    return out
+}
+
+/// Published blossom URLs from one transcript page. Pending echo blobs
+/// are not published. A new send must exclude these so
+/// `cachePublishedUploadMedia` cannot bind new bytes to a 0.8
+/// attachment that shares filename/mime.
+/// Compose `publishedMediaUrlsFromMessages`.
+/// Newest-page a persist-folds sibling for the send exclude set.
+/// A folded hist id answers `[]` (not a throw); treating that as
+/// authoritative drops cached 0.8 blossom URLs so a new send can bind
+/// over the recovered attachment. Compose `publishedMediaScanRows`.
+func snPublishedMediaScanRows<Message>(
+    loaded: [Message]?,
+    cached: [Message]
+) -> [Message] {
+    (loaded ?? []) + cached
+}
+
+func snPublishedMediaUrlsFromMessages(
+    _ messages: [MarmotService.MarmotMessage],
+    pendingPrefix: String = "pending-media-"
+) -> Set<String> {
+    Set(
+        messages.flatMap { $0.media.map(\.url) }.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && !$0.hasPrefix(pendingPrefix)
+        }
+    )
+}
+
+/// Union published blossom URLs across persist-folds siblings.
+/// `pageForId` must already have paged each sibling — a live-only
+/// extract does not invent hidden 0.8 attachments.
+/// Compose `publishedMediaUrlsFromFamilyPages`.
+func snPublishedMediaUrlsFromFamilyPages(
+    startGroupId: String,
+    historicalFolds: [String: String],
+    pageForId: (String) -> [MarmotService.MarmotMessage],
+    pendingPrefix: String = "pending-media-",
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    let ids = snMediaFetchGroupIds(
+        startGroupId: startGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let walk = ids.isEmpty ? [startGroupId] : ids
+    var urls = Set<String>()
+    for id in walk {
+        urls.formUnion(
+            snPublishedMediaUrlsFromMessages(pageForId(id), pendingPrefix: pendingPrefix)
+        )
+    }
+    return urls
+}
+
+/// Mesh-folded DMs resolve to listed live groups only. After persist-folds
+/// the 0.8 sibling is hidden from `groups()`, so load-older / newest /
+/// preserve must still expand those live ids through the fold family.
+/// Compose `meshFoldTranscriptSourceIds`.
+func snMeshFoldTranscriptSourceIds(
+    listedDirectIds: [String],
+    historicalFolds: [String: String],
+    resolvedGroupId: String? = nil,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    var seeds: [String] = []
+    var seen = Set<String>()
+    func appendSeed(_ id: String) {
+        guard !id.isEmpty, seen.insert(id).inserted else { return }
+        seeds.append(id)
+    }
+    for id in listedDirectIds { appendSeed(id) }
+    if let resolvedGroupId { appendSeed(resolvedGroupId) }
+    var out: [String] = []
+    var outSeen = Set<String>()
+    for id in seeds {
+        for source in snTranscriptSourceIds(
+            groupId: id,
+            listedDirectIds: listedDirectIds,
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ) where outSeen.insert(source).inserted {
+            out.append(source)
+        }
+    }
+    return out
+}
+
+/// Home-row unread across listed 1:1 duplicates plus the hidden 0.8 sibling.
+/// Compose `unreadForFoldFamily` — rooms used to key only the live id.
+func snUnreadForFoldFamily(
+    groupId: String,
+    unreadByGroup: [String: UInt64],
+    historicalFolds: [String: String],
+    listedDuplicateIds: [String] = [],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> UInt64 {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: listedDuplicateIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).reduce(UInt64(0)) { $0 + (unreadByGroup[$1] ?? 0) }
+}
+
+/// Safety-number verify across listed 1:1 duplicates plus the hidden 0.8 sibling.
+func snVerifiedForFoldFamily(
+    groupId: String,
+    verifiedIds: Set<String>,
+    historicalFolds: [String: String],
+    listedDuplicateIds: [String] = [],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: listedDuplicateIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).contains { verifiedIds.contains($0) }
+}
+
+/// Ids whose local transcript window must reload for one `conversationChanged`.
+/// A bak remainder tick names the hidden 0.8 id. Persist-folds can land
+/// before core `fold_family`, so FFI `messages(live)` does not union hist
+/// yet — refresh the listed sibling **and** the changed hidden id. Compose
+/// `conversationRefreshIds`.
+/// First 0.9 send names the live id while persist-folds is still empty.
+/// Merge FFI before `snConversationRefreshIds` or the open hist
+/// transcript never reloads. Compose `conversationRefreshShouldMergeFolds`.
+func snConversationRefreshShouldMergeFolds(
+    changedGroupIds: [String],
+    persistedFolds: [String: String]
+) -> Bool {
+    changedGroupIds.contains { snFirstOpenShouldMergeFolds(seedId: $0, persistedFolds: persistedFolds) }
+}
+
+/// Foreground APNs names the live sibling while the recovered 0.8 chat
+/// is open and persist-folds is still empty. Merge FFI before
+/// `isConversationOpen` or `willPresent` banners the chat the user is in.
+/// Compose `conversationOpenShouldMergeFolds`.
+func snConversationOpenShouldMergeFolds(
+    openId: String,
+    incomingId: String,
+    persistedFolds: [String: String]
+) -> Bool {
+    let open = snBareMarmotGroupId(openId)
+    let incoming = snBareMarmotGroupId(incomingId)
+    if open.isEmpty || incoming.isEmpty || open == incoming { return false }
+    if snConversationsMatchFoldFamily(left: open, right: incoming, historicalFolds: persistedFolds) {
+        return false
+    }
+    return snFirstOpenShouldMergeFolds(seedId: open, persistedFolds: persistedFolds)
+}
+
+/// Shade tap names the live sibling while the recovered 0.8 chat is
+/// open. After FFI merge, Jump — do not `openDM` or the already-painted
+/// transcript remounts (scroll, unread divider, composer).
+/// Compose `notificationOpenShouldJump`.
+func snNotificationOpenShouldJump(
+    openId: String,
+    incomingId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    if snConversationsMatchFoldFamily(
+        left: openId,
+        right: incomingId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) { return true }
+    let pair = snRemountPairConversationIds(
+        conversationId: openId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return pair.contains(where: { snOpenedConversationIdMatches($0, incomingId) })
+}
+
+/// Mac split-view `present:` skips `push`, so `path` has no `.dm`.
+/// `openedDM` still ran — keep that id as the open transcript.
+/// Compose desktop `Screen.Chat` is already the open id.
+func snCurrentOpenConversationId(
+    pathDMId: String?,
+    openedConversationId: String?
+) -> String? {
+    // Remount writes opened to live while iPhone path may stay hist
+    // so NavigationStack does not remake the pane. Opened is the
+    // logical open. Compose `currentOpenConversationId`.
+    if let openedConversationId, !openedConversationId.isEmpty { return openedConversationId }
+    if let pathDMId, !pathDMId.isEmpty { return pathDMId }
+    return nil
+}
+
+/// Fold remount copies the scrolled window onto live, then SwiftUI
+/// recreates the DM screen and `onAppear` calls `openedDM`. Keep
+/// opened=live / pane=hist so remount-pair unions still see both
+/// siblings. Opening a different chat uses that id for both.
+/// Compose `openedDMRemountOpenedPane`.
+func snOpenedDMRemountOpenedPane(
+    openingId: String,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> (opened: String, pane: String) {
+    guard let replacement = routeReplacement,
+          !replacement.pendingId.isEmpty,
+          !replacement.realId.isEmpty
+    else { return (openingId, openingId) }
+    if snOpenedConversationIdMatches(openingId, replacement.pendingId)
+        || snOpenedConversationIdMatches(openingId, replacement.realId) {
+        return (replacement.realId, replacement.pendingId)
+    }
+    return (openingId, openingId)
+}
+
+/// Fold remount copies the scrolled window onto live, then SwiftUI
+/// recreates the DM screen and `onAppear` calls `openedDM`. Skip
+/// newest-page hydrate so a scrolled recovered transcript stays put.
+/// Compose remounts the nav id in place and never re-runs `openChat`.
+func snOpenedDMShouldSkipHydrate(
+    openingId: String,
+    suppressedIds: Set<String>
+) -> Bool {
+    let bare = snBareMarmotGroupId(openingId)
+    if suppressedIds.contains(openingId) { return true }
+    if !bare.isEmpty && suppressedIds.contains(bare) { return true }
+    if !bare.isEmpty && suppressedIds.contains("marmot:" + bare) { return true }
+    return false
+}
+
+/// Remount always stamps the live id hydrated. In-flight `openedDM`
+/// may still hold the hist spinner; further hist newest-page is
+/// cancelled. Compose `remountMarksTranscriptHydrated`.
+func snRemountMarksTranscriptHydrated(
+    historicalId: String,
+    liveId: String,
+    hydratedIds: Set<String>
+) -> Set<String> {
+    var next = hydratedIds
+    func drop(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        next.remove(trimmed)
+        let bare = snBareMarmotGroupId(trimmed)
+        guard !bare.isEmpty else { return }
+        next.remove(bare)
+        next.remove("marmot:" + bare)
+    }
+    func add(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        next.insert(trimmed)
+        let bare = snBareMarmotGroupId(trimmed)
+        guard !bare.isEmpty else { return }
+        next.insert(bare)
+        next.insert("marmot:" + bare)
+    }
+    drop(historicalId)
+    add(liveId)
+    return next
+}
+
+/// Keep ChatScreen / Mac pane identity across remount hist→live.
+/// Changing the SwiftUI `.id` remakes the pane and snaps scroll.
+/// Compose `remountStableTranscriptSessionKey`.
+func snRemountStableTranscriptSessionKey(
+    previousKey: String?,
+    screenId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    let screen = screenId.trimmingCharacters(in: .whitespacesAndNewlines)
+    if screen.isEmpty {
+        return previousKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+    let previous = previousKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if previous.isEmpty { return screen }
+    if snOpenedDMShouldSkipHydrate(openingId: screen, suppressedIds: [previous]) {
+        return previous
+    }
+    let remountPair = snRemountPairConversationIds(
+        conversationId: previous,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if remountPair.count > 1,
+       remountPair.contains(where: { snOpenedConversationIdMatches($0, screen) }) {
+        return previous
+    }
+    let previousBare = snBareMarmotGroupId(previous)
+    let screenBare = snBareMarmotGroupId(screen)
+    if !previousBare.isEmpty && !screenBare.isEmpty {
+        if snFoldFamilyIds(id: previousBare, historicalFolds: historicalFolds).contains(screenBare) {
+            return previous
+        }
+        if snFoldFamilyIds(id: screenBare, historicalFolds: historicalFolds).contains(previousBare) {
+            return previous
+        }
+    }
+    if snFoldFamilyIds(id: previous, historicalFolds: historicalFolds).contains(screen) {
+        return previous
+    }
+    if snFoldFamilyIds(id: screen, historicalFolds: historicalFolds).contains(previous) {
+        return previous
+    }
+    return screen
+}
+
+/// Mac `.id(selection)` remakes the pane on remount hop. Keep hist identity
+/// while selection is already live and the pane is still hist.
+func snMacConversationPaneIdentity(
+    selectionId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?
+) -> String {
+    if let pane = openedConversationPaneId, !pane.isEmpty,
+       !snOpenedConversationIdMatches(selectionId, pane),
+       snOpenedConversationIdMatches(selectionId, openedConversationId) {
+        return pane
+    }
+    return selectionId
+}
+
+/// Path / `.id` hop disappears hist after remount already opened live.
+/// Skip `closedDM(hist)` so the hop does not clear currentDM.
+func snClosedDMShouldSkipFoldRemountHop(
+    closingId: String,
+    pathDMId: String?,
+    openedConversationId: String?,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> Bool {
+    guard let replacement = routeReplacement else { return false }
+    // Only the hist disappear caused by a path hop onto live. A user
+    // leave while the painted route is still hist must still close.
+    return snOpenedConversationIdMatches(closingId, replacement.pendingId)
+        && snOpenedConversationIdMatches(replacement.realId, pathDMId)
+        && snOpenedConversationIdMatches(replacement.realId, openedConversationId)
+}
+
+/// Keep the empty-pane spinner on live when remount cancels hist hydrate.
+func snRemountLocalHydratingIds(
+    historicalKeys: [String],
+    liveKeys: [String],
+    hydrating: Set<String>
+) -> Set<String> {
+    let wasHydrating = historicalKeys.contains {
+        snOpenedDMShouldSkipHydrate(openingId: $0, suppressedIds: hydrating)
+    }
+    var next = hydrating
+    for key in historicalKeys {
+        next.remove(key)
+        let bare = snBareMarmotGroupId(key)
+        if !bare.isEmpty {
+            next.remove(bare)
+            next.remove("marmot:" + bare)
+        }
+    }
+    if wasHydrating {
+        for live in liveKeys where !live.isEmpty {
+            next.insert(live)
+        }
+    }
+    return next
+}
+
+/// Warmup / pane keys whose in-flight `openedDM` newest-page must stop
+/// when remount copies the window onto live. Pinned older-edge
+/// (`snNewestPageShouldMergeFamilyWindow` is false) would otherwise
+/// snap the recovered transcript to the tail. Compose
+/// `remountOpeningHydrateKeys`.
+func snRemountOpeningHydrateKeys(
+    openId: String,
+    groupId: String,
+    liveId: String,
+    liveGroupId: String
+) -> Set<String> {
+    var keys = Set<String>()
+    func insert(_ id: String) {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        keys.insert(trimmed)
+        let bare = snBareMarmotGroupId(trimmed)
+        guard !bare.isEmpty else { return }
+        keys.insert(bare)
+        keys.insert("marmot:" + bare)
+    }
+    insert(openId)
+    insert(groupId)
+    insert(liveId)
+    insert(liveGroupId)
+    return keys
+}
+
+/// Mesh-row delete must also pop a remounted live Marmot pane / group-info.
+/// Compose `deletedMeshConversationPurgeIds`.
+func snDeletedMeshConversationPurgeIds(
+    meshChatIds: [String],
+    foldedGroupIds: [String]
+) -> Set<String> {
+    Set((meshChatIds + foldedGroupIds).filter { !$0.isEmpty })
+}
+
+/// Mac remount rewrites `openedConversationId` to live while the pane
+/// `.id` stays hist. `closedDM(hist)` must still clear the leaked live
+/// id — otherwise notification suppress / mark-read keep treating the
+/// recovered chat as open after the user leaves.
+/// Compose remounts `Screen.Chat.id` in place, so back-nav closes live.
+func snOpenedConversationIdMatches(_ candidate: String, _ stored: String?) -> Bool {
+    guard let stored, !stored.isEmpty else { return false }
+    if candidate == stored { return true }
+    let left = snBareMarmotGroupId(candidate)
+    let right = snBareMarmotGroupId(stored)
+    return !left.isEmpty && left == right
+}
+
+func snClosedDMShouldClearOpened(
+    closingId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?
+) -> Bool {
+    if closingId.isEmpty { return false }
+    if snOpenedConversationIdMatches(closingId, openedConversationId) { return true }
+    return snOpenedConversationIdMatches(closingId, openedConversationPaneId)
+}
+
+/// Remount-pair live / hist while a conversation is actually open.
+/// A leftover `pendingMarmotRouteReplacement` after leave must not keep
+/// treating hist+live as the open pair. Compose `remountPairOpenedPane`.
+func snRemountPairOpenedPane(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> (opened: String?, pane: String?) {
+    let openedStored = openedConversationId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let paneStored = openedConversationPaneId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if openedStored.isEmpty && paneStored.isEmpty {
+        return (nil, nil)
+    }
+    let opened = openedStored.isEmpty ? routeReplacement?.realId : openedConversationId
+    let pane = paneStored.isEmpty ? routeReplacement?.pendingId : openedConversationPaneId
+    return (
+        opened?.isEmpty == true ? nil : opened,
+        pane?.isEmpty == true ? nil : pane
+    )
+}
+
+/// Background FFI hide of a folded 0.8 room must not invent a remount
+/// pair from home, and must not clobber the open remount with another
+/// conversation's hist→live. Upgrade can hide A, B, C in one refresh;
+/// `promoteFoldedLocalTranscriptPaging` used to `rememberRemountPair`
+/// for every promoted pair — last write won — so `directGroup` /
+/// `startChatReturningId` newest-sorted the open DM back onto hist.
+/// Compose remount is the open transcript only (`remountPairForOpenChat`).
+/// Compose `promoteShouldReplaceRemountPair`.
+func snPromoteShouldReplaceRemountPair(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    historical: String,
+    live: String
+) -> Bool {
+    let opened = openedConversationId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !opened.isEmpty else { return false }
+    if snOpenedConversationIdMatches(historical, openedConversationId) { return true }
+    if snOpenedConversationIdMatches(live, openedConversationId) { return true }
+    if snOpenedConversationIdMatches(historical, openedConversationPaneId) { return true }
+    return snOpenedConversationIdMatches(live, openedConversationPaneId)
+}
+
+/// Leave / delete that ends the remounted open must drop the leftover
+/// route replacement. Skip-hop `closedDM(hist)` during Mac selection hop
+/// must keep it. Compose `closedDMShouldClearPendingRouteReplacement`.
+func snClosedDMShouldClearPendingRouteReplacement(
+    closingId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> Bool {
+    guard let replacement = routeReplacement else { return false }
+    guard snClosedDMShouldClearOpened(
+        closingId: closingId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) else { return false }
+    return snOpenedConversationIdMatches(closingId, replacement.pendingId)
+        || snOpenedConversationIdMatches(closingId, replacement.realId)
+}
+
+/// Mac split-view keeps `.dm(hist)` after fold remount copies state onto
+/// live. Hop selection to live so the pane binds the activated transcript
+/// (send / call / group-info) instead of the deactivated hist id.
+/// Compose remounts `Screen.Chat.id` in place.
+func snMacSelectionAfterFoldRemount(
+    selectionId: String,
+    openId: String,
+    realId: String
+) -> String {
+    if realId.isEmpty { return selectionId }
+    if snOpenedConversationIdMatches(selectionId, openId) { return realId }
+    return selectionId
+}
+
+/// Fold remount hops Mac `.dm(hist)` → `.dm(live)` while the pane id
+/// is still hist. `onChange(of: selection)` must not `path.removeAll()`
+/// — group-info / contact-profile stay up for `remountFoldedNavigationPath`.
+/// A real chat switch has already set pane == next. Compose rewrites the
+/// nav stack in place.
+func snMacSelectionChangeShouldClearPath(
+    nextId: String?,
+    openedConversationId: String?,
+    openedConversationPaneId: String?
+) -> Bool {
+    guard let nextId, !nextId.isEmpty else { return true }
+    guard snOpenedConversationIdMatches(nextId, openedConversationId),
+          let pane = openedConversationPaneId, !pane.isEmpty,
+          !snOpenedConversationIdMatches(nextId, pane)
+    else { return true }
+    return false
+}
+
+/// Viewing the recovered 0.8 id must still mark-read a live sibling
+/// change. Empty persist-folds cannot match; merge first.
+/// Compose `viewingConversationShouldMarkRead`.
+func snViewingConversationShouldMarkRead(
+    viewingGroupIds: Set<String>,
+    changedGroupId: String,
+    refreshId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    if changedGroupId.isEmpty && refreshId.isEmpty { return false }
+    if !refreshId.isEmpty && viewingGroupIds.contains(refreshId) { return true }
+    if !changedGroupId.isEmpty && viewingGroupIds.contains(changedGroupId) { return true }
+    let seed = changedGroupId.isEmpty ? refreshId : changedGroupId
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: seed,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return viewingGroupIds.contains(where: { family.contains($0) })
+}
+
+/// Ids whose local transcript window must reload for one `conversationChanged`.
+/// Empty persist-folds still union the remount pair. Compose
+/// `conversationRefreshIds`.
+func snConversationRefreshIds(
+    changedGroupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    guard !changedGroupId.isEmpty else { return [] }
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: changedGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let listedFamily = family.filter { listedGroupIds.contains($0) }
+    var out = listedFamily.isEmpty ? [changedGroupId] : listedFamily.sorted()
+    if !out.contains(changedGroupId) {
+        out.append(changedGroupId)
+    }
+    return out.sorted()
+}
+
+/// Hidden 0.8 remainder ticks are unlisted and may have no host cache key
+/// after remount. Still `loadLocalPage` them — do not treat that as a
+/// brand-new group (`loadLocalSummaries`). Empty persist-folds still
+/// union the remount pair. Compose `conversationRefreshShouldLoadPage`.
+func snConversationRefreshShouldLoadPage(
+    refreshId: String,
+    listedGroupIds: Set<String>,
+    cachedGroupIds: Set<String>,
+    changedGroupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    if listedGroupIds.contains(refreshId) || cachedGroupIds.contains(refreshId) {
+        return true
+    }
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: changedGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    guard family.contains(refreshId) else { return false }
+    // Only the hidden sibling of a listed live — not a brand-new group.
+    return family.contains { listedGroupIds.contains($0) && $0 != refreshId }
+}
+
+/// Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id.
+/// Empty persist-folds still remap via the remount pair.
+func snConversationChangeTargetId(
+    changedGroupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    guard !changedGroupId.isEmpty else { return changedGroupId }
+    if listedGroupIds.contains(changedGroupId) { return changedGroupId }
+    let remount = snRemountPairConversationIds(
+        conversationId: changedGroupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if let live = remount
+        .map({ snBareMarmotGroupId($0) })
+        .first(where: { !$0.isEmpty && $0 != changedGroupId && listedGroupIds.contains($0) }) {
+        return live
+    }
+    let listedFamily = snFoldFamilyIds(id: changedGroupId, historicalFolds: historicalFolds)
+        .filter { listedGroupIds.contains($0) }
+    return listedFamily.sorted().first ?? changedGroupId
+}
+
+/// Sitting in a mesh-folded DM while a bak remainder tick names the
+/// hidden 0.8 sibling. Persist-folds prune the hist→peer map, so a
+/// changed-id-only lookup misses. Walk the fold family and resolve
+/// the peer from the listed live sibling. Compose
+/// `conversationChangeShouldRefreshOpenMesh`. Production iOS remainder
+/// refresh pages the family via `snConversationRefreshIds` instead of
+/// this peer lookup.
+func snConversationChangeShouldRefreshOpenMesh(
+    openMeshChatId: String,
+    changedGroupId: String,
+    historicalFolds: [String: String],
+    peerIdForGroup: (String) -> String?,
+    meshChatId: (String) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    guard !openMeshChatId.isEmpty, !changedGroupId.isEmpty else { return false }
+    if let peerId = peerIdForGroup(changedGroupId), openMeshChatId == meshChatId(peerId) {
+        return true
+    }
+    for id in snEchoReconcileFamilyIds(
+        echoGroupId: changedGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) where !snOpenedConversationIdMatches(id, changedGroupId) {
+        if let peerId = peerIdForGroup(id), openMeshChatId == meshChatId(peerId) {
+            return true
+        }
+        let bare = snBareMarmotGroupId(id)
+        if !bare.isEmpty, bare != id, let peerId = peerIdForGroup(bare),
+           openMeshChatId == meshChatId(peerId) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Group ids that may still hold in-flight upload bytes after a hist→live remount.
+/// Remount MOVES cache-key prefixes onto live before wake-mute persist
+/// writes `fold_aliases`. Empty persist-folds still union the remount pair
+/// so hist-keyed mark/forget/cache find the moved bytes.
+func snPendingUploadLookupGroupIds(
+    groupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    var family = snFoldFamilyIds(id: snBareMarmotGroupId(groupId), historicalFolds: historicalFolds)
+    if family.isEmpty {
+        if !groupId.isEmpty { family.insert(groupId) }
+    }
+    for id in snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id)
+        if !bare.isEmpty { family.insert(bare) }
+        family.formUnion(snFoldFamilyIds(id: bare, historicalFolds: historicalFolds))
+    }
+    return family.filter { !$0.isEmpty }.sorted()
+}
+
+/// Store in-flight upload bytes on the live sibling. Prefer persist-fold
+/// live, then the remount-pair live, so a new album from the painted hist
+/// pane joins the bucket remount already moved. Compose `pendingMediaUploadStoreId`.
+func snPendingUploadStoreGroupId(
+    groupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    let bare = snBareMarmotGroupId(groupId)
+    if let live = historicalFolds[bare] ?? historicalFolds[groupId],
+       !live.isEmpty, live != bare, live != groupId {
+        return snBareMarmotGroupId(live)
+    }
+    let pair = snRemountPairConversationIds(
+        conversationId: groupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if pair.count > 1, let opened = openedConversationId, !opened.isEmpty {
+        return snBareMarmotGroupId(opened)
+    }
+    return historicalFolds.first(where: { $0.value == bare || $0.value == groupId })?.value
+        ?? (bare.isEmpty ? groupId : bare)
+}
+
+/// Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold.
+/// Mesh-folded White Noise notify: suppress the live group, the mesh row,
+/// and the hidden 0.8 sibling so sitting in recovered history does not ring.
+func snMeshNotificationSuppressIds(
+    groupId: String,
+    meshId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    var out: [String] = []
+    var seen = Set<String>()
+    for listed in [groupId, meshId] where !listed.isEmpty {
+        for id in snRemountPairConversationIds(
+            conversationId: listed,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ) where !id.isEmpty {
+            if seen.insert(id).inserted { out.append(id) }
+            for alias in snFoldFamilyIds(id: id, historicalFolds: historicalFolds) {
+                if seen.insert(alias).inserted { out.append(alias) }
+            }
+        }
+    }
+    return out
+}
+
+/// Shade-clear keys for one conversation after a fold. Opening the live
+/// row must dismiss a banner still keyed on the hidden 0.8 id (Compose
+/// `notificationClearIds`).
+func snNotificationClearIds(
+    conversationId: String,
+    relatedIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Set<String> {
+    var out = Set<String>()
+    func insert(_ id: String) {
+        guard !id.isEmpty else { return }
+        out.insert(id)
+        let bare = snBareMarmotGroupId(id, prefix: prefix)
+        guard !bare.isEmpty else { return }
+        out.insert(bare)
+        out.insert(prefix + bare)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+            out.insert(alias)
+            out.insert(prefix + alias)
+        }
+    }
+    for id in snRemountPairConversationIds(
+        conversationId: conversationId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        insert(id)
+    }
+    for id in relatedIds { insert(id) }
+    return out
+}
+
+/// Listed live id that should receive a hidden 0.8 conversation-index row.
+/// Compose `hydrationTargetId` — after collapse, hist-keyed summaries were
+/// dropped because they are not in `groups()`, so the live home row stayed
+/// on "Tap to open" even when recovered last-message text was still in the
+/// conversation index (window before `copy_summary`, or persist-folds
+/// collapse before core fold).
+func snHydrationTargetGroupId(
+    sourceId: String,
+    activeGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    if activeGroupIds.contains(sourceId) { return sourceId }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let bare = snBareMarmotGroupId(sourceId)
+    guard let live = folds[bare] ?? folds[sourceId],
+          !live.isEmpty, live != bare, live != sourceId
+    else { return nil }
+    return activeGroupIds.contains(live) ? live : nil
+}
+
+/// True when [rows] already hold real event ids. Compose
+/// `hydrationHasRealTranscriptRows` — iOS never writes `summary:` rows into
+/// `messagesByGroup` (home paint uses `snMarmotHomeRowMessage` only), so a
+/// persist-folds remount must not be treated as empty just because a
+/// conversation-index stand-in is newer.
+func snHydrationHasRealTranscriptRows<Message>(
+    rows: [Message],
+    idOf: (Message) -> String
+) -> Bool {
+    rows.contains { !idOf($0).hasPrefix("summary:") }
+}
+
+/// Merge a bounded home page into remounted / leftover rows. Compose
+/// `hydrateMergedPageRows`. iOS `loadLocalSummaries` must keep the remounted
+/// 0.8 extract when a newer live page arrives.
+func snHydrateMergedPageRows(
+    existing: [MarmotService.MarmotMessage],
+    incoming: [MarmotService.MarmotMessage]
+) -> [MarmotService.MarmotMessage] {
+    let real = existing.filter { !$0.id.hasPrefix("summary:") }
+    var byID: [String: MarmotService.MarmotMessage] = [:]
+    for message in real { byID[message.id] = message }
+    for message in incoming { byID[message.id] = message }
+    return byID.values.sorted {
+        if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+        return $0.createdAt < $1.createdAt
+    }
+}
+
+/// Remount leftover hist conversation-index rows onto the listed live sibling.
+/// Keep the newer `latestAt` when both sides still have a snapshot.
+func snRemountedConversationSummaries(
+    summaries: [MarmotService.ConversationSummary],
+    activeGroupIds: Set<String>,
+    historicalFolds: [String: String],
+    previous: [String: MarmotService.ConversationSummary] = [:],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String: MarmotService.ConversationSummary] {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    var out: [String: MarmotService.ConversationSummary] = [:]
+    for summary in summaries {
+        guard let target = snHydrationTargetGroupId(
+            sourceId: summary.groupIdHex,
+            activeGroupIds: activeGroupIds,
+            historicalFolds: folds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ) else { continue }
+        let remounted = summary.groupIdHex == target
+            ? summary
+            : MarmotService.ConversationSummary(
+                groupIdHex: target,
+                name: summary.name,
+                latestContent: summary.latestContent,
+                latestSenderNpub: summary.latestSenderNpub,
+                latestAt: summary.latestAt,
+                latestMine: summary.latestMine,
+                messageCount: summary.messageCount,
+                unreadCount: summary.unreadCount
+            )
+        if let existing = out[target], existing.latestAt > remounted.latestAt {
+            continue
+        }
+        out[target] = remounted
+    }
+    // `conversation_summaries()` hides folded hist. A later live-only
+    // probe (latestAt/count 0 after restore-without-copy_summary) must
+    // not drop the previous hist newest. Empty success still clears.
+    // Compose `remountFoldedSummaryIndex`.
+    guard !out.isEmpty else { return out }
+    for (historical, live) in folds {
+        guard !live.isEmpty, live != historical else { continue }
+        guard let hist = out[historical] ?? previous[historical] else { continue }
+        let histSecs = hist.latestAt.timeIntervalSince1970
+        guard histSecs > 0 || hist.messageCount > 0 else { continue }
+        if out[historical] == nil { out[historical] = hist }
+        if let liveSummary = out[live] {
+            let liveSecs = liveSummary.latestAt.timeIntervalSince1970
+            let paintedName = snCollapsedFoldDisplayName(
+                liveName: liveSummary.name,
+                historicalName: hist.name
+            )
+            if histSecs > liveSecs ||
+                (liveSecs <= 0 && hist.messageCount > liveSummary.messageCount)
+            {
+                out[live] = MarmotService.ConversationSummary(
+                    groupIdHex: live,
+                    name: paintedName,
+                    latestContent: hist.latestContent,
+                    latestSenderNpub: hist.latestSenderNpub,
+                    latestAt: hist.latestAt,
+                    latestMine: hist.latestMine,
+                    messageCount: max(liveSummary.messageCount, hist.messageCount),
+                    unreadCount: liveSummary.unreadCount
+                )
+            } else if paintedName != liveSummary.name {
+                out[live] = MarmotService.ConversationSummary(
+                    groupIdHex: live,
+                    name: paintedName,
+                    latestContent: liveSummary.latestContent,
+                    latestSenderNpub: liveSummary.latestSenderNpub,
+                    latestAt: liveSummary.latestAt,
+                    latestMine: liveSummary.latestMine,
+                    messageCount: liveSummary.messageCount,
+                    unreadCount: liveSummary.unreadCount
+                )
+            }
+        } else {
+            out[live] = MarmotService.ConversationSummary(
+                groupIdHex: live,
+                name: hist.name,
+                latestContent: hist.latestContent,
+                latestSenderNpub: hist.latestSenderNpub,
+                latestAt: hist.latestAt,
+                latestMine: hist.latestMine,
+                messageCount: hist.messageCount,
+                unreadCount: 0
+            )
+        }
+    }
+    return out
+}
+
+/// Union leftover hist pages onto the listed live id so first paint / open
+/// does not read an empty `messagesByGroup[live]` while recovered rows still
+/// sit on the hidden 0.8 key (Compose `hydrateLocalConversationRows` pages).
+func snFoldFamilyCachedMessages<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [Message] {
+    var out = messagesByGroup[groupId] ?? []
+    let aliases = snTranscriptSourceIds(
+        groupId: groupId,
+        listedDirectIds: [],
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for alias in aliases {
+        guard alias != groupId, let incoming = messagesByGroup[alias], !incoming.isEmpty else {
+            continue
+        }
+        out = snMergedFoldedMessageLists(historical: incoming, live: out, idOf: idOf)
+    }
+    return out
+}
+
+/// Hist echo + live canonical after remount, including empty persist-folds.
+/// Compose `echoReconcileFamilyIds`.
+func snEchoReconcileFamilyIds(
+    echoGroupId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    var out = Set<String>()
+    if !echoGroupId.isEmpty { out.insert(echoGroupId) }
+    out.formUnion(snFoldFamilyIds(id: echoGroupId, historicalFolds: historicalFolds))
+    for id in snRemountPairConversationIds(
+        conversationId: echoGroupId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id)
+        if !bare.isEmpty {
+            out.insert(bare)
+            out.formUnion(snFoldFamilyIds(id: bare, historicalFolds: historicalFolds))
+        }
+    }
+    return out
+}
+
+/// Fresh canonical rows that can fulfill an in-flight send echo.
+/// First-resume send echoes on the recovered 0.8 id; the relay copy
+/// lands on the live 0.9 sibling. Walk the fold family or the remount
+/// pair, or the echo stays "Sending" forever beside the real row.
+/// Compose `optimisticFreshCanonicalRows`.
+func snOptimisticFreshCanonicalRows<Message>(
+    echoGroupId: String,
+    freshRowsByGroup: [String: [Message]],
+    cachedRowsByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    isLocalEcho: (Message) -> Bool,
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [Message] {
+    let ids = snEchoReconcileFamilyIds(
+        echoGroupId: echoGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).sorted()
+    var seen = Set<String>()
+    var out: [Message] = []
+    func addAll(_ rows: [Message]) {
+        for row in rows {
+            guard !isLocalEcho(row) else { continue }
+            guard seen.insert(idOf(row)).inserted else { continue }
+            out.append(row)
+        }
+    }
+    for id in ids {
+        addAll(freshRowsByGroup[id] ?? [])
+        addAll(cachedRowsByGroup[id] ?? [])
+    }
+    return out
+}
+
+/// After a hist echo is fulfilled by a live sibling, drop that echo from
+/// every family transcript so `dmMsgs` does not show Sending + Sent.
+/// Empty persist-folds still strip the remounted hist pane.
+/// Compose `transcriptsAfterOptimisticReconcile`.
+func snTranscriptsAfterOptimisticReconcile<Message>(
+    echoGroupId: String,
+    messagesByGroup: [String: [Message]],
+    pendingIds: [String],
+    survivorIds: [String],
+    visible: [Message],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String: [Message]] {
+    let survivors = Set(survivorIds)
+    let fulfilled = Set(pendingIds.filter { !survivors.contains($0) })
+    var next = messagesByGroup
+    next[echoGroupId] = visible
+    guard !fulfilled.isEmpty else { return next }
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: echoGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for sibling in family where sibling != echoGroupId {
+        guard let rows = next[sibling] else { continue }
+        let stripped = rows.filter { !fulfilled.contains(idOf($0)) }
+        if stripped.isEmpty {
+            next.removeValue(forKey: sibling)
+        } else {
+            next[sibling] = stripped
+        }
+    }
+    return next
+}
+
+/// Move in-flight echoes off a hidden 0.8 id onto the live sibling.
+/// Compose `remountedOptimisticPending`.
+func snRemountedOptimisticPending<Message>(
+    pendingByGroup: [String: [Message]],
+    historicalGroupId: String,
+    liveGroupId: String,
+    idOf: (Message) -> String
+) -> [String: [Message]] {
+    guard !historicalGroupId.isEmpty,
+          !liveGroupId.isEmpty,
+          historicalGroupId != liveGroupId,
+          let historical = pendingByGroup[historicalGroupId],
+          !historical.isEmpty
+    else { return pendingByGroup }
+    var next = pendingByGroup
+    next.removeValue(forKey: historicalGroupId)
+    let existing = next[liveGroupId] ?? []
+    var seen = Set(existing.map(idOf))
+    var merged = existing
+    for echo in historical where seen.insert(idOf(echo)).inserted {
+        merged.append(echo)
+    }
+    if merged.isEmpty {
+        next.removeValue(forKey: liveGroupId)
+    } else {
+        next[liveGroupId] = merged
+    }
+    return next
+}
+
+/// Keys that may hold an in-flight echo after persist-folds remounts hist→live.
+/// Discard/fail must walk these or a remounted Sending bubble stays forever.
+/// Compose `optimisticPendingLookupIds`.
+func snOptimisticPendingLookupIds(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: [String: [String]],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    var out = snEchoReconcileFamilyIds(
+        echoGroupId: sendGroupId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if !echoId.isEmpty {
+        for (key, ids) in pendingByGroup where ids.contains(echoId) {
+            out.insert(key)
+        }
+    }
+    return out.filter { !$0.isEmpty }
+}
+
+/// Where to write the failed echo after remount. Prefer the live sibling
+/// (persist-folds or the key that already holds the echo).
+/// Compose `optimisticPendingStoreId`.
+func snOptimisticPendingStoreId(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: [String: [String]],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String {
+    if let live = historicalFolds[sendGroupId], !live.isEmpty, live != sendGroupId {
+        return live
+    }
+    if !echoId.isEmpty {
+        for (key, ids) in pendingByGroup where key != sendGroupId && ids.contains(echoId) {
+            return key
+        }
+    }
+    let openedBare = snBareMarmotGroupId(openedConversationId ?? "")
+    if !openedBare.isEmpty,
+       !snOpenedConversationIdMatches(openedBare, sendGroupId),
+       snRemountPairConversationIds(
+            conversationId: sendGroupId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+       ).contains(where: { snOpenedConversationIdMatches($0, openedConversationId) }) {
+        return openedBare
+    }
+    return snFoldFamilyIds(id: sendGroupId, historicalFolds: historicalFolds)
+        .first(where: { $0 != sendGroupId })
+        ?? sendGroupId
+}
+
+/// Family-union event ids. `loadOlderDM` must compare this, not
+/// `messagesByGroup[live]` only — persist-folds older-pages hist.
+func snFoldFamilyCanonicalMessageIDs<Message>(
+    groupId: String,
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Set<String> {
+    Set(
+        snFoldFamilyCachedMessages(
+            groupId: groupId,
+            messagesByGroup: messagesByGroup,
+            historicalFolds: historicalFolds,
+            idOf: idOf,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ).map(idOf)
+    )
+}
+
+func snRetainedTranscriptForChat<Message>(
+    chatId: String,
+    retainedByChat: [String: [Message]],
+    historicalFolds: [String: String],
+    prefix: String = "marmot:",
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [Message] {
+    if let rows = retainedByChat[chatId], !rows.isEmpty { return rows }
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: bare,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for alias in family {
+        for key in [alias, prefix + alias] where !snOpenedConversationIdMatches(key, chatId) {
+            if let rows = retainedByChat[key], !rows.isEmpty { return rows }
+        }
+    }
+    return []
+}
+
+/// Union leave-paint across the fold family. A short live 0.9 leave-frame
+/// must not hide recovered 0.8 rows still keyed on the hidden sibling.
+/// `snRetainedTranscriptForChat` is first-hit; first-open paint keeps every
+/// family window. Compose `firstOpenFamilyRetainedRows`.
+func snFirstOpenFamilyRetainedRows<Message>(
+    chatId: String,
+    retainedByChat: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String,
+    prefix: String = "marmot:",
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [Message] {
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    var ids: [String] = [chatId]
+    var seen: Set<String> = [chatId]
+    let family = snEchoReconcileFamilyIds(
+        echoGroupId: bare,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    for alias in family {
+        for key in [alias, prefix + alias] where seen.insert(key).inserted {
+            ids.append(key)
+        }
+    }
+    var merged: [Message] = []
+    for id in ids {
+        guard let rows = retainedByChat[id], !rows.isEmpty else { continue }
+        merged = merged.isEmpty
+            ? rows
+            : snMergedFoldedMessageLists(historical: merged, live: rows, idOf: idOf)
+    }
+    return merged
+}
+
+/// Prefer last leave paint, then union remounted family snapshot rows so a
+/// short live leave-frame cannot hide recovered 0.8 history.
+/// Compose `firstOpenTranscriptPaintRows`.
+func snFirstOpenTranscriptPaintRows<Message>(
+    chatId: String,
+    retainedByChat: [String: [Message]],
+    snapshotPaint: [Message],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [Message] {
+    let retained = snFirstOpenFamilyRetainedRows(
+        chatId: chatId,
+        retainedByChat: retainedByChat,
+        historicalFolds: historicalFolds,
+        idOf: idOf,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if retained.isEmpty { return snapshotPaint }
+    if snapshotPaint.isEmpty { return retained }
+    return snMergedFoldedMessageLists(historical: snapshotPaint, live: retained, idOf: idOf)
+}
+
+/// First open may paint immediately from a remounted 0.8 host cache, not
+/// only a leave-frame. Waiting on `loadLocalWhenConnected` hid recovered
+/// history until the live page returned. Compose `firstOpenHasLocalTranscriptPaint`.
+func snFirstOpenHasLocalTranscriptPaint<Message>(
+    retained: [Message],
+    familyCached: [Message]
+) -> Bool {
+    !retained.isEmpty || !familyCached.isEmpty
+}
+
+/// Empty persist-folds hide a recovered 0.8 sibling from retained paint
+/// and `localTranscriptGroups`. Merge FFI `fold_aliases` before first
+/// paint and before hydrate paging. Do not cache a family-of-one
+/// result: an unresumed 0.8 chat looks unfolded until the first 0.9
+/// send. Compose always merges in `captureOpenChatUnread` before
+/// `firstOpenTranscriptPaintRows`.
+func snFirstOpenShouldMergeFolds(
+    seedId: String,
+    persistedFolds: [String: String]
+) -> Bool {
+    let bare = snBareMarmotGroupId(seedId)
+    guard !bare.isEmpty else { return false }
+    return snFoldFamilyIds(id: bare, historicalFolds: persistedFolds).count <= 1
+}
+
+/// A process-local "already merged, no family" cache must not skip the
+/// next FFI hop. Recovered 0.8 chats look unfolded until the first 0.9
+/// send; persist-folds with a family is the only reuse. Compose
+/// `firstOpenShouldReuseCachedFoldMerge`.
+func snFirstOpenShouldReuseCachedFoldMerge(
+    seedId: String,
+    persistedFolds: [String: String],
+    cachedSeeds: Set<String>
+) -> Bool {
+    let bare = snBareMarmotGroupId(seedId)
+    guard !bare.isEmpty, cachedSeeds.contains(bare) else { return false }
+    return !snFirstOpenShouldMergeFolds(seedId: seedId, persistedFolds: persistedFolds)
+}
+
+/// Listed live pages plus leftover hist cache. After collapse
+/// `messagesByGroup[live]` can be empty while recovered 0.8 rows still
+/// sit on the hidden sibling.
+func snDMHasLocalMarmotPaint<Message>(
+    groupId: String,
+    listedGroupIds: [String],
+    messagesByGroup: [String: [Message]],
+    historicalFolds: [String: String],
+    idOf: (Message) -> String,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> Bool {
+    let ids = listedGroupIds.isEmpty ? [groupId] : listedGroupIds
+    if ids.contains(where: { !(messagesByGroup[$0] ?? []).isEmpty }) { return true }
+    return !snFoldFamilyCachedMessages(
+        groupId: groupId,
+        messagesByGroup: messagesByGroup,
+        historicalFolds: historicalFolds,
+        idOf: idOf,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ).isEmpty
+}
+
+/// Newest-page hydrate must keep remounted fold-family rows.
+/// After persist-folds, recovered 0.8 rows sit on live (sibling cache
+/// empty). `loadLocalWhenConnected` then loads `.newestPage`, and the
+/// live-only replace path hid history first-open had just painted.
+/// Compose `newestPageShouldMergeFamilyWindow` / `refreshTranscriptRows`.
+func snNewestPageShouldMergeFamilyWindow(
+    existingCanonicalCount: Int,
+    hiddenSiblingHasRows: Bool,
+    hasFoldFamily: Bool,
+    pinnedToOlderEdge: Bool
+) -> Bool {
+    guard existingCanonicalCount > 0, !pinnedToOlderEdge else { return false }
+    return hiddenSiblingHasRows || hasFoldFamily
+}
+
+/// Remount copies a pinned hist window onto live. An in-flight or
+/// follow-up `.newestPage` on that just-pinned live must merge in place
+/// — not replace+unpin. Explicit scroll-to-bottom
+/// (`loadNewestLocalPageWhenAvailable`) still unpins.
+/// Do not treat every newestPage+pinned as preserve: reopen-at-tail
+/// would stay stuck on the historical cursor.
+/// Compose `newestPageShouldPreserveRemountedPin`.
+func snNewestPageShouldPreserveRemountedPin(
+    isNewestPage: Bool,
+    pinnedToOlderEdge: Bool,
+    remountCopiedPinOntoTarget: Bool,
+    explicitNewestReload: Bool
+) -> Bool {
+    isNewestPage && pinnedToOlderEdge && remountCopiedPinOntoTarget && !explicitNewestReload
+}
+
+/// Empty newest page is not proof the conversation is empty.
+/// Before persist-folds, a recovered 0.8 id answers `[]` from the 0.9
+/// engine; replacing first-open extract wipes history. Compose
+/// `transcriptReadIsUntrusted`.
+func snTranscriptReadIsUntrusted<Message>(
+    fetched: [Message]?,
+    coreStarted: Bool,
+    knownLatestSecs: UInt64
+) -> Bool {
+    guard let fetched else { return true }
+    if !fetched.isEmpty { return false }
+    return !coreStarted || knownLatestSecs > 0
+}
+
+/// Read a draft from the open id or its hidden 0.8 sibling after a fold.
+func snComposerDraft(
+    chatId: String,
+    drafts: [String: String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    if let draft = drafts[chatId], !draft.isEmpty { return draft }
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) where key != chatId {
+        if let draft = drafts[key], !draft.isEmpty { return draft }
+    }
+    return ""
+}
+
+/// Write the draft onto `chatId` and drop leftover family keys so a clear
+/// cannot resurrect hist text. Empty wake-mute persist still clears the
+/// remount-pair live copy remount already stamped.
+func snComposerDraftsAfterEdit(
+    drafts: [String: String],
+    chatId: String,
+    text: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: String] {
+    var next = drafts
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) where key != chatId {
+        next[key] = nil
+    }
+    return snUpdatedComposerDrafts(drafts: next, chatId: chatId, text: text)
+}
+
+/// Read a reply chip from the open id or its remount / fold sibling.
+/// Compose `composerReplyForChat`.
+func snComposerReply<Reply>(
+    chatId: String,
+    replies: [String: Reply],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Reply? {
+    if let reply = replies[chatId] { return reply }
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) where key != chatId {
+        if let reply = replies[key] { return reply }
+    }
+    return nil
+}
+
+/// Stamp a new reply chip onto every remount / fold-family key. After
+/// remount iPhone still paints hist; a hist-only write would vanish when
+/// persist-folds family-clears hist or Mac reads live. Compose
+/// `composerRepliesAfterBegin`.
+func snComposerRepliesAfterBegin<Reply>(
+    replies: [String: Reply],
+    chatId: String,
+    reply: Reply,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: Reply] {
+    var next = replies
+    var keys = snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    )
+    if keys.isEmpty { keys.insert(chatId) }
+    for key in keys {
+        next[key] = reply
+    }
+    return next
+}
+
+/// Drop the reply chip from every remount / fold sibling so send / cancel
+/// cannot leave a live leftover that persist-folds later resurrects.
+/// Compose `composerRepliesAfterClear`.
+func snComposerRepliesAfterClear<Reply>(
+    replies: [String: Reply],
+    chatId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: Reply] {
+    var next = replies
+    next[chatId] = nil
+    for key in snPaymentActivityPeerKeys(
+        conversationId: chatId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        next[key] = nil
+    }
+    return next
+}
+
+/// Rewrite a pending-upload cache key off a hidden 0.8 group id.
+/// Keys are `groupId + US + filename + …`; only the group prefix moves.
+func snRemountedPendingUploadMediaKey(
+    _ key: String,
+    historical: String,
+    live: String
+) -> String {
+    guard historical != live, !historical.isEmpty, !live.isEmpty, !key.isEmpty else {
+        return key
+    }
+    let parts = key.split(separator: "\u{1f}", maxSplits: 1, omittingEmptySubsequences: false)
+    guard String(parts[0]) == historical, parts.count == 2 else { return key }
+    return live + "\u{1f}" + String(parts[1])
+}
+
+/// Painted hist id plus remounted live id. Wake-mute persist only writes
+/// `fold_aliases`, so FFI `liveFoldTarget` remount can move payment / call
+/// rows onto live while persist-folds are still empty. iPhone still paints
+/// `.dm(hist)`. Compose `remountPairConversationIds`.
+func snRemountPairConversationIds(
+    conversationId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?
+) -> [String] {
+    var ids: [String] = []
+    func add(_ raw: String?) {
+        guard let raw, !raw.isEmpty else { return }
+        if ids.contains(where: { snOpenedConversationIdMatches($0, raw) }) { return }
+        ids.append(raw)
+    }
+    add(conversationId)
+    let inPair = snOpenedConversationIdMatches(conversationId, openedConversationId)
+        || snOpenedConversationIdMatches(conversationId, openedConversationPaneId)
+    if inPair {
+        add(openedConversationId)
+        add(openedConversationPaneId)
+    }
+    return ids
+}
+
+/// Persist-folds sidecar, plus the open remount pair as hist→live when
+/// wake-mute has not written that pair yet. Persist already mapping
+/// `hist` wins (R-045). A first-resume blob for another chat must not
+/// hide this remount — empty persist-folds without a remount pair stay
+/// empty. Compose `remountPairHistoricalFolds`.
+func snRemountPairHistoricalFolds(
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String: String] {
+    let live = snBareMarmotGroupId(openedConversationId ?? "")
+    let hist = snBareMarmotGroupId(openedConversationPaneId ?? "")
+    let pair: [String: String]
+    if live.isEmpty || hist.isEmpty || snOpenedConversationIdMatches(live, hist) {
+        pair = [:]
+    } else {
+        pair = [hist: live]
+    }
+    if pair.isEmpty { return historicalFolds }
+    if historicalFolds.isEmpty { return pair }
+    if historicalFolds[hist] != nil { return historicalFolds }
+    var next = historicalFolds
+    next.merge(pair) { existing, _ in existing }
+    return next
+}
+
+/// Persist-wins merge of host folds + FFI `fold_aliases`. Contact-profile
+/// 1:1 resolution from a remounted group has a remount pair that is not
+/// the DM; FFI still knows hist→live for the peer's 1:1s. Persist
+/// hist→stale still wins (R-045). Wake-mute stays FFI-wins.
+/// Compose `persistThenFfiHistoricalFolds`.
+func snPersistThenFfiHistoricalFolds(
+    persisted: [String: String],
+    ffi: [String: String]
+) -> [String: String] {
+    if ffi.isEmpty { return persisted }
+    if persisted.isEmpty { return ffi }
+    var next = persisted
+    for (historical, live) in ffi where next[historical] == nil {
+        next[historical] = live
+    }
+    return next
+}
+
+/// Prefer persist/FFI/remount live among duplicate 1:1 ids.
+/// Compose `preferredFoldedDirectMarmotChatId`.
+func snPreferredFoldedDirectMarmotGroupId(
+    groupIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    ffiHistoricalFolds: [String: String] = [:]
+) -> String? {
+    let ids = groupIds.map { snBareMarmotGroupId($0) }.filter { !$0.isEmpty }
+    guard ids.count > 1 else { return nil }
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: snPersistThenFfiHistoricalFolds(
+            persisted: historicalFolds,
+            ffi: ffiHistoricalFolds
+        ),
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    guard !folds.isEmpty else { return nil }
+    for id in ids {
+        let live = snBareMarmotGroupId(folds[id] ?? "")
+        if !live.isEmpty, live != id, ids.contains(where: { snOpenedConversationIdMatches($0, live) }) {
+            return ids.first(where: { snOpenedConversationIdMatches($0, live) })
+        }
+    }
+    return nil
+}
+
+/// Compose `marmotSendTargetGroupId`: prefer persist/remount live among
+/// duplicate 1:1s, then newest-`latest_at` / id. Empty persist-folds
+/// without a remount pair stay newest-sort so first-resume is unchanged.
+func snMarmotSendTargetGroupId(
+    openGroupId: String,
+    duplicateGroupIds: [String],
+    latestSecs: [String: Int64],
+    historicalFolds: [String: String] = [:],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    ffiHistoricalFolds: [String: String] = [:]
+) -> String {
+    if let preferred = snPreferredFoldedDirectMarmotGroupId(
+        groupIds: duplicateGroupIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        ffiHistoricalFolds: ffiHistoricalFolds
+    ) {
+        return preferred
+    }
+    return duplicateGroupIds.max { lhs, rhs in
+        let left = latestSecs[snBareMarmotGroupId(lhs)] ?? latestSecs[lhs] ?? 0
+        let right = latestSecs[snBareMarmotGroupId(rhs)] ?? latestSecs[rhs] ?? 0
+        if left != right { return left < right }
+        return lhs < rhs
+    } ?? openGroupId
+}
+
+/// Persist+remount live among duplicate 1:1s, else newest-`latest_at`.
+/// No FFI — startChat / existence checks must not wait. Call site:
+/// `MarmotChatModel.directGroup(forNpub:)`. Compose
+/// `preferredDirectMarmotChatId`.
+func snPreferredDirectMarmotGroupId(
+    groupIds: [String],
+    latestSecs: [String: Int64],
+    historicalFolds: [String: String] = [:],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> String? {
+    guard !groupIds.isEmpty else { return nil }
+    if let preferred = snPreferredFoldedDirectMarmotGroupId(
+        groupIds: groupIds,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        return preferred
+    }
+    return groupIds.max { lhs, rhs in
+        let left = latestSecs[snBareMarmotGroupId(lhs)] ?? latestSecs[lhs] ?? 0
+        let right = latestSecs[snBareMarmotGroupId(rhs)] ?? latestSecs[rhs] ?? 0
+        if left != right { return left < right }
+        return lhs < rhs
+    }
+}
+
+/// Rewrite a staged preview onto the live sibling. Empty persist-folds
+/// still use the remount pair so confirmSendPreview does not send
+/// against a hist id FFI no longer lists.
+/// Compose `promotedFoldedPendingMediaPreviewChatId`.
+func snPromotedFoldedPendingMediaPreviewPeerId(
+    peerId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    let bare = snBareMarmotGroupId(peerId, prefix: prefix)
+    guard let live = folds[bare] ?? folds[peerId],
+          !live.isEmpty, live != bare, live != peerId
+    else { return peerId }
+    let liveBare = snBareMarmotGroupId(live, prefix: prefix)
+    return peerId.hasPrefix(prefix) ? prefix + liveBare : liveBare
+}
+
+/// Key new call-log rows on the remounted live sibling. Remount already
+/// moved hist rows onto live; a call placed from the painted hist pane
+/// must not write a second hist bucket that home-row counts miss while
+/// persist-folds are still empty. Keep `activeCall.convId` on hist so
+/// BLE signaling still resolves. Compose `callConversationStoreId`.
+func snCallConversationStoreId(
+    conversationId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    let pair = snRemountPairConversationIds(
+        conversationId: conversationId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if pair.count > 1, let opened = openedConversationId, !opened.isEmpty {
+        return opened
+    }
+    let bare = snBareMarmotGroupId(conversationId, prefix: prefix)
+    if let live = historicalFolds[bare] ?? historicalFolds[conversationId],
+       !live.isEmpty, live != bare, live != conversationId {
+        return conversationId.hasPrefix(prefix) ? prefix + snBareMarmotGroupId(live, prefix: prefix) : live
+    }
+    return conversationId
+}
+
+/// Key new conversation-scoped payment rows on the remounted live sibling.
+/// Wallet / Unify keys stay put. Compose `paymentConversationStoreId`.
+func snPaymentConversationStoreId(
+    peerKey: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> String {
+    if peerKey == "wallet" || peerKey.hasPrefix("unify:") {
+        return peerKey
+    }
+    return snCallConversationStoreId(
+        conversationId: peerKey,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    )
+}
+
+/// Conversation keys a chat-scoped payment read must check after a fold.
+/// Includes both bare MLS ids and `marmot:` conversation ids. Empty
+/// persist-folds still union the remount pair so a moved live row stays
+/// visible on the painted hist pane.
+func snPaymentActivityPeerKeys(
+    conversationId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Set<String> {
+    var keys: Set<String> = []
+    for id in snRemountPairConversationIds(
+        conversationId: conversationId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(id, prefix: prefix)
+        keys.insert(id)
+        keys.insert(bare)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+            keys.insert(alias)
+            if !alias.hasPrefix(prefix) {
+                keys.insert(prefix + alias)
+            }
+        }
+    }
+    return keys.filter { !$0.isEmpty }
+}
+
+/// Latest sender cooldown across the fold family (Compose
+/// `trillCooldownUntilMsForChat`).
+func snTrillCooldownUntil(
+    conversationId: String,
+    cooldownUntilByChat: [String: Date],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Date? {
+    var latest: Date?
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ) {
+        guard let until = cooldownUntilByChat[key] else { continue }
+        if latest == nil || until > latest! {
+            latest = until
+        }
+    }
+    return latest
+}
+
+/// Stamp sender cooldown onto every remount / fold-family key. After remount
+/// iPhone still paints hist; a hist-only write is invisible on live while
+/// persist-folds are empty. Compose `trillCooldownUntilMsWritten`.
+func snTrillCooldownWritten(
+    conversationId: String,
+    until: Date,
+    cooldownUntilByChat: [String: Date],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String: Date] {
+    var next = cooldownUntilByChat
+    var keys = snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    )
+    if keys.isEmpty { keys.insert(conversationId) }
+    for key in keys {
+        next[key] = until
+    }
+    return next
+}
+
+/// Call-log rows for the open id plus its hidden 0.8 sibling. Promote copies
+/// hist onto live asynchronously; first paint of the live transcript must
+/// still show recovered calls before that rewrite lands.
+func snCallLogsForChat<Record>(
+    conversationId: String,
+    callLogs: [String: [Record]],
+    historicalFolds: [String: String],
+    idOf: (Record) -> String,
+    dateOf: (Record) -> Date,
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [Record] {
+    let keys = snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if keys.isEmpty { return callLogs[conversationId] ?? [] }
+    let bare = snBareMarmotGroupId(conversationId)
+    let liveKeys = Set(
+        [conversationId, bare, "marmot:" + bare].filter { !$0.isEmpty }
+    )
+    var byId: [String: Record] = [:]
+    for key in keys.subtracting(liveKeys).sorted() {
+        for record in callLogs[key] ?? [] {
+            byId[idOf(record)] = record
+        }
+    }
+    for key in liveKeys {
+        for record in callLogs[key] ?? [] {
+            byId[idOf(record)] = record
+        }
+    }
+    return byId.values.sorted { dateOf($0) < dateOf($1) }
+}
+
+/// Conversation keys whose in-flight / failed send echoes belong on this
+/// transcript after a fold. Includes listed 1:1 duplicates and the hidden
+/// 0.8 sibling (`marmot:` + bare).
+func snPendingMessageKeys(
+    conversationId: String,
+    sourceGroupIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String] {
+    var seen = Set<String>()
+    var keys: [String] = []
+    func append(_ id: String) {
+        guard !id.isEmpty, seen.insert(id).inserted else { return }
+        keys.append(id)
+    }
+    append(conversationId)
+    for groupId in sourceGroupIds {
+        append(groupId)
+        if !groupId.hasPrefix(prefix) {
+            append(prefix + groupId)
+        }
+    }
+    for key in snPaymentActivityPeerKeys(
+        conversationId: conversationId,
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId,
+        prefix: prefix
+    ).sorted() {
+        append(key)
+    }
+    return keys
+}
+
+/// Rewrite a conversation-scoped payment peerKey onto the live sibling.
+/// Wallet / Unify keys stay put — those are not Marmot conversation ids.
+func snRemountedPaymentPeerKey(
+    peerKey: String,
+    historicalKeys: Set<String>,
+    liveKey: String
+) -> String {
+    guard !liveKey.isEmpty,
+          peerKey != liveKey,
+          peerKey != "wallet",
+          !peerKey.hasPrefix("unify:"),
+          historicalKeys.contains(peerKey)
+    else { return peerKey }
+    return liveKey
+}
+
+/// Persist-rewrite conversation-scoped payment peerKeys from every hidden
+/// 0.8 id onto its live sibling. Empty persist-folds still use the
+/// remount pair so a hist-keyed ledger row lands on live before
+/// wake-mute writes the blob. Compose `remountedPaymentActivitiesFromFolds`.
+func snRemountedPaymentPeerKeysFromFolds(
+    peerKeys: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    let folds = snRemountPairHistoricalFolds(
+        historicalFolds: historicalFolds,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    return peerKeys.map { key in
+        var next = key
+        for (historical, live) in folds {
+            guard !live.isEmpty, live != historical else { continue }
+            next = snRemountedPaymentPeerKey(
+                peerKey: next,
+                historicalKeys: [historical],
+                liveKey: live
+            )
+        }
+        return next
+    }
+}
+
+/// Mute keys a foreground / gap-recovery banner must check so a mute
+/// stored on the recovered 0.8 id still silences a live 0.9 push.
+/// Empty persist-folds still union the remount pair so a mute from the
+/// painted hist pane stamps the listed live sibling on the first write.
+func snMutedFoldKeys(
+    groupIdHex: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> [String] {
+    var keys: [String] = []
+    var seen = Set<String>()
+    func append(_ raw: String) {
+        guard !raw.isEmpty, seen.insert(raw).inserted else { return }
+        keys.append(raw)
+    }
+    for seed in snRemountPairConversationIds(
+        conversationId: groupIdHex,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    ) {
+        let bare = snBareMarmotGroupId(seed, prefix: prefix)
+        for alias in snFoldFamilyIds(id: bare, historicalFolds: historicalFolds) {
+            append(alias)
+            if !alias.hasPrefix(prefix) {
+                append(prefix + alias)
+            }
+        }
+    }
+    return keys
+}
+
+/// Hidden 0.8 ids core `leave_group(live)` will not purge when persist-folds
+/// landed before `fold_family`. Hosts must `deleteGroup` these after leave
+/// or the next cold start resurrects the room. Compose
+/// `leaveFamilyCorePurgeIds`.
+func snLeaveFamilyCorePurgeIds(
+    leaveId: String,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    let leave = leaveId.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !leave.isEmpty else { return [] }
+    return Array(Set(
+        snEchoReconcileFamilyIds(
+            echoGroupId: leave,
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+        .map { snBareMarmotGroupId($0) }
+        .filter { !$0.isEmpty && !snOpenedConversationIdMatches($0, leave) }
+    )).sorted()
+}
+
+/// Listed Marmot ids plus their persist-folds siblings. Mesh-folded DM
+/// delete must `deleteGroup` the hidden 0.8 id, not only the listed live
+/// group. Empty persist-folds still union the remount pair.
+/// Compose `deletedConversationCorePurgeIds`.
+func snDeletedConversationCorePurgeIds(
+    listedIds: [String],
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil
+) -> [String] {
+    var out = Set<String>()
+    for id in listedIds {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        out.insert(trimmed)
+        for alias in snEchoReconcileFamilyIds(
+            echoGroupId: trimmed,
+            historicalFolds: historicalFolds,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ) {
+            if !alias.isEmpty { out.insert(alias) }
+            let bare = snBareMarmotGroupId(alias)
+            if !bare.isEmpty { out.insert(bare) }
+        }
+    }
+    return out.filter { !$0.isEmpty }.sorted()
+}
+
+/// Drop host fold bindings whose historical or live id was just deleted.
+func snPurgedHistoricalFolds(
+    _ folds: [String: String],
+    deletedIds: Set<String>
+) -> [String: String] {
+    folds.filter { historical, live in
+        !deletedIds.contains(historical) && !deletedIds.contains(live)
+    }
+}
+
+/// After an authoritative `groups()` listing, drop hist→live bindings whose
+/// whole family is gone. First-paint / empty startup listings must pass
+/// `listedAuthoritative == false` so a recovered 0.8 row is not forgotten
+/// before the live sibling appears.
+///
+/// An empty listing is never authoritative: `$groups` can emit `[]` while
+/// the node is closed or reconnecting, and that must not persist an empty
+/// host fold blob. Wipe / leave already forget the family explicitly.
+func snPrunedOrphanedHistoricalFolds(
+    _ folds: [String: String],
+    listedIds: Set<String>,
+    listedAuthoritative: Bool
+) -> [String: String] {
+    guard listedAuthoritative, !listedIds.isEmpty else { return folds }
+    return folds.filter { historical, live in
+        live == historical || listedIds.contains(live) || listedIds.contains(historical)
+    }
+}
+
+/// Keep recovered call-log rows on the live sibling after FFI hides the 0.8 id.
+func snPromotedFoldedCallLogs(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    callLogs: [String: [SNCallRecord]],
+    liveFoldTarget: (String) -> String?,
+    maxPerConversation: Int = 100
+) -> [String: [SNCallRecord]] {
+    var next = callLogs.filter { !$0.value.isEmpty }
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(next.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let incoming = next[pair.historical], !incoming.isEmpty else { continue }
+        var byId: [String: SNCallRecord] = [:]
+        for record in incoming { byId[record.id] = record }
+        for record in next[pair.live] ?? [] { byId[record.id] = record }
+        next[pair.live] = Array(byId.values.sorted { $0.date < $1.date }.suffix(maxPerConversation))
+    }
+    return next
+}
+
+func snMarmotSendNeedsPeerUpdate(_ error: String) -> Bool {
+    let lower = error.lowercased()
+    return lower.contains("no key package")
+        || lower.contains("cannot send until the other members update")
+}
+
+func snMarmotSendUserMessage(_ error: String) -> String {
+    snMarmotSendNeedsPeerUpdate(error)
+        ? "Waiting for them to update Sonar"
+        : "Couldn't send: \(error)"
+}
+
+/// Invite mint is local and must not create a group. An unresumed 0.8 room
+/// has no live MLS id — fail closed instead of handing out a dead token.
+func snMarmotInviteUserMessage(_ error: String) -> String {
+    error.lowercased().contains("cannot invite until it is resumed")
+        ? "Send a message first to resume this chat, then invite"
+        : "Couldn't create link: \(error)"
+}
+
+func snRecoveredChatNeedsPeerUpdate(
+    hasLiveFoldSibling: Bool,
+    keyPackageMissing: Bool
+) -> Bool {
+    !hasLiveFoldSibling && keyPackageMissing
+}
+
+/// FFI hides the folded 0.8 id, so listed duplicate DMs go back to 1.
+/// Rooms never have listed duplicates. A persisted hist→live binding is
+/// the live sibling.
+func snRecoveredChatHasLiveFoldSibling(
+    chatId: String,
+    listedDuplicateCount: Int,
+    historicalFolds: [String: String],
+    openedConversationId: String? = nil,
+    openedConversationPaneId: String? = nil,
+    prefix: String = "marmot:"
+) -> Bool {
+    if listedDuplicateCount > 1 { return true }
+    let remount = snRemountPairConversationIds(
+        conversationId: chatId,
+        openedConversationId: openedConversationId,
+        openedConversationPaneId: openedConversationPaneId
+    )
+    if remount.count > 1 { return true }
+    let bare = snBareMarmotGroupId(chatId, prefix: prefix)
+    guard !bare.isEmpty else { return false }
+    if let live = historicalFolds[bare] ?? historicalFolds[chatId],
+       !live.isEmpty,
+       snBareMarmotGroupId(live, prefix: prefix) != bare {
+        return true
+    }
+    return historicalFolds.contains { _, live in
+        snBareMarmotGroupId(live, prefix: prefix) == bare
+    }
+}
+
+/// Resume created the live sibling. Drop the waiting flag — do not copy it.
+func snRemountClearsRecoveredWaitingFlag(
+    needsUpdate: Set<String>,
+    remountedIds: [String]
+) -> Set<String> {
+    needsUpdate.subtracting(Set(remountedIds))
+}
+
+let SNRecoveredLegacyMediaCopy =
+    "This attachment is from an older Sonar and can't be opened after the update."
+
+func snRecoveredLegacyMediaUnavailable(_ error: String) -> Bool {
+    let lower = error.lowercased()
+    return lower.contains("older sonar")
+        && lower.contains("cannot be opened after the update")
+}
+
 /// A stored call record: its timeline `date` (used to merge it
 /// chronologically into the transcript) plus the prebuilt CallLog message.
 struct SNCallRecord: Identifiable, Equatable {
@@ -672,6 +4671,8 @@ enum SNMediaTransferPhase: Equatable {
     case downloading
     case available
     case failed
+    /// Recovered 0.8 attachment — cannot decrypt; do not offer Retry.
+    case unavailable
 }
 
 /// Signal-style attachment state. A remote pointer becomes a local file before
@@ -680,6 +4681,7 @@ struct SNMediaTransferState: Equatable {
     let phase: SNMediaTransferPhase
     let progress: Double?
     let localURL: URL?
+    var userMessage: String? = nil
 
     static let notDownloaded = SNMediaTransferState(
         phase: .notDownloaded,
@@ -696,6 +4698,15 @@ struct SNMediaTransferState: Equatable {
     }
 
     static let failed = SNMediaTransferState(phase: .failed, progress: nil, localURL: nil)
+
+    static func unavailable(_ message: String) -> SNMediaTransferState {
+        SNMediaTransferState(
+            phase: .unavailable,
+            progress: nil,
+            localURL: nil,
+            userMessage: message
+        )
+    }
 }
 
 private final class SNMediaDownloadListener: MediaDownloadListener, @unchecked Sendable {
@@ -903,6 +4914,36 @@ struct SNScanMark: Equatable, Hashable {
     let count: Int64
 
     static let unseen = SNScanMark(secs: Int64.min, count: Int64.min)
+}
+
+func snMaxScanMark(_ left: SNScanMark, _ right: SNScanMark) -> SNScanMark {
+    if right.secs != left.secs { return right.secs > left.secs ? right : left }
+    return SNScanMark(secs: left.secs, count: max(left.count, right.count))
+}
+
+/// Keep call/pay/notification watermarks on the live sibling after FFI hide.
+func snPromotedFoldedScanMarks(
+    previousGroupIds: Set<String>,
+    currentGroupIds: Set<String>,
+    watermarks: [String: SNScanMark],
+    liveFoldTarget: (String) -> String?
+) -> [String: SNScanMark] {
+    var next = watermarks
+    let pairs = snPromotedFoldedMutePairs(
+        previousGroupIds: previousGroupIds,
+        currentGroupIds: currentGroupIds,
+        muteKeys: Set(watermarks.keys),
+        liveFoldTarget: liveFoldTarget
+    )
+    for pair in pairs {
+        guard let incoming = watermarks[pair.historical] else { continue }
+        if let existing = next[pair.live] {
+            next[pair.live] = snMaxScanMark(existing, incoming)
+        } else {
+            next[pair.live] = incoming
+        }
+    }
+    return next
 }
 
 func snChatsNeedingMessageScan(
@@ -1269,6 +5310,7 @@ final class SonarAppStore: ObservableObject {
         static let marmotConversationGroups = "sonar.marmotConversationGroups.v1"
         /// Persisted local call-log rows ([conversation id: call records] JSON).
         static let callLogs = "sonar.callLogs.v1"
+        static let historicalFolds = snHistoricalFoldsDefaultsKey
         static let notificationsEnabled = SonarNotificationPreferenceStore.enabledKey
         static let notificationShowNames = SonarNotificationPreferenceStore.showNamesKey
         static let notificationShowPreview = SonarNotificationPreferenceStore.showPreviewKey
@@ -1335,6 +5377,12 @@ final class SonarAppStore: ObservableObject {
     /// Navigation stack below the home root.
     @Published var path: [SonarRoute] = []
     @Published var toast: String? = nil
+    /// Recovered 0.8 chats whose resume send failed because the peer has no 0.9 KeyPackage.
+    @Published private(set) var recoveredChatNeedsUpdate: Set<String> = []
+    /// Last painted group-info join-request list. Persist-folds remounts
+    /// `groupInfo(hist) → groupInfo(live)` and SwiftUI may recreate the
+    /// screen; a closed-node live probe must not start from `[]`.
+    private var pendingJoinRequestsCache: (chatId: String, requests: [JoinRequestInfo])?
     /// External payments this process is currently sending, keyed by activity
     /// id. The persisted ledger owns the outcome; this holds only what it
     /// deliberately does not keep — the resolving/paying/slow split and the
@@ -1382,6 +5430,9 @@ final class SonarAppStore: ObservableObject {
     /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
     /// while the encrypted transcript is keyed by the Marmot MLS group id.
     private var marmotGroupIdsByConversationId: [String: String] = [:]
+    /// Last FFI `groups()` ids, used to copy a recovered-chat mute onto the
+    /// live sibling when the historical row disappears after resume.
+    private var lastMarmotGroupIds: Set<String> = []
     /// Our optional BIP-353 payment address ("" = unset, TLV omitted).
     @Published private(set) var bip353: String
     /// Lifecycle of the unified handle claim (name@sonarprivacy.xyz). The
@@ -1468,14 +5519,30 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var composerDraftHasText: [String: Bool] = [:]
 
     func composerDraft(for chatId: String) -> String {
-        composerDrafts[chatId] ?? ""
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snComposerDraft(
+            chatId: chatId,
+            drafts: composerDrafts,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     static var replyUIEnabled: Bool { snReplyUIEnabled() }
 
     func composerReply(for chatId: String) -> SNReplyRef? {
         guard Self.replyUIEnabled else { return nil }
-        return composerReplyByChat[chatId]
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snComposerReply(
+            chatId: chatId,
+            replies: composerReplyByChat,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     func beginReply(chatId: String, to message: SNMessage) {
@@ -1491,28 +5558,96 @@ final class SonarAppStore: ObservableObject {
             previewSource = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         let fallback = String(localized: "chat.reply.fallback", defaultValue: "Message")
-        composerReplyByChat[chatId] = SNReplyRef(
-            parentId: message.id,
-            parentNpub: message.senderNpub,
-            author: message.mine
-                ? String(localized: "chat.reply.you", defaultValue: "You")
-                : message.author,
-            preview: previewSource.isEmpty ? fallback : String(previewSource.prefix(140))
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        composerReplyByChat = snComposerRepliesAfterBegin(
+            replies: composerReplyByChat,
+            chatId: chatId,
+            reply: SNReplyRef(
+                parentId: message.id,
+                parentNpub: message.senderNpub,
+                author: message.mine
+                    ? String(localized: "chat.reply.you", defaultValue: "You")
+                    : message.author,
+                preview: previewSource.isEmpty ? fallback : String(previewSource.prefix(140))
+            ),
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
         )
     }
 
     func cancelReply(chatId: String) {
-        composerReplyByChat[chatId] = nil
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        composerReplyByChat = snComposerRepliesAfterClear(
+            replies: composerReplyByChat,
+            chatId: chatId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     func jumpToQuotedMessage(chatId: String, parentId: String) {
-        jumpMessageIdAtOpenByDM[chatId] = parentId
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+            conversationId: chatId,
+            parentId: parentId,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        // `ConversationViewState.rebuildNow` expands `visibleMessageLimit`
+        // when the parent already sits in the family-unioned host cache.
         objectWillChange.send()
     }
 
+    /// Jump parent for the open transcript. Walks hist / live / `marmot:`
+    /// aliases so remount cannot hide a recovered 0.8 quote.
+    func unreadCountAtOpen(for conversationId: String) -> UInt64? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snUnreadCountAtOpen(
+            conversationId: conversationId,
+            unreadAtOpen: unreadCountAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
+    func jumpMessageIdAtOpen(for conversationId: String) -> String? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snQuotedJumpParentId(
+            conversationId: conversationId,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
     private func consumeComposerReply(for chatId: String) -> SNReplyRef? {
-        let reply = composerReplyByChat[chatId]
-        composerReplyByChat[chatId] = nil
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        let reply = snComposerReply(
+            chatId: chatId,
+            replies: composerReplyByChat,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        composerReplyByChat = snComposerRepliesAfterClear(
+            replies: composerReplyByChat,
+            chatId: chatId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
         return reply
     }
 
@@ -1525,9 +5660,26 @@ final class SonarAppStore: ObservableObject {
     }
 
     func setComposerDraft(_ text: String, for chatId: String) {
-        let nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        var nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
+        for key in snPaymentActivityPeerKeys(
+            conversationId: chatId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) where key != chatId {
+            nextFlags[key] = nil
+        }
         if nextFlags != composerDraftHasText { composerDraftHasText = nextFlags }
-        let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
+        let next = snComposerDraftsAfterEdit(
+            drafts: composerDrafts,
+            chatId: chatId,
+            text: text,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
         guard next != composerDrafts else { return }
         composerDrafts = next
     }
@@ -1539,9 +5691,42 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    /// Mac split-view (and any `present:` that skips `push`) has no `.dm`
+    /// on `path`. `openedDM` / `closedDM` still run from the pane.
+    private var openedConversationId: String?
+    /// SwiftUI pane / Mac selection id. Fold remount rewrites
+    /// `openedConversationId` to live without changing `.id(hist)`.
+    private var openedConversationPaneId: String?
+
+    /// Remount-pair live / hist while a conversation is actually open.
+    /// A leftover `pendingMarmotRouteReplacement` after leave is ignored.
+    private func remountOpenedAndPane() -> (opened: String?, pane: String?) {
+        snRemountPairOpenedPane(
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            routeReplacement: pendingMarmotRouteReplacement
+        )
+    }
+    /// Live ids whose `ConversationViewState` was just fold-remounted.
+    /// `onAppear` `openedDM` must not newest-page hydrate them.
+    private var suppressOpenedDMHydrateIds: Set<String> = []
+
     private var currentDMId: String? {
-        if case .dm(let id)? = path.last { return id }
-        return nil
+        let pathId: String?
+        if case .dm(let id)? = path.last { pathId = id } else { pathId = nil }
+        return snCurrentOpenConversationId(
+            pathDMId: pathId,
+            openedConversationId: openedConversationId
+        )
+    }
+
+    /// Mac `.id` that stays on hist while remount hops selection to live.
+    func macConversationPaneIdentity(forSelectionId id: String) -> String {
+        snMacConversationPaneIdentity(
+            selectionId: id,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
     }
 
     private func nextMediaPreviewGeneration() -> UInt64 {
@@ -1721,7 +5906,7 @@ final class SonarAppStore: ObservableObject {
         _ peerId: String,
         items: [(payload: PendingMediaPayload, filename: String, mime: String)]
     ) {
-        guard currentDMId == peerId, !items.isEmpty else {
+        guard pendingMediaStageBelongsToOpenChat(peerId), !items.isEmpty else {
             // Never staged — drop any picker-owned temp files so a video
             // picked right before navigating away doesn't orphan on disk.
             Task.detached(priority: .utility) {
@@ -1764,7 +5949,7 @@ final class SonarAppStore: ObservableObject {
                 showToast("Couldn't prepare media.")
                 return
             }
-            guard mediaPreviewGeneration == generation, currentDMId == peerId else {
+            guard mediaPreviewGeneration == generation, pendingMediaStageBelongsToOpenChat(peerId) else {
                 Task.detached(priority: .utility) {
                     for (url, _, _) in written { Self.deleteTempMediaFile(url) }
                 }
@@ -1776,12 +5961,42 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    private func pendingMediaStageBelongsToOpenChat(_ peerId: String) -> Bool {
+        guard let openId = currentDMId else { return false }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snPendingMediaPreviewBelongsToChat(
+            previewPeerId: peerId,
+            chatId: openId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            historicalFolds: folds
+        )
+    }
+
+    func pendingMediaPreviewsMatching(_ chatId: String) -> [PendingMediaPreview] {
+        pendingMediaPreviews.filter { pendingMediaPreviewMatches($0, chatId: chatId) }
+    }
+
+    private func pendingMediaPreviewMatches(
+        _ preview: PendingMediaPreview,
+        chatId: String
+    ) -> Bool {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        return snPendingMediaPreviewBelongsToChat(
+            previewPeerId: preview.peerId,
+            chatId: chatId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            historicalFolds: folds
+        )
+    }
+
     func confirmSendPreview(peerId: String? = nil) {
-        let items = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
+        let items = peerId.map { pendingMediaPreviewsMatching($0) } ?? pendingMediaPreviews
         guard !items.isEmpty else { return }
         _ = nextMediaPreviewGeneration()
         if let peerId {
-            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+            pendingMediaPreviews.removeAll { pendingMediaPreviewMatches($0, chatId: peerId) }
         } else {
             pendingMediaPreviews = []
         }
@@ -1886,9 +6101,9 @@ final class SonarAppStore: ObservableObject {
 
     func cancelPreview(peerId: String? = nil) {
         _ = nextMediaPreviewGeneration()
-        let toRemove = peerId.map { id in pendingMediaPreviews.filter { $0.peerId == id } } ?? pendingMediaPreviews
+        let toRemove = peerId.map { pendingMediaPreviewsMatching($0) } ?? pendingMediaPreviews
         if let peerId {
-            pendingMediaPreviews.removeAll { $0.peerId == peerId }
+            pendingMediaPreviews.removeAll { pendingMediaPreviewMatches($0, chatId: peerId) }
         } else {
             pendingMediaPreviews = []
         }
@@ -1911,6 +6126,9 @@ final class SonarAppStore: ObservableObject {
     @Published private var pendingMarmotMessagesByChat: [String: [SNMessage]] = [:]
     @Published private(set) var pendingMarmotRouteReplacement: SNMarmotRouteReplacement?
     @Published private(set) var pendingMarmotRouteFailure: SNMarmotRouteFailure?
+    /// Mac split-view selection is not on `path`. Increment when delete/leave
+    /// removes the open transcript so the pane hops to radar.
+    @Published private(set) var deletedOpenConversationTick: UInt64 = 0
     private var pendingDirectMarmotSends: [String: [SNPendingMarmotSend]] = [:]
     private var pendingMarmotGroupSends: [String: [SNPendingMarmotGroupSend]] = [:]
     private var startingMarmotChats = Set<String>()
@@ -2103,6 +6321,9 @@ final class SonarAppStore: ObservableObject {
         invalidateHomeRows(on: marmot.$groups)
         invalidateHomeRows(on: marmot.$messagesByGroup)
         invalidateHomeRows(on: marmot.$unreadByGroup)
+        // Compose `conversationIndexVersion`: remounted index latest_at /
+        // preview can land without groups/messages/unread identity moving.
+        invalidateHomeRows(on: marmot.$conversationSummariesByGroup)
         invalidateHomeRows(on: marmot.$profilesByNpub)
         invalidateHomeRows(on: $sonarProfiles)
         invalidateHomeRows(on: $marmotVerified)
@@ -2162,7 +6383,29 @@ final class SonarAppStore: ObservableObject {
         }
         marmot.$groups
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.resolvePendingSecureChats() }
+            .sink { [weak self] groups in
+                guard let self else { return }
+                let current = Set(groups.map(\.id))
+                self.resolvePendingSecureChats()
+                Task { @MainActor in
+                    // Rediscover hist→live from FFI before host family walks.
+                    // After nsec restore the host blob was wiped; NSE / mute /
+                    // notification-tap fallbacks would otherwise miss the
+                    // restored sidecar until a later groups emission.
+                    await self.rememberHistoricalFolds(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedMutes(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedComposerState(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedTranscriptCache(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedPendingEchoes(from: self.lastMarmotGroupIds, to: current)
+                    self.promoteFoldedPendingMediaPreviews()
+                    self.promoteFoldedConversationViewStates(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedCallLogs(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedVerified(from: self.lastMarmotGroupIds, to: current)
+                    await self.promoteFoldedScanWatermarks(from: self.lastMarmotGroupIds, to: current)
+                    self.lastMarmotGroupIds = current
+                    await self.remountFoldedOpenChatIfNeeded()
+                }
+            }
             .store(in: &cancellables)
         marmot.$npub
             .receive(on: DispatchQueue.main)
@@ -3103,6 +7346,8 @@ final class SonarAppStore: ObservableObject {
         // replace the account, so both have to.
         defaults.removeObject(forKey: MarmotAccountBackupFlow.cellularOptInKey)
         path = []
+        hopMacOpenConversationSelection()
+        suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
@@ -3114,6 +7359,8 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
+        recoveredChatNeedsUpdate = []
+        pendingJoinRequestsCache = nil
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil
@@ -3129,6 +7376,8 @@ final class SonarAppStore: ObservableObject {
 
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
+        defaults.removeObject(forKey: Keys.historicalFolds)
+        UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
@@ -3683,7 +7932,7 @@ final class SonarAppStore: ObservableObject {
                     seenMarmotNotificationMessageIDs.insert(message.id)
                     continue
                 }
-                let groupName = group.memberNpubs.count > 2 ? title : nil
+                let groupName = snMarmotTreatsAsGroupChat(group) ? title : nil
                 // Push wake already bannered this message id — mark seen, no second banner.
                 if marmot.pushWakeNotifiedMessageIDs.contains(message.id) {
                     seenMarmotNotificationMessageIDs.insert(message.id)
@@ -3701,7 +7950,7 @@ final class SonarAppStore: ObservableObject {
                 // transcript, which renders no mention styling there. Mute is
                 // enforced downstream in NotificationService, so a mention does
                 // NOT pierce it (R-022).
-                let isGroupMessage = group.memberNpubs.count > 2
+                let isGroupMessage = snMarmotTreatsAsGroupChat(group)
                 let kind: SonarLocalNotificationKind =
                     (classified == .message && isGroupMessage && mentionsMe(message.content))
                         ? .mention
@@ -4972,7 +9221,7 @@ final class SonarAppStore: ObservableObject {
             )
         }
         if id.hasPrefix(Self.marmotIDPrefix), let groupId = marmotGroupId(id) {
-            let group = marmot.groups.first { $0.id == groupId }
+            let group = marmotGroup(byId: groupId)
             return SNPeerItem(
                 id: id,
                 name: group.map { marmot.title(for: $0) } ?? "Secure chat",
@@ -5045,6 +9294,48 @@ final class SonarAppStore: ObservableObject {
         return preferredDirectMarmotGroup(in: marmotGroups(forNpub: target))
     }
 
+    /// Contact-profile 1:1 only. Home-row `preferredDirectMarmotGroup` stays
+    /// persist+remount so paint never waits on FFI. Persist hist→stale wins.
+    /// Empty persist+remount+FFI newest-sorts hist so Message keeps the
+    /// recovered transcript (Compose `directMarmotChatIdForPeer`).
+    func contactDirectMarmotGroup(
+        forNpub npub: String,
+        ffiHistoricalFolds: [String: String] = [:]
+    ) -> MarmotService.MarmotGroup? {
+        let target = SNMarmotProfileCache.canonicalKey(npub)
+        let groups = marmotGroups(forNpub: target)
+        let persist = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        if let preferredId = snPreferredFoldedDirectMarmotGroupId(
+            groupIds: groups.map(\.id),
+            historicalFolds: persist,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane,
+            ffiHistoricalFolds: ffiHistoricalFolds
+        ), let match = groups.first(where: { $0.id == preferredId }) {
+            return match
+        }
+        return preferredDirectMarmotGroup(in: groups)
+    }
+
+    func ffiFoldsForDirectNpub(_ npub: String) async -> [String: String] {
+        let groups = marmotGroups(forNpub: npub)
+        let listed = groups.map(\.id)
+        var aliasesById: [String: [String]] = [:]
+        var liveById: [String: String] = [:]
+        for id in listed {
+            aliasesById[id] = await marmot.foldAliases(groupId: id)
+            if let live = await marmot.liveFoldTarget(groupId: id) {
+                liveById[id] = live
+            }
+        }
+        return snHistoricalFoldsFromAliases(
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
+    }
+
     private func marmotGroups(forNpub npub: String) -> [MarmotService.MarmotGroup] {
         let target = SNMarmotProfileCache.canonicalKey(npub)
         return marmot.groups.filter { directMarmotPeerKey(in: $0) == target }
@@ -5074,34 +9365,211 @@ final class SonarAppStore: ObservableObject {
         (pendingMarmotNpub(for: id) != nil && marmotGroupId(id) == nil) || isPendingMarmotGroup(id)
     }
 
+    func marmotSendTargetGroupId(
+        _ id: String,
+        ffiHistoricalFolds: [String: String] = [:]
+    ) -> String? {
+        guard let groupId = marmotGroupId(id) else { return nil }
+        guard let group = marmotGroup(byId: groupId),
+              let peer = directMarmotPeerKey(in: group)
+        else { return groupId }
+        let groups = marmotGroups(forNpub: peer)
+        let persist = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        if let preferredId = snPreferredFoldedDirectMarmotGroupId(
+            groupIds: groups.map(\.id),
+            historicalFolds: persist,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane,
+            ffiHistoricalFolds: ffiHistoricalFolds
+        ), let match = groups.first(where: { $0.id == preferredId }) {
+            return match.id
+        }
+        return preferredDirectMarmotGroup(in: groups)?.id ?? groupId
+    }
+
+    /// Sticker / media / payment / internet call signaling must use the
+    /// same live duplicate as text. Persist+remount first; pass FFI so a
+    /// recovered hist opened from home (empty persist, no remount) still
+    /// publishes against live. Do not persist the merge.
+    /// Compose `resolveMarmotSendTargetGroupId`.
+    private func marmotOutboundGroupId(
+        _ id: String,
+        ffiHistoricalFolds: [String: String] = [:]
+    ) -> String? {
+        if let groupId = marmotSendTargetGroupId(id, ffiHistoricalFolds: ffiHistoricalFolds) {
+            return groupId
+        }
+        guard let profile = resolvedSonarProfile(id) else { return nil }
+        return contactDirectMarmotGroup(
+            forNpub: profile.npub,
+            ffiHistoricalFolds: ffiHistoricalFolds
+        )?.id
+    }
+
+    /// Persist+remount first. When more than one 1:1 is listed, merge
+    /// persist-wins FFI. `fallback` is an alias-found group when the
+    /// conversation id itself is not yet mapped (mesh-media internet
+    /// fallback). Compose `resolveMarmotSendTargetGroupId`.
+    private func resolvedMarmotOutboundGroupId(
+        _ id: String,
+        fallback: String? = nil
+    ) async -> String? {
+        guard let groupId = marmotOutboundGroupId(id) ?? fallback else { return nil }
+        guard let group = marmotGroup(byId: groupId),
+              let peer = directMarmotPeerKey(in: group),
+              marmotGroups(forNpub: peer).count > 1
+        else { return groupId }
+        let ffi = await ffiFoldsForDirectNpub(peer)
+        return marmotOutboundGroupId(id, ffiHistoricalFolds: ffi)
+            ?? marmotSendTargetGroupId(groupId, ffiHistoricalFolds: ffi)
+            ?? groupId
+    }
+
+    private func directMarmotHasDuplicateSiblings(_ groupId: String) -> Bool {
+        guard let group = marmotGroup(byId: groupId),
+              let peer = directMarmotPeerKey(in: group)
+        else { return false }
+        return marmotGroups(forNpub: peer).count > 1
+    }
+
+    /// Mesh-folded `sendOverMarmot` / sticker / pending flush. Persist+remount
+    /// first; persist-wins FFI when more than one 1:1 is listed.
+    private func resolvedMarmotOutboundGroupId(forNpub npub: String) async -> String? {
+        guard let persist = marmotGroup(forNpub: npub) else { return nil }
+        return await resolvedMarmotOutboundGroupId(
+            Self.marmotIDPrefix + persist.id,
+            fallback: persist.id
+        )
+    }
+
+    func recoveredChatWaitingForPeerUpdate(_ id: String) -> Bool {
+        let groupId = marmotGroupId(id)
+        let groups: [MarmotService.MarmotGroup]
+        if let groupId, let group = marmotGroup(byId: groupId), let peer = directMarmotPeerKey(in: group) {
+            groups = marmotGroups(forNpub: peer)
+        } else {
+            groups = []
+        }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        let family = snFoldFamilyIds(id: groupId ?? id, historicalFolds: folds)
+            .union(snRemountPairConversationIds(
+                conversationId: groupId ?? id,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            ))
+        let flagged = recoveredChatNeedsUpdate.contains(id)
+            || groupId.map { recoveredChatNeedsUpdate.contains($0) } == true
+            || family.contains(where: {
+                recoveredChatNeedsUpdate.contains($0)
+                    || recoveredChatNeedsUpdate.contains(Self.marmotIDPrefix + $0)
+            })
+        return snRecoveredChatNeedsPeerUpdate(
+            hasLiveFoldSibling: snRecoveredChatHasLiveFoldSibling(
+                chatId: groupId ?? id,
+                listedDuplicateCount: groups.count,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            ),
+            keyPackageMissing: flagged
+        )
+    }
+
+    func noteRecoveredChatSendFailure(_ chatId: String, error: String) {
+        guard snMarmotSendNeedsPeerUpdate(error) else { return }
+        recoveredChatNeedsUpdate.insert(chatId)
+        showToast(snMarmotSendUserMessage(error))
+    }
+
+    func rememberPendingJoinRequests(_ requests: [JoinRequestInfo], for chatId: String) {
+        pendingJoinRequestsCache = (chatId, requests)
+    }
+
+    /// Seed group-info after persist-folds remounts `hist → live`. Same-family
+    /// cache wins (including a remembered empty success); other rooms keep
+    /// the in-view list.
+    func pendingJoinRequestsCached(
+        for chatId: String,
+        painted: [JoinRequestInfo] = []
+    ) -> [JoinRequestInfo] {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        guard let cache = pendingJoinRequestsCache else { return painted }
+        if cache.chatId.isEmpty || chatId.isEmpty {
+            return cache.requests
+        }
+        if snConversationsMatchFoldFamily(
+            left: cache.chatId,
+            right: chatId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
+            return cache.requests
+        }
+        return painted
+    }
+
     func marmotGroupId(_ id: String) -> String? {
         if isPendingMarmotGroup(id) { return nil }
         if let pendingNpub = pendingMarmotNpub(for: id),
            let group = marmotGroup(forNpub: pendingNpub) {
-            return group.id
+            return resolvedOpenGroupId(group.id)
         }
         if id.hasPrefix(Self.marmotIDPrefix) {
-            return String(id.dropFirst(Self.marmotIDPrefix.count))
+            return resolvedOpenGroupId(String(id.dropFirst(Self.marmotIDPrefix.count)))
         }
         if let mapped = marmotGroupIdsByConversationId[id] {
-            return mapped
+            return resolvedOpenGroupId(mapped)
         }
         if let fp = chatViewModel.getFingerprint(for: PeerID(str: id)),
            let mapped = marmotGroupIdsByConversationId[fp] {
-            rememberMarmotGroup(mapped, forConversationId: id)
-            return mapped
+            let resolved = resolvedOpenGroupId(mapped)
+            rememberMarmotGroup(resolved, forConversationId: id)
+            return resolved
         }
         guard let profile = resolvedSonarProfile(id),
               let group = marmotGroup(forNpub: profile.npub)
         else { return nil }
-        rememberMarmotGroup(group.id, forConversationId: id)
+        let resolved = resolvedOpenGroupId(group.id)
+        rememberMarmotGroup(resolved, forConversationId: id)
         let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
-        rememberMarmotGroup(group.id, forConversationId: fp)
-        return group.id
+        rememberMarmotGroup(resolved, forConversationId: fp)
+        return resolved
+    }
+
+    /// Persist-fold remap so catch-up / load / send hit the listed live id.
+    /// Empty wake-mute persist still remaps via the remount pair so the
+    /// painted hist pane keeps title / send / call on the listed sibling.
+    private func resolvedOpenGroupId(_ groupId: String) -> String {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snResolvedOpenGroupId(
+            groupId: groupId,
+            listedGroupIds: Set(marmot.groups.map(\.id)),
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
-        marmot.groups.first { $0.id == groupId }
+        if let exact = marmot.groups.first(where: { $0.id == groupId }) {
+            return exact
+        }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let listed = Set(marmot.groups.map(\.id))
+        let (opened, pane) = remountOpenedAndPane()
+        guard let sibling = snListedOrFoldedSiblingGroupId(
+            groupId: groupId,
+            listedGroupIds: listed,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) else { return nil }
+        return marmot.groups.first { $0.id == sibling }
     }
 
     private func directMarmotPeerKey(in group: MarmotService.MarmotGroup) -> String? {
@@ -5122,11 +9590,27 @@ final class SonarAppStore: ObservableObject {
     private func latestMarmotMessage(
         in groups: [MarmotService.MarmotGroup]
     ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
         var latest: (groupId: String, message: MarmotService.MarmotMessage)?
         for group in groups {
-            guard let message = marmot.homeRowMessage(groupId: group.id) else { continue }
-            if latest == nil || message.createdAt > latest!.message.createdAt {
-                latest = (group.id, message)
+            for alias in snFoldFamilyIds(
+                id: group.id,
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            ) {
+                guard let message = snMarmotHomeRowMessage(
+                    loaded: marmot.messagesByGroup[alias]?.max(by: {
+                        if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+                        return $0.createdAt < $1.createdAt
+                    }),
+                    summary: marmot.conversationSummariesByGroup[alias]
+                        ?? marmot.conversationSummariesByGroup[group.id]
+                ) else { continue }
+                if latest == nil || message.createdAt > latest!.message.createdAt {
+                    latest = (group.id, message)
+                }
             }
         }
         return latest
@@ -5135,9 +9619,19 @@ final class SonarAppStore: ObservableObject {
     private func preferredDirectMarmotGroup(
         in groups: [MarmotService.MarmotGroup]
     ) -> MarmotService.MarmotGroup? {
-        groups.sorted { lhs, rhs in
-            let lhsDate = marmot.homeRowMessage(groupId: lhs.id)?.createdAt ?? .distantPast
-            let rhsDate = marmot.homeRowMessage(groupId: rhs.id)?.createdAt ?? .distantPast
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        if let preferredId = snPreferredFoldedDirectMarmotGroupId(
+            groupIds: groups.map(\.id),
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ), let match = groups.first(where: { $0.id == preferredId }) {
+            return match
+        }
+        return groups.sorted { lhs, rhs in
+            let lhsDate = latestMarmotMessage(in: [lhs])?.message.createdAt ?? .distantPast
+            let rhsDate = latestMarmotMessage(in: [rhs])?.message.createdAt ?? .distantPast
             if lhsDate != rhsDate { return lhsDate > rhsDate }
             let lhsVerified = marmotVerified[lhs.id] ?? false
             let rhsVerified = marmotVerified[rhs.id] ?? false
@@ -5147,19 +9641,64 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func hasUnreadMarmotMessage(in groups: [MarmotService.MarmotGroup]) -> Bool {
-        groups.contains { (marmot.unreadByGroup[$0.id] ?? 0) > 0 }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        guard let first = groups.first else { return false }
+        let (opened, pane) = remountOpenedAndPane()
+        return snUnreadForFoldFamily(
+            groupId: first.id,
+            unreadByGroup: marmot.unreadByGroup,
+            historicalFolds: folds,
+            listedDuplicateIds: groups.map(\.id),
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) > 0
     }
 
     private func hasVerifiedMarmotGroup(in groups: [MarmotService.MarmotGroup]) -> Bool {
-        groups.contains { marmotVerified[$0.id] ?? false }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        guard let first = groups.first else { return false }
+        let verifiedIds = Set(marmotVerified.compactMap { key, value -> String? in
+            guard value else { return nil }
+            return key.hasPrefix(Self.marmotIDPrefix)
+                ? String(key.dropFirst(Self.marmotIDPrefix.count))
+                : key
+        })
+        let (opened, pane) = remountOpenedAndPane()
+        return snVerifiedForFoldFamily(
+            groupId: first.id,
+            verifiedIds: verifiedIds,
+            historicalFolds: folds,
+            listedDuplicateIds: groups.map(\.id),
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
+    /// Listed 1:1 duplicates plus the hidden 0.8 sibling. Unread / mark-read
+    /// walk this set. First-open hydrate and load-older also page it: core
+    /// `fold_family(live)` may not exist yet after persist-folds, so a
+    /// live-only `messages_cursor_page` misses bak remainder. Empty
+    /// wake-mute persist still unions the remount pair so a remapped
+    /// live seed does not drop hidden hist.
+    private func transcriptSourceIds(forGroupId groupId: String) -> [String] {
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snTranscriptSourceIds(
+            groupId: groupId,
+            listedDirectIds: groups.map(\.id),
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     private func markMarmotGroupsRead(matchingGroupId groupId: String) {
-        let groups = directMarmotGroups(matchingGroupId: groupId)
-        if groups.isEmpty {
+        let ids = transcriptSourceIds(forGroupId: groupId)
+        if ids.isEmpty {
             marmot.markConversationRead(groupId: groupId)
         } else {
-            for group in groups { marmot.markConversationRead(groupId: group.id) }
+            for id in ids { marmot.markConversationRead(groupId: id) }
         }
     }
 
@@ -5393,9 +9932,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func callMarmotGroupId(_ id: String) -> String? {
-        if let groupId = marmotGroupId(id) { return groupId }
-        guard let profile = resolvedSonarProfile(id) else { return nil }
-        return marmotGroup(forNpub: profile.npub)?.id
+        marmotOutboundGroupId(id)
     }
 
     private func callProfile(_ id: String) -> SonarPeerProfile? {
@@ -5465,7 +10002,7 @@ final class SonarAppStore: ObservableObject {
     private func callDisplayName(_ id: String) -> String {
         if !meshReachable(id),
            let groupId = callMarmotGroupId(id),
-           let group = marmot.groups.first(where: { $0.id == groupId }) {
+           let group = marmotGroup(byId: groupId) {
             return marmot.title(for: group)
         }
         return peerItem(id).name
@@ -5596,17 +10133,25 @@ final class SonarAppStore: ObservableObject {
         // (the DM screen renders both transcripts merged) instead of
         // showing a second row.
         var marmotRows: [SNDMRow] = []
+        let historicalFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
-            let last = marmot.homeRowMessage(groupId: group.id)
+            let last = latestMarmotMessage(in: [group])?.message
             guard marmot.isDirectGroup(group) else {
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
                     title: marmot.title(for: group),
                     preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure group · reaches anywhere",
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
+                    unread: snUnreadForFoldFamily(
+                        groupId: group.id,
+                        unreadByGroup: marmot.unreadByGroup,
+                        historicalFolds: historicalFolds,
+                        openedConversationId: opened,
+                        openedConversationPaneId: pane
+                    ) > 0,
                     presence: false,
                     verified: false,
                     isMarmot: true,
@@ -5833,6 +10378,9 @@ final class SonarAppStore: ObservableObject {
 
     /// Whether any local Marmot source folded into this visible conversation
     /// still has an older database page. Each source keeps its own cursor.
+    /// Also the open-unread `familyHasOlder` signal: do not abandon the
+    /// divider while a hidden 0.8 sibling / bak remainder may still hold
+    /// incoming unread rows. Compose `familyHasOlderForOpenChat`.
     func canLoadOlderDM(_ id: String) -> Bool {
         localTranscriptGroups(for: id).contains {
             marmot.hasOlderLocalMessages(groupId: $0.id)
@@ -5921,11 +10469,53 @@ final class SonarAppStore: ObservableObject {
     }
 
     func cachedPaymentActivityCount(_ id: String) -> Int {
-        paymentActivityLedger.activities(peerKey: id).count
+        paymentActivityLedger.activities(peerKeys: paymentActivityKeys(for: id)).count
+    }
+
+    /// Bare + `marmot:` ids for this conversation and its recovered siblings.
+    /// After remount, iPhone still paints hist — include the live sibling
+    /// even when persist-folds have not landed yet.
+    private func paymentActivityKeys(for id: String) -> Set<String> {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snPaymentActivityPeerKeys(
+            conversationId: id,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
+    /// Store new conversation-scoped payments on remount live. Wallet /
+    /// Unify keys stay put.
+    private func paymentConversationStoreId(for id: String) -> String {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snPaymentConversationStoreId(
+            peerKey: id,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     func cachedCallRecordCount(_ id: String) -> Int {
-        callLogs[id]?.count ?? 0
+        callLogsForChat(id).count
+    }
+
+    /// Open id plus hidden 0.8 sibling — same family walk as payments.
+    private func callLogsForChat(_ id: String) -> [SNCallRecord] {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        return snCallLogsForChat(
+            conversationId: id,
+            callLogs: callLogs,
+            historicalFolds: folds,
+            idOf: { $0.id },
+            dateOf: { $0.date },
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
     }
 
     func hasCachedRenderOnlyOlderDM(
@@ -5946,13 +10536,41 @@ final class SonarAppStore: ObservableObject {
         groupIDs: Set<String>
     ) async -> SNConversationTranscriptLoadResult {
         var result = SNConversationTranscriptLoadResult.none
-        for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
-            let before = marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+        let seed = marmotGroupId(id) ?? id
+        let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        if snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted) {
+            _ = await adoptMergedActionFolds(for: [id, seed])
+        }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        let family = Set(snFoldFamilyIds(
+            id: snBareMarmotGroupId(seed),
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ))
+        let wanted = groupIDs.union(family)
+        for group in localTranscriptGroups(for: id) where wanted.contains(group.id) {
+            let before = snFoldFamilyCanonicalMessageIDs(
+                groupId: group.id,
+                messagesByGroup: marmot.messagesByGroup,
+                historicalFolds: folds,
+                idOf: { $0.id },
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
             if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
                 marmotStagedPageRescanIds.insert(group.id)
                 result.record(
                     before: before,
-                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+                    after: snFoldFamilyCanonicalMessageIDs(
+                        groupId: group.id,
+                        messagesByGroup: marmot.messagesByGroup,
+                        historicalFolds: folds,
+                        idOf: { $0.id },
+                        openedConversationId: remount.opened,
+                        openedConversationPaneId: remount.pane
+                    )
                 )
             }
         }
@@ -5987,8 +10605,43 @@ final class SonarAppStore: ObservableObject {
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else { return [] }
         let folded = directMarmotGroups(matchingGroupId: groupId)
-        if !folded.isEmpty { return folded }
-        return [MarmotService.MarmotGroup(id: groupId, name: "", memberNpubs: [])]
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        // Load-older / newest / preserve must page the hidden 0.8 sibling
+        // too. Listed live-only groups miss bak remainder when core
+        // `fold_family(live)` is not ready yet. Compose `transcriptGroupIds`
+        // / `meshFoldTranscriptSourceIds`.
+        let (opened, pane) = remountOpenedAndPane()
+        let ids = snMeshFoldTranscriptSourceIds(
+            listedDirectIds: folded.map(\.id),
+            historicalFolds: folds,
+            resolvedGroupId: groupId,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        let byId = Dictionary(uniqueKeysWithValues: folded.map { ($0.id, $0) })
+        return ids.map { pagingId in
+            byId[pagingId] ?? MarmotService.MarmotGroup(id: pagingId, name: "", memberNpubs: [])
+        }
+    }
+
+    /// Already-loaded fold-family Marmot rows. `ConversationViewState`
+    /// raises `sourceMessageLimit` to this count so remounted 0.8
+    /// extract rows stay reachable without a new database id.
+    func cachedMarmotFamilyRowCount(for conversationId: String) -> Int {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let seed = localTranscriptGroups(for: conversationId).first?.id
+            ?? marmotGroupId(conversationId)
+        guard let seed else { return 0 }
+        var seen = Set<String>()
+        let (opened, pane) = remountOpenedAndPane()
+        return snFoldFamilyCachedMessages(
+            groupId: seed,
+            messagesByGroup: marmot.messagesByGroup,
+            historicalFolds: folds,
+            idOf: { $0.id },
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ).filter { seen.insert($0.id).inserted }.count
     }
 
     /// How one chat line renders: regular text, a ⚡PAY receipt bubble,
@@ -6064,7 +10717,7 @@ final class SonarAppStore: ObservableObject {
         limit: Int? = nil,
         newestOffset: Int = 0
     ) -> [(Date, SNMessage)] {
-        let relevant = paymentActivityLedger.activities(peerKey: id).filter { activity in
+        let relevant = paymentActivityLedger.activities(peerKeys: paymentActivityKeys(for: id)).filter { activity in
             payLedger.entry(for: activity.id) == nil || !transcriptPayIDs.contains(activity.id)
         }.sorted { lhs, rhs in
             (lhs.settledAt ?? lhs.createdAt) < (rhs.settledAt ?? rhs.createdAt)
@@ -6133,8 +10786,20 @@ final class SonarAppStore: ObservableObject {
             // Built once per page: per-row it would repeat a bech32 decode for
             // every group member on every message.
             let mentionCtx = mentionContext(forConversationId: id)
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let (opened, pane) = remountOpenedAndPane()
             for group in sourceGroups {
-                let groupMessages = marmot.messagesByGroup[group.id] ?? []
+                let groupMessages = snFoldFamilyCachedMessages(
+                    groupId: group.id,
+                    messagesByGroup: marmot.messagesByGroup,
+                    historicalFolds: folds,
+                    idOf: { $0.id },
+                    openedConversationId: opened,
+                    openedConversationPaneId: pane
+                ).sorted {
+                    if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+                    return $0.createdAt < $1.createdAt
+                }
                 let parentAuthorById = snReplyParentAuthorsById(
                     groupMessages.map {
                         (
@@ -6261,9 +10926,13 @@ final class SonarAppStore: ObservableObject {
                 }
                 dated.sort { $0.0 < $1.0 }
             }
-            let echoIds = ([id] + sourceGroups.map { Self.marmotIDPrefix + $0.id }).reduce(into: [String]()) { ids, echoId in
-                if !ids.contains(echoId) { ids.append(echoId) }
-            }
+            let echoIds = snPendingMessageKeys(
+                conversationId: id,
+                sourceGroupIds: sourceGroups.map(\.id),
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
             for echoId in echoIds {
                 dated += Self.transcriptSource(
                     pendingMarmotMessagesByChat[echoId] ?? [],
@@ -6364,8 +11033,21 @@ final class SonarAppStore: ObservableObject {
         // stores but RENDERS them as one, merged chronologically; the
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let (opened, pane) = remountOpenedAndPane()
+            let groupMessages = snFoldFamilyCachedMessages(
+                groupId: group.id,
+                messagesByGroup: marmot.messagesByGroup,
+                historicalFolds: folds,
+                idOf: { $0.id },
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            ).sorted {
+                if $0.createdAt == $1.createdAt { return $0.id < $1.id }
+                return $0.createdAt < $1.createdAt
+            }
             dated += Self.transcriptSource(
-                marmot.messagesByGroup[group.id] ?? [],
+                groupMessages,
                 limit: limit
             ).compactMap { m in
                 // Drop a blocked person's messages from the transcript, the
@@ -6434,7 +11116,7 @@ final class SonarAppStore: ObservableObject {
         limit: Int?,
         newestOffset: Int
     ) -> [SNMessage] {
-        let calls = callLogs[id] ?? []
+        let calls = callLogsForChat(id)
         var combined = dated
         for c in Self.transcriptSource(calls, limit: limit, newestOffset: newestOffset) {
             var message = c.message
@@ -6475,8 +11157,23 @@ final class SonarAppStore: ObservableObject {
             chatViewModel.sendPrivateMessage(text, to: PeerID(str: route), replyTo: reply?.parentId)
             return
         }
-        if let groupId = marmotGroupId(id) {
-            marmot.send(text, to: groupId, reply: marmotReply)
+        if let groupId = marmotSendTargetGroupId(id) {
+            let onFailure: () -> Void = { [weak self] in
+                guard let self else { return }
+                self.noteRecoveredChatSendFailure(id, error: self.marmot.errorText ?? "")
+            }
+            if let group = marmotGroup(byId: groupId),
+               let peer = directMarmotPeerKey(in: group),
+               marmotGroups(forNpub: peer).count > 1 {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let ffi = await self.ffiFoldsForDirectNpub(peer)
+                    let target = self.marmotSendTargetGroupId(id, ffiHistoricalFolds: ffi) ?? groupId
+                    self.marmot.send(text, to: target, reply: marmotReply, onFailure: onFailure)
+                }
+                return
+            }
+            marmot.send(text, to: groupId, reply: marmotReply, onFailure: onFailure)
             return
         }
         if let pendingNpub = pendingMarmotNpub(for: id) {
@@ -6504,24 +11201,44 @@ final class SonarAppStore: ObservableObject {
     /// reuse the content already retained for that exact bubble.
     func retryDm(_ id: String, message: SNMessage) {
         guard snCanRetryFailedMessage(message) else { return }
-        let groupId = message.media.first?.groupId
+        let persistGroupId = message.media.first?.groupId
             ?? marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
 
-        if let groupId,
+        if let persistGroupId,
            MarmotChatModel.isFailedOptimisticMessageId(message.id),
            !message.media.isEmpty {
-            retryFailedMedia(message, groupId: groupId)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let groupId = await self.resolvedMarmotOutboundGroupId(id, fallback: persistGroupId)
+                    ?? persistGroupId
+                self.retryFailedMedia(message, groupId: groupId)
+            }
             return
         }
 
-        if let groupId, snIsFailedOptimisticStickerMessage(message) {
-            retryFailedSticker(message, groupId: groupId)
+        if let persistGroupId, snIsFailedOptimisticStickerMessage(message) {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let groupId = await self.resolvedMarmotOutboundGroupId(id, fallback: persistGroupId)
+                    ?? persistGroupId
+                self.retryFailedSticker(message, groupId: groupId)
+            }
             return
         }
 
         if message.id.hasPrefix("echo-") {
-            retryFailedPendingText(id, message: message, groupId: groupId)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let groupId: String?
+                if let persistGroupId {
+                    groupId = await self.resolvedMarmotOutboundGroupId(id, fallback: persistGroupId)
+                        ?? persistGroupId
+                } else {
+                    groupId = nil
+                }
+                self.retryFailedPendingText(id, message: message, groupId: groupId)
+            }
             return
         }
 
@@ -6653,12 +11370,14 @@ final class SonarAppStore: ObservableObject {
             for line in lines { chatViewModel.sendPrivateMessage(line, to: peer) }
             return true
         }
-        if let groupId = marmotGroupId(id) {
+        if marmotOutboundGroupId(id) != nil {
+            guard let groupId = await resolvedMarmotOutboundGroupId(id) else { return false }
             return await marmot.send(lines, to: groupId)
         }
         if let profile = resolvedSonarProfile(id) {
             if let group = marmotGroup(forNpub: profile.npub) {
-                return await marmot.send(lines, to: group.id)
+                let groupId = await resolvedMarmotOutboundGroupId(id, fallback: group.id) ?? group.id
+                return await marmot.send(lines, to: groupId)
             }
             marmot.connectIfNeeded()
             guard let groupId = await marmot.startChatReturningId(with: profile.npub) else { return false }
@@ -6678,13 +11397,17 @@ final class SonarAppStore: ObservableObject {
             chatViewModel.sendPrivateMessage(content, to: PeerID(str: route))
             return
         }
-        if let groupId = marmotGroupId(id) {
-            marmot.sendSticker(
-                groupId: groupId,
-                packCoordinate: packCoordinate,
-                shortcode: sticker.shortcode,
-                plaintextSha256: sticker.sha256
-            )
+        if marmotOutboundGroupId(id) != nil {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let groupId = await self.resolvedMarmotOutboundGroupId(id) else { return }
+                self.marmot.sendSticker(
+                    groupId: groupId,
+                    packCoordinate: packCoordinate,
+                    shortcode: sticker.shortcode,
+                    plaintextSha256: sticker.sha256
+                )
+            }
             return
         }
         if let pendingNpub = pendingMarmotNpub(for: id) {
@@ -6706,6 +11429,19 @@ final class SonarAppStore: ObservableObject {
 
     private func sendOverMarmotSticker(npub: String, packCoordinate: String, sticker: StickerInfo) {
         if let group = marmotGroup(forNpub: npub) {
+            if directMarmotHasDuplicateSiblings(group.id) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let groupId = await self.resolvedMarmotOutboundGroupId(forNpub: npub) ?? group.id
+                    self.marmot.sendSticker(
+                        groupId: groupId,
+                        packCoordinate: packCoordinate,
+                        shortcode: sticker.shortcode,
+                        plaintextSha256: sticker.sha256
+                    )
+                }
+                return
+            }
             marmot.sendSticker(
                 groupId: group.id,
                 packCoordinate: packCoordinate,
@@ -6725,6 +11461,14 @@ final class SonarAppStore: ObservableObject {
 
     private func sendOverMarmot(_ text: String, npub: String, reply: MarmotService.MarmotReplyRef? = nil) {
         if let group = marmotGroup(forNpub: npub) {
+            if directMarmotHasDuplicateSiblings(group.id) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let groupId = await self.resolvedMarmotOutboundGroupId(forNpub: npub) ?? group.id
+                    self.marmot.send(text, to: groupId, reply: reply)
+                }
+                return
+            }
             marmot.send(text, to: group.id, reply: reply)
             return
         }
@@ -6900,6 +11644,854 @@ final class SonarAppStore: ObservableObject {
         }
         flushPendingDirectMarmot(npub: npub, groupId: groupId, realId: realId)
         openedDM(realId, marmotGroupId: groupId)
+    }
+
+    /// Persisted folds first so a promote before FFI `liveFoldTarget` still
+    /// remounts host state onto the live sibling (Compose `persistedLiveFoldTarget`).
+    private func resolvedLiveFoldTarget(for groupId: String) async -> String? {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        return snResolvedLiveFoldTarget(
+            groupId: groupId,
+            historicalFolds: folds,
+            ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId),
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+    }
+
+    /// Copy a mute from a hidden 0.8 row onto the live 0.9 sibling.
+    @MainActor
+    private func promoteFoldedMutes(from previous: Set<String>, to current: Set<String>) async {
+        var muteGroupIds = Set<String>()
+        for key in SonarChatMuteStore.shared.mutedUntil.keys {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                muteGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                muteGroupIds.insert(key.lowercased())
+            }
+        }
+        var targets: [String: String] = [:]
+        for historical in previous.union(muteGroupIds).subtracting(current) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
+                targets[historical] = live
+            }
+        }
+        let pairs = snPromotedFoldedMutePairs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            muteKeys: muteGroupIds,
+            liveFoldTarget: { targets[$0] }
+        )
+        for pair in pairs {
+            let historicalKeys = [
+                pair.historical,
+                Self.marmotIDPrefix + pair.historical
+            ]
+            guard let until = SonarChatMuteStore.shared.muteEnd(anyOf: historicalKeys) else {
+                continue
+            }
+            let liveId = Self.marmotIDPrefix + pair.live
+            let liveUntil = SonarChatMuteStore.shared.muteEnd(anyOf: muteKeys(forChatId: liveId))
+            SonarChatMuteStore.shared.mute(
+                keys: muteKeys(forChatId: liveId),
+                until: max(until, liveUntil ?? until)
+            )
+        }
+        if !pairs.isEmpty {
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
+    }
+
+    /// Copy a draft / reply target from a hidden 0.8 row onto the live sibling.
+    @MainActor
+    private func promoteFoldedComposerState(from previous: Set<String>, to current: Set<String>) async {
+        var extraGroupIds = Set<String>()
+        for key in Set(composerDrafts.keys).union(composerReplyByChat.keys) {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                extraGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                extraGroupIds.insert(key.lowercased())
+            }
+        }
+        var targets: [String: String] = [:]
+        for historical in previous.union(extraGroupIds).subtracting(current) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
+                targets[historical] = live
+            }
+        }
+        var draftsByGroup: [String: String] = [:]
+        for (key, value) in composerDrafts {
+            guard !value.isEmpty else { continue }
+            let groupId: String
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                groupId = String(key.dropFirst(Self.marmotIDPrefix.count))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                groupId = key.lowercased()
+            } else {
+                continue
+            }
+            draftsByGroup[groupId] = value
+        }
+        let nextDrafts = snPromotedFoldedComposerDrafts(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            drafts: draftsByGroup,
+            liveFoldTarget: { targets[$0] }
+        )
+        for (groupId, draft) in nextDrafts {
+            guard current.contains(groupId) else { continue }
+            let liveId = Self.marmotIDPrefix + groupId
+            if composerDraft(for: liveId).isEmpty {
+                setComposerDraft(draft, for: liveId)
+            }
+        }
+        let pairs = snPromotedFoldedMutePairs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            muteKeys: extraGroupIds,
+            liveFoldTarget: { targets[$0] }
+        )
+        for pair in pairs {
+            let historicalIds = [pair.historical, Self.marmotIDPrefix + pair.historical]
+            let liveId = Self.marmotIDPrefix + pair.live
+            guard composerReplyByChat[liveId] == nil else { continue }
+            if let reply = historicalIds.compactMap({ composerReplyByChat[$0] }).first {
+                composerReplyByChat[liveId] = reply
+            }
+        }
+    }
+
+    /// Copy an in-memory recovered transcript onto the live sibling so home
+    /// preview / open-chat first paint do not miss the hidden 0.8 id.
+    @MainActor
+    private func promoteFoldedTranscriptCache(from previous: Set<String>, to current: Set<String>) async {
+        var extraGroupIds = Set(marmot.messagesByGroup.keys)
+        extraGroupIds.formUnion(previous)
+        extraGroupIds.subtract(current)
+        var targets: [String: String] = [:]
+        for historical in extraGroupIds {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedMessagesByGroup(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            messagesByGroup: marmot.messagesByGroup,
+            liveFoldTarget: { targets[$0] },
+            idOf: { $0.id }
+        )
+        if next != marmot.messagesByGroup {
+            marmot.messagesByGroup = next
+        }
+        marmot.promoteFoldedLocalTranscriptPaging(
+            from: previous,
+            to: current,
+            liveFoldTarget: { targets[$0] }
+        )
+    }
+
+    /// Keep an in-flight send echo on the live sibling after FFI hides the 0.8 id.
+    @MainActor
+    private func promoteFoldedPendingEchoes(from previous: Set<String>, to current: Set<String>) async {
+        var extraGroupIds = Set<String>()
+        for key in pendingMarmotMessagesByChat.keys {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                extraGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                extraGroupIds.insert(key.lowercased())
+            }
+        }
+        extraGroupIds.formUnion(previous)
+        extraGroupIds.subtract(current)
+        var targets: [String: String] = [:]
+        for historical in extraGroupIds {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
+                targets[historical] = live
+            }
+        }
+        var byGroup: [String: [SNMessage]] = [:]
+        for (key, rows) in pendingMarmotMessagesByChat {
+            let groupId: String
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                groupId = String(key.dropFirst(Self.marmotIDPrefix.count))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                groupId = key.lowercased()
+            } else {
+                continue
+            }
+            byGroup[groupId, default: []].append(contentsOf: rows)
+        }
+        let next = snPromotedFoldedPendingMessages(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            messagesByChat: byGroup,
+            liveFoldTarget: { targets[$0] },
+            idOf: { $0.id }
+        )
+        for (groupId, rows) in next where current.contains(groupId) {
+            let liveId = Self.marmotIDPrefix + groupId
+            let existing = pendingMarmotMessagesByChat[liveId] ?? []
+            var seen = Set(existing.map(\.id))
+            var merged = existing
+            for row in rows where seen.insert(row.id).inserted {
+                merged.append(row)
+            }
+            if merged.isEmpty {
+                pendingMarmotMessagesByChat[liveId] = nil
+            } else {
+                pendingMarmotMessagesByChat[liveId] = merged
+            }
+        }
+        let pairs = snPromotedFoldedMutePairs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            muteKeys: extraGroupIds,
+            liveFoldTarget: { targets[$0] }
+        )
+        for pair in pairs {
+            remountFoldedPendingSendQueues(
+                from: [pair.historical, Self.marmotIDPrefix + pair.historical],
+                onto: Self.marmotIDPrefix + pair.live
+            )
+            remountFoldedPendingUploadMedia(from: pair.historical, onto: pair.live)
+            if let until = trillCooldownUntilByChat[pair.historical]
+                ?? trillCooldownUntilByChat[Self.marmotIDPrefix + pair.historical] {
+                let liveId = Self.marmotIDPrefix + pair.live
+                if trillCooldownUntilByChat[liveId] == nil {
+                    trillCooldownUntilByChat[liveId] = until
+                }
+                if trillCooldownUntilByChat[pair.live] == nil {
+                    trillCooldownUntilByChat[pair.live] = until
+                }
+            }
+        }
+    }
+
+    /// Copy a safety-number verify from a hidden 0.8 row onto the live sibling.
+    @MainActor
+    private func promoteFoldedVerified(from previous: Set<String>, to current: Set<String>) async {
+        var verifiedGroupIds = Set<String>()
+        for key in marmotVerified.keys where marmotVerified[key] == true {
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                verifiedGroupIds.insert(String(key.dropFirst(Self.marmotIDPrefix.count)))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                verifiedGroupIds.insert(key.lowercased())
+            }
+        }
+        let remount = remountOpenedAndPane()
+        let persistedFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let recovered = snRecoveredVerifiedIdsFromFolds(
+            folds: persistedFolds,
+            verifiedIds: verifiedGroupIds,
+            historicalBlobVerified: { id in
+                marmotVerified[id] == true || marmotVerified[Self.marmotIDPrefix + id] == true
+            },
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        var targets: [String: String] = snRemountPairHistoricalFolds(
+            historicalFolds: persistedFolds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        for historical in previous.union(recovered).subtracting(current) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedVerifiedIds(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            verifiedIds: recovered,
+            liveFoldTarget: { targets[$0] }
+        )
+        var changed = false
+        for groupId in next where current.contains(groupId) {
+            if marmotVerified[groupId] != true {
+                marmotVerified[groupId] = true
+                changed = true
+            }
+        }
+        if changed {
+            defaults.set(marmotVerified, forKey: Keys.marmotVerified)
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
+    }
+
+    /// Keep call/pay/notification watermarks on the live sibling after FFI hide.
+    @MainActor
+    private func promoteFoldedScanWatermarks(from previous: Set<String>, to current: Set<String>) async {
+        var extra = Set(marmotMessageScanWatermark.keys)
+        extra.formUnion(previous)
+        extra.subtract(current)
+        var targets: [String: String] = [:]
+        for historical in extra {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedScanMarks(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            watermarks: marmotMessageScanWatermark,
+            liveFoldTarget: { targets[$0] }
+        )
+        if next != marmotMessageScanWatermark {
+            marmotMessageScanWatermark = next
+        }
+    }
+
+    /// Remember hist→live bindings so the next cold-start snapshot can hide
+    /// a folded 0.8 row before FFI `groups()` returns.
+    @MainActor
+    private func rememberHistoricalFolds(from previous: Set<String>, to current: Set<String>) async {
+        var map = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        var changed = false
+        let listed = Array(previous.union(current).union(Set(map.keys)).union(Set(map.values)))
+        var liveById: [String: String] = [:]
+        var aliasesById: [String: [String]] = [:]
+        for id in listed {
+            if let live = await resolvedLiveFoldTarget(for: id) {
+                liveById[id] = live
+            }
+            aliasesById[id] = await marmot.foldAliases(groupId: id)
+        }
+        let discovered = map.isEmpty
+            ? snHistoricalFoldsAfterAccountRestore(
+                previousAccountFolds: [:],
+                listedIds: listed,
+                foldAliases: { aliasesById[$0] ?? [] },
+                liveFoldTarget: { liveById[$0] }
+            )
+            : snHistoricalFoldsFromAliases(
+                listedIds: listed,
+                foldAliases: { aliasesById[$0] ?? [] },
+                liveFoldTarget: { liveById[$0] }
+            )
+        for (historical, live) in discovered {
+            if map[historical] != live {
+                map[historical] = live
+                changed = true
+            }
+        }
+        for id in listed {
+            guard let live = liveById[id], live != id else { continue }
+            if map[id] != live {
+                map[id] = live
+                changed = true
+            }
+        }
+        let listedAuthoritative = !current.isEmpty || !previous.isEmpty
+        let pruned = snPrunedOrphanedHistoricalFolds(
+            map,
+            listedIds: current,
+            listedAuthoritative: listedAuthoritative
+        )
+        if pruned != map {
+            map = pruned
+            changed = true
+        }
+        if changed {
+            snPersistHistoricalFolds(map, to: defaults)
+            invalidateHomeDMRows()
+        } else if let shared = UserDefaults(suiteName: Self.appGroupId),
+                  (shared.dictionary(forKey: Keys.historicalFolds) as? [String: String]) != map {
+            // Heal an App Group mirror that missed a mid-session delete.
+            shared.set(map, forKey: Keys.historicalFolds)
+        }
+        promoteMutesFromHistoricalFolds(map, remount: remountOpenedAndPane())
+        promotePaymentActivitiesFromHistoricalFolds(map, remount: remountOpenedAndPane())
+    }
+
+    /// Persist-rewrite 0.8-keyed wallet rows onto the live sibling. Always
+    /// runs so already-folded testers remount on the next `groups()` sink.
+    /// Empty persist-folds still walk the remount pair.
+    @MainActor
+    private func promotePaymentActivitiesFromHistoricalFolds(
+        _ folds: [String: String],
+        remount: (opened: String?, pane: String?) = (nil, nil)
+    ) {
+        let folds = snRemountPairHistoricalFolds(
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        guard !folds.isEmpty else { return }
+        var changed = false
+        for (historical, live) in folds {
+            guard !live.isEmpty, live != historical else { continue }
+            let liveId = live.hasPrefix(Self.marmotIDPrefix) ? live : Self.marmotIDPrefix + live
+            let historicalKeys: Set<String> = [
+                historical,
+                Self.marmotIDPrefix + historical,
+                snBareMarmotGroupId(historical)
+            ]
+            if paymentActivityLedger.remountPeerKeys(historicalKeys: historicalKeys, onto: liveId) {
+                changed = true
+            }
+        }
+        if changed {
+            objectWillChange.send()
+        }
+    }
+
+    /// A mute stored on the recovered 0.8 id must also cover the live 0.9
+    /// sibling so killed-app NSE / push can match before the next refresh.
+    /// Empty persist-folds still walk the remount pair.
+    @MainActor
+    private func promoteMutesFromHistoricalFolds(
+        _ folds: [String: String],
+        remount: (opened: String?, pane: String?) = (nil, nil)
+    ) {
+        let folds = snRemountPairHistoricalFolds(
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        guard !folds.isEmpty else { return }
+        var changed = false
+        for (historical, live) in folds {
+            guard !live.isEmpty, live != historical else { continue }
+            let historicalKeys = [historical, Self.marmotIDPrefix + historical]
+            guard let until = SonarChatMuteStore.shared.muteEnd(anyOf: historicalKeys) else {
+                continue
+            }
+            let liveId = Self.marmotIDPrefix + live
+            let liveUntil = SonarChatMuteStore.shared.muteEnd(anyOf: muteKeys(forChatId: liveId))
+            if liveUntil == nil || liveUntil! < until {
+                SonarChatMuteStore.shared.mute(
+                    keys: muteKeys(forChatId: liveId),
+                    until: until
+                )
+                changed = true
+            }
+        }
+        if changed {
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
+    }
+
+    /// Copy persisted call-log rows from a hidden 0.8 id onto the live sibling.
+    @MainActor
+    private func promoteFoldedCallLogs(from previous: Set<String>, to current: Set<String>) async {
+        var logsByGroup: [String: [SNCallRecord]] = [:]
+        var extra = Set<String>()
+        for (key, records) in callLogs {
+            guard !records.isEmpty else { continue }
+            let groupId: String
+            if key.hasPrefix(Self.marmotIDPrefix) {
+                groupId = String(key.dropFirst(Self.marmotIDPrefix.count))
+            } else if key.count == 64, key.allSatisfy(\.isHexDigit) {
+                groupId = key.lowercased()
+            } else {
+                continue
+            }
+            extra.insert(groupId)
+            logsByGroup[groupId] = records
+        }
+        var targets: [String: String] = [:]
+        for historical in previous.union(extra).subtracting(current) {
+            if let live = await resolvedLiveFoldTarget(for: historical) {
+                targets[historical] = live
+            }
+        }
+        let next = snPromotedFoldedCallLogs(
+            previousGroupIds: previous,
+            currentGroupIds: current,
+            callLogs: logsByGroup,
+            liveFoldTarget: { targets[$0] }
+        )
+        var changed = false
+        for (groupId, records) in next where current.contains(groupId) {
+            let liveId = Self.marmotIDPrefix + groupId
+            if callLogs[liveId] != records {
+                callLogs[liveId] = records
+                changed = true
+            }
+        }
+        if changed {
+            persistCallLogs()
+        }
+    }
+
+    /// Newest-page hidden 0.8 siblings that have never been paged. Host
+    /// remount drops the hist cache key; paging maps keep hist once it has
+    /// a cursor / hasOlder entry, so this is not a tight loop on summaries.
+    /// `currentDMId` may be a mesh peer — `marmotGroupId` resolves the WN
+    /// family first. Compose `pageHiddenFoldFamilyForOpenLiveChat` now
+    /// does the same via `transcriptGroupIds` / `localTranscriptRowsForChat`.
+    @MainActor
+    private func pageUnpagedHiddenFoldFamily(for groupId: String) async {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        let unpaged = snHiddenFoldFamilyIdsNeedingPage(
+            groupId: groupId,
+            historicalFolds: folds,
+            pagedGroupIds: marmot.pagedLocalTranscriptGroupIds(),
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        for sibling in unpaged {
+            _ = await marmot.loadLocalPage(groupId: sibling, mode: .newestPage)
+        }
+    }
+
+    /// FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
+    /// transcript — or in group-info / contact-profile / an in-flight call on
+    /// that id — swap the nav id to the live 0.9 sibling.
+    @MainActor
+    private func remountFoldedOpenChatIfNeeded() async {
+        let listed = Set(marmot.groups.map(\.id))
+        var knownLiveTargets: [String: String] = [:]
+        var preserveOpenTranscriptIds: Set<String> = []
+        defer {
+            remountFoldedNavigationPath(
+                listedGroupIds: listed,
+                knownLiveTargets: knownLiveTargets,
+                preserveIds: preserveOpenTranscriptIds
+            )
+            syncViewingUnreadGroups()
+        }
+        guard let openId = currentDMId, let groupId = marmotGroupId(openId) else { return }
+        let live = await resolvedLiveFoldTarget(for: groupId)
+        let remounted = snRemountFoldedOpenGroupId(
+            openGroupId: groupId,
+            listedGroupIds: listed,
+            liveFoldTarget: live
+        )
+        if remounted != groupId {
+            knownLiveTargets[groupId] = remounted
+            knownLiveTargets[snBareMarmotGroupId(openId)] = remounted
+        } else if let live, !live.isEmpty, live != groupId {
+            knownLiveTargets[groupId] = live
+            knownLiveTargets[snBareMarmotGroupId(openId)] = live
+        }
+        let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let pathIds = snPathConversationIds(path) + [openId, groupId]
+        if snPathRemountShouldMergeFolds(pathIds: pathIds, persistedFolds: blob) {
+            _ = await adoptMergedActionFolds(for: pathIds)
+        }
+        guard remounted != groupId else {
+            // Already sitting on live. Persist-folds remounts hist onto this
+            // id without re-running openedDM — still newest-page the hidden
+            // sibling so extract / bak stay reachable.
+            await pageUnpagedHiddenFoldFamily(for: groupId)
+            return
+        }
+        let realId = Self.marmotIDPrefix + remounted
+        cancelOpeningHydrateForFoldRemount(
+            openId: openId,
+            groupId: groupId,
+            liveId: realId,
+            liveGroupId: remounted
+        )
+        marmot.remountFoldedLocalTranscriptWindow(from: groupId, onto: remounted)
+        remountFoldedPendingEchoes(from: [openId, groupId], onto: realId)
+        remountFoldedPendingSendQueues(from: [openId, groupId], onto: realId)
+        trillCooldownUntilByChat = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: trillCooldownUntilByChat
+        )
+        unreadCountAtOpenByDM = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: unreadCountAtOpenByDM
+        )
+        jumpMessageIdAtOpenByDM = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: jumpMessageIdAtOpenByDM
+        )
+        pendingJumpMessageIdByDM = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: pendingJumpMessageIdByDM
+        )
+        remountFoldedConversationViewState(from: openId, groupId: groupId, onto: realId)
+        remountFoldedPendingUploadMedia(from: groupId, onto: remounted)
+        paymentActivityLedger.remountPeerKeys(
+            historicalKeys: [openId, groupId],
+            onto: realId
+        )
+        if pendingMediaPreviews.contains(where: { $0.peerId == openId || $0.peerId == groupId }) {
+            pendingMediaPreviews = pendingMediaPreviews.map { preview in
+                PendingMediaPreview(
+                    peerId: snRemountFoldedOpenId(
+                        historicalKeys: [openId, groupId],
+                        liveId: realId,
+                        id: preview.peerId
+                    ),
+                    tempURL: preview.tempURL,
+                    filename: preview.filename,
+                    mime: preview.mime,
+                    caption: preview.caption
+                )
+            }
+        }
+        composerDrafts = snRemountComposerDrafts(
+            drafts: composerDrafts,
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted]
+        )
+        composerDraftHasText = snRemountComposerDraftHasText(
+            flags: composerDraftHasText,
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted]
+        )
+        composerReplyByChat = snRemountFoldedOpenValues(
+            historicalKeys: [openId, groupId],
+            liveKeys: [realId, remounted],
+            values: composerReplyByChat
+        )
+        if let historical = callLogs[openId] ?? callLogs[groupId], !historical.isEmpty {
+            var byId: [String: SNCallRecord] = [:]
+            for record in historical { byId[record.id] = record }
+            for record in callLogs[realId] ?? [] { byId[record.id] = record }
+            callLogs[realId] = Array(
+                byId.values.sorted { $0.date < $1.date }.suffix(Self.maxStoredCallsPerConversation)
+            )
+            persistCallLogs()
+        }
+        if recoveredChatNeedsUpdate.contains(openId) || recoveredChatNeedsUpdate.contains(groupId)
+            || recoveredChatNeedsUpdate.contains(realId) || recoveredChatNeedsUpdate.contains(remounted) {
+            recoveredChatNeedsUpdate = snRemountClearsRecoveredWaitingFlag(
+                needsUpdate: recoveredChatNeedsUpdate,
+                remountedIds: [openId, groupId, realId, remounted]
+            )
+        }
+        if marmotVerified[groupId] == true, marmotVerified[remounted] != true {
+            marmotVerified[remounted] = true
+            defaults.set(marmotVerified, forKey: Keys.marmotVerified)
+        }
+        preserveOpenTranscriptIds = Set(
+            [openId, groupId, openedConversationPaneId].compactMap { $0 }.filter { !$0.isEmpty }
+        )
+        openedConversationId = realId
+        marmot.rememberRemountPair(
+            openedConversationId: realId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+        // openedDM cleared hist-only before this remount pair existed.
+        // Live shade from a background tap then stays up while the
+        // user is already in the recovered room. Compose remount hop
+        // and willPresent walk the same remount family.
+        clearNotificationsForConversation(realId)
+        let persistedFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        _ = snPromoteMutedFoldSiblings(
+            folds: persistedFolds,
+            openedConversationId: realId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+        promotePaymentActivitiesFromHistoricalFolds(
+            persistedFolds,
+            remount: (realId, openedConversationPaneId)
+        )
+        promoteFoldedPendingMediaPreviews()
+        // Keep `openedConversationPaneId` on hist. iPhone NavigationStack
+        // stays on `.dm(hist)` so the painted pane is not remade. Mac hops
+        // selection to live while `.id` stays hist. Same publish as
+        // pending→real for attachment-import preserve.
+        pendingMarmotRouteReplacement = SNMarmotRouteReplacement(
+            pendingId: openId,
+            realId: realId
+        )
+        // Do not call `openedDM` here: it hydrates the live id as a fresh
+        // open (`loadLocalWhenConnected` newest-page) and would snap a
+        // scrolled recovered transcript back to the tail.
+        // iPhone keeps the hist pane/CVS active. Mac hops selection onto
+        // live, so hist can deactivate.
+        #if !os(iOS)
+        conversationViewStates[openId]?.deactivate()
+        conversationViewStates[groupId]?.deactivate()
+        #endif
+        conversationViewStates[realId]?.activate()
+        rememberMarmotGroup(remounted, forConversationId: realId)
+        // Compose remount hop markGroupsRead after the remount pair
+        // exists. conversationChanged can race before hop and miss
+        // live unread while the user is already in the recovered room.
+        markMarmotGroupsRead(matchingGroupId: remounted)
+        syncViewingUnreadGroups()
+        Task {
+            await self.marmot.refreshWhenConnected(groupId: remounted, hydrateBeforeSync: false)
+            self.localHydratingDMs.remove(realId)
+            self.localHydratingDMs.remove(remounted)
+            self.localHydratingDMs.remove(openId)
+            self.localHydratingDMs.remove(groupId)
+        }
+    }
+
+    /// Rewrite group-info / contact-profile / call / buried DM routes after
+    /// FFI hides a folded 0.8 id. Transcript remount still copies host state
+    /// when the open route is a DM.
+    private func remountFoldedNavigationPath(
+        listedGroupIds: Set<String>,
+        knownLiveTargets: [String: String] = [:],
+        preserveIds: Set<String> = []
+    ) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        let next = snRemountFoldedPath(
+            path: path,
+            listedGroupIds: listedGroupIds,
+            liveFoldTarget: { id in
+                snPathRemountLiveTarget(
+                    id: id,
+                    persistedFolds: folds,
+                    knownLiveTargets: knownLiveTargets,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
+            },
+            preserveIds: preserveIds
+        )
+        if next != path {
+            path = next
+        }
+        if let call = activeCall {
+            let remounted = snRemountFoldedConversationId(
+                call.convId,
+                listedGroupIds: listedGroupIds,
+                liveFoldTarget: snPathRemountLiveTarget(
+                    id: call.convId,
+                    persistedFolds: folds,
+                    knownLiveTargets: knownLiveTargets,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
+            )
+            if remounted != call.convId {
+                activeCall = SNActiveCall(
+                    callId: call.callId,
+                    convId: remounted,
+                    signalingVia: call.signalingVia,
+                    peerName: call.peerName,
+                    video: call.video,
+                    incoming: call.incoming,
+                    phase: call.phase,
+                    connectedSecs: call.connectedSecs,
+                    muted: call.muted,
+                    speakerOn: call.speakerOn
+                )
+            }
+        }
+    }
+
+    /// Stop in-flight hist newest-page before remount copies the window.
+    /// `openedDM` already passed `consumeOpenedDMHydrateSuppression`; a
+    /// sibling `.newestPage` on live drops the older-edge pin.
+    private func cancelOpeningHydrateForFoldRemount(
+        openId: String,
+        groupId: String,
+        liveId: String,
+        liveGroupId: String
+    ) {
+        let keys = snRemountOpeningHydrateKeys(
+            openId: openId,
+            groupId: groupId,
+            liveId: liveId,
+            liveGroupId: liveGroupId
+        )
+        for key in keys {
+            openingDMTasks.removeValue(forKey: key)?.cancel()
+            refreshingDMTasks.removeValue(forKey: key)?.cancel()
+            suppressOpenedDMHydrateIds.insert(key)
+        }
+        localHydratingDMs = snRemountLocalHydratingIds(
+            historicalKeys: [openId, groupId],
+            liveKeys: [liveId, liveGroupId],
+            hydrating: localHydratingDMs
+        )
+    }
+
+    /// Move in-flight send echoes off a hidden 0.8 conversation id.
+    private func remountFoldedPendingEchoes(from historicalIds: [String], onto liveId: String) {
+        var moved = pendingMarmotMessagesByChat[liveId] ?? []
+        var seen = Set(moved.map(\.id))
+        for historical in historicalIds {
+            guard let incoming = pendingMarmotMessagesByChat.removeValue(forKey: historical) else {
+                continue
+            }
+            for echo in incoming where seen.insert(echo.id).inserted {
+                moved.append(echo)
+            }
+        }
+        if moved.isEmpty {
+            pendingMarmotMessagesByChat[liveId] = nil
+        } else {
+            pendingMarmotMessagesByChat[liveId] = moved
+        }
+    }
+
+    /// Keep queued recovered sends pointed at the live conversation id so
+    /// fail/clear still finds the echo after remount.
+    private func remountFoldedPendingSendQueues(from historicalIds: [String], onto liveId: String) {
+        for historical in historicalIds {
+            if let queue = pendingDirectMarmotSends.removeValue(forKey: historical) {
+                let remounted = queue.map {
+                    SNPendingMarmotSend(
+                        chatId: liveId,
+                        text: $0.text,
+                        messageId: $0.messageId,
+                        reply: $0.reply
+                    )
+                }
+                pendingDirectMarmotSends[liveId, default: []].append(contentsOf: remounted)
+            }
+            if let queue = pendingMarmotGroupSends.removeValue(forKey: historical) {
+                pendingMarmotGroupSends[liveId, default: []].append(contentsOf: queue)
+            }
+        }
+    }
+
+    /// `ConversationViewState.conversationId` is immutable, so remount creates
+    /// a live-keyed state and copies the recovered window onto it.
+    private func remountFoldedConversationViewState(
+        from openId: String,
+        groupId: String,
+        onto realId: String
+    ) {
+        guard let historical = conversationViewStates[openId] ?? conversationViewStates[groupId]
+        else { return }
+        let liveState: ConversationViewState
+        if let existing = conversationViewStates[realId] {
+            liveState = existing
+        } else {
+            liveState = ConversationViewState(conversationId: realId, store: self)
+            conversationViewStates[realId] = liveState
+            retainedConversationOrder.removeAll { $0 == realId }
+            retainedConversationOrder.append(realId)
+        }
+        liveState.adoptOpenWindow(from: historical)
+        if historical.isPinnedToOlderEdge {
+            preserveHistoricalDM(realId)
+        }
+    }
+
+    /// Leave-paint `ConversationViewState` stays on the hidden 0.8 id when
+    /// fold lands after the user already left. Reopen of the live row must
+    /// still see that window (Compose `promoteFoldedRetainedTranscripts`).
+    @MainActor
+    private func promoteFoldedConversationViewStates(from previous: Set<String>, to current: Set<String>) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        var pairs: [(historical: String, live: String)] = []
+        for historical in previous.union(Set(folds.keys)).subtracting(current) {
+            if let live = folds[historical], current.contains(live) {
+                pairs.append((historical, live))
+            }
+        }
+        for pair in pairs {
+            remountFoldedConversationViewState(
+                from: Self.marmotIDPrefix + pair.historical,
+                groupId: pair.historical,
+                onto: Self.marmotIDPrefix + pair.live
+            )
+        }
     }
 
     private func resolvePendingSecureChats() {
@@ -7241,16 +12833,19 @@ final class SonarAppStore: ObservableObject {
     private func flushPendingMarmotSends() {
         guard !pendingMarmotSends.isEmpty else { return }
         for (npub, sends) in pendingMarmotSends {
-            guard let group = marmotGroup(forNpub: npub) else { continue }
+            guard marmotGroup(forNpub: npub) != nil else { continue }
             pendingMarmotSends[npub] = nil
             Task { @MainActor in
+                let groupId = await resolvedMarmotOutboundGroupId(forNpub: npub)
+                    ?? marmotGroup(forNpub: npub)?.id
+                guard let groupId else { return }
                 for send in sends {
                     // Await real send outcome without creating a second optimistic.
                     // Clear the mesh echo only once a folded canonical row exists.
-                    let ok = await sendQueuedMarmotContent(send.text, to: group.id, reply: send.reply)
+                    let ok = await sendQueuedMarmotContent(send.text, to: groupId, reply: send.reply)
                     guard !send.chatId.isEmpty, !send.messageId.isEmpty else { continue }
                     if ok {
-                        await clearMeshEchoWhenCanonical(send: send, groupId: group.id)
+                        await clearMeshEchoWhenCanonical(send: send, groupId: groupId)
                     } else {
                         failMeshMarmotSendEcho(send)
                         objectWillChange.send()
@@ -7274,7 +12869,7 @@ final class SonarAppStore: ObservableObject {
         let localURL: String
         let data: Data
         let startedAt: Date
-        let existingMediaURLs: Set<String>
+        var existingMediaURLs: Set<String>
         var completedOrder: Int?
     }
 
@@ -7285,6 +12880,10 @@ final class SonarAppStore: ObservableObject {
     private var pendingUploadMediaCache: [String: [PendingUploadMedia]] = [:]
     private var retryingFailedOptimisticMessageIDs: Set<String> = []
     private static let pendingMediaURLPrefix = "pending-media-"
+    /// Match Compose `BACKGROUND_TRANSCRIPT_SCAN_LIMIT` for send-time
+    /// published-URL exclusion. Newest 100 per sibling is enough to
+    /// catch remounted 0.8 attachments that share filename/mime.
+    private static let publishedMediaScanLimit: UInt32 = 100
 
     /// Map a Marmot message's attachments into UI items carrying the group id.
     static func mediaItems(_ m: MarmotService.MarmotMessage, groupId: String) -> [SNMediaItem] {
@@ -7313,6 +12912,124 @@ final class SonarAppStore: ObservableObject {
         [groupId, filename, mime, caption].joined(separator: "\u{1f}")
     }
 
+    /// After a hist→live remount the cache key prefix moves. In-flight
+    /// mark/forget/cache still pass the id captured at send start.
+    private func pendingUploadMediaCacheKey(
+        groupId: String,
+        filename: String,
+        mime: String,
+        caption: String
+    ) -> String {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        for alias in snPendingUploadLookupGroupIds(
+            groupId: groupId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
+            let key = Self.pendingUploadMediaKey(
+                groupId: alias,
+                filename: filename,
+                mime: mime,
+                caption: caption
+            )
+            if pendingUploadMediaCache[key] != nil { return key }
+        }
+        let store = snPendingUploadStoreGroupId(
+            groupId: groupId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        return Self.pendingUploadMediaKey(
+            groupId: store,
+            filename: filename,
+            mime: mime,
+            caption: caption
+        )
+    }
+
+    /// Preview sheet can stay up across a fold that remounts the open chat,
+    /// or after a notification tap already swapped the id to live. Empty
+    /// persist-folds still walk the remount pair.
+    @MainActor
+    private func promoteFoldedPendingMediaPreviews() {
+        guard !pendingMediaPreviews.isEmpty else { return }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        let next = pendingMediaPreviews.map { preview -> PendingMediaPreview in
+            let liveId = snPromotedFoldedPendingMediaPreviewPeerId(
+                peerId: preview.peerId,
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
+            guard liveId != preview.peerId else { return preview }
+            return PendingMediaPreview(
+                peerId: liveId,
+                tempURL: preview.tempURL,
+                filename: preview.filename,
+                mime: preview.mime,
+                caption: preview.caption
+            )
+        }
+        if next.map(\.peerId) != pendingMediaPreviews.map(\.peerId) {
+            pendingMediaPreviews = next
+        }
+    }
+
+    /// Keep in-flight upload bytes when resume folds the recovered id away.
+    private func remountFoldedPendingUploadMedia(from historical: String, onto live: String) {
+        guard historical != live, !historical.isEmpty, !live.isEmpty else { return }
+        var next: [String: [PendingUploadMedia]] = [:]
+        var changed = false
+        for (key, items) in pendingUploadMediaCache {
+            let remounted = snRemountedPendingUploadMediaKey(key, historical: historical, live: live)
+            if remounted != key { changed = true }
+            next[remounted, default: []].append(contentsOf: items)
+        }
+        if changed {
+            pendingUploadMediaCache = next
+        }
+    }
+
+    /// Newest-page each persist-folds sibling so a remounted 0.8 attachment
+    /// that is not yet in `messagesByGroup` still lands in the exclude set.
+    /// Compose `existingPublishedMediaUrls`.
+    private func existingPublishedMediaUrls(groupId: String) async -> Set<String> {
+        // First send after resume can mint live 0.9 before persist-folds.
+        // A live-only exclude set misses recovered 0.8 blossom URLs.
+        let folds = await adoptMergedActionFolds(for: [groupId])
+        let (opened, pane) = remountOpenedAndPane()
+        let ids = snMediaFetchGroupIds(
+            startGroupId: groupId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        let walk = ids.isEmpty ? [groupId] : ids
+        var pages: [String: [MarmotService.MarmotMessage]] = [:]
+        for id in walk {
+            let fetched = try? await marmot.messagesPage(
+                groupId: id,
+                limit: Self.publishedMediaScanLimit
+            )
+            let cached = marmot.messagesByGroup[id]
+                ?? marmot.messagesByGroup[snBareMarmotGroupId(id)]
+                ?? []
+            pages[id] = snPublishedMediaScanRows(loaded: fetched, cached: cached)
+        }
+        return snPublishedMediaUrlsFromFamilyPages(
+            startGroupId: groupId,
+            historicalFolds: folds,
+            pageForId: { pages[$0] ?? [] },
+            pendingPrefix: Self.pendingMediaURLPrefix,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
     private func rememberPendingUploadMedia(
         groupId: String,
         filename: String,
@@ -7320,13 +13037,30 @@ final class SonarAppStore: ObservableObject {
         caption: String,
         localURL: String,
         data: Data
-    ) {
-        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
-        let existingMediaURLs = Set(
-            marmot.messagesByGroup[groupId, default: []]
-                .flatMap { $0.media.map(\.url) }
-                .filter { !$0.hasPrefix(Self.pendingMediaURLPrefix) }
+    ) async {
+        let key = pendingUploadMediaCacheKey(
+            groupId: groupId,
+            filename: filename,
+            mime: mime,
+            caption: caption
         )
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        let cached = snPublishedMediaUrlsFromFamilyPages(
+            startGroupId: groupId,
+            historicalFolds: folds,
+            pageForId: { id in
+                marmot.messagesByGroup[id]
+                    ?? marmot.messagesByGroup[snBareMarmotGroupId(id)]
+                    ?? []
+            },
+            pendingPrefix: Self.pendingMediaURLPrefix,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        // Page hidden siblings before sendMedia so a later remainder tick
+        // cannot present a recovered isMine URL that was missing from cache.
+        let existingMediaURLs = cached.union(await existingPublishedMediaUrls(groupId: groupId))
         pendingUploadMediaCache[key, default: []].append(
             PendingUploadMedia(
                 localURL: localURL,
@@ -7348,7 +13082,12 @@ final class SonarAppStore: ObservableObject {
         caption: String,
         localURL: String
     ) {
-        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        let key = pendingUploadMediaCacheKey(
+            groupId: groupId,
+            filename: filename,
+            mime: mime,
+            caption: caption
+        )
         guard var pending = pendingUploadMediaCache[key],
               let index = pending.firstIndex(where: { $0.localURL == localURL }),
               pending[index].completedOrder == nil else { return }
@@ -7364,7 +13103,12 @@ final class SonarAppStore: ObservableObject {
         caption: String,
         localURL: String
     ) {
-        let key = Self.pendingUploadMediaKey(groupId: groupId, filename: filename, mime: mime, caption: caption)
+        let key = pendingUploadMediaCacheKey(
+            groupId: groupId,
+            filename: filename,
+            mime: mime,
+            caption: caption
+        )
         guard var pending = pendingUploadMediaCache[key] else { return }
         pending.removeAll { $0.localURL == localURL }
         if pending.isEmpty {
@@ -7381,7 +13125,7 @@ final class SonarAppStore: ObservableObject {
             for message in messages where message.isMine {
                 for media in message.media
                     where !media.url.hasPrefix(Self.pendingMediaURLPrefix) && mediaImageCache[media.url] == nil {
-                    let key = Self.pendingUploadMediaKey(
+                    let key = pendingUploadMediaCacheKey(
                         groupId: groupId,
                         filename: media.filename,
                         mime: media.mimeType,
@@ -7424,17 +13168,27 @@ final class SonarAppStore: ObservableObject {
         }
         guard retryingFailedOptimisticMessageIDs.insert(message.id).inserted else { return }
 
-        for payload in payloads {
-            rememberPendingUploadMedia(
-                groupId: groupId,
-                filename: payload.item.filename,
-                mime: payload.item.mime,
-                caption: message.text,
-                localURL: payload.item.url,
-                data: payload.data
-            )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            for payload in payloads {
+                await self.rememberPendingUploadMedia(
+                    groupId: groupId,
+                    filename: payload.item.filename,
+                    mime: payload.item.mime,
+                    caption: message.text,
+                    localURL: payload.item.url,
+                    data: payload.data
+                )
+            }
+            self.sendRetriedMedia(payloads, message: message, groupId: groupId)
         }
+    }
 
+    private func sendRetriedMedia(
+        _ payloads: [(item: SNMediaItem, data: Data)],
+        message: SNMessage,
+        groupId: String
+    ) {
         if payloads.count == 1, let payload = payloads.first {
             marmot.sendMedia(
                 groupId: groupId,
@@ -7615,52 +13369,51 @@ final class SonarAppStore: ObservableObject {
             sendImageOverMesh(PeerID(str: route), data: data)
             return
         }
-        let groupId: String?
-        if let gid = marmotGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else {
+        guard marmotOutboundGroupId(id) != nil else {
             showToast("Couldn't send the image — the secure chat isn't ready yet.")
             return
         }
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(
-            groupId: gid,
-            filename: filename,
-            mime: mime,
-            caption: "",
-            localURL: pendingURL,
-            data: data
-        )
-        marmot.sendMedia(
-            groupId: gid,
-            data: data,
-            filename: filename,
-            mime: mime,
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(
-                    groupId: gid,
-                    filename: filename,
-                    mime: mime,
-                    caption: "",
-                    localURL: pendingURL
-                )
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(
-                    groupId: gid,
-                    filename: filename,
-                    mime: mime,
-                    caption: "",
-                    localURL: pendingURL
-                )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else {
+                self.showToast("Couldn't send the image — the secure chat isn't ready yet.")
+                return
             }
-        )
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: filename,
+                mime: mime,
+                caption: "",
+                localURL: pendingURL,
+                data: data
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: data,
+                filename: filename,
+                mime: mime,
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
     }
 
     /// Send N images to one peer as ONE album message (single kind-445 with N
@@ -7695,30 +13448,13 @@ final class SonarAppStore: ObservableObject {
             }
             return
         }
-        let groupId: String?
-        if let gid = marmotGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else { return }
+        guard marmotOutboundGroupId(id) != nil else { return }
         // One pending-echo entry per attachment; the canonical album message
         // reconciles each media item against its filename-keyed cache entry.
         var albumItems: [MarmotService.MediaAlbumItem] = []
         var pendingURLs: [String] = []
         for item in items {
-            let pendingURL = Self.pendingMediaURL()
-            pendingURLs.append(pendingURL)
-            rememberPendingUploadMedia(
-                groupId: gid,
-                filename: item.filename,
-                mime: item.mime,
-                caption: "",
-                localURL: pendingURL,
-                data: item.data
-            )
+            pendingURLs.append(Self.pendingMediaURL())
             albumItems.append(
                 MarmotService.MediaAlbumItem(data: item.data, filename: item.filename, mime: item.mime)
             )
@@ -7726,33 +13462,47 @@ final class SonarAppStore: ObservableObject {
         let pairs = zip(items.map { ($0.filename, $0.mime) }, pendingURLs).map {
             (filename: $0.0, mime: $0.1, url: $1)
         }
-        marmot.sendMediaAlbum(
-            groupId: gid,
-            items: albumItems,
-            localPreviewURLs: pendingURLs,
-            onComplete: { [weak self] in
-                for pair in pairs {
-                    self?.markPendingUploadMediaCompleted(
-                        groupId: gid,
-                        filename: pair.filename,
-                        mime: pair.mime,
-                        caption: "",
-                        localURL: pair.url
-                    )
-                }
-            },
-            onFailure: { [weak self] in
-                for pair in pairs {
-                    self?.forgetPendingUploadMedia(
-                        groupId: gid,
-                        filename: pair.filename,
-                        mime: pair.mime,
-                        caption: "",
-                        localURL: pair.url
-                    )
-                }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else { return }
+            for (item, pendingURL) in zip(items, pendingURLs) {
+                await self.rememberPendingUploadMedia(
+                    groupId: gid,
+                    filename: item.filename,
+                    mime: item.mime,
+                    caption: "",
+                    localURL: pendingURL,
+                    data: item.data
+                )
             }
-        )
+            self.marmot.sendMediaAlbum(
+                groupId: gid,
+                items: albumItems,
+                localPreviewURLs: pendingURLs,
+                onComplete: { [weak self] in
+                    for pair in pairs {
+                        self?.markPendingUploadMediaCompleted(
+                            groupId: gid,
+                            filename: pair.filename,
+                            mime: pair.mime,
+                            caption: "",
+                            localURL: pair.url
+                        )
+                    }
+                },
+                onFailure: { [weak self] in
+                    for pair in pairs {
+                        self?.forgetPendingUploadMedia(
+                            groupId: gid,
+                            filename: pair.filename,
+                            mime: pair.mime,
+                            caption: "",
+                            localURL: pair.url
+                        )
+                    }
+                }
+            )
+        }
     }
 
     /// Send a desktop-selected attachment. White Noise can preserve the source
@@ -7774,50 +13524,46 @@ final class SonarAppStore: ObservableObject {
             // refusing while a perfectly good encrypted route exists.
         }
 
-        let groupId: String?
-        if let gid = marmotGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else { return false }
+        guard marmotOutboundGroupId(id) != nil else { return false }
 
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(
-            groupId: gid,
-            filename: safeName,
-            mime: safeMime,
-            caption: "",
-            localURL: pendingURL,
-            data: data
-        )
-        marmot.sendMedia(
-            groupId: gid,
-            data: data,
-            filename: safeName,
-            mime: safeMime,
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(
-                    groupId: gid,
-                    filename: safeName,
-                    mime: safeMime,
-                    caption: "",
-                    localURL: pendingURL
-                )
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(
-                    groupId: gid,
-                    filename: safeName,
-                    mime: safeMime,
-                    caption: "",
-                    localURL: pendingURL
-                )
-            }
-        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else { return }
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: safeName,
+                mime: safeMime,
+                caption: "",
+                localURL: pendingURL,
+                data: data
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: data,
+                filename: safeName,
+                mime: safeMime,
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: safeName,
+                        mime: safeMime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: safeName,
+                        mime: safeMime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
         return true
     }
 
@@ -7833,52 +13579,51 @@ final class SonarAppStore: ObservableObject {
             return
         }
         guard let data = try? Data(contentsOf: url) else { return }
-        let groupId: String?
-        if let gid = marmotGroupId(id) {
-            groupId = gid
-        } else if let profile = resolvedSonarProfile(id) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        } else {
-            groupId = nil
-        }
-        guard let gid = groupId else {
+        guard marmotOutboundGroupId(id) != nil else {
             showToast("Couldn't send the voice note — the secure chat isn't ready yet.")
             return
         }
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(
-            groupId: gid,
-            filename: url.lastPathComponent,
-            mime: "audio/mp4",
-            caption: "",
-            localURL: pendingURL,
-            data: data
-        )
-        marmot.sendMedia(
-            groupId: gid,
-            data: data,
-            filename: url.lastPathComponent,
-            mime: "audio/mp4",
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(
-                    groupId: gid,
-                    filename: url.lastPathComponent,
-                    mime: "audio/mp4",
-                    caption: "",
-                    localURL: pendingURL
-                )
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(
-                    groupId: gid,
-                    filename: url.lastPathComponent,
-                    mime: "audio/mp4",
-                    caption: "",
-                    localURL: pendingURL
-                )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let gid = await self.resolvedMarmotOutboundGroupId(id) else {
+                self.showToast("Couldn't send the voice note — the secure chat isn't ready yet.")
+                return
             }
-        )
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: url.lastPathComponent,
+                mime: "audio/mp4",
+                caption: "",
+                localURL: pendingURL,
+                data: data
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: data,
+                filename: url.lastPathComponent,
+                mime: "audio/mp4",
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: url.lastPathComponent,
+                        mime: "audio/mp4",
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: url.lastPathComponent,
+                        mime: "audio/mp4",
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
     }
 
     /// Internet fallback for a mesh media send that found no live BLE route
@@ -7891,10 +13636,7 @@ final class SonarAppStore: ObservableObject {
         let filename = packet.fileName ?? "file"
         let mime = packet.mimeType ?? "application/octet-stream"
         let key = canonicalPeerKey(peerID)
-        var groupId = marmotGroupId(key)
-        if groupId == nil, let profile = resolvedSonarProfile(key) {
-            groupId = marmotGroup(forNpub: profile.npub)?.id
-        }
+        var groupId = marmotOutboundGroupId(key)
         if groupId == nil {
             for alias in meshPeerAliases(for: key) {
                 if let gid = marmotGroupId(alias) { groupId = gid; break }
@@ -7905,22 +13647,45 @@ final class SonarAppStore: ObservableObject {
                 }
             }
         }
-        guard let gid = groupId else { return false }
+        guard let fallback = groupId else { return false }
         let pendingURL = Self.pendingMediaURL()
-        rememberPendingUploadMedia(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL, data: packet.content)
-        marmot.sendMedia(
-            groupId: gid,
-            data: packet.content,
-            filename: filename,
-            mime: mime,
-            localPreviewURL: pendingURL,
-            onComplete: { [weak self] in
-                self?.markPendingUploadMediaCompleted(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL)
-            },
-            onFailure: { [weak self] in
-                self?.forgetPendingUploadMedia(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL)
-            }
-        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let gid = await self.resolvedMarmotOutboundGroupId(key, fallback: fallback) ?? fallback
+            await self.rememberPendingUploadMedia(
+                groupId: gid,
+                filename: filename,
+                mime: mime,
+                caption: "",
+                localURL: pendingURL,
+                data: packet.content
+            )
+            self.marmot.sendMedia(
+                groupId: gid,
+                data: packet.content,
+                filename: filename,
+                mime: mime,
+                localPreviewURL: pendingURL,
+                onComplete: { [weak self] in
+                    self?.markPendingUploadMediaCompleted(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                },
+                onFailure: { [weak self] in
+                    self?.forgetPendingUploadMedia(
+                        groupId: gid,
+                        filename: filename,
+                        mime: mime,
+                        caption: "",
+                        localURL: pendingURL
+                    )
+                }
+            )
+        }
         return true
     }
 
@@ -8026,10 +13791,13 @@ final class SonarAppStore: ObservableObject {
     /// transcript during chat open (Signal avoids this churn).
     func prepareMedia(_ item: SNMediaItem, autoDownload: Bool) {
         let key = Self.mediaKey(item)
+        if mediaTransferStates[key]?.phase == .unavailable { return }
         if let url = existingMediaURL(item) {
             switch mediaTransferStates[key]?.phase {
             case .downloading, .failed:
                 mediaTransferStates[key] = .available(url)
+            case .unavailable:
+                break
             default:
                 break // nil / .available: no @Published churn
             }
@@ -8042,6 +13810,7 @@ final class SonarAppStore: ObservableObject {
 
     func requestMediaDownload(_ item: SNMediaItem) {
         let key = Self.mediaKey(item)
+        if mediaTransferStates[key]?.phase == .unavailable { return }
         if let url = existingMediaURL(item) {
             mediaTransferStates[key] = .available(url)
             return
@@ -8087,12 +13856,32 @@ final class SonarAppStore: ObservableObject {
                     guard !item.groupId.isEmpty, !item.url.isEmpty else {
                         throw MarmotService.ServiceError.invalidInput("attachment has no download route")
                     }
-                    _ = try await marmot.fetchMediaToFile(
-                        groupId: item.groupId,
-                        url: item.url,
-                        destination: partialURL,
-                        listener: listener
+                    let folds = await self.adoptMergedActionFolds(for: [item.groupId])
+                    let (opened, pane) = self.remountOpenedAndPane()
+                    let groupIds = snMediaFetchGroupIds(
+                        startGroupId: item.groupId,
+                        historicalFolds: folds,
+                        openedConversationId: opened,
+                        openedConversationPaneId: pane
                     )
+                    var lastError: Error?
+                    for groupId in groupIds {
+                        do {
+                            _ = try await marmot.fetchMediaToFile(
+                                groupId: groupId,
+                                url: item.url,
+                                destination: partialURL,
+                                listener: listener
+                            )
+                            lastError = nil
+                            break
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch {
+                            lastError = error
+                        }
+                    }
+                    if let lastError { throw lastError }
                 }
                 guard !listener.isCancelled(), !Task.isCancelled else {
                     throw CancellationError()
@@ -8110,9 +13899,13 @@ final class SonarAppStore: ObservableObject {
                     try? FileManager.default.removeItem(at: partialURL)
                 }.value
                 guard mediaDownloadGenerations[key] == generation else { return }
-                mediaTransferStates[key] = listener.isCancelled() || error is CancellationError
-                    ? .notDownloaded
-                    : .failed
+                if listener.isCancelled() || error is CancellationError {
+                    mediaTransferStates[key] = .notDownloaded
+                } else if snRecoveredLegacyMediaUnavailable(error.localizedDescription) {
+                    mediaTransferStates[key] = .unavailable(SNRecoveredLegacyMediaCopy)
+                } else {
+                    mediaTransferStates[key] = .failed
+                }
             }
             if mediaDownloadGenerations[key] == generation {
                 mediaDownloadTasks[key] = nil
@@ -8279,49 +14072,145 @@ final class SonarAppStore: ObservableObject {
     /// read races openedDM's read-marking, but read-marking only runs after
     /// the local hydrate completes, so the summaries read lands first.
     ///
-    /// Always publishes a settled value (including `0`). While the key is
-    /// absent, `SNMsgList` must not treat the open as fully-read (`?? 0` was
-    /// the alpha.11 unread→tail flash race).
+    /// Publishes a settled value (including `0`) only after a successful
+    /// probe. A failed summaries read must leave the key `nil` so
+    /// `SNMsgList` keeps the provisional live edge (`?? 0` was the
+    /// alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
-        unreadCountAtOpenByDM[id] = nil
-        if let jump = pendingJumpMessageIdByDM.removeValue(forKey: id) {
-            jumpMessageIdAtOpenByDM[id] = jump
-        } else {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        unreadCountAtOpenByDM = snUnreadCountAtOpenWritten(
+            conversationId: id,
+            count: nil,
+            unreadAtOpen: unreadCountAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        if let jump = snQuotedJumpParentId(
+            conversationId: id,
+            jumps: pendingJumpMessageIdByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
+            pendingJumpMessageIdByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: pendingJumpMessageIdByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+                conversationId: id,
+                parentId: jump,
+                jumps: jumpMessageIdAtOpenByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+        } else if snQuotedJumpParentId(
+            conversationId: id,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) == nil {
             jumpMessageIdAtOpenByDM[id] = nil
         }
         let groupId = marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else {
-            unreadCountAtOpenByDM[id] = 0
+            setUnreadCountAtOpen(id, count: 0)
             return
         }
-        let groups = directMarmotGroups(matchingGroupId: groupId)
-        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
-        let hasCachedEntry = ids.contains { marmot.unreadByGroup[$0] != nil }
-        let cached = ids.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
+        let blobIds = transcriptSourceIds(forGroupId: groupId)
+        let hasCachedEntry = blobIds.contains { marmot.unreadByGroup[$0] != nil }
+        let cached = blobIds.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
         if hasCachedEntry || cached > 0 {
-            unreadCountAtOpenByDM[id] = cached
+            setUnreadCountAtOpen(id, count: cached)
             return
         }
         Task { [weak self] in
             guard let self else { return }
-            let unread = await self.marmot.unreadCount(forGroups: ids)
-            self.unreadCountAtOpenByDM[id] = unread
+            let folds = await self.adoptMergedActionFolds(for: [id, groupId])
+            let (opened, pane) = self.remountOpenedAndPane()
+            let ids = snTranscriptSourceIds(
+                groupId: groupId,
+                listedDirectIds: self.directMarmotGroups(matchingGroupId: groupId).map(\.id),
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            let familyHit = ids.contains { self.marmot.unreadByGroup[$0] != nil }
+            let familyCached = ids.reduce(UInt64(0)) { $0 + (self.marmot.unreadByGroup[$1] ?? 0) }
+            let unread: UInt64?
+            if familyHit || familyCached > 0 {
+                unread = familyCached
+            } else {
+                unread = await self.marmot.unreadCount(forGroups: ids)
+            }
+            guard let unread else { return }
+            let openIds = [opened, pane, self.currentDMId].compactMap { $0 }
+            guard let publishId = snOpenChatUnreadPublishId(
+                capturedFor: id,
+                openIds: openIds,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            ) else { return }
+            self.setUnreadCountAtOpen(publishId, count: unread)
         }
     }
 
-    /// Newest known message date across the DM's folded groups, from the
-    /// core conversation index. The transcript must not freeze its unread
+    private func setUnreadCountAtOpen(_ id: String, count: UInt64?) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        unreadCountAtOpenByDM = snUnreadCountAtOpenWritten(
+            conversationId: id,
+            count: count,
+            unreadAtOpen: unreadCountAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+    }
+
+    /// Newest known message date across the DM's folded groups (index +
+    /// remounted snapshot). The transcript must not freeze its unread
     /// divider before the visible rows have caught up to this — hydration can
     /// publish one leg before the folded White Noise groups merge in, and the
     /// rows still missing are exactly the unread ones.
+    /// Compose `expectedNewestTsForOpenChat`.
     func expectedNewestMessageDate(_ id: String) -> Date? {
         let groupId = marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else { return nil }
-        let groups = directMarmotGroups(matchingGroupId: groupId)
-        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
-        return ids.compactMap { marmot.conversationSummariesByGroup[$0]?.latestAt }.max()
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let ids = transcriptSourceIds(forGroupId: groupId)
+        var messagesByChat: [String: [Int64]] = [:]
+        var summaryLatest: [String: Int64] = [:]
+        for alias in ids {
+            if let rows = marmot.messagesByGroup[alias], !rows.isEmpty {
+                messagesByChat[alias] = rows.map { Int64($0.createdAt.timeIntervalSince1970) }
+            }
+            let latest = marmot.conversationSummariesByGroup[alias]?.latestAt.timeIntervalSince1970 ?? 0
+            if latest > 0 {
+                summaryLatest[alias] = Int64(latest)
+            }
+        }
+        let (opened, pane) = remountOpenedAndPane()
+        let secs = snExpectedNewestTsForChat(
+            chatId: groupId,
+            messagesByChat: messagesByChat,
+            latestByChat: [:],
+            summaryLatestByChat: summaryLatest,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        guard secs > 0 else { return nil }
+        return Date(timeIntervalSince1970: TimeInterval(secs))
     }
 
     /// Generations cancel a superseded first-open Task when the user taps another chat.
@@ -8330,20 +14219,43 @@ final class SonarAppStore: ObservableObject {
     /// True when a local newest page (or retained ConversationViewState) can
     /// paint without awaiting disk — Compose `retainedTranscriptByChat` reopen.
     private func dmHasLocalTranscriptPaint(_ id: String, marmotGroupId knownMarmotGroupId: String?) -> Bool {
-        if let retained = conversationViewStates[id], !retained.messages.isEmpty { return true }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let retainedMessages = Dictionary(
+            uniqueKeysWithValues: conversationViewStates.compactMap { key, state in
+                state.messages.isEmpty ? nil : (key, state.messages)
+            }
+        )
+        let remount = remountOpenedAndPane()
+        if !snRetainedTranscriptForChat(
+            chatId: id,
+            retainedByChat: retainedMessages,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ).isEmpty {
+            return true
+        }
         if cachedMeshMessageCount(id) > 0 { return true }
         let groupId = knownMarmotGroupId
             ?? marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else { return false }
         let groups = directMarmotGroups(matchingGroupId: groupId)
-        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
-        return ids.contains { !(marmot.messagesByGroup[$0] ?? []).isEmpty }
+        return snDMHasLocalMarmotPaint(
+            groupId: groupId,
+            listedGroupIds: groups.map(\.id),
+            messagesByGroup: marmot.messagesByGroup,
+            historicalFolds: folds,
+            idOf: { $0.id },
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
     }
 
-    /// Navigate into a DM after the local newest page is ready (Compose
-    /// `openChat` parity). First open awaits `loadLocalWhenConnected` before
-    /// present; reopen uses retained leave paint and hydrates in the background.
+    /// Navigate into a DM when local paint is ready (Compose `openChat`
+    /// parity). A remounted 0.8 family cache or retained leave paint
+    /// presents immediately; otherwise first open awaits
+    /// `loadLocalWhenConnected` before present.
     /// Pass `present` on Mac (selection) instead of the default `push(.dm)`.
     func openDM(
         _ id: String,
@@ -8369,6 +14281,48 @@ final class SonarAppStore: ObservableObject {
         }
         #endif
         let presentDM = present ?? { self.push(.dm(id)) }
+        // Mac sidebar / desktop list can tap the listed live row while the
+        // recovered 0.8 transcript is already open. Presenting again
+        // recreates the pane and newest-page hydrates. Jump in place.
+        if isConversationOpen(id)
+            || (knownMarmotGroupId.map { isConversationOpen($0) } ?? false) {
+            if let jumpMessageId {
+                applyOpenConversationJump(id, parentId: jumpMessageId)
+            }
+            #if DEBUG
+            benchPresent("already-open")
+            #endif
+            return
+        }
+        if let openId = currentDMId {
+            let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if snConversationOpenShouldMergeFolds(
+                openId: openId,
+                incomingId: id,
+                persistedFolds: blob
+            ) {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    _ = await self.adoptMergedActionFolds(
+                        for: [openId, id, knownMarmotGroupId].compactMap { $0 }
+                    )
+                    if self.isConversationOpen(id)
+                        || (knownMarmotGroupId.map { self.isConversationOpen($0) } ?? false) {
+                        if let jumpMessageId {
+                            self.applyOpenConversationJump(id, parentId: jumpMessageId)
+                        }
+                        return
+                    }
+                    self.openDM(
+                        id,
+                        marmotGroupId: knownMarmotGroupId,
+                        jumpMessageId: jumpMessageId,
+                        present: present
+                    )
+                }
+                return
+            }
+        }
         if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
             openedDM(id, marmotGroupId: knownMarmotGroupId)
             presentDM()
@@ -8377,7 +14331,20 @@ final class SonarAppStore: ObservableObject {
             #endif
             return
         }
-        if dmHasLocalTranscriptPaint(id, marmotGroupId: knownMarmotGroupId) {
+        let seed = knownMarmotGroupId
+            ?? marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+            ?? id
+        let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        // Persist-folds with a family is the only skip. A prior empty-family
+        // merge (unresumed 0.8) must not hide the sibling the first 0.9 send
+        // creates. Compose `captureOpenChatUnread` always merges.
+        let shouldMergeFolds = snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted)
+        // Blob-only retained paint can be a live leave-frame while recovered
+        // 0.8 rows sit on the hidden sibling. Merge FFI folds before present
+        // so `localTranscriptGroups` / retained walk see hist. Compose
+        // `captureOpenChatUnread` does this synchronously before first paint.
+        if !shouldMergeFolds && dmHasLocalTranscriptPaint(id, marmotGroupId: knownMarmotGroupId) {
             openedDM(id, marmotGroupId: knownMarmotGroupId)
             presentDM()
             #if DEBUG
@@ -8389,6 +14356,19 @@ final class SonarAppStore: ObservableObject {
         dmOpenGenerations[id] = generation
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if shouldMergeFolds {
+                _ = await self.adoptMergedActionFolds(for: [id, seed, knownMarmotGroupId].compactMap { $0 })
+            }
+            guard self.dmOpenGenerations[id] == generation else { return }
+            if self.dmHasLocalTranscriptPaint(id, marmotGroupId: knownMarmotGroupId) {
+                self.openedDM(id, marmotGroupId: knownMarmotGroupId)
+                self.dmOpenGenerations[id] = nil
+                presentDM()
+                #if DEBUG
+                benchPresent("retained")
+                #endif
+                return
+            }
             self.openedDM(id, marmotGroupId: knownMarmotGroupId)
             let warmupKey = knownMarmotGroupId
                 ?? self.marmotGroupId(id)
@@ -8406,7 +14386,31 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    private func consumeOpenedDMHydrateSuppression(for id: String, groupId: String?) -> Bool {
+        let skip = snOpenedDMShouldSkipHydrate(
+            openingId: id,
+            suppressedIds: suppressOpenedDMHydrateIds
+        ) || (groupId.map {
+            snOpenedDMShouldSkipHydrate(openingId: $0, suppressedIds: suppressOpenedDMHydrateIds)
+        } ?? false)
+        guard skip else { return false }
+        suppressOpenedDMHydrateIds.remove(id)
+        if let groupId { suppressOpenedDMHydrateIds.remove(groupId) }
+        suppressOpenedDMHydrateIds.remove(snBareMarmotGroupId(id))
+        return true
+    }
+
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
+        let remounted = snOpenedDMRemountOpenedPane(
+            openingId: id,
+            routeReplacement: pendingMarmotRouteReplacement
+        )
+        openedConversationId = remounted.opened
+        openedConversationPaneId = remounted.pane
+        marmot.rememberRemountPair(
+            openedConversationId: remounted.opened,
+            openedConversationPaneId: remounted.pane
+        )
         conversationViewStates[id]?.activate()
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
@@ -8435,6 +14439,9 @@ final class SonarAppStore: ObservableObject {
         // background; duplicate open notifications for the same id join the
         // in-flight work instead of starting another sync.
         guard hasMarmotGroup || sonarProfile != nil else { return }
+        if consumeOpenedDMHydrateSuppression(for: id, groupId: groupId) {
+            return
+        }
         marmot.connectIfNeeded()
         let warmupKey = groupId ?? id
         if let task = openingDMTasks[warmupKey], !task.isCancelled {
@@ -8451,6 +14458,14 @@ final class SonarAppStore: ObservableObject {
             defer {
                 self.openingDMTasks[warmupKey] = nil
             }
+            // Page the hidden 0.8 sibling too. Callers that skip `openDM`
+            // (Mac selection, already-pushed DM) still merge before
+            // `localTranscriptGroups` walks the blob.
+            let hydrateSeed = groupId ?? id
+            let hydrateFolds = (self.defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if snFirstOpenShouldMergeFolds(seedId: hydrateSeed, persistedFolds: hydrateFolds) {
+                _ = await self.adoptMergedActionFolds(for: [id, hydrateSeed])
+            }
             guard await self.marmot.loadLocalWhenConnected(groupId: groupId) else {
                 self.localHydratingDMs.remove(id)
                 return
@@ -8462,13 +14477,23 @@ final class SonarAppStore: ObservableObject {
             let hydratedGroupId = groupId
                 ?? sonarProfile.flatMap { self.marmotGroup(forNpub: $0.npub)?.id }
             if let hydratedGroupId {
+                // Page the hidden 0.8 sibling too. Listed 1:1 duplicates miss
+                // bak remainder after persist-folds. Compose
+                // `marmotMessagesForPeer` / `meshFoldTranscriptSourceIds`.
+                let paging = self.localTranscriptGroups(for: id)
                 let groups = self.directMarmotGroups(matchingGroupId: hydratedGroupId)
-                let sourceGroups = groups.isEmpty
-                    ? [MarmotService.MarmotGroup(id: hydratedGroupId, name: "", memberNpubs: [])]
-                    : groups
+                let sourceGroups = !paging.isEmpty
+                    ? paging
+                    : (groups.isEmpty
+                        ? [MarmotService.MarmotGroup(id: hydratedGroupId, name: "", memberNpubs: [])]
+                        : groups)
                 for group in sourceGroups {
+                    guard !Task.isCancelled else {
+                        self.localHydratingDMs.remove(id)
+                        return
+                    }
                     // `loadLocalWhenConnected(groupId:)` already painted the
-                    // known source. Only hydrate additional folded groups here.
+                    // known source. Only hydrate additional family ids here.
                     if groupId == nil || group.id != groupId {
                         await self.marmot.loadLocalPage(groupId: group.id, mode: .newestPage)
                     }
@@ -8482,12 +14507,20 @@ final class SonarAppStore: ObservableObject {
             if let hydratedGroupId {
                 Task { await self.marmot.preferCatchupGroup(hydratedGroupId) }
             }
+            let folds = (self.defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let remount = self.remountOpenedAndPane()
             let needsHistoryBackfill = hydratedGroupId.map {
-                let groups = self.directMarmotGroups(matchingGroupId: $0)
-                let sourceGroups = groups.isEmpty
-                    ? [MarmotService.MarmotGroup(id: $0, name: "", memberNpubs: [])]
-                    : groups
-                return sourceGroups.contains { self.marmot.messagesByGroup[$0.id]?.isEmpty ?? true }
+                // Live 0.9 is empty after resume; leftover hist cache is
+                // already paint. Do not wait on relay for that. Compose
+                // blank recovery uses `blankTranscriptKnownNonEmpty`.
+                // Empty persist-folds still union the remount pair.
+                snFamilyTranscriptNeedsNetworkBackfill(
+                    groupId: $0,
+                    messagesByGroup: self.marmot.messagesByGroup,
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
             } ?? false
             if !needsHistoryBackfill {
                 self.localHydratingDMs.remove(id)
@@ -8506,7 +14539,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     func isLocallyHydratingDM(_ id: String) -> Bool {
-        localHydratingDMs.contains(id)
+        snOpenedDMShouldSkipHydrate(openingId: id, suppressedIds: localHydratingDMs)
     }
 
     private func refreshMarmotDMInBackground(
@@ -8541,6 +14574,65 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
+        let pathDMId: String?
+        if case .dm(let pathId) = path.last { pathDMId = pathId } else { pathDMId = nil }
+        if snClosedDMShouldSkipFoldRemountHop(
+            closingId: id,
+            pathDMId: pathDMId,
+            openedConversationId: openedConversationId,
+            routeReplacement: pendingMarmotRouteReplacement
+        ) {
+            conversationViewStates[id]?.deactivate()
+            return
+        }
+        let clearPendingReplacement = snClosedDMShouldClearPendingRouteReplacement(
+            closingId: id,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId,
+            routeReplacement: pendingMarmotRouteReplacement
+        )
+        if snClosedDMShouldClearOpened(
+            closingId: id,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        ) {
+            // Clear remount-pair unread / jump *before* dropping opened ids —
+            // a live-only subtract leaves hist, and the next open walks the
+            // pair / fold family back onto that leftover divider.
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let (opened, pane) = remountOpenedAndPane()
+            unreadCountAtOpenByDM = snUnreadCountAtOpenWritten(
+                conversationId: id,
+                count: nil,
+                unreadAtOpen: unreadCountAtOpenByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            jumpMessageIdAtOpenByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: jumpMessageIdAtOpenByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            pendingJumpMessageIdByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: pendingJumpMessageIdByDM,
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            openedConversationId = nil
+            openedConversationPaneId = nil
+            marmot.rememberRemountPair(
+                openedConversationId: nil,
+                openedConversationPaneId: nil
+            )
+        }
+        if clearPendingReplacement {
+            pendingMarmotRouteReplacement = nil
+        }
         // Keep ConversationViewState rows for Signal-style reopen paint (Compose
         // retainedTranscriptByChat), but detach from store invalidation so a
         // closed chat does not keep rebuilding on every BLE/relay/wallet tick.
@@ -9009,7 +15101,7 @@ final class SonarAppStore: ObservableObject {
         paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
             kind: .sonarDirect,
-            peerKey: id,
+            peerKey: paymentConversationStoreId(for: id),
             peerName: peerItem(id).name,
             direction: .outgoing,
             sats: sats,
@@ -9034,7 +15126,7 @@ final class SonarAppStore: ObservableObject {
         // ledger is consistent even if the chat send path ever fails.
         paymentActivityLedger.markPaid(activityId, payment: payment)
         payLedger.record(SonarPayEntry(
-            id: activityId, peerKey: id, sats: sats,
+            id: activityId, peerKey: paymentConversationStoreId(for: id), sats: sats,
             direction: .outgoing, state: .claimed, via: via.rawValue
         ))
         let receiptOk = await sendPaymentReceiptLines(
@@ -9179,7 +15271,23 @@ final class SonarAppStore: ObservableObject {
     /// True when the nudge action for this chat is currently allowed (outside
     /// the 8-second sender cooldown).
     func canSendTrill(_ id: String) -> Bool {
-        SonarTrillPolicy.cooldownRemaining(until: trillCooldownUntilByChat[chatAlertKey(id)]) == nil
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        let familyUntil = snTrillCooldownUntil(
+            conversationId: id,
+            cooldownUntilByChat: trillCooldownUntilByChat,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        let alertUntil = trillCooldownUntilByChat[chatAlertKey(id)]
+        let until: Date?
+        if let familyUntil, let alertUntil {
+            until = familyUntil > alertUntil ? familyUntil : alertUntil
+        } else {
+            until = familyUntil ?? alertUntil
+        }
+        return SonarTrillPolicy.cooldownRemaining(until: until) == nil
     }
 
     /// Sends an MSN-style nudge through the exact same path a text message
@@ -9187,8 +15295,19 @@ final class SonarAppStore: ObservableObject {
     /// the per-chat sender cooldown.
     func sendTrill(_ id: String) {
         guard canSendTrill(id) else { return }
-        trillCooldownUntilByChat[chatAlertKey(id)] =
-            Date().addingTimeInterval(SonarTrillPolicy.cooldownSeconds)
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        let until = Date().addingTimeInterval(SonarTrillPolicy.cooldownSeconds)
+        var next = snTrillCooldownWritten(
+            conversationId: id,
+            until: until,
+            cooldownUntilByChat: trillCooldownUntilByChat,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        next[chatAlertKey(id)] = until
+        trillCooldownUntilByChat = next
         sendDm(id, SonarTrillMessage(id: SonarTrillMessage.makeID()).encoded())
         // The sender's own send triggers the local buzz (MSN behaviour).
         triggerTrillBuzz()
@@ -9269,7 +15388,7 @@ final class SonarAppStore: ObservableObject {
                     isBlocked: isMarmotSenderBlocked(m.senderNpub),
                     conversationTitle: title,
                     senderName: senderName,
-                    groupName: group.memberNpubs.count > 2 ? title : nil,
+                    groupName: snMarmotTreatsAsGroupChat(group) ? title : nil,
                     content: m.content
                 )
             }
@@ -9328,9 +15447,63 @@ final class SonarAppStore: ObservableObject {
     /// `marmot:`-prefixed), and — for direct chats only — the peer's npub
     /// (the push drain path has no group id). Group-chat mutes never store an
     /// npub so muting a group cannot silence the member's direct chat.
-    private func muteKeys(forChatId id: String) -> [String] {
+    /// Host blob plus FFI `fold_aliases` for mute / leave / delete / first open.
+    /// Same merge as wake mute so a hidden 0.8 sibling is visible before
+    /// persist-folds rewrites the App Group map.
+    private func mergedActionHistoricalFolds(for id: String) async -> [String: String] {
+        await mergedActionHistoricalFolds(for: [id])
+    }
+
+    private func mergedActionHistoricalFolds(for ids: [String]) async -> [String: String] {
+        let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        var listed: [String] = []
+        var seen = Set<String>()
+        for id in ids {
+            for part in [snBareMarmotGroupId(id), id] where !part.isEmpty && seen.insert(part).inserted {
+                listed.append(part)
+            }
+        }
+        var aliasesById: [String: [String]] = [:]
+        var liveById: [String: String] = [:]
+        for actionId in listed {
+            aliasesById[actionId] = await marmot.foldAliases(groupId: actionId)
+            if let live = await marmot.liveFoldTarget(groupId: actionId) {
+                liveById[actionId] = live
+            }
+        }
+        return snWakeMuteHistoricalFolds(
+            persisted: persisted,
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
+    }
+
+    /// Persist the FFI fold family. Do not cache an empty-family merge —
+    /// recovered 0.8 chats look unfolded until the first 0.9 send.
+    @discardableResult
+    private func adoptMergedActionFolds(for ids: [String]) async -> [String: String] {
+        let folds = await mergedActionHistoricalFolds(for: ids)
+        let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        if folds != persisted {
+            snPersistHistoricalFolds(folds, to: defaults)
+        }
+        return folds
+    }
+
+    private func muteKeys(forChatId id: String, historicalFolds folds: [String: String]? = nil) -> [String] {
         var keys: Set<String> = [id, chatAlertKey(id)]
         for alias in meshPeerAliases(for: id) {
+            keys.insert(alias)
+        }
+        let folds = folds ?? (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        for alias in snMutedFoldKeys(
+            groupIdHex: id,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
             keys.insert(alias)
         }
         for group in localTranscriptGroups(for: id) where !group.id.isEmpty {
@@ -9378,12 +15551,37 @@ final class SonarAppStore: ObservableObject {
         SonarChatMuteStore.shared.mute(keys: muteKeys(forChatId: id), until: until)
         invalidateHomeDMRows()
         objectWillChange.send()
+        Task { @MainActor in
+            let folds = await mergedActionHistoricalFolds(for: id)
+            SonarChatMuteStore.shared.mute(
+                keys: muteKeys(forChatId: id, historicalFolds: folds),
+                until: until
+            )
+            let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if folds != persisted {
+                snPersistHistoricalFolds(folds, to: defaults)
+            }
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
     }
 
     func unmuteChat(_ id: String) {
         SonarChatMuteStore.shared.unmute(keys: muteKeys(forChatId: id))
         invalidateHomeDMRows()
         objectWillChange.send()
+        Task { @MainActor in
+            let folds = await mergedActionHistoricalFolds(for: id)
+            SonarChatMuteStore.shared.unmute(
+                keys: muteKeys(forChatId: id, historicalFolds: folds)
+            )
+            let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if folds != persisted {
+                snPersistHistoricalFolds(folds, to: defaults)
+            }
+            invalidateHomeDMRows()
+            objectWillChange.send()
+        }
     }
 
     /// A Marmot group folded into a Sonar peer's conversation replies on
@@ -9401,7 +15599,7 @@ final class SonarAppStore: ObservableObject {
         switch line {
         case .pay(let id, let sats):
             payLedger.record(SonarPayEntry(
-                id: id, peerKey: convId, sats: sats,
+                id: id, peerKey: paymentConversationStoreId(for: convId), sats: sats,
                 direction: .incoming, state: .sealed, via: via.rawValue
             ))
 
@@ -9611,7 +15809,23 @@ final class SonarAppStore: ObservableObject {
     func isVerified(_ id: String) -> Bool {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
-            if groups.isEmpty { return marmotVerified[groupId] ?? false }
+            if groups.isEmpty {
+                let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+                let verifiedIds = Set(marmotVerified.compactMap { key, value -> String? in
+                    guard value else { return nil }
+                    return key.hasPrefix(Self.marmotIDPrefix)
+                        ? String(key.dropFirst(Self.marmotIDPrefix.count))
+                        : key
+                })
+                let remount = remountOpenedAndPane()
+                return snVerifiedForFoldFamily(
+                    groupId: groupId,
+                    verifiedIds: verifiedIds,
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
+            }
             return hasVerifiedMarmotGroup(in: groups)
         }
         guard let fingerprint = chatViewModel.getFingerprint(for: PeerID(str: id)) else { return false }
@@ -9621,10 +15835,18 @@ final class SonarAppStore: ObservableObject {
     func markVerified(_ id: String) {
         if let groupId = marmotGroupId(id) {
             let groups = directMarmotGroups(matchingGroupId: groupId)
-            if groups.isEmpty {
-                marmotVerified[groupId] = true
-            } else {
-                for group in groups { marmotVerified[group.id] = true }
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let (opened, pane) = remountOpenedAndPane()
+            let ids = snTranscriptSourceIds(
+                groupId: groupId,
+                listedDirectIds: groups.map(\.id),
+                historicalFolds: folds,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+            for stamped in ids {
+                marmotVerified[stamped] = true
+                marmotVerified[Self.marmotIDPrefix + stamped] = true
             }
             defaults.set(marmotVerified, forKey: Keys.marmotVerified)
         } else {
@@ -9639,6 +15861,17 @@ final class SonarAppStore: ObservableObject {
     // MARK: Navigation
 
     func push(_ route: SonarRoute) {
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        // After remount hop, iPhone still paints `.dm(hist)` and can
+        // push group-info / contact-profile from that pane. Remap those
+        // onto live. `.dm` / `.call` stay on the painted id.
+        let route = snRemountPushedRoute(
+            route,
+            persistedFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
         if case .dm(let id) = route, currentDMId != id {
             cleanupPreviewTempFiles()
         }
@@ -9660,7 +15893,43 @@ final class SonarAppStore: ObservableObject {
     /// aliases of the same person, not only exact string equality.
     func isConversationOpen(_ conversationId: String) -> Bool {
         guard let openId = currentDMId else { return false }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        if snNotificationOpenShouldJump(
+            openId: openId,
+            incomingId: conversationId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        ) {
+            return true
+        }
         return conversationsMatchForNotification(openId, conversationId)
+    }
+
+    /// Mac `onChange(of: selection)` — keep pushed group-info when fold
+    /// remount hops hist → live before `openedDM(live)` refreshes the pane id.
+    func macSelectionChangeShouldClearPath(nextConversationId: String?) -> Bool {
+        snMacSelectionChangeShouldClearPath(
+            nextId: nextConversationId,
+            openedConversationId: openedConversationId,
+            openedConversationPaneId: openedConversationPaneId
+        )
+    }
+
+    /// `willPresent` is already async. Merge FFI when the open recovered
+    /// chat has no persist family so a live-sibling push does not banner.
+    func shouldSuppressForegroundNotification(_ conversationId: String) async -> Bool {
+        guard let openId = currentDMId else { return false }
+        let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        if snConversationOpenShouldMergeFolds(
+            openId: openId,
+            incomingId: conversationId,
+            persistedFolds: blob
+        ) {
+            _ = await adoptMergedActionFolds(for: [openId, conversationId])
+        }
+        return isConversationOpen(conversationId)
     }
 
     /// Open a conversation from a notification tap (local or private-message).
@@ -9680,30 +15949,220 @@ final class SonarAppStore: ObservableObject {
             return raw
         }()
         if isConversationOpen(id) {
+            jumpOnOpenNotificationConversation(id, jump: jump)
+            return
+        }
+        // Viewing recovered hist + tap live: persist-folds can still be
+        // empty, so the sync `isConversationOpen` miss would `openDM` and
+        // remount. Merge first (same gate as willPresent), then Jump.
+        if let openId = currentDMId {
+            let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            if snConversationOpenShouldMergeFolds(
+                openId: openId,
+                incomingId: id,
+                persistedFolds: blob
+            ) {
+                Task { @MainActor in
+                    await self.openNotificationConversationAfterFoldMerge(id, jump: jump)
+                }
+                return
+            }
+        }
+        openResolvedNotificationConversation(id, jump: jump)
+    }
+
+    private func jumpOnOpenNotificationConversation(_ id: String, jump: String?) {
+        clearNotificationsForConversation(id)
+        // Already on this DM — still apply Jump so a tap while backgrounded
+        // on the open chat scrolls to the notified message (#376 GLM Medium).
+        if let jump {
+            applyOpenConversationJump(id, parentId: jump)
+        }
+    }
+
+    @MainActor
+    private func openNotificationConversationAfterFoldMerge(_ id: String, jump: String?) async {
+        if let openId = currentDMId {
+            _ = await adoptMergedActionFolds(for: [openId, id])
+        }
+        if isConversationOpen(id) {
+            jumpOnOpenNotificationConversation(id, jump: jump)
+            return
+        }
+        openResolvedNotificationConversation(id, jump: jump)
+    }
+
+    private func openResolvedNotificationConversation(_ id: String, jump: String?) {
+        if let target = resolveNotificationConversation(id) {
+            openDM(target.id, marmotGroupId: target.marmotGroupId, jumpMessageId: jump)
+            if target.id != id {
+                clearNotificationsForConversation(id)
+            }
+            return
+        }
+        Task { @MainActor in
+            await self.openFoldedNotificationConversation(id, jump: jump)
+        }
+    }
+
+    /// A shade tap can still carry the hidden 0.8 group id after resume.
+    /// Refresh local groups and rediscover hist→live (the host blob is empty
+    /// after nsec restore) before fail-closing. Compose
+    /// `openConversationFromNotification` refreshes once and retries.
+    @MainActor
+    private func openFoldedNotificationConversation(_ id: String, jump: String?) async {
+        let groupId = marmotGroupId(id) ?? {
+            id.count == 64 && id.allSatisfy(\.isHexDigit) ? id.lowercased() : nil
+        }()
+        guard let groupId else {
             clearNotificationsForConversation(id)
-            // Already on this DM — still apply Jump so a tap while backgrounded
-            // on the open chat scrolls to the notified message (#376 GLM Medium).
+            return
+        }
+
+        func refreshFolds() async {
+            _ = await marmot.loadLocalSummaries(resolveMembers: false)
+            await rememberHistoricalFolds(
+                from: lastMarmotGroupIds,
+                to: Set(marmot.groups.map(\.id))
+            )
+        }
+
+        func resolve() async -> (folds: [String: String], remounted: String, listed: Set<String>) {
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let remount = remountOpenedAndPane()
+            let live = snNotificationLiveFoldTarget(
+                tappedGroupId: groupId,
+                ffiLiveFoldTarget: await marmot.liveFoldTarget(groupId: groupId),
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
+            let remounted = snNotificationOpenGroupId(
+                tappedGroupId: groupId,
+                liveFoldTarget: live
+            )
+            return (folds, remounted, Set(marmot.groups.map(\.id)))
+        }
+
+        await refreshFolds()
+        var resolved = await resolve()
+        if !snNotificationOpenIsReady(
+            requestedGroupId: groupId,
+            remounted: resolved.remounted,
+            listed: resolved.listed
+        ) {
+            await refreshFolds()
+            resolved = await resolve()
+        }
+        let folds = resolved.folds
+        let remounted = resolved.remounted
+        guard snNotificationOpenIsReady(
+            requestedGroupId: groupId,
+            remounted: remounted,
+            listed: resolved.listed
+        ) else {
+            showToast("That chat isn’t ready yet — try again from Messages.")
+            clearNotificationsForConversation(id)
+            return
+        }
+        let liveId = Self.marmotIDPrefix + remounted
+        if isConversationOpen(liveId) || isConversationOpen(remounted) {
+            clearNotificationsForConversation(id)
+            clearNotificationsForConversation(liveId)
             if let jump {
-                pendingJumpMessageIdByDM[id] = jump
-                jumpMessageIdAtOpenByDM[id] = jump
+                let remount = remountOpenedAndPane()
+                pendingJumpMessageIdByDM = snQuotedJumpWritten(
+                    conversationId: liveId,
+                    parentId: jump,
+                    jumps: pendingJumpMessageIdByDM,
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
+                jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+                    conversationId: liveId,
+                    parentId: jump,
+                    jumps: jumpMessageIdAtOpenByDM,
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
                 objectWillChange.send()
             }
             return
         }
-        guard let target = resolveNotificationConversation(id) else {
-            // Deleted / left / never-hydrated — clear the shade, stay on Home.
-            clearNotificationsForConversation(id)
-            return
+        if let row = dmRows.first(where: {
+            $0.marmotGroupId == remounted || $0.id == liveId
+        }) {
+            openDM(row.id, marmotGroupId: remounted, jumpMessageId: jump)
+        } else {
+            openDM(liveId, marmotGroupId: remounted, jumpMessageId: jump)
         }
-        openDM(target.id, marmotGroupId: target.marmotGroupId, jumpMessageId: jump)
+        clearNotificationsForConversation(id)
+    }
+
+    /// Write Jump onto the open id and every persist-folds sibling. When the
+    /// blob is still empty after an unresumed first open, merge FFI so a
+    /// hist-id tap while viewing live still expands the family.
+    private func applyOpenConversationJump(_ conversationId: String, parentId: String) {
+        let blob = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        writeOpenConversationJump(conversationId, parentId: parentId, folds: blob)
+        let seed = marmotGroupId(conversationId) ?? conversationId
+        guard snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: blob) else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let folds = await self.adoptMergedActionFolds(for: [conversationId, seed])
+            self.writeOpenConversationJump(conversationId, parentId: parentId, folds: folds)
+        }
+    }
+
+    private func writeOpenConversationJump(
+        _ conversationId: String,
+        parentId: String,
+        folds: [String: String]
+    ) {
+        let remount = remountOpenedAndPane()
+        pendingJumpMessageIdByDM = snQuotedJumpWritten(
+            conversationId: conversationId,
+            parentId: parentId,
+            jumps: pendingJumpMessageIdByDM,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        jumpMessageIdAtOpenByDM = snQuotedJumpWritten(
+            conversationId: conversationId,
+            parentId: parentId,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        objectWillChange.send()
     }
 
     /// Drop a one-shot Jump target after the host has applied (or soft-failed)
     /// the open action so later transcript updates do not re-jump.
     func clearJumpMessageIdAtOpen(_ id: String) {
-        guard jumpMessageIdAtOpenByDM[id] != nil || pendingJumpMessageIdByDM[id] != nil else { return }
-        jumpMessageIdAtOpenByDM[id] = nil
-        pendingJumpMessageIdByDM[id] = nil
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        let nextJump = snQuotedJumpCleared(
+            conversationId: id,
+            jumps: jumpMessageIdAtOpenByDM,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        let nextPending = snQuotedJumpCleared(
+            conversationId: id,
+            jumps: pendingJumpMessageIdByDM,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
+        guard nextJump != jumpMessageIdAtOpenByDM || nextPending != pendingJumpMessageIdByDM else { return }
+        jumpMessageIdAtOpenByDM = nextJump
+        pendingJumpMessageIdByDM = nextPending
         // Not `@Published` — nudge SwiftUI so the host stops receiving the jump.
         objectWillChange.send()
     }
@@ -9720,6 +16179,22 @@ final class SonarAppStore: ObservableObject {
         }
         if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
             return (id, nil)
+        }
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        if let live = snNotificationLiveFoldTarget(
+            tappedGroupId: marmotGroupId(id) ?? id,
+            ffiLiveFoldTarget: nil,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        ) {
+            if let row = dmRows.first(where: {
+                $0.marmotGroupId == live || $0.id == Self.marmotIDPrefix + live
+            }) {
+                return (row.id, live)
+            }
+            return (Self.marmotIDPrefix + live, live)
         }
         if let groupId = marmotGroupId(id),
            marmot.groups.contains(where: { $0.id == groupId }) {
@@ -9761,7 +16236,15 @@ final class SonarAppStore: ObservableObject {
            leftHex == rightHex {
             return true
         }
-        return false
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let remount = remountOpenedAndPane()
+        return snConversationsMatchFoldFamily(
+            left: left,
+            right: right,
+            historicalFolds: folds,
+            openedConversationId: remount.opened,
+            openedConversationPaneId: remount.pane
+        )
     }
 
     /// Dismiss OS notifications that were posted for this conversation (and
@@ -9795,7 +16278,34 @@ final class SonarAppStore: ObservableObject {
                 ids.insert(Self.marmotIDPrefix + mapped)
             }
         }
-        NotificationService.shared.clearNotifications(forConversationIds: ids)
+        let persisted = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        NotificationService.shared.clearNotifications(
+            forConversationIds: snNotificationClearIds(
+                conversationId: conversationId,
+                relatedIds: Array(ids),
+                historicalFolds: persisted,
+                openedConversationId: opened,
+                openedConversationPaneId: pane
+            )
+        )
+        let seed = marmotGroupId(conversationId) ?? conversationId
+        if snFirstOpenShouldMergeFolds(seedId: seed, persistedFolds: persisted) {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let folds = await self.adoptMergedActionFolds(for: [conversationId, seed])
+                let remount = self.remountOpenedAndPane()
+                NotificationService.shared.clearNotifications(
+                    forConversationIds: snNotificationClearIds(
+                        conversationId: conversationId,
+                        relatedIds: Array(ids),
+                        historicalFolds: folds,
+                        openedConversationId: remount.opened,
+                        openedConversationPaneId: remount.pane
+                    )
+                )
+            }
+        }
     }
 
     func pop() {
@@ -9803,9 +16313,23 @@ final class SonarAppStore: ObservableObject {
         // The unread divider lives while its chat is on the stack; leaving the
         // chat retires it so a later reopen (already marked read) starts clean.
         if case .dm(let id)? = path.last {
-            unreadCountAtOpenByDM[id] = nil
-            jumpMessageIdAtOpenByDM[id] = nil
-            pendingJumpMessageIdByDM[id] = nil
+            setUnreadCountAtOpen(id, count: nil)
+            let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+            let remount = remountOpenedAndPane()
+            jumpMessageIdAtOpenByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: jumpMessageIdAtOpenByDM,
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
+            pendingJumpMessageIdByDM = snQuotedJumpCleared(
+                conversationId: id,
+                jumps: pendingJumpMessageIdByDM,
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
         }
         if !path.isEmpty { path.removeLast() }
         syncViewingUnreadGroups()
@@ -9834,8 +16358,7 @@ final class SonarAppStore: ObservableObject {
             marmot.setViewingUnreadGroups([])
             return
         }
-        let groups = directMarmotGroups(matchingGroupId: groupId)
-        marmot.setViewingUnreadGroups(groups.isEmpty ? [groupId] : groups.map(\.id))
+        marmot.setViewingUnreadGroups(transcriptSourceIds(forGroupId: groupId))
     }
 
     private func popCallRouteIfNeeded() {
@@ -10096,9 +16619,17 @@ final class SonarAppStore: ObservableObject {
                 )
             )
         )
-        var records = callLogs[convId, default: []]
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let (opened, pane) = remountOpenedAndPane()
+        let storeId = snCallConversationStoreId(
+            conversationId: convId,
+            historicalFolds: folds,
+            openedConversationId: opened,
+            openedConversationPaneId: pane
+        )
+        var records = callLogs[storeId, default: []]
         records.append(record)
-        callLogs[convId] = Array(records.suffix(Self.maxStoredCallsPerConversation))
+        callLogs[storeId] = Array(records.suffix(Self.maxStoredCallsPerConversation))
         persistCallLogs()
     }
 
@@ -10174,6 +16705,14 @@ final class SonarAppStore: ObservableObject {
             return sent
         case .internet:
             if let groupId = callMarmotGroupId(convId) {
+                if directMarmotHasDuplicateSiblings(groupId) {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        let target = await self.resolvedMarmotOutboundGroupId(convId) ?? groupId
+                        self.marmot.send(line, to: target)
+                    }
+                    return true
+                }
                 marmot.send(line, to: groupId)
                 return true
             }
@@ -10189,6 +16728,20 @@ final class SonarAppStore: ObservableObject {
     @discardableResult
     private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia, messageId: String) -> Bool {
         let conversationId = callConversationId(convId)
+        if isContactBlocked(conversationId, npub: callNpub(conversationId) ?? "") {
+            SecureLogger.debug(
+                "SonarCall: ignoring blocked call control convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16))",
+                category: .session
+            )
+            if case let .offer(callId, _, _, _) = ctrl {
+                _ = sendCallControl(
+                    convId,
+                    callEncodeAnswer(callId: callId, answer: .decline, nodeAddrB64: ""),
+                    via: via
+                )
+            }
+            return true
+        }
         if case let .offer(callId, _, _, _) = ctrl, !canCall(conversationId) {
             if shouldDeferOfferForSonarDescriptor(conversationId) {
                 SecureLogger.debug("SonarCall: deferring offer until Sonar descriptor lookup completes convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16))", category: .session)
@@ -10299,6 +16852,28 @@ final class SonarAppStore: ObservableObject {
     ///
     /// Optimistic: hide the row immediately (Compose filters `chats` first), then
     /// await durable MLS purge so a stuck relay cannot keep the chat visible.
+    private func noteDeletedOpenConversation(deletedId: String, purgeIds: Set<String>) {
+        guard snDeletedConversationClearsOpen(
+            openId: currentDMId,
+            deletedId: deletedId,
+            purgeIds: purgeIds
+        ) else { return }
+        hopMacOpenConversationSelection()
+    }
+
+    /// Compose `stack = listOf(Home)` on erase / wipe / nsec restore.
+    /// Mac selection is view-local and would otherwise keep `.dm` / `.channel`.
+    private func hopMacOpenConversationSelection() {
+        openedConversationId = nil
+        openedConversationPaneId = nil
+        pendingMarmotRouteReplacement = nil
+        marmot.rememberRemountPair(
+            openedConversationId: nil,
+            openedConversationPaneId: nil
+        )
+        deletedOpenConversationTick &+= 1
+    }
+
     func deleteChat(_ id: String) {
         discardRetainedConversation(id)
         if isPendingSecureChat(id) {
@@ -10311,37 +16886,83 @@ final class SonarAppStore: ObservableObject {
                 pendingDirectMarmotSends[pendingNpub] = nil
                 cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
             }
-            path.removeAll { route in
-                if case .dm(let rid) = route { return rid == id }
-                return false
+            path.removeAll {
+                snDeletedConversationShouldClearRoute($0, deletedId: id, purgeIds: [id])
             }
+            noteDeletedOpenConversation(deletedId: id, purgeIds: [id])
             objectWillChange.send()
             return
         }
 
         if let groupId = marmotGroupId(id) {
             let shouldLeave = isMultiMemberMarmotGroupId(id)
+            // Capture before hopMacOpenConversationSelection: remount can
+            // hop live while persist-folds are still empty, and the pair
+            // is the only name host leave has for the hidden 0.8 sibling.
+            let remount = remountOpenedAndPane()
             // A deduped direct row can represent several duplicate Marmot groups
             // for the same peer; delete the whole set so hidden duplicates don't
-            // resurface after the next refresh.
+            // resurface after the next refresh. After an MDK 0.8→0.9 resume the
+            // hidden 0.8 sibling must leave too, or the next cold-start snapshot
+            // can resurrect a deleted room.
+            let blobFolds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
-            let groupIds = matching.isEmpty ? [groupId] : matching
+            let family = snEchoReconcileFamilyIds(
+                echoGroupId: groupId,
+                historicalFolds: blobFolds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            ).map { snBareMarmotGroupId($0) }.filter { !$0.isEmpty }
+            let groupIds = Array(Set((matching.isEmpty ? [groupId] : matching) + family))
+            let nextFolds = snPurgedHistoricalFolds(blobFolds, deletedIds: Set(groupIds))
+            if nextFolds != blobFolds {
+                snPersistHistoricalFolds(nextFolds, to: defaults)
+            }
             for gid in groupIds {
                 discardRetainedConversation(gid)
                 forgetMarmotGroupMappings(forGroupId: gid)
                 marmot.dropGroupFromLocalState(gid)
             }
-            path.removeAll { route in
-                if case .dm(let rid) = route { return rid == id || groupIds.contains(rid) }
-                return false
+            path.removeAll {
+                snDeletedConversationShouldClearRoute(
+                    $0,
+                    deletedId: id,
+                    purgeIds: Set(groupIds)
+                )
             }
+            noteDeletedOpenConversation(deletedId: id, purgeIds: Set(groupIds))
             objectWillChange.send()
             Task { @MainActor in
+                let folds = await mergedActionHistoricalFolds(for: groupId)
+                let mergedPurge = snLeaveFamilyCorePurgeIds(
+                    leaveId: groupId,
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
+                let mergedDelete = snDeletedConversationCorePurgeIds(
+                    listedIds: groupIds,
+                    historicalFolds: folds,
+                    openedConversationId: remount.opened,
+                    openedConversationPaneId: remount.pane
+                )
+                for gid in mergedDelete where !groupIds.contains(gid) {
+                    discardRetainedConversation(gid)
+                    forgetMarmotGroupMappings(forGroupId: gid)
+                    marmot.dropGroupFromLocalState(gid)
+                }
+                let purged = snPurgedHistoricalFolds(folds, deletedIds: Set(mergedDelete + mergedPurge))
+                if purged != folds {
+                    snPersistHistoricalFolds(purged, to: defaults)
+                }
                 do {
                     if shouldLeave {
                         try await marmot.leaveGroup(groupId)
+                        for gid in mergedPurge {
+                            try await marmot.deleteGroup(gid)
+                        }
                     } else {
-                        for gid in groupIds { try await marmot.deleteGroup(gid) }
+                        for gid in mergedDelete { try await marmot.deleteGroup(gid) }
                     }
                 } catch {
                     // Optimistic hide already ran — reload from durable state so a
@@ -10359,28 +16980,65 @@ final class SonarAppStore: ObservableObject {
 
         // Mesh / Sonar peer: erase mesh transcript and every folded WN leg.
         chatViewModel.deleteConversation(with: PeerID(str: id))
+        let remount = remountOpenedAndPane()
         let foldedGroups: [MarmotService.MarmotGroup]
+        let folds = (defaults.dictionary(forKey: Keys.historicalFolds) as? [String: String]) ?? [:]
+        let meshPurgeIds: [String]
         if let profile = resolvedSonarProfile(id) {
             foldedGroups = marmotGroups(forNpub: profile.npub)
-            for g in foldedGroups {
-                discardRetainedConversation(g.id)
-                forgetMarmotGroupMappings(forGroupId: g.id)
-                marmot.dropGroupFromLocalState(g.id)
+            meshPurgeIds = snDeletedConversationCorePurgeIds(
+                listedIds: foldedGroups.map(\.id),
+                historicalFolds: folds,
+                openedConversationId: remount.opened,
+                openedConversationPaneId: remount.pane
+            )
+            for gid in meshPurgeIds {
+                discardRetainedConversation(gid)
+                forgetMarmotGroupMappings(forGroupId: gid)
+                marmot.dropGroupFromLocalState(gid)
+            }
+            let nextFolds = snPurgedHistoricalFolds(folds, deletedIds: Set(meshPurgeIds))
+            if nextFolds != folds {
+                snPersistHistoricalFolds(nextFolds, to: defaults)
             }
         } else {
             foldedGroups = []
+            meshPurgeIds = []
         }
-        path.removeAll { route in
-            if case .dm(let rid) = route {
-                return rid == id || foldedGroups.contains(where: { $0.id == rid })
-            }
-            return false
+        let meshRoutePurge = snDeletedMeshConversationPurgeIds(
+            meshChatIds: [id],
+            foldedGroupIds: meshPurgeIds + foldedGroups.map(\.id)
+        )
+        path.removeAll {
+            snDeletedConversationShouldClearRoute(
+                $0,
+                deletedId: id,
+                purgeIds: meshRoutePurge
+            )
         }
+        noteDeletedOpenConversation(deletedId: id, purgeIds: meshRoutePurge)
         objectWillChange.send()
-        if !foldedGroups.isEmpty {
+        if !meshPurgeIds.isEmpty || !foldedGroups.isEmpty {
             Task { @MainActor in
+                var purge = Set(meshPurgeIds)
+                for group in foldedGroups {
+                    let folds = await mergedActionHistoricalFolds(for: group.id)
+                    purge.formUnion(
+                        snDeletedConversationCorePurgeIds(
+                            listedIds: [group.id],
+                            historicalFolds: folds,
+                            openedConversationId: remount.opened,
+                            openedConversationPaneId: remount.pane
+                        )
+                    )
+                }
+                for gid in purge where !meshPurgeIds.contains(gid) {
+                    discardRetainedConversation(gid)
+                    forgetMarmotGroupMappings(forGroupId: gid)
+                    marmot.dropGroupFromLocalState(gid)
+                }
                 do {
-                    for g in foldedGroups { try await marmot.deleteGroup(g.id) }
+                    for gid in purge { try await marmot.deleteGroup(gid) }
                 } catch {
                     _ = await marmot.loadLocalSummaries(resolveMembers: false)
                     showToast("Couldn't delete chat: \(error.localizedDescription)")
@@ -10412,6 +17070,8 @@ final class SonarAppStore: ObservableObject {
         // store is erased so a late completion cannot recreate a group.
         await quiescePendingMarmotGroupSetups()
         path = []
+        hopMacOpenConversationSelection()
+        suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
@@ -10433,6 +17093,8 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
+        recoveredChatNeedsUpdate = []
+        pendingJoinRequestsCache = nil
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil
@@ -10453,6 +17115,8 @@ final class SonarAppStore: ObservableObject {
         localHydratingDMs = []
         clearMarmotConversationGroups()
         marmot.groups = []
+        defaults.removeObject(forKey: Keys.historicalFolds)
+        UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         applyBLEDiscoveryPolicy()
         publishedBolt12Offer = nil
@@ -10496,6 +17160,8 @@ final class SonarAppStore: ObservableObject {
         marmot.stopPolling()
         await marmot.wipeDatabase()
         path = []
+        hopMacOpenConversationSelection()
+        suppressOpenedDMHydrateIds.removeAll()
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
         pendingJumpMessageIdByDM.removeAll()
@@ -10534,6 +17200,8 @@ final class SonarAppStore: ObservableObject {
         marmot.messagesByGroup = [:]
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
+        defaults.removeObject(forKey: Keys.historicalFolds)
+        UserDefaults(suiteName: Self.appGroupId)?.removeObject(forKey: Keys.historicalFolds)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).
@@ -10569,6 +17237,8 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
+        recoveredChatNeedsUpdate = []
+        pendingJoinRequestsCache = nil
         pendingMarmotMessagesByChat = [:]
         pendingMarmotRouteReplacement = nil
         pendingMarmotRouteFailure = nil

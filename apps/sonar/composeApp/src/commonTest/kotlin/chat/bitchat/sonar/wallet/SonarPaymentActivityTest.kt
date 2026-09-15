@@ -135,6 +135,35 @@ class SonarPaymentActivityLedgerTest {
         l.recordPending(activity("a2"))
         assertEquals(listOf("a1"), l.activities("peer-a1").map { it.id })
     }
+
+    @Test
+    fun remountPeerKeysMovesHistoricalChatOntoLiveSibling() {
+        val l = SonarPaymentActivityLedger()
+        l.recordPending(activity("hist").copy(peerKey = "group-08"))
+        l.recordPending(activity("live").copy(peerKey = "group-09"))
+        l.recordPending(activity("wallet").copy(peerKey = "wallet"))
+        l.recordPending(activity("unify").copy(peerKey = "unify:peer"))
+        assertTrue(l.remountPeerKeys(listOf("group-08"), "group-09"))
+        assertEquals(listOf("hist", "live"), l.activities("group-09").map { it.id }.sorted())
+        assertTrue(l.activities("group-08").isEmpty())
+        assertEquals("wallet", l.get("wallet")!!.peerKey)
+        assertEquals("unify:peer", l.get("unify")!!.peerKey)
+        val reloaded = SonarPaymentActivityLedger(l.serialize())
+        assertEquals(listOf("hist", "live"), reloaded.activities("group-09").map { it.id }.sorted())
+        assertEquals("wallet", reloaded.get("wallet")!!.peerKey)
+        assertFalse(l.remountPeerKeys(listOf("group-08"), "group-09"))
+    }
+
+    @Test
+    fun activitiesByPeerKeysUnionsFoldFamily() {
+        val l = SonarPaymentActivityLedger()
+        l.recordPending(activity("hist", createdAtSecs = 100).copy(peerKey = "group-08"))
+        l.recordPending(activity("live", createdAtSecs = 200).copy(peerKey = "group-09"))
+        assertEquals(
+            listOf("live", "hist"),
+            l.activities(listOf("group-08", "group-09")).map { it.id },
+        )
+    }
 }
 
 class MergeWalletActivityTest {

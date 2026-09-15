@@ -8,6 +8,9 @@ data class SonarChat(
     val id: String,        // MLS group id hex
     val name: String,
     val members: List<String>,
+    /** Core-authored. Default false so an omitted flag cannot fold a
+     *  remounted room onto a 1:1 (R-045). Snapshot decode matches. */
+    val isDirect: Boolean = false,
 )
 
 /** Pending multi-member group invite awaiting explicit accept/decline. */
@@ -458,25 +461,57 @@ internal fun normalizedProfileCache(profiles: Map<String, SonarProfile>): Map<St
         result
     }
 
+/** Recency written into the metadata-only chat snapshot.
+ *  Fold remount does not sort, so `lastOrNull()` can be the oldest recovered
+ *  0.8 extract row. Persisting that as latest lets a newer empty live sibling
+ *  win `dedupeDirectMarmotChats` after process death — the in-memory extract
+ *  is gone and only this timestamp remains. iOS `snChatSnapshotLatestTs`;
+ *  iOS snapshot is groups-only, so that helper is the persist contract. */
+internal fun chatSnapshotLatestTs(
+    messages: List<SonarMsg>?,
+    persistedLatest: Long?,
+): Long {
+    val messageTs = messages?.maxOfOrNull { it.tsSecs } ?: 0L
+    return maxOf(messageTs, persistedLatest ?: 0L)
+}
+
 internal fun encodeChatSnapshot(
     chats: List<SonarChat>,
     messagesByChat: Map<String, List<SonarMsg>>,
     latestByChat: Map<String, Long> = emptyMap(),
+    includeIsDirect: Boolean = true,
 ): String =
     buildString {
         // Order is part of this metadata-only snapshot: it is the last locally
         // computed recency order and lets Home paint without an ID-order flash
         // while the encrypted core database opens. Only the thread-style latest
         // timestamp is cached for cross-transport sorting; message bodies stay
-        // out of this preferences blob.
+        // out of this preferences blob. The 6th field is `isDirect` so a
+        // two-member recovered room does not first-paint as a DM (R-045).
+        // Omit it when rewriting a pre-isDirect blob (startup strip of old
+        // message bodies) so invented `false` is not stamped durable.
         chats.forEach { chat ->
             append("c\t")
             append(hexEnc(chat.id)).append('\t')
             append(hexEnc(chat.name)).append('\t')
             append(chat.members.joinToString(",") { hexEnc(it) }).append('\t')
-            append(messagesByChat[chat.id]?.lastOrNull()?.tsSecs ?: latestByChat[chat.id] ?: 0L)
+            append(chatSnapshotLatestTs(messagesByChat[chat.id], latestByChat[chat.id]))
+            if (includeIsDirect) {
+                append('\t')
+                append(if (chat.isDirect) "1" else "0")
+            }
             append('\n')
         }
+    }
+
+/** True when the blob still has leftover non-chat lines (old message bodies). */
+internal fun chatSnapshotNeedsMetadataRewrite(blob: String): Boolean =
+    blob.lineSequence().any { it.isNotBlank() && !it.startsWith("c\t") }
+
+/** True when at least one chat row already persisted `isDirect`. */
+internal fun chatSnapshotHasIsDirect(blob: String): Boolean =
+    blob.lineSequence().any { line ->
+        line.startsWith("c\t") && line.split('\t').size >= 6
     }
 
 internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String, List<SonarMsg>>> {
@@ -486,7 +521,7 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
         val parts = line.split('\t')
         when (parts.firstOrNull()) {
             "c" -> {
-                if (parts.size !in 4..5) return@forEach
+                if (parts.size !in 4..6) return@forEach
                 val id = hexDec(parts[1]) ?: return@forEach
                 val name = hexDec(parts[2]) ?: return@forEach
                 val members = parts[3]
@@ -494,7 +529,12 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
                     ?.split(",")
                     ?.mapNotNull { hexDec(it) }
                     .orEmpty()
-                chats += SonarChat(id, name, members)
+                // Missing 6th field is a pre-isDirect snapshot. Default false
+                // so a two-member recovered room stays its own row on the
+                // first-upgrade paint (R-045). Old DMs may show room chrome
+                // until the first groups() persist writes the real flag.
+                val isDirect = parts.getOrNull(5)?.let { it != "0" } ?: false
+                chats += SonarChat(id, name, members, isDirect = isDirect)
             }
         }
     }
@@ -506,7 +546,7 @@ internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
     buildMap {
         blob.lineSequence().forEach { line ->
             val parts = line.split('\t')
-            if (parts.firstOrNull() != "c" || parts.size != 5) return@forEach
+            if (parts.firstOrNull() != "c" || parts.size !in 5..6) return@forEach
             val id = hexDec(parts[1]) ?: return@forEach
             val latest = parts[4].toLongOrNull()?.takeIf { it > 0L } ?: return@forEach
             put(id, latest)
@@ -845,8 +885,15 @@ expect object SonarCore {
     /** The `#abcd` disambiguator for [pubkeyHex] — its last 4 hex, lowercased. */
     fun mentionShortSuffix(pubkeyHex: String): String?
 
-    /** All active Marmot chats we belong to. */
+    /** All active Marmot chats we belong to. Throws when the node is closed
+     *  so a seal/reconnect cannot look like a successful empty account. */
     suspend fun chats(): List<SonarChat>
+
+    /** Live 0.9 group that replaced a recovered 0.8 row, or null if not folded. */
+    fun liveFoldTarget(groupId: String): String?
+
+    /** Recovered and live ids that share one conversation after resume. */
+    fun foldAliases(groupId: String): List<String>
 
     /** Start (or fetch) a 1:1 chat with a peer (npub or hex). Returns chat id. */
     suspend fun startChat(peer: String): String
@@ -854,7 +901,7 @@ expect object SonarCore {
     /** Start a multi-member group with peers (npub or hex). Returns chat id. */
     suspend fun startGroup(members: List<String>, name: String): String
 
-    /** Pending multi-member group invites. */
+    /** Pending multi-member group invites. Throws when the node is closed. */
     suspend fun pendingGroupInvites(): List<SonarGroupInvite>
 
     /** Accept a pending group invite. Returns chat id. */
@@ -992,17 +1039,20 @@ expect object SonarCore {
         listener: SonarMediaDownloadListener,
     ): Long
 
-    /** Decrypted message history for a chat, oldest first. */
+    /** Decrypted message history for a chat, oldest first. Throws when the node is closed. */
     suspend fun messages(chatId: String): List<SonarMsg>
 
-    /** Bounded local message window for a chat, oldest first within the page. */
+    /** Bounded local message window for a chat, oldest first within the page.
+     *  Throws when the node is closed. */
     suspend fun messagesPage(chatId: String, limit: Int, offset: Int = 0): List<SonarMsg>
 
-    /** Bounded local transcript windows for the most recent chats. */
+    /** Bounded local transcript windows for the most recent chats.
+     *  Throws when the node is closed. */
     suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage>
 
     /** Precomputed conversation summaries from the core-owned index, ordered
-     *  by latest message timestamp (newest first). */
+     *  by latest message timestamp (newest first). Throws when the node is closed
+     *  so a seal cannot look like a successful empty inbox and wipe badges. */
     suspend fun conversationSummaries(): List<SonarConversationSummary>
 
     /** Reset unread count for a chat to 0. */

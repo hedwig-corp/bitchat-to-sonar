@@ -407,6 +407,10 @@ final class ConversationViewState: ObservableObject {
 
     var isActive: Bool { rebuildSubscription.isAttached }
 
+    /// True when the render window has left the newest page (scrolled up /
+    /// older-edge pin). Remount must keep this so `openedDM` cannot snap back.
+    var isPinnedToOlderEdge: Bool { needsNewestReload }
+
     /// Follow store invalidations while this conversation is on screen. The
     /// synchronous rebuild is what makes reopen paint current: a retained
     /// transcript stopped following the store when the chat was closed.
@@ -423,6 +427,51 @@ final class ConversationViewState: ObservableObject {
     /// Stop following store invalidations. `messages` is kept for reopen paint.
     func deactivate() {
         rebuildSubscription.detach()
+    }
+
+    /// After an MDK 0.8→0.9 remount, keep the scrolled window / older-edge pin
+    /// on the live sibling. `conversationId` is immutable, so the host creates
+    /// a new state keyed by the live id and copies this window onto it.
+    func adoptOpenWindow(from other: ConversationViewState) {
+        visibleMessageLimit = other.visibleMessageLimit
+        sourceMessageLimit = other.sourceMessageLimit
+        meshNewestOffset = other.meshNewestOffset
+        paymentNewestOffset = other.paymentNewestOffset
+        callNewestOffset = other.callNewestOffset
+        needsNewestReload = other.needsNewestReload
+        lastMeshMessageCount = other.lastMeshMessageCount
+        lastPaymentActivityCount = other.lastPaymentActivityCount
+        lastCallRecordCount = other.lastCallRecordCount
+        renderState = other.renderState
+        hasOlderMessages = other.hasOlderMessages
+        isLoadingOlder = false
+    }
+
+    /// Expand the painted suffix so a quote parent already in the family
+    /// cache is reachable without waiting on load-older.
+    private func applyQuotedMessageRevealIfNeeded(store: SonarAppStore) {
+        guard let parentId = store.jumpMessageIdAtOpen(for: conversationId)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !parentId.isEmpty
+        else { return }
+        let retained = TransportConfig.sonarTranscriptRetainedCount
+        let pageSize = TransportConfig.sonarTranscriptPageCount
+        let cached = store.dmMsgs(
+            conversationId,
+            limit: retained,
+            meshNewestOffset: meshNewestOffset,
+            paymentNewestOffset: paymentNewestOffset,
+            callNewestOffset: callNewestOffset
+        )
+        guard let reveal = snQuotedMessageRevealLimit(
+            parentId: parentId,
+            cached: cached,
+            idOf: { $0.id },
+            pageSize: pageSize,
+            retainedRows: retained
+        ) else { return }
+        visibleMessageLimit = max(visibleMessageLimit, reveal)
+        sourceMessageLimit = max(sourceMessageLimit, reveal)
     }
 
     /// Coalesce rebuild requests: at most one queued build at a time. A change
@@ -452,6 +501,15 @@ final class ConversationViewState: ObservableObject {
             )
         }
         #endif
+        let retained = TransportConfig.sonarTranscriptRetainedCount
+        // Remounted 0.8 extract rows are already in the family cache.
+        // Keep the source window large enough that load-older can
+        // prepend them without waiting for a new database id.
+        sourceMessageLimit = snCachedFoldFamilySourceLimit(
+            cachedCount: store.cachedMarmotFamilyRowCount(for: conversationId),
+            currentLimit: sourceMessageLimit,
+            retainedLimit: retained
+        )
         let meshCount = store.cachedMeshMessageCount(conversationId)
         let paymentCount = store.cachedPaymentActivityCount(conversationId)
         let callCount = store.cachedCallRecordCount(conversationId)
@@ -475,6 +533,7 @@ final class ConversationViewState: ObservableObject {
             // its newest page while the visible anchor remains much older.
             store.preserveHistoricalDM(conversationId)
         }
+        applyQuotedMessageRevealIfNeeded(store: store)
         let sourceLookaheadLimit = min(
             TransportConfig.sonarTranscriptRetainedCount,
             sourceMessageLimit + 1
@@ -527,6 +586,11 @@ final class ConversationViewState: ObservableObject {
     /// different chat after navigation.
     func loadOlder() async -> Bool {
         guard !isLoadingOlder, hasOlderMessages, let store else { return false }
+        sourceMessageLimit = snCachedFoldFamilySourceLimit(
+            cachedCount: store.cachedMarmotFamilyRowCount(for: conversationId),
+            currentLimit: sourceMessageLimit,
+            retainedLimit: TransportConfig.sonarTranscriptRetainedCount
+        )
         isLoadingOlder = true
         defer { isLoadingOlder = false }
         let pageSize = TransportConfig.sonarTranscriptPageCount

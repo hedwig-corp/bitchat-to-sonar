@@ -191,14 +191,80 @@ struct MarmotProfileCacheTests {
         let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
         let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
         let peerHex = peerRaw.map { String(format: "%02x", $0) }.joined()
-        let first = MarmotService.MarmotGroup(id: "group-a", name: "", memberNpubs: [ownNpub, peerHex])
-        let second = MarmotService.MarmotGroup(id: "group-b", name: "", memberNpubs: [ownNpub, peerNpub])
+        let first = MarmotService.MarmotGroup(id: "group-a", name: "", memberNpubs: [ownNpub, peerHex], isDirect: true)
+        let second = MarmotService.MarmotGroup(id: "group-b", name: "", memberNpubs: [ownNpub, peerNpub], isDirect: true)
         let room = MarmotService.MarmotGroup(id: "room", name: "", memberNpubs: [ownNpub, peerNpub, "npub1third"])
 
         let grouped = snCanonicalDirectMarmotGroups([first, second, room], ownNpub: ownNpub)
 
         #expect(snDirectMarmotPeerKey(for: first, ownNpub: ownNpub) == peerNpub)
         #expect(grouped[peerNpub]?.map(\.id) == ["group-a", "group-b"])
+    }
+
+    @Test
+    func recoveredRoomWithOneKnownPeerDoesNotFoldOntoDirect() throws {
+        let ownRaw = Data(repeating: 1, count: 32)
+        let peerRaw = Data(repeating: 2, count: 32)
+        let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
+        let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
+        let dm = MarmotService.MarmotGroup(id: "bob-dm", name: "bob dm", memberNpubs: [ownNpub, peerNpub], isDirect: true)
+        let pendingRoom = MarmotService.MarmotGroup(
+            id: "pending-room",
+            name: "pending room",
+            memberNpubs: [ownNpub, peerNpub],
+            isDirect: false
+        )
+
+        let grouped = snCanonicalDirectMarmotGroups([dm, pendingRoom], ownNpub: ownNpub)
+
+        #expect(snDirectMarmotPeerKey(for: pendingRoom, ownNpub: ownNpub) == nil)
+        #expect(snDirectMarmotPeerKey(for: dm, ownNpub: ownNpub) == peerNpub)
+        #expect(grouped[peerNpub]?.map(\.id) == ["bob-dm"])
+        #expect(snMarmotTreatsAsGroupChat(pendingRoom))
+        #expect(!snMarmotTreatsAsGroupChat(dm))
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: pendingRoom.isDirect,
+                name: pendingRoom.name,
+                otherMemberCount: 1,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "pending room"
+        )
+    }
+
+    @Test
+    func emptyTopicResumedRoomDoesNotFoldOntoWelcomerDm() throws {
+        let ownRaw = Data(repeating: 1, count: 32)
+        let peerRaw = Data(repeating: 2, count: 32)
+        let ownNpub = try Bech32.encode(hrp: "npub", data: ownRaw)
+        let peerNpub = try Bech32.encode(hrp: "npub", data: peerRaw)
+        let dm = MarmotService.MarmotGroup(id: "bob-dm", name: "bob dm", memberNpubs: [ownNpub, peerNpub], isDirect: true)
+        // Live sibling after an empty-topic 3-person resume: two MLS members,
+        // empty name. FFI reports isDirect=false. Omitting the host flag
+        // must stay a room — the in-memory default used to be true (R-045).
+        let resumedRoom = MarmotService.MarmotGroup(
+            id: "empty-topic-live",
+            name: "",
+            memberNpubs: [ownNpub, peerNpub]
+        )
+
+        let grouped = snCanonicalDirectMarmotGroups([dm, resumedRoom], ownNpub: ownNpub)
+
+        #expect(snDirectMarmotPeerKey(for: resumedRoom, ownNpub: ownNpub) == nil)
+        #expect(snDirectMarmotPeerKey(for: dm, ownNpub: ownNpub) == peerNpub)
+        #expect(grouped[peerNpub]?.map(\.id) == ["bob-dm"])
+        #expect(snMarmotTreatsAsGroupChat(resumedRoom))
+        #expect(!snMarmotTreatsAsGroupChat(dm))
+        #expect(
+            snMarmotChatDisplayTitle(
+                isDirect: resumedRoom.isDirect,
+                name: resumedRoom.name,
+                otherMemberCount: 1,
+                profileName: "Bob",
+                npubFallback: "npub1bob…"
+            ) == "Group chat"
+        )
     }
 
     @Test
@@ -239,6 +305,53 @@ struct MarmotProfileCacheTests {
         let loaded = SNMarmotChatSnapshotCache.load(from: defaults)
         #expect(loaded.0 == [group])
         #expect(loaded.1.isEmpty)
+    }
+
+    @Test
+    func chatSnapshotPreservesRecoveredRoomIsDirect() {
+        let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let pendingRoom = MarmotService.MarmotGroup(
+            id: "pending-room",
+            name: "pending room",
+            memberNpubs: ["npub1sara", "npub1me"],
+            isDirect: false
+        )
+
+        SNMarmotChatSnapshotCache.save(
+            groups: [pendingRoom],
+            messagesByGroup: [:],
+            to: defaults
+        )
+
+        let loaded = SNMarmotChatSnapshotCache.load(from: defaults)
+        #expect(loaded.0 == [pendingRoom])
+        #expect(loaded.0.first?.isDirect == false)
+        #expect(snDirectMarmotPeerKey(for: loaded.0[0], ownNpub: "npub1me") == nil)
+        #expect(snMarmotTreatsAsGroupChat(loaded.0[0]))
+    }
+
+    @Test
+    func legacyChatSnapshotWithoutIsDirectDoesNotFoldAsDirect() throws {
+        let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let json = """
+        {"groups":[{"id":"pending-room","name":"pending room","memberNpubs":["npub1sara","npub1me"]}]}
+        """
+        defaults.set(Data(json.utf8), forKey: "marmot.chatSnapshot.v1")
+
+        let loaded = SNMarmotChatSnapshotCache.load(from: defaults)
+        #expect(loaded.0.count == 1)
+        #expect(loaded.0.first?.id == "pending-room")
+        #expect(loaded.0.first?.isDirect == false)
+        #expect(snDirectMarmotPeerKey(for: loaded.0[0], ownNpub: "npub1me") == nil)
+        #expect(snMarmotTreatsAsGroupChat(loaded.0[0]))
+        let stored = defaults.data(forKey: "marmot.chatSnapshot.v1").flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        #expect(!stored.contains("isDirect"), "load must not stamp invented isDirect onto a pre-isDirect blob")
     }
 
     @Test

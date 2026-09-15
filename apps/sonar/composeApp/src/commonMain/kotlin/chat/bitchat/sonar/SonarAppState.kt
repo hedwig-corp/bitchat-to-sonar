@@ -28,6 +28,7 @@ import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import chat.bitchat.sonar.wallet.mergeWalletActivity
 import chat.bitchat.sonar.wallet.paymentDestinationHash
+import chat.bitchat.sonar.wallet.remountedPaymentActivities
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -111,6 +112,8 @@ private const val PRESENCE_BEAT_MS = 60_000L
 /** Stale kind-0 profile sweep (was `tick % 450` ≈ every 30 min). */
 private const val PROFILE_SWEEP_MS = 30 * 60_000L
 private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
+internal const val HISTORICAL_FOLDS_BLOB_KEY = "sonar.historicalFolds"
+private const val VERIFIED_IDS_BLOB_KEY = "verified.ids"
 private const val NPUB_BLOB_KEY = "sonar.npub"
 private const val MESH_NAMES_BLOB_KEY = "sonar.meshNames"
 private const val FAVORITED_CONTROL = "[FAVORITED]"
@@ -420,6 +423,19 @@ internal fun homeListTitleForFoldedMeshRow(
     meshDerivedName: String,
 ): String = directMarmotTitle ?: meshDerivedName
 
+/** Search / share-to must match the painted title. Recovered 1:1s have a
+ *  blank MLS `chat.name` after hide; filtering that field hides the person.
+ *  iOS search uses `dmRows.title`. */
+internal fun conversationSearchMatches(
+    query: String,
+    storedName: String,
+    displayTitle: String,
+): Boolean {
+    val q = query.trim().lowercase()
+    if (q.isEmpty()) return true
+    return displayTitle.lowercase().contains(q) || storedName.lowercase().contains(q)
+}
+
 /** Rename-signal decision: force a kind-0 refetch only when the BLE name is
  *  real, differs from the cached profile name, and no fetch is in flight or
  *  recently done. */
@@ -431,6 +447,19 @@ internal fun shouldForceProfileRefetch(cachedName: String?, liveName: String?, f
  *  profile lands, and a short npub is the last resort. */
 internal fun directChatRowTitle(profileName: String?, groupName: String, npubFallback: String): String =
     profileName?.takeIf { it.isNotBlank() } ?: groupName.ifBlank { npubFallback }
+
+/** Home / header title. Recovered rooms keep their name even when only one
+ *  peer is listed; the 1:1 profile path is only for `isDirect` chats. */
+internal fun marmotChatDisplayTitle(
+    isDirect: Boolean,
+    name: String,
+    otherMemberCount: Int,
+    profileName: String?,
+    npubFallback: String,
+): String {
+    if (!isDirect || otherMemberCount != 1) return name.ifBlank { "Group chat" }
+    return directChatRowTitle(profileName, name, npubFallback)
+}
 
 /** Fold only when both transports identify the same cryptographic account. */
 internal fun peerNpubHexMatchesLinkedPeer(
@@ -474,12 +503,3772 @@ internal fun aliasesHaveMutualFavorite(
 }
 
 internal fun directMarmotPeerKey(chat: SonarChat, ownNpub: String): String? {
+    if (!chat.isDirect) return null
     val mine = canonicalProfileKey(ownNpub)
     val others = chat.members
         .map { canonicalProfileKey(it) }
         .filter { it.isNotBlank() && it != mine }
         .distinct()
     return others.singleOrNull()
+}
+
+/** Persist-wins merge of host folds + FFI `fold_aliases`. Contact-profile
+ *  1:1 resolution from a remounted **group** has a remount pair that is
+ *  not the DM; FFI still knows hist→live for the peer's 1:1s. Persist
+ *  hist→stale still wins (R-045). Wake-mute stays FFI-wins.
+ *  iOS `snPersistThenFfiHistoricalFolds`. */
+internal fun persistThenFfiHistoricalFolds(
+    persisted: Map<String, String>,
+    ffi: Map<String, String>,
+): Map<String, String> {
+    if (ffi.isEmpty()) return persisted
+    if (persisted.isEmpty()) return ffi
+    return persisted + ffi.filterKeys { it !in persisted }
+}
+
+/** Prefer persist/FFI/remount live among duplicate 1:1 ids. Newest-`latest_at`
+ *  and first-listed both pick recovered hist after remount (hist keeps
+ *  the transcript; live is empty or ties). Contact-profile Message /
+ *  iOS `preferredDirectMarmotGroup` then send against hist while FFI
+ *  still lists it. Empty persist-folds without FFI or a remount pair stay
+ *  null so first-resume newest-sort is unchanged. iOS
+ *  `snPreferredFoldedDirectMarmotGroupId`. */
+internal fun preferredFoldedDirectMarmotChatId(
+    candidateIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    ffiHistoricalFolds: Map<String, String> = emptyMap(),
+): String? {
+    val ids = candidateIds.map { it.removePrefix("marmot:").trim() }.filter { it.isNotBlank() }
+    if (ids.size <= 1) return null
+    val folds = remountPairHistoricalFolds(
+        persistThenFfiHistoricalFolds(historicalFolds, ffiHistoricalFolds),
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return null
+    for (id in ids) {
+        val live = folds[id]?.removePrefix("marmot:")?.trim().orEmpty()
+        if (live.isNotEmpty() && live != id && ids.any { openedConversationIdMatches(it, live) }) {
+            return ids.first { openedConversationIdMatches(it, live) }
+        }
+    }
+    return null
+}
+
+/** 1:1 row for [peerNpub], ignoring recovered/live rooms that currently list
+ *  only that peer. Persist/FFI/remount live wins among duplicate DMs.
+ *  Empty persist+remount+FFI newest-sorts so contact-profile Message
+ *  keeps recovered hist (iOS `preferredDirectMarmotGroup`). First-listed
+ *  used to open live when `chats()` listed it first — empty transcript
+ *  on first-resume. */
+internal fun directMarmotChatIdForPeer(
+    chats: List<SonarChat>,
+    ownNpub: String,
+    peerNpub: String,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    ffiHistoricalFolds: Map<String, String> = emptyMap(),
+    latestSecs: (String) -> Long = { 0L },
+): String? {
+    val peer = canonicalProfileKey(peerNpub)
+    if (peer.isBlank()) return null
+    val matches = chats.filter { directMarmotPeerKey(it, ownNpub) == peer }
+    return preferredFoldedDirectMarmotChatId(
+        matches.map { it.id },
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+        ffiHistoricalFolds = ffiHistoricalFolds,
+    ) ?: preferredDirectMarmotChatId(
+        matches.map { it.id },
+        latestSecs,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+}
+
+internal fun marmotNotificationGroupName(chat: SonarChat, paintedTitle: String? = null): String? {
+    if (chat.isDirect) return null
+    return paintedTitle?.trim()?.takeIf { it.isNotEmpty() }
+        ?: chat.name.takeIf { it.isNotBlank() }
+}
+
+/** iOS `SonarPushProcessor` wake titles: room name is conversationTitle
+ *  when present, and `groupName` only when a distinct sender is known —
+ *  otherwise the router renders "standup in standup". */
+internal data class WakeNotificationNames(
+    val conversationTitle: String?,
+    val groupName: String?,
+)
+
+internal fun wakeNotificationNames(
+    summaryName: String,
+    senderName: String?,
+): WakeNotificationNames {
+    val room = summaryName.trim().takeIf { it.isNotEmpty() }
+    val sender = senderName?.trim()?.takeIf { it.isNotEmpty() }
+    return WakeNotificationNames(
+        conversationTitle = room ?: sender,
+        groupName = if (sender != null && room != null && room != sender) room else null,
+    )
+}
+
+/** After an MDK 0.8→0.9 resume, send to the live duplicate so the recovered
+ *  row stays the history bucket. Newest-`latest_at` and `thenBy id` both
+ *  pick hist after remount: hist keeps the transcript, and remount-walked
+ *  [localLatestTsForChat] ties hist+live so lexicographic id is a coin
+ *  flip. Prefer persist/remount live among 1:1 candidates. Empty
+ *  persist-folds without a remount pair stay newest-sort so first-resume
+ *  is unchanged. iOS `preferredDirectMarmotGroup`. */
+internal fun marmotSendTargetGroupId(
+    openChatId: String,
+    duplicateGroupIds: List<String>,
+    latestSecs: (String) -> Long,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    ffiHistoricalFolds: Map<String, String> = emptyMap(),
+): String =
+    preferredFoldedDirectMarmotChatId(
+        duplicateGroupIds,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+        ffiHistoricalFolds = ffiHistoricalFolds,
+    ) ?: duplicateGroupIds.maxWithOrNull(compareBy(latestSecs).thenBy { it }) ?: openChatId
+
+/** Persist+remount live among duplicate 1:1s, else newest-`latest_at`.
+ *  No FFI — startChat / existence checks must not wait. Empty persist
+ *  without a remount pair stays newest-sort so first-resume is unchanged.
+ *  iOS `preferredDirectMarmotGroup`. */
+internal fun preferredDirectMarmotChatId(
+    candidateIds: Collection<String>,
+    latestSecs: (String) -> Long,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    val ids = candidateIds.map { it.removePrefix("marmot:").trim() }.filter { it.isNotBlank() }
+    if (ids.isEmpty()) return null
+    return preferredFoldedDirectMarmotChatId(
+        ids,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    ) ?: ids.maxWithOrNull(compareBy(latestSecs).thenBy { it })
+}
+
+/** Shared groups on a contact profile. Callers must pass the collapsed
+ *  home list — raw [SonarChat] rows still include folded 0.8 hist. */
+internal fun sharedGroupsWithContact(
+    chats: List<SonarChat>,
+    ownNpub: String,
+    peerNpub: String,
+    isMultiMember: (SonarChat) -> Boolean,
+): List<SonarChat> {
+    val mine = canonicalProfileKey(ownNpub)
+    val peer = canonicalProfileKey(peerNpub)
+    if (mine.isBlank() || peer.isBlank()) return emptyList()
+    return chats.filter { chat ->
+        isMultiMember(chat) &&
+            chat.members.any { canonicalProfileKey(it) == mine } &&
+            chat.members.any { canonicalProfileKey(it) == peer }
+    }
+}
+
+/** After FFI `groups()` hides a folded 0.8 room, remount the open transcript
+ *  onto the live 0.9 sibling. Peer / call / send-duplicate lookups use
+ *  [listedChat] so a still-open hidden id still finds the live sibling. */
+/** Move in-flight media uploads off a hidden 0.8 id onto the live sibling. */
+internal fun <V> remountFoldedPendingMediaUploads(
+    historical: String,
+    live: String,
+    uploads: Map<String, List<V>>,
+): Map<String, List<V>> {
+    if (historical.isBlank() || live.isBlank() || historical == live) return uploads
+    val incoming = uploads[historical] ?: return uploads
+    val existing = uploads[live].orEmpty()
+    return uploads - historical + (live to (existing + incoming))
+}
+
+/** Same move after FFI hides the 0.8 id even if the user already left. */
+internal fun <V> promotedFoldedPendingMediaUploads(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    uploads: Map<String, List<V>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, List<V>> {
+    var next = uploads
+    for (historical in previousIds + uploads.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        if (next[historical].isNullOrEmpty()) continue
+        next = remountFoldedPendingMediaUploads(historical, live, next)
+    }
+    return next
+}
+
+internal fun remountFoldedOpenChatId(
+    openChatId: String,
+    listedChatIds: Set<String>,
+    liveFoldTarget: String?,
+): String {
+    if (openChatId in listedChatIds) return openChatId
+    val live = liveFoldTarget?.takeIf { it.isNotBlank() && it != openChatId } ?: return openChatId
+    // Notification taps already remap onto live before `chats()` lists it.
+    // An open recovered transcript must do the same: after FFI hides the
+    // 0.8 id, waiting for the live row leaves title / members / send
+    // chrome on a chat that is no longer listed.
+    return live
+}
+
+/** Prefer the listed row. If FFI hid a folded 0.8 id or has not painted
+ *  the live sibling yet, reuse the other listed fold sibling so title /
+ *  members / directness stay correct. The returned [SonarChat.id] is always
+ *  [chatId] so send/admin keep the open id. */
+/** Open / catch-up / media-send target. A stale hist id remaps onto the
+ *  listed live sibling so `preferCatchupGroup` hits `engine.groups()`. */
+internal fun resolvedOpenGroupId(
+    groupId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    if (groupId in listedGroupIds) return groupId
+    historicalFolds[groupId]
+        ?.takeIf { it.isNotBlank() && it != groupId && it in listedGroupIds }
+        ?.let { return it }
+    historicalFolds.entries
+        .firstOrNull { it.value == groupId && it.key.isNotBlank() && it.key != groupId && it.key in listedGroupIds }
+        ?.let { return it.key }
+    for (id in remountPairConversationIds(
+        conversationId = groupId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        if (bare in listedGroupIds) return bare
+    }
+    return groupId
+}
+
+/** FFI group-admin / leave target. `listedOrFoldedSiblingChat` keeps the
+ *  open hist id so the painted pane is not remade; `canManageGroup` then
+ *  looks manageable while `pendingJoinRequests(hist)` misses the listed
+ *  live group. iOS `marmotGroupId`. */
+internal fun marmotAdminGroupId(
+    chatId: String,
+    listedGroupIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String = resolvedOpenGroupId(
+    chatId.removePrefix("marmot:").ifBlank { chatId },
+    listedGroupIds,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+)
+
+internal fun listedOrFoldedSiblingChat(
+    chatId: String,
+    listedChats: List<SonarChat>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): SonarChat? {
+    listedChats.firstOrNull { it.id == chatId }?.let { return it }
+    val historicalId = historicalFolds.entries
+        .firstOrNull { it.value == chatId && it.key != chatId }
+        ?.key
+    listedChats.firstOrNull { it.id == historicalId }?.let { return it.copy(id = chatId) }
+    val liveId = historicalFolds[chatId]?.takeIf { it != chatId }
+    listedChats.firstOrNull { it.id == liveId }?.let { return it.copy(id = chatId) }
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        listedChats.firstOrNull { it.id == id || it.id == bare }?.let { return it.copy(id = chatId) }
+    }
+    return null
+}
+
+/** Shade taps remapped onto a live sibling must open even before `chats()`
+ *  lists that id. Prefer the recovered sibling's name/members so a named
+ *  room does not open as "Group chat". Default not-direct (R-045). */
+internal fun notificationOpenChat(
+    remappedChatId: String,
+    listedChats: List<SonarChat>,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): SonarChat = listedOrFoldedSiblingChat(
+    remappedChatId,
+    listedChats,
+    historicalFolds,
+    openedConversationId = openedConversationId,
+    openedConversationPaneId = openedConversationPaneId,
+) ?: SonarChat(id = remappedChatId, name = "", members = emptyList(), isDirect = false)
+
+/** After `chats()` lists the remapped row, replace a stub "Group chat" title.
+ *  Do not replace a recovered room name with the generic placeholder if the
+ *  live MLS name is still blank. */
+internal fun adoptedListedChatTitle(
+    openChatId: String,
+    currentTitle: String,
+    listedChats: List<SonarChat>,
+    titleOf: (SonarChat) -> String,
+    genericTitle: String = "Group chat",
+): String? {
+    val listed = listedChats.firstOrNull { it.id == openChatId } ?: return null
+    val next = titleOf(listed)
+    if (next.isBlank() || next == currentTitle) return null
+    if (next == genericTitle && currentTitle.isNotBlank() && currentTitle != genericTitle) {
+        return null
+    }
+    return next
+}
+
+/** Copy an open-chat host map from a hidden 0.8 id onto the live sibling. */
+internal fun <V> remountFoldedOpenValues(
+    historicalKeys: List<String>,
+    liveKeys: List<String>,
+    values: Map<String, V>,
+    preferExisting: (V) -> Boolean = { true },
+): Map<String, V> {
+    val incoming = historicalKeys.firstNotNullOfOrNull { values[it] } ?: return values
+    var next = values
+    for (live in liveKeys) {
+        val existing = next[live]
+        if (existing != null && preferExisting(existing)) continue
+        next = next + (live to incoming)
+    }
+    return next
+}
+
+/** Copy a hist composer draft onto live without family-clearing.
+ *  `composerDraftsAfterEdit("", hist)` after persist-folds wipes live too.
+ *  iPhone still paints `.dm(hist)`, so hist keys must stay.
+ *  iOS `snRemountComposerDrafts`. */
+internal fun remountComposerDrafts(
+    drafts: Map<String, String>,
+    historicalKeys: List<String>,
+    liveKeys: List<String>,
+): Map<String, String> {
+    val nonempty = historicalKeys.filter { !drafts[it].isNullOrEmpty() }
+    return remountFoldedOpenValues(
+        historicalKeys = nonempty,
+        liveKeys = liveKeys,
+        values = drafts,
+        preferExisting = { it.isNotEmpty() },
+    )
+}
+
+/** Rebind one open-chat id from a hidden 0.8 row onto the live sibling. */
+internal fun remountFoldedOpenId(
+    historicalKeys: Collection<String>,
+    liveId: String,
+    id: String,
+): String = if (id in historicalKeys) liveId else id
+
+/** Painted iPhone DM route stays hist. Compose remounts [Screen.Chat.id]
+ *  and keeps viewport via [remountStableTranscriptSessionKey].
+ *  iOS `snRemountShouldPreserveOpenTranscriptRoute`. */
+internal fun remountShouldPreserveOpenTranscriptRoute(
+    routeId: String,
+    preserveIds: Set<String>,
+): Boolean {
+    if (routeId in preserveIds) return true
+    return preserveIds.any { openedConversationIdMatches(routeId, it) }
+}
+
+/** Remount group-info / contact-profile / call / buried chat routes after
+ *  FFI hides a folded 0.8 id. Transcript remount still copies host state
+ *  separately; this only rewrites nav ids. */
+internal fun remountFoldedNavStack(
+    stack: List<Screen>,
+    liveTarget: (String) -> String,
+): List<Screen> = stack.map { screen ->
+    when (screen) {
+        is Screen.Chat -> {
+            val live = liveTarget(screen.id)
+            if (live == screen.id) screen else screen.copy(id = live)
+        }
+        is Screen.GroupInfo -> {
+            val live = liveTarget(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        is Screen.ContactProfile -> {
+            val live = liveTarget(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        is Screen.Call -> {
+            val live = liveTarget(screen.peerId)
+            if (live == screen.peerId) screen else screen.copy(peerId = live)
+        }
+        else -> screen
+    }
+}
+
+/** Path remount must see the same live target as open-chat remount.
+ *  Persist-folds can still be empty when FFI already hid hist.
+ *  After hop, iPhone can still push group-info / call from the
+ *  painted hist pane; persist-other must not hide this remount.
+ *  iOS `snPathRemountLiveTarget`. */
+internal fun pathRemountLiveTarget(
+    id: String,
+    persistedFolds: Map<String, String>,
+    knownLiveTargets: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    val bare = id.removePrefix("marmot:").trim()
+    persistedFolds[bare]?.takeIf { it.isNotBlank() && it != bare }?.let { return it }
+    knownLiveTargets[bare]?.takeIf { it.isNotBlank() }?.let { return it }
+    knownLiveTargets[id]?.takeIf { it.isNotBlank() }?.let { return it }
+    val folds = remountPairHistoricalFolds(
+        persistedFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    folds[bare]?.takeIf { it.isNotBlank() && it != bare }?.let { return it }
+    folds[id]?.takeIf { it.isNotBlank() && it != id }?.let { return it }
+    return persistedFolds[bare]
+}
+
+/** After remount hop, iPhone still paints hist and can push group-info
+ *  / contact-profile from that pane. Path remount already rewrote routes
+ *  that were on the stack at hop; a new push must remap the same way.
+ *  Persist hist→stale still wins (R-045). Empty without a remount pair
+ *  stays hist. Do not remount `Screen.Chat` — the painted pane stays hist.
+ *  iOS `snPushedConversationRouteId`. */
+internal fun pushedConversationRouteId(
+    id: String,
+    persistedFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    val live = pathRemountLiveTarget(
+        id = id,
+        persistedFolds = persistedFolds,
+        knownLiveTargets = emptyMap(),
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    ) ?: return id
+    val bare = id.removePrefix("marmot:").trim()
+    val liveBare = live.removePrefix("marmot:").trim()
+    if (liveBare.isEmpty() || liveBare == bare) return id
+    return if (id.startsWith("marmot:")) "marmot:$liveBare" else liveBare
+}
+
+/** Remap group-info / contact-profile onto live. Leave Chat / Call /
+ *  other routes alone — Chat pane identity stays hist; Call keeps the
+ *  painted id so BLE signaling still resolves. iOS `snRemountPushedRoute`. */
+internal fun remountPushedScreen(
+    screen: Screen,
+    persistedFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Screen {
+    fun remap(id: String) = pushedConversationRouteId(
+        id,
+        persistedFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    return when (screen) {
+        is Screen.GroupInfo -> {
+            val live = remap(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        is Screen.ContactProfile -> {
+            val live = remap(screen.chatId)
+            if (live == screen.chatId) screen else screen.copy(chatId = live)
+        }
+        else -> screen
+    }
+}
+
+internal fun pathRemountShouldMergeFolds(
+    pathIds: Collection<String>,
+    persistedFolds: Map<String, String>,
+): Boolean = pathIds.any { firstOpenShouldMergeFolds(it, persistedFolds) }
+
+/** Delete/leave of the listed live row must also pop group-info / call
+ *  / a remounted hist pane. iOS `snDeletedConversationClearsOpen`. */
+internal fun deletedConversationIdInPurge(id: String, purgeIds: Set<String>): Boolean {
+    if (id in purgeIds) return true
+    val bare = id.removePrefix("marmot:")
+    return bare.isNotEmpty() && (bare in purgeIds || "marmot:$bare" in purgeIds)
+}
+
+/** Wipe / erase / nsec restore hop Mac off a dead DM or channel.
+ *  Compose resets `stack` to Home. iOS
+ *  `snMacSelectionShouldHopAfterOpenSessionCleared`. */
+internal fun macSelectionShouldHopAfterOpenSessionCleared(
+    isDM: Boolean,
+    isChannel: Boolean,
+): Boolean = isDM || isChannel
+
+internal fun deletedConversationClearsOpen(
+    openId: String?,
+    deletedId: String,
+    purgeIds: Set<String>,
+): Boolean {
+    val open = openId?.trim().orEmpty()
+    if (open.isEmpty()) return false
+    if (openedConversationIdMatches(open, deletedId)) return true
+    return deletedConversationIdInPurge(open, purgeIds)
+}
+
+internal fun deletedConversationShouldClearScreen(
+    screen: Screen,
+    deletedId: String,
+    purgeIds: Set<String>,
+): Boolean {
+    val id = when (screen) {
+        is Screen.Chat -> screen.id
+        is Screen.GroupInfo -> screen.chatId
+        is Screen.ContactProfile -> screen.chatId
+        is Screen.Call -> screen.peerId
+        else -> return false
+    }
+    return openedConversationIdMatches(id, deletedId) ||
+        deletedConversationIdInPurge(id, purgeIds)
+}
+
+/**
+ * Wake mute / FGS banners: merge the host fold blob with FFI
+ * `fold_aliases`. FFI wins per historical id — same shape as
+ * notification tap (`notificationLiveFoldTargets`). A first-resume
+ * live sibling can exist in core before the host fold blob is rewritten.
+ */
+internal fun wakeMuteHistoricalFolds(
+    persisted: Map<String, String>,
+    listedIds: Collection<String>,
+    foldAliases: (String) -> List<String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> {
+    val ffi = historicalFoldsFromAliases(listedIds, foldAliases, liveFoldTarget)
+    if (ffi.isEmpty()) return persisted
+    if (persisted.isEmpty()) return ffi
+    return persisted + ffi
+}
+
+internal fun encodeGroupFoldMap(map: Map<String, String>): String =
+    map.entries.joinToString("\n") { "${it.key}=${it.value}" }
+
+/** Discover hidden 0.8 ids from listed live siblings via FFI `fold_aliases`. */
+internal fun historicalFoldsFromAliases(
+    listedIds: Collection<String>,
+    foldAliases: (String) -> List<String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> {
+    val next = linkedMapOf<String, String>()
+    for (id in listedIds) {
+        val live = liveFoldTarget(id) ?: continue
+        if (live.isBlank()) continue
+        for (alias in foldAliases(id)) {
+            if (alias.isBlank() || alias == live) continue
+            next[alias] = live
+        }
+    }
+    return next
+}
+
+/**
+ * After nsec restore the previous account's host fold blob must not
+ * survive, but the restored core sidecar still knows hist→live.
+ * Rebuild from listed live ids via `fold_aliases`; never merge
+ * [previousAccountFolds] — those belong to the wiped identity.
+ */
+internal fun historicalFoldsAfterAccountRestore(
+    previousAccountFolds: Map<String, String>,
+    listedIds: Collection<String>,
+    foldAliases: (String) -> List<String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> {
+    val rediscovered = historicalFoldsFromAliases(listedIds, foldAliases, liveFoldTarget)
+    for (historical in previousAccountFolds.keys) {
+        if (historical !in rediscovered) continue
+        // Keep the rediscovered live target even when the wiped account
+        // pointed the same hist id at a different sibling.
+    }
+    return rediscovered
+}
+
+/** Load-older / older-edge pins must survive a fold after Leave. */
+internal fun foldedSiblingHasMore(
+    historicalHasMore: Boolean,
+    liveHasMore: Boolean,
+): Boolean = historicalHasMore || liveHasMore
+
+/** True when a family-unioned host cache is larger than the painted page.
+ *  First paint takeLast(page) would otherwise drop recovered 0.8 rows while
+ *  every stored hasMore flag stays false (iOS `hasRowsOlder`). */
+internal fun foldFamilyCacheHasOlderThanPage(
+    cachedCount: Int,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+): Boolean = pageSize > 0 && cachedCount > pageSize
+
+/** Seeded window / load-older gate after a fold: leftover host rows or a
+ *  stored family flag both mean the live transcript still has older history. */
+internal fun seededFoldFamilyTranscriptHasMore(
+    cachedCount: Int,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+    familyHasOlder: Boolean = false,
+): Boolean = familyHasOlder || foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)
+
+/** Blank-transcript recovery must treat a leftover hist summary / latest
+ *  as proof the conversation is non-empty. `copy_summary` leaves live
+ *  `message_count` at 0 on conflict; a live-only 0.9 count then skips
+ *  recovery while bak remainder sat on hist.
+ *  iOS `snBlankTranscriptKnownNonEmpty` now also uses latest-or-count. */
+internal fun blankTranscriptKnownNonEmpty(
+    chatId: String,
+    latestByChat: Map<String, Long>,
+    messageCountByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean = transcriptSourceIds(
+    chatId,
+    emptyList(),
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).any { id ->
+    (latestByChat[id] ?: 0L) > 0L || (messageCountByChat[id] ?: 0L) > 0L
+}
+
+/** Keep fold-family hist keys that `conversation_summaries()` hides after
+ *  remount. A successful live-only probe (live `latest_at` / `message_count`
+ *  0 after restore-without-`copy_summary`) used to replace the cache and
+ *  drop hist=50. Empty success still clears. Failed probe keeps [previous]. */
+internal fun remountFoldedSummaryIndex(
+    next: Map<String, Long>,
+    previous: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    if (next.isEmpty()) return next
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return next
+    var out = next
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        val histValue = maxOf(out[historical] ?: 0L, previous[historical] ?: 0L)
+        if (histValue <= 0L) continue
+        if (out[historical] != histValue) out = out + (historical to histValue)
+        if (histValue > (out[live] ?: 0L)) out = out + (live to histValue)
+    }
+    return out
+}
+
+/** Index `message_count` from the last successful summaries probe.
+ *  A failed probe (`null`) keeps [previous] so blank-transcript recovery
+ *  can still see a recovered 0.8 hist count. Empty success clears.
+ *  iOS `conversationSummariesByGroup`. */
+internal fun conversationMessageCountsFromSummaries(
+    summaries: List<SonarConversationSummary>?,
+    previous: Map<String, Long>,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    if (summaries == null) return previous
+    return remountFoldedSummaryIndex(
+        summaries.associate { it.groupIdHex to it.messageCount },
+        previous,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+}
+
+/** Index `latest_at` from the last successful summaries probe.
+ *  Failed probe keeps [previous]. Empty success clears.
+ *  iOS `conversationSummariesByGroup[].latestAt`. */
+internal fun conversationLatestAtFromSummaries(
+    summaries: List<SonarConversationSummary>?,
+    previous: Map<String, Long>,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    if (summaries == null) return previous
+    return remountFoldedSummaryIndex(
+        summaries.associate { it.groupIdHex to it.latestAtSecs },
+        previous,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+}
+
+/** Full remounted summaries (including `latestContent`) from the last
+ *  successful probe. Failed probe keeps [previous]. Empty success clears.
+ *  A live-only probe after hide must not drop hist preview text.
+ *  iOS `snRemountedConversationSummaries`. */
+internal fun conversationSummariesByChat(
+    summaries: List<SonarConversationSummary>?,
+    previous: Map<String, SonarConversationSummary>,
+    historicalFolds: Map<String, String> = emptyMap(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, SonarConversationSummary> {
+    if (summaries == null) return previous
+    if (summaries.isEmpty()) return emptyMap()
+    var out = summaries.associateBy { it.groupIdHex }
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return out
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        val hist = out[historical] ?: previous[historical] ?: continue
+        if (!homeRowSummaryKnownNonEmpty(hist)) continue
+        if (out[historical] == null) out = out + (historical to hist)
+        val liveSummary = out[live]
+        if (liveSummary == null) {
+            out = out + (live to hist.copy(groupIdHex = live, unreadCount = 0L))
+            continue
+        }
+        val paintedName = collapsedFoldDisplayName(liveSummary.name, hist.name)
+        val histNewer = hist.latestAtSecs > liveSummary.latestAtSecs ||
+            (liveSummary.latestAtSecs <= 0L && hist.messageCount > liveSummary.messageCount)
+        if (histNewer) {
+            out = out + (
+                live to liveSummary.copy(
+                    name = paintedName,
+                    latestContent = hist.latestContent,
+                    latestSenderNpub = hist.latestSenderNpub,
+                    latestAtSecs = hist.latestAtSecs,
+                    latestMine = hist.latestMine,
+                    messageCount = maxOf(liveSummary.messageCount, hist.messageCount),
+                )
+            )
+        } else if (paintedName != liveSummary.name) {
+            out = out + (live to liveSummary.copy(name = paintedName))
+        }
+    }
+    return out
+}
+
+/** Newest known timestamp across snapshot + remounted index latest.
+ *  Snapshot-only understates a recovered 0.8 hist `latest_at` when the
+ *  first live page is still short — home-list recency then sinks the
+ *  recovered row. iOS `expectedNewestMessageDate` / `latestMarmotMessage`. */
+internal fun expectedNewestTsForChat(
+    chatId: String,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    latestByChat: Map<String, Long>,
+    summaryLatestByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Long {
+    val ids = transcriptSourceIds(
+        chatId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    var snapshot = 0L
+    for (id in ids) {
+        val messageTs = messagesByChat[id]?.maxOfOrNull { it.tsSecs } ?: 0L
+        val ts = maxOf(messageTs, latestByChat[id] ?: 0L)
+        if (ts > snapshot) snapshot = ts
+    }
+    val persistSnapshot = localLatestTsForChat(
+        chatId,
+        messagesByChat,
+        latestByChat,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val index = ids.maxOfOrNull { summaryLatestByChat[it] ?: 0L } ?: 0L
+    return maxOf(snapshot, persistSnapshot, index)
+}
+
+/** First-open must not wait on relay when any fold-family cache already
+ *  has rows. iOS `openDM` used a live-only empty check
+ *  (`snFamilyTranscriptNeedsNetworkBackfill`). */
+internal fun familyTranscriptNeedsNetworkBackfill(
+    chatId: String,
+    messagesByChat: Map<String, List<*>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean = transcriptSourceIds(
+    chatId,
+    emptyList(),
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).all { messagesByChat[it].isNullOrEmpty() }
+
+/** Newest-page hydrate must keep load-older armed for remounted 0.8 rows.
+ *  Comparing overflow to the 500-row retained cap hid bak remainder after
+ *  the first-paint extract (80). Home hydrate only remounts
+ *  [LOCAL_SUMMARY_PAGE_LIMIT] (20) rows, so cache overflow vs page-size
+ *  (30) is not enough: a short live FFI page on a fold family still
+ *  means extract / bak remain on hist.
+ *  iOS `snNewestPageFamilyHasOlder`. */
+internal fun newestPageFamilyHasOlder(
+    existingCount: Int,
+    incomingCount: Int,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+    rawPageCount: Int,
+    previousHasOlder: Boolean,
+    hasFoldFamily: Boolean = false,
+): Boolean = seededFoldFamilyTranscriptHasMore(
+    cachedCount = existingCount + incomingCount,
+    pageSize = pageSize,
+    familyHasOlder = previousHasOlder ||
+        rawPageCount > pageSize ||
+        (hasFoldFamily && existingCount > 0 && pageSize > 0 && incomingCount < pageSize),
+)
+
+/** A short/empty load-older page must not disarm a previously armed
+ *  family flag. The first cursor read can land before bak remainder is
+ *  copied; only a short page that admitted new rows proves this source
+ *  is exhausted. iOS `snLoadOlderPageHasOlder`. */
+internal fun loadOlderPageHasOlder(
+    rawPageCount: Int,
+    pageSize: Int,
+    admittedNewRows: Boolean,
+    previousHasOlder: Boolean,
+): Boolean {
+    if (pageSize > 0 && rawPageCount > pageSize) return true
+    if (admittedNewRows) return false
+    return previousHasOlder
+}
+
+/** iOS `dmMsgs` formats only `sourceMessageLimit` rows per Marmot source.
+ *  After persist-folds the first-paint extract (80) is already in the
+ *  family cache, but load-older that re-reads the same page reports
+ *  `added=false` and used to leave the rest of that extract — and bak
+ *  when bak is empty — unreachable. Raise the source window to the
+ *  already-loaded family count (capped at the retained budget).
+ *  Compose `transcriptWindows` already hold the full extract, so the
+ *  coordinator does not need this raise; keep the helper in lockstep
+ *  with iOS `snCachedFoldFamilySourceLimit`. */
+internal fun cachedFoldFamilySourceLimit(
+    cachedCount: Int,
+    currentLimit: Int,
+    retainedLimit: Int = TRANSCRIPT_RETAINED_ROWS,
+): Int {
+    if (retainedLimit <= 0) return maxOf(0, currentLimit)
+    return minOf(retainedLimit, maxOf(currentLimit, maxOf(0, cachedCount)))
+}
+
+/** Prefer this id's load-older cursor; fall back to a hidden sibling so
+ *  an unpaged live / remounted-empty hist row can still request remainder.
+ *  iOS `snFoldFamilyPagingCursor`. */
+internal fun <T> foldFamilyPagingCursor(
+    groupId: String,
+    cursorsById: Map<String, T>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): T? {
+    cursorsById[groupId]?.let { return it }
+    for (alias in transcriptSourceIds(
+        groupId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(alias, groupId)) continue
+        cursorsById[alias]?.let { return it }
+    }
+    return null
+}
+
+/** Parent row for a quote chip. Walk the family-unioned cache, not only
+ *  the painted page — persist-folds keep the hist parent off a short live
+ *  window. iOS `snQuotedParentInFamilyCache` / `snReplyRef(parents:)`. */
+internal fun quotedParentInFamilyCache(
+    parentId: String,
+    familyMessages: List<SonarMsg>,
+): SonarMsg? {
+    val id = parentId.trim()
+    if (id.isEmpty()) return null
+    return familyMessages.firstOrNull { it.id.equals(id, ignoreCase = true) }
+}
+
+/** Visible-row budget that includes [parentId] when it already sits in the
+ *  family-unioned host cache. Quote-jump searches the painted suffix; a
+ *  parent older than [pageSize] but still in the retained window must
+ *  expand the budget instead of soft-failing. iOS `snQuotedMessageRevealLimit`. */
+internal fun quotedMessageRevealLimit(
+    parentId: String,
+    cached: List<SonarMsg>,
+    pageSize: Int = TRANSCRIPT_PAGE_SIZE,
+    retainedRows: Int = TRANSCRIPT_RETAINED_ROWS,
+): Int? {
+    val id = parentId.trim()
+    if (id.isEmpty() || cached.isEmpty() || pageSize <= 0 || retainedRows <= 0) return null
+    val idx = cached.indexOfFirst { it.id == id }
+    if (idx < 0) return null
+    return maxOf(pageSize, cached.size - idx).coerceAtMost(retainedRows)
+}
+
+/** Keep a Jump target until the parent is in the painted feed.
+ *  Soft-fail must not clear it: 0.8 remainder / family reveal can still
+ *  admit the row. iOS `snShouldSettleQuotedJump`. */
+internal fun shouldSettleQuotedJump(parentInFeed: Boolean): Boolean = parentInFeed
+
+/** Soft-fail after a load-older miss must keep the jump. An empty first
+ *  bak page / persist-folds-before-core-fold hist miss is not exhaustion.
+ *  iOS `applyQuotedJump` does not clear on a failed page.
+ *  [added] is ignored on purpose — do not `if (!added) clear`. */
+@Suppress("UNUSED_PARAMETER")
+internal fun shouldClearQuotedJumpAfterMiss(
+    added: Boolean,
+    parentInFeed: Boolean,
+): Boolean = shouldSettleQuotedJump(parentInFeed)
+
+/** Quote-jump retry identity. At the 500-row cap a bak page trims the
+ *  newer edge and keeps `feed.size` constant — size-only keys never
+ *  re-run, so a recovered 0.8 parent past the painted suffix stays
+ *  unreachable. Include the oldest and newest ids. iOS
+ *  `snQuotedJumpRetryToken` / `SNTailRevision`. */
+internal fun quotedJumpRetryToken(
+    feedSize: Int,
+    oldestId: String?,
+    newestId: String? = null,
+): String = "$feedSize:${oldestId.orEmpty()}:${newestId.orEmpty()}"
+
+/** Quote-jump parent stored on any fold-family key. After remount the
+ *  open screen may still look up hist / mesh while the live sibling
+ *  holds the target — or the reverse. iOS `snQuotedJumpParentId`. */
+internal fun quotedJumpParentId(
+    chatId: String,
+    jumps: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        jumps[id]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return null
+}
+
+/** Write the Jump parent onto every fold-family key so a quote tap that
+ *  lands after maps were copied but before nav remount still expands
+ *  the live sibling. Empty wake-mute persist still stamps the remount
+ *  pair. iOS `snQuotedJumpWritten`. */
+internal fun quotedJumpWritten(
+    chatId: String,
+    parentId: String,
+    jumps: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, String> {
+    val parent = parentId.trim()
+    if (parent.isEmpty()) return jumps
+    var next = jumps
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        next = next + (id to parent)
+    }
+    return next
+}
+
+/** Drop the Jump parent from every fold-family key so Leave cannot
+ *  resurrect it on the live sibling. Empty persist still clears the
+ *  remount pair. iOS `snQuotedJumpCleared`. */
+internal fun quotedJumpCleared(
+    chatId: String,
+    jumps: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, String> {
+    var next = jumps
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        if (id in next) next = next - id
+    }
+    return next
+}
+
+/** Open-time unread stored on any remount / fold-family key. After remount
+ *  Compose hops `Screen.Chat.id` to live while a hist capture may still
+ *  be in flight. iOS `snUnreadCountAtOpen`. */
+internal fun unreadCountAtOpen(
+    chatId: String,
+    unreadAtOpen: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Long? {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        unreadAtOpen[id]?.let { return it }
+    }
+    return null
+}
+
+/** Stamp open-time unread onto every remount / fold-family key.
+ *  `null` clears. iOS `snUnreadCountAtOpenWritten`. */
+internal fun unreadCountAtOpenWritten(
+    chatId: String,
+    count: Long?,
+    unreadAtOpen: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    var next = unreadAtOpen
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        next = if (count == null) next - id else next + (id to count)
+    }
+    return next
+}
+
+/** Frozen unread-anchor row id on any remount / fold-family key.
+ *  After remount Compose hops `Screen.Chat.id` to live; a hist-only
+ *  write would vanish, and a live-only leave would leave hist for
+ *  the next open. iOS has no host-anchor map — the divider lives on
+ *  the transcript host. */
+internal fun unreadAnchorAtOpen(
+    chatId: String,
+    anchors: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        anchors[id]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return null
+}
+
+/** Stamp or clear the unread-anchor row on every remount / fold-family
+ *  key. `null` clears. iOS `snUnreadCountAtOpenWritten` is the count
+ *  twin; this is the Compose host-anchor twin of [quotedJumpWritten]. */
+internal fun unreadAnchorAtOpenWritten(
+    chatId: String,
+    anchorId: String?,
+    anchors: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, String> {
+    val trimmed = anchorId?.trim().orEmpty()
+    var next = anchors
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }) {
+        next = if (trimmed.isEmpty()) next - id else next + (id to trimmed)
+    }
+    return next
+}
+
+/** Ids that have had a trusted FFI newest/cursor page.
+ *  Seeded `transcriptWindows` keys and remounted host-cache copies are
+ *  not paging keys — passing those made hist look paged before
+ *  `messagesCursorPage(hist)` ran, so load-older skipped bak remainder.
+ *  iOS `pagedLocalTranscriptGroupIds` is cursor ∪ hasOlder, not
+ *  `messagesByGroup.keys`. */
+internal fun pagedFoldFamilyGroupIds(trustedFfiPageIds: Set<String>): Set<String> =
+    trustedFfiPageIds.filterTo(linkedSetOf()) { it.isNotBlank() }
+
+/** Newest-page these hidden siblings before cursor-paging. Walk listed
+ *  live ids only — passing hist would newest-page a remounted live
+ *  extract and snap. Empty persist-folds still union the remount pair.
+ *  iOS `loadOlderLocalPage` hidden-sibling preflight. */
+internal fun loadOlderHiddenSiblingsNeedingNewestPage(
+    listedLiveIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val out = linkedSetOf<String>()
+    for (listed in listedLiveIds) {
+        if (listed.isBlank()) continue
+        out.addAll(
+            hiddenFoldFamilyIdsNeedingPage(
+                listed,
+                historicalFolds,
+                pagedGroupIds,
+                openedConversationId,
+                openedConversationPaneId,
+            ),
+        )
+    }
+    return out.sorted()
+}
+
+/** After hidden siblings have a newest page, older-page each sibling that
+ *  still has remainder — with that sibling's own cursor. Persist-folds
+ *  live FFI has no hist rows; paging live with a borrowed hist cursor
+ *  returns empty and bak stays stuck. Empty persist-folds still union
+ *  the remount pair. iOS `snLoadOlderFamilyPageIds`. */
+internal fun loadOlderFamilyPageIds(
+    openGroupId: String,
+    historicalFolds: Map<String, String>,
+    hasOlderByGroup: Map<String, Boolean>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    if (openGroupId.isBlank()) return emptyList()
+    val family = echoReconcileFamilyIds(
+        openGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val ids = if (family.isEmpty()) listOf(openGroupId) else family.toList()
+    return ids.filter { hasOlderByGroup[it] == true }.sorted()
+}
+
+/** Wait for a fold-family sibling that is already paging, not only the
+ *  listed live id. Persist-folds load-older on live while hist is
+ *  newest-paging returns false immediately if we only watch [openGroupId].
+ *  Empty persist-folds still union the remount pair.
+ *  iOS `snLoadOlderBusyRetryShouldWait`. */
+internal fun loadOlderBusyRetryShouldWait(
+    openGroupId: String,
+    loadingGroupIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    val open = openGroupId.trim()
+    if (open.isEmpty() || loadingGroupIds.isEmpty()) return false
+    val family = echoReconcileFamilyIds(
+        open,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(open) }
+    return family.any { sibling ->
+        sibling in loadingGroupIds ||
+            loadingGroupIds.any { openedConversationIdMatches(sibling, it) }
+    }
+}
+
+/** Hidden 0.8 sibling has never been newest-paged. Persist-folds remounts
+ *  hist onto live and drops the hist cache key; paging maps keep hist
+ *  once it has been paged. Empty persist-folds still union the remount
+ *  pair so an empty 0.9 room is not stuck on “Say hi”. Never newest-page
+ *  the remounted live extract (R-045). iOS `snHiddenFoldFamilyNeedsPage`. */
+internal fun hiddenFoldFamilyNeedsPage(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean = hiddenFoldFamilyIdsNeedingPage(
+    groupId,
+    historicalFolds,
+    pagedGroupIds,
+    openedConversationId,
+    openedConversationPaneId,
+).isNotEmpty()
+
+internal fun hiddenFoldFamilyIdsNeedingPage(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> = echoReconcileFamilyIds(
+    groupId,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).filter { sibling ->
+    !openedConversationIdMatches(sibling, groupId) &&
+        sibling !in pagedGroupIds &&
+        pagedGroupIds.none { openedConversationIdMatches(sibling, it) } &&
+        !openedConversationIdMatches(sibling, openedConversationId)
+}.sorted()
+
+/** This source has no paging key and no cached rows. Newest-page it
+ *  (iOS `snFoldFamilySourceNeedsNewestPage`). A remounted live id with
+ *  leftover extract rows must not take this path — that would snap. */
+internal fun foldFamilySourceNeedsNewestPage(
+    groupId: String,
+    pagedGroupIds: Set<String>,
+    cachedRowCount: Int,
+): Boolean {
+    return groupId !in pagedGroupIds && cachedRowCount <= 0
+}
+
+/** Already sitting on listed live: remountFoldedOpenChatId is a no-op.
+ *  Still newest-page hist so an empty 0.9 room is not stuck on “Say hi”.
+ *  A mesh route id (`mesh:<peer>`) is not a fold-family key — pass
+ *  [familySourceIds] from `transcriptGroupIds` / `meshFoldTranscriptSourceIds`.
+ *  Empty persist-folds still union the remount pair.
+ *  iOS `pageUnpagedHiddenFoldFamily` resolves `marmotGroupId` first. */
+internal fun shouldPageHiddenFoldFamilyForOpenLive(
+    openChatId: String,
+    historicalFolds: Map<String, String>,
+    pagedGroupIds: Set<String>,
+    familySourceIds: Collection<String> = emptyList(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean = (listOf(openChatId) + familySourceIds)
+    .filter { it.isNotBlank() }
+    .distinct()
+    .any {
+        hiddenFoldFamilyNeedsPage(
+            it,
+            historicalFolds,
+            pagedGroupIds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+    }
+
+/** Load-older pages missing family windows first, then used to bail when
+ *  the painted feed was empty — empty live rooms never mount that list.
+ *  Publish the family window instead. iOS `dmMsgs` unions immediately. */
+internal fun loadOlderEmptyPaintShouldPublishFamily(
+    paintedCount: Int,
+    familyRowCount: Int,
+): Boolean = paintedCount <= 0 && familyRowCount > 0
+
+/** True when any fold-family id still has an older local page, or when the
+ *  unioned host cache itself overflows the painted page.
+ *  `unpagedHiddenSibling` is the persist-folds window: host remounted
+ *  onto live before hist had a newest page (R-045 — do not invent a fold).
+ *  Empty persist-folds still union the remount pair. */
+internal fun hasOlderForFoldFamily(
+    groupId: String,
+    hasMoreById: Map<String, Boolean>,
+    historicalFolds: Map<String, String>,
+    cachedCount: Int = 0,
+    pageSize: Int = 0,
+    unpagedHiddenSibling: Boolean = false,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    if (unpagedHiddenSibling) return true
+    if (foldFamilyCacheHasOlderThanPage(cachedCount, pageSize)) return true
+    return echoReconcileFamilyIds(
+        groupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(groupId) }
+        .any { sibling ->
+            hasMoreById[sibling] == true ||
+                hasMoreById.entries.any {
+                    it.value && openedConversationIdMatches(sibling, it.key)
+                }
+        }
+}
+
+/** Promote load-older flags from a hidden 0.8 id onto the listed live sibling. */
+internal fun promotedFoldedPagingFlags(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    flags: Map<String, Boolean>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, Boolean> {
+    var next = flags
+    for (historical in previousIds + flags.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        next = next + (
+            live to foldedSiblingHasMore(
+                historicalHasMore = flags[historical] == true,
+                liveHasMore = next[live] == true,
+            )
+        )
+    }
+    return next
+}
+
+/** Keep call/pay/notification watermarks on hidden 0.8 siblings after FFI hide.
+ *  Empty persist-folds still union the remount pair so a missed promote
+ *  cannot drop recovered history into unseen and re-banner it.
+ *  iOS `snRetainedScanChatIds`. */
+internal fun retainedScanChatIds(
+    listedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return listedIds
+    val out = listedIds.toMutableSet()
+    for (id in listedIds) {
+        out.addAll(foldFamilyIds(id, folds))
+    }
+    return out
+}
+
+/** When FFI hides a folded 0.8 row, keep its mute on the live 0.9 sibling. */
+/** Copy a mute from every hidden 0.8 row onto its live sibling. Empty
+ *  persist-folds still use the remount pair so a hist mute lands on
+ *  live before wake-mute writes the blob. iOS
+ *  `snPromotedFoldedMutesFromFolds`. */
+internal fun promotedFoldedMutesFromFolds(
+    mutes: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (mutes.isEmpty() || folds.isEmpty()) return mutes
+    var next = mutes
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        val until = mutes[historical] ?: continue
+        val existing = next[live]
+        next = next + (live to maxOf(existing ?: until, until))
+    }
+    return next
+}
+
+internal fun promotedFoldedMutes(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    mutes: Map<String, Long>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, Long> {
+    var next = mutes
+    for (historical in previousIds + mutes.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val until = mutes[historical] ?: continue
+        val existing = next[live]
+        next = next + (live to maxOf(existing ?: until, until))
+    }
+    return next
+}
+
+/** Copy a host map from a hidden 0.8 row onto the live sibling. */
+internal fun <V> promotedFoldedValues(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    values: Map<String, V>,
+    liveFoldTarget: (String) -> String?,
+    preferExisting: (V) -> Boolean = { true },
+): Map<String, V> {
+    var next = values
+    for (historical in previousIds + values.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = values[historical] ?: continue
+        val existing = next[live]
+        if (existing != null && preferExisting(existing)) continue
+        next = next + (live to incoming)
+    }
+    return next
+}
+
+/** When FFI hides a folded 0.8 row, keep its in-progress draft on the live sibling. */
+internal fun promotedFoldedComposerDrafts(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    drafts: Map<String, String>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, String> =
+    promotedFoldedValues(
+        previousIds = previousIds,
+        currentIds = currentIds,
+        values = drafts.filterValues { it.isNotEmpty() },
+        liveFoldTarget = liveFoldTarget,
+        preferExisting = { it.isNotEmpty() },
+    )
+
+/** Merge in-flight send echoes from a hidden 0.8 id onto the live sibling. */
+internal fun <V> promotedFoldedPendingMessages(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    messagesByChat: Map<String, List<V>>,
+    liveFoldTarget: (String) -> String?,
+    idOf: (V) -> String,
+): Map<String, List<V>> {
+    var next = messagesByChat
+    for (historical in previousIds + messagesByChat.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = messagesByChat[historical].orEmpty()
+        if (incoming.isEmpty()) continue
+        val existing = next[live].orEmpty()
+        val existingIds = existing.mapTo(hashSetOf(), idOf)
+        next = next + (live to existing + incoming.filter { idOf(it) !in existingIds })
+    }
+    return next
+}
+
+/** Union leftover hist pages onto the listed live id so first paint / open
+ *  does not read an empty host cache while recovered rows still sit on the
+ *  hidden 0.8 key (iOS `snFoldFamilyCachedMessages`). */
+internal fun <V> foldFamilyCachedMessages(
+    groupId: String,
+    messagesByChat: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    idOf: (V) -> String,
+): List<V> {
+    var out = messagesByChat[groupId].orEmpty()
+    for (alias in transcriptSourceIds(
+        groupId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(alias, groupId)) continue
+        val incoming = messagesByChat[alias].orEmpty()
+        if (incoming.isEmpty()) continue
+        out = mergedFoldedMessageLists(incoming, out, idOf)
+    }
+    return out
+}
+
+/** Family-union event ids. iOS `loadOlderDM` must compare this, not
+ *  `messagesByGroup[live]` only — persist-folds older-pages hist. */
+internal fun <V> foldFamilyCanonicalMessageIds(
+    groupId: String,
+    messagesByChat: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    idOf: (V) -> String,
+): Set<String> = foldFamilyCachedMessages(
+    groupId,
+    messagesByChat,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+    idOf,
+).mapTo(linkedSetOf()) { idOf(it) }
+
+/** Merge recovered transcript rows onto the live sibling after FFI hides the 0.8 id. */
+internal fun <V> mergedFoldedMessageLists(
+    historical: List<V>,
+    live: List<V>,
+    idOf: (V) -> String,
+): List<V> {
+    if (historical.isEmpty()) return live
+    if (live.isEmpty()) return historical
+    val seen = live.mapTo(hashSetOf(), idOf)
+    return live + historical.filter { idOf(it) !in seen }
+}
+
+/** Keep a recovered transcript window on the live sibling after FFI hides the 0.8 id. */
+internal fun promotedFoldedSnapshotMessages(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, List<SonarMsg>> {
+    var next = messagesByChat.filterValues { it.isNotEmpty() }
+    for (historical in previousIds + messagesByChat.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = messagesByChat[historical].orEmpty()
+        if (incoming.isEmpty()) continue
+        next = next + (live to mergedFoldedMessageLists(incoming, next[live].orEmpty()) { it.id })
+    }
+    return next
+}
+
+/** Keep recovered call-log rows on the live sibling after FFI hides the 0.8 id. */
+internal fun promotedFoldedCallLogs(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    callLogs: Map<String, List<CallRecord>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, List<CallRecord>> {
+    var next = callLogs
+    for (historical in previousIds + callLogs.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = callLogs[historical].orEmpty()
+        if (incoming.isEmpty()) continue
+        next = next + (live to dedupeCallRecordsLastWins(incoming + next[live].orEmpty()))
+    }
+    return next
+}
+
+/** When FFI hides a folded 0.8 row, keep its reply target on the live sibling. */
+internal fun <V> promotedFoldedComposerReplies(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    replies: Map<String, V>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, V> =
+    promotedFoldedValues(
+        previousIds = previousIds,
+        currentIds = currentIds,
+        values = replies,
+        liveFoldTarget = liveFoldTarget,
+    )
+
+/** When FFI hides a folded 0.8 row, keep its safety-number verify on the live sibling. */
+/** Recover a verify flag left on a hidden 0.8 id after resume. Blobs have no
+ *  enumeration, so probe only the hist→live pairs we already persisted.
+ *  Empty persist-folds still use the remount pair so a hist verify
+ *  stamps live before the blob is rewritten. iOS
+ *  `snRecoveredVerifiedIdsFromFolds`. */
+internal fun recoveredVerifiedIdsFromFolds(
+    folds: Map<String, String>,
+    verifiedIds: Set<String>,
+    historicalBlobVerified: (String) -> Boolean,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val folds = remountPairHistoricalFolds(
+        folds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    var next = verifiedIds
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        if (historical in next || historicalBlobVerified(historical)) {
+            next = next + historical + live
+        }
+    }
+    return next
+}
+
+internal fun promotedFoldedVerifiedIds(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    verifiedIds: Set<String>,
+    liveFoldTarget: (String) -> String?,
+): Set<String> {
+    var next = verifiedIds
+    for (historical in previousIds + verifiedIds) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        if (historical in verifiedIds) next = next + live
+    }
+    return next
+}
+
+/** Live MLS name wins (a later rename must stick). Blank live falls
+ *  back to the recovered 0.8 title so persist-folds collapse cannot
+ *  turn a named room into "Group chat". Core `display_name`. */
+internal fun collapsedFoldDisplayName(
+    liveName: String,
+    historicalName: String,
+): String {
+    val live = liveName.trim()
+    if (live.isNotEmpty()) return live
+    return historicalName.trim()
+}
+
+/** Union live MLS members with the recovered 0.8 roster. Persist-folds
+ *  can remount before core `fold_family`, so FFI `display_members(live)`
+ *  is still live-only. Keep live order, then hist extras. Core
+ *  `display_members`. */
+internal fun collapsedFoldDisplayMembers(
+    liveMembers: List<String>,
+    historicalMembers: List<String>,
+): List<String> {
+    val seen = linkedSetOf<String>()
+    val out = ArrayList<String>()
+    for (member in liveMembers + historicalMembers) {
+        val trimmed = member.trim()
+        if (trimmed.isEmpty()) continue
+        if (!seen.add(trimmed.lowercase())) continue
+        out += trimmed
+    }
+    return out
+}
+
+/** Paint fields a remounted live row should keep from its hidden 0.8
+ *  sibling. Do **not** copy `isDirect` — R-045. */
+internal fun collapsedFoldDisplayChat(
+    live: SonarChat,
+    historical: SonarChat,
+): SonarChat = live.copy(
+    name = collapsedFoldDisplayName(live.name, historical.name),
+    members = collapsedFoldDisplayMembers(live.members, historical.members),
+)
+
+/** Drop a recovered snapshot row once its live 0.9 sibling is already listed.
+ *  Persist-folds hide hist before core `fold_family`, so copy the recovered
+ *  name / roster onto live here — otherwise group info and mentions only
+ *  see people who already joined 0.9. */
+/**
+ * `SonarCore.chats()` must not look like a successful empty account when the
+ * node is closed (seal / reconnect). Null keeps the painted snapshot; an
+ * empty success list is a real zero-chat account.
+ */
+internal fun trustedChatListing(
+    loaded: List<SonarChat>?,
+    sessionReady: Boolean,
+): List<SonarChat>? = when {
+    loaded == null -> null
+    loaded.isNotEmpty() || sessionReady -> loaded
+    else -> null
+}
+
+internal fun chatListingOrCached(
+    loaded: List<SonarChat>?,
+    cached: List<SonarChat>,
+): List<SonarChat> = loaded ?: cached
+
+internal fun shouldPersistChatListing(loaded: List<SonarChat>?): Boolean = loaded != null
+
+/** A failed invite probe must not clear recovered pending welcomes. */
+internal fun pendingInvitesOrCached(
+    loaded: List<SonarGroupInvite>?,
+    cached: List<SonarGroupInvite>,
+): List<SonarGroupInvite> = loaded ?: cached
+
+/** A failed join-request probe must not clear recovered pending members. */
+internal fun pendingJoinRequestsOrCached(
+    loaded: List<SonarJoinRequest>?,
+    cached: List<SonarJoinRequest>,
+): List<SonarJoinRequest> = loaded ?: cached
+
+/**
+ * Persist-folds remounts group-info `hist → live`. Resetting the painted
+ * list on that id change drops recovered requests; a closed-node live
+ * probe then has nothing to keep ([pendingJoinRequestsOrCached]).
+ */
+internal fun pendingJoinRequestsAcrossRemount(
+    previousChatId: String,
+    nextChatId: String,
+    requests: List<SonarJoinRequest>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<SonarJoinRequest> {
+    if (previousChatId.isBlank() || nextChatId.isBlank()) return requests
+    if (conversationsMatchFoldFamily(
+            previousChatId,
+            nextChatId,
+            historicalFolds,
+            openedConversationId = openedConversationId,
+            openedConversationPaneId = openedConversationPaneId,
+        )
+    ) {
+        return requests
+    }
+    return emptyList()
+}
+
+internal fun collapsedFoldedSnapshotChats(
+    chats: List<SonarChat>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<SonarChat> {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return chats
+    val ids = chats.mapTo(hashSetOf()) { it.id }
+    val byId = chats.associateBy { it.id }
+    val mergedByLive = HashMap<String, SonarChat>()
+    for (chat in chats) {
+        val liveId = folds[chat.id] ?: continue
+        if (liveId == chat.id || liveId !in ids) continue
+        val current = mergedByLive[liveId] ?: byId.getValue(liveId)
+        mergedByLive[liveId] = collapsedFoldDisplayChat(current, chat)
+    }
+    return chats.mapNotNull { chat ->
+        val liveId = folds[chat.id]
+        if (liveId != null && liveId != chat.id && liveId in ids) return@mapNotNull null
+        mergedByLive[chat.id] ?: chat
+    }
+}
+
+/** Persisted hist→live binding. Usable before FFI `liveFoldTarget` is ready. */
+internal fun persistedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+): String? = historicalFolds[groupId]?.takeIf { it.isNotBlank() && it != groupId }
+
+/** Persist-folds, then FFI, then the open remount pair. Empty persist-folds
+ *  without a remount pair stay null so promote* cannot invent a family-of-one.
+ *  iOS `snResolvedLiveFoldTarget`. */
+internal fun resolvedLiveFoldTarget(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    ffiLiveFoldTarget: String? = null,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String? {
+    persistedLiveFoldTarget(groupId, historicalFolds)?.let { return it }
+    ffiLiveFoldTarget?.takeIf { it.isNotBlank() && it != groupId }?.let { return it }
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val bare = groupId.removePrefix("marmot:")
+    return folds[bare]?.takeIf { it.isNotBlank() && it != bare && it != groupId }
+        ?: folds[groupId]?.takeIf { it.isNotBlank() && it != groupId }
+}
+
+/**
+ * Copy a hidden 0.8 snapshot timestamp onto the live sibling.
+ *
+ * First paint collapses the hist row but the metadata blob still keys latest
+ * on that id. Without this, `localLatestTs(live)` is 0 and the recovered chat
+ * sinks under every other row (or persist writes live=0 and the next cold
+ * start cannot recover recency until core summaries arrive).
+ */
+internal fun snapshotLatestAfterHistoricalFolds(
+    latestByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    if (latestByChat.isEmpty()) return latestByChat
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return latestByChat
+    var next = latestByChat
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        val incoming = latestByChat[historical] ?: continue
+        if (incoming <= 0L) continue
+        val existing = next[live] ?: 0L
+        if (incoming > existing) next = next + (live to incoming)
+    }
+    return next
+}
+
+/** Newest local timestamp across the fold family (hidden 0.8 sibling included).
+ *  Fold merge does not sort, so `lastOrNull()` can be the oldest remounted
+ *  0.8 row. Dedupe / send-target then prefer a newer empty live sibling and
+ *  hide the row that still holds recovered history. iOS `snLocalLatestTsForChat`. */
+internal fun localLatestTsForChat(
+    chatId: String,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    latestByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Long {
+    var latest = 0L
+    val ids = transcriptSourceIds(
+        chatId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { listOf(chatId) }
+    for (id in ids) {
+        val messageTs = messagesByChat[id]?.maxOfOrNull { it.tsSecs } ?: 0L
+        val ts = maxOf(messageTs, latestByChat[id] ?: 0L)
+        if (ts > latest) latest = ts
+    }
+    return latest
+}
+
+/** Newest home-row message. Fold remount concatenates without sorting, so
+ *  `lastOrNull()` can be the oldest recovered 0.8 extract — preview and
+ *  recency then sink under a newer empty live sibling.
+ *  iOS `latestMarmotMessage` uses `max(by: createdAt)`. */
+internal fun latestHomeRowMessage(messages: List<SonarMsg>): SonarMsg? =
+    messages.maxWithOrNull(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+
+/** `copy_summary` leaves live `message_count` at 0 on conflict but still
+ *  copies `latest_*`. Count-only treated that as empty, so process-death
+ *  home paint (metadata-only snapshot) dropped preview. iOS
+ *  `snMarmotHomeRowSummaryKnownNonEmpty`. */
+internal fun homeRowSummaryKnownNonEmpty(summary: SonarConversationSummary): Boolean =
+    summary.messageCount > 0L || summary.latestAtSecs > 0L
+
+/** Home-only projection of the remounted conversation index. Transcript
+ *  pages stay bounded and authoritative; a synthetic row is used only
+ *  when the summary is newer than the loaded page (or that group is
+ *  outside the page window). iOS `snMarmotHomeRowMessage`. */
+internal fun homeRowMessage(
+    loaded: SonarMsg?,
+    summary: SonarConversationSummary?,
+): SonarMsg? {
+    val usable = summary?.takeIf(::homeRowSummaryKnownNonEmpty)
+    if (usable == null) return loaded
+    if (loaded != null) {
+        if (loaded.tsSecs > usable.latestAtSecs) return loaded
+        if (loaded.tsSecs == usable.latestAtSecs &&
+            loaded.senderNpub == usable.latestSenderNpub &&
+            loaded.content == usable.latestContent &&
+            loaded.mine == usable.latestMine
+        ) {
+            return loaded
+        }
+    }
+    return SonarMsg(
+        id = "$SYNTHETIC_SUMMARY_ID_PREFIX${usable.groupIdHex}:${usable.messageCount}",
+        senderNpub = usable.latestSenderNpub,
+        content = usable.latestContent,
+        mine = usable.latestMine,
+        tsSecs = usable.latestAtSecs,
+        viaInternet = true,
+    )
+}
+
+/** Newest home-row message across a fold family, preferring remounted
+ *  index preview when the metadata-only snapshot is empty.
+ *  iOS `latestMarmotMessage` walks aliases + `snMarmotHomeRowMessage`. */
+internal fun latestHomeRowForChat(
+    chatId: String,
+    messagesByChat: Map<String, List<SonarMsg>>,
+    summaryByChat: Map<String, SonarConversationSummary>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): SonarMsg? {
+    val ids = transcriptSourceIds(
+        chatId,
+        emptyList(),
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { listOf(chatId) }
+    return ids.mapNotNull { id ->
+        homeRowMessage(
+            loaded = latestHomeRowMessage(messagesByChat[id].orEmpty()),
+            summary = summaryByChat[id] ?: summaryByChat[chatId],
+        )
+    }.maxWithOrNull(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+}
+
+/** Mesh-folded row timestamp when the Marmot snapshot is still empty
+ *  (process death, metadata-only blob). `latestMarmotMessage` would
+ *  return null and stamp ts=0, burying a remounted 0.8 DM under every
+ *  other row until hydrate. iOS uses remounted `latestAt`. */
+internal fun foldedMeshRowTs(latestMessageTs: Long?, localLatestTs: Long): Long =
+    maxOf(latestMessageTs ?: 0L, localLatestTs)
+
+/** Every recovered sibling that must leave with [id] on delete / leave.
+ *  Empty persist-folds still use the remount pair so newest-page /
+ *  unread-divider / seed-window treat hist+live as one family before
+ *  wake-mute writes the blob. iOS `snFoldFamilyIds`. */
+internal fun foldFamilyIds(
+    id: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    if (id.isBlank()) return emptySet()
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    val live = folds[id]
+        ?: folds.entries.firstOrNull { it.value == id }?.value
+        ?: id
+    val family = linkedSetOf(id, live)
+    for ((historical, target) in folds) {
+        if (historical == id || target == id || historical == live || target == live) {
+            family += historical
+            family += target
+        }
+    }
+    return family.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
+/** Ids whose local transcript window must reload for one conversation
+ *  change. A bak remainder tick names the hidden 0.8 id. Persist-folds
+ *  can land before core `fold_family`, so FFI `messages(live)` does not
+ *  union hist yet — refresh the listed sibling **and** the changed
+ *  hidden id. iOS `snConversationRefreshIds`. */
+/** First 0.9 send names the live id while persist-folds is still empty.
+ *  Merge FFI before [conversationRefreshIds] or the open hist transcript
+ *  never reloads. iOS `snConversationRefreshShouldMergeFolds`. */
+internal fun conversationRefreshShouldMergeFolds(
+    changedIds: Collection<String>,
+    persistedFolds: Map<String, String>,
+): Boolean = changedIds.any { firstOpenShouldMergeFolds(it, persistedFolds) }
+
+/** Foreground APNs names the live sibling while the recovered 0.8 chat
+ *  is open and persist-folds is still empty. Merge FFI before
+ *  [isConversationOpen] or willPresent banners the chat the user is in.
+ *  iOS `snConversationOpenShouldMergeFolds`. */
+internal fun conversationOpenShouldMergeFolds(
+    openId: String,
+    incomingId: String,
+    persistedFolds: Map<String, String>,
+): Boolean {
+    val open = openId.removePrefix("marmot:").trim()
+    val incoming = incomingId.removePrefix("marmot:").trim()
+    if (open.isEmpty() || incoming.isEmpty() || open == incoming) return false
+    if (conversationsMatchFoldFamily(open, incoming, persistedFolds)) return false
+    return firstOpenShouldMergeFolds(open, persistedFolds)
+}
+
+/** Shade tap names the live sibling while the recovered 0.8 chat is
+ *  open. After FFI merge, Jump — do not [openChat] or the already-painted
+ *  transcript remounts (scroll, unread divider, composer).
+ *  iOS `snNotificationOpenShouldJump`. */
+internal fun notificationOpenShouldJump(
+    openId: String,
+    incomingId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    val open = openId.removePrefix("marmot:").trim()
+    val incoming = incomingId.removePrefix("marmot:").trim()
+    if (open.isEmpty() || incoming.isEmpty()) return false
+    if (conversationsMatchFoldFamily(
+            open,
+            incoming,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+    ) return true
+    val pair = remountPairConversationIds(
+        openId,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    return pair.any { openedConversationIdMatches(it, incomingId) }
+}
+
+/** Mac split-view `present:` skips `push`, so `path` has no `.dm`.
+ *  `openedDM` still ran — keep that id as the open transcript.
+ *  iOS `snCurrentOpenConversationId`. */
+internal fun currentOpenConversationId(
+    pathDMId: String?,
+    openedConversationId: String?,
+): String? {
+    // Remount writes opened to live while iPhone path may stay hist
+    // so NavigationStack does not remake the pane. Opened is the
+    // logical open. iOS `snCurrentOpenConversationId`.
+    val opened = openedConversationId?.trim().orEmpty()
+    if (opened.isNotEmpty()) return opened
+    val path = pathDMId?.trim().orEmpty()
+    return path.takeIf { it.isNotEmpty() }
+}
+
+/** Fold remount copies the scrolled window onto live, then a host
+ *  `openedDM` / pane `onAppear` must keep opened=live / pane=hist.
+ *  Opening a different chat uses that id for both.
+ *  iOS `snOpenedDMRemountOpenedPane`. */
+internal fun openedDMRemountOpenedPane(
+    openingId: String,
+    routeReplacementPendingId: String? = null,
+    routeReplacementRealId: String? = null,
+): Pair<String, String> {
+    val pending = routeReplacementPendingId?.trim()?.takeIf { it.isNotEmpty() }
+    val real = routeReplacementRealId?.trim()?.takeIf { it.isNotEmpty() }
+    if (pending != null && real != null &&
+        (openedConversationIdMatches(openingId, pending) ||
+            openedConversationIdMatches(openingId, real))
+    ) {
+        return real to pending
+    }
+    return openingId to openingId
+}
+
+/** Fold remount copies the scrolled window onto live, then a host
+ *  `openChat` / `openedDM` must not newest-page hydrate.
+ *  iOS `snOpenedDMShouldSkipHydrate`. */
+internal fun openedDMShouldSkipHydrate(
+    openingId: String,
+    suppressedIds: Set<String>,
+): Boolean {
+    val opening = openingId.trim()
+    if (opening.isEmpty()) return false
+    if (opening in suppressedIds) return true
+    val bare = opening.removePrefix("marmot:")
+    if (bare.isEmpty()) return false
+    return bare in suppressedIds || "marmot:$bare" in suppressedIds
+}
+
+/** Remount always stamps the live id hydrated. In-flight `openChat`
+ *  may not have called [markTranscriptHydrated] on hist yet, and
+ *  further hist hydrate is suppressed — without this,
+ *  `isTranscriptHydrated(live)` stays false and the unread divider
+ *  never settles. iOS `snRemountMarksTranscriptHydrated`. */
+internal fun remountMarksTranscriptHydrated(
+    historicalId: String,
+    liveId: String,
+    hydratedIds: Set<String>,
+): Set<String> {
+    val next = hydratedIds.toMutableSet()
+    fun drop(id: String) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) return
+        next.remove(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isEmpty()) return
+        next.remove(bare)
+        next.remove("marmot:$bare")
+    }
+    fun add(id: String) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) return
+        next.add(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isEmpty()) return
+        next.add(bare)
+        next.add("marmot:$bare")
+    }
+    drop(historicalId)
+    add(liveId)
+    return next
+}
+
+/** Keep the empty-pane spinner on live when remount cancels hist hydrate.
+ *  iOS `snRemountLocalHydratingIds`. */
+internal fun remountLocalHydratingIds(
+    historicalKeys: Collection<String>,
+    liveKeys: Collection<String>,
+    hydrating: Set<String>,
+): Set<String> {
+    val wasHydrating = historicalKeys.any { openedDMShouldSkipHydrate(it, hydrating) }
+    val next = hydrating.toMutableSet()
+    for (key in historicalKeys) {
+        val trimmed = key.trim()
+        if (trimmed.isEmpty()) continue
+        next.remove(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isNotEmpty()) {
+            next.remove(bare)
+            next.remove("marmot:$bare")
+        }
+    }
+    if (wasHydrating) {
+        for (live in liveKeys) {
+            val trimmed = live.trim()
+            if (trimmed.isNotEmpty()) next.add(trimmed)
+        }
+    }
+    return next
+}
+
+/** Keep ChatScreen viewport remembers across remount hist→live.
+ *  Changing [screenId] would remake LazyListState / unread / tail-pin
+ *  and snap a scrolled recovered transcript. iOS
+ *  `snRemountStableTranscriptSessionKey`. */
+internal fun remountStableTranscriptSessionKey(
+    previousKey: String?,
+    screenId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    val screen = screenId.trim()
+    if (screen.isEmpty()) return previousKey?.trim().orEmpty()
+    val previous = previousKey?.trim().orEmpty()
+    if (previous.isEmpty()) return screen
+    if (openedDMShouldSkipHydrate(screen, setOf(previous))) return previous
+    val remountPair = remountPairConversationIds(
+        previous,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (remountPair.size > 1 && remountPair.any { openedConversationIdMatches(it, screen) }) {
+        return previous
+    }
+    val previousBare = previous.removePrefix("marmot:")
+    val screenBare = screen.removePrefix("marmot:")
+    if (previousBare.isNotEmpty() && screenBare.isNotEmpty()) {
+        if (screenBare in foldFamilyIds(previousBare, historicalFolds)) return previous
+        if (previousBare in foldFamilyIds(screenBare, historicalFolds)) return previous
+    }
+    if (screen in foldFamilyIds(previous, historicalFolds)) return previous
+    if (previous in foldFamilyIds(screen, historicalFolds)) return previous
+    return screen
+}
+
+/** Warmup / pane keys whose in-flight `openChat` newest-page must stop
+ *  when remount copies the window onto live. iOS
+ *  `snRemountOpeningHydrateKeys`. */
+internal fun remountOpeningHydrateKeys(
+    openId: String,
+    groupId: String,
+    liveId: String,
+    liveGroupId: String,
+): Set<String> {
+    val keys = linkedSetOf<String>()
+    fun insert(id: String) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) return
+        keys.add(trimmed)
+        val bare = trimmed.removePrefix("marmot:")
+        if (bare.isEmpty()) return
+        keys.add(bare)
+        keys.add("marmot:$bare")
+    }
+    insert(openId)
+    insert(groupId)
+    insert(liveId)
+    insert(liveGroupId)
+    return keys
+}
+
+/** Mesh-row delete must also pop a remounted live Marmot pane / group-info.
+ *  iOS `snDeletedMeshConversationPurgeIds`. */
+internal fun deletedMeshConversationPurgeIds(
+    meshChatIds: Collection<String>,
+    foldedGroupIds: Collection<String>,
+): Set<String> = (meshChatIds + foldedGroupIds)
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+    .toSet()
+
+/** Mac remount rewrites the logical open id to live while the pane
+ *  stays hist. `closedDM(hist)` must still clear the leaked live id.
+ *  Compose remounts `Screen.Chat.id` in place — iOS `snClosedDMShouldClearOpened`. */
+internal fun openedConversationIdMatches(candidate: String, stored: String?): Boolean {
+    val left = candidate.trim()
+    val right = stored?.trim().orEmpty()
+    if (left.isEmpty() || right.isEmpty()) return false
+    if (left == right) return true
+    val leftBare = left.removePrefix("marmot:")
+    val rightBare = right.removePrefix("marmot:")
+    return leftBare.isNotEmpty() && leftBare == rightBare
+}
+
+internal fun closedDMShouldClearOpened(
+    closingId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+): Boolean {
+    val closing = closingId.trim()
+    if (closing.isEmpty()) return false
+    return openedConversationIdMatches(closing, openedConversationId) ||
+        openedConversationIdMatches(closing, openedConversationPaneId)
+}
+
+/** Remount-pair live / hist while a conversation is actually open.
+ *  A leftover pending→live replacement after leave must not keep
+ *  treating hist+live as the open pair. iOS `snRemountPairOpenedPane`. */
+internal fun remountPairOpenedPane(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacementPendingId: String? = null,
+    routeReplacementRealId: String? = null,
+): Pair<String?, String?> {
+    val openedStored = openedConversationId?.trim().orEmpty()
+    val paneStored = openedConversationPaneId?.trim().orEmpty()
+    if (openedStored.isEmpty() && paneStored.isEmpty()) return null to null
+    val opened = openedStored.takeIf { it.isNotEmpty() }
+        ?: routeReplacementRealId?.trim()?.takeIf { it.isNotEmpty() }
+    val pane = paneStored.takeIf { it.isNotEmpty() }
+        ?: routeReplacementPendingId?.trim()?.takeIf { it.isNotEmpty() }
+    return opened to pane
+}
+
+/** Background FFI hide of a folded 0.8 room must not invent a remount
+ *  pair from home, and must not clobber the open remount with another
+ *  conversation's hist→live. Upgrade can hide A, B, C in one refresh;
+ *  iOS `promoteFoldedLocalTranscriptPaging` used to `rememberRemountPair`
+ *  for every promoted pair — last write won — so `directGroup` /
+ *  `startChatReturningId` newest-sorted the open DM back onto hist.
+ *  Compose remount is the open transcript only (`remountPairForOpenChat`).
+ *  iOS `snPromoteShouldReplaceRemountPair`. */
+internal fun promoteShouldReplaceRemountPair(
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    historical: String,
+    live: String,
+): Boolean {
+    val opened = openedConversationId?.trim().orEmpty()
+    if (opened.isEmpty()) return false
+    return openedConversationIdMatches(historical, openedConversationId) ||
+        openedConversationIdMatches(live, openedConversationId) ||
+        openedConversationIdMatches(historical, openedConversationPaneId) ||
+        openedConversationIdMatches(live, openedConversationPaneId)
+}
+
+/** Leave / delete that ends the remounted open must drop the leftover
+ *  route replacement. Skip-hop `closedDM(hist)` during Mac selection hop
+ *  must keep it. iOS `snClosedDMShouldClearPendingRouteReplacement`. */
+internal fun closedDMShouldClearPendingRouteReplacement(
+    closingId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+    routeReplacementPendingId: String?,
+    routeReplacementRealId: String?,
+): Boolean {
+    if (routeReplacementPendingId.isNullOrBlank() && routeReplacementRealId.isNullOrBlank()) {
+        return false
+    }
+    if (!closedDMShouldClearOpened(closingId, openedConversationId, openedConversationPaneId)) {
+        return false
+    }
+    return openedConversationIdMatches(closingId, routeReplacementPendingId) ||
+        openedConversationIdMatches(closingId, routeReplacementRealId)
+}
+
+/** Mac split-view keeps `.dm(hist)` after fold remount. Hop selection
+ *  to live so send/call/group-info bind the remounted transcript.
+ *  Compose remounts `Screen.Chat.id` in place — iOS `snMacSelectionAfterFoldRemount`. */
+internal fun macSelectionAfterFoldRemount(
+    selectionId: String,
+    openId: String,
+    realId: String,
+): String {
+    val live = realId.trim()
+    if (live.isEmpty()) return selectionId
+    return if (openedConversationIdMatches(selectionId, openId)) live else selectionId
+}
+
+/** Fold remount hops Mac `.dm(hist)` → `.dm(live)` while the pane is
+ *  still hist. Do not clear pushed group-info / profile.
+ *  iOS `snMacSelectionChangeShouldClearPath`. */
+internal fun macSelectionChangeShouldClearPath(
+    nextId: String?,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+): Boolean {
+    val next = nextId?.trim().orEmpty()
+    if (next.isEmpty()) return true
+    if (!openedConversationIdMatches(next, openedConversationId)) return true
+    val pane = openedConversationPaneId?.trim().orEmpty()
+    if (pane.isEmpty()) return true
+    return openedConversationIdMatches(next, pane)
+}
+
+/** Viewing the recovered 0.8 id must still mark-read a live sibling
+ *  change. Empty persist-folds cannot match; merge first.
+ *  iOS `snViewingConversationShouldMarkRead`. */
+internal fun viewingConversationShouldMarkRead(
+    viewingGroupIds: Set<String>,
+    changedId: String,
+    refreshId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    if (changedId.isBlank() && refreshId.isBlank()) return false
+    if (refreshId.isNotBlank() && refreshId in viewingGroupIds) return true
+    if (changedId.isNotBlank() && changedId in viewingGroupIds) return true
+    val family = echoReconcileFamilyIds(
+        changedId.ifBlank { refreshId },
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    return viewingGroupIds.any { it in family }
+}
+
+internal fun conversationRefreshIds(
+    changedId: String,
+    listedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    if (changedId.isBlank()) return emptyList()
+    val family = echoReconcileFamilyIds(
+        changedId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val listedFamily = family.filter { it in listedIds }.sorted()
+    val out = ArrayList(if (listedFamily.isEmpty()) listOf(changedId) else listedFamily)
+    if (changedId !in out) out += changedId
+    return out.sorted()
+}
+
+/** Hidden 0.8 remainder ticks are unlisted and may have no host cache
+ *  key after remount. Still page them — do not treat that as a brand-new
+ *  group. Empty persist-folds still union the remount pair.
+ *  iOS `snConversationRefreshShouldLoadPage`. */
+internal fun conversationRefreshShouldLoadPage(
+    refreshId: String,
+    listedIds: Set<String>,
+    cachedIds: Set<String>,
+    changedId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    if (refreshId in listedIds || refreshId in cachedIds) return true
+    val family = echoReconcileFamilyIds(
+        changedId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (refreshId !in family) return false
+    // Only the hidden sibling of a listed live — not a brand-new group.
+    return family.any { it in listedIds && it != refreshId }
+}
+
+/** Prefer the listed live sibling when `conversationChanged` names a hidden 0.8 id.
+ *  Empty persist-folds still remap via the remount pair. */
+internal fun conversationChangeTargetId(
+    changedId: String,
+    listedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    if (changedId.isBlank()) return changedId
+    if (changedId in listedIds) return changedId
+    val live = historicalFolds[changedId]
+    if (!live.isNullOrBlank() && live != changedId && live in listedIds) return live
+    for (id in remountPairConversationIds(
+        conversationId = changedId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank() && bare != changedId && bare in listedIds) return bare
+    }
+    return foldFamilyIds(changedId, historicalFolds).firstOrNull { it in listedIds }
+        ?: changedId
+}
+
+/** Sitting in `mesh:<peer>` while a bak remainder tick names the hidden
+ *  0.8 sibling. Persist-folds prune `groupFoldMap[hist]`, so
+ *  `peerIdForMarmotGroup(hist)` is null. Walk the fold family and
+ *  resolve the peer from the listed live sibling.
+ *  iOS remainder refresh pages the family via `snConversationRefreshIds`
+ *  and does not need this mesh-only peer lookup; the twin is
+ *  `snConversationChangeShouldRefreshOpenMesh`. */
+internal fun conversationChangeShouldRefreshOpenMesh(
+    openMeshChatId: String,
+    changedGroupId: String,
+    historicalFolds: Map<String, String>,
+    peerIdForGroup: (String) -> String?,
+    meshChatId: (String) -> String,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    if (openMeshChatId.isBlank() || changedGroupId.isBlank()) return false
+    peerIdForGroup(changedGroupId)?.let { if (openMeshChatId == meshChatId(it)) return true }
+    for (id in echoReconcileFamilyIds(
+        changedGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(id, changedGroupId)) continue
+        val bare = id.removePrefix("marmot:")
+        peerIdForGroup(id)?.let { if (openMeshChatId == meshChatId(it)) return true }
+        if (bare.isNotBlank() && bare != id) {
+            peerIdForGroup(bare)?.let { if (openMeshChatId == meshChatId(it)) return true }
+        }
+    }
+    return false
+}
+
+/** Chat ids that may still hold in-flight media after a hist→live promote.
+ *  Remount MOVES hist buckets onto live before wake-mute persist writes
+ *  `fold_aliases`. Empty persist-folds still union the remount pair so
+ *  hist-keyed send closures find the moved bytes. */
+internal fun pendingMediaUploadLookupIds(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val ids = linkedSetOf<String>()
+    fun add(raw: String) {
+        if (raw.isBlank()) return
+        ids += raw
+        ids.addAll(foldFamilyIds(raw, historicalFolds))
+        val bare = raw.removePrefix("marmot:")
+        if (bare.isNotBlank() && bare != raw) {
+            ids += bare
+            ids.addAll(foldFamilyIds(bare, historicalFolds))
+        }
+    }
+    add(chatId)
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        add(id)
+    }
+    return if (ids.isEmpty()) listOf(chatId) else ids.toList()
+}
+
+/** Store in-flight media on the live sibling so hist-keyed send closures still find it.
+ *  Prefer persist-fold live, then the remount-pair live, so a new album
+ *  started from the painted hist pane joins the bucket remount already moved. */
+internal fun pendingMediaUploadStoreId(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    val live = historicalFolds[chatId]
+    if (!live.isNullOrBlank() && live != chatId) return live
+    val pair = remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (pair.size > 1) {
+        openedConversationId?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+    }
+    return historicalFolds.entries.firstOrNull { it.value == chatId }?.value ?: chatId
+}
+
+/** Read leave-paint rows from the open id or its hidden 0.8 sibling after a fold.
+ *  Empty persist-folds still union the remount pair so a remounted live
+ *  reopen sees hist-keyed leave-paint before FFI merge. */
+internal fun retainedTranscriptForChat(
+    chatId: String,
+    retainedByChat: Map<String, List<SonarMsg>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<SonarMsg> {
+    retainedByChat[chatId]?.takeIf { it.isNotEmpty() }?.let { return it }
+    for (id in echoReconcileFamilyIds(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (openedConversationIdMatches(id, chatId)) continue
+        retainedByChat[id]?.takeIf { it.isNotEmpty() }?.let { return it }
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank() && bare != id) {
+            retainedByChat[bare]?.takeIf { it.isNotEmpty() }?.let { return it }
+        }
+    }
+    return emptyList()
+}
+
+/** Family snapshot a first-open local page must keep through FFI.
+ *  Persist-folds can remount recovered 0.8 rows onto the host cache before
+ *  `messages(live)` lists them; merge that seed with the live page instead
+ *  of replacing it. iOS `loadLocalPage` already merges `hiddenSiblingHasRows`. */
+internal fun firstOpenFoldFamilySeedRows(snapshot: List<SonarMsg>): List<SonarMsg> =
+    snapshot.withoutSyntheticSummaryRows().takeLast(TRANSCRIPT_RETAINED_ROWS)
+
+/** Union leave-paint across the fold family. A short live 0.9 leave-frame
+ *  must not hide recovered 0.8 rows still keyed on the hidden sibling.
+ *  `retainedTranscriptForChat` is first-hit (any paint exists); first-open
+ *  paint has to keep every family window. Empty persist-folds still union
+ *  the remount pair. iOS `snFirstOpenFamilyRetainedRows`. */
+internal fun firstOpenFamilyRetainedRows(
+    chatId: String,
+    retainedByChat: Map<String, List<SonarMsg>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<SonarMsg> {
+    val ids = linkedSetOf(chatId)
+    for (id in echoReconcileFamilyIds(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        ids += id
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank()) ids += bare
+    }
+    var merged: List<SonarMsg> = emptyList()
+    for (id in ids) {
+        val rows = retainedByChat[id]?.takeIf { it.isNotEmpty() } ?: continue
+        merged = if (merged.isEmpty()) {
+            rows
+        } else {
+            mergedFoldedMessageLists(merged, rows) { it.id }
+        }
+    }
+    return merged
+}
+
+/** Prefer last leave paint (including a hidden 0.8 sibling), then union any
+ *  remounted family snapshot rows so a short live leave-frame cannot hide
+ *  recovered 0.8 history. iOS `snFirstOpenTranscriptPaintRows`. */
+internal fun firstOpenTranscriptPaintRows(
+    chatId: String,
+    retainedByChat: Map<String, List<SonarMsg>>,
+    snapshotPaint: List<SonarMsg>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<SonarMsg> {
+    val retained = firstOpenFamilyRetainedRows(
+        chatId,
+        retainedByChat,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val snapshot = snapshotPaint.withoutSyntheticSummaryRows()
+    if (retained.isEmpty()) return snapshot
+    if (snapshot.isEmpty()) return retained
+    return mergedFoldedMessageLists(snapshot, retained) { it.id }
+        .sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+}
+
+/** First open may paint immediately from a remounted 0.8 snapshot, not
+ *  only a leave-frame. Waiting on the FFI local page hid recovered
+ *  history until `messages(live)` returned. iOS `snFirstOpenHasLocalTranscriptPaint`. */
+internal fun firstOpenHasLocalTranscriptPaint(
+    retained: List<SonarMsg>,
+    snapshot: List<SonarMsg>,
+): Boolean = retained.isNotEmpty() || snapshot.withoutSyntheticSummaryRows().isNotEmpty()
+
+/** Empty persist-folds hide a recovered 0.8 sibling from retained paint
+ *  and `transcriptGroupIds`. Merge FFI `fold_aliases` before first paint.
+ *  Do not cache a family-of-one result: an unresumed 0.8 chat looks
+ *  unfolded until the first 0.9 send.
+ *  iOS `snFirstOpenShouldMergeFolds` / `openDM`. */
+internal fun firstOpenShouldMergeFolds(
+    seedId: String,
+    persistedFolds: Map<String, String>,
+): Boolean {
+    val bare = seedId.removePrefix("marmot:").trim()
+    if (bare.isEmpty()) return false
+    return foldFamilyIds(bare, persistedFolds).size <= 1
+}
+
+/** A process-local "already merged, no family" cache must not skip the
+ *  next FFI hop. Recovered 0.8 chats look unfolded until the first 0.9
+ *  send; persist-folds with a family is the only reuse.
+ *  iOS `snFirstOpenShouldReuseCachedFoldMerge`. */
+internal fun firstOpenShouldReuseCachedFoldMerge(
+    seedId: String,
+    persistedFolds: Map<String, String>,
+    cachedSeeds: Set<String>,
+): Boolean {
+    val bare = seedId.removePrefix("marmot:").trim()
+    if (bare.isEmpty() || (bare !in cachedSeeds && seedId !in cachedSeeds)) return false
+    return !firstOpenShouldMergeFolds(seedId, persistedFolds)
+}
+
+/** Newest-page hydrate must keep remounted fold-family rows.
+ *  After persist-folds those rows sit on live (sibling cache empty).
+ *  A live-only FFI page must merge into that window — not replace it —
+ *  or first-open paint vanishes. iOS `snNewestPageShouldMergeFamilyWindow`. */
+internal fun newestPageShouldMergeFamilyWindow(
+    existingCanonicalCount: Int,
+    hiddenSiblingHasRows: Boolean,
+    hasFoldFamily: Boolean,
+    pinnedToOlderEdge: Boolean,
+): Boolean {
+    if (existingCanonicalCount <= 0 || pinnedToOlderEdge) return false
+    return hiddenSiblingHasRows || hasFoldFamily
+}
+
+/** Remount copies a pinned hist window onto live. An in-flight or
+ *  follow-up newest page on that just-pinned live must merge in place
+ *  — not replace+unpin. Explicit scroll-to-bottom still unpins.
+ *  Do not treat every newestPage+pinned as preserve: reopen-at-tail
+ *  would stay stuck on the historical cursor.
+ *  iOS `snNewestPageShouldPreserveRemountedPin`. */
+internal fun newestPageShouldPreserveRemountedPin(
+    isNewestPage: Boolean,
+    pinnedToOlderEdge: Boolean,
+    remountCopiedPinOntoTarget: Boolean,
+    explicitNewestReload: Boolean,
+): Boolean = isNewestPage && pinnedToOlderEdge && remountCopiedPinOntoTarget && !explicitNewestReload
+
+/** Read a draft from the open id or its hidden 0.8 sibling after a fold. */
+internal fun composerDraftForChat(
+    chatId: String,
+    drafts: Map<String, String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    drafts[chatId]?.takeIf { it.isNotEmpty() }?.let { return it }
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (id == chatId) continue
+        drafts[id]?.takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return ""
+}
+
+/** Write the draft onto [chatId] and drop leftover family keys so a clear
+ *  cannot resurrect hist text. Empty wake-mute persist still clears the
+ *  remount-pair live copy remount already stamped. */
+internal fun composerDraftsAfterEdit(
+    drafts: Map<String, String>,
+    chatId: String,
+    text: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, String> {
+    var next = drafts
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (id != chatId && id in next) next = next - id
+    }
+    return updatedComposerDrafts(next, chatId, text)
+}
+
+/** Read a reply chip from the open id or its remount / fold sibling.
+ *  iOS `snComposerReply`. */
+internal fun <Reply> composerReplyForChat(
+    chatId: String,
+    replies: Map<String, Reply>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Reply? {
+    replies[chatId]?.let { return it }
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (id == chatId) continue
+        replies[id]?.let { return it }
+    }
+    return null
+}
+
+/** Stamp a new reply chip onto every remount / fold-family key. After
+ *  remount Compose hops `Screen.Chat.id` to live; a hist-only write
+ *  would vanish when persist-folds family-clears hist.
+ *  iOS `snComposerRepliesAfterBegin`. */
+internal fun <Reply> composerRepliesAfterBegin(
+    replies: Map<String, Reply>,
+    chatId: String,
+    reply: Reply,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Reply> {
+    var next = replies
+    val keys = paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }
+    for (id in keys) {
+        next = next + (id to reply)
+    }
+    return next
+}
+
+/** Drop the reply chip from every remount / fold sibling so send / cancel
+ *  cannot leave a leftover that persist-folds later resurrects.
+ *  iOS `snComposerRepliesAfterClear`. */
+internal fun <Reply> composerRepliesAfterClear(
+    replies: Map<String, Reply>,
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Reply> {
+    var next = replies
+    next = next - chatId
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        if (id in next) next = next - id
+    }
+    return next
+}
+
+/** Latest trill cooldown across the fold family. */
+internal fun trillCooldownUntilMsForChat(
+    chatId: String,
+    cooldownUntilMs: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Long {
+    var latest = 0L
+    for (id in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        latest = maxOf(latest, cooldownUntilMs[id] ?: 0L)
+    }
+    return latest
+}
+
+/** Stamp sender cooldown onto every remount / fold-family key. After remount
+ *  a hist-only write is invisible on live while persist-folds are empty.
+ *  iOS `snTrillCooldownWritten`. */
+internal fun trillCooldownUntilMsWritten(
+    chatId: String,
+    untilMs: Long,
+    cooldownUntilMs: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, Long> {
+    var next = cooldownUntilMs
+    val keys = paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { setOf(chatId) }
+    for (id in keys) {
+        next = next + (id to untilMs)
+    }
+    return next
+}
+
+/** Ids that count as "this chat is open" for banner suppression after a fold.
+ *  Scan stays on listed ids so a bak remainder cannot replay recovered
+ *  history as never-seen. Suppression must include the hidden 0.8 sibling
+ *  — iOS `snConversationsMatchFoldFamily` already does. */
+internal fun notificationSuppressIds(
+    listedIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val out = linkedSetOf<String>()
+    for (listed in listedIds) {
+        if (listed.isBlank()) continue
+        for (id in remountPairConversationIds(
+            listed,
+            openedConversationId,
+            openedConversationPaneId,
+        )) {
+            if (id.isBlank()) continue
+            out += id
+            out.addAll(foldFamilyIds(id, historicalFolds))
+            val bare = id.removePrefix("marmot:")
+            if (bare.isNotBlank() && bare != id) {
+                out += bare
+                out.addAll(foldFamilyIds(bare, historicalFolds))
+            }
+        }
+    }
+    return out.toList()
+}
+
+/** Shade / mute keys for one conversation after a fold.
+ *  Opening the live row must dismiss a banner still keyed on the hidden 0.8 id. */
+internal fun notificationClearIds(
+    chatId: String,
+    relatedIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> = SonarNotificationHandoff.conversationIdsToClear(
+    chatId,
+    notificationSuppressIds(
+        listOf(chatId) + relatedIds,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ),
+)
+
+/** Mesh-folded White Noise notify: suppress the live group, the mesh row,
+ *  and the hidden 0.8 sibling so sitting in recovered history does not ring. */
+internal fun meshNotificationSuppressIds(
+    groupId: String,
+    meshId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> = notificationSuppressIds(
+    listOf(groupId, meshId),
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+)
+
+/** Marmot ids whose unread / transcript belong to the open chat after a fold.
+ *  Listed 1:1 duplicates plus the hidden 0.8 sibling. */
+internal fun transcriptSourceIds(
+    chatId: String,
+    listedDirectIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val out = linkedSetOf<String>()
+    if (chatId.isNotBlank()) out += chatId
+    for (id in listedDirectIds) {
+        if (id.isNotBlank()) out += id
+    }
+    val remount = remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    for (id in remount) {
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank()) out += bare
+    }
+    out.addAll(
+        foldFamilyIds(
+            chatId,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        ),
+    )
+    for (id in remount) {
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank()) {
+            out.addAll(
+                foldFamilyIds(
+                    bare,
+                    historicalFolds,
+                    openedConversationId,
+                    openedConversationPaneId,
+                ),
+            )
+        }
+    }
+    return out.toList()
+}
+
+/** Mesh-folded DMs resolve to listed live groups only. After persist-folds
+ *  the 0.8 sibling is hidden from `groups()`, so load-older / first-open
+ *  FFI must still expand those live ids through the fold family.
+ *  iOS `snMeshFoldTranscriptSourceIds` / `localTranscriptGroups`. */
+/** Download/decrypt must try every fold-family id. Hosts stamp media with
+ *  the painted live id; persist-folds can land before core `fold_family`,
+ *  so a live-only fetch misses hist exporter secrets.
+ *  iOS `snMediaFetchGroupIds`. */
+internal fun mediaFetchGroupIds(
+    startGroupId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val start = startGroupId.trim()
+    if (start.isEmpty()) return emptyList()
+    val out = linkedSetOf(start)
+    out.addAll(
+        transcriptSourceIds(
+            start,
+            emptyList(),
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        ),
+    )
+    return out.toList()
+}
+
+/**
+ * Newest-page a persist-folds sibling for the send exclude set.
+ * A folded hist id answers `[]` (not a throw); treating that as
+ * authoritative drops cached 0.8 blossom URLs so a new send can bind
+ * over the recovered attachment.
+ */
+internal fun publishedMediaScanRows(
+    loaded: List<SonarMsg>?,
+    cached: List<SonarMsg>,
+): List<SonarMsg> = (loaded ?: emptyList()) + cached
+
+/** Blossom URLs already on recovered or live rows. Pending echo blobs are
+ *  not published. A new send must exclude these so
+ *  `cacheUploadedMediaBytes` cannot bind new bytes to a 0.8 attachment
+ *  that shares filename/mime. Persist-folds remounts before core
+ *  `fold_family`, so a live-only page misses hist URLs. */
+internal fun publishedMediaUrlsFromMessages(
+    messages: Sequence<SonarMsg>,
+    pendingPrefix: String = "pending-media-",
+): Set<String> = messages
+    .flatMap { it.media.asSequence() }
+    .map { it.url }
+    .filter { it.isNotBlank() && !it.startsWith(pendingPrefix) }
+    .toSet()
+
+internal fun publishedMediaUrlsFromFamilyPages(
+    groupId: String,
+    historicalFolds: Map<String, String>,
+    pageForId: (String) -> List<SonarMsg>,
+    pendingPrefix: String = "pending-media-",
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val ids = mediaFetchGroupIds(
+        groupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).ifEmpty { listOf(groupId) }
+    return publishedMediaUrlsFromMessages(
+        ids.asSequence().flatMap { pageForId(it).asSequence() },
+        pendingPrefix,
+    )
+}
+
+internal fun meshFoldTranscriptSourceIds(
+    listedDirectIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    resolvedGroupId: String? = null,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val seeds = linkedSetOf<String>()
+    for (id in listedDirectIds) {
+        if (id.isNotBlank()) seeds += id
+    }
+    if (!resolvedGroupId.isNullOrBlank()) seeds += resolvedGroupId
+    if (seeds.isEmpty()) return emptyList()
+    val out = linkedSetOf<String>()
+    for (id in seeds) {
+        out.addAll(
+            transcriptSourceIds(
+                id,
+                listedDirectIds,
+                historicalFolds,
+                openedConversationId,
+                openedConversationPaneId,
+            ),
+        )
+    }
+    return out.toList()
+}
+
+/**
+ * Home-row / notification unread across the fold family.
+ *
+ * After collapse the hist row is hidden and `unreadByChat` can still be keyed
+ * on that id until core summaries remount the count onto live. Rooms used to
+ * sum only the listed live id, so a recovered badge vanished until refresh.
+ */
+internal fun unreadForFoldFamily(
+    chatId: String,
+    unreadByChat: Map<String, Long>,
+    historicalFolds: Map<String, String>,
+    listedDuplicateIds: Collection<String> = emptyList(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Long = transcriptSourceIds(
+    chatId,
+    listedDuplicateIds,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).sumOf { unreadByChat[it] ?: 0L }
+
+/** Safety-number verify across the fold family (hidden 0.8 sibling included). */
+internal fun verifiedForFoldFamily(
+    chatId: String,
+    verifiedIds: Set<String>,
+    historicalFolds: Map<String, String>,
+    listedDuplicateIds: Collection<String> = emptyList(),
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean = transcriptSourceIds(
+    chatId,
+    listedDuplicateIds,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+).any { it in verifiedIds }
+
+/** Preview sheet stays up when remount rewrites chatId to live while
+ *  the painted pane is still hist (or Compose hops the other way).
+ *  Empty persist-folds still union the remount pair.
+ *  iOS `snPendingMediaPreviewBelongsToChat`. */
+internal fun pendingMediaPreviewBelongsToChat(
+    previewChatId: String,
+    screenId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    if (openedConversationIdMatches(previewChatId, screenId)) return true
+    val previewBare = previewChatId.removePrefix("marmot:")
+    val screenBare = screenId.removePrefix("marmot:")
+    if (conversationsMatchFoldFamily(
+            previewBare,
+            screenBare,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )
+    ) return true
+    if (openedConversationIdMatches(previewChatId, openedConversationId) &&
+        openedConversationIdMatches(screenId, openedConversationPaneId)
+    ) {
+        return true
+    }
+    if (openedConversationIdMatches(previewChatId, openedConversationPaneId) &&
+        openedConversationIdMatches(screenId, openedConversationId)
+    ) {
+        return true
+    }
+    return false
+}
+
+/** Same recovered conversation under either the hidden 0.8 or live 0.9 id.
+ *  Empty persist-folds still match the remount pair so group-info / pending
+ *  joins stay on the painted hist pane. iOS `snConversationsMatchFoldFamily`. */
+internal fun conversationsMatchFoldFamily(
+    left: String,
+    right: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    if (left.isBlank() || right.isBlank()) return false
+    if (left == right || openedConversationIdMatches(left, right)) return true
+    if (foldFamilyIds(
+            left,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        ).contains(right)
+    ) return true
+    val remount = remountPairConversationIds(
+        conversationId = left,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    return remount.size > 1 && remount.any { openedConversationIdMatches(it, right) }
+}
+
+/** Open group-info must reload pending joins when `conversationChanged`
+ *  names this room, its hidden 0.8 sibling, or the remount pair.
+ *  iOS `snGroupInfoShouldReloadPending`. */
+internal fun groupInfoShouldReloadPending(
+    openGroupInfoChatId: String?,
+    changedId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    val open = openGroupInfoChatId?.takeIf { it.isNotBlank() } ?: return false
+    return conversationsMatchFoldFamily(
+        open,
+        changedId,
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+}
+
+/** Painted hist id plus remounted live id. Wake-mute persist only writes
+ *  `fold_aliases`, so remount can move payment / call rows onto live while
+ *  persist-folds are still empty. iPhone still paints `.dm(hist)`.
+ *  iOS `snRemountPairConversationIds`. */
+internal fun remountPairConversationIds(
+    conversationId: String,
+    openedConversationId: String?,
+    openedConversationPaneId: String?,
+): List<String> {
+    val ids = ArrayList<String>()
+    fun add(raw: String?) {
+        val id = raw?.trim().orEmpty()
+        if (id.isEmpty()) return
+        if (ids.any { openedConversationIdMatches(it, id) }) return
+        ids += id
+    }
+    add(conversationId)
+    val inPair = openedConversationIdMatches(conversationId, openedConversationId) ||
+        openedConversationIdMatches(conversationId, openedConversationPaneId)
+    if (inPair) {
+        add(openedConversationId)
+        add(openedConversationPaneId)
+    }
+    return ids
+}
+
+/** Persist-folds sidecar, plus the open remount pair as hist→live when
+ *  wake-mute has not written that pair yet. Persist already mapping
+ *  [hist] wins (R-045). A first-resume blob for another chat must not
+ *  hide this remount — empty persist-folds without a remount pair stay
+ *  empty. iOS `snRemountPairHistoricalFolds`. */
+internal fun remountPairHistoricalFolds(
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, String> {
+    val live = openedConversationId?.trim()?.removePrefix("marmot:").orEmpty()
+    val hist = openedConversationPaneId?.trim()?.removePrefix("marmot:").orEmpty()
+    val pair = if (live.isEmpty() || hist.isEmpty() || openedConversationIdMatches(live, hist)) {
+        emptyMap()
+    } else {
+        mapOf(hist to live)
+    }
+    if (pair.isEmpty()) return historicalFolds
+    if (historicalFolds.isEmpty()) return pair
+    if (historicalFolds.containsKey(hist)) return historicalFolds
+    return historicalFolds + pair
+}
+
+/** Rewrite a staged preview onto the live sibling. Empty persist-folds
+ *  still use the remount pair so confirmSendPreview does not send
+ *  against a hist id FFI no longer lists.
+ *  iOS `snPromotedFoldedPendingMediaPreviewPeerId`. */
+internal fun promotedFoldedPendingMediaPreviewChatId(
+    previewChatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    prefix: String = "marmot:",
+): String {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (folds.isEmpty()) return previewChatId
+    val bare = previewChatId.removePrefix(prefix)
+    val live = folds[bare] ?: folds[previewChatId] ?: return previewChatId
+    if (live.isBlank() || live == bare || live == previewChatId) return previewChatId
+    val liveBare = live.removePrefix(prefix)
+    return if (previewChatId.startsWith(prefix)) prefix + liveBare else liveBare
+}
+
+/** Key new call-log rows on the remounted live sibling. Remount already
+ *  moved hist rows onto live; a call placed from a still-hist id must
+ *  not write a second hist bucket that home-row counts miss while
+ *  persist-folds are empty. Keep [ActiveCall.chatId] on hist so BLE
+ *  signaling still resolves. iOS `snCallConversationStoreId`. */
+internal fun callConversationStoreId(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    val pair = remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    if (pair.size > 1) {
+        openedConversationId?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+    }
+    val live = historicalFolds[chatId]
+    if (!live.isNullOrBlank() && live != chatId) return live
+    return chatId
+}
+
+/** Key new conversation-scoped payment rows on the remounted live sibling.
+ *  Wallet / Unify keys stay put. iOS `snPaymentConversationStoreId`. */
+internal fun paymentConversationStoreId(
+    peerKey: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    if (peerKey == "wallet" || peerKey.startsWith("unify:")) return peerKey
+    return callConversationStoreId(
+        peerKey,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+}
+
+/** Mute / unmute keys for one conversation. Empty persist-folds still
+ *  union the remount pair so a mute from a still-hist id stamps live
+ *  on the first write. iOS `snMutedFoldKeys`. */
+internal fun muteConversationIds(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val ids = linkedSetOf<String>()
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        if (id.isNotBlank()) ids += id
+        ids.addAll(foldFamilyIds(id, historicalFolds))
+    }
+    return ids.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
+/** Conversation keys a chat-scoped payment read must check after a fold.
+ *  Empty persist-folds still union the remount pair so a moved live row
+ *  stays visible on the painted hist pane. */
+internal fun paymentActivityPeerKeys(
+    chatId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val keys = linkedSetOf<String>()
+    for (id in remountPairConversationIds(
+        conversationId = chatId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        keys += id
+        keys.addAll(foldFamilyIds(id, historicalFolds))
+    }
+    return keys.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
+/** Persist-rewrite conversation-scoped payment rows from every hidden
+ *  0.8 id onto its live sibling. Empty persist-folds still use the
+ *  remount pair so a hist-keyed ledger row lands on live before
+ *  wake-mute writes the blob. iOS `snRemountedPaymentPeerKeysFromFolds`. */
+internal fun remountedPaymentActivitiesFromFolds(
+    activities: List<SonarPaymentActivity>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<SonarPaymentActivity> {
+    val folds = remountPairHistoricalFolds(
+        historicalFolds,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )
+    var next = activities
+    for ((historical, live) in folds) {
+        if (live.isBlank() || live == historical) continue
+        next = remountedPaymentActivities(listOf(historical), live, next)
+    }
+    return next
+}
+
+/**
+ * Call-log rows for the open id plus its hidden 0.8 sibling. Promote copies
+ * hist onto live asynchronously; first paint of the live transcript must
+ * still show recovered calls before that rewrite lands.
+ */
+internal fun <V> callRecordsForChat(
+    chatId: String,
+    callLogs: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<V> {
+    val keys = paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (keys.size <= 1) return callLogs[chatId].orEmpty()
+    val rows = ArrayList<V>()
+    for (id in keys) {
+        if (id != chatId) rows += callLogs[id].orEmpty()
+    }
+    rows += callLogs[chatId].orEmpty()
+    return rows
+}
+
+/** In-flight / failed send echoes for the open id plus its hidden 0.8 sibling. */
+internal fun <V> pendingMessagesForChat(
+    chatId: String,
+    messagesByChat: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<V> = callRecordsForChat(
+    chatId,
+    messagesByChat,
+    historicalFolds,
+    openedConversationId,
+    openedConversationPaneId,
+)
+
+/** Drop matching echoes from every fold-family key, not only the open id. */
+internal fun <V> removePendingMessagesForChat(
+    chatId: String,
+    messagesByChat: MutableMap<String, MutableList<V>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+    shouldRemove: (V) -> Boolean,
+) {
+    for (key in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        val list = messagesByChat[key] ?: continue
+        list.removeAll(shouldRemove)
+        if (list.isEmpty()) messagesByChat.remove(key)
+    }
+}
+
+/** Hist echo + live canonical after remount, including empty persist-folds.
+ *  iOS `snEchoReconcileFamilyIds`. */
+internal fun echoReconcileFamilyIds(
+    echoGroupId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val out = linkedSetOf<String>()
+    if (echoGroupId.isNotBlank()) out += echoGroupId
+    out.addAll(foldFamilyIds(echoGroupId, historicalFolds))
+    for (id in remountPairConversationIds(
+        conversationId = echoGroupId,
+        openedConversationId = openedConversationId,
+        openedConversationPaneId = openedConversationPaneId,
+    )) {
+        val bare = id.removePrefix("marmot:")
+        if (bare.isNotBlank()) {
+            out += bare
+            out.addAll(foldFamilyIds(bare, historicalFolds))
+        }
+    }
+    return out
+}
+
+/** Fresh canonical rows that can fulfill an in-flight send echo.
+ *  First-resume send echoes on the recovered 0.8 id; the relay copy
+ *  lands on the live 0.9 sibling. Walk the fold family or the remount
+ *  pair, or the echo stays "Sending" forever beside the real row.
+ *  iOS `snOptimisticFreshCanonicalRows`. */
+internal fun <V> optimisticFreshCanonicalRows(
+    echoGroupId: String,
+    freshRowsByGroup: Map<String, List<V>>,
+    cachedRowsByGroup: Map<String, List<V>>,
+    historicalFolds: Map<String, String>,
+    isLocalEcho: (V) -> Boolean,
+    idOf: (V) -> String,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<V> {
+    val family = echoReconcileFamilyIds(
+        echoGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    val seen = linkedSetOf<String>()
+    val out = ArrayList<V>()
+    fun addAll(rows: List<V>) {
+        for (row in rows) {
+            if (isLocalEcho(row)) continue
+            if (seen.add(idOf(row))) out += row
+        }
+    }
+    for (id in family) {
+        addAll(freshRowsByGroup[id].orEmpty())
+        addAll(cachedRowsByGroup[id].orEmpty())
+    }
+    return out
+}
+
+/** After a hist echo is fulfilled by a live sibling, drop that echo from
+ *  every family transcript so `dmMsgs` does not show Sending + Sent.
+ *  iOS `snTranscriptsAfterOptimisticReconcile`. */
+internal fun <V> transcriptsAfterOptimisticReconcile(
+    echoGroupId: String,
+    messagesByGroup: Map<String, List<V>>,
+    pendingIds: Collection<String>,
+    survivorIds: Collection<String>,
+    visible: List<V>,
+    historicalFolds: Map<String, String>,
+    idOf: (V) -> String,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Map<String, List<V>> {
+    val survivors = survivorIds.toSet()
+    val fulfilled = pendingIds.filterNot { it in survivors }.toSet()
+    val next = messagesByGroup.toMutableMap()
+    next[echoGroupId] = visible
+    if (fulfilled.isEmpty()) return next
+    val family = echoReconcileFamilyIds(
+        echoGroupId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    for (sibling in family) {
+        if (sibling == echoGroupId) continue
+        val rows = next[sibling] ?: continue
+        val stripped = rows.filterNot { idOf(it) in fulfilled }
+        if (stripped.isEmpty()) next.remove(sibling)
+        else next[sibling] = stripped
+    }
+    return next
+}
+
+/** Move in-flight echoes off a hidden 0.8 id onto the live sibling.
+ *  iOS `snRemountedOptimisticPending`. */
+internal fun <V> remountedOptimisticPending(
+    pendingByGroup: Map<String, List<V>>,
+    historicalGroupId: String,
+    liveGroupId: String,
+    idOf: (V) -> String,
+): Map<String, List<V>> {
+    if (historicalGroupId.isBlank() || liveGroupId.isBlank() || historicalGroupId == liveGroupId) {
+        return pendingByGroup
+    }
+    val historical = pendingByGroup[historicalGroupId].orEmpty()
+    if (historical.isEmpty()) return pendingByGroup
+    val next = pendingByGroup.toMutableMap()
+    next.remove(historicalGroupId)
+    val existing = next[liveGroupId].orEmpty()
+    val seen = existing.map(idOf).toMutableSet()
+    val merged = existing.toMutableList()
+    for (echo in historical) {
+        if (seen.add(idOf(echo))) merged += echo
+    }
+    if (merged.isEmpty()) next.remove(liveGroupId)
+    else next[liveGroupId] = merged
+    return next
+}
+
+/** Keys that may hold an in-flight echo after persist-folds remounts hist→live.
+ *  Discard/fail must walk these or a remounted Sending bubble stays forever.
+ *  iOS `snOptimisticPendingLookupIds`. */
+internal fun optimisticPendingLookupIds(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: Map<String, Collection<String>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Set<String> {
+    val out = linkedSetOf<String>()
+    out.addAll(
+        echoReconcileFamilyIds(
+            sendGroupId,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        ),
+    )
+    for ((key, ids) in pendingByGroup) {
+        if (echoId.isNotBlank() && echoId in ids) out += key
+    }
+    return out.filterTo(linkedSetOf()) { it.isNotBlank() }
+}
+
+/** Where to write the failed echo after remount. Prefer the live sibling
+ *  (persist-folds or the key that already holds the echo).
+ *  iOS `snOptimisticPendingStoreId`. */
+internal fun optimisticPendingStoreId(
+    sendGroupId: String,
+    echoId: String,
+    pendingByGroup: Map<String, Collection<String>>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): String {
+    historicalFolds[sendGroupId]?.takeIf { it.isNotBlank() && it != sendGroupId }?.let { return it }
+    for ((key, ids) in pendingByGroup) {
+        if (key != sendGroupId && echoId.isNotBlank() && echoId in ids) return key
+    }
+    val openedBare = openedConversationId?.removePrefix("marmot:")?.trim().orEmpty()
+    if (openedBare.isNotBlank() &&
+        !openedConversationIdMatches(openedBare, sendGroupId) &&
+        remountPairConversationIds(
+            sendGroupId,
+            openedConversationId,
+            openedConversationPaneId,
+        ).any { openedConversationIdMatches(it, openedConversationId) }
+    ) {
+        return openedBare
+    }
+    return foldFamilyIds(sendGroupId, historicalFolds).firstOrNull { it != sendGroupId }
+        ?: sendGroupId
+}
+
+/** Rewrite matching echoes on every fold-family key. */
+internal fun <V> updatePendingMessagesForChat(
+    chatId: String,
+    messagesByChat: MutableMap<String, MutableList<V>>,
+    historicalFolds: Map<String, String>,
+    matches: (V) -> Boolean,
+    update: (V) -> V,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    var found = false
+    for (key in paymentActivityPeerKeys(
+        chatId,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    )) {
+        val list = messagesByChat[key] ?: continue
+        for (index in list.indices) {
+            if (!matches(list[index])) continue
+            list[index] = update(list[index])
+            found = true
+        }
+    }
+    return found
+}
+
+/** Hidden 0.8 ids core `leave_group(live)` will not purge when persist-folds
+ *  landed before `fold_family`. Hosts must `deleteChat` these after leave or
+ *  the next cold start resurrects the room. Empty persist-folds still union
+ *  the remount pair. iOS `snLeaveFamilyCorePurgeIds`. */
+internal fun leaveFamilyCorePurgeIds(
+    leaveId: String,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val leave = leaveId.trim()
+    if (leave.isEmpty()) return emptyList()
+    return echoReconcileFamilyIds(
+        leave,
+        historicalFolds,
+        openedConversationId,
+        openedConversationPaneId,
+    ).map { it.removePrefix("marmot:") }
+        .filter { it.isNotBlank() && !openedConversationIdMatches(it, leave) }
+        .distinct()
+        .sorted()
+}
+
+/** Listed Marmot ids plus their persist-folds siblings. Mesh-folded DM
+ *  delete must `deleteChat` the hidden 0.8 id, not only the listed live
+ *  group. Empty persist-folds still union the remount pair.
+ *  iOS `snDeletedConversationCorePurgeIds`. */
+internal fun deletedConversationCorePurgeIds(
+    listedIds: Collection<String>,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): List<String> {
+    val out = linkedSetOf<String>()
+    for (id in listedIds) {
+        val trimmed = id.trim()
+        if (trimmed.isEmpty()) continue
+        out += trimmed
+        for (alias in echoReconcileFamilyIds(
+            trimmed,
+            historicalFolds,
+            openedConversationId,
+            openedConversationPaneId,
+        )) {
+            val bare = alias.removePrefix("marmot:")
+            if (bare.isNotBlank()) out += bare
+            if (alias.isNotBlank()) out += alias
+        }
+    }
+    return out.filter { it.isNotBlank() }.sorted()
+}
+
+/** Drop host fold bindings whose historical or live id was just deleted. */
+internal fun purgedHistoricalFolds(
+    folds: Map<String, String>,
+    deletedIds: Set<String>,
+): Map<String, String> =
+    folds.filterNot { (historical, live) ->
+        historical in deletedIds || live in deletedIds
+    }
+
+/**
+ * After an authoritative `groups()` / `chats()` listing, drop hist→live
+ * bindings whose whole family is gone. First-paint / core-not-ready listings
+ * must pass [listedAuthoritative] = false so a recovered 0.8 row is not
+ * forgotten before the live sibling appears.
+ *
+ * An empty listing is never authoritative: a closed node or reconnect
+ * must not persist an empty host fold blob. Wipe / delete already call
+ * [forgetHistoricalFolds].
+ */
+internal fun prunedOrphanedHistoricalFolds(
+    folds: Map<String, String>,
+    listedIds: Set<String>,
+    listedAuthoritative: Boolean,
+): Map<String, String> {
+    if (!listedAuthoritative || listedIds.isEmpty()) return folds
+    return folds.filter { (historical, live) ->
+        live == historical || live in listedIds || historical in listedIds
+    }
+}
+
+/** Keep call/pay/notification watermarks on the live sibling after FFI hide. */
+internal fun promotedFoldedScanMarks(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    watermarks: Map<String, ScanMark>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, ScanMark> {
+    var next = watermarks
+    for (historical in previousIds + watermarks.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = watermarks[historical] ?: continue
+        next = next + (live to maxScanMark(next[live], incoming))
+    }
+    return next
+}
+
+/** Keep notification seen-ids on the live sibling so recovered history is not re-bannered. */
+internal fun promotedFoldedSeenMessageIds(
+    previousIds: Set<String>,
+    currentIds: Set<String>,
+    seenByChat: Map<String, Set<String>>,
+    liveFoldTarget: (String) -> String?,
+): Map<String, Set<String>> {
+    var next = seenByChat
+    for (historical in previousIds + seenByChat.keys) {
+        if (historical in currentIds) continue
+        val live = liveFoldTarget(historical) ?: continue
+        if (live !in currentIds) continue
+        val incoming = seenByChat[historical] ?: continue
+        next = next + (live to next[live].orEmpty() + incoming)
+    }
+    return next
+}
+
+internal enum class RecoveredChatResumeUi { Live, WaitingForPeerUpdate }
+
+internal fun recoveredChatResumeUi(
+    hasLiveFoldSibling: Boolean,
+    keyPackageMissing: Boolean,
+): RecoveredChatResumeUi =
+    if (!hasLiveFoldSibling && keyPackageMissing) {
+        RecoveredChatResumeUi.WaitingForPeerUpdate
+    } else {
+        RecoveredChatResumeUi.Live
+    }
+
+/** FFI hides the folded 0.8 id, so listed duplicate DMs go back to 1.
+ *  Rooms never have listed duplicates. A persisted hist→live binding is
+ *  the live sibling. */
+internal fun recoveredChatHasLiveFoldSibling(
+    chatId: String,
+    listedDuplicateCount: Int,
+    historicalFolds: Map<String, String>,
+    openedConversationId: String? = null,
+    openedConversationPaneId: String? = null,
+): Boolean {
+    if (listedDuplicateCount > 1) return true
+    if (chatId.isBlank()) return false
+    val remount = remountPairConversationIds(
+        chatId,
+        openedConversationId,
+        openedConversationPaneId,
+    )
+    if (remount.size > 1) return true
+    val live = historicalFolds[chatId]
+    if (!live.isNullOrBlank() && live != chatId) return true
+    return historicalFolds.values.any { it == chatId }
+}
+
+/** Resume created the live sibling. Drop the waiting flag — do not copy it. */
+internal fun remountClearsRecoveredWaitingFlag(
+    needsUpdate: Set<String>,
+    historicalId: String,
+    liveId: String,
+): Set<String> = needsUpdate - historicalId - liveId
+
+internal fun marmotSendUserMessage(error: String): String {
+    val lower = error.lowercase()
+    return if (
+        "no key package" in lower ||
+            "cannot send until the other members update" in lower
+    ) {
+        "Waiting for them to update Sonar"
+    } else {
+        "send failed: $error"
+    }
+}
+
+/** Invite mint is local and must not create a group. An unresumed 0.8 room
+ *  has no live MLS id — fail closed instead of handing out a dead token. */
+internal fun marmotInviteUserMessage(error: String): String {
+    val lower = error.lowercase()
+    return if ("cannot invite until it is resumed" in lower) {
+        "Send a message first to resume this chat, then invite"
+    } else {
+        "couldn't create invite link: $error"
+    }
+}
+
+internal fun marmotSendNeedsPeerUpdate(error: String): Boolean =
+    marmotSendUserMessage(error) == "Waiting for them to update Sonar"
+
+internal const val RECOVERED_LEGACY_MEDIA_COPY =
+    "This attachment is from an older Sonar and can't be opened after the update."
+
+internal fun recoveredLegacyMediaUnavailable(error: String): Boolean {
+    val lower = error.lowercase()
+    return "older sonar" in lower && "cannot be opened after the update" in lower
 }
 
 internal fun dedupeDirectMarmotChats(
@@ -579,6 +4368,15 @@ internal fun isMeshAliasGroupBlocked(
  *  right after a text) leaves `secs` unchanged — the count catches it. */
 internal data class ScanMark(val secs: Long, val count: Long)
 
+internal fun maxScanMark(left: ScanMark?, right: ScanMark): ScanMark {
+    val existing = left ?: return right
+    return when {
+        right.secs > existing.secs -> right
+        right.secs < existing.secs -> existing
+        else -> ScanMark(existing.secs, maxOf(existing.count, right.count))
+    }
+}
+
 /** Per-chat probe used to decide, from the single `conversationSummaries()` FFI
  *  call, which chats actually gained a newer message since the last scan. Only
  *  those chats need the expensive `messagesPage` fetch + re-parse for call/pay
@@ -634,9 +4432,10 @@ internal data class VisibleChatsKey(
     val snapshotVersion: Int,
     val ownNpub: String,
     val holdVersion: Int,
+    val conversationIndexVersion: Int = 0,
 )
 
-private fun decodeGroupFoldMap(blob: String): Map<String, String> =
+internal fun decodeGroupFoldMap(blob: String): Map<String, String> =
     blob.lineSequence()
         .mapNotNull { line ->
             val i = line.indexOf('=')
@@ -813,8 +4612,14 @@ class SonarAccountRestoreException(
 
 class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
-    private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
-    private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob)
+    private val initialHistoricalFolds = decodeGroupFoldMap(SonarCore.loadBlob(HISTORICAL_FOLDS_BLOB_KEY))
+    private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob).let { (chats, messages) ->
+        collapsedFoldedSnapshotChats(chats, initialHistoricalFolds) to messages
+    }
+    private val initialChatSnapshotLatest = snapshotLatestAfterHistoricalFolds(
+        decodeChatSnapshotLatest(initialChatSnapshotBlob),
+        initialHistoricalFolds,
+    )
     private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
     private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
         .mapTo(hashSetOf()) { it.id }
@@ -879,17 +4684,77 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  Message bodies remain in the core database; this map only prevents the
      *  mixed mesh/Marmot Home list from treating every restored Marmot row as 0. */
     private var chatSnapshotLatestByChat: Map<String, Long> = initialChatSnapshotLatest
+    /** Index `message_count` from the last successful summaries probe.
+     *  `transcriptKnownNonEmpty` must not hard-code `emptyMap()` — iOS feeds
+     *  `conversationSummariesByGroup`. A failed probe keeps this map. */
+    private var conversationMessageCountByChat: Map<String, Long> = emptyMap()
+    /** Index `latest_at` from the last successful summaries probe.
+     *  `expectedNewestTsForOpenChat` must not be snapshot-only — iOS reads
+     *  remounted `conversationSummariesByGroup[].latestAt`. */
+    private var conversationLatestAtByChat: Map<String, Long> = emptyMap()
+    /** Remounted summaries including `latestContent`. Home preview must not
+     *  depend on synthetics surviving in the metadata-only snapshot.
+     *  iOS `conversationSummariesByGroup`. */
+    private var conversationSummaryByChat: Map<String, SonarConversationSummary> = emptyMap()
+    /** Bumped when the summaries-index cache changes so [visibleChats]
+     *  dedupe / [marmotRow] recency re-run. Snapshot-only memo keys left a
+     *  recovered row sunk after `rememberConversationSummaryIndex`. */
+    private var conversationIndexVersion = 0
 
-    private fun localLatestTs(chatId: String): Long =
-        chatSnapshotMessagesByChat[chatId]?.lastOrNull()?.tsSecs
-            ?: chatSnapshotLatestByChat[chatId]
-            ?: 0L
+    private fun rememberConversationSummaryIndex(summaries: List<SonarConversationSummary>?) {
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
+        val nextCounts = conversationMessageCountsFromSummaries(
+            summaries,
+            conversationMessageCountByChat,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        val nextLatest = conversationLatestAtFromSummaries(
+            summaries,
+            conversationLatestAtByChat,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        val nextSummaries = conversationSummariesByChat(
+            summaries,
+            conversationSummaryByChat,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        if (nextCounts !== conversationMessageCountByChat ||
+            nextLatest !== conversationLatestAtByChat ||
+            nextSummaries !== conversationSummaryByChat
+        ) {
+            conversationIndexVersion++
+        }
+        conversationMessageCountByChat = nextCounts
+        conversationLatestAtByChat = nextLatest
+        conversationSummaryByChat = nextSummaries
+    }
+
+    private fun localLatestTs(chatId: String): Long {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return localLatestTsForChat(
+            chatId,
+            chatSnapshotMessagesByChat,
+            chatSnapshotLatestByChat,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
     /** Pending 1:1 secure chats keyed by local id (`npub:…`). Value carries
      *  the peer npub plus [PendingMarmotDirect.createdAtSecs] so the Home list
      *  can sort by creation time (iOS `pending.createdAt` / `dmRows` parity)
      *  instead of treating them as epoch-zero after the recency merge. */
     private var pendingMarmotChatNpubs by mutableStateOf<Map<String, PendingMarmotDirect>>(emptyMap())
     private var pendingMarmotGroups by mutableStateOf<Map<String, PendingMarmotGroup>>(emptyMap())
+    /** Recovered 0.8 chats whose resume send failed because the peer has no 0.9 KeyPackage. */
+    private var recoveredChatNeedsUpdate by mutableStateOf<Set<String>>(emptySet())
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
     private val pendingInviteTokens = mutableListOf<String>()
@@ -913,8 +4778,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val profileMissedAt = mutableMapOf<String, Long>()
 
     init {
-        if (initialChatSnapshotBlob.isNotEmpty()) {
-            persistChatSnapshot()
+        if (chatSnapshotNeedsMetadataRewrite(initialChatSnapshotBlob)) {
+            // Strip leftover plaintext bodies. Keep isDirect only when the
+            // source blob already had it — otherwise a good 6-field snapshot
+            // would be rewritten to 5 fields on every cold start.
+            persistChatSnapshot(includeIsDirect = chatSnapshotHasIsDirect(initialChatSnapshotBlob))
         }
     }
 
@@ -952,14 +4820,27 @@ class SonarAppState(private val scope: CoroutineScope) {
     var chatOpenBenchMark: kotlin.time.TimeSource.Monotonic.ValueTimeMark? = null
 
     fun push(s: Screen) {
-        if (s is Screen.Chat && (screen as? Screen.Chat)?.id != s.id) {
+        val routeId = when (s) {
+            is Screen.GroupInfo -> s.chatId
+            is Screen.ContactProfile -> s.chatId
+            else -> null
+        }
+        val next = if (routeId == null) {
+            s
+        } else {
+            val fromRoute = remountPairForOpenChat(routeId)
+            val fromOpen = remountPairForOpenChat((screen as? Screen.Chat)?.id.orEmpty())
+            val (opened, pane) = if (fromRoute.first != null) fromRoute else fromOpen
+            remountPushedScreen(s, historicalFoldMap, opened, pane)
+        }
+        if (next is Screen.Chat && (screen as? Screen.Chat)?.id != next.id) {
             cleanupPreviewTempFiles()
             if (sonarBenchMarkersEnabled) {
                 chatOpenBenchMark = kotlin.time.TimeSource.Monotonic.markNow()
             }
         }
-        if (callOverlay && s is Screen.Call) return
-        stack = stack + s
+        if (callOverlay && next is Screen.Call) return
+        stack = stack + next
     }
 
     /**
@@ -1010,10 +4891,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             MeshRadio.discardPendingDeliverySignals()
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             meshPeers = emptyList()
-            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
+            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear(); historicalFoldMap.clear()
             meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
-            persistLinks(); persistLinkCaps(); persistGroupFolds()
+            persistLinks(); persistLinkCaps(); persistGroupFolds(); persistHistoricalFolds()
             updateBleDiscoveryPolicy()
             // Bump BEFORE the suspending write: persistSonarDescriptorCacheNow()
             // suspends, and an in-flight fetch resuming in that window would
@@ -1028,6 +4909,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             socialState = SonarSocialState(); persistSocialState()
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
+            recoveredChatNeedsUpdate = emptySet()
             pendingDirectMarmotSends.clear()
             pendingMarmotGroupSends.clear()
             outbox.clear()
@@ -1095,8 +4977,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
-            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-            persistLinks(); persistLinkCaps(); persistGroupFolds()
+            recoveredChatNeedsUpdate = emptySet()
+            linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear(); historicalFoldMap.clear()
+            persistLinks(); persistLinkCaps(); persistGroupFolds(); persistHistoricalFolds()
             profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCacheNow()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
@@ -1165,19 +5048,28 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var conversationPinnedToOlderEdge by mutableStateOf(false)
     private var transcriptGeneration = 0L
     private var activeTranscriptChatId: String? = null
+    /** Open-id aliases kept across a 0.8→0.9 remount so an in-flight send
+     *  that still holds the historical id can publish into the live session. */
+    private var transcriptSessionAliases = setOf<String>()
 
     private fun isCurrentTranscriptSession(chatId: String, generation: Long): Boolean =
         generation == transcriptGeneration &&
-            activeTranscriptChatId == chatId &&
-            (screen as? Screen.Chat)?.id == chatId
+            chatId in transcriptSessionChatIds() &&
+            (screen as? Screen.Chat)?.id in transcriptSessionChatIds()
 
     /** Session still owned while the first local page loads *before* [push]. */
     private fun isActiveTranscriptGeneration(chatId: String, generation: Long): Boolean =
-        generation == transcriptGeneration && activeTranscriptChatId == chatId
+        generation == transcriptGeneration && chatId in transcriptSessionChatIds()
+
+    private fun transcriptSessionChatIds(): Set<String> {
+        val active = activeTranscriptChatId ?: return emptySet()
+        return transcriptSessionAliases + active
+    }
 
     private fun beginTranscriptSession(chatId: String): Long {
         transcriptGeneration += 1
         activeTranscriptChatId = chatId
+        transcriptSessionAliases = setOf(chatId)
         // Reopening starts from a viewport-sized local page. Older pages are a
         // property of the live view, not an account-wide plaintext cache.
         transcriptWindows.clear()
@@ -1188,12 +5080,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         conversationTranscriptRows = emptyList()
         conversationVisibleRowLimit = TRANSCRIPT_PAGE_SIZE
         conversationPinnedToOlderEdge = false
+        suppressOpenedHydrateIds = emptySet()
         return transcriptGeneration
     }
 
     private fun endTranscriptSession() {
         transcriptGeneration += 1
         activeTranscriptChatId = null
+        transcriptSessionAliases = emptySet()
         transcriptWindows.clear()
         freshCanonicalByGroup.clear()
         meshTranscriptRows = emptyList()
@@ -1207,8 +5101,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True when the active 500-row window has moved away from the newest edge. */
     fun canLoadNewestMessages(chatId: String): Boolean =
         conversationPinnedToOlderEdge &&
-            activeTranscriptChatId == chatId &&
-            (screen as? Screen.Chat)?.id == chatId
+            chatId in transcriptSessionChatIds() &&
+            (screen as? Screen.Chat)?.id in transcriptSessionChatIds()
 
     /**
      * Reset this live conversation to its bounded newest edge. Advancing the
@@ -1222,7 +5116,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val snapshot = if (isMeshChat(chatId)) {
             refreshMeshTranscriptWindow(meshPeerId(chatId))
         } else {
-            chatSnapshotMessagesByChat[chatId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+            val full = snapshotMessagesForChat(chatId).withoutSyntheticSummaryRows()
+            seedFoldFamilyTranscriptWindows(chatId, full)
+            full
         }
         val immediate = refreshConversationRows(snapshot, chatId, generation)
         setCurrentVisibleMessages(
@@ -1291,18 +5187,139 @@ class SonarAppState(private val scope: CoroutineScope) {
      * read 0, leaving radar/BLE-folded conversations with no divider while
      * plain Marmot chats got one. That resolver is also what the read-marking
      * paths use, so capture and clear always cover the same groups.
+     *
+     * A cache miss must not publish `0`. Missing key means capture has not
+     * settled — hosts treat that as provisional live edge, not fully-read.
+     * On miss, probe the conversation index *before* [markGroupsRead] can
+     * zero it (Compose marks on open; iOS waits for hydrate). Failed probe
+     * leaves the key unset. Empty success settles 0.
      */
     private fun captureOpenChatUnread(chatId: String, jumpMessageId: String? = null) {
-        val unreadAtOpen = transcriptGroupIds(chatId).sumOf { unreadByChat[it] ?: 0L }
-        openChatUnreadAnchor = openChatUnreadAnchor - chatId
-        // Always publish a settled value (including 0). Missing key means
-        // capture has not run — hosts must not coerce that to live-edge.
-        openChatUnread = openChatUnread + (chatId to unreadAtOpen)
+        // First open after upgrade can have hist unread in unreadByChat
+        // while the host blob is still empty. Expand ids via FFI before
+        // the cache/probe so the divider is not settled as 0 / unset.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(listOf(chatId) + transcriptGroupIds(chatId))
+        adoptActionHistoricalFolds(folds)
+        if (folds != beforeFolds) persistHistoricalFolds()
+        val ids = transcriptGroupIds(chatId)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+            chatId,
+            null,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         openChatJumpMessageId = if (jumpMessageId != null) {
-            openChatJumpMessageId + (chatId to jumpMessageId)
-        } else {
+            quotedJumpWritten(
+                chatId,
+                jumpMessageId,
+                openChatJumpMessageId,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+        } else if (quotedJumpParentId(
+                chatId,
+                openChatJumpMessageId,
+                historicalFoldMap,
+                opened,
+                pane,
+            ) == null
+        ) {
             openChatJumpMessageId - chatId
+        } else {
+            openChatJumpMessageId
         }
+        val cached = openChatUnreadFromCache(ids, unreadByChat)
+        if (cached != null || ids.isEmpty()) {
+            openChatUnread = unreadCountAtOpenWritten(
+                chatId,
+                cached ?: 0L,
+                openChatUnread,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+            markGroupsRead(ids)
+            return
+        }
+        // Leave unset until the index probe settles.
+        openChatUnread = unreadCountAtOpenWritten(
+            chatId,
+            null,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        scope.launch {
+            val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
+            rememberConversationSummaryIndex(summaries)
+            val unread = openChatUnreadFromSummaries(summaries, ids)
+            if (unread != null) publishCapturedOpenUnread(chatId, unread)
+            // Mark after capture so the probe still sees pre-open unread.
+            markGroupsRead(ids)
+        }
+    }
+
+    fun openChatUnreadFor(chatId: String): Long? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return unreadCountAtOpen(
+            chatId,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
+    fun openChatUnreadAnchorFor(chatId: String): String? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return unreadAnchorAtOpen(
+            chatId,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
+    fun rememberOpenChatUnreadAnchor(chatId: String, anchorKey: String) {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+            chatId,
+            anchorKey,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
+    private fun publishCapturedOpenUnread(capturedFor: String, unread: Long) {
+        val (opened, pane) = remountPairForOpenChat(capturedFor)
+        val stackChatIds = stack.mapNotNull { (it as? Screen.Chat)?.id }
+        val key = openChatUnreadPublishId(
+            capturedFor = capturedFor,
+            stackChatIds = stackChatIds,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ) ?: return
+        if (unreadCountAtOpen(key, openChatUnread, historicalFoldMap, opened, pane) != null) {
+            return
+        }
+        openChatUnread = unreadCountAtOpenWritten(
+            key,
+            unread,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     /** Give up on a pending unread divider for this open: the transcript is
@@ -1310,14 +5327,42 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  is a filtered control line). Settles to 0 so open policy becomes
      *  live-edge and tail following resumes. */
     fun retireOpenChatUnread(chatId: String) {
-        openChatUnread = openChatUnread + (chatId to 0L)
-        openChatUnreadAnchor = openChatUnreadAnchor - chatId
-        openChatJumpMessageId = openChatJumpMessageId - chatId
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatUnread = unreadCountAtOpenWritten(
+            chatId,
+            0L,
+            openChatUnread,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+            chatId,
+            null,
+            openChatUnreadAnchor,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        openChatJumpMessageId = quotedJumpCleared(
+            chatId,
+            openChatJumpMessageId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     /** Drop a one-shot Jump target after the host applied (or soft-failed) it. */
     fun clearOpenChatJump(chatId: String) {
-        openChatJumpMessageId = openChatJumpMessageId - chatId
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatJumpMessageId = quotedJumpCleared(
+            chatId,
+            openChatJumpMessageId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     /** Account wipe/erase: per-open transcript state must not outlive the
@@ -1327,6 +5372,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatUnreadAnchor = emptyMap()
         openChatJumpMessageId = emptyMap()
         hydratedTranscripts = emptySet()
+        suppressOpenedHydrateIds = emptySet()
         unreadSuppressGroupIds.clear()
         // Every caller is a full teardown (account wipe, eraseAllChats,
         // restoreAccount). Echoes now outlive their first reconcile (R-025),
@@ -1340,11 +5386,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
     private fun markGroupsRead(groupIds: Collection<String>) {
         if (groupIds.isEmpty()) return
-        val marked = groupIds.toSet()
+        // Home-row unread walks the fold family. Clearing only the live id
+        // leaves unreadByChat[hist] in place and the badge returns after
+        // persist-folds remounts. Merge FFI aliases the same way unmute /
+        // leave do so a first open before the host blob exists still
+        // clears the hidden 0.8 key.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(groupIds)
+        adoptActionHistoricalFolds(folds)
+        val openId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = openId?.let { remountPairForOpenChat(it) } ?: (null to null)
+        val marked = notificationSuppressIds(groupIds, folds, opened, pane).toSet()
         unreadSuppressGroupIds.addAll(marked)
         unreadByChat = unreadByChat - marked
+        if (folds != beforeFolds) persistHistoricalFolds()
         scope.launch {
-            for (groupId in marked) {
+            for (groupId in marked.filter { it.isNotBlank() }) {
                 runCatching { SonarCore.markConversationRead(groupId) }
             }
             // End in-flight suppress for this batch, then reconcile from core.
@@ -1356,7 +5413,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             unreadSuppressGroupIds.removeAll(marked)
             // null = FFI failure — keep the current map (do not wipe every badge).
             // emptyList() is a real empty inbox and must clear badges.
-            if (summaries != null) applyUnreadCounts(summaries)
+            if (shouldApplyUnreadCounts(summaries)) {
+                applyUnreadCounts(requireNotNull(summaries))
+            }
         }
     }
 
@@ -1373,7 +5432,58 @@ class SonarAppState(private val scope: CoroutineScope) {
     var hydratedTranscripts by mutableStateOf<Set<String>>(emptySet())
         private set
 
-    fun isTranscriptHydrated(chatId: String): Boolean = chatId in hydratedTranscripts
+    /** Fold remount copied the window — in-flight `openChat` newest-page
+     *  must not publish over it. iOS `suppressOpenedDMHydrateIds`. */
+    private var suppressOpenedHydrateIds: Set<String> = emptySet()
+
+    fun isTranscriptHydrated(chatId: String): Boolean =
+        openedDMShouldSkipHydrate(chatId, hydratedTranscripts)
+
+    /** Hidden 0.8 sibling exists — first Marmot paint may be live-only. */
+    fun chatHasFoldFamily(chatId: String): Boolean {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return foldFamilyIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).size > 1
+    }
+
+    /** Viewport remember key that stays on hist when remount hops to live. */
+    fun remountTranscriptSessionKey(previousKey: String, screenId: String): String {
+        val (opened, pane) = remountPairForOpenChat(screenId)
+        return remountStableTranscriptSessionKey(
+            previousKey,
+            screenId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
+    /** Newest known local timestamp across the fold family (index + snapshot).
+     *  Home-list recency, unread retire, and extract-keep must use this —
+     *  not snapshot-only [localLatestTs]. */
+    fun expectedNewestTsForOpenChat(chatId: String): Long {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return expectedNewestTsForChat(
+            chatId,
+            chatSnapshotMessagesByChat,
+            chatSnapshotLatestByChat,
+            conversationLatestAtByChat,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
+
+    /** True when bak / hidden hist / overflow cache may still hold unread rows. */
+    fun familyHasOlderForOpenChat(chatId: String): Boolean {
+        val ids = transcriptGroupIds(chatId)
+        if (ids.isEmpty()) return false
+        return ids.any { transcriptWindowHasMore(it) }
+    }
 
     private fun markTranscriptHydrated(chatId: String) {
         if (chatId in hydratedTranscripts) return
@@ -1397,9 +5507,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     private fun meshWhiteNoiseSeed(chatId: String): List<SonarMsg> =
         transcriptGroupIds(chatId).flatMap { groupId ->
-            chatSnapshotMessagesByChat[groupId].orEmpty()
-                .withoutSyntheticSummaryRows()
-                .map { it.copy(viaInternet = true) }
+            snapshotMessagesForChat(groupId).map { it.copy(viaInternet = true) }
         }
 
     // ── Mocked voice/video call log (in-memory only) ──
@@ -1408,15 +5516,48 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Bumped on every call-log change so the open chat recomposes. */
     var callVersion by mutableStateOf(0)
         private set
+    /** Bumped when `conversationChanged` hits the open group-info family
+     *  so pending join requests reload without leaving the screen. */
+    var groupInfoPendingRevision by mutableStateOf(0)
+        private set
 
     /** Call-log records for [chatId] (oldest first). Deduped last-wins so a
      *  hangup-then-finalize race never feeds duplicate LazyColumn keys. */
-    fun callRecords(chatId: String): List<CallRecord> =
-        dedupeCallRecordsLastWins(callLogs[chatId].orEmpty())
+    fun callRecords(chatId: String): List<CallRecord> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return dedupeCallRecordsLastWins(
+            callRecordsForChat(
+                chatId,
+                callLogs,
+                historicalFoldMap,
+                opened,
+                pane,
+            ),
+        )
+    }
+
+    /** Live / hist remount pair while this chat is the open transcript.
+     *  Promote of other hidden 0.8 siblings must not rewrite this pair
+     *  (`promoteShouldReplaceRemountPair`). */
+    private fun remountPairForOpenChat(chatId: String): Pair<String?, String?> {
+        val live = activeTranscriptChatId?.takeIf { it.isNotBlank() } ?: return null to null
+        if (!openedConversationIdMatches(chatId, live) && chatId !in transcriptSessionAliases) {
+            return null to null
+        }
+        val hist = transcriptSessionAliases.firstOrNull { !openedConversationIdMatches(it, live) }
+        return live to (hist ?: chatId)
+    }
 
     /** Insert or replace by call id — hangup/decline and finalize share one id. */
     private fun upsertCallRecord(chatId: String, record: CallRecord) {
-        val list = callLogs.getOrPut(chatId) { mutableListOf() }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val storeId = callConversationStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        val list = callLogs.getOrPut(storeId) { mutableListOf() }
         upsertCallRecordList(list, record)
         callVersion++
     }
@@ -1797,7 +5938,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return foldedPeerName(peerId, group)
         }
         val mine = canonicalProfileKey(npub)
-        return chats.firstOrNull { it.id == chatId }
+        return listedChat(chatId)
             ?.members?.firstOrNull { canonicalProfileKey(it) != mine && it.isNotBlank() }
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName ?: (it.take(10) + "…") } ?: "secure chat"
     }
@@ -2050,6 +6191,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  that was folded once stays folded even when BLE is off and the live profile
      *  lookup chain fails. */
     private val groupFoldMap = initialGroupFoldMap.toMutableMap()
+    private val historicalFoldMap = initialHistoricalFolds.toMutableMap()
 
     /** Memo cache for [visibleChats]. The home LazyColumn reads the getter on
      *  every recomposition, so recomputing dedupe/fold/pending each read burned
@@ -2086,6 +6228,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             snapshotVersion = snapshotVersion,
             ownNpub = npub,
             holdVersion = holdInputsVersion,
+            conversationIndexVersion = conversationIndexVersion,
         )
     }
 
@@ -2109,7 +6252,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val result = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
             chats = standalone,
             ownNpub = npub,
-            latestSecs = ::localLatestTs,
+            latestSecs = ::expectedNewestTsForOpenChat,
         )
         // Only cache the stable (no active settle window) computation. A held
         // chat can flip to visible purely by time passing, which the key can't
@@ -2129,7 +6272,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val npubHex = canonicalNpubHex(peerNpub) ?: return@mapNotNull null
             if (marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) != null) return@mapNotNull null
             if (socialState.isBlockedNostr(npubHex)) return@mapNotNull null
-            SonarChat(id = id, name = "", members = listOf(npub, peerNpub))
+            SonarChat(id = id, name = "", members = listOf(npub, peerNpub), isDirect = true)
         }
 
     /** Creation time for a pending secure chat/group, used as the Home-list
@@ -2150,7 +6293,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun pendingMarmotGroupChats(): List<SonarChat> =
         pendingMarmotGroups.entries.sortedByDescending { it.value.createdAtSecs }.map { (id, pending) ->
-            SonarChat(id = id, name = pending.name, members = listOf(npub) + pending.members)
+            SonarChat(id = id, name = pending.name, members = listOf(npub) + pending.members, isDirect = false)
         }
 
     private fun pendingMarmotChatId(peer: String): String? {
@@ -2385,10 +6528,53 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isMeshChat(chatId) && isMeshContactBlocked(meshPeerId(chatId))) emptyList()
         else source.filter { msg -> socialState.allowsChatMessage(chatId, msg.senderNpub, msg.mine) }
 
+    /** Host snapshot rows for the open id plus its hidden 0.8 sibling. */
+    private fun snapshotMessagesForChat(chatId: String): List<SonarMsg> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return foldFamilyCachedMessages(
+            chatId,
+            chatSnapshotMessagesByChat,
+            historicalFoldMap,
+            opened,
+            pane,
+        ) { it.id }.sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+    }
+
+    /** Keep the full family-unioned host cache in the source window so first
+     *  paint takeLast(page) cannot hide recovered 0.8 rows or disable load-older. */
+    private fun seedFoldFamilyTranscriptWindows(chatId: String, snapshot: List<SonarMsg>) {
+        val rows = firstOpenFoldFamilySeedRows(snapshot)
+        if (rows.isEmpty()) return
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val hasMore = seededFoldFamilyTranscriptHasMore(
+            cachedCount = rows.size,
+            familyHasOlder = hasOlderForFoldFamily(
+                chatId,
+                transcriptWindows.mapValues { it.value.hasMore },
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            ),
+        )
+        val window = TranscriptGroupWindow(rows = rows, hasMore = hasMore)
+        for (id in foldFamilyIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).ifEmpty { setOf(chatId) }) {
+            transcriptWindows[id] = window
+        }
+    }
+
     private fun setCurrentVisibleMessages(chatId: String, source: List<SonarMsg>, processCalls: Boolean = false) {
         // Local cursor reads race navigation. A late page from chat A must not
         // overwrite chat B's render state after the user switches screens.
-        if ((screen as? Screen.Chat)?.id != chatId || activeTranscriptChatId != chatId) return
+        if ((screen as? Screen.Chat)?.id !in transcriptSessionChatIds() ||
+            chatId !in transcriptSessionChatIds()
+        ) {
+            return
+        }
         publishOpenTranscript(chatId, visibleMessagesForChat(chatId, source), processCalls)
     }
 
@@ -2402,7 +6588,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         visible: List<SonarMsg>,
         processCalls: Boolean = false,
     ) {
-        if ((screen as? Screen.Chat)?.id != chatId || activeTranscriptChatId != chatId) return
+        if ((screen as? Screen.Chat)?.id !in transcriptSessionChatIds() ||
+            chatId !in transcriptSessionChatIds()
+        ) {
+            return
+        }
+        if (openedDMShouldSkipHydrate(chatId, suppressOpenedHydrateIds)) return
         if (!sameTranscriptPaint(messages, visible)) {
             messages = visible
         }
@@ -2427,11 +6618,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Prefer last leave paint, else snapshot — never open on empty when we can avoid it. */
     private fun firstOpenTranscriptPaint(chatId: String, snapshotPaint: List<SonarMsg>): List<SonarMsg> {
-        val retained = retainedTranscriptByChat[chatId]
-        return when {
-            retained != null && retained.isNotEmpty() -> retained
-            else -> snapshotPaint
-        }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return firstOpenTranscriptPaintRows(
+            chatId,
+            retainedTranscriptByChat,
+            snapshotPaint,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
     }
 
     /**
@@ -2482,6 +6677,29 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun isDirectMarmotChat(chat: SonarChat): Boolean =
         directMarmotPeerKey(chat, npub) != null
 
+    /** Contact-profile Message / call / pay target. Persist/FFI/remount
+     *  live wins among duplicate 1:1s so a recovered hist row is not
+     *  reopened after remount. Empty persist+remount+FFI newest-sorts
+     *  so first-resume keeps hist (iOS `preferredDirectMarmotGroup`). */
+    fun directChatIdForPeer(peerNpub: String): String? {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val peer = canonicalProfileKey(peerNpub)
+        val candidateIds = chats.mapNotNull { chat ->
+            chat.id.takeIf { directMarmotPeerKey(chat, npub) == peer }
+        }
+        val ffi = ffiFoldsForDirectIds(candidateIds)
+        return directMarmotChatIdForPeer(
+            chats,
+            npub,
+            peerNpub,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffi,
+            latestSecs = ::expectedNewestTsForOpenChat,
+        )
+    }
+
     private fun directMarmotPeerKey(chat: SonarChat): String? =
         directMarmotPeerKey(chat, npub)
 
@@ -2492,7 +6710,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun duplicateDirectMarmotChats(chatId: String): List<SonarChat> {
-        val chat = chats.firstOrNull { it.id == chatId } ?: return emptyList()
+        val chat = listedChat(chatId) ?: return emptyList()
         return duplicateDirectMarmotChats(chat)
     }
 
@@ -2502,20 +6720,81 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun isSameDirectMarmotChat(leftId: String, rightId: String): Boolean {
-        val left = chats.firstOrNull { it.id == leftId } ?: return false
-        val right = chats.firstOrNull { it.id == rightId } ?: return false
+        val left = listedChat(leftId) ?: return false
+        val right = listedChat(rightId) ?: return false
         val leftKey = directMarmotPeerKey(left) ?: return false
         return leftKey == directMarmotPeerKey(right)
+    }
+
+    fun recoveredChatWaitingForPeerUpdate(chatId: String): Boolean {
+        val groups = duplicateDirectMarmotChats(chatId)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val hasLiveSibling = recoveredChatHasLiveFoldSibling(
+            chatId = chatId,
+            listedDuplicateCount = groups.size,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        val family = foldFamilyIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ) + remountPairConversationIds(chatId, opened, pane)
+        val flagged = chatId in recoveredChatNeedsUpdate ||
+            groups.any { it.id in recoveredChatNeedsUpdate } ||
+            family.any { it in recoveredChatNeedsUpdate }
+        return recoveredChatResumeUi(
+            hasLiveFoldSibling = hasLiveSibling,
+            keyPackageMissing = flagged,
+        ) == RecoveredChatResumeUi.WaitingForPeerUpdate
+    }
+
+    private fun noteRecoveredChatSendFailure(chatId: String, error: String) {
+        if (marmotSendNeedsPeerUpdate(error)) {
+            recoveredChatNeedsUpdate = recoveredChatNeedsUpdate + chatId
+        }
+    }
+
+    internal fun listedChat(chatId: String): SonarChat? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return listedOrFoldedSiblingChat(
+            chatId,
+            chats,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
     }
 
     fun isMultiMemberChat(chatId: String): Boolean =
         if (isPendingMarmotChat(chatId)) false
         else if (isPendingMarmotGroup(chatId)) true
-        else chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+        else listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
 
     fun canManageGroup(chatId: String): Boolean =
         !isPendingMarmotGroup(chatId) &&
-            chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+            listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
+
+    fun pendingJoinRequestsAfterNavIdChange(
+        previousChatId: String,
+        nextChatId: String,
+        requests: List<SonarJoinRequest>,
+    ): List<SonarJoinRequest> {
+        val (opened, pane) = remountPairForOpenChat(nextChatId).let { pair ->
+            if (pair.first != null || pair.second != null) pair
+            else remountPairForOpenChat(previousChatId)
+        }
+        return pendingJoinRequestsAcrossRemount(
+            previousChatId = previousChatId,
+            nextChatId = nextChatId,
+            requests = requests,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     fun hasDirectPaymentRoute(chatId: String): Boolean {
         if (directPaymentOffer(chatId) != null) return true
@@ -2566,7 +6845,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun groupMemberContacts(chatId: String): List<GroupContact> {
         val members = pendingMarmotGroups[chatId]?.members
-            ?: chats.firstOrNull { it.id == chatId }?.let { otherMembers(it) }
+            ?: listedChat(chatId)?.let { otherMembers(it) }
             ?: emptyList()
         return members.map { member ->
             ensureProfile(member)
@@ -2581,7 +6860,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun allGroupMemberContacts(chatId: String): List<GroupContact> {
-        val chat = chats.firstOrNull { it.id == chatId } ?: return emptyList()
+        val chat = listedChat(chatId) ?: return emptyList()
         return chat.members
             .map { canonicalProfileKey(it) }
             .filter { it.isNotBlank() }
@@ -2614,7 +6893,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun mentionRoster(chatId: String): List<MentionCandidate> {
         if (!isMultiMemberChat(chatId)) return emptyList()
         val members = pendingMarmotGroups[chatId]?.members
-            ?: chats.firstOrNull { it.id == chatId }?.let { otherMembers(it) }
+            ?: listedChat(chatId)?.let { otherMembers(it) }
             ?: return emptyList()
         return members.mapNotNull { member ->
             val name = profilesByNpub[canonicalProfileKey(member)]?.bestName ?: return@mapNotNull null
@@ -2653,7 +6932,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun groupMemberNpubs(chatId: String): Set<String> =
         pendingMarmotGroups[chatId]?.members?.toSet()
-            ?: chats.firstOrNull { it.id == chatId }?.members.orEmpty().toSet()
+            ?: listedChat(chatId)?.members.orEmpty().toSet()
 
     /** This peer's npub (32 raw bytes) if known — from a live 0x53 OR the persisted
      *  [linkByFp] (so it still resolves out of range / after restart). The bridge
@@ -2761,6 +7040,111 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.saveBlob(GROUP_FOLDS_BLOB_KEY, groupFoldMap.entries.joinToString("\n") { "${it.key}=${it.value}" })
     }
 
+    private fun persistHistoricalFolds() {
+        SonarCore.saveBlob(
+            HISTORICAL_FOLDS_BLOB_KEY,
+            encodeGroupFoldMap(historicalFoldMap),
+        )
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val next = promotedFoldedMutesFromFolds(
+            mutedUntilByChat,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        if (next != mutedUntilByChat) {
+            mutedUntilByChat = next
+            persistMutes()
+        }
+        promoteFoldedPaymentActivitiesFromFolds()
+    }
+
+    /** Persist-rewrite 0.8-keyed wallet rows onto the live sibling. */
+    private fun promoteFoldedPaymentActivitiesFromFolds() {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val folds = remountPairHistoricalFolds(
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        for ((historical, live) in folds) {
+            if (live.isBlank() || live == historical) continue
+            PaymentActivityStore.remountPeerKeys(listOf(historical), live)
+        }
+    }
+
+    private fun forgetHistoricalFolds(deletedIds: Set<String>) {
+        if (deletedIds.isEmpty()) return
+        val next = purgedHistoricalFolds(historicalFoldMap, deletedIds)
+        if (next.size == historicalFoldMap.size && next == historicalFoldMap) return
+        historicalFoldMap.clear()
+        historicalFoldMap.putAll(next)
+        persistHistoricalFolds()
+    }
+
+    private fun resolvedLiveFoldTarget(id: String): String? {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        return resolvedLiveFoldTarget(
+            groupId = id,
+            historicalFolds = historicalFoldMap,
+            ffiLiveFoldTarget = runCatching { SonarCore.liveFoldTarget(id) }.getOrNull(),
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
+
+    private fun rememberHistoricalFolds(previousIds: Set<String>, currentIds: Set<String>) {
+        var changed = false
+        val listed = previousIds + currentIds + historicalFoldMap.keys + historicalFoldMap.values
+        val foldAliases = { id: String -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) }
+        val liveTarget = { id: String -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() }
+        val discovered = if (historicalFoldMap.isEmpty()) {
+            historicalFoldsAfterAccountRestore(
+                previousAccountFolds = emptyMap(),
+                listedIds = listed,
+                foldAliases = foldAliases,
+                liveFoldTarget = liveTarget,
+            )
+        } else {
+            historicalFoldsFromAliases(
+                listedIds = listed,
+                foldAliases = foldAliases,
+                liveFoldTarget = liveTarget,
+            )
+        }
+        for ((historical, live) in discovered) {
+            if (historicalFoldMap[historical] != live) {
+                historicalFoldMap[historical] = live
+                changed = true
+            }
+        }
+        for (id in listed) {
+            val live = runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() ?: continue
+            if (live.isBlank() || live == id) continue
+            if (historicalFoldMap[id] != live) {
+                historicalFoldMap[id] = live
+                changed = true
+            }
+        }
+        val listedAuthoritative = localCoreReady || started || currentIds.isNotEmpty()
+        val pruned = prunedOrphanedHistoricalFolds(
+            folds = historicalFoldMap,
+            listedIds = currentIds,
+            listedAuthoritative = listedAuthoritative,
+        )
+        if (pruned != historicalFoldMap) {
+            historicalFoldMap.clear()
+            historicalFoldMap.putAll(pruned)
+            changed = true
+        }
+        if (changed) {
+            persistHistoricalFolds()
+            // Fold map is mutated in place; row-model identity cache would
+            // otherwise keep a live-only unread sum after hist is hidden.
+            marmotRowsKey = null
+        }
+    }
+
     /** Record fingerprint→npub from a 0x53 (persisted on change). When a new
      *  mapping is learned this is also the trigger to flush any queued outbox
      *  messages — the peer now has a reachable npub route (mirrors iOS
@@ -2802,40 +7186,154 @@ class SonarAppState(private val scope: CoroutineScope) {
     private val composerDrafts = mutableStateMapOf<String, String>()
     private val composerReplyByChat = mutableStateMapOf<String, SonarReplyRef>()
 
-    fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
+    fun composerDraft(chatId: String): String {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return composerDraftForChat(
+            chatId,
+            composerDrafts.toMap(),
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
 
     fun composerReply(chatId: String): SonarReplyRef? {
         if (!sonarReplyUiEnabled()) return null
-        return composerReplyByChat[chatId]
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return composerReplyForChat(
+            chatId,
+            composerReplyByChat.toMap(),
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     fun beginReply(chatId: String, message: SonarMsg, preview: String, author: String? = null) {
         if (!sonarCanReply(message)) return
         val trimmed = preview.trim()
         if (trimmed.isEmpty()) return
-        composerReplyByChat[chatId] = SonarReplyRef(
-            parentId = message.id,
-            parentNpub = message.senderNpub.takeIf { it.startsWith("npub1") },
-            author = author?.trim()?.takeIf { it.isNotEmpty() },
-            preview = trimmed.take(140),
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val stamped = composerRepliesAfterBegin(
+            composerReplyByChat.toMap(),
+            chatId,
+            SonarReplyRef(
+                parentId = message.id,
+                parentNpub = message.senderNpub.takeIf { it.startsWith("npub1") },
+                author = author?.trim()?.takeIf { it.isNotEmpty() },
+                preview = trimmed.take(140),
+            ),
+            historicalFoldMap,
+            opened,
+            pane,
         )
+        for ((id, reply) in stamped) {
+            composerReplyByChat[id] = reply
+        }
     }
 
     fun cancelReply(chatId: String) {
-        composerReplyByChat.remove(chatId)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val next = composerRepliesAfterClear(
+            composerReplyByChat.toMap(),
+            chatId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        val stale = composerReplyByChat.keys - next.keys
+        for (id in stale) composerReplyByChat.remove(id)
     }
+
+    /** Quote-chip parent from the fold-family cache, then the painted page. */
+    fun quotedParentMessage(chatId: String, parentId: String): SonarMsg? =
+        quotedParentInFamilyCache(parentId, quotedMessageRevealCache(chatId))
+            ?: quotedParentInFamilyCache(parentId, messages)
 
     fun jumpToQuotedMessage(chatId: String, parentId: String) {
-        openChatJumpMessageId = openChatJumpMessageId + (chatId to parentId)
+        val trimmed = parentId.trim()
+        if (trimmed.isEmpty()) return
+        val cached = quotedMessageRevealCache(chatId)
+        applyQuotedMessageReveal(trimmed, cached)
+        if (chatId in transcriptSessionChatIds()) {
+            val sessionId = activeTranscriptChatId ?: chatId
+            val bounded = refreshConversationRows(cached, sessionId, transcriptGeneration)
+            setCurrentVisibleMessages(sessionId, withSendEchoes(sessionId, bounded))
+        }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        openChatJumpMessageId = quotedJumpWritten(
+            chatId,
+            trimmed,
+            openChatJumpMessageId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
-    private fun consumeComposerReply(chatId: String): SonarReplyRef? =
-        composerReplyByChat.remove(chatId)
+    /** Jump parent for the open transcript. Walks hist / live aliases so
+     *  remount cannot hide a recovered 0.8 quote. */
+    fun jumpMessageIdForChat(chatId: String): String? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return quotedJumpParentId(chatId, openChatJumpMessageId, historicalFoldMap, opened, pane)
+    }
+
+    /** After a load-older miss, expand the painted page if the parent
+     *  just landed in the family cache. Size-only quote-jump effects
+     *  would otherwise keep paging past a parent already in the window. */
+    fun revealQuotedJumpIfCached(chatId: String) {
+        val parentId = jumpMessageIdForChat(chatId) ?: return
+        val cached = quotedMessageRevealCache(chatId)
+        applyQuotedMessageReveal(parentId, cached)
+        if (chatId in transcriptSessionChatIds()) {
+            val sessionId = activeTranscriptChatId ?: chatId
+            val bounded = refreshConversationRows(cached, sessionId, transcriptGeneration)
+            setCurrentVisibleMessages(sessionId, withSendEchoes(sessionId, bounded))
+        }
+    }
+
+    /** Host + window rows a quote-jump may expand into without a load-older. */
+    private fun quotedMessageRevealCache(chatId: String): List<SonarMsg> {
+        val rows = ArrayList<SonarMsg>()
+        rows += snapshotMessagesForChat(chatId)
+        if (isMeshChat(chatId)) {
+            rows += meshWhiteNoiseSeed(chatId)
+            for (groupId in transcriptGroupIds(chatId)) {
+                rows += snapshotMessagesForChat(groupId)
+                rows += transcriptWindows[groupId]?.rows.orEmpty()
+            }
+        } else {
+            for (id in transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }) {
+                rows += transcriptWindows[id]?.rows.orEmpty()
+            }
+        }
+        rows += conversationTranscriptRows
+        return mergeAllTranscriptRows(rows)
+    }
+
+    private fun applyQuotedMessageReveal(parentId: String, cached: List<SonarMsg>) {
+        quotedMessageRevealLimit(parentId, cached)?.let { reveal ->
+            conversationVisibleRowLimit = maxOf(conversationVisibleRowLimit, reveal)
+        }
+    }
+
+    private fun consumeComposerReply(chatId: String): SonarReplyRef? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val current = composerReplyByChat.toMap()
+        val reply = composerReplyForChat(chatId, current, historicalFoldMap, opened, pane)
+        val next = composerRepliesAfterClear(current, chatId, historicalFoldMap, opened, pane)
+        val stale = current.keys - next.keys
+        for (id in stale) composerReplyByChat.remove(id)
+        return reply
+    }
 
     fun setComposerDraft(chatId: String, text: String) {
         val current = composerDrafts.toMap()
-        val next = updatedComposerDrafts(current, chatId, text)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val next = composerDraftsAfterEdit(current, chatId, text, historicalFoldMap, opened, pane)
         if (next == current) return
+        val stale = current.keys - next.keys
+        for (id in stale) composerDrafts.remove(id)
         if (!next.containsKey(chatId)) {
             composerDrafts.remove(chatId)
         } else {
@@ -3209,7 +7707,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isMeshChat(chatId)) {
             npubRawFor(meshPeerId(chatId))?.toHexLower()
         } else {
-            chats.firstOrNull { it.id == chatId }
+            listedChat(chatId)
                 ?.takeIf { isDirectMarmotChat(it) }
                 ?.let { otherMembers(it).singleOrNull() }
                 ?.let { canonicalNpubHex(it) }
@@ -3262,6 +7760,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val offer = directPaymentOffer(chatId)
         if (offer == null) return "Fetching payment details — try again in a moment."
         val payId = randomPayId()
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val storePeerKey = paymentConversationStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         // iOS parity (SonarAppStore.sendPay → SonarPaymentActivityLedger):
         // record a pending sonarDirect activity BEFORE the wallet send, then
         // settle or fail it below so the Wallet screen shows direct sends.
@@ -3269,7 +7774,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             SonarPaymentActivity(
                 id = payId,
                 kind = SonarPaymentActivity.Kind.SonarDirect,
-                peerKey = chatId,
+                peerKey = storePeerKey,
                 peerName = callPeerName(chatId),
                 direction = SonarPaymentActivity.Direction.Outgoing,
                 sats = sats,
@@ -3427,7 +7932,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshPeerId = peerId,
             )
         }
-        return sendPaymentReceiptLinesOverMarmot(chatId, clean, refreshPeerId = null)
+        return sendPaymentReceiptLinesOverMarmot(
+            resolveMarmotSendTargetGroupId(chatId) ?: chatId,
+            clean,
+            refreshPeerId = null,
+        )
     }
 
     private suspend fun sendPaymentReceiptLinesOverMarmot(
@@ -3843,21 +8352,52 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  (off the render path). Blobs have no enumeration, so we probe the ids we
      *  actually have from the restored snapshot. */
     private fun seedVerifiedChatIds() {
-        for (chat in chats) {
-            for (id in directMarmotChatIds(chat.id)) {
-                if (SonarCore.loadBlob("verified.$id") == "1") verifiedChatIds += id
-            }
+        val listed = chats.flatMap { directMarmotChatIds(it.id) }
+        val persisted = SonarCore.loadBlob(VERIFIED_IDS_BLOB_KEY)
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+        val folded = historicalFoldMap.keys + historicalFoldMap.values
+        for (id in (listed + persisted + folded).distinct()) {
+            if (SonarCore.loadBlob("verified.$id") == "1") verifiedChatIds += id
         }
+        persistVerifiedIdList()
         verifiedVersion++
     }
 
-    fun isVerified(chatId: String): Boolean =
-        directMarmotChatIds(chatId).any { it in verifiedChatIds }
+    private fun persistVerifiedId(id: String) {
+        SonarCore.saveBlob("verified.$id", "1")
+        verifiedChatIds += id
+        persistVerifiedIdList()
+    }
+
+    private fun persistVerifiedIdList() {
+        SonarCore.saveBlob(VERIFIED_IDS_BLOB_KEY, verifiedChatIds.sorted().joinToString("\n"))
+    }
+
+    fun isVerified(chatId: String): Boolean {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return verifiedForFoldFamily(
+            chatId = chatId,
+            verifiedIds = verifiedChatIds,
+            historicalFolds = historicalFoldMap,
+            listedDuplicateIds = directMarmotChatIds(chatId),
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     fun markVerified(chatId: String) {
-        for (id in directMarmotChatIds(chatId)) {
-            SonarCore.saveBlob("verified.$id", "1")
-            verifiedChatIds += id
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        for (id in transcriptSourceIds(
+            chatId,
+            directMarmotChatIds(chatId),
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )) {
+            persistVerifiedId(id)
         }
         verifiedVersion++
         payVersion++ // recompose verify-dependent UI
@@ -3866,7 +8406,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Verify info for a Marmot chat: the 12 safety groups, or an honest note. */
     fun verifyInfo(chatId: String): SonarVerify {
-        val chat = chats.firstOrNull { it.id == chatId }
+        val chat = listedChat(chatId)
         if (chat != null && !isDirectMarmotChat(chat)) {
             return SonarVerify(emptyList(), false, "Safety numbers are available for 1:1 chats.")
         }
@@ -3982,9 +8522,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 persistMeshNames()
                 pendingMarmotChatNpubs = emptyMap()
                 pendingMarmotGroups = emptyMap()
+                recoveredChatNeedsUpdate = emptySet()
                 pendingInviteTokens.clear()
-                linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-                persistLinks(); persistLinkCaps(); persistGroupFolds()
+                linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear(); historicalFoldMap.clear()
+                persistLinks(); persistLinkCaps(); persistGroupFolds(); persistHistoricalFolds()
                 updateBleDiscoveryPolicy()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
@@ -4015,7 +8556,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 nick = ""
                 meshBroadcast = emptyList(); meshDmRows = emptyList()
                 verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
-                verifiedChatIds.clear(); verifiedVersion++
+                verifiedChatIds.clear(); SonarCore.saveBlob(VERIFIED_IDS_BLOB_KEY, ""); verifiedVersion++
                 chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear(); channelMsgs = emptyList()
                 clearChatSnapshot()
                 lastWnGroups = -1; lastWnMsgs = -1
@@ -4710,11 +9251,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         dedupeDirectMarmotChats(
             chats = chats,
             ownNpub = npub,
-            latestSecs = ::localLatestTs,
+            latestSecs = ::expectedNewestTsForOpenChat,
         ).count { isVerified(it.id) }
 
-    fun unreadForChat(chatId: String): Long =
-        directMarmotChatIds(chatId).sumOf { unreadByChat[it] ?: 0L }
+    fun unreadForChat(chatId: String): Long {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return unreadForFoldFamily(
+            chatId = chatId,
+            unreadByChat = unreadByChat,
+            historicalFolds = historicalFoldMap,
+            listedDuplicateIds = directMarmotChatIds(chatId),
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     /** Last-message preview + timestamp for a chat-list row (design ConvRow):
      *  replaces the static "Tap to open" with the real transcript tail, read
@@ -4725,7 +9275,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun chatRowMeta(chatId: String): Pair<String, Long>? =
         directMarmotChatIds(chatId)
             .mapNotNull { id ->
-                visibleMessagesForChat(id, chatSnapshotMessagesByChat[id].orEmpty()).lastOrNull()
+                latestHomeRowMessage(visibleMessagesForChat(id, snapshotMessagesForChat(id)))
             }
             .maxByOrNull { it.tsSecs }
             ?.let { messagePreview(it.content, it.stickerRef, it.media) to it.tsSecs }
@@ -4769,9 +9319,28 @@ class SonarAppState(private val scope: CoroutineScope) {
         return rows.associate { chat ->
             val pending = isPendingSecureChat(chat.id)
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)
-            val newest = if (pending) null else ids
-                .mapNotNull { visibleMessagesForChat(it, chatSnapshotMessagesByChat[it].orEmpty()).lastOrNull() }
-                .maxByOrNull { it.tsSecs }
+            val (opened, pane) = remountPairForOpenChat(chat.id)
+            val unreadIds = transcriptSourceIds(
+                chat.id,
+                ids,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+            val newest = if (pending) {
+                null
+            } else {
+                latestHomeRowForChat(
+                    chatId = chat.id,
+                    messagesByChat = unreadIds.associateWith { id ->
+                        visibleMessagesForChat(id, snapshotMessagesForChat(id))
+                    },
+                    summaryByChat = conversationSummaryByChat,
+                    historicalFolds = historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
+            }
             chat.id to MarmotRowModel(
                 id = chat.id,
                 title = chatTitle(chat),
@@ -4782,9 +9351,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 },
                 // Pending rows use creation time so recency merge does not sink
                 // a freshly-started chat under older history (iOS dmRows parity).
-                tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
-                verified = ids.any { it in verifiedChatIds },
-                unread = ids.sumOf { unreadByChat[it] ?: 0L } > 0,
+                // Recovered 0.8 rows must use index `latest_at` when the
+                // snapshot is still empty — iOS `latestMarmotMessage`.
+                tsSecs = newest?.tsSecs
+                    ?: pendingCreatedAtSecs(chat.id)
+                    ?: expectedNewestTsForOpenChat(chat.id),
+                verified = unreadIds.any { it in verifiedChatIds },
+                unread = unreadIds.sumOf { unreadByChat[it] ?: 0L } > 0,
                 pending = pending,
                 multiMember = isMultiMemberChat(chat.id),
             )
@@ -4972,6 +9545,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.saveBlob(MUTE_BLOB_KEY, encodeMuteMap(mutedUntilByChat))
     }
 
+    /** Host fold blob plus FFI `fold_aliases` for one mutating action.
+     *  Same merge as wake mute — unmute / leave / delete must see a
+     *  hidden 0.8 sibling before persist-folds rewrites the blob. */
+    private fun mergeActionHistoricalFolds(actionIds: Collection<String>): Map<String, String> =
+        wakeMuteHistoricalFolds(
+            persisted = historicalFoldMap.toMap(),
+            listedIds = actionIds.map { it.trim() }.filter { it.isNotBlank() },
+            foldAliases = { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            liveFoldTarget = { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+
+    private fun adoptActionHistoricalFolds(folds: Map<String, String>) {
+        if (folds == historicalFoldMap) return
+        historicalFoldMap.clear()
+        historicalFoldMap.putAll(folds)
+    }
+
     /** All ids a chat's alerts can arrive under (mirrors the folded-id set used
      *  by [clearNotificationsForChat]): the row id itself, duplicate direct
      *  groups, folded White Noise groups, and the mesh row of a folded group. */
@@ -4979,6 +9569,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         add(chatId)
         addAll(directMarmotChatIds(chatId))
         addAll(transcriptGroupIds(chatId))
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        addAll(
+            muteConversationIds(
+                chatId,
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            ),
+        )
+        for (id in directMarmotChatIds(chatId) + transcriptGroupIds(chatId)) {
+            addAll(
+                foldFamilyIds(
+                    id,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
+            )
+        }
         foldedGroupPeerIds[chatId]?.let { add(meshChatId(it)) }
         if (isMeshChat(chatId)) {
             meshPeerAliases(meshPeerId(chatId)).forEach { add(meshChatId(it)) }
@@ -5000,17 +9609,24 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  killed-app push-wake drain, which cannot resolve folding — match the
      *  mute by direct lookup. */
     fun muteChat(chatId: String, durationSecs: Long?) {
+        adoptActionHistoricalFolds(mergeActionHistoricalFolds(listOf(chatId) + muteIdsFor(chatId)))
         val now = SonarClock.nowSecs()
         val until = muteUntilFor(durationSecs, now)
         mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) +
             muteIdsFor(chatId).associateWith { until }
         persistMutes()
+        persistHistoricalFolds()
     }
 
     fun unmuteChat(chatId: String) {
         val now = SonarClock.nowSecs()
-        mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) - muteIdsFor(chatId)
+        val folds = mergeActionHistoricalFolds(listOf(chatId) + muteIdsFor(chatId))
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val family = muteIdsFor(chatId) + foldFamilyIds(chatId, folds, opened, pane)
+        mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) - family
         persistMutes()
+        adoptActionHistoricalFolds(folds)
+        persistHistoricalFolds()
     }
 
     // ── Trill (nudge) — docs/SONAR-TRILL.md ──
@@ -5026,8 +9642,16 @@ class SonarAppState(private val scope: CoroutineScope) {
     // Receiver alert throttle: one buzz/notification per chat per 8 s window.
     private val trillAlertThrottle = TrillAlertThrottle()
 
-    fun canSendTrill(chatId: String): Boolean =
-        SonarClock.monotonicMillis() >= (trillCooldownUntilMs[chatId] ?: 0L)
+    fun canSendTrill(chatId: String): Boolean {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return SonarClock.monotonicMillis() >= trillCooldownUntilMsForChat(
+            chatId,
+            trillCooldownUntilMs,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
 
     /** Send a nudge through the exact same path a text message takes (local
      *  echo, transport auto-pick, outbox). The sender's own send also triggers
@@ -5041,8 +9665,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock to send a nudge"
             return
         }
-        trillCooldownUntilMs = trillCooldownUntilMs +
-            (chatId to SonarClock.monotonicMillis() + TRILL_SEND_COOLDOWN_MS)
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        trillCooldownUntilMs = trillCooldownUntilMsWritten(
+            chatId,
+            SonarClock.monotonicMillis() + TRILL_SEND_COOLDOWN_MS,
+            trillCooldownUntilMs,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         send(chatId, TrillLine(randomTrillId()).encoded())
         triggerTrillBuzz()
     }
@@ -5174,6 +9805,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Dismiss OS notifications for this chat and every folded/duplicate id. */
     private fun clearNotificationsForChat(chatId: String) {
+        // First open after upgrade can have shade entries on the hidden
+        // 0.8 id while the host blob is empty. Merge FFI aliases before
+        // `notificationClearIds` so opening the live row dismisses them.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(
+            listOf(chatId) + directMarmotChatIds(chatId) + transcriptGroupIds(chatId),
+        )
+        adoptActionHistoricalFolds(folds)
+        if (folds != beforeFolds) persistHistoricalFolds()
         val related = buildList {
             addAll(directMarmotChatIds(chatId))
             addAll(transcriptGroupIds(chatId))
@@ -5182,8 +9822,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (meshChatId(peerId) == chatId) add(groupId)
             }
         }
+        val openId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = remountPairForOpenChat(openId ?: chatId)
         Notifier.clearConversations(
-            SonarNotificationHandoff.conversationIdsToClear(chatId, related)
+            notificationClearIds(
+                chatId,
+                related,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
         )
     }
 
@@ -5216,20 +9864,146 @@ class SonarAppState(private val scope: CoroutineScope) {
         conversationId: String,
         jumpMessageId: String? = null,
     ): Boolean {
+        val foldLookup = conversationId.removePrefix("marmot:")
+        val liveFold = runCatching { SonarCore.liveFoldTarget(foldLookup) }.getOrNull()
+            ?: runCatching { SonarCore.liveFoldTarget(conversationId) }.getOrNull()
+        val openId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = openId?.let { remountPairForOpenChat(it) }
+            ?: remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val liveFoldTargets = SonarNotificationHandoff.notificationLiveFoldTargets(
+            conversationId = conversationId,
+            persistedFolds = historicalFoldMap,
+            ffiLiveFoldTarget = liveFold,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
         val target = SonarNotificationHandoff.resolveOpenTarget(
             conversationId = conversationId,
             knownChatIds = chats.mapTo(hashSetOf()) { it.id },
             foldedGroupPeerIds = foldedGroupPeerIds,
             foldedGroupIds = foldedGroupIds,
+            liveFoldTargets = liveFoldTargets,
         ) ?: return false
+        // Viewing recovered hist + tap live: persist-folds can still be
+        // empty, so resolve would `openChat(live)` and remount. Merge
+        // first (same gate as willPresent), then Jump in place.
+        if (openId != null &&
+            conversationOpenShouldMergeFolds(openId, conversationId, historicalFoldMap)
+        ) {
+            val before = historicalFoldMap.toMap()
+            val folds = mergeActionHistoricalFolds(listOf(openId, conversationId))
+            adoptActionHistoricalFolds(folds)
+            if (folds != before) persistHistoricalFolds()
+        }
         when (target) {
-            is SonarNotificationOpenTarget.MeshPeer ->
+            is SonarNotificationOpenTarget.MeshPeer -> {
+                val meshId = meshChatId(target.peerId)
+                if (openId != null &&
+                    (
+                        openId == meshId ||
+                            notificationOpenShouldJump(
+                                openId,
+                                meshId,
+                                historicalFoldMap,
+                                opened,
+                                pane,
+                            )
+                        )
+                ) {
+                    jumpOnOpenNotificationConversation(openId, conversationId, jumpMessageId)
+                    return true
+                }
                 openDm(target.peerId, meshPeerName(target.peerId), jumpMessageId = jumpMessageId)
+            }
             is SonarNotificationOpenTarget.Chat -> {
-                val chat = chats.firstOrNull { it.id == target.chatId } ?: return false
+                val alreadyOpen = openId != null && (
+                    notificationOpenShouldJump(
+                        openId,
+                        conversationId,
+                        historicalFoldMap,
+                        opened,
+                        pane,
+                    ) ||
+                        notificationOpenShouldJump(
+                            openId,
+                            target.chatId,
+                            historicalFoldMap,
+                            opened,
+                            pane,
+                        )
+                    )
+                if (alreadyOpen) {
+                    jumpOnOpenNotificationConversation(openId, conversationId, jumpMessageId)
+                    if (conversationId != target.chatId) {
+                        clearNotificationsForChat(target.chatId)
+                    }
+                    return true
+                }
+                val chat = notificationOpenChat(
+                    target.chatId,
+                    chats,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
                 openChat(chat, jumpMessageId = jumpMessageId)
+                if (conversationId != target.chatId) {
+                    clearNotificationsForChat(conversationId)
+                }
             }
         }
+        return true
+    }
+
+    private fun jumpOnOpenNotificationConversation(
+        openId: String,
+        conversationId: String,
+        jumpMessageId: String?,
+    ) {
+        clearNotificationsForChat(conversationId)
+        if (conversationId != openId) clearNotificationsForChat(openId)
+        if (!jumpMessageId.isNullOrBlank()) {
+            jumpToQuotedMessage(openId, jumpMessageId)
+        }
+    }
+
+    /** True when [chatId] is the open transcript or a fold sibling.
+     *  Desktop sidebar highlight — blob-only (do not FFI on every
+     *  recomposition). iOS `isConversationOpen`. */
+    fun isConversationOpen(chatId: String): Boolean {
+        val openId = (screen as? Screen.Chat)?.id ?: return false
+        if (openId == chatId) return true
+        val (opened, pane) = remountPairForOpenChat(openId)
+        return notificationOpenShouldJump(
+            openId,
+            chatId,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+    }
+
+    /** Desktop sidebar / home-list can tap the listed live row while the
+     *  recovered 0.8 transcript is already open. Reuse the painted
+     *  screen — do not `openChat` remount. */
+    private fun reuseOpenFoldSibling(incomingId: String, jumpMessageId: String?): Boolean {
+        val openId = (screen as? Screen.Chat)?.id ?: return false
+        if (conversationOpenShouldMergeFolds(openId, incomingId, historicalFoldMap)) {
+            val before = historicalFoldMap.toMap()
+            val folds = mergeActionHistoricalFolds(listOf(openId, incomingId))
+            adoptActionHistoricalFolds(folds)
+            if (folds != before) persistHistoricalFolds()
+        }
+        val (opened, pane) = remountPairForOpenChat(openId)
+        if (!notificationOpenShouldJump(
+                openId,
+                incomingId,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+        ) return false
+        jumpOnOpenNotificationConversation(openId, incomingId, jumpMessageId)
         return true
     }
 
@@ -5241,6 +10015,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         summaryByChat: Map<String, SonarConversationSummary>,
     ) {
         val openChatId = (screen as? Screen.Chat)?.id
+        val (opened, pane) = openChatId?.let { remountPairForOpenChat(it) } ?: (null to null)
         val knownChatIds = chats.map { it.id }.toSet()
         val snapshot = visibleChats.filter { it.id in knownChatIds }
         for (c in snapshot) {
@@ -5248,7 +10023,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notifyChatIfNew(
                 c,
                 scanIds = chatIds,
-                suppressIds = chatIds,
+                suppressIds = notificationSuppressIds(chatIds, historicalFoldMap, opened, pane),
                 openChatId = openChatId,
                 idKey = c.id,
                 title = chatTitle(c),
@@ -5268,7 +10043,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notifyChatIfNew(
                 c,
                 scanIds = listOf(groupId),
-                suppressIds = listOf(groupId, meshId),
+                suppressIds = meshNotificationSuppressIds(groupId, meshId, historicalFoldMap, opened, pane),
                 openChatId = openChatId,
                 idKey = meshId,
                 title = meshPeerName(peerId),
@@ -5285,8 +10060,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 observedLatestSecs = summaryByChat[chatId]?.latestAtSecs ?: 0L,
             )
         }
-        notificationSeenMessageIds.keys.retainAll(knownChatIds)
-        notificationLatestSecs.keys.retainAll(knownChatIds)
+        // After FFI hides a folded 0.8 id it leaves knownChatIds. Keep
+        // fold-family watermarks so a later historical remainder tick cannot
+        // replay recovered history as never-seen.
+        val retainIds = retainedScanChatIds(
+            knownChatIds,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        notificationSeenMessageIds.keys.retainAll(retainIds)
+        notificationLatestSecs.keys.retainAll(retainIds)
     }
 
     private fun notifyChatIfNew(
@@ -5341,7 +10125,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 newestTrill = trillCandidate
             }
         }
-        val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
+        val groupName = marmotNotificationGroupName(c, paintedTitle = title)
         newestIncoming?.let { incoming ->
             notifyIncoming(
                 idKey = idKey,
@@ -5388,7 +10172,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun notificationSenderName(chat: SonarChat, message: SonarMsg): String? {
         if (message.senderNpub.isBlank()) return null
-        if (chat.members.size > 2) {
+        if (!chat.isDirect) {
             return resolveGroupAuthorName(message, isGroup = true, profilesByNpub, ::ensureProfile)
         }
         val key = canonicalProfileKey(message.senderNpub)
@@ -5755,17 +10539,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         pendingMarmotGroups[chat.id]?.let { return it.name }
         val others = otherMembers(chat)
-        if (others.size != 1) return chat.name.ifBlank { "Group chat" }
-        val other = others.first()
+        val other = others.singleOrNull()
         // A 1:1 chat is titled by the counterpart's LIVE kind-0 profile name.
         // The MLS group name is a creation-time snapshot (hosts may pass one,
         // e.g. sonar-cli --group-name) and must not freeze the row, shadow a
         // rename, or make two different contacts share one titled row.
-        return directChatRowTitle(
-            profileName = profilesByNpub[canonicalProfileKey(other)]?.bestName,
-            groupName = chat.name,
-            npubFallback = shortNpub(other),
-        ).also { if (profilesByNpub[canonicalProfileKey(other)] == null) ensureProfile(other) }
+        // Recovered rooms (`isDirect == false`) keep the room name even when
+        // only one peer has updated — otherwise the home list looks like a
+        // second 1:1 with the welcomer (R-045).
+        return marmotChatDisplayTitle(
+            isDirect = chat.isDirect,
+            name = chat.name,
+            otherMemberCount = others.size,
+            profileName = other?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName },
+            npubFallback = other?.let(::shortNpub).orEmpty(),
+        ).also {
+            if (chat.isDirect && other != null && profilesByNpub[canonicalProfileKey(other)] == null) {
+                ensureProfile(other)
+            }
+        }
     }
 
     private fun shortNpub(value: String): String = shortNpubLabel(value)
@@ -6056,6 +10848,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun openChat(chat: SonarChat, jumpMessageId: String? = null) {
+        if (reuseOpenFoldSibling(chat.id, jumpMessageId)) return
         // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
         // empty home leftover messages, then rebuild when the page lands.
         noteTranscriptOpen("marmot", chat.id, "begin", emptyList())
@@ -6079,17 +10872,52 @@ class SonarAppState(private val scope: CoroutineScope) {
             push(Screen.Chat(chat.id, chatTitle(chat)))
             return
         }
-        val readChatIds = directMarmotChatIds(chat.id)
         captureOpenChatUnread(chat.id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(chat.id)
-        // Mark read immediately — do not wait for the local page. Housekeeping
-        // can otherwise restore unreadByChat from still-nonzero summaries.
-        markGroupsRead(readChatIds)
+        // Mark-read is inside captureOpenChatUnread: immediately on a cache
+        // hit, after the index probe on a miss, so a leftover hist unread
+        // cannot re-badge the live row and a failed probe cannot settle 0.
         val title = chatTitle(chat)
 
-        // Reopen: retained paint is already the last leave frame — push now.
-        retainedTranscriptByChat[chat.id]?.takeIf { it.isNotEmpty() }?.let { retained ->
-            messages = retained
+        // Reopen *or* first open with a remounted 0.8 snapshot: push now.
+        // Waiting on `messages(live)` hid recovered history when there was
+        // no leave-frame. After a fold the leave frame may still be keyed
+        // on the hidden historical id; walk the family so first paint is
+        // not empty.
+        val (opened, pane) = remountPairForOpenChat(chat.id)
+        val openSnapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
+        val openUnion = firstOpenTranscriptPaintRows(
+            chat.id,
+            retainedTranscriptByChat,
+            openSnapshot,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        if (firstOpenHasLocalTranscriptPaint(
+                retainedTranscriptForChat(
+                    chat.id,
+                    retainedTranscriptByChat,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
+                openSnapshot,
+            )
+        ) {
+            if (retainedTranscriptByChat[chat.id].isNullOrEmpty()) {
+                retainOpenTranscript(chat.id, openUnion)
+            }
+            seedFoldFamilyTranscriptWindows(chat.id, openUnion)
+            applyQuotedMessageReveal(jumpMessageId.orEmpty(), openUnion)
+            messages = visibleMessagesForChat(
+                chat.id,
+                withSendEchoes(
+                    chat.id,
+                    refreshConversationRows(openUnion, chat.id, generation),
+                ),
+            )
+            retainOpenTranscript(chat.id, messages)
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("marmot", chat.id, "push-retained")
             push(Screen.Chat(chat.id, title))
@@ -6112,6 +10940,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         // First open (Signal-Android): load the bounded local page *before*
         // ChatScreen mounts. Snapshot→async replace was the rebuild flash.
         // Home stays up for the local read; Chat's frame 0 is the final page.
+        // Seed remounted family rows first so a live-only FFI page cannot
+        // drop recovered 0.8 history (persist-folds before core fold).
+        seedFoldFamilyTranscriptWindows(
+            chat.id,
+            snapshotMessagesForChat(chat.id),
+        )
+        applyQuotedMessageReveal(jumpMessageId.orEmpty(), snapshotMessagesForChat(chat.id))
         scope.launch {
             val local = withSendEchoes(
                 chat.id,
@@ -6143,21 +10978,65 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openDm(peerId: String, name: String, pay: Boolean = false, jumpMessageId: String? = null) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val id = meshChatId(canonicalPeerId)
+        if (reuseOpenFoldSibling(id, jumpMessageId) || reuseOpenFoldSibling(peerId, jumpMessageId)) {
+            return
+        }
         noteTranscriptOpen("mesh-folded", id, "begin", emptyList())
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         clearNotificationsForChat(id)
         captureOpenChatUnread(id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(id)
-        // Mesh route ids are not group keys — resolve before clearing badges.
-        markGroupsRead(transcriptGroupIds(id))
+        // Mark-read is inside captureOpenChatUnread (cache hit now; miss
+        // probes first). Mesh route ids are resolved via transcriptGroupIds.
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
         }
 
-        // Reopen: retained leave paint → push now; hydrate quietly.
-        retainedTranscriptByChat[id]?.takeIf { it.isNotEmpty() }?.let { retained ->
-            messages = retained
+        // Reopen *or* first open with remounted WN / mesh snapshot: push now.
+        // After an MDK 0.8→0.9 fold the leave frame may be a short live
+        // 0.9 + mesh tail; union remounted WN family rows so first paint
+        // cannot hide recovered 0.8 history. iOS `rebuildNow` already
+        // unions via `dmMsgs`.
+        val (opened, pane) = remountPairForOpenChat(id)
+        val familySnapshot = mergeAllTranscriptRows(
+            meshWhiteNoiseSeed(id) + snapshotMessagesForChat(id),
+        )
+        val openUnion = firstOpenTranscriptPaintRows(
+            id,
+            retainedTranscriptByChat,
+            familySnapshot,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        if (firstOpenHasLocalTranscriptPaint(
+                retainedTranscriptForChat(
+                    id,
+                    retainedTranscriptByChat,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
+                familySnapshot,
+            )
+        ) {
+            if (retainedTranscriptByChat[id].isNullOrEmpty()) {
+                retainOpenTranscript(id, openUnion)
+            }
+            for (groupId in transcriptGroupIds(id)) {
+                seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
+            }
+            seedFoldFamilyTranscriptWindows(id, openUnion)
+            applyQuotedMessageReveal(jumpMessageId.orEmpty(), openUnion)
+            messages = visibleMessagesForChat(
+                id,
+                withSendEchoes(
+                    id,
+                    refreshConversationRows(openUnion, id, generation),
+                ),
+            )
+            retainOpenTranscript(id, messages)
             processPayLines(id, messages)
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("mesh-folded", id, "push-retained")
@@ -6173,6 +11052,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
         // First open: merge mesh + White Noise local page before Chat mounts
         // so frame 0 is not a seed that later jumps when WN merges.
+        // Seed remounted WN family rows so a live-only cursor cannot drop
+        // recovered 0.8 history after a mesh-folded resume.
+        for (groupId in transcriptGroupIds(id)) {
+            seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
+        }
+        applyQuotedMessageReveal(
+            jumpMessageId.orEmpty(),
+            mergeAllTranscriptRows(meshWhiteNoiseSeed(id) + snapshotMessagesForChat(id)),
+        )
         scope.launch {
             val mesh = refreshMeshTranscriptWindow(canonicalPeerId)
             val wn = marmotMessagesForPeer(canonicalPeerId, id, generation)
@@ -6265,16 +11153,23 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Seed the White Noise leg from the cached snapshot so the restored
             // paint is already complete (see openDm) — otherwise back-revealing
             // a mesh chat repeats the BLE-tail-then-jump on every navigation.
-            val wnSnapshot = meshWhiteNoiseSeed(chat.id)
-            val seedPaint = visibleMessagesForChat(
+            // Walk the remounted 0.8 family and seed the source window so
+            // Back cannot drop recovered rows or disable load-older.
+            val familySnapshot = mergeAllTranscriptRows(
+                refreshMeshTranscriptWindow(peerId) + meshWhiteNoiseSeed(chat.id),
+            )
+            for (groupId in transcriptGroupIds(chat.id)) {
+                seedFoldFamilyTranscriptWindows(groupId, snapshotMessagesForChat(groupId))
+            }
+            seedFoldFamilyTranscriptWindows(chat.id, familySnapshot)
+            val union = firstOpenTranscriptPaint(chat.id, familySnapshot)
+            messages = visibleMessagesForChat(
                 chat.id,
-                refreshConversationRows(
-                    refreshMeshTranscriptWindow(peerId) + wnSnapshot,
+                withSendEchoes(
                     chat.id,
-                    generation,
+                    refreshConversationRows(union, chat.id, generation),
                 ),
             )
-            messages = firstOpenTranscriptPaint(chat.id, seedPaint)
             retainOpenTranscript(chat.id, messages)
             warmOpenTranscriptThumbs(messages)
             scope.launch {
@@ -6288,18 +11183,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
             return
         }
-        val snapshotPaint = visibleMessagesForChat(
+        val snapshot = snapshotMessagesForChat(chat.id).withoutSyntheticSummaryRows()
+        seedFoldFamilyTranscriptWindows(chat.id, snapshot)
+        val union = firstOpenTranscriptPaint(chat.id, snapshot)
+        messages = visibleMessagesForChat(
             chat.id,
             withSendEchoes(
                 chat.id,
-                boundedTranscriptRows(
-                    chatSnapshotMessagesByChat[chat.id].orEmpty(),
-                    TRANSCRIPT_PAGE_SIZE,
-                    pinnedToOlderEdge = false,
-                ),
+                refreshConversationRows(union, chat.id, generation),
             ),
         )
-        messages = firstOpenTranscriptPaint(chat.id, snapshotPaint)
         retainOpenTranscript(chat.id, messages)
         warmOpenTranscriptThumbs(messages)
         scope.launch {
@@ -6331,9 +11224,30 @@ class SonarAppState(private val scope: CoroutineScope) {
         // (Signal adapter retention), before we clear the live [messages] list.
         (popped as? Screen.Chat)?.let {
             retainOpenTranscript(it.id, messages)
-            openChatUnread = openChatUnread - it.id
-            openChatUnreadAnchor = openChatUnreadAnchor - it.id
-            openChatJumpMessageId = openChatJumpMessageId - it.id
+            val (opened, pane) = remountPairForOpenChat(it.id)
+            openChatUnread = unreadCountAtOpenWritten(
+                it.id,
+                null,
+                openChatUnread,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+            openChatUnreadAnchor = unreadAnchorAtOpenWritten(
+                it.id,
+                null,
+                openChatUnreadAnchor,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+            openChatJumpMessageId = quotedJumpCleared(
+                it.id,
+                openChatJumpMessageId,
+                historicalFoldMap,
+                opened,
+                pane,
+            )
         }
         if (stack.size > 1) stack = stack.dropLast(1)
         restoreRevealedChatOrClear()
@@ -6365,13 +11279,36 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Group is still setting up."
             return
         }
-        val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
-        val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+        val isGroup = listedChat(chatId)?.let { !isDirectMarmotChat(it) } == true
+        // Capture before endTranscriptSession: remount can hop live
+        // while persist-folds are still empty, and the pair is the only
+        // name host leave has for the hidden 0.8 sibling.
+        val (opened, pane) = remountPairForOpenChat(chatId)
         // A deduped direct row can represent several duplicate Marmot groups for
         // the same peer; delete the whole set so hidden duplicates don't resurface.
-        val deleteIds = if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
+        // After an MDK 0.8→0.9 resume the hidden 0.8 sibling must leave too,
+        // or the next cold-start snapshot can resurrect a deleted room.
+        val folds = mergeActionHistoricalFolds(
+            (if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)) + chatId,
+        )
+        adoptActionHistoricalFolds(folds)
+        val deleteIds = (
+            if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
+            ) + echoReconcileFamilyIds(chatId, folds, opened, pane)
+                .map { it.removePrefix("marmot:") }
+                .filter { it.isNotBlank() }
         val deleteIdSet = deleteIds.toSet()
+        val wasOpen = stack.any { screen ->
+            deletedConversationShouldClearScreen(screen, chatId, deleteIdSet)
+        }
+        val familyPurgeIds = leaveFamilyCorePurgeIds(chatId, folds, opened, pane)
+        // Capture before endTranscriptSession nils remount: FFI leave
+        // must hit the listed live group, not the painted hist id.
+        val adminGroupId = adminGroupIdFor(chatId)
+        forgetHistoricalFolds(deleteIdSet)
         chats = chats.filterNot { it.id in deleteIdSet }
+        chatSnapshotMessagesByChat = chatSnapshotMessagesByChat.filterKeys { it !in deleteIdSet }
+        chatSnapshotLatestByChat = chatSnapshotLatestByChat.filterKeys { it !in deleteIdSet }
         for (id in deleteIds) {
             notificationSeenMessageIds.remove(id)
             notificationLatestSecs.remove(id)
@@ -6387,15 +11324,24 @@ class SonarAppState(private val scope: CoroutineScope) {
                 previouslyPublishedMessageIdsByEcho.remove(echo.id)
             }
         }
+        persistChatSnapshot()
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
-            stack = stack.dropLast(1) // pop WITHOUT refresh
+            while (stack.size > 1 && stack.lastOrNull()?.let {
+                    deletedConversationShouldClearScreen(it, chatId, deleteIdSet)
+                } == true) {
+                stack = stack.dropLast(1)
+            }
             restoreRevealedChatOrClear()
         }
         scope.launch {
             try {
                 if (isGroup) {
-                    SonarCore.leaveGroup(chatId)
+                    SonarCore.leaveGroup(adminGroupId)
+                    // Persist-folds: core leave only purges fold_aliases.
+                    for (id in familyPurgeIds) {
+                        runCatching { SonarCore.deleteChat(id) }
+                    }
                 } else {
                     for (id in deleteIds) SonarCore.deleteChat(id)
                 }
@@ -6411,7 +11357,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val aliases = meshPeerAliases(canonicalPeerId)
         val chatId = meshChatId(canonicalPeerId)
-        val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val foldedGroups = (
             npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }.orEmpty() +
                 chats.filter { group ->
@@ -6419,7 +11364,22 @@ class SonarAppState(private val scope: CoroutineScope) {
                         peerIdForMarmotGroup(group)?.let { it in aliases } == true
                 }
             ).distinctBy { it.id }
-        val foldedGroupIdsToDelete = foldedGroups.mapTo(hashSetOf()) { it.id }
+        val meshFolds = mergeActionHistoricalFolds(foldedGroups.map { it.id })
+        adoptActionHistoricalFolds(meshFolds)
+        val remountChat = activeTranscriptChatId ?: chatId
+        val (opened, pane) = remountPairForOpenChat(remountChat)
+        val foldedGroupIdsToDelete = foldedGroups.flatMapTo(hashSetOf()) { group ->
+            echoReconcileFamilyIds(group.id, meshFolds, opened, pane)
+                .map { it.removePrefix("marmot:") }
+                .filter { it.isNotBlank() } + group.id
+        }
+        val deleteIdSet = deletedMeshConversationPurgeIds(
+            aliases.map(::meshChatId) + chatId,
+            foldedGroupIdsToDelete,
+        )
+        val wasOpen = stack.any { screen ->
+            deletedConversationShouldClearScreen(screen, chatId, deleteIdSet)
+        }
         aliases.forEach { alias ->
             meshChats.remove(alias)
             meshChatNames.remove(alias)
@@ -6428,6 +11388,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         discardRetainedTranscript(chatId)
         meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
         if (foldedGroupIdsToDelete.isNotEmpty()) {
+            forgetHistoricalFolds(foldedGroupIdsToDelete)
             chats = chats.filterNot { it.id in foldedGroupIdsToDelete }
             foldedGroupIds = foldedGroupIds - foldedGroupIdsToDelete
             foldedGroupPeerIds = foldedGroupPeerIds.filterKeys { it !in foldedGroupIdsToDelete }
@@ -6448,7 +11409,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // ghost as a phantom bubble or — worse — be DELIVERED by
         // flushPendingMarmot after the user removed the conversation (R-025
         // sibling of the "/clear" scoped ledger clear).
-        val deletedChatIds = (aliases.map(::meshChatId) + chatId + foldedGroupIdsToDelete).toSet()
+        val deletedChatIds = deleteIdSet
         deletedChatIds.forEach { id ->
             pendingSendEchoes.remove(id)?.forEach { echo ->
                 previouslyPublishedMessageIdsByEcho.remove(echo.id)
@@ -6461,16 +11422,26 @@ class SonarAppState(private val scope: CoroutineScope) {
         updateBleDiscoveryPolicy()
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
-            stack = stack.dropLast(1)
+            while (stack.size > 1 && stack.lastOrNull()?.let {
+                    deletedConversationShouldClearScreen(it, chatId, deleteIdSet)
+                } == true) {
+                stack = stack.dropLast(1)
+            }
             restoreRevealedChatOrClear()
         }
         scope.launch {
             aliases.forEach { MessageStore.deleteMeshDm(it) }
-            foldedGroups.forEach { group ->
-                runCatching { SonarCore.deleteChat(group.id) }
+            val purgeIds = deletedConversationCorePurgeIds(
+                foldedGroupIdsToDelete,
+                meshFolds,
+                opened,
+                pane,
+            )
+            for (id in purgeIds) {
+                runCatching { SonarCore.deleteChat(id) }
                     .onFailure { toast = "couldn't delete chat: ${it.message}" }
             }
-            if (foldedGroups.isNotEmpty()) refreshChats()
+            if (purgeIds.isNotEmpty()) refreshChats()
         }
     }
 
@@ -6563,7 +11534,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotChatNpubs = pendingMarmotChatNpubs - pendingChatId
         if (refreshFirst) refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
-            ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
+            ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub), isDirect = true)
         moveSendEchoes(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {
@@ -6630,7 +11601,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 .onSuccess { clearSendEcho(chatId, send.echoId) }
                 .onFailure {
                     failSendEcho(chatId, send.echoId)
-                    toast = "send failed: ${it.message}"
+                    val message = it.message.orEmpty()
+                    noteRecoveredChatSendFailure(chatId, message)
+                    toast = marmotSendUserMessage(message)
                 }
         }
     }
@@ -6701,7 +11674,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotGroups = pendingMarmotGroups - pendingChatId
         refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
-            ?: SonarChat(id = chatId, name = pending.name, members = listOf(npub) + pending.members)
+            ?: SonarChat(id = chatId, name = pending.name, members = listOf(npub) + pending.members, isDirect = false)
         moveSendEchoes(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {
@@ -7147,9 +12120,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val echo = createSendEcho(chatId, t, reply = reply)
         messages = (messages + echo).sortedBy { it.tsSecs }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val sendDuplicates = directMarmotChatIds(chatId)
+        val sendTarget = marmotSendTargetGroupId(
+            chatId,
+            sendDuplicates,
+            ::localLatestTs,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffiFoldsForDirectIds(sendDuplicates),
+        )
         scope.launch {
             runMarmotSendWithBestEffortReconciliation(
-                send = { sendMarmotTextOrdered(chatId, t, reply) },
+                send = { sendMarmotTextOrdered(sendTarget, t, reply) },
                 onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                 reconcile = {
                     val refreshGeneration = transcriptGeneration
@@ -7180,7 +12164,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 },
                 onSendFailure = { error ->
                     failSendEcho(chatId, echo.id)
-                    toast = "send failed: ${error.message}"
+                    val message = error.message.orEmpty()
+                    noteRecoveredChatSendFailure(chatId, message)
+                    toast = marmotSendUserMessage(message)
                 },
                 onReconciliationFailure = { markSendEchoAccepted(chatId, echo.id) },
             )
@@ -7193,9 +12179,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  reuse the local plaintext/bytes that are already held for that row. */
     fun retryMessage(chatId: String, message: SonarMsg) {
         if (marmotAccountMutationSuspended || !sonarCanRetryMessage(message)) return
-        val mediaUploads = pendingMediaUploads[chatId]
-            ?.filter { it.message.id == message.id }
-            .orEmpty()
+        val mediaUploads = pendingMediaUploadsAcrossFamily(chatId)
+            .filter { it.message.id == message.id }
         if (mediaUploads.isNotEmpty()) {
             retryPendingMedia(chatId, message.id)
             return
@@ -7230,7 +12215,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         chatId: String,
         pendingId: String,
     ) {
-        val pending = pendingMediaUploads[chatId] ?: return
+        val pending = pendingMediaUploadBucket(chatId) ?: return
         val matchingIndices = pending.indices.filter { pending[it].message.id == pendingId }
         val firstIndex = matchingIndices.firstOrNull() ?: return
         val retryState =
@@ -7247,12 +12232,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val uploads = matchingIndices.map { pending[it] }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
-            if (groupId == null) {
-                markPendingMediaFailed(chatId, pendingId)
-                toast = "This media is no longer available to retry."
-                return@launch
-            }
+        // Persist-wins FFI — same live as first send. iOS retryDm remaps
+        // optimistic media / sticker / echo the same way.
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
+        if (groupId == null) {
+            markPendingMediaFailed(chatId, pendingId)
+            toast = "This media is no longer available to retry."
+            return@launch
+        }
             val listener = MediaUploadControl { id, fraction ->
                 noteMediaUploadProgress(id, fraction)
             }
@@ -7371,8 +12358,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
 
-        val groupId = resolveMarmotGroupId(chatId)
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
         if (groupId != null) {
+            // Persist-wins FFI — same live as first send / iOS retryDm.
             scope.launch {
                 try {
                     sendQueuedMarmotContent(groupId, content, source.reply)
@@ -7493,18 +12481,42 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun clearSendEcho(chatId: String, echoId: String) {
         previouslyPublishedMessageIdsByEcho.remove(echoId)
-        pendingSendEchoes[chatId]?.removeAll { it.id == echoId }
-        if (pendingSendEchoes[chatId].isNullOrEmpty()) pendingSendEchoes.remove(chatId)
-        if ((screen as? Screen.Chat)?.id == chatId) {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        removePendingMessagesForChat(
+            chatId,
+            pendingSendEchoes,
+            historicalFoldMap,
+            shouldRemove = { it.id == echoId },
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        val openId = (screen as? Screen.Chat)?.id
+        if (openId != null && conversationsMatchFoldFamily(
+                openId,
+                chatId,
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        ) {
             messages = messages.filterNot { it.id == echoId }
         }
     }
 
     private fun markSendEchoAccepted(chatId: String, echoId: String) {
-        val list = pendingSendEchoes[chatId] ?: return
-        val idx = list.indexOfFirst { it.id == echoId }
-        if (idx < 0) return
-        list[idx] = list[idx].copy(state = "Accepted")
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        if (!updatePendingMessagesForChat(
+                chatId,
+                pendingSendEchoes,
+                historicalFoldMap,
+                matches = { it.id == echoId },
+                update = { it.copy(state = "Accepted") },
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        ) {
+            return
+        }
         messages = messages.map { if (it.id == echoId) it.copy(state = "Accepted") else it }
     }
 
@@ -7526,7 +12538,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         ).mapTo(mutableSetOf()) { it.id }
         if (canonicalIds.isEmpty()) return false
 
-        pendingSendEchoes[chatId].orEmpty()
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        pendingMessagesForChat(
+            chatId,
+            pendingSendEchoes,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
             .asSequence()
             .filter {
                 it.id != succeededEcho.id &&
@@ -7543,30 +12562,58 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun failSendEcho(chatId: String, echoId: String) {
         previouslyPublishedMessageIdsByEcho.remove(echoId)
-        val list = pendingSendEchoes[chatId] ?: return
-        val idx = list.indexOfFirst { it.id == echoId }
-        if (idx >= 0) list[idx] = list[idx].copy(state = "Couldn't send")
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        if (!updatePendingMessagesForChat(
+                chatId,
+                pendingSendEchoes,
+                historicalFoldMap,
+                matches = { it.id == echoId },
+                update = { it.copy(state = "Couldn't send") },
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        ) {
+            return
+        }
         messages = messages.map { if (it.id == echoId) it.copy(state = "Couldn't send") else it }
     }
 
     private fun moveSendEchoes(fromChatId: String, toChatId: String) {
         val moving = pendingSendEchoes.remove(fromChatId).orEmpty()
         if (moving.isEmpty()) return
-        pendingSendEchoes.getOrPut(toChatId) { mutableListOf() }.addAll(moving)
+        val dest = pendingSendEchoes.getOrPut(toChatId) { mutableListOf() }
+        val seen = dest.mapTo(hashSetOf()) { it.id }
+        for (echo in moving) {
+            if (seen.add(echo.id)) dest.add(echo)
+        }
     }
 
     private fun withSendEchoes(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
-        val echoes = pendingSendEchoes[chatId] ?: return published
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val familyEchoes = pendingMessagesForChat(
+            chatId,
+            pendingSendEchoes,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        if (familyEchoes.isEmpty()) return published
         val plan = planSendEchoDisplay(
-            echoes,
+            familyEchoes,
             published,
             previouslyPublishedMessageIdsByEcho,
             freshCanonicalForChat(chatId),
         )
         if (plan.terminalAcceptedEchoIds.isNotEmpty()) {
-            echoes.removeAll { it.id in plan.terminalAcceptedEchoIds }
+            removePendingMessagesForChat(
+                chatId,
+                pendingSendEchoes,
+                historicalFoldMap,
+                shouldRemove = { it.id in plan.terminalAcceptedEchoIds },
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
             plan.terminalAcceptedEchoIds.forEach(previouslyPublishedMessageIdsByEcho::remove)
-            if (echoes.isEmpty()) pendingSendEchoes.remove(chatId)
         }
         // A canonical row can suppress a duplicate bubble before the send
         // coroutine reports its exact outcome. Keep the echo pending until
@@ -7606,6 +12653,33 @@ class SonarAppState(private val scope: CoroutineScope) {
     var pendingMediaPreviews by mutableStateOf<List<PendingMediaPreview>>(emptyList())
     private var mediaPreviewGeneration = 0L
 
+    fun pendingMediaPreviewsMatching(chatId: String): List<PendingMediaPreview> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return pendingMediaPreviews.filter {
+            pendingMediaPreviewBelongsToChat(
+                previewChatId = it.chatId,
+                screenId = chatId,
+                historicalFolds = historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        }
+    }
+
+    /** Stage / publish may start on hist and finish after Compose hops to
+     *  live. Empty persist-folds still accept the remount pair. */
+    private fun pendingMediaStageBelongsToOpenChat(chatId: String): Boolean {
+        val openId = (screen as? Screen.Chat)?.id ?: return false
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return pendingMediaPreviewBelongsToChat(
+            previewChatId = chatId,
+            screenId = openId,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
+
     private fun nextMediaPreviewGeneration(): Long {
         mediaPreviewGeneration += 1
         return mediaPreviewGeneration
@@ -7637,7 +12711,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  written to temp files off the UI thread (Signal-style: full quality
      *  until send confirmation); the batch replaces prior staged previews. */
     fun stageMediaPreviews(chatId: String, items: List<PickedPhoto>) {
-        if ((screen as? Screen.Chat)?.id != chatId || items.isEmpty()) return
+        if (!pendingMediaStageBelongsToOpenChat(chatId) || items.isEmpty()) return
         val generation = nextMediaPreviewGeneration()
         val previous = pendingMediaPreviews
         pendingMediaPreviews = emptyList()
@@ -7666,7 +12740,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "Couldn't prepare media."
                 return@launch
             }
-            if (mediaPreviewGeneration != generation || (screen as? Screen.Chat)?.id != chatId) {
+            if (mediaPreviewGeneration != generation || !pendingMediaStageBelongsToOpenChat(chatId)) {
                 withContext(Dispatchers.IO) { for (p in written) deleteTempMediaFile(p.tempPath) }
                 return@launch
             }
@@ -7678,14 +12752,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         val items = if (chatId == null) {
             pendingMediaPreviews
         } else {
-            pendingMediaPreviews.filter { it.chatId == chatId }
+            pendingMediaPreviewsMatching(chatId)
         }
         if (items.isEmpty()) return
         nextMediaPreviewGeneration()
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
-            pendingMediaPreviews.filterNot { it.chatId == chatId }
+            val (opened, pane) = remountPairForOpenChat(chatId)
+            pendingMediaPreviews.filterNot {
+                pendingMediaPreviewBelongsToChat(
+                    previewChatId = it.chatId,
+                    screenId = chatId,
+                    historicalFolds = historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
+            }
         }
         scope.launch {
             // Finalize every staged item IN ORDER (lazy jpeg re-encode happens
@@ -7747,12 +12830,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         val toRemove = if (chatId == null) {
             pendingMediaPreviews
         } else {
-            pendingMediaPreviews.filter { it.chatId == chatId }
+            pendingMediaPreviewsMatching(chatId)
         }
         pendingMediaPreviews = if (chatId == null) {
             emptyList()
         } else {
-            pendingMediaPreviews.filterNot { it.chatId == chatId }
+            val (opened, pane) = remountPairForOpenChat(chatId)
+            pendingMediaPreviews.filterNot {
+                pendingMediaPreviewBelongsToChat(
+                    previewChatId = it.chatId,
+                    screenId = chatId,
+                    historicalFolds = historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
+            }
         }
         deletePreviewTempFilesAsync(toRemove)
     }
@@ -7870,14 +12962,22 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  per-attachment entry is appended so each reconciles independently. */
     private fun rememberPendingMediaUploads(chatId: String, uploads: List<PendingMediaUpload>) {
         if (uploads.isEmpty()) return
-        val pending = pendingMediaUploads.getOrPut(chatId) { mutableListOf() }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val storeId = pendingMediaUploadStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        val pending = pendingMediaUploads.getOrPut(storeId) { mutableListOf() }
         val ids = uploads.mapTo(mutableSetOf()) { it.message.id }
         pending.removeAll { it.message.id in ids }
         pending += uploads
+        if (storeId != chatId) pendingMediaUploads.remove(chatId)
     }
 
     private fun markPendingMediaCompleted(chatId: String, pendingId: String) {
-        val pending = pendingMediaUploads[chatId] ?: return
+        val pending = pendingMediaUploadBucket(chatId) ?: return
         // An album shares one echo message across N per-attachment entries —
         // mark every entry so each reconciles against the canonical message.
         for (index in pending.indices) {
@@ -7888,8 +12988,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    private fun pendingMediaUploadsAcrossFamily(chatId: String): List<PendingMediaUpload> {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return pendingMediaUploadLookupIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).flatMap { pendingMediaUploads[it].orEmpty() }
+    }
+
+    /** The bucket that still holds this chat's in-flight media after a fold promote. */
+    private fun pendingMediaUploadBucket(chatId: String): MutableList<PendingMediaUpload>? {
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        for (id in pendingMediaUploadLookupIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )) {
+            pendingMediaUploads[id]?.let { return it }
+        }
+        return null
+    }
+
     private fun markPendingMediaFailed(chatId: String, pendingId: String) {
-        val pending = pendingMediaUploads[chatId] ?: return
+        val pending = pendingMediaUploadBucket(chatId) ?: return
         for (index in pending.indices) {
             if (pending[index].message.id == pendingId) {
                 val upload = pending[index]
@@ -7899,7 +13023,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun mergePendingMediaUploads(chatId: String, published: List<SonarMsg>): List<SonarMsg> {
-        val pending = pendingMediaUploads[chatId] ?: return published.sortedBy { it.tsSecs }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val lookupIds = pendingMediaUploadLookupIds(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        val pending = lookupIds.flatMap { pendingMediaUploads[it].orEmpty() }
+        if (pending.isEmpty()) return published.sortedBy { it.tsSecs }
         // Track matched entries INDIVIDUALLY, not by message id: an album's N
         // attachments share one echo message id, so removing by id would drop the
         // whole echo (and its not-yet-cached siblings) the instant one attachment
@@ -7925,11 +13057,21 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (ok) matchedUrls += upload.pendingUrl
         }
         val survivors = pending.filterNot { it.pendingUrl in matchedUrls }
+        val storeId = pendingMediaUploadStoreId(
+            chatId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        for (id in lookupIds) {
+            if (id != storeId) pendingMediaUploads.remove(id)
+        }
         if (survivors.isEmpty()) {
+            pendingMediaUploads.remove(storeId)
             pendingMediaUploads.remove(chatId)
             return published.sortedBy { it.tsSecs }
         }
-        pendingMediaUploads[chatId] = survivors.toMutableList()
+        pendingMediaUploads[storeId] = survivors.toMutableList()
         // Distinct by id: an album echo appears once per surviving attachment.
         val survivorMessages = survivors.map { it.message }.distinctBy { it.id }.map { msg ->
             val progress = mediaUploadProgress[msg.id]
@@ -7958,22 +13100,123 @@ class SonarAppState(private val scope: CoroutineScope) {
         mediaUploadProgress.remove(pendingId)
     }
 
-    private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> =
-        runCatching { SonarCore.messagesPage(groupId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT) }
-            .getOrDefault(messages)
-            .asSequence()
-            .flatMap { it.media.asSequence() }
-            .map { it.url }
-            .filterNot { it.startsWith(pendingMediaUrlPrefix) }
-            .toSet()
+    private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> {
+        // First send after resume can mint live 0.9 before persist-folds.
+        // A live-only exclude set misses recovered 0.8 blossom URLs and
+        // `cacheUploadedMediaBytes` can bind new bytes onto that attachment.
+        val beforeFolds = historicalFoldMap.toMap()
+        val folds = mergeActionHistoricalFolds(listOf(groupId))
+        adoptActionHistoricalFolds(folds)
+        if (folds != beforeFolds) persistHistoricalFolds()
+        val (opened, pane) = remountPairForOpenChat(groupId)
+        val ids = mediaFetchGroupIds(
+            groupId,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).ifEmpty { listOf(groupId) }
+        val pages = ids.map { id ->
+            val loaded = runCatching {
+                SonarCore.messagesPage(id, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+            }.getOrNull()
+            val cached = chatSnapshotMessagesByChat[id].orEmpty()
+                .ifEmpty { if (id == groupId) messages else emptyList() }
+            publishedMediaScanRows(loaded, cached)
+        }
+        return publishedMediaUrlsFromMessages(
+            pages.asSequence().flatten(),
+            pendingMediaUrlPrefix,
+        )
+    }
+
+    /** Newest live duplicate for outbound Marmot traffic. Hist remaps via
+     *  [resolveMarmotGroupId]; two live 0.9 siblings pick the same target
+     *  text send already uses. Media / sticker / payment / internet call
+     *  signaling share this helper. Persist-wins FFI; do not persist.
+     *  iOS `resolvedMarmotOutboundGroupId`. */
+    private fun resolveMarmotSendTargetGroupId(chatId: String): String? {
+        val open = resolveMarmotGroupId(chatId) ?: return null
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        val duplicates = directMarmotChatIds(chatId)
+        return marmotSendTargetGroupId(
+            open,
+            duplicates,
+            ::localLatestTs,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffiFoldsForDirectIds(duplicates),
+        )
+    }
+
+    /** In-memory FFI hist→live for send / contact-profile. Do not persist —
+     *  empty-family merge must not cache a family-of-one. */
+    private fun ffiFoldsForDirectIds(candidateIds: Collection<String>): Map<String, String> =
+        historicalFoldsFromAliases(
+            candidateIds,
+            { id -> runCatching { SonarCore.foldAliases(id) }.getOrDefault(emptyList()) },
+            { id -> runCatching { SonarCore.liveFoldTarget(id) }.getOrNull() },
+        )
+
+    /** Mesh-folded sendOverMarmot / sticker / pending flush / outbox /
+     *  call-by-npub. Persist/newest first, then persist-wins FFI so a
+     *  recovered hist sibling is not published against. Do not persist.
+     *  iOS `resolvedMarmotOutboundGroupId`. */
+    private fun outboundMarmotGroupIdForNpub(
+        npubRaw: ByteArray,
+        openChatId: String,
+    ): String? {
+        val groups = marmotGroupsForNpub(npubRaw)
+        val persist = preferredDirectMarmotChat(groups) ?: return null
+        val (opened, pane) = remountPairForOpenChat(openChatId)
+        val ids = groups.map { it.id }
+        return marmotSendTargetGroupId(
+            persist.id,
+            ids,
+            ::localLatestTs,
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+            ffiHistoricalFolds = ffiFoldsForDirectIds(ids),
+        )
+    }
 
     /** The Marmot group id backing [chatId]: the chat id itself for a White Noise
      *  chat, or the Sonar peer's group for a mesh-routed DM. null ⇒ no group yet. */
     private fun resolveMarmotGroupId(chatId: String): String? {
         if (chatId.startsWith(PENDING_MARMOT_CHAT_PREFIX) || chatId.startsWith(PENDING_MARMOT_GROUP_PREFIX)) return null
-        if (!isMeshChat(chatId)) return chatId
+        if (!isMeshChat(chatId)) {
+            val (opened, pane) = remountPairForOpenChat(chatId)
+            return resolvedOpenGroupId(
+                chatId,
+                chats.mapTo(hashSetOf()) { it.id },
+                historicalFoldMap,
+                opened,
+                pane,
+            )
+        }
         val raw = npubRawFor(meshPeerId(chatId)) ?: return null
         return marmotGroupForNpub(raw)?.id
+    }
+
+    /** FFI group-admin / leave target. `listedChat` keeps hist identity;
+     *  this remaps onto the listed live sibling. iOS `marmotGroupId`. */
+    private fun adminGroupIdFor(chatId: String): String {
+        val fromChat = remountPairForOpenChat(chatId)
+        val fromInfo = remountPairForOpenChat((screen as? Screen.GroupInfo)?.chatId.orEmpty())
+        val fromOpen = remountPairForOpenChat((screen as? Screen.Chat)?.id.orEmpty())
+        val (opened, pane) = when {
+            fromChat.first != null -> fromChat
+            fromInfo.first != null -> fromInfo
+            else -> fromOpen
+        }
+        return marmotAdminGroupId(
+            chatId,
+            chats.mapTo(hashSetOf()) { it.id },
+            historicalFoldMap,
+            opened,
+            pane,
+        )
     }
 
     private fun meshMediaUrl(peerId: String, messageId: String, filename: String): String =
@@ -8003,7 +13246,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             return AttachmentRoutePreparation.Ready(chatId)
         }
-        resolveMarmotGroupId(chatId)?.let { return AttachmentRoutePreparation.Ready(it) }
+        resolveMarmotSendTargetGroupId(chatId)?.let { return AttachmentRoutePreparation.Ready(it) }
 
         val pendingNpub = pendingMarmotNpub(chatId)
             ?: return AttachmentRoutePreparation.Unavailable
@@ -8115,7 +13358,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
+            val groupId = resolveMarmotSendTargetGroupId(chatId)
             if (groupId == null) {
                 if (isMeshChat(chatId)) {
                     queueMeshMediaForRetry(chatId, data, filename, mime)
@@ -8264,7 +13507,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
+            val groupId = resolveMarmotSendTargetGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first, then send a photo."; return@launch }
             val pendingId = "pending-media-${randomMeshId()}"
             val startedAtSecs = SonarClock.nowSecs()
@@ -8402,7 +13645,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (resolveMarmotGroupId(chatId) == null) return
         }
         scope.launch {
-            val groupId = resolveMarmotGroupId(chatId)
+            val groupId = resolveMarmotSendTargetGroupId(chatId)
             if (groupId == null) { toast = "Start the secure chat first to send a voice note."; return@launch }
             val pendingId = "pending-media-${randomMeshId()}"
             val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
@@ -8523,7 +13766,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             sendPendingMarmotGroup(chatId, encoded)
             return
         }
-        val groupId = resolveMarmotGroupId(chatId)
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
         if (groupId == null) {
             toast = "Stickers require an encrypted chat"
             return
@@ -8948,6 +14191,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun prepareMedia(chatId: String, media: SonarMedia, autoDownload: Boolean) {
         val key = media.url
         if (mediaTransfers[key]?.phase == MediaTransferPhase.Downloading) return
+        if (mediaTransfers[key]?.phase == MediaTransferPhase.Unavailable) return
         val finalPath = MediaCache.finalPath(key)
         if (MediaCache.existsSync(finalPath)) {
             if (shouldPublishDiskHit(mediaTransfers[key]?.phase)) {
@@ -8965,6 +14209,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun requestMediaDownload(chatId: String, media: SonarMedia) {
         val key = media.url
+        if (mediaTransfers[key]?.phase == MediaTransferPhase.Unavailable) return
         if (mediaDownloadJobs[key]?.isActive == true) return
         val generation = ++nextMediaDownloadGeneration
         val finalPath = MediaCache.finalPath(key)
@@ -9005,10 +14250,35 @@ class SonarAppState(private val scope: CoroutineScope) {
                             bytes != null && MediaCache.write(partialPath, bytes)
                         }
                         else -> {
-                            val groupId = resolveMarmotGroupId(chatId)
+                            val startGroupId = resolveMarmotGroupId(chatId)
                                 ?: throw IllegalStateException("attachment has no secure media route")
-                            SonarCore.fetchMediaToFile(groupId, key, partialPath, control)
-                            true
+                            val beforeFolds = historicalFoldMap.toMap()
+                            val folds = mergeActionHistoricalFolds(listOf(startGroupId, chatId))
+                            adoptActionHistoricalFolds(folds)
+                            if (folds != beforeFolds) persistHistoricalFolds()
+                            val (opened, pane) = remountPairForOpenChat(chatId)
+                            val groupIds = mediaFetchGroupIds(
+                                startGroupId,
+                                historicalFoldMap,
+                                openedConversationId = opened,
+                                openedConversationPaneId = pane,
+                            )
+                            var lastError: Throwable? = null
+                            var fetched = false
+                            for (groupId in groupIds) {
+                                try {
+                                    SonarCore.fetchMediaToFile(groupId, key, partialPath, control)
+                                    lastError = null
+                                    fetched = true
+                                    break
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Throwable) {
+                                    lastError = e
+                                }
+                            }
+                            lastError?.let { throw it }
+                            fetched
                         }
                     }
                     if (!wrotePartial) throw IllegalStateException("could not write attachment cache")
@@ -9027,11 +14297,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (mediaDownloadGenerations[key] == generation) {
                     setMediaTransfer(key, MediaTransferState.NotDownloaded)
                 }
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
                 if (mediaDownloadGenerations[key] == generation) {
+                    val message = error.message.orEmpty()
                     setMediaTransfer(
                         key,
-                        if (control.isCancelled()) MediaTransferState.NotDownloaded else MediaTransferState.Failed,
+                        when {
+                            control.isCancelled() -> MediaTransferState.NotDownloaded
+                            recoveredLegacyMediaUnavailable(message) ->
+                                MediaTransferState.unavailable(RECOVERED_LEGACY_MEDIA_COPY)
+                            else -> MediaTransferState.Failed
+                        },
                     )
                 }
             } finally {
@@ -9151,7 +14427,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return ok
             }
         }
-        val groupId = resolveMarmotGroupId(chatId)
+        val groupId = resolveMarmotSendTargetGroupId(chatId)
         if (groupId != null) {
             return sendCallOverMarmot(groupId, text)
         }
@@ -9178,7 +14454,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun sendCallOverMarmot(peerId: String, npubRaw: ByteArray, text: String): Boolean {
         return try {
             refreshChats()
-            val groupId = marmotGroupForNpub(npubRaw)?.id ?: run {
+            val groupId = outboundMarmotGroupIdForNpub(npubRaw, meshChatId(peerId)) ?: run {
                 if (!awaitRelayConnection()) return false
                 runMarmotAccountOperation { SonarCore.startChat(npubRaw.toHexLower()) }
             }.also {
@@ -9721,13 +14997,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         reply: SonarReplyRef? = null,
     ) {
         val chatId = meshChatId(peerId)
-        val group = marmotGroupForNpub(npubRaw)
-        if (group != null) {
+        val groupId = outboundMarmotGroupIdForNpub(npubRaw, chatId)
+        if (groupId != null) {
             val echo = createSendEcho(chatId, text, reply = reply)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 runMarmotSendWithBestEffortReconciliation(
-                    send = { sendMarmotTextOrdered(group.id, text, reply) },
+                    send = { sendMarmotTextOrdered(groupId, text, reply) },
                     onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                     reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
                     onSendFailure = { error ->
@@ -9754,14 +15030,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     ) {
         val chatId = meshChatId(peerId)
         val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-        val group = marmotGroupForNpub(npubRaw)
-        if (group != null) {
+        val groupId = outboundMarmotGroupIdForNpub(npubRaw, chatId)
+        if (groupId != null) {
             val echo = createSendEcho(chatId, encoded)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
                 runMarmotSendWithBestEffortReconciliation(
                     send = {
-                        sendMarmotStickerOrdered(group.id, packCoordinate, sticker.shortcode, sticker.sha256)
+                        sendMarmotStickerOrdered(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
                     },
                     onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
                     reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
@@ -9863,7 +15139,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         for ((npubHex, sends) in pendingMarmotSends.toMap()) {
             if (socialState.isBlockedNostr(npubHex)) continue
             if (pendingMarmotFlushJobs[npubHex]?.isActive == true) continue
-            val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
+            val openId = sends.firstOrNull()?.meshChatId.orEmpty()
+            val groupId = outboundMarmotGroupIdForNpub(npubHex.hexToBytesOrEmpty(), openId) ?: continue
             pendingMarmotSends.remove(npubHex)
             val job = scope.launch {
                 var drainedQueueEmpty = false
@@ -9873,7 +15150,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         val echo = pendingSendEchoes[send.meshChatId]
                             ?.firstOrNull { it.id == send.echoId }
                         runMarmotSendWithBestEffortReconciliation(
-                            send = { sendQueuedMarmotContent(group.id, send.text, send.reply) },
+                            send = { sendQueuedMarmotContent(groupId, send.text, send.reply) },
                             onSendAccepted = {
                                 if (echo != null) markSendEchoAccepted(send.meshChatId, echo.id)
                             },
@@ -10027,7 +15304,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {
-        marmotGroupForNpub(npubRaw)?.id?.let { return it }
+        outboundMarmotGroupIdForNpub(npubRaw, meshChatId(peerId))?.let { return it }
         if (!SonarCore.isRelayConnected()) {
             startRelayConnection()
             return null
@@ -10254,7 +15531,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                SonarCore.addGroupMembers(chatId, cleanMembers)
+                SonarCore.addGroupMembers(adminGroupIdFor(chatId), cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId))))
@@ -10276,7 +15553,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (cleanMembers.isEmpty()) return
         scope.launch {
             try {
-                SonarCore.removeGroupMembers(chatId, cleanMembers)
+                SonarCore.removeGroupMembers(adminGroupIdFor(chatId), cleanMembers)
                 refreshChats()
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     setCurrentVisibleMessages(chatId, withSendEchoes(chatId, mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId))))
@@ -10294,26 +15571,28 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                val token = SonarCore.createInviteLink(chatId, groupName)
+                val token = SonarCore.createInviteLink(adminGroupIdFor(chatId), groupName)
                 onResult(token)
             } catch (e: Throwable) {
-                toast = "couldn't create invite link: ${e.message}"
+                toast = marmotInviteUserMessage(e.message.orEmpty())
             }
         }
     }
 
-    fun loadPendingJoinRequests(chatId: String, onResult: (List<SonarJoinRequest>) -> Unit) {
+    fun loadPendingJoinRequests(
+        chatId: String,
+        cached: List<SonarJoinRequest> = emptyList(),
+        onResult: (List<SonarJoinRequest>) -> Unit,
+    ) {
         if (!canManageGroup(chatId)) {
             onResult(emptyList())
             return
         }
         scope.launch {
-            try {
-                onResult(SonarCore.pendingJoinRequests(chatId))
-            } catch (e: Throwable) {
-                toast = "couldn't load join requests: ${e.message}"
-                onResult(emptyList())
-            }
+            val loaded = runCatching { SonarCore.pendingJoinRequests(adminGroupIdFor(chatId)) }
+                .onFailure { toast = "couldn't load join requests: ${it.message}" }
+                .getOrNull()
+            onResult(pendingJoinRequestsOrCached(loaded, cached))
         }
     }
 
@@ -10330,7 +15609,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                SonarCore.approveJoinRequest(chatId, requesterNpub)
+                SonarCore.approveJoinRequest(adminGroupIdFor(chatId), requesterNpub)
                 refreshChats()
                 toast = "Member added"
                 onDone()
@@ -10349,7 +15628,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
-                SonarCore.declineJoinRequest(chatId, requesterNpub)
+                SonarCore.declineJoinRequest(adminGroupIdFor(chatId), requesterNpub)
                 toast = "Request declined"
                 onDone()
             } catch (e: Throwable) {
@@ -10586,7 +15865,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
 
     private fun peerIdForMarmotGroup(groupId: String): String? {
-        val group = chats.firstOrNull { it.id == groupId }
+        val group = listedChat(groupId)
         foldedGroupPeerIds[groupId]?.let { peerId ->
             if (group == null || peerLinkMatchesGroup(group, peerId)) return peerId
         }
@@ -10616,11 +15895,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun marmotGroupForNpub(npubRaw: ByteArray): SonarChat? =
         preferredDirectMarmotChat(marmotGroupsForNpub(npubRaw))
 
-    private fun preferredDirectMarmotChat(groups: List<SonarChat>): SonarChat? =
-        groups.maxWithOrNull(
-            compareBy<SonarChat> { localLatestTs(it.id) }
-                .thenBy { it.id }
-        )
+    private fun preferredDirectMarmotChat(groups: List<SonarChat>): SonarChat? {
+        val open = activeTranscriptChatId.orEmpty()
+        val (opened, pane) = remountPairForOpenChat(open)
+        val preferredId = preferredDirectMarmotChatId(
+            groups.map { it.id },
+            { expectedNewestTsForOpenChat(it) },
+            historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ) ?: return null
+        return groups.firstOrNull { openedConversationIdMatches(it.id, preferredId) }
+            ?: groups.firstOrNull { it.id == preferredId }
+    }
 
     private suspend fun latestCursorPage(groupId: String): List<SonarMsg>? = runCatching {
         SonarCore.messagesCursorPage(
@@ -10638,10 +15925,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         generation: Long,
     ): List<SonarMsg> {
         val fetched = latestCursorPage(groupId)
-        val untrusted = transcriptReadIsUntrusted(fetched, started, localLatestTs(groupId))
-        if (!isCurrentTranscriptSession(sessionChatId, generation)) {
+        val untrusted = transcriptReadIsUntrusted(
+            fetched,
+            started,
+            maxOf(
+                expectedNewestTsForOpenChat(groupId),
+                expectedNewestTsForOpenChat(sessionChatId),
+            ),
+        )
+        if (!isCurrentTranscriptSession(sessionChatId, generation) ||
+            openedDMShouldSkipHydrate(sessionChatId, suppressOpenedHydrateIds)
+        ) {
             return when {
-                untrusted -> chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+                untrusted -> snapshotMessagesForChat(groupId).takeLast(TRANSCRIPT_PAGE_SIZE)
                 else -> visibleTranscriptPage(fetched.orEmpty())
             }
         }
@@ -10651,12 +15947,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Keep whatever is already painted; only fall through to the
             // snapshot when there is nothing to keep.
             if (current != null && current.rows.isNotEmpty()) return current.rows
-            val fallback = chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+            val fallback = snapshotMessagesForChat(groupId).takeLast(TRANSCRIPT_PAGE_SIZE)
             // Never cache an empty window. A cached blank is indistinguishable
             // from a real one at the `current != null` check above, so it would
             // shadow the store on every later refresh and pin the chat black.
             if (fallback.isNotEmpty()) {
-                transcriptWindows[groupId] = TranscriptGroupWindow(fallback, hasMore = false)
+                transcriptWindows[groupId] = TranscriptGroupWindow(
+                    fallback,
+                    hasMore = true,
+                )
             }
             return fallback
         }
@@ -10675,11 +15974,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             newest = newest,
             pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
         )
-        val hasMore = when {
-            unboundedCount > TRANSCRIPT_RETAINED_ROWS -> true
-            current != null -> current.hasMore || page.size > TRANSCRIPT_PAGE_SIZE
-            else -> page.size > TRANSCRIPT_PAGE_SIZE
-        }
+        val (opened, pane) = remountPairForOpenChat(sessionChatId)
+        val hasMore = newestPageFamilyHasOlder(
+            existingCount = current?.rows.orEmpty().size,
+            incomingCount = newest.size,
+            rawPageCount = page.size,
+            previousHasOlder = current?.hasMore == true
+                || unboundedCount > TRANSCRIPT_RETAINED_ROWS,
+            hasFoldFamily = foldFamilyIds(
+                groupId,
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            ).any { it != groupId },
+        )
         transcriptWindows[groupId] = TranscriptGroupWindow(
             rows = merged,
             hasMore = hasMore,
@@ -10702,8 +16010,26 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** True when local metadata remembers messages for this conversation, even
      *  if the encrypted store cannot be read right now. Survives a cold launch,
      *  so it is the signal that a blank transcript is wrong rather than empty. */
-    private fun transcriptKnownNonEmpty(chatId: String): Boolean =
-        localLatestTs(chatId) > 0L || transcriptGroupIds(chatId).any { localLatestTs(it) > 0L }
+    private fun transcriptKnownNonEmpty(chatId: String): Boolean {
+        val ids = transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }
+        val latest = buildMap {
+            for (id in ids) {
+                // iOS feeds summary `latestAt` here. `copy_summary` leaves live
+                // `message_count` at 0 on conflict; snapshot-only latest then
+                // skips recovery while bak remainder sat on hist.
+                put(id, maxOf(localLatestTs(id), conversationLatestAtByChat[id] ?: 0L))
+            }
+        }
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        return blankTranscriptKnownNonEmpty(
+            chatId,
+            latestByChat = latest,
+            messageCountByChat = conversationMessageCountByChat,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+    }
 
     /** Whether this conversation's transport legs are known yet. A mesh route
      *  resolves its folded White Noise groups through `chats` / `npubRawFor`,
@@ -10787,17 +16113,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         chatId: String,
         generation: Long = transcriptGeneration,
     ): List<SonarMsg> {
-        val groups = duplicateDirectMarmotChats(chatId)
-        if (groups.isEmpty()) {
-            return refreshConversationRows(
-                refreshTranscriptGroupWindow(chatId, chatId, generation),
-                chatId,
-                generation,
-            )
-        }
+        // Rooms are not 1:1 duplicates — `duplicateDirectMarmotChats` is only
+        // the live row. Page the hidden 0.8 sibling too so first-open FFI
+        // and blank recovery can fill bak remainder. iOS blank recovery
+        // pages `snTranscriptSourceIds` the same way.
+        val groupIds = transcriptGroupIds(chatId).ifEmpty { listOf(chatId) }
         val merged = ArrayList<SonarMsg>()
-        for (group in groups) {
-            merged += refreshTranscriptGroupWindow(group.id, chatId, generation)
+        for (groupId in groupIds) {
+            merged += refreshTranscriptGroupWindow(groupId, chatId, generation)
         }
         return refreshConversationRows(merged, chatId, generation)
     }
@@ -10811,9 +16134,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
+        val (opened, pane) = remountPairForOpenChat(sessionChatId)
+        val groupIds = meshFoldTranscriptSourceIds(
+            groups.map { it.id },
+            historicalFoldMap,
+            resolveMarmotGroupId(sessionChatId),
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        ).ifEmpty { groups.map { it.id } }
         val merged = ArrayList<SonarMsg>()
-        for (group in groups) {
-            val msgs = refreshTranscriptGroupWindow(group.id, sessionChatId, generation)
+        for (groupId in groupIds) {
+            val msgs = refreshTranscriptGroupWindow(groupId, sessionChatId, generation)
             merged += msgs.map { it.copy(viaInternet = true) }
         }
         return mergeAllTranscriptRows(merged)
@@ -10825,8 +16156,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         generation: Long,
     ): List<SonarMsg> {
         val merged = mergeAllTranscriptRows(source)
-        if (!isCurrentTranscriptSession(chatId, generation)) {
-            return boundedTranscriptRows(merged, TRANSCRIPT_PAGE_SIZE, pinnedToOlderEdge = false)
+        if (!isCurrentTranscriptSession(chatId, generation) ||
+            openedDMShouldSkipHydrate(chatId, suppressOpenedHydrateIds)
+        ) {
+            return if (openedDMShouldSkipHydrate(chatId, suppressOpenedHydrateIds) &&
+                conversationTranscriptRows.isNotEmpty()
+            ) {
+                conversationTranscriptRows
+            } else {
+                boundedTranscriptRows(merged, TRANSCRIPT_PAGE_SIZE, pinnedToOlderEdge = false)
+            }
         }
         conversationTranscriptRows = if (conversationTranscriptRows.isEmpty()) {
             boundedTranscriptRows(merged, conversationVisibleRowLimit, conversationPinnedToOlderEdge)
@@ -10891,13 +16230,66 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
+    private fun transcriptWindowHasMore(groupId: String): Boolean {
+        val window = transcriptWindows[groupId]
+        val (opened, pane) = remountPairForOpenChat(groupId)
+        val cachedCount = echoReconcileFamilyIds(
+            groupId,
+            historicalFoldMap,
+            opened,
+            pane,
+        ).ifEmpty { setOf(groupId) }
+            .flatMap { transcriptWindows[it]?.rows.orEmpty() }
+            .distinctBy { it.id }
+            .size
+        return (window?.hasMore == true) ||
+            hasOlderForFoldFamily(
+                groupId,
+                transcriptWindows.mapValues { it.value.hasMore },
+                historicalFoldMap,
+                cachedCount = cachedCount,
+                pageSize = conversationVisibleRowLimit,
+                unpagedHiddenSibling = hiddenFoldFamilyNeedsPage(
+                    groupId,
+                    historicalFoldMap,
+                    pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys),
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+    }
+
     private fun transcriptGroupIds(chatId: String): List<String> {
-        if (!isMeshChat(chatId)) return directMarmotChatIds(chatId).distinct()
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        if (!isMeshChat(chatId)) {
+            // Includes the hidden 0.8 sibling so load-older can page bak
+            // remainder when core fold_family(live) is not ready yet.
+            // Empty wake-mute persist still unions the remount pair so a
+            // remapped live seed does not drop hidden hist.
+            // iOS `localTranscriptGroups` / `snTranscriptSourceIds`.
+            return transcriptSourceIds(
+                chatId,
+                directMarmotChatIds(chatId),
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        }
         val peerId = canonicalMeshPeerId(meshPeerId(chatId))
         val aliases = meshPeerAliases(peerId)
         val groups = npubRawFor(peerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
-        return groups.map { it.id }.distinct()
+        // Listed live-only misses the hidden 0.8 sibling after persist-folds.
+        // iOS `localTranscriptGroups` / `snMeshFoldTranscriptSourceIds`.
+        return meshFoldTranscriptSourceIds(
+            groups.map { it.id },
+            historicalFoldMap,
+            resolveMarmotGroupId(chatId),
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
     }
 
     /** Keep only the active viewport's BLE history; the complete transcript remains in MessageStore. */
@@ -10960,19 +16352,63 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     suspend fun loadOlderMessages(chatId: String): Boolean {
         val generation = transcriptGeneration
-        if (activeTranscriptChatId != chatId || (screen as? Screen.Chat)?.id != chatId) return false
+        if (chatId !in transcriptSessionChatIds() ||
+            (screen as? Screen.Chat)?.id !in transcriptSessionChatIds()
+        ) {
+            return false
+        }
 
         val groupIds = transcriptGroupIds(chatId)
+        val folds = historicalFoldMap
+        val (opened, pane) = remountPairForOpenChat(chatId)
+        var busyWait = 0
+        while (
+            busyWait < 21 &&
+            loadOlderBusyRetryShouldWait(
+                chatId,
+                transcriptWindows.filter { it.value.loadingOlder }.keys,
+                folds,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        ) {
+            delay(50)
+            busyWait++
+            if (!isCurrentTranscriptSession(chatId, generation)) return false
+        }
+        val paged = pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys)
+        val listed = chats.mapTo(hashSetOf()) { it.id }
+        for (sibling in loadOlderHiddenSiblingsNeedingNewestPage(
+            groupIds.filter { it in listed },
+            historicalFoldMap,
+            paged,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )) {
+            refreshTranscriptGroupWindow(sibling, chatId, generation)
+            if (!isCurrentTranscriptSession(chatId, generation)) return false
+        }
         for (groupId in groupIds) {
             var window = transcriptWindows[groupId]
-            if (window == null) {
+            if (window == null || foldFamilySourceNeedsNewestPage(
+                    groupId,
+                    paged,
+                    window.rows.size,
+                )
+            ) {
                 refreshTranscriptGroupWindow(groupId, chatId, generation)
                 if (!isCurrentTranscriptSession(chatId, generation)) return false
                 window = transcriptWindows[groupId]
             }
         }
 
-        val oldestVisible = conversationTranscriptRows.firstOrNull() ?: return false
+        val oldestVisible = conversationTranscriptRows.firstOrNull()
+        if (oldestVisible == null) {
+            val familyRows = groupIds.flatMap { transcriptWindows[it]?.rows.orEmpty() }
+            if (!loadOlderEmptyPaintShouldPublishFamily(0, familyRows.size)) return false
+            refreshConversationRows(familyRows, chatId, generation)
+            return conversationTranscriptRows.isNotEmpty()
+        }
         val peerId = chatId.takeIf(::isMeshChat)?.let(::meshPeerId)
         var sourcesReady = false
         for (attempt in 0..<3) {
@@ -10989,7 +16425,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 for (groupId in groupIds) {
                     val window = transcriptWindows[groupId] ?: continue
-                    add(TranscriptSourceWindow(groupId, window.rows, window.hasMore))
+                    add(TranscriptSourceWindow(groupId, window.rows, transcriptWindowHasMore(groupId)))
                 }
             }
             val sourceIds = transcriptSourceIdsNeedingExpansion(sources, oldestVisible)
@@ -11004,11 +16440,21 @@ class SonarAppState(private val scope: CoroutineScope) {
             for (groupId in groupIds) {
                 if (groupId !in sourceIds) continue
                 val current = transcriptWindows[groupId] ?: continue
-                if (current.loadingOlder || !current.hasMore || current.rows.isEmpty()) continue
+                if (current.loadingOlder || !transcriptWindowHasMore(groupId)) continue
+                val cursor = current.rows.firstOrNull()
+                    ?: foldFamilyPagingCursor(
+                        groupId,
+                        transcriptWindows.mapNotNull { (id, window) ->
+                            window.rows.firstOrNull()?.let { id to it }
+                        }.toMap(),
+                        historicalFoldMap,
+                        opened,
+                        pane,
+                    )
+                    ?: continue
 
                 if (!isCurrentTranscriptSession(chatId, generation)) return false
                 transcriptWindows[groupId] = current.copy(loadingOlder = true)
-                val cursor = current.rows.first()
                 val fetched = runCatching {
                     SonarCore.messagesCursorPage(
                         chatId = groupId,
@@ -11030,12 +16476,20 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // suspended. Merge into the latest window so it cannot overwrite
                 // a new canonical row or clear the in-flight state prematurely.
                 val latest = transcriptWindows[groupId] ?: current
+                val admittedNewRows = older.any { candidate ->
+                    latest.rows.none { it.id == candidate.id }
+                }
                 val trimsNewerEdge = latest.rows.size >= TRANSCRIPT_RETAINED_ROWS &&
-                    older.any { candidate -> latest.rows.none { it.id == candidate.id } }
+                    admittedNewRows
                 val merged = prependTranscriptRows(latest.rows, older)
                 transcriptWindows[groupId] = TranscriptGroupWindow(
                     rows = merged,
-                    hasMore = fetched.size > TRANSCRIPT_PAGE_SIZE,
+                    hasMore = loadOlderPageHasOlder(
+                        rawPageCount = fetched.size,
+                        pageSize = TRANSCRIPT_PAGE_SIZE,
+                        admittedNewRows = admittedNewRows,
+                        previousHasOlder = latest.hasMore,
+                    ),
                     pinnedToOlderEdge = latest.pinnedToOlderEdge || trimsNewerEdge,
                 )
             }
@@ -11048,7 +16502,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 for (groupId in groupIds) {
                     val window = transcriptWindows[groupId] ?: continue
-                    add(TranscriptSourceWindow(groupId, window.rows, window.hasMore))
+                    add(TranscriptSourceWindow(groupId, window.rows, transcriptWindowHasMore(groupId)))
                 }
             }
             if (transcriptSourceIdsNeedingExpansion(sources, oldestVisible).isNotEmpty()) return false
@@ -11074,9 +16528,21 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun latestMarmotMessage(groups: List<SonarChat>): SonarMsg? {
         var latest: SonarMsg? = null
         for (group in groups) {
-            val msg = chatSnapshotMessagesByChat[group.id]?.lastOrNull()
+            val (opened, pane) = remountPairForOpenChat(group.id)
+            val msg = latestHomeRowForChat(
+                chatId = group.id,
+                messagesByChat = chatSnapshotMessagesByChat,
+                summaryByChat = conversationSummaryByChat,
+                historicalFolds = historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
             val current = latest
-            if (msg != null && (current == null || msg.tsSecs > current.tsSecs)) latest = msg
+            if (msg != null && (current == null || msg.tsSecs > current.tsSecs ||
+                    (msg.tsSecs == current.tsSecs && msg.id > current.id))
+            ) {
+                latest = msg
+            }
         }
         return latest
     }
@@ -11108,7 +16574,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
-        markGroupsRead(groups.map { it.id })
+        markGroupsRead(transcriptGroupIds(chatId))
     }
 
     private fun observedMeshPeer(peerId: String): Boolean =
@@ -11180,7 +16646,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      * version of this test passed while the bug was fully restorable.
      */
     internal fun seedCallableChatForTest(chatId: String, peerNpub: String, descriptor: SonarDescriptor) {
-        chats = listOf(SonarChat(id = chatId, name = "Peer", members = listOf(peerNpub, npub)))
+        chats = listOf(SonarChat(id = chatId, name = "Peer", members = listOf(peerNpub, npub), isDirect = true))
         // Keyed exactly the way the lookup keys it. Keying it by the bech32 npub
         // instead produced a fixture that silently had no route, which made the
         // capability assertion pass for the wrong reason. Loud rather than silent:
@@ -11208,7 +16674,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun marmotChatPeerNpubHex(chatId: String): String? {
         val mine = canonicalProfileKey(npub)
-        val other = chats.firstOrNull { it.id == chatId }
+        val other = listedChat(chatId)
             ?.members
             ?.map { canonicalProfileKey(it) }
             ?.firstOrNull { it != mine && it.isNotBlank() }
@@ -11755,7 +17221,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 groups.forEach { g -> folded += g.id; groupPeers[g.id] = peerId }
                 latestMarmotMessage(groups)?.let { if (it.tsSecs > last.tsSecs) last = it }
             }
-            upsert(peerId, MeshDmRow(peerId, foldedPeerName(peerId, groups.firstOrNull()), messagePreview(last.content, last.stickerRef, last.media), last.tsSecs))
+            val remountedTs = groups.maxOfOrNull { expectedNewestTsForOpenChat(it.id) } ?: 0L
+            upsert(
+                peerId,
+                MeshDmRow(
+                    peerId,
+                    foldedPeerName(peerId, groups.firstOrNull()),
+                    messagePreview(last.content, last.stickerRef, last.media),
+                    foldedMeshRowTs(last.tsSecs, remountedTs),
+                ),
+            )
         }
         for (group in chats) {
             if (!isDirectMarmotChat(group)) continue
@@ -11776,7 +17251,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     peerId,
                     foldedPeerName(peerId, group),
                     last?.let { messagePreview(it.content, it.stickerRef, it.media) } ?: "Secure chat · reaches anywhere",
-                    last?.tsSecs ?: 0L,
+                    foldedMeshRowTs(last?.tsSecs, expectedNewestTsForOpenChat(group.id)),
                 )
             )
         }
@@ -11800,10 +17275,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         meshDmRows = rowsByPeer.values.sortedByDescending { it.tsSecs }
     }
 
-    private fun persistChatSnapshot() {
+    private fun persistChatSnapshot(includeIsDirect: Boolean = true) {
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
         SonarCore.saveBlob(
             CHAT_SNAPSHOT_BLOB_KEY,
-            encodeChatSnapshot(chats, chatSnapshotMessagesByChat, chatSnapshotLatestByChat),
+            encodeChatSnapshot(
+                chats,
+                chatSnapshotMessagesByChat,
+                snapshotLatestAfterHistoricalFolds(
+                    chatSnapshotLatestByChat,
+                    historicalFoldMap,
+                    opened,
+                    pane,
+                ),
+                includeIsDirect = includeIsDirect,
+            ),
         )
     }
 
@@ -11878,21 +17365,64 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun refreshChatsInner() {
         val previousOrder = chats.map { it.id }
-        val loadedChats = SonarCore.chats()
-        val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
+        val loadedChats = runCatching { SonarCore.chats() }.getOrNull()
+        val trustedListing = trustedChatListing(
+            loaded = loadedChats,
+            sessionReady = localCoreReady || started,
+        )
+        val loadedOrCached = chatListingOrCached(trustedListing, chats)
+        // Rediscover hist→live from FFI before first paint. After nsec restore
+        // the host blob was wiped (previous account) and family walks would
+        // otherwise miss the restored sidecar for one refresh cycle.
+        rememberHistoricalFolds(previousOrder.toSet(), loadedOrCached.mapTo(hashSetOf()) { it.id })
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
+        val localChats = collapsedFoldedSnapshotChats(
+            loadedOrCached,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
-        val summaries = if (localChats.isEmpty()) emptyList() else runCatching {
-            SonarCore.conversationSummaries()
-        }.getOrDefault(emptyList())
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
+        val existingMessages = promotedFoldedSnapshotMessages(
+            previousIds = previousOrder.toSet(),
+            currentIds = activeIds,
+            messagesByChat = chatSnapshotMessagesByChat,
+            liveFoldTarget = liveFoldTarget,
+        )
+        val existingLatest = snapshotLatestAfterHistoricalFolds(
+            promotedFoldedValues(
+                previousIds = previousOrder.toSet(),
+                currentIds = activeIds,
+                values = chatSnapshotLatestByChat,
+                liveFoldTarget = liveFoldTarget,
+            ),
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        val summaries = if (localChats.isEmpty()) {
+            emptyList()
+        } else {
+            runCatching { SonarCore.conversationSummaries() }.getOrNull()
+        }
+        rememberConversationSummaryIndex(summaries)
         val pages = if (localChats.isEmpty()) emptyList() else runCatching {
                 SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
         }.getOrDefault(emptyList())
+        // Failed probe must still mint preview from the remounted cache
+        // (iOS keeps `conversationSummariesByGroup`). `orEmpty()` dropped
+        // hist `latestContent` and left process-death home on "Tap to open".
         val hydration = hydrateLocalConversationRows(
             activeChatIds = activeIds,
-            existingMessagesByChat = chatSnapshotMessagesByChat,
-            existingLatestByChat = chatSnapshotLatestByChat,
-            summaries = summaries,
+            existingMessagesByChat = existingMessages,
+            existingLatestByChat = existingLatest,
+            summaries = conversationSummaryByChat.values.toList(),
             pages = pages,
+            historicalFolds = historicalFoldMap,
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
         )
 
         // Publish one coherent local snapshot. Previously `chats = loadedChats`
@@ -11901,20 +17431,517 @@ class SonarAppState(private val scope: CoroutineScope) {
         // That two-step hydrate was the visible startup reorder.
         chatSnapshotMessagesByChat = hydration.messagesByChat
         chatSnapshotLatestByChat = hydration.latestByChat
+        // Assign the snapshot first so `expectedNewestTsForOpenChat` can
+        // max hydration latest with a kept index `latest_at`. A failed
+        // summaries probe leaves `hydration.latestByChat` at snapshot 0
+        // while the remounted hist newest is still in the cache — using
+        // hydration alone sank the recovered row (iOS `latestAt`).
         chats = orderChatsByLocalRecency(
             chats = localChats,
-            latestSecs = { hydration.latestByChat[it] ?: 0L },
+            latestSecs = ::expectedNewestTsForOpenChat,
             previousOrder = previousOrder,
         )
-        persistChatSnapshot()
+        val listedIds = chats.mapTo(hashSetOf()) { it.id }
+        promoteFoldedPaymentActivitiesFromFolds()
+        promoteFoldedMutes(previousOrder.toSet(), listedIds)
+        promoteFoldedComposerState(previousOrder.toSet(), listedIds)
+        promoteFoldedCallLogs(previousOrder.toSet(), listedIds)
+        promoteFoldedVerified(previousOrder.toSet(), listedIds)
+        promoteFoldedScanState(previousOrder.toSet(), listedIds)
+        promoteFoldedPendingEchoes(previousOrder.toSet(), listedIds)
+        promoteFoldedInFlightSends(previousOrder.toSet(), listedIds)
+        promoteFoldedPendingMediaPreviews()
+        promoteFoldedRetainedTranscripts(previousOrder.toSet(), listedIds)
+        if (shouldPersistChatListing(trustedListing)) {
+            persistChatSnapshot()
+        }
         refreshUnreadCounts()
         for (c in chats) {
             c.members.forEach {
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
             }
         }
-        groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
+        groupInvites = pendingInvitesOrCached(
+            loaded = runCatching { SonarCore.pendingGroupInvites() }.getOrNull(),
+            cached = groupInvites,
+        )
         resolvePendingMarmotChats()
+        remountFoldedOpenChat()
+        adoptOpenChatTitleIfListed()
+    }
+
+    /** Compose captures `Screen.Chat.name` at push. After `chats()` lists the
+     *  remapped live row, replace a stub "Group chat" title. iOS derives the
+     *  title from `marmot.groups` each render, so it does not need this. */
+    private fun adoptOpenChatTitleIfListed() {
+        val open = screen as? Screen.Chat ?: return
+        val next = adoptedListedChatTitle(open.id, open.name, chats, ::chatTitle) ?: return
+        stack = stack.map { s ->
+            if (s is Screen.Chat && s.id == open.id) s.copy(name = next) else s
+        }
+    }
+
+    private fun promoteFoldedMutes(previousIds: Set<String>, currentIds: Set<String>) {
+        val next = promotedFoldedMutes(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            mutes = mutedUntilByChat,
+            liveFoldTarget = ::resolvedLiveFoldTarget,
+        )
+        if (next != mutedUntilByChat) {
+            mutedUntilByChat = next
+            persistMutes()
+        }
+    }
+
+    private fun promoteFoldedComposerState(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
+        val nextDrafts = promotedFoldedComposerDrafts(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            drafts = composerDrafts.toMap(),
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextDrafts != composerDrafts.toMap()) {
+            for ((id, text) in nextDrafts) {
+                composerDrafts[id] = text
+            }
+        }
+        val nextReplies = promotedFoldedComposerReplies(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            replies = composerReplyByChat.toMap(),
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextReplies != composerReplyByChat.toMap()) {
+            for ((id, reply) in nextReplies) {
+                composerReplyByChat[id] = reply
+            }
+        }
+    }
+
+    private fun promoteFoldedScanState(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
+        val nextMarks = promotedFoldedScanMarks(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            watermarks = scanWatermark.toMap(),
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextMarks != scanWatermark) {
+            scanWatermark.clear()
+            scanWatermark.putAll(nextMarks)
+        }
+        val nextLatest = promotedFoldedValues(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            values = notificationLatestSecs.toMap(),
+            liveFoldTarget = liveFoldTarget,
+            preferExisting = { false },
+        ).mapValues { (id, incoming) ->
+            maxOf(notificationLatestSecs[id] ?: incoming, incoming)
+        }
+        if (nextLatest != notificationLatestSecs) {
+            notificationLatestSecs.clear()
+            notificationLatestSecs.putAll(nextLatest)
+        }
+        val nextSeen = promotedFoldedSeenMessageIds(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            seenByChat = notificationSeenMessageIds.mapValues { it.value.toSet() },
+            liveFoldTarget = liveFoldTarget,
+        )
+        for ((id, ids) in nextSeen) {
+            val seen = notificationSeenMessageIds.getOrPut(id) { LinkedHashSet() }
+            seen.addAll(ids)
+        }
+        val nextStaged = promotedFoldedPendingMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = stagedChangedPages,
+            liveFoldTarget = liveFoldTarget,
+            idOf = { it.id },
+        )
+        if (nextStaged != stagedChangedPages) {
+            stagedChangedPages.clear()
+            stagedChangedPages.putAll(nextStaged)
+        }
+        val nextFailed = promotedFoldedValues(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            values = failedChangedPageReads.associateWith { true },
+            liveFoldTarget = liveFoldTarget,
+        ).keys
+        if (nextFailed != failedChangedPageReads) {
+            failedChangedPageReads.clear()
+            failedChangedPageReads.addAll(nextFailed)
+        }
+    }
+
+    private fun promoteFoldedVerified(previousIds: Set<String>, currentIds: Set<String>) {
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val recovered = recoveredVerifiedIdsFromFolds(
+            folds = historicalFoldMap.toMap(),
+            verifiedIds = verifiedChatIds.toSet(),
+            historicalBlobVerified = { id -> SonarCore.loadBlob("verified.$id") == "1" },
+            openedConversationId = opened,
+            openedConversationPaneId = pane,
+        )
+        val next = promotedFoldedVerifiedIds(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            verifiedIds = recovered,
+            liveFoldTarget = ::resolvedLiveFoldTarget,
+        )
+        if (next == verifiedChatIds) return
+        for (id in next - verifiedChatIds) {
+            persistVerifiedId(id)
+        }
+        verifiedVersion++
+        payVersion++
+    }
+
+    private fun promoteFoldedCallLogs(previousIds: Set<String>, currentIds: Set<String>) {
+        val next = promotedFoldedCallLogs(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            callLogs = callLogs.mapValues { it.value.toList() },
+            liveFoldTarget = ::resolvedLiveFoldTarget,
+        )
+        if (next == callLogs.mapValues { it.value.toList() }) return
+        for ((id, records) in next) {
+            callLogs[id] = records.toMutableList()
+        }
+        callVersion++
+    }
+
+    private fun promoteFoldedPendingEchoes(previousIds: Set<String>, currentIds: Set<String>) {
+        val next = promotedFoldedPendingMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = pendingSendEchoes.mapValues { it.value.toList() },
+            liveFoldTarget = ::resolvedLiveFoldTarget,
+            idOf = { it.id },
+        )
+        if (next != pendingSendEchoes.mapValues { it.value.toList() }) {
+            pendingSendEchoes.clear()
+            for ((id, echoes) in next) {
+                if (echoes.isNotEmpty()) pendingSendEchoes[id] = echoes.toMutableList()
+            }
+        }
+        val nextTrill = promotedFoldedValues(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            values = trillCooldownUntilMs,
+            liveFoldTarget = ::resolvedLiveFoldTarget,
+        )
+        if (nextTrill != trillCooldownUntilMs) {
+            trillCooldownUntilMs = nextTrill
+        }
+    }
+
+    /** In-flight media / pending-group queues stay on the hidden 0.8 id when
+     *  fold lands after the user leaves. Echoes already promote above; these
+     *  queues must move too or Send finishes against a chat FFI no longer lists. */
+    private fun promoteFoldedInFlightSends(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
+        val nextUploads = promotedFoldedPendingMediaUploads(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            uploads = pendingMediaUploads.mapValues { it.value.toList() },
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextUploads != pendingMediaUploads.mapValues { it.value.toList() }) {
+            pendingMediaUploads.clear()
+            for ((id, rows) in nextUploads) {
+                if (rows.isNotEmpty()) pendingMediaUploads[id] = rows.toMutableList()
+            }
+        }
+        val nextGroupSends = promotedFoldedPendingMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = pendingMarmotGroupSends.mapValues { it.value.toList() },
+            liveFoldTarget = liveFoldTarget,
+            idOf = { it.echoId },
+        )
+        if (nextGroupSends != pendingMarmotGroupSends.mapValues { it.value.toList() }) {
+            pendingMarmotGroupSends.clear()
+            for ((id, rows) in nextGroupSends) {
+                if (rows.isNotEmpty()) pendingMarmotGroupSends[id] = rows.toMutableList()
+            }
+        }
+    }
+
+    /** FFI `groups()` hides a folded 0.8 room. If the user is sitting in that
+     *  transcript — or in group-info / contact-profile / an in-flight call on
+     *  that id — swap the nav id to the live 0.9 sibling so member/title
+     *  lookups keep working. In-flight send closures keep the historical id
+     *  via [transcriptSessionAliases]. */
+    private fun remountFoldedOpenChat() {
+        val listed = chats.mapTo(hashSetOf()) { it.id }
+        fun liveFor(id: String) = remountFoldedOpenChatId(
+            openChatId = id,
+            listedChatIds = listed,
+            liveFoldTarget = resolvedLiveFoldTarget(id),
+        )
+        val open = stack.filterIsInstance<Screen.Chat>().firstOrNull { liveFor(it.id) != it.id }
+        if (open != null) {
+            val live = liveFor(open.id)
+            val liveChat = chats.firstOrNull { it.id == live }
+            ?: notificationOpenChat(
+                live,
+                chats,
+                historicalFoldMap,
+                openedConversationId = live,
+                openedConversationPaneId = open.id,
+            )
+        moveSendEchoes(open.id, live)
+        trillCooldownUntilMs = remountFoldedOpenValues(
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+            values = trillCooldownUntilMs,
+        )
+        retainedTranscriptByChat[open.id]?.let { retainedTranscriptByChat[live] = it }
+        retainedTranscriptByChat.remove(open.id)
+        val historicalWindow = transcriptWindows[open.id]
+        val liveWindow = transcriptWindows[live]
+        if (historicalWindow != null && historicalWindow.rows.isNotEmpty()) {
+            transcriptWindows[live] = TranscriptGroupWindow(
+                rows = mergedFoldedMessageLists(
+                    historicalWindow.rows,
+                    liveWindow?.rows.orEmpty(),
+                ) { it.id },
+                hasMore = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.hasMore,
+                    liveHasMore = liveWindow?.hasMore == true,
+                ),
+                loadingOlder = liveWindow?.loadingOlder == true,
+                pinnedToOlderEdge = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.pinnedToOlderEdge,
+                    liveHasMore = liveWindow?.pinnedToOlderEdge == true,
+                ),
+            )
+        }
+        val historicalCanonical = freshCanonicalByGroup[open.id].orEmpty()
+        if (historicalCanonical.isNotEmpty()) {
+            freshCanonicalByGroup[live] = mergedFoldedMessageLists(
+                historicalCanonical,
+                freshCanonicalByGroup[live].orEmpty(),
+            ) { it.id }
+        }
+        if (pendingMediaPreviews.any { it.chatId == open.id }) {
+            pendingMediaPreviews = pendingMediaPreviews.map { preview ->
+                preview.copy(chatId = remountFoldedOpenId(listOf(open.id), live, preview.chatId))
+            }
+        }
+        if (open.id in pendingMediaUploads) {
+            val remountedUploads = remountFoldedPendingMediaUploads(
+                historical = open.id,
+                live = live,
+                uploads = pendingMediaUploads,
+            )
+            pendingMediaUploads.clear()
+            remountedUploads.forEach { (id, rows) ->
+                pendingMediaUploads[id] = rows.toMutableList()
+            }
+        }
+        hydratedTranscripts = remountMarksTranscriptHydrated(
+            historicalId = open.id,
+            liveId = live,
+            hydratedIds = hydratedTranscripts,
+        )
+        openChatUnread[open.id]?.let { openChatUnread = openChatUnread - open.id + (live to it) }
+        openChatUnreadAnchor[open.id]?.let { openChatUnreadAnchor = openChatUnreadAnchor - open.id + (live to it) }
+        openChatJumpMessageId = remountFoldedOpenValues(
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+            values = openChatJumpMessageId,
+        )
+        val remountedDrafts = remountComposerDrafts(
+            drafts = composerDrafts.toMap(),
+            historicalKeys = listOf(open.id),
+            liveKeys = listOf(live),
+        )
+        if (remountedDrafts != composerDrafts.toMap()) {
+            remountedDrafts.forEach { (id, text) -> composerDrafts[id] = text }
+        }
+        composerReplyByChat[open.id]?.let { reply ->
+            if (live !in composerReplyByChat) composerReplyByChat[live] = reply
+        }
+        callLogs[open.id]?.takeIf { it.isNotEmpty() }?.let { historical ->
+            val merged = dedupeCallRecordsLastWins(historical + callLogs[live].orEmpty())
+            callLogs[live] = merged.toMutableList()
+            callLogs.remove(open.id)
+            callVersion++
+        }
+        PaymentActivityStore.remountPeerKeys(listOf(open.id), live)
+        if (open.id in recoveredChatNeedsUpdate || live in recoveredChatNeedsUpdate) {
+            recoveredChatNeedsUpdate = remountClearsRecoveredWaitingFlag(
+                recoveredChatNeedsUpdate,
+                open.id,
+                live,
+            )
+        }
+        if (open.id in verifiedChatIds && live !in verifiedChatIds) {
+            persistVerifiedId(live)
+            verifiedVersion++
+            payVersion++
+        }
+        if (activeTranscriptChatId == open.id || open.id in transcriptSessionAliases) {
+            transcriptSessionAliases = transcriptSessionAliases + open.id + live
+            activeTranscriptChatId = live
+        }
+        val remountedMutes = promotedFoldedMutesFromFolds(
+            mutedUntilByChat,
+            historicalFoldMap,
+            openedConversationId = live,
+            openedConversationPaneId = open.id,
+        )
+        if (remountedMutes != mutedUntilByChat) {
+            mutedUntilByChat = remountedMutes
+            persistMutes()
+        }
+        promoteFoldedPaymentActivitiesFromFolds()
+        promoteFoldedPendingMediaPreviews()
+        // Hist-only: live must still newest-page hidden siblings.
+        // iOS also suppresses live because `onAppear` re-runs `openedDM`.
+        suppressOpenedHydrateIds = suppressOpenedHydrateIds + remountOpeningHydrateKeys(
+            openId = open.id,
+            groupId = open.id,
+            liveId = open.id,
+            liveGroupId = open.id,
+        )
+        if (historicalWindow?.pinnedToOlderEdge == true) {
+            conversationPinnedToOlderEdge = true
+        }
+        stack = stack.map { s ->
+            if (s is Screen.Chat && s.id == open.id) {
+                s.copy(id = live, name = chatTitle(liveChat))
+            } else {
+                s
+            }
+        }
+        // openedDM / openChat cleared hist-only before this remount
+        // pair existed. Live shade from a background tap then stays
+        // up while the user is already in the recovered room.
+        // iOS remount hop + willPresent use the same remount family.
+        clearNotificationsForChat(live)
+        // iOS remount hop calls markMarmotGroupsRead after
+        // rememberRemountPair. conversationChanged can race before
+        // this hop, so live unread stays on the home row.
+        val (opened, pane) = remountPairForOpenChat(live)
+        markGroupsRead(
+            transcriptSourceIds(
+                live,
+                directMarmotChatIds(live),
+                historicalFoldMap,
+                opened,
+                pane,
+            ).ifEmpty { listOf(live) },
+        )
+        // iOS remount calls refreshWhenConnected on the live sibling.
+        // Opening the recovered 0.8 id catch-up'd a group FFI no longer lists.
+        if (live.isNotBlank()) {
+            scope.launch { runCatching { SonarCore.preferCatchupGroup(live) } }
+        }
+        }
+        val nextStack = remountFoldedNavStack(stack, ::liveFor)
+        if (nextStack != stack) stack = nextStack
+        activeCall?.let { call ->
+            val live = liveFor(call.chatId)
+            if (live != call.chatId) activeCall = call.copy(chatId = live)
+        }
+        pageHiddenFoldFamilyForOpenLiveChat()
+    }
+
+    /** Persist-folds remounts hist onto an already-open live transcript
+     *  without swapping the nav id or re-running openChat. Newest-page
+     *  the hidden sibling — iOS `pageUnpagedHiddenFoldFamily`. */
+    private fun pageHiddenFoldFamilyForOpenLiveChat() {
+        val sc = screen as? Screen.Chat ?: return
+        val familyIds = transcriptGroupIds(sc.id)
+        val (opened, pane) = remountPairForOpenChat(sc.id)
+        if (!shouldPageHiddenFoldFamilyForOpenLive(
+                sc.id,
+                historicalFoldMap,
+                pagedFoldFamilyGroupIds(freshCanonicalByGroup.keys),
+                familyIds,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        ) return
+        val chatId = sc.id
+        scope.launch {
+            // Mesh route ids are not Marmot group ids — use the same
+            // family merge as openDm (`localTranscriptRowsForChat`).
+            val merged = localTranscriptRowsForChat(chatId, transcriptGeneration)
+            if (chatId !in transcriptSessionChatIds() ||
+                (screen as? Screen.Chat)?.id !in transcriptSessionChatIds()
+            ) return@launch
+            setCurrentVisibleMessages(
+                chatId,
+                withSendEchoes(chatId, mergePendingMediaUploads(chatId, merged)),
+            )
+        }
+    }
+
+    /** Leave-paint / scroll windows stay on the hidden 0.8 id when fold lands
+     *  after the user already left. Reopen of the live row must paint that
+     *  frame immediately — iOS promotes `messagesByGroup` the same way. */
+    private fun promoteFoldedRetainedTranscripts(previousIds: Set<String>, currentIds: Set<String>) {
+        val liveFoldTarget = { id: String -> resolvedLiveFoldTarget(id) }
+        val nextRetained = promotedFoldedSnapshotMessages(
+            previousIds = previousIds,
+            currentIds = currentIds,
+            messagesByChat = retainedTranscriptByChat,
+            liveFoldTarget = liveFoldTarget,
+        )
+        if (nextRetained != retainedTranscriptByChat) {
+            retainedTranscriptByChat.clear()
+            retainedTranscriptByChat.putAll(nextRetained)
+        }
+        for (historical in previousIds + transcriptWindows.keys) {
+            if (historical in currentIds) continue
+            val live = liveFoldTarget(historical) ?: continue
+            if (live !in currentIds) continue
+            val historicalWindow = transcriptWindows[historical] ?: continue
+            if (historicalWindow.rows.isEmpty()) continue
+            val liveWindow = transcriptWindows[live]
+            transcriptWindows[live] = TranscriptGroupWindow(
+                rows = mergedFoldedMessageLists(
+                    historicalWindow.rows,
+                    liveWindow?.rows.orEmpty(),
+                ) { it.id },
+                hasMore = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.hasMore,
+                    liveHasMore = liveWindow?.hasMore == true,
+                ),
+                loadingOlder = liveWindow?.loadingOlder == true,
+                pinnedToOlderEdge = foldedSiblingHasMore(
+                    historicalHasMore = historicalWindow.pinnedToOlderEdge,
+                    liveHasMore = liveWindow?.pinnedToOlderEdge == true,
+                ),
+            )
+        }
+    }
+
+    /** Preview sheet can stay up across a fold that remounts the open chat,
+     *  or after a notification tap already swapped the id to live. Empty
+     *  persist-folds still walk the remount pair. */
+    private fun promoteFoldedPendingMediaPreviews() {
+        if (pendingMediaPreviews.isEmpty()) return
+        val (opened, pane) = remountPairForOpenChat(activeTranscriptChatId ?: "")
+        val next = pendingMediaPreviews.map { preview ->
+            preview.copy(
+                chatId = promotedFoldedPendingMediaPreviewChatId(
+                    preview.chatId,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                ),
+            )
+        }
+        if (next != pendingMediaPreviews) pendingMediaPreviews = next
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)
@@ -11945,21 +17972,64 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // immediately so a call rings / pay processes / the open
                 // transcript updates without waiting for the heartbeat.
                 refreshChats()
+                // Remainder / fold-alias ticks name the hidden 0.8 id. Stage
+                // and process against the listed live sibling so housekeeping
+                // cannot drop the page and in-flight call/pay rows land on
+                // a chat FFI still lists.
+                val listedIds = chats.mapTo(hashSetOf()) { it.id }
+                val (opened, pane) = remountPairForOpenChat(groupIdHex)
+                val targetId = conversationChangeTargetId(
+                    groupIdHex,
+                    listedIds,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
+                val refreshIds = conversationRefreshIds(
+                    groupIdHex,
+                    listedIds,
+                    historicalFoldMap,
+                    openedConversationId = opened,
+                    openedConversationPaneId = pane,
+                )
+                val cachedIds = chatSnapshotMessagesByChat.keys
+                for (refreshId in refreshIds) {
+                    if (refreshId == targetId) continue
+                    if (!conversationRefreshShouldLoadPage(
+                            refreshId,
+                            listedIds,
+                            cachedIds,
+                            groupIdHex,
+                            historicalFoldMap,
+                            openedConversationId = opened,
+                            openedConversationPaneId = pane,
+                        )
+                    ) {
+                        continue
+                    }
+                    val siblingPage = runCatching {
+                        SonarCore.messagesPage(refreshId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+                    }.getOrNull() ?: continue
+                    val existing = chatSnapshotMessagesByChat[refreshId].orEmpty()
+                    if (siblingPage.isEmpty() && existing.isNotEmpty()) continue
+                    chatSnapshotMessagesByChat = chatSnapshotMessagesByChat + (refreshId to siblingPage)
+                }
                 val freshChangedMessages = runCatching {
-                    SonarCore.messagesPage(groupIdHex, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+                    SonarCore.messagesPage(targetId, BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
                 }.getOrNull()
                 val changedMessages = if (freshChangedMessages == null ||
                     (!started && freshChangedMessages.isEmpty())
                 ) {
-                    chatSnapshotMessagesByChat[groupIdHex]
+                    chatSnapshotMessagesByChat[targetId]
                         .orEmpty()
+                        .ifEmpty { chatSnapshotMessagesByChat[groupIdHex].orEmpty() }
                         .takeLast(BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
                 } else {
                     freshChangedMessages
                 }
-                val visibleChangedMessages = visibleMessagesForChat(groupIdHex, changedMessages)
-                processPayLines(groupIdHex, visibleChangedMessages)
-                processCallLines(groupIdHex, visibleChangedMessages)
+                val visibleChangedMessages = visibleMessagesForChat(targetId, changedMessages)
+                processPayLines(targetId, visibleChangedMessages)
+                processCallLines(targetId, visibleChangedMessages)
                 // Hand the page to housekeeping before requesting it. That pass
                 // owns the shared scan watermark so call/pay and notification
                 // consumers cannot race by independently marking work complete.
@@ -11967,17 +18037,53 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // but never counts as a successful read of this change. Only a
                 // fresh core page may advance the shared scan watermark.
                 if (freshChangedMessages != null) {
-                    stagedChangedPages[groupIdHex] = freshChangedMessages
-                    failedChangedPageReads.remove(groupIdHex)
+                    stagedChangedPages[targetId] = freshChangedMessages
+                    failedChangedPageReads.remove(targetId)
+                    if (targetId != groupIdHex) {
+                        stagedChangedPages.remove(groupIdHex)
+                        failedChangedPageReads.remove(groupIdHex)
+                    }
                 } else {
                     // Supersede any older staged page. The next housekeeping
                     // pass must read the newer invalidation from core before it
                     // is allowed to advance this chat's watermark.
-                    stagedChangedPages.remove(groupIdHex)
-                    failedChangedPageReads.add(groupIdHex)
+                    stagedChangedPages.remove(targetId)
+                    failedChangedPageReads.add(targetId)
+                    if (targetId != groupIdHex) stagedChangedPages.remove(groupIdHex)
+                }
+                (screen as? Screen.GroupInfo)?.let { info ->
+                    val (opened, pane) = remountPairForOpenChat(info.chatId)
+                    if (groupInfoShouldReloadPending(
+                            info.chatId,
+                            groupIdHex,
+                            historicalFoldMap,
+                            openedConversationId = opened,
+                            openedConversationPaneId = pane,
+                        ) ||
+                        groupInfoShouldReloadPending(
+                            info.chatId,
+                            targetId,
+                            historicalFoldMap,
+                            openedConversationId = opened,
+                            openedConversationPaneId = pane,
+                        )
+                    ) {
+                        groupInfoPendingRevision++
+                    }
                 }
                 (screen as? Screen.Chat)?.let { sc ->
-                    if (!isMeshChat(sc.id) && (sc.id == groupIdHex || isSameDirectMarmotChat(sc.id, groupIdHex))) {
+                    val (openedChat, paneChat) = remountPairForOpenChat(sc.id)
+                    if (!isMeshChat(sc.id) && (
+                        sc.id == groupIdHex ||
+                            isSameDirectMarmotChat(sc.id, groupIdHex) ||
+                            conversationsMatchFoldFamily(
+                                sc.id,
+                                groupIdHex,
+                                historicalFoldMap,
+                                openedConversationId = openedChat,
+                                openedConversationPaneId = paneChat,
+                            )
+                    )) {
                         val mergedMessages = marmotMessagesPageForChat(sc.id)
                         setCurrentVisibleMessages(
                             sc.id,
@@ -11985,12 +18091,31 @@ class SonarAppState(private val scope: CoroutineScope) {
                             processCalls = true,
                         )
                         // Viewing the chat: new arrivals must not leave a badge.
-                        markGroupsRead(directMarmotChatIds(sc.id))
-                    } else if (isMeshChat(sc.id)) {
-                        val peerId = peerIdForMarmotGroup(groupIdHex)
-                        if (peerId != null && sc.id == meshChatId(peerId)) {
-                            refreshOpenDm(peerId)
-                        }
+                        // Core mark_read walks the fold family; include both
+                        // ids here so viewing-suppress matches a remainder
+                        // tick that still names the hidden 0.8 sibling.
+                        markGroupsRead(
+                            (
+                                directMarmotChatIds(sc.id) +
+                                    foldFamilyIds(
+                                        sc.id,
+                                        historicalFoldMap,
+                                        openedConversationId = openedChat,
+                                        openedConversationPaneId = paneChat,
+                                    )
+                                ).distinct(),
+                        )
+                    } else if (isMeshChat(sc.id) && conversationChangeShouldRefreshOpenMesh(
+                            openMeshChatId = sc.id,
+                            changedGroupId = groupIdHex,
+                            historicalFolds = historicalFoldMap,
+                            peerIdForGroup = { peerIdForMarmotGroup(it) },
+                            meshChatId = ::meshChatId,
+                            openedConversationId = openedChat,
+                            openedConversationPaneId = paneChat,
+                        )
+                    ) {
+                        refreshOpenDm(meshPeerId(sc.id))
                     }
                 }
                 // Fan the rest of the maintenance work (notifications, unread
@@ -12002,8 +18127,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private suspend fun refreshUnreadCounts() {
         // null = FFI failure — keep the current map (same guard as markGroupsRead).
         val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
-            ?: return
-        applyUnreadCounts(summaries)
+        if (!shouldApplyUnreadCounts(summaries)) return
+        applyUnreadCounts(requireNotNull(summaries))
     }
 
     private fun applyUnreadCounts(summaries: List<SonarConversationSummary>) {
@@ -12022,7 +18147,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         unreadSuppressGroupIds.clear()
         unreadSuppressGroupIds.addAll(pruned)
-        unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds)
+        val (opened, pane) = remountPairForOpenChat(
+            (screen as? Screen.Chat)?.id ?: activeTranscriptChatId ?: "",
+        )
+        unreadByChat = if (summaries.isEmpty()) {
+            emptyMap()
+        } else {
+            remountFoldedUnread(
+                unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds),
+                unreadByChat,
+                historicalFoldMap,
+                openedConversationId = opened,
+                openedConversationPaneId = pane,
+            )
+        }
+        rememberConversationSummaryIndex(summaries)
     }
 
     /** Request a housekeeping pass. Conflated: many requests within one in-flight
@@ -12126,7 +18265,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val summaryByChat = summaries.associateBy { it.groupIdHex }
         // Only publish unread on a successful probe — getOrDefault(emptyList())
         // on failure would wipe every badge until the next cycle.
-        if (summariesResult.isSuccess) applyUnreadCounts(summaries)
+        if (shouldApplyUnreadCounts(summariesResult.getOrNull())) applyUnreadCounts(summaries)
         // Incremental scan: only chats whose newest ts moved past the watermark
         // need a page fetch + ☎CALL / pay re-scan. Everything else is skipped —
         // this replaces the old O(chats) messagesPage()+re-parse every 4 s.
@@ -12225,19 +18364,27 @@ class SonarAppState(private val scope: CoroutineScope) {
             wnMsgs += summaryCount ?: ms.size
             processCallLines(c.id, visibleMs)
             processPayLines(c.id, visibleMs)
-            if (c.members.size > 2) {
+            if (!c.isDirect) {
                 for (m in visibleMs) {
                     if (!m.mine && m.senderNpub.isNotBlank()) senders.add(m.senderNpub)
                 }
             }
             scanWatermark[c.id] = latestByChat[c.id] ?: ScanMark(0L, 0L)
         }
-        // Prune watermarks for chats that no longer exist.
-        if (scanWatermark.size > latestByChat.size) {
-            scanWatermark.keys.retainAll(latestByChat.keys)
-        }
-        stagedChangedPages.keys.retainAll(latestByChat.keys)
-        failedChangedPageReads.retainAll(latestByChat.keys)
+        // Prune watermarks for chats that no longer exist, but keep hidden
+        // 0.8 siblings so a missed promote cannot drop recovered history
+        // into "unseen" and re-banner it.
+        val remountChat = activeTranscriptChatId
+        val (opened, pane) = remountChat?.let { remountPairForOpenChat(it) } ?: (null to null)
+        val retainScanIds = retainedScanChatIds(
+            latestByChat.keys,
+            historicalFoldMap,
+            opened,
+            pane,
+        )
+        scanWatermark.keys.retainAll(retainScanIds)
+        stagedChangedPages.keys.retainAll(retainScanIds)
+        failedChangedPageReads.retainAll(retainScanIds)
         senders.forEach { ensureProfile(it) }
         if (chats.size != lastWnGroups || wnMsgs != lastWnMsgs) {
             sonarLog("SonarWN", "White Noise: ${chats.size} group(s), $wnMsgs message(s)")

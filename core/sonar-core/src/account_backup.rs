@@ -6,7 +6,7 @@
 //!
 //! Blossom sees ciphertext only (`application/vnd.sonar.account-backup-v1`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,7 +28,9 @@ use crate::conversation_index::index_db_path_for_db;
 use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"SONARBAK";
-const FORMAT_VERSION: u32 = 1;
+/// v1: db + optional index. v2: plus recovered-chat sidecars / `*.mdk08.bak`.
+const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION_V1: u32 = 1;
 const HKDF_SALT: &[u8] = b"sonar-backup";
 const HKDF_INFO: &[u8] = b"sonar-account-backup-v1";
 const NONCE_LEN: usize = 12;
@@ -48,9 +50,11 @@ use crate::client::DEFAULT_BLOSSOM_SERVER;
 /// restore finds it by LISTING one host, so moving the default would otherwise
 /// orphan every backup already sitting on the old one.
 const LEGACY_BACKUP_BLOSSOM_SERVERS: &[&str] = &["https://nostr.download"];
-/// Soft ceiling for a downloaded backup (DB + index). Far above typical chats;
-/// guards memory against a malicious Blossom response.
-const MAX_BACKUP_BYTES: usize = 200 * 1024 * 1024;
+/// Soft ceiling for a downloaded backup (DB + index + recovered-chat sidecars).
+/// After an MDK 0.8 migrate the quarantined bak can roughly double the blob
+/// while remainder is still pending. Far above typical chats; guards memory
+/// against a malicious Blossom response.
+const MAX_BACKUP_BYTES: usize = 400 * 1024 * 1024;
 
 /// Cap on the BUD-03 listing body. The listing is descriptors only — one small
 /// JSON object per blob — so even a pathological account fits far under this,
@@ -536,7 +540,9 @@ pub fn record_backup_success(
     })
 }
 
-/// Total messages across every conversation in the local index.
+/// Total messages across published conversations in the local index.
+/// Folded 0.8 hist rows stay in the table after resume; summing them with
+/// the live sibling double-counts the Settings backup stats strip.
 fn count_indexed_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
     let key: [u8; 32] = hex::decode(db_key_hex).ok()?.try_into().ok()?;
     let index = crate::conversation_index::ConversationIndex::open(
@@ -545,7 +551,111 @@ fn count_indexed_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
     )
     .ok()?;
     let summaries = index.summaries_ordered().ok()?;
-    Some(summaries.iter().map(|s| s.message_count).sum())
+    let folds = merge_preview_folds(
+        index.list_folds().unwrap_or_default(),
+        sidecar_string_map(db_path, crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX)
+            .into_iter()
+            .collect(),
+    );
+    let rows = remount_preview_summaries(
+        summaries,
+        &folds,
+        &dropped_group_hexes_on_disk(db_path),
+        &sidecar_string_map(db_path, crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX),
+    );
+    Some(rows.iter().map(|row| row.message_count).sum())
+}
+
+/// Index first; recovered-chat transcript sidecar if the index is missing
+/// or still empty (a backup taken after the 0.8 migrate, before connect
+/// seeded chat-list rows).
+fn count_restored_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
+    match count_indexed_messages(db_path, db_key_hex) {
+        Some(n) if n > 0 => Some(n),
+        _ => count_transcript_sidecar_messages(db_path),
+    }
+}
+
+fn count_transcript_sidecar_messages(db_path: &Path) -> Option<u64> {
+    let bytes = fs::read(sidecar_named(
+        db_path,
+        crate::marmot::TRANSCRIPT_FILE_SUFFIX,
+    ))
+    .ok()?;
+    let folds: Vec<(String, String)> =
+        sidecar_string_map(db_path, crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX)
+            .into_iter()
+            .collect();
+    count_transcript_bytes_remounted(&bytes, &folds, &dropped_group_hexes_on_disk(db_path))
+}
+
+fn count_transcript_bytes(bytes: &[u8]) -> Option<u64> {
+    count_transcript_bytes_remounted(bytes, &[], &HashSet::new())
+}
+
+fn count_transcript_bytes_remounted(
+    bytes: &[u8],
+    folds: &[(String, String)],
+    dropped: &HashSet<String>,
+) -> Option<u64> {
+    let keyed: HashMap<String, Vec<serde_json::Value>> = serde_json::from_slice(bytes).ok()?;
+    let hidden = folded_historical_hexes(folds);
+    let live_present = |live: &str| {
+        let live_key = preview_hex_key(live);
+        keyed.keys().any(|id| preview_hex_key(id) == live_key)
+    };
+    let mut total = 0u64;
+    for (id, msgs) in &keyed {
+        let hex = preview_hex_key(id);
+        if dropped.contains(&hex) {
+            continue;
+        }
+        if hidden.contains(&hex) {
+            let live = folds.iter().find_map(|(historical, live)| {
+                (preview_hex_key(historical) == hex).then_some(live.as_str())
+            });
+            if live.is_some_and(live_present) {
+                continue;
+            }
+        }
+        let mut n = msgs.len() as u64;
+        for (historical, live) in folds {
+            if preview_hex_key(live) != hex {
+                continue;
+            }
+            let hist_key = preview_hex_key(historical);
+            if let Some(hist_msgs) = keyed
+                .iter()
+                .find(|(other, _)| preview_hex_key(other) == hist_key)
+                .map(|(_, rows)| rows)
+            {
+                n += hist_msgs.len() as u64;
+            }
+        }
+        total += n;
+    }
+    Some(total)
+}
+
+fn sidecar_string_map(db_path: &Path, suffix: &str) -> HashMap<String, String> {
+    fs::read(sidecar_named(db_path, suffix))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn dropped_group_hexes_on_disk(db_path: &Path) -> HashSet<String> {
+    fs::read(sidecar_named(
+        db_path,
+        crate::marmot::DROPPED_GROUPS_FILE_SUFFIX,
+    ))
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok())
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|id| !id.is_empty())
+    .map(|id| id.to_ascii_lowercase())
+    .collect()
 }
 
 /// Wipe hook: remove a plaintext key sidecar left by builds that briefly wrote
@@ -659,6 +769,41 @@ pub fn wipe_backup_policy_for_db(db_path: &Path) {
             tracing::warn!(%e, path = %path.display(), "wipe backup policy failed");
         }
     }
+    wipe_backup_policy_tmps(&path);
+}
+
+/// Policy writes `{name}.{pid}.{secs}.tmp` then renames. A reset that only
+/// deletes the final file leaves the previous account's cadence / dirty
+/// state on disk for the next install on this path.
+fn wipe_backup_policy_tmps(path: &Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let prefix = format!("{name}.");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        if !(fname.starts_with(&prefix) && fname.ends_with(".tmp")) {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(entry.path()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    %e,
+                    path = %entry.path().display(),
+                    "wipe backup policy tmp failed"
+                );
+            }
+        }
+    }
 }
 
 /// Plaintext package before AEAD wrap.
@@ -667,6 +812,9 @@ pub struct AccountBackupPackage {
     pub db_key_hex: String,
     pub db_bytes: Vec<u8>,
     pub index_bytes: Option<Vec<u8>>,
+    /// Allow-listed host sidecars keyed by suffix (`.sonar-transcript.json`,
+    /// `.mdk08.bak`, …). Empty on v1 backups.
+    pub sidecar_files: Vec<(String, Vec<u8>)>,
 }
 
 /// Result of uploading a sealed backup to Blossom.
@@ -711,6 +859,22 @@ fn encode_plaintext(package: &AccountBackupPackage) -> Result<Vec<u8>> {
     out.extend_from_slice(&package.db_bytes);
     out.extend_from_slice(&(index.len() as u64).to_le_bytes());
     out.extend_from_slice(index);
+    out.extend_from_slice(&(package.sidecar_files.len() as u32).to_le_bytes());
+    for (name, bytes) in &package.sidecar_files {
+        if !sidecar_suffix_allowed(name) {
+            return Err(Error::InvalidInput(format!(
+                "backup sidecar suffix not allowed: {name}"
+            )));
+        }
+        let name_bytes = name.as_bytes();
+        if name_bytes.len() > 128 {
+            return Err(Error::InvalidInput("backup sidecar name too long".into()));
+        }
+        out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
     Ok(out)
 }
 
@@ -722,7 +886,7 @@ fn decode_plaintext(bytes: &[u8]) -> Result<AccountBackupPackage> {
         return Err(Error::InvalidInput("bad backup magic".into()));
     }
     let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_V1 {
         return Err(Error::InvalidInput(format!(
             "unsupported backup version {version}"
         )));
@@ -753,19 +917,189 @@ fn decode_plaintext(bytes: &[u8]) -> Result<AccountBackupPackage> {
     }
     let index_len = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as usize;
     off += 8;
-    if off + index_len != bytes.len() {
-        return Err(Error::InvalidInput("backup trailing bytes mismatch".into()));
+    if off + index_len > bytes.len() {
+        return Err(Error::InvalidInput("bad index payload in backup".into()));
     }
     let index_bytes = if index_len == 0 {
         None
     } else {
-        Some(bytes[off..].to_vec())
+        Some(bytes[off..off + index_len].to_vec())
+    };
+    off += index_len;
+    let sidecar_files = if version == FORMAT_VERSION_V1 {
+        if off != bytes.len() {
+            return Err(Error::InvalidInput("backup trailing bytes mismatch".into()));
+        }
+        Vec::new()
+    } else {
+        decode_sidecar_files(bytes, &mut off)?
     };
     Ok(AccountBackupPackage {
         db_key_hex,
         db_bytes,
         index_bytes,
+        sidecar_files,
     })
+}
+
+fn decode_sidecar_files(bytes: &[u8], off: &mut usize) -> Result<Vec<(String, Vec<u8>)>> {
+    if *off + 4 > bytes.len() {
+        return Err(Error::InvalidInput("truncated backup sidecar count".into()));
+    }
+    let count = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap()) as usize;
+    *off += 4;
+    if count > 16 {
+        return Err(Error::InvalidInput("backup sidecar count too large".into()));
+    }
+    let mut sidecar_files = Vec::with_capacity(count);
+    for _ in 0..count {
+        if *off + 2 > bytes.len() {
+            return Err(Error::InvalidInput("truncated backup sidecar name".into()));
+        }
+        let name_len = u16::from_le_bytes(bytes[*off..*off + 2].try_into().unwrap()) as usize;
+        *off += 2;
+        if name_len == 0 || name_len > 128 || *off + name_len > bytes.len() {
+            return Err(Error::InvalidInput("bad backup sidecar name".into()));
+        }
+        let name = std::str::from_utf8(&bytes[*off..*off + name_len])
+            .map_err(|e| Error::InvalidInput(format!("sidecar name utf8: {e}")))?
+            .to_string();
+        *off += name_len;
+        if !sidecar_suffix_allowed(&name) {
+            return Err(Error::InvalidInput(format!(
+                "backup sidecar suffix not allowed: {name}"
+            )));
+        }
+        if *off + 8 > bytes.len() {
+            return Err(Error::InvalidInput(
+                "truncated backup sidecar length".into(),
+            ));
+        }
+        let data_len = u64::from_le_bytes(bytes[*off..*off + 8].try_into().unwrap()) as usize;
+        *off += 8;
+        if *off + data_len > bytes.len() {
+            return Err(Error::InvalidInput("bad sidecar payload in backup".into()));
+        }
+        sidecar_files.push((name, bytes[*off..*off + data_len].to_vec()));
+        *off += data_len;
+    }
+    if *off != bytes.len() {
+        return Err(Error::InvalidInput("backup trailing bytes mismatch".into()));
+    }
+    Ok(sidecar_files)
+}
+
+fn backup_sidecar_suffixes() -> &'static [&'static str] {
+    &[
+        crate::marmot::TRANSCRIPT_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_DESCRIPTIONS_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_MEMBER_COUNTS_SUFFIX,
+        crate::mdk08_migrate::HISTORICAL_EXPORTER_SECRETS_SUFFIX,
+        crate::mdk08_migrate::MDK08_MIGRATED_MARKER_SUFFIX,
+        crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX,
+        crate::marmot::PARKED_INVITES_FILE_SUFFIX,
+        crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX,
+        crate::marmot::DROPPED_GROUPS_FILE_SUFFIX,
+        crate::outbox::OUTBOX_STATE_FILE_SUFFIX,
+        crate::marmot::SYNC_STATE_FILE_SUFFIX,
+        crate::mdk08_migrate::MDK08_BACKUP_SUFFIX,
+        "-wal.mdk08.bak",
+        "-shm.mdk08.bak",
+        "-journal.mdk08.bak",
+    ]
+}
+
+fn sidecar_suffix_allowed(name: &str) -> bool {
+    !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && backup_sidecar_suffixes()
+            .iter()
+            .any(|suffix| *suffix == name)
+}
+
+fn sidecar_named(db_path: &Path, suffix: &str) -> PathBuf {
+    let name = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("marmot.sqlite");
+    db_path.with_file_name(format!("{name}{suffix}"))
+}
+
+fn is_mdk08_bak_suffix(suffix: &str) -> bool {
+    suffix == crate::mdk08_migrate::MDK08_BACKUP_SUFFIX
+        || suffix == "-wal.mdk08.bak"
+        || suffix == "-shm.mdk08.bak"
+        || suffix == "-journal.mdk08.bak"
+}
+
+/// Pack the quarantined 0.8 file while leftover rows or bak metadata
+/// (pending welcomes / labeled media secrets) are still only in the bak.
+fn pack_mdk08_bak(db_path: &Path) -> bool {
+    crate::mdk08_migrate::bak_needed_for_backup(db_path)
+}
+
+fn read_backup_sidecars(db_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let include_bak = pack_mdk08_bak(db_path);
+    let mut files = Vec::new();
+    for suffix in backup_sidecar_suffixes() {
+        if is_mdk08_bak_suffix(suffix) && !include_bak {
+            continue;
+        }
+        let path = sidecar_named(db_path, suffix);
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .map_err(|e| Error::Storage(format!("read sidecar {}: {e}", path.display())))?;
+        files.push(((*suffix).to_string(), bytes));
+    }
+    Ok(files)
+}
+
+fn write_backup_sidecars(db_path: &Path, files: &[(String, Vec<u8>)]) -> Result<()> {
+    remove_backup_sidecars(db_path);
+    for (suffix, bytes) in files {
+        if !sidecar_suffix_allowed(suffix) {
+            return Err(Error::InvalidInput(format!(
+                "backup sidecar suffix not allowed: {suffix}"
+            )));
+        }
+        let path = sidecar_named(db_path, suffix);
+        fs::write(&path, bytes)
+            .map_err(|e| Error::Storage(format!("write sidecar {}: {e}", path.display())))?;
+    }
+    Ok(())
+}
+
+fn remove_backup_sidecars(db_path: &Path) {
+    for suffix in backup_sidecar_suffixes() {
+        let _ = fs::remove_file(sidecar_named(db_path, suffix));
+    }
+}
+
+fn promote_staged_sidecars_best_effort(db_path: &Path) {
+    let staged = staging_db_path(db_path);
+    for suffix in backup_sidecar_suffixes() {
+        let from = sidecar_named(&staged, suffix);
+        let to = sidecar_named(db_path, suffix);
+        if from.is_file() {
+            let _ = fs::remove_file(&to);
+            if let Err(e) = fs::rename(&from, &to) {
+                tracing::warn!(
+                    error = %e,
+                    "account restore: sidecar rename failed; main DB committed, staged sidecar kept"
+                );
+            }
+        } else if to.is_file() {
+            // Restored package omitted this file — drop leftover history from
+            // the outgoing account so a v1 blob cannot keep the previous
+            // install's recovered transcript.
+            let _ = fs::remove_file(&to);
+        }
+    }
 }
 
 /// AEAD-seal a package with a key derived from the account secret.
@@ -829,10 +1163,8 @@ fn checkpoint_sqlcipher_file(path: &Path, db_key_hex: &str) -> Result<()> {
     // Wrong SQLCipher keys often "succeed" as an empty DB — require user tables
     // before sealing so we never backup garbage under a bad key.
     verify_sqlcipher_opens(path, db_key_hex)?;
-    let conn = Connection::open(path)
+    let conn = open_sqlcipher_with_host_key(path, db_key_hex)
         .map_err(|e| Error::Storage(format!("backup checkpoint open {}: {e}", path.display())))?;
-    conn.execute_batch(&format!("PRAGMA key = \"x'{db_key_hex}'\";"))
-        .map_err(|e| Error::Storage(format!("backup checkpoint key: {e}")))?;
     // Inspect the busy column — execute_batch success does not mean TRUNCATE
     // finished if another connection still holds the WAL.
     let busy: i64 = conn
@@ -869,6 +1201,7 @@ pub fn read_account_backup_package(
         db_key_hex: db_key_hex.to_string(),
         db_bytes,
         index_bytes,
+        sidecar_files: read_backup_sidecars(db_path)?,
     })
 }
 
@@ -925,6 +1258,7 @@ fn remove_db_tree(db_path: &Path) {
         p.push(suffix);
         let _ = fs::remove_file(Path::new(&p));
     }
+    remove_backup_sidecars(db_path);
 }
 
 /// Write a restored package to disk. Parent dirs must exist. Caller must not
@@ -944,6 +1278,7 @@ pub fn write_account_backup_package(db_path: &Path, package: &AccountBackupPacka
         let index_path = index_db_path_for_db(db_path);
         fs::write(&index_path, index).map_err(|e| Error::Storage(format!("write index: {e}")))?;
     }
+    write_backup_sidecars(db_path, &package.sidecar_files)?;
     Ok(())
 }
 
@@ -984,6 +1319,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     if !staged.is_file() {
         // Already promoted (or never staged). Finish any leftover staged index.
         promote_staged_index_best_effort(db_path);
+        promote_staged_sidecars_best_effort(db_path);
         // Staging gone AND intent still set means a previous call renamed but
         // died before finishing cleanup, so the slot below may still be the
         // OUTGOING install's. Finish it here, gated on the intent marker: called
@@ -1023,6 +1359,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     // which is the narrower form of the bug this cleanup exists to prevent.
     drop_outgoing_key_package_slot(db_path);
     promote_staged_index_best_effort(db_path);
+    promote_staged_sidecars_best_effort(db_path);
     promote_staged_backup_policy_best_effort(db_path);
     // Drop leftover staging DB sidecars (index may remain if rename failed).
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -1052,7 +1389,10 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
 /// is cleared immediately afterwards.
 fn drop_outgoing_key_package_slot(db_path: &Path) {
     let live_slot = crate::marmot::key_package_slot_path_for(db_path);
-    for path in [crate::marmot::key_package_slot_tmp_path(&live_slot), live_slot] {
+    for path in [
+        crate::marmot::key_package_slot_tmp_path(&live_slot),
+        live_slot,
+    ] {
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1088,7 +1428,7 @@ fn stage_restored_backup_policy(staged_db: &Path, db_key_hex: &str, meta: Restor
         last_size_bytes: Some(meta.size_bytes),
         // Counted from the staged index, which is what the blob actually
         // contains — the live index at commit time has post-restore traffic.
-        last_message_count: count_indexed_messages(staged_db, db_key_hex),
+        last_message_count: count_restored_messages(staged_db, db_key_hex),
         ..BackupPolicy::default()
     };
     if let Err(e) = save_backup_policy_to_disk(staged_db, &restored) {
@@ -1169,26 +1509,43 @@ pub fn abort_staged_account_restore(db_path: &Path) {
     clear_restore_intent(db_path);
 }
 
-fn verify_sqlcipher_opens(path: &Path, db_key_hex: &str) -> Result<()> {
+fn sqlcipher_key_pragmas(db_key_hex: &str) -> [String; 2] {
+    [
+        format!("PRAGMA key = \"x'{db_key_hex}'\";"),
+        format!("PRAGMA key = '{db_key_hex}';"),
+    ]
+}
+
+fn sqlcipher_user_table_count(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Storage(format!("verify schema: {e}")))
+}
+
+fn open_sqlcipher_with_host_key(path: &Path, db_key_hex: &str) -> Result<Connection> {
     validate_db_key_hex(db_key_hex)?;
-    let conn = Connection::open(path)
-        .map_err(|e| Error::Storage(format!("verify open {}: {e}", path.display())))?;
-    conn.execute_batch(&format!("PRAGMA key = \"x'{db_key_hex}'\";"))
-        .map_err(|e| Error::Storage(format!("verify key: {e}")))?;
-    // Wrong SQLCipher keys often "succeed" as an empty DB — require user tables.
-    let table_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| Error::Storage(format!("verify schema: {e}")))?;
-    if table_count <= 0 {
-        return Err(Error::Storage(
-            "staged restore DB empty or wrong key".into(),
-        ));
+    let mut last_err = None;
+    for pragma in sqlcipher_key_pragmas(db_key_hex) {
+        let conn = Connection::open(path)
+            .map_err(|e| Error::Storage(format!("open {}: {e}", path.display())))?;
+        if let Err(e) = conn.execute_batch(&pragma) {
+            last_err = Some(Error::Storage(format!("key: {e}")));
+            continue;
+        }
+        match sqlcipher_user_table_count(&conn) {
+            Ok(count) if count > 0 => return Ok(conn),
+            Ok(_) => last_err = Some(Error::Storage("empty or wrong key".into())),
+            Err(e) => last_err = Some(e),
+        }
     }
-    Ok(())
+    Err(last_err.unwrap_or_else(|| Error::Storage("sqlcipher open failed".into())))
+}
+
+fn verify_sqlcipher_opens(path: &Path, db_key_hex: &str) -> Result<()> {
+    open_sqlcipher_with_host_key(path, db_key_hex).map(|_| ())
 }
 
 /// Boot-time recovery: if `*.sonar-restore-staging` remains and `db_key_hex`
@@ -1201,6 +1558,7 @@ pub fn reconcile_staged_account_restore(db_path: &Path, db_key_hex: &str) -> Res
     if !staged.is_file() {
         // Crash after DB rename / before index rename — finish the index only.
         promote_staged_index_best_effort(db_path);
+        promote_staged_sidecars_best_effort(db_path);
         // And the stats, under the same intent gate commit uses: the promotion
         // is the last thing commit does, so this window is exactly where a
         // restored install would otherwise keep reporting "Never" forever and
@@ -1414,12 +1772,15 @@ fn backup_blob_url(base: &Url, sha256: &Sha256Hash) -> Result<Url> {
 ///
 /// `Content-Length` is the server's claim about a body it has not sent yet, so
 /// it must never size the allocation. Bounding the hint by `MAX_BACKUP_BYTES`
-/// is not enough: a hostile host can advertise 200 MiB and then send nothing,
-/// and the phone is out of memory before the first byte arrives. Reserve a
-/// small fixed amount instead and let the `Vec` grow — growth is amortized, and
-/// the streaming check in `download_blob_capped_to` is the real bound.
+/// is not enough: a hostile host can advertise the whole cap and then send
+/// nothing, and the phone is out of memory before the first byte arrives.
+/// Reserve a small fixed amount instead and let the `Vec` grow — growth is
+/// amortized, and the streaming check in `download_blob_capped_to` is the
+/// real bound.
 fn download_buffer_capacity(content_length: Option<u64>) -> usize {
-    content_length.unwrap_or(0).min(INITIAL_DOWNLOAD_CAPACITY as u64) as usize
+    content_length
+        .unwrap_or(0)
+        .min(INITIAL_DOWNLOAD_CAPACITY as u64) as usize
 }
 
 /// Download a blob, refusing to buffer more than `MAX_BACKUP_BYTES`.
@@ -1434,7 +1795,7 @@ async fn download_blob_capped(keys: &Keys, base: &Url, sha256: Sha256Hash) -> Re
 }
 
 /// Same, with an injectable ceiling so tests can prove the mid-stream abort
-/// without moving 200 MiB.
+/// without moving the full download cap.
 async fn download_blob_capped_to(
     keys: &Keys,
     base: &Url,
@@ -1612,51 +1973,369 @@ async fn preview_account_backup_from(
     let (sealed, uploaded_at_secs) = download_latest_sealed_backup_from(keys, hosts).await?;
     let package = open_account_backup(&secret_bytes(keys), &sealed)?;
     let size_bytes = sealed.len() as u64;
-    let Some(index_bytes) = package.index_bytes.as_ref() else {
-        // A backup with no index still restores; there is just nothing to list.
-        return Ok(AccountBackupPreview {
-            conversations: Vec::new(),
-            total_messages: 0,
-            size_bytes,
-            uploaded_at_secs,
-        });
-    };
-
-    let scratch = preview_scratch_dir(db_path)?;
-    let index_path = scratch.path().join("preview-index.db");
-    fs::write(&index_path, index_bytes)
-        .map_err(|e| Error::Storage(format!("backup preview index write: {e}")))?;
-    let key: [u8; 32] = hex::decode(&package.db_key_hex)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| Error::InvalidInput("backup db key malformed".into()))?;
-
-    let summaries = crate::conversation_index::ConversationIndex::open(&index_path, key)
-        .and_then(|idx| idx.summaries_ordered())
-        .unwrap_or_default();
-    let conversations: Vec<_> = summaries
-        .into_iter()
-        .map(|s| BackupPreviewConversation {
-            name: s.name,
-            // Control lines (⚡TRILL / ⚡PAY / ☎CALL) are transcript-hidden;
-            // leaking them here was caught on device — the dry run rendered a
-            // raw "⚡TRILL|1|…" as a chat's preview. Blank anything that is not
-            // a plain message and let hosts render name/count only.
-            latest_content: match crate::notification::classify_content(&s.latest_content) {
-                crate::notification::NotificationKind::Message => s.latest_content,
-                _ => String::new(),
-            },
-            message_count: s.message_count,
-        })
-        .collect();
+    let conversations = preview_conversations(db_path, &package);
     let total_messages = conversations.iter().map(|c| c.message_count).sum();
-    // `scratch` drops here: the decrypted index never outlives the call.
     Ok(AccountBackupPreview {
         conversations,
         total_messages,
         size_bytes,
         uploaded_at_secs,
     })
+}
+
+/// Prefer the conversation index. If it is missing or empty — a backup
+/// taken after the 0.8 migrate, before chat-list rows were seeded — list
+/// recovered chats from the transcript / historical-groups sidecars.
+/// Always union titles from a packed `*.mdk08.bak` so a pending 0.8 invite
+/// that never reached the index still appears in Settings.
+pub fn preview_conversations(
+    db_path: &Path,
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let mut out = preview_from_index(db_path, package);
+    if out.is_empty() {
+        out = preview_from_recovered_sidecars(package);
+    }
+    for row in preview_from_packed_bak(db_path, package) {
+        if row.name.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|existing| existing.name == row.name) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+fn sidecar_historical_names(package: &AccountBackupPackage) -> HashMap<String, String> {
+    package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX)
+        .and_then(|(_, bytes)| serde_json::from_slice::<HashMap<String, String>>(bytes).ok())
+        .unwrap_or_default()
+}
+
+fn sidecar_historical_folds(package: &AccountBackupPackage) -> Vec<(String, String)> {
+    package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX)
+        .and_then(|(_, bytes)| serde_json::from_slice::<HashMap<String, String>>(bytes).ok())
+        .map(|map| map.into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn merge_preview_folds(
+    index_folds: Vec<(String, String)>,
+    sidecar_folds: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut out = index_folds;
+    for (historical, live) in sidecar_folds {
+        if historical.is_empty() || live.is_empty() || historical.eq_ignore_ascii_case(&live) {
+            continue;
+        }
+        if !out
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(&historical))
+        {
+            out.push((historical, live));
+        }
+    }
+    out
+}
+
+fn preview_hex_key(hex: &str) -> String {
+    hex.to_ascii_lowercase()
+}
+
+fn folded_historical_hexes(folds: &[(String, String)]) -> HashSet<String> {
+    folds
+        .iter()
+        .map(|(historical, _)| preview_hex_key(historical))
+        .collect()
+}
+
+fn preview_painted_name(
+    group_id_hex: &str,
+    index_name: &str,
+    folds: &[(String, String)],
+    names_by_hex: &HashMap<String, String>,
+    sidecar_names: &HashMap<String, String>,
+) -> String {
+    let trimmed = index_name.trim();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let key = preview_hex_key(group_id_hex);
+    if let Some(name) = sidecar_names
+        .iter()
+        .find(|(id, _)| preview_hex_key(id) == key)
+        .map(|(_, name)| name.trim())
+        .filter(|name| !name.is_empty())
+    {
+        return name.to_string();
+    }
+    for (historical, live) in folds {
+        if preview_hex_key(live) != key {
+            continue;
+        }
+        let hist_key = preview_hex_key(historical);
+        if let Some(name) = names_by_hex
+            .get(&hist_key)
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
+        }
+        if let Some(name) = sidecar_names
+            .iter()
+            .find(|(id, _)| preview_hex_key(id) == hist_key)
+            .map(|(_, name)| name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            return name.to_string();
+        }
+    }
+    String::new()
+}
+
+fn remount_preview_summaries(
+    summaries: Vec<crate::conversation_index::ConversationSummary>,
+    folds: &[(String, String)],
+    dropped: &HashSet<String>,
+    sidecar_names: &HashMap<String, String>,
+) -> Vec<BackupPreviewConversation> {
+    let hidden = folded_historical_hexes(folds);
+    let by_hex: HashMap<String, crate::conversation_index::ConversationSummary> = summaries
+        .into_iter()
+        .map(|summary| (preview_hex_key(&summary.group_id_hex), summary))
+        .collect();
+    let names_by_hex: HashMap<String, String> = by_hex
+        .iter()
+        .map(|(hex, summary)| (hex.clone(), summary.name.clone()))
+        .collect();
+    let mut published: HashMap<String, crate::conversation_index::ConversationSummary> = by_hex
+        .iter()
+        .filter(|(hex, _)| !dropped.contains(*hex) && !hidden.contains(*hex))
+        .map(|(hex, summary)| (hex.clone(), summary.clone()))
+        .collect();
+    for (historical, live) in folds {
+        let hist_key = preview_hex_key(historical);
+        let live_key = preview_hex_key(live);
+        if dropped.contains(&live_key) || live_key == hist_key {
+            continue;
+        }
+        let Some(hist) = by_hex.get(&hist_key) else {
+            continue;
+        };
+        if let Some(live_summary) = published.get_mut(&live_key) {
+            if hist.latest_at_secs > live_summary.latest_at_secs {
+                live_summary.latest_content = hist.latest_content.clone();
+                live_summary.latest_at_secs = hist.latest_at_secs;
+            }
+            if hist.message_count > live_summary.message_count {
+                live_summary.message_count = hist.message_count;
+            }
+            if live_summary.name.trim().is_empty() && !hist.name.trim().is_empty() {
+                live_summary.name = hist.name.clone();
+            }
+        } else {
+            let mut published_hist = hist.clone();
+            published_hist.group_id_hex = live.clone();
+            published.insert(live_key, published_hist);
+        }
+    }
+    let mut rows: Vec<BackupPreviewConversation> = published
+        .into_values()
+        .map(|summary| {
+            let name = preview_painted_name(
+                &summary.group_id_hex,
+                &summary.name,
+                folds,
+                &names_by_hex,
+                sidecar_names,
+            );
+            BackupPreviewConversation {
+                name,
+                latest_content: match crate::notification::classify_content(&summary.latest_content)
+                {
+                    crate::notification::NotificationKind::Message => summary.latest_content,
+                    _ => String::new(),
+                },
+                message_count: summary.message_count,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.message_count
+            .cmp(&a.message_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows
+}
+
+fn dropped_group_hexes(package: &AccountBackupPackage) -> HashSet<String> {
+    package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::marmot::DROPPED_GROUPS_FILE_SUFFIX)
+        .and_then(|(_, bytes)| serde_json::from_slice::<Vec<String>>(bytes).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !id.is_empty())
+        .map(|id| id.to_ascii_lowercase())
+        .collect()
+}
+
+fn preview_from_packed_bak(
+    db_path: &Path,
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let Some((_, bytes)) = package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::mdk08_migrate::MDK08_BACKUP_SUFFIX)
+    else {
+        return Vec::new();
+    };
+    let Ok(scratch) = preview_scratch_dir(db_path) else {
+        return Vec::new();
+    };
+    let bak_path = scratch.path().join("preview.mdk08.bak");
+    if fs::write(&bak_path, bytes).is_err() {
+        return Vec::new();
+    }
+    let key: [u8; 32] = match hex::decode(&package.db_key_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(key) => key,
+        None => return Vec::new(),
+    };
+    let dropped = dropped_group_hexes(package);
+    crate::mdk08_migrate::preview_groups_from_bak(&bak_path, key)
+        .into_iter()
+        .filter(|(id, _)| !dropped.contains(&id.to_ascii_lowercase()))
+        .map(|(_, name)| BackupPreviewConversation {
+            name,
+            latest_content: String::new(),
+            message_count: 0,
+        })
+        .collect()
+}
+
+fn preview_from_index(
+    db_path: &Path,
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let Some(index_bytes) = package.index_bytes.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(scratch) = preview_scratch_dir(db_path) else {
+        return Vec::new();
+    };
+    let index_path = scratch.path().join("preview-index.db");
+    if fs::write(&index_path, index_bytes).is_err() {
+        return Vec::new();
+    }
+    let key: [u8; 32] = match hex::decode(&package.db_key_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(key) => key,
+        None => return Vec::new(),
+    };
+    let opened = crate::conversation_index::ConversationIndex::open(&index_path, key);
+    let Ok(idx) = opened else {
+        return Vec::new();
+    };
+    let summaries = idx.summaries_ordered().unwrap_or_default();
+    let folds = merge_preview_folds(
+        idx.list_folds().unwrap_or_default(),
+        sidecar_historical_folds(package),
+    );
+    remount_preview_summaries(
+        summaries,
+        &folds,
+        &dropped_group_hexes(package),
+        &sidecar_historical_names(package),
+    )
+}
+
+fn preview_from_recovered_sidecars(
+    package: &AccountBackupPackage,
+) -> Vec<BackupPreviewConversation> {
+    let transcript = package
+        .sidecar_files
+        .iter()
+        .find(|(name, _)| name == crate::marmot::TRANSCRIPT_FILE_SUFFIX)
+        .and_then(|(_, bytes)| {
+            serde_json::from_slice::<HashMap<String, Vec<crate::marmot::ChatMessage>>>(bytes).ok()
+        })
+        .unwrap_or_default();
+    let names = sidecar_historical_names(package);
+    if transcript.is_empty() && names.is_empty() {
+        return Vec::new();
+    }
+    let dropped = dropped_group_hexes(package);
+    let folds = sidecar_historical_folds(package);
+    let hidden = folded_historical_hexes(&folds);
+    let mut ids: Vec<String> = transcript
+        .keys()
+        .cloned()
+        .chain(names.keys().cloned())
+        .filter(|id| {
+            let hex = preview_hex_key(id);
+            !dropped.contains(&hex) && !hidden.contains(&hex)
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let mut conversations: Vec<BackupPreviewConversation> = ids
+        .into_iter()
+        .map(|id| {
+            let name = preview_painted_name(
+                &id,
+                names.get(&id).map(String::as_str).unwrap_or(""),
+                &folds,
+                &names,
+                &names,
+            );
+            let mut msgs: Vec<&crate::marmot::ChatMessage> = transcript
+                .get(&id)
+                .map(|rows| rows.iter().collect())
+                .unwrap_or_default();
+            for (historical, live) in &folds {
+                if preview_hex_key(live) != preview_hex_key(&id) {
+                    continue;
+                }
+                if let Some(hist_msgs) = transcript.get(historical) {
+                    msgs.extend(hist_msgs.iter());
+                }
+            }
+            let latest = msgs.iter().max_by_key(|msg| msg.created_at.as_secs());
+            let latest_content = latest
+                .map(
+                    |msg| match crate::notification::classify_content(&msg.content) {
+                        crate::notification::NotificationKind::Message => msg.content.clone(),
+                        _ => String::new(),
+                    },
+                )
+                .unwrap_or_default();
+            BackupPreviewConversation {
+                name,
+                latest_content,
+                message_count: msgs.len() as u64,
+            }
+        })
+        .collect();
+    conversations.sort_by(|a, b| {
+        b.message_count
+            .cmp(&a.message_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    conversations
 }
 
 /// List this pubkey's blobs and download the newest account-backup MIME.
@@ -1769,7 +2448,7 @@ pub fn seal_account_backup_files(keys: &Keys, db_path: &Path, db_key_hex: &str) 
 ///
 /// Fed to the hasher incrementally rather than assembled into one buffer. An
 /// account snapshot is tens of MB (the reported account was ~46 MB sealed, and
-/// the cap is 200 MiB); a concatenated copy would double that at the exact
+/// the cap is 400 MiB); a concatenated copy would double that at the exact
 /// moment the sealed ciphertext is about to be allocated too — inside a BGTask
 /// with a memory ceiling.
 fn plaintext_fingerprint(package: &AccountBackupPackage) -> String {
@@ -1780,6 +2459,12 @@ fn plaintext_fingerprint(package: &AccountBackupPackage) -> String {
     hasher.update(&package.db_bytes);
     hasher.update((index.len() as u64).to_le_bytes());
     hasher.update(index);
+    for (name, bytes) in &package.sidecar_files {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
     // The wrapped SQLCipher key is part of what a restore needs: if it ever
     // changed without the DB changing, the old blob would no longer open.
     hasher.update(package.db_key_hex.as_bytes());
@@ -1802,7 +2487,9 @@ fn upload_is_redundant(policy: &BackupPolicy, fingerprint: &str, now_secs: u64) 
 }
 
 fn backup_upload_is_redundant(db_path: &Path, fingerprint: &str, now_secs: u64) -> bool {
-    with_policy_state(|map| upload_is_redundant(&cached_policy(map, db_path), fingerprint, now_secs))
+    with_policy_state(|map| {
+        upload_is_redundant(&cached_policy(map, db_path), fingerprint, now_secs)
+    })
 }
 
 /// Close the in-flight window opened by [`record_backup_attempt`] without
@@ -2100,7 +2787,10 @@ mod tests {
             .await
             .expect("must search the legacy host too");
         assert_eq!(got, sealed);
-        assert_eq!(uploaded, 7, "the descriptor timestamp travels with the blob");
+        assert_eq!(
+            uploaded, 7,
+            "the descriptor timestamp travels with the blob"
+        );
     }
 
     /// A real error on the first host must not be retried onto the next and
@@ -2237,8 +2927,7 @@ mod tests {
         // "NSE": a different process writes the sidecar directly with a newer
         // bump (fs write = exactly what crosses the process boundary).
         let path = backup_policy_path_for_db(&db);
-        let mut disk: BackupPolicy =
-            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut disk: BackupPolicy = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         disk.dirty = true;
         disk.dirty_seq += 1;
         disk.last_dirty_at = Some(4242);
@@ -2324,7 +3013,9 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 let mut buf = [0u8; 8192];
-                let Ok(n) = stream.read(&mut buf) else { continue };
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
                 let head = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = head
                     .lines()
@@ -2335,7 +3026,9 @@ mod tests {
                     .unwrap_or("")
                     .to_string();
                 if path != list_path {
-                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
                     continue;
                 }
                 // No Content-Length: body runs until close. Deliberately valid
@@ -2501,6 +3194,7 @@ mod tests {
             db_key_hex: "ab".repeat(32),
             db_bytes: b"fake-sqlcipher-bytes".to_vec(),
             index_bytes: Some(b"index".to_vec()),
+            sidecar_files: Vec::new(),
         };
         let sealed = seal_account_backup(&secret_bytes(&keys), &package).unwrap();
         let opened = open_account_backup(&secret_bytes(&keys), &sealed).unwrap();
@@ -2515,6 +3209,7 @@ mod tests {
             db_key_hex: "cd".repeat(32),
             db_bytes: vec![1, 2, 3, 4],
             index_bytes: None,
+            sidecar_files: Vec::new(),
         };
         let sealed = seal_account_backup(&secret_bytes(&a), &package).unwrap();
         assert!(open_account_backup(&secret_bytes(&b), &sealed).is_err());
@@ -2528,6 +3223,7 @@ mod tests {
             db_key_hex: "ef".repeat(32),
             db_bytes: b"db-body".to_vec(),
             index_bytes: Some(b"idx-body".to_vec()),
+            sidecar_files: Vec::new(),
         };
         write_account_backup_package(&db_path, &package).unwrap();
         // Checkpoint needs a real SQLCipher DB; skip read_account for fake bytes.
@@ -2538,6 +3234,505 @@ mod tests {
     }
 
     #[test]
+    fn decode_v1_package_has_empty_sidecars() {
+        let key = "ab".repeat(32);
+        let db = b"legacy-db";
+        let index = b"legacy-idx";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        bytes.extend_from_slice(&(64u32).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&(db.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(db);
+        bytes.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(index);
+        let opened = decode_plaintext(&bytes).unwrap();
+        assert_eq!(opened.db_key_hex, key);
+        assert_eq!(opened.db_bytes, db);
+        assert_eq!(opened.index_bytes.as_deref(), Some(index.as_slice()));
+        assert!(
+            opened.sidecar_files.is_empty(),
+            "v1 backups predate recovered-chat sidecars"
+        );
+    }
+
+    #[test]
+    fn seal_open_roundtrip_keeps_recovered_sidecars() {
+        let keys = Keys::generate();
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"fake-sqlcipher-bytes".to_vec(),
+            index_bytes: Some(b"index".to_vec()),
+            sidecar_files: vec![(
+                crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                b"{\"g\":[]}".to_vec(),
+            )],
+        };
+        let sealed = seal_account_backup(&secret_bytes(&keys), &package).unwrap();
+        let opened = open_account_backup(&secret_bytes(&keys), &sealed).unwrap();
+        assert_eq!(opened, package);
+    }
+
+    #[test]
+    fn encode_rejects_sidecar_path_traversal() {
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![("../escape.json".into(), b"no".to_vec())],
+        };
+        assert!(encode_plaintext(&package).is_err());
+    }
+
+    #[test]
+    fn write_read_package_files_roundtrips_invite_sidecar() {
+        let dir = tempdir().unwrap();
+        let mint_db = dir.path().join("mint.sqlite");
+        let group_id = crate::GroupId::new([0x08u8; 16]);
+        let store = crate::invite_link::InviteLinkStore::load(Some(
+            crate::invite_link::invite_link_state_path_for_db(&mint_db),
+        ));
+        let admin = crate::identity::Identity::generate();
+        let token = store
+            .create_link(&group_id, "standup", &admin, Vec::new())
+            .unwrap();
+        let decoded = crate::invite_link::decode_invite_token(&token).unwrap();
+        let hash = crate::invite_link::sha256(&decoded.invite_secret);
+        let invite_bytes =
+            std::fs::read(crate::invite_link::invite_link_state_path_for_db(&mint_db)).unwrap();
+        let package = AccountBackupPackage {
+            db_key_hex: "ef".repeat(32),
+            db_bytes: b"db-body".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![(
+                crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX.to_string(),
+                invite_bytes,
+            )],
+        };
+        let restored = dir.path().join("restored.sqlite");
+        write_account_backup_package(&restored, &package).unwrap();
+        let restored_store = crate::invite_link::InviteLinkStore::load(Some(
+            crate::invite_link::invite_link_state_path_for_db(&restored),
+        ));
+        assert!(
+            restored_store.validate_secret(&group_id, &hash),
+            "nsec restore must keep minted invite secrets"
+        );
+        assert_eq!(restored_store.active_links(&group_id).len(), 1);
+    }
+
+    #[test]
+    fn write_read_package_files_roundtrips_sidecars() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let transcript = b"{\"messages\":[]}";
+        let package = AccountBackupPackage {
+            db_key_hex: "ef".repeat(32),
+            db_bytes: b"db-body".to_vec(),
+            index_bytes: Some(b"idx-body".to_vec()),
+            sidecar_files: vec![(
+                crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                transcript.to_vec(),
+            )],
+        };
+        write_account_backup_package(&db_path, &package).unwrap();
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::marmot::TRANSCRIPT_FILE_SUFFIX
+            ))
+            .unwrap(),
+            transcript
+        );
+    }
+
+    #[test]
+    fn preview_lists_recovered_chats_when_index_is_missing() {
+        let peer = Keys::generate();
+        let group_id = crate::GroupId::new(vec![0x11u8; 16]);
+        let hex_id = hex::encode(group_id.as_slice());
+        let msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xABu8; 32]).unwrap(),
+            group_id: group_id.clone(),
+            sender: peer.public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        };
+        let mut transcript = HashMap::new();
+        transcript.insert(hex_id.clone(), vec![msg]);
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(hex_id, "alice & bob".into());
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&transcript).unwrap(),
+                ),
+                (
+                    crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&names).unwrap(),
+                ),
+            ],
+        };
+        let listed = preview_from_recovered_sidecars(&package);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "alice & bob");
+        assert_eq!(listed[0].latest_content, "keep this chat");
+        assert_eq!(listed[0].message_count, 1);
+        assert_eq!(
+            count_transcript_bytes(&serde_json::to_vec(&transcript).unwrap()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn preview_hides_folded_hist_and_paints_live_room_name() {
+        let hist = crate::conversation_index::ConversationSummary {
+            group_id_hex: "08".repeat(16),
+            name: "standup".into(),
+            latest_content: "keep this chat".into(),
+            latest_sender: "alice".into(),
+            latest_at_secs: 100,
+            latest_mine: false,
+            message_count: 50,
+            unread_count: 3,
+            version: 1,
+        };
+        let live = crate::conversation_index::ConversationSummary {
+            group_id_hex: "09".repeat(16),
+            name: String::new(),
+            latest_content: String::new(),
+            latest_sender: String::new(),
+            latest_at_secs: 0,
+            latest_mine: false,
+            message_count: 0,
+            unread_count: 0,
+            version: 1,
+        };
+        let folds = vec![(hist.group_id_hex.clone(), live.group_id_hex.clone())];
+        let listed = remount_preview_summaries(
+            vec![hist, live],
+            &folds,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "standup");
+        assert_eq!(listed[0].latest_content, "keep this chat");
+        assert_eq!(listed[0].message_count, 50);
+        let live_with_new = crate::conversation_index::ConversationSummary {
+            group_id_hex: "09".repeat(16),
+            name: String::new(),
+            latest_content: "new 0.9".into(),
+            latest_sender: "alice".into(),
+            latest_at_secs: 200,
+            latest_mine: true,
+            message_count: 5,
+            unread_count: 0,
+            version: 1,
+        };
+        let folded = remount_preview_summaries(
+            vec![
+                crate::conversation_index::ConversationSummary {
+                    group_id_hex: "08".repeat(16),
+                    name: "standup".into(),
+                    latest_content: "keep this chat".into(),
+                    latest_sender: "alice".into(),
+                    latest_at_secs: 100,
+                    latest_mine: false,
+                    message_count: 50,
+                    unread_count: 0,
+                    version: 1,
+                },
+                live_with_new,
+            ],
+            &folds,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            folded.iter().map(|row| row.message_count).sum::<u64>(),
+            50,
+            "stats must remount max, not sum hist+live: {folded:?}"
+        );
+    }
+
+    #[test]
+    fn backup_stats_do_not_double_count_folded_hist() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        let key: [u8; 32] = hex::decode(&key_hex).unwrap().try_into().unwrap();
+        {
+            let idx = crate::conversation_index::ConversationIndex::open(
+                &crate::conversation_index::index_db_path_for_db(&db_path),
+                key,
+            )
+            .unwrap();
+            let hist = "08".repeat(16);
+            let live = "09".repeat(16);
+            idx.upsert_summary(&hist, "standup", "old 1", "alice", 80, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist, "standup", "old 2", "alice", 90, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist, "standup", "keep", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live, "", "new 0.9", "alice", 200, false, true)
+                .unwrap();
+            idx.record_fold(&hist, &live).unwrap();
+        }
+        assert_eq!(
+            count_indexed_messages(&db_path, &key_hex),
+            Some(3),
+            "folded hist count must remount, not add onto live"
+        );
+    }
+
+    #[test]
+    fn transcript_stats_union_folded_family_without_double_listing() {
+        let hist = "08".repeat(16);
+        let live = "09".repeat(16);
+        let mut keyed = HashMap::new();
+        keyed.insert(hist.clone(), vec![serde_json::json!({"n": 1})]);
+        keyed.insert(live.clone(), vec![serde_json::json!({"n": 2})]);
+        let bytes = serde_json::to_vec(&keyed).unwrap();
+        let folds = vec![(hist, live)];
+        assert_eq!(
+            count_transcript_bytes_remounted(&bytes, &folds, &HashSet::new()),
+            Some(2)
+        );
+        assert_eq!(
+            count_transcript_bytes(&bytes),
+            Some(2),
+            "no-fold helper still sums every group"
+        );
+    }
+
+    #[test]
+    fn preview_paints_sidecar_name_when_index_name_blank() {
+        let live_hex = "09".repeat(16);
+        let hist_hex = "08".repeat(16);
+        let live = crate::conversation_index::ConversationSummary {
+            group_id_hex: live_hex.clone(),
+            name: String::new(),
+            latest_content: "new 0.9".into(),
+            latest_sender: "alice".into(),
+            latest_at_secs: 200,
+            latest_mine: false,
+            message_count: 1,
+            unread_count: 0,
+            version: 1,
+        };
+        let folds = vec![(hist_hex.clone(), live_hex)];
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(hist_hex, "standup".into());
+        let listed = remount_preview_summaries(vec![live], &folds, &HashSet::new(), &names);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "standup");
+        assert_eq!(listed[0].latest_content, "new 0.9");
+        assert_eq!(listed[0].message_count, 1);
+    }
+
+    #[test]
+    fn preview_sidecars_hide_folded_hist_and_union_counts() {
+        let peer = Keys::generate();
+        let historical = crate::GroupId::new(vec![0x08u8; 16]);
+        let live = crate::GroupId::new(vec![0x09u8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        let hist_msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xABu8; 32]).unwrap(),
+            group_id: historical,
+            sender: peer.public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        };
+        let live_msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xCDu8; 32]).unwrap(),
+            group_id: live,
+            sender: peer.public_key(),
+            content: "new 0.9".into(),
+            created_at: Timestamp::from_secs(200),
+            mine: true,
+            delivery_state: crate::marmot::DeliveryState::Sent,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("new 0.9"),
+            reply: None,
+        };
+        let mut transcript = HashMap::new();
+        transcript.insert(hist_hex.clone(), vec![hist_msg]);
+        transcript.insert(live_hex.clone(), vec![live_msg]);
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(hist_hex.clone(), "standup".into());
+        let mut folds: HashMap<String, String> = HashMap::new();
+        folds.insert(hist_hex, live_hex);
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&transcript).unwrap(),
+                ),
+                (
+                    crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&names).unwrap(),
+                ),
+                (
+                    crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&folds).unwrap(),
+                ),
+            ],
+        };
+        let listed = preview_from_recovered_sidecars(&package);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "standup");
+        assert_eq!(listed[0].latest_content, "new 0.9");
+        assert_eq!(listed[0].message_count, 2);
+    }
+
+    #[test]
+    fn preview_omits_dropped_recovered_chats() {
+        let peer = Keys::generate();
+        let kept = crate::GroupId::new(vec![0x11u8; 16]);
+        let gone = crate::GroupId::new(vec![0x22u8; 16]);
+        let kept_hex = hex::encode(kept.as_slice());
+        let gone_hex = hex::encode(gone.as_slice());
+        let msg = crate::marmot::ChatMessage {
+            id: EventId::from_slice(&[0xABu8; 32]).unwrap(),
+            group_id: kept.clone(),
+            sender: peer.public_key(),
+            content: "still here".into(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: Vec::new(),
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("still here"),
+            reply: None,
+        };
+        let mut transcript = HashMap::new();
+        transcript.insert(kept_hex.clone(), vec![msg]);
+        let mut names: HashMap<String, String> = HashMap::new();
+        names.insert(kept_hex, "keep room".into());
+        names.insert(gone_hex.clone(), "deleted room".into());
+        let package = AccountBackupPackage {
+            db_key_hex: "ab".repeat(32),
+            db_bytes: b"db".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&transcript).unwrap(),
+                ),
+                (
+                    crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&names).unwrap(),
+                ),
+                (
+                    crate::marmot::DROPPED_GROUPS_FILE_SUFFIX.to_string(),
+                    serde_json::to_vec(&vec![gone_hex]).unwrap(),
+                ),
+            ],
+        };
+        let listed = preview_from_recovered_sidecars(&package);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "keep room");
+        assert!(listed.iter().all(|row| row.name != "deleted room"));
+    }
+
+    #[test]
+    fn write_read_package_files_roundtrips_outbox_and_sync() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let package = AccountBackupPackage {
+            db_key_hex: "ef".repeat(32),
+            db_bytes: b"db-body".to_vec(),
+            index_bytes: None,
+            sidecar_files: vec![
+                (
+                    crate::outbox::OUTBOX_STATE_FILE_SUFFIX.to_string(),
+                    b"{\"version\":1,\"entries\":[]}".to_vec(),
+                ),
+                (
+                    crate::marmot::SYNC_STATE_FILE_SUFFIX.to_string(),
+                    b"{\"version\":1,\"watermark_secs\":9,\"processed_event_ids\":[]}".to_vec(),
+                ),
+            ],
+        };
+        write_account_backup_package(&db_path, &package).unwrap();
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::outbox::OUTBOX_STATE_FILE_SUFFIX
+            ))
+            .unwrap(),
+            b"{\"version\":1,\"entries\":[]}"
+        );
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::marmot::SYNC_STATE_FILE_SUFFIX
+            ))
+            .unwrap(),
+            b"{\"version\":1,\"watermark_secs\":9,\"processed_event_ids\":[]}"
+        );
+    }
+
+    #[test]
+    fn staged_restore_replaces_outgoing_sidecars() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        std::fs::write(&db_path, b"old-db").unwrap();
+        std::fs::write(
+            sidecar_named(&db_path, crate::marmot::TRANSCRIPT_FILE_SUFFIX),
+            b"old-account-transcript",
+        )
+        .unwrap();
+        let package = AccountBackupPackage {
+            db_key_hex: "aa".repeat(32),
+            db_bytes: b"staged-db".to_vec(),
+            index_bytes: Some(b"staged-idx".to_vec()),
+            sidecar_files: vec![(
+                crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX.to_string(),
+                b"{\"new\":true}".to_vec(),
+            )],
+        };
+        write_account_backup_package(&staging_db_path(&db_path), &package).unwrap();
+        commit_staged_account_restore(&db_path).unwrap();
+        assert!(
+            !sidecar_named(&db_path, crate::marmot::TRANSCRIPT_FILE_SUFFIX).exists(),
+            "restore without a transcript sidecar must drop leftover outgoing history"
+        );
+        assert_eq!(
+            std::fs::read(sidecar_named(
+                &db_path,
+                crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX
+            ))
+            .unwrap(),
+            b"{\"new\":true}"
+        );
+    }
+
+    #[test]
     fn staged_restore_commit_roundtrip() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("marmot.sqlite");
@@ -2545,6 +3740,7 @@ mod tests {
             db_key_hex: "aa".repeat(32),
             db_bytes: b"staged-db".to_vec(),
             index_bytes: Some(b"staged-idx".to_vec()),
+            sidecar_files: Vec::new(),
         };
         write_account_backup_package(&staging_db_path(&db_path), &package).unwrap();
         assert!(!db_path.exists());
@@ -2683,6 +3879,25 @@ mod tests {
             .unwrap();
         let v: i64 = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn wipe_backup_policy_removes_crashed_unique_tmp() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let path = backup_policy_path_for_db(&db_path);
+        std::fs::write(&path, b"{}").unwrap();
+        let tmp = path.with_file_name(format!(
+            "{}.1234.1700000000.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap()
+        ));
+        std::fs::write(&tmp, b"{\"previous-account\":true}").unwrap();
+        wipe_backup_policy_for_db(&db_path);
+        assert!(!path.exists(), "backup policy sidecar removed");
+        assert!(
+            !tmp.exists(),
+            "a crashed unique policy rename must not survive a wipe"
+        );
     }
 
     #[test]
@@ -3029,7 +4244,10 @@ mod tests {
             "boot must finish the restore's stats, not leave 'Never'"
         );
         assert_eq!(policy.last_message_count, Some(3));
-        assert!(!staged_policy.exists(), "no sidecar left in the account dir");
+        assert!(
+            !staged_policy.exists(),
+            "no sidecar left in the account dir"
+        );
     }
 
     /// An abandoned restore must leave nothing a later commit could adopt: the
@@ -3100,13 +4318,17 @@ mod tests {
 
     /// A server's `Content-Length` must never drive the allocation. Bounding
     /// the hint by `MAX_BACKUP_BYTES` looks safe and is not: a hostile host can
-    /// advertise 200 MiB, send nothing, and the phone is out of memory before
+    /// advertise the whole cap, send nothing, and the phone is out of memory before
     /// the first byte — on the restore path, which the user only reaches after
     /// they have already wiped.
     #[test]
     fn a_lying_content_length_cannot_size_the_download_buffer() {
         assert_eq!(download_buffer_capacity(None), 0);
-        assert_eq!(download_buffer_capacity(Some(4096)), 4096, "honest small body");
+        assert_eq!(
+            download_buffer_capacity(Some(4096)),
+            4096,
+            "honest small body"
+        );
         assert_eq!(
             download_buffer_capacity(Some(MAX_BACKUP_BYTES as u64)),
             INITIAL_DOWNLOAD_CAPACITY,
@@ -3137,10 +4359,7 @@ mod tests {
         let err = download_blob_capped_to(&keys, &base, sha, 1024)
             .await
             .expect_err("4096 bytes must not pass a 1024 byte ceiling");
-        assert!(
-            err.to_string().contains("exceeds size cap"),
-            "got {err:?}"
-        );
+        assert!(err.to_string().contains("exceeds size cap"), "got {err:?}");
 
         // Same blob, ample ceiling: the cap must not break honest restores.
         let ok = download_blob_capped_to(&keys, &base, sha, 8192)
@@ -3181,7 +4400,10 @@ mod tests {
             "scratch {} escaped the account dir",
             path.display()
         );
-        assert!(path.is_dir(), "scratch dir was not created (parent unmade?)");
+        assert!(
+            path.is_dir(),
+            "scratch dir was not created (parent unmade?)"
+        );
         drop(scratch);
         assert!(!path.exists(), "scratch dir must be reaped on drop");
     }
@@ -3262,6 +4484,7 @@ mod tests {
             db_key_hex: "55".repeat(32),
             db_bytes: db.to_vec(),
             index_bytes: index.map(|b| b.to_vec()),
+            sidecar_files: Vec::new(),
         }
     }
 
@@ -3293,8 +4516,14 @@ mod tests {
             plaintext_fingerprint(&package_of(b"chats", Some(b"index"))),
             "same bytes must fingerprint the same — otherwise nothing is ever skipped"
         );
-        assert_ne!(a, plaintext_fingerprint(&package_of(b"chatz", Some(b"index"))));
-        assert_ne!(a, plaintext_fingerprint(&package_of(b"chats", Some(b"indeX"))));
+        assert_ne!(
+            a,
+            plaintext_fingerprint(&package_of(b"chatz", Some(b"index")))
+        );
+        assert_ne!(
+            a,
+            plaintext_fingerprint(&package_of(b"chats", Some(b"indeX")))
+        );
         // Length-delimited: moving the boundary must not collide.
         assert_ne!(
             plaintext_fingerprint(&package_of(b"ab", Some(b"c"))),
@@ -3304,6 +4533,14 @@ mod tests {
         let mut rekeyed = package_of(b"chats", Some(b"index"));
         rekeyed.db_key_hex = "66".repeat(32);
         assert_ne!(a, plaintext_fingerprint(&rekeyed));
+        // Recovered-chat sidecars are part of the sealed account. A 0.8
+        // migrate that only writes host JSON must dirty the next backup.
+        let mut with_history = package_of(b"chats", Some(b"index"));
+        with_history.sidecar_files = vec![(
+            crate::marmot::TRANSCRIPT_FILE_SUFFIX.to_string(),
+            b"history".to_vec(),
+        )];
+        assert_ne!(a, plaintext_fingerprint(&with_history));
     }
 
     #[test]
@@ -3360,14 +4597,20 @@ mod tests {
             !upload_is_redundant(&daily, "abc", now),
             "a daily account must still refresh daily, identical bytes or not"
         );
-        assert_eq!(unchanged_refresh_window_secs(&daily), DEFAULT_DAILY_INTERVAL_SECS);
+        assert_eq!(
+            unchanged_refresh_window_secs(&daily),
+            DEFAULT_DAILY_INTERVAL_SECS
+        );
 
         // Weekly sits exactly at the ceiling, so both agree.
         let weekly = BackupPolicy {
             daily_interval_secs: 7 * DEFAULT_DAILY_INTERVAL_SECS,
             ..Default::default()
         };
-        assert_eq!(unchanged_refresh_window_secs(&weekly), UNCHANGED_REFRESH_SECS);
+        assert_eq!(
+            unchanged_refresh_window_secs(&weekly),
+            UNCHANGED_REFRESH_SECS
+        );
     }
 
     /// Upgrade path and "nothing ever succeeded" path: with no recorded success
@@ -3593,7 +4836,10 @@ mod tests {
         let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
         record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
         record_backup_failure(&db_path, "blossom upload timed out").unwrap();
-        assert!(load_backup_policy(&db_path).last_error.is_some(), "precondition");
+        assert!(
+            load_backup_policy(&db_path).last_error.is_some(),
+            "precondition"
+        );
 
         assert!(matches!(
             seal_account_backup_files(&keys, &db_path, &key_hex),

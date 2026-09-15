@@ -14,6 +14,8 @@ pub mod handles;
 pub mod identity;
 pub mod invite_link;
 pub mod marmot;
+pub(crate) mod mdk08_migrate;
+pub mod media_crypto;
 pub mod media_staging;
 pub mod mention;
 pub mod mesh;
@@ -33,7 +35,7 @@ pub use error::Error;
 
 /// Re-exported so FFI/shell crates can name MLS group ids without depending
 /// on MDK directly.
-pub use mdk_core::GroupId;
+pub use cgka_traits::types::GroupId;
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;

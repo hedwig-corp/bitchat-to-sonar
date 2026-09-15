@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::marmot::MarmotEngine;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 pub struct ConversationIndex {
     db: Connection,
@@ -196,6 +196,21 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index add version column: {e}")))?;
         }
 
+        if current < 3 {
+            // Durable hist→live binds. The JSON fold sidecar can vanish while
+            // this SQLCipher file stays put. Restore only recorded pairs —
+            // do not infer a bind from members/name (R-045).
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS historical_fold (
+                    historical_hex TEXT PRIMARY KEY,
+                    live_hex TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_historical_fold_live
+                    ON historical_fold(live_hex);",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index create historical_fold: {e}")))?;
+        }
+
         tx.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
             params![SCHEMA_VERSION],
@@ -216,7 +231,8 @@ impl ConversationIndex {
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(|e| crate::Error::Storage(format!("index table_info query: {e}")))?;
         for name in names {
-            let name = name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
+            let name =
+                name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
             if name == column {
                 return Ok(true);
             }
@@ -269,6 +285,67 @@ impl ConversationIndex {
         Ok(())
     }
 
+    /// Copy a recovered-chat summary onto its live 0.9 sibling without
+    /// incrementing message counts. Unread is **added** onto the live row
+    /// (an incoming 0.9 DM can already have a badge) and then zeroed on
+    /// the historical id so a second copy cannot double-count.
+    pub fn copy_summary(&self, from_hex: &str, to_hex: &str) -> Result<()> {
+        if from_hex == to_hex {
+            return Ok(());
+        }
+        let Some(src) = self.summary(from_hex)? else {
+            return Ok(());
+        };
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Storage(format!("index copy_summary begin: {e}")))?;
+        tx.execute(
+            "INSERT INTO conversation_summary
+                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs,
+                     latest_mine, message_count, unread_count, version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END,
+                    latest_content = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_content ELSE latest_content END,
+                    latest_sender = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_sender ELSE latest_sender END,
+                    latest_at_secs = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_at_secs ELSE latest_at_secs END,
+                    latest_mine = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_mine ELSE latest_mine END,
+                    unread_count = unread_count + excluded.unread_count,
+                    version = version + 1",
+            params![
+                to_hex,
+                src.name,
+                src.latest_content,
+                src.latest_sender,
+                src.latest_at_secs as i64,
+                src.latest_mine as i32,
+                src.message_count as i64,
+                src.unread_count as i64,
+                src.version as i64,
+            ],
+        )
+        .map_err(|e| crate::Error::Storage(format!("index copy_summary: {e}")))?;
+        tx.execute(
+            "UPDATE conversation_summary
+                    SET unread_count = 0, version = version + 1
+                    WHERE group_id_hex = ?1 AND unread_count != 0",
+            params![from_hex],
+        )
+        .map_err(|e| crate::Error::Storage(format!("index copy_summary zero hist: {e}")))?;
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index copy_summary commit: {e}")))?;
+        Ok(())
+    }
+
     pub fn ensure_group(&self, group_id_hex: &str, name: &str) -> Result<()> {
         self.db
             .execute(
@@ -310,6 +387,57 @@ impl ConversationIndex {
                 params![group_id_hex],
             )
             .map_err(|e| crate::Error::Storage(format!("index remove: {e}")))?;
+        self.forget_folds_for(group_id_hex)
+    }
+
+    /// Persist a hist→live resume bind that `record_historical_fold` already
+    /// accepted. Lost JSON sidecars rebuild from this table; they must not
+    /// invent a pair from overlapping members.
+    pub fn record_fold(&self, historical_hex: &str, live_hex: &str) -> Result<()> {
+        if historical_hex == live_hex || historical_hex.is_empty() || live_hex.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .execute(
+                "INSERT INTO historical_fold (historical_hex, live_hex)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(historical_hex) DO UPDATE SET live_hex = excluded.live_hex",
+                params![historical_hex, live_hex],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index record_fold: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_folds(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT historical_hex, live_hex FROM historical_fold")
+            .map_err(|e| crate::Error::Storage(format!("index list_folds prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| crate::Error::Storage(format!("index list_folds query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index list_folds row: {e}")))
+    }
+
+    pub fn forget_folds_for(&self, group_id_hex: &str) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM historical_fold
+                 WHERE historical_hex = ?1 OR live_hex = ?1",
+                params![group_id_hex],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index forget_folds: {e}")))?;
+        Ok(())
+    }
+
+    /// Drop every recorded bind. Tests pair this with
+    /// [`crate::marmot::MarmotEngine::clear_historical_folds`] to isolate the
+    /// topic-match heal from index restore. Production hosts must not call it.
+    pub fn clear_folds(&self) -> Result<()> {
+        self.db
+            .execute("DELETE FROM historical_fold", [])
+            .map_err(|e| crate::Error::Storage(format!("index clear_folds: {e}")))?;
         Ok(())
     }
 
@@ -382,31 +510,61 @@ impl ConversationIndex {
     pub fn materialize_from(&self, engine: &MarmotEngine) -> Result<()> {
         let groups = engine.groups()?;
         for group in &groups {
-            let group_id_hex = hex::encode(group.mls_group_id.as_slice());
-            let page = engine.messages_page(&group.mls_group_id, 1, 0)?;
-            if let Some(msg) = page.first() {
-                let sender = msg.sender.to_string();
-                self.upsert_summary(
-                    &group_id_hex,
-                    &group.name,
-                    &crate::client::index_preview(msg),
-                    &sender,
-                    msg.created_at.as_secs(),
-                    msg.mine,
-                    // Rebuild from storage resets unread below anyway.
-                    msg.classification.is_transcript_visible(),
-                )?;
-                self.db
-                    .execute(
-                        "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
-                        params![group_id_hex],
-                    )
-                    .map_err(|e| {
-                        crate::Error::Storage(format!("index materialize unread reset: {e}"))
-                    })?;
-            } else {
-                self.ensure_group(&group_id_hex, &group.name)?;
+            self.materialize_one(engine, &group.id, &group.name)?;
+        }
+        // Recovered 0.8 history lives on the transcript sidecar, not in the
+        // 0.9 MLS group list. Seed those rows so chat-list first paint keeps
+        // the old conversations after a protocol port.
+        self.seed_missing_recovered(engine)
+    }
+
+    /// Add recovered 0.8 rows that the existing index never stored. Safe on a
+    /// non-empty index: existing summaries (and their unread counts) stay put.
+    pub fn seed_missing_recovered(&self, engine: &MarmotEngine) -> Result<()> {
+        for group_id in engine.recovered_group_ids() {
+            if engine.is_dropped(&group_id) {
+                continue;
             }
+            let hex = hex::encode(group_id.as_slice());
+            if self.summary(&hex)?.is_some() {
+                continue;
+            }
+            let name = engine.historical_group_name(&group_id).unwrap_or_default();
+            self.materialize_one(engine, &group_id, &name)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_one(
+        &self,
+        engine: &MarmotEngine,
+        group_id: &crate::GroupId,
+        name: &str,
+    ) -> Result<()> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let page = engine.messages_page(group_id, 1, 0)?;
+        if let Some(msg) = page.first() {
+            let sender = msg.sender.to_string();
+            self.upsert_summary(
+                &group_id_hex,
+                name,
+                &crate::client::index_preview(msg),
+                &sender,
+                msg.created_at.as_secs(),
+                msg.mine,
+                // Rebuild from storage resets unread below anyway.
+                msg.classification.is_transcript_visible(),
+            )?;
+            self.db
+                .execute(
+                    "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
+                    params![group_id_hex],
+                )
+                .map_err(|e| {
+                    crate::Error::Storage(format!("index materialize unread reset: {e}"))
+                })?;
+        } else {
+            self.ensure_group(&group_id_hex, name)?;
         }
         Ok(())
     }
@@ -417,12 +575,29 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn repair_json_previews_rewrites_legacy_rows_once() {
         let idx = ConversationIndex::open_in_memory().unwrap();
         // Simulate a row written before the guard landed.
-        idx.upsert_summary("g1", "agent", "{\"alert\":\"cpu\",\"host\":\"ocean\"}", "npub1x", 10, false, true).unwrap();
-        idx.upsert_summary("g2", "human", "{ not json, just a brace", "npub1y", 20, false, true).unwrap();
+        idx.upsert_summary(
+            "g1",
+            "agent",
+            "{\"alert\":\"cpu\",\"host\":\"ocean\"}",
+            "npub1x",
+            10,
+            false,
+            true,
+        )
+        .unwrap();
+        idx.upsert_summary(
+            "g2",
+            "human",
+            "{ not json, just a brace",
+            "npub1y",
+            20,
+            false,
+            true,
+        )
+        .unwrap();
         idx.repair_json_previews().unwrap();
         let summaries = idx.summaries_ordered().unwrap();
         let g1 = summaries.iter().find(|s| s.group_id_hex == "g1").unwrap();
@@ -431,7 +606,15 @@ mod tests {
         assert_eq!(g2.latest_content, "{ not json, just a brace");
         // Second repair is a no-op (row no longer brace-prefixed JSON).
         idx.repair_json_previews().unwrap();
-        assert_eq!(idx.summaries_ordered().unwrap().iter().find(|s| s.group_id_hex == "g1").unwrap().latest_content, crate::client::JSON_PAYLOAD_PREVIEW_LABEL);
+        assert_eq!(
+            idx.summaries_ordered()
+                .unwrap()
+                .iter()
+                .find(|s| s.group_id_hex == "g1")
+                .unwrap()
+                .latest_content,
+            crate::client::JSON_PAYLOAD_PREVIEW_LABEL
+        );
     }
 
     #[test]
@@ -521,6 +704,58 @@ mod tests {
         idx.remove_group("g1").unwrap();
         assert!(idx.is_empty());
         assert!(idx.summary("g1").unwrap().is_none());
+    }
+
+    #[test]
+    fn copy_summary_promotes_recovered_row_onto_live_id() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary(
+            "hist",
+            "alice & bob",
+            "keep this chat",
+            "bob",
+            100,
+            false,
+            true,
+        )
+        .unwrap();
+        idx.copy_summary("hist", "live").unwrap();
+
+        let live = idx.summary("live").unwrap().unwrap();
+        assert_eq!(live.name, "alice & bob");
+        assert_eq!(live.latest_content, "keep this chat");
+        assert_eq!(live.unread_count, 1);
+        assert_eq!(
+            idx.summary("hist").unwrap().unwrap().latest_content,
+            "keep this chat"
+        );
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 0);
+    }
+
+    #[test]
+    fn copy_summary_adds_historical_unread_onto_live_that_already_has_unread() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("hist", "alice", "old 1", "bob", 100, false, true)
+            .unwrap();
+        idx.upsert_summary("hist", "alice", "old 2", "bob", 110, false, true)
+            .unwrap();
+        idx.upsert_summary("hist", "alice", "old 3", "bob", 120, false, true)
+            .unwrap();
+        idx.upsert_summary("live", "alice", "new 0.9", "bob", 200, false, true)
+            .unwrap();
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 3);
+        assert_eq!(idx.summary("live").unwrap().unwrap().unread_count, 1);
+
+        idx.copy_summary("hist", "live").unwrap();
+        assert_eq!(idx.summary("live").unwrap().unwrap().unread_count, 4);
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 0);
+
+        idx.copy_summary("hist", "live").unwrap();
+        assert_eq!(
+            idx.summary("live").unwrap().unwrap().unread_count,
+            4,
+            "second copy must not double-count after historical unread is zeroed"
+        );
     }
 
     #[test]
@@ -652,7 +887,7 @@ mod tests {
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
 
-        // Reopen: schema_version is now 2, migration is a no-op.
+        // Reopen: schema_version is now SCHEMA_VERSION, migration is a no-op.
         drop(idx);
         let idx = ConversationIndex::open(&path, key).expect("reopen must not fail");
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
@@ -690,5 +925,78 @@ mod tests {
         // They are still messages: count, ordering and preview are untouched.
         assert_eq!(s.message_count, 3);
         assert_eq!(s.latest_at_secs, 300);
+    }
+
+    #[test]
+    fn record_fold_roundtrips_and_remove_group_forgets_bind() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
+
+        idx.record_fold("hist", "live2").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live2".into())],
+            "same historical id must replace the live sibling"
+        );
+
+        idx.remove_group("live2").unwrap();
+        assert!(
+            idx.list_folds().unwrap().is_empty(),
+            "leave/delete of either id must drop the recorded bind"
+        );
+    }
+
+    #[test]
+    fn clear_folds_drops_recorded_binds_only() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("hist", "room", "hi", "bob", 100, false, true)
+            .unwrap();
+        idx.record_fold("hist", "live").unwrap();
+        idx.clear_folds().unwrap();
+        assert!(idx.list_folds().unwrap().is_empty());
+        assert!(
+            idx.summary("hist").unwrap().is_some(),
+            "clear_folds must not wipe conversation summaries"
+        );
+    }
+
+    #[test]
+    fn migrates_v2_schema_adding_historical_fold_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x33u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex    TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL DEFAULT '',
+                    latest_content  TEXT NOT NULL DEFAULT '',
+                    latest_sender   TEXT NOT NULL DEFAULT '',
+                    latest_at_secs  INTEGER NOT NULL DEFAULT 0,
+                    latest_mine     INTEGER NOT NULL DEFAULT 0,
+                    message_count   INTEGER NOT NULL DEFAULT 0,
+                    unread_count    INTEGER NOT NULL DEFAULT 0,
+                    version         INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO schema_version(version) VALUES (2);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("v2 must migrate");
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
     }
 }

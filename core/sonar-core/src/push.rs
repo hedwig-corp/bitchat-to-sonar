@@ -194,11 +194,17 @@ pub(crate) fn push_token_cache_path_for_db(db_path: &Path) -> PathBuf {
 
 pub(crate) fn wipe_push_token_cache_for_db(db_path: &Path) -> crate::Result<()> {
     let path = push_token_cache_path_for_db(db_path);
-    match fs::remove_file(&path) {
+    let tmp = push_token_cache_tmp_path(&path);
+    remove_optional_file(&path, "remove push token cache")?;
+    remove_optional_file(&tmp, "remove push token cache tmp")
+}
+
+fn remove_optional_file(path: &Path, label: &str) -> crate::Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(crate::Error::Storage(format!(
-            "remove push token cache {}: {e}",
+            "{label} {}: {e}",
             path.display()
         ))),
     }
@@ -293,15 +299,39 @@ mod tests {
             false
         ));
         // Oversized encrypted token is rejected, even for an in-place update.
-        assert!(!should_cache_push_token(MAX_ENCRYPTED_TOKEN_B64_LEN + 1, 0, false));
-        assert!(!should_cache_push_token(MAX_ENCRYPTED_TOKEN_B64_LEN + 1, 0, true));
+        assert!(!should_cache_push_token(
+            MAX_ENCRYPTED_TOKEN_B64_LEN + 1,
+            0,
+            false
+        ));
+        assert!(!should_cache_push_token(
+            MAX_ENCRYPTED_TOKEN_B64_LEN + 1,
+            0,
+            true
+        ));
         // A new entry at / over the cap is rejected (no unbounded growth).
-        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES, false));
-        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES + 1, false));
+        assert!(!should_cache_push_token(
+            1,
+            MAX_PUSH_TOKEN_CACHE_ENTRIES,
+            false
+        ));
+        assert!(!should_cache_push_token(
+            1,
+            MAX_PUSH_TOKEN_CACHE_ENTRIES + 1,
+            false
+        ));
         // An in-place update for an already-cached member is allowed even at the
         // cap (a full cache must never pin a stale / rotated token).
-        assert!(should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES, true));
-        assert!(should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES + 1, true));
+        assert!(should_cache_push_token(
+            1,
+            MAX_PUSH_TOKEN_CACHE_ENTRIES,
+            true
+        ));
+        assert!(should_cache_push_token(
+            1,
+            MAX_PUSH_TOKEN_CACHE_ENTRIES + 1,
+            true
+        ));
     }
 
     #[test]
@@ -360,5 +390,21 @@ mod tests {
 
         assert_eq!(entry.encrypted_token_b64, "updated-token");
         assert_eq!(entry.server_pubkey, server);
+    }
+
+    #[test]
+    fn wipe_removes_crashed_cache_tmp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let path = push_token_cache_path_for_db(&db);
+        let tmp = push_token_cache_tmp_path(&path);
+        fs::write(&path, b"{}").expect("cache");
+        fs::write(&tmp, b"{\"previous-account\":true}").expect("tmp");
+        wipe_push_token_cache_for_db(&db).expect("wipe");
+        assert!(!path.exists(), "push token cache removed");
+        assert!(
+            !tmp.exists(),
+            "a crashed push-token-cache rename must not survive a wipe"
+        );
     }
 }
