@@ -1884,6 +1884,26 @@ func snCurrentOpenConversationId(
 }
 
 /// Fold remount copies the scrolled window onto live, then SwiftUI
+/// recreates the DM screen and `onAppear` calls `openedDM`. Keep
+/// opened=live / pane=hist so remount-pair unions still see both
+/// siblings. Opening a different chat uses that id for both.
+/// Compose `openedDMRemountOpenedPane`.
+func snOpenedDMRemountOpenedPane(
+    openingId: String,
+    routeReplacement: SNMarmotRouteReplacement?
+) -> (opened: String, pane: String) {
+    guard let replacement = routeReplacement,
+          !replacement.pendingId.isEmpty,
+          !replacement.realId.isEmpty
+    else { return (openingId, openingId) }
+    if snOpenedConversationIdMatches(openingId, replacement.pendingId)
+        || snOpenedConversationIdMatches(openingId, replacement.realId) {
+        return (replacement.realId, replacement.pendingId)
+    }
+    return (openingId, openingId)
+}
+
+/// Fold remount copies the scrolled window onto live, then SwiftUI
 /// recreates the DM screen and `onAppear` calls `openedDM`. Skip
 /// newest-page hydrate so a scrolled recovered transcript stays put.
 /// Compose remounts the nav id in place and never re-runs `openChat`.
@@ -13157,8 +13177,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
-        openedConversationId = id
-        openedConversationPaneId = id
+        let remounted = snOpenedDMRemountOpenedPane(
+            openingId: id,
+            routeReplacement: pendingMarmotRouteReplacement
+        )
+        openedConversationId = remounted.opened
+        openedConversationPaneId = remounted.pane
         conversationViewStates[id]?.activate()
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)

@@ -1725,6 +1725,40 @@ struct SonarConversationFoldTests {
             openingId: "marmot:other",
             suppressedIds: ["marmot:group-09"]
         ))
+        let remountReplacement = SNMarmotRouteReplacement(
+            pendingId: "marmot:group-08",
+            realId: "marmot:group-09"
+        )
+        #expect(
+            snOpenedDMRemountOpenedPane(
+                openingId: "marmot:group-08",
+                routeReplacement: remountReplacement
+            ) == (opened: "marmot:group-09", pane: "marmot:group-08")
+        )
+        #expect(
+            snOpenedDMRemountOpenedPane(
+                openingId: "group-08",
+                routeReplacement: remountReplacement
+            ) == (opened: "marmot:group-09", pane: "marmot:group-08")
+        )
+        #expect(
+            snOpenedDMRemountOpenedPane(
+                openingId: "marmot:group-09",
+                routeReplacement: remountReplacement
+            ) == (opened: "marmot:group-09", pane: "marmot:group-08")
+        )
+        #expect(
+            snOpenedDMRemountOpenedPane(
+                openingId: "marmot:other",
+                routeReplacement: remountReplacement
+            ) == (opened: "marmot:other", pane: "marmot:other")
+        )
+        #expect(
+            snOpenedDMRemountOpenedPane(
+                openingId: "marmot:group-08",
+                routeReplacement: nil
+            ) == (opened: "marmot:group-08", pane: "marmot:group-08")
+        )
         let remountKeys = snRemountOpeningHydrateKeys(
             openId: "marmot:group-08",
             groupId: "group-08",

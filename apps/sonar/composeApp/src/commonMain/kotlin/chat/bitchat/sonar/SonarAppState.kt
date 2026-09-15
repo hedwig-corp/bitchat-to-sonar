@@ -1990,6 +1990,26 @@ internal fun currentOpenConversationId(
 }
 
 /** Fold remount copies the scrolled window onto live, then a host
+ *  `openedDM` / pane `onAppear` must keep opened=live / pane=hist.
+ *  Opening a different chat uses that id for both.
+ *  iOS `snOpenedDMRemountOpenedPane`. */
+internal fun openedDMRemountOpenedPane(
+    openingId: String,
+    routeReplacementPendingId: String? = null,
+    routeReplacementRealId: String? = null,
+): Pair<String, String> {
+    val pending = routeReplacementPendingId?.trim()?.takeIf { it.isNotEmpty() }
+    val real = routeReplacementRealId?.trim()?.takeIf { it.isNotEmpty() }
+    if (pending != null && real != null &&
+        (openedConversationIdMatches(openingId, pending) ||
+            openedConversationIdMatches(openingId, real))
+    ) {
+        return real to pending
+    }
+    return openingId to openingId
+}
+
+/** Fold remount copies the scrolled window onto live, then a host
  *  `openChat` / `openedDM` must not newest-page hydrate.
  *  iOS `snOpenedDMShouldSkipHydrate`. */
 internal fun openedDMShouldSkipHydrate(

@@ -1380,6 +1380,46 @@ class ConversationFoldTest {
     }
 
     @Test
+    fun openedDmAfterRemountKeepsLiveHistPair() {
+        assertEquals(
+            "marmot:group-09" to "marmot:group-08",
+            openedDMRemountOpenedPane(
+                openingId = "marmot:group-08",
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
+        assertEquals(
+            "marmot:group-09" to "marmot:group-08",
+            openedDMRemountOpenedPane(
+                openingId = "group-08",
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
+        assertEquals(
+            "marmot:group-09" to "marmot:group-08",
+            openedDMRemountOpenedPane(
+                openingId = "marmot:group-09",
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
+        assertEquals(
+            "marmot:other" to "marmot:other",
+            openedDMRemountOpenedPane(
+                openingId = "marmot:other",
+                routeReplacementPendingId = "marmot:group-08",
+                routeReplacementRealId = "marmot:group-09",
+            ),
+        )
+        assertEquals(
+            "marmot:group-08" to "marmot:group-08",
+            openedDMRemountOpenedPane(openingId = "marmot:group-08"),
+        )
+    }
+
+    @Test
     fun remountMarksTranscriptHydratedWhenHistWasNotYetStamped() {
         val next = remountMarksTranscriptHydrated(
             historicalId = "marmot:group-08",
