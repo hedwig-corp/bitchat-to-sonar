@@ -32,6 +32,9 @@ serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Same major as cdk-common; only to name a saga id when materializing the
+# saga table on a fresh store (see `build_wallet`).
+uuid = "1"
 # Only for the in-process fake mint (`test-support`); cdk already links it.
 async-trait = { version = "0.1", optional = true }
 

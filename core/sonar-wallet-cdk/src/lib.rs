@@ -35,6 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::KnownMethod;
 use cdk::nuts::{CurrencyUnit, MeltOptions, MeltQuoteState, MintQuoteState, PaymentMethod};
+use cdk::wallet::types::TransactionId;
 use cdk::wallet::{MintConnector, Wallet, WalletBuilder};
 use cdk::Amount;
 use sonar_wallet::{
@@ -70,16 +71,10 @@ const ACCOUNT_MARKER: &str = "cashu.account";
 /// expose no push channel over plain HTTP.
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Unpaid mint quotes must not inflate pending receive. Only Paid quotes
-/// (invoice settled at the mint, proofs not yet issued) belong in the figure.
-fn quoted_pending_receive_sats(
-    quotes: impl IntoIterator<Item = (MintQuoteState, Option<u64>)>,
-) -> u64 {
-    quotes
-        .into_iter()
-        .filter(|(state, _)| *state == MintQuoteState::Paid)
-        .filter_map(|(_, amount)| amount)
-        .fold(0u64, u64::saturating_add)
+/// Sats the mint owes us: paid into quotes but not yet minted, summed over
+/// each quote's `amount_mintable()`.
+fn quoted_pending_receive_sats(mintable: impl IntoIterator<Item = u64>) -> u64 {
+    mintable.into_iter().fold(0u64, u64::saturating_add)
 }
 
 /// Exactly our artifacts, nothing prefix-shaped: `cashu.redb-backup` or
@@ -416,7 +411,47 @@ impl CdkWallet {
         let wallet = builder
             .build()
             .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))?;
+        // cdk-redb creates `wallet_sagas` lazily, on the first saga WRITE,
+        // but reads it unconditionally: on a store that has never minted or
+        // melted, `finalize_pending_melts` and `recover_incomplete_sagas`
+        // fail with "Table 'wallet_sagas' does not exist", so every sync
+        // reported failure until the first payment. Deleting a saga that
+        // cannot exist opens the table in a write txn, which creates it.
+        self.rt()
+            .block_on(wallet.localstore.delete_saga(&uuid::Uuid::nil()))
+            .map_err(|e| WalletError::Backend(format!("prepare saga table: {e}")))?;
         Ok((wallet, restore_owed))
+    }
+
+    /// Ask the mint for a receive quote. An amountless BOLT12 offer is the
+    /// normal receive primitive and carries no fixed amount; only a BOLT11
+    /// invoice needs one.
+    fn create_mint_quote(
+        &self,
+        request: &ReceiveRequest,
+    ) -> Result<cdk::wallet::types::MintQuote> {
+        let wallet = self.wallet()?;
+        let method = match request.method {
+            ReceiveMethod::Bolt11Invoice => PaymentMethod::Known(KnownMethod::Bolt11),
+            ReceiveMethod::Bolt12Offer => PaymentMethod::Known(KnownMethod::Bolt12),
+            other => {
+                return Err(WalletError::Unsupported(format!("receiving via {other:?}")));
+            }
+        };
+        if request.method == ReceiveMethod::Bolt11Invoice && request.amount_sats.is_none() {
+            return Err(WalletError::InvalidInput(
+                "a BOLT11 invoice needs an amount".into(),
+            ));
+        }
+        self.rt().block_on(bounded(
+            MINT_CALL_BUDGET,
+            wallet.mint_quote(
+                method,
+                request.amount_sats.map(Amount::from),
+                request.description.clone(),
+                None,
+            ),
+        ))
     }
 
     /// One pass of the pending-mint-quote watcher (best-effort: errors are
@@ -471,36 +506,66 @@ impl CdkWallet {
     }
 
     /// Incoming side: mint proofs for paid quotes.
+    ///
+    /// Walks every UNISSUED quote, not CDK's "active" list: that one keeps
+    /// only `expiry > now`, and BOLT12 quotes carry no expiry (stored as 0),
+    /// so a paid offer was never minted — and an invoice paid while the app
+    /// slept past its expiry was stranded the same way. Minting keys on
+    /// `amount_mintable()` because a reusable BOLT12 quote goes Issued and
+    /// then Paid again with every new payment.
     async fn reconcile_mint_quotes(
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
     ) -> Result<usize> {
         let mut minted = 0;
         let quotes = wallet
-            .get_active_mint_quotes()
+            .get_unissued_mint_quotes()
             .await
             .map_err(|e| WalletError::Network(format!("list mint quotes: {e}")))?;
+        let now = now_secs();
         // Per-quote errors are isolated: one stale or pruned quote must not
         // stop every later quote from minting, now or on any future pass.
         let mut errors: Vec<String> = Vec::new();
         for quote in quotes {
-            let state = match wallet.check_mint_quote_status(&quote.id).await {
-                Ok(updated) => updated.state,
+            let updated = match bounded(
+                MINT_CALL_BUDGET,
+                wallet.check_mint_quote_status(&quote.id),
+            )
+            .await
+            {
+                Ok(updated) => updated,
                 Err(e) => {
                     errors.push(format!("quote {}: {e}", quote.id));
                     continue;
                 }
             };
-            if state != MintQuoteState::Paid {
+            if updated.amount_mintable() == Amount::ZERO {
+                if is_abandoned_invoice(&updated, now) {
+                    // An unpaid invoice well past its expiry can never be
+                    // paid; stop polling it on every pass forever.
+                    if let Err(e) = wallet.localstore.remove_mint_quote(&updated.id).await {
+                        tracing::warn!("prune expired mint quote {}: {e}", updated.id);
+                    }
+                }
                 continue;
             }
-            match wallet.mint(&quote.id, SplitTarget::default(), None).await {
+            match bounded(
+                MINT_CALL_BUDGET,
+                wallet.mint(&quote.id, SplitTarget::default(), None),
+            )
+            .await
+            {
                 Ok(proofs) => {
                     minted += 1;
                     let amount_sats = proofs.iter().map(|p| u64::from(p.amount)).sum::<u64>();
+                    let id = incoming_payment_id(
+                        &updated.id,
+                        &updated.payment_method,
+                        TransactionId::from_proofs(proofs.clone()).ok(),
+                    );
                     let _ = events.send(WalletEvent::PaymentReceived {
                         payment: Payment {
-                            id: quote.id.clone(),
+                            id,
                             amount_sats,
                             fees_sats: Some(0),
                             incoming: true,
@@ -621,6 +686,57 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Upper bound on a single mint round-trip. A mint that accepts the
+/// connection and then never answers must not stall the caller (or the
+/// watcher) indefinitely.
+const MINT_CALL_BUDGET: Duration = Duration::from_secs(15);
+
+/// How long past its expiry an unpaid BOLT11 invoice is still checked before
+/// it is dropped from the store. Generous: a payment in flight at expiry can
+/// still settle at the mint for a while.
+const ABANDONED_INVOICE_GRACE_SECS: u64 = 3_600;
+
+/// Run one mint call under a deadline. Must be awaited inside the wallet's
+/// runtime: the timer is created here, not by the caller, because creating a
+/// tokio `Sleep` outside a runtime panics with "no reactor running".
+async fn bounded<T>(
+    budget: Duration,
+    call: impl std::future::Future<Output = std::result::Result<T, cdk::Error>>,
+) -> Result<T> {
+    match tokio::time::timeout(budget, call).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(WalletError::Network(e.to_string())),
+        Err(_) => Err(WalletError::Timeout),
+    }
+}
+
+/// An unpaid BOLT11 invoice more than [`ABANDONED_INVOICE_GRACE_SECS`] past
+/// its expiry. BOLT12 quotes (no expiry) and paid quotes never qualify.
+fn is_abandoned_invoice(quote: &cdk::wallet::types::MintQuote, now: u64) -> bool {
+    quote.payment_method == PaymentMethod::Known(KnownMethod::Bolt11)
+        && quote.state == MintQuoteState::Unpaid
+        && quote.amount_paid == Amount::ZERO
+        && quote.expiry != 0
+        && now > quote.expiry.saturating_add(ABANDONED_INVOICE_GRACE_SECS)
+}
+
+/// The id hosts see for an incoming payment. A BOLT11 invoice is paid once,
+/// so its quote id is the payment. A BOLT12 offer is ONE quote paid many
+/// times: keying on the quote id alone would merge every payment to the
+/// published offer into a single row, so each minting is qualified by the
+/// transaction id of its proofs. History rebuilds the same id from the same
+/// proofs (`Transaction::id()` hashes the same Ys).
+fn incoming_payment_id(
+    quote_id: &str,
+    method: &PaymentMethod,
+    transaction: Option<TransactionId>,
+) -> String {
+    match (method, transaction) {
+        (PaymentMethod::Known(KnownMethod::Bolt12), Some(tx)) => format!("{quote_id}:{tx}"),
+        _ => quote_id.to_string(),
+    }
+}
+
 impl Drop for CdkWallet {
     fn drop(&mut self) {
         // Same hazard as the Breez backend: dropping the owned multi-thread
@@ -652,28 +768,7 @@ impl TrackedReceiveBackend for CdkWallet {
     }
 
     fn create_tracked_receive(&self, request: &ReceiveRequest) -> Result<TrackedReceive> {
-        let wallet = self.wallet()?;
-        let method = match request.method {
-            ReceiveMethod::Bolt11Invoice => PaymentMethod::Known(KnownMethod::Bolt11),
-            ReceiveMethod::Bolt12Offer => PaymentMethod::Known(KnownMethod::Bolt12),
-            other => {
-                return Err(WalletError::Unsupported(format!("receiving via {other:?}")));
-            }
-        };
-        if request.method == ReceiveMethod::Bolt11Invoice && request.amount_sats.is_none() {
-            return Err(WalletError::InvalidInput(
-                "a BOLT11 invoice needs an amount".into(),
-            ));
-        }
-        let quote = self
-            .rt()
-            .block_on(wallet.mint_quote(
-                method,
-                request.amount_sats.map(Amount::from),
-                request.description.clone(),
-                None,
-            ))
-            .map_err(|e| WalletError::Backend(e.to_string()))?;
+        let quote = self.create_mint_quote(request)?;
         let amount_sats = quote
             .amount
             .map(u64::from)
@@ -898,16 +993,17 @@ impl WalletBackend for CdkWallet {
                 .map_err(|e| WalletError::Backend(e.to_string()))?;
             // The Balance contract names Cashu unminted quotes as pending
             // receives; CDK's pending-proof balance does not see a quote that
-            // has no proofs yet, so sum Paid quote amounts in as well. Unpaid
-            // quotes (just-issued invoices, abandoned fee-adjustment quotes)
-            // must not inflate the figure.
+            // has no proofs yet, so add what the mint owes us. Local store
+            // only (no network). Unpaid quotes (just-issued invoices) owe
+            // nothing and must not inflate the figure; paid BOLT12 offers
+            // (no expiry, no fixed amount) and invoices paid past expiry do.
             let quoted = quoted_pending_receive_sats(
                 wallet
-                    .get_active_mint_quotes()
+                    .get_unissued_mint_quotes()
                     .await
                     .map_err(|e| WalletError::Backend(e.to_string()))?
                     .iter()
-                    .map(|q| (q.state, q.amount.map(u64::from))),
+                    .map(|q| u64::from(q.amount_mintable())),
             );
             Ok(Balance {
                 confirmed_sats: u64::from(confirmed),
@@ -926,7 +1022,7 @@ impl WalletBackend for CdkWallet {
     }
 
     fn receive(&self, request: &ReceiveRequest) -> Result<String> {
-        Ok(self.create_tracked_receive(request)?.request)
+        Ok(self.create_mint_quote(request)?.request)
     }
 
     fn parse_destination(&self, input: &str) -> Result<Destination> {
@@ -1127,12 +1223,24 @@ impl WalletBackend for CdkWallet {
                         // their proofs are minted).
                         None => PaymentStatus::Complete,
                     };
+                    // Live returns and events identify a payment by its
+                    // mint/melt QUOTE id (qualified per payment for a reusable
+                    // BOLT12 offer); reconstructing history any other way
+                    // would make hosts insert a duplicate row instead of
+                    // updating the existing one.
+                    let id = match (&tx.quote_id, incoming) {
+                        (Some(quote_id), true) => incoming_payment_id(
+                            quote_id,
+                            tx.payment_method
+                                .as_ref()
+                                .unwrap_or(&PaymentMethod::Known(KnownMethod::Bolt11)),
+                            Some(tx.id()),
+                        ),
+                        (Some(quote_id), false) => quote_id.clone(),
+                        (None, _) => tx.id().to_string(),
+                    };
                     Payment {
-                        // Live returns and events identify a payment by its
-                        // mint/melt QUOTE id; reconstructing history with
-                        // CDK's transaction id would make hosts insert a
-                        // duplicate row instead of updating the existing one.
-                        id: tx.quote_id.clone().unwrap_or_else(|| tx.id().to_string()),
+                        id,
                         amount_sats: u64::from(tx.amount),
                         fees_sats: Some(u64::from(tx.fee)),
                         incoming,
@@ -1534,21 +1642,191 @@ mod tests {
         ));
     }
 
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<WalletEvent>>);
+
+    impl WalletEventListener for Recorder {
+        fn on_event(&self, event: WalletEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    impl Recorder {
+        fn received_ids(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    WalletEvent::PaymentReceived { payment } => Some(payment.id.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Events are dispatched on their own thread; poll briefly.
+    fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..300 {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn newest_quote(mint: &test_mint::FakeMint, before: &[String]) -> String {
+        mint.mint_quote_ids()
+            .into_iter()
+            .find(|id| !before.contains(id))
+            .expect("a new mint quote")
+    }
+
+    /// Rewrite a quote's LOCAL expiry, as if the app slept past it.
+    fn set_local_expiry(w: &CdkWallet, id: &str, expiry: u64) {
+        let wallet = w.wallet().unwrap();
+        w.rt().block_on(async {
+            let mut quote = wallet.localstore.get_mint_quote(id).await.unwrap().unwrap();
+            quote.expiry = expiry;
+            wallet.localstore.add_mint_quote(quote).await.unwrap();
+        });
+    }
+
+    fn local_quote_exists(w: &CdkWallet, id: &str) -> bool {
+        let wallet = w.wallet().unwrap();
+        w.rt()
+            .block_on(wallet.localstore.get_mint_quote(id))
+            .unwrap()
+            .is_some()
+    }
+
+    fn bolt11_receive(w: &CdkWallet, sats: u64) {
+        w.receive(&ReceiveRequest {
+            method: ReceiveMethod::Bolt11Invoice,
+            amount_sats: Some(sats),
+            description: None,
+        })
+        .unwrap();
+    }
+
+    /// The published offer is one BOLT12 quote with no expiry. Each payment
+    /// to it must be minted (it was filtered out by `expiry > now`) and must
+    /// surface as its own payment, in events and history alike.
     #[test]
-    fn unpaid_mint_quotes_are_excluded_from_pending_receive() {
-        assert_eq!(
-            quoted_pending_receive_sats([
-                (MintQuoteState::Unpaid, Some(1_000)),
-                (MintQuoteState::Paid, Some(250)),
-                (MintQuoteState::Issued, Some(400)),
-                (MintQuoteState::Paid, None),
-            ]),
-            250,
-            "only Paid quotes with an amount belong in pending receive"
+    fn paid_bolt12_offer_is_minted_per_payment_with_distinct_ids() {
+        let dir = scratch("bolt12-mint");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+
+        let before = mint.mint_quote_ids();
+        let offer = w.receive(&ReceiveRequest::offer()).unwrap();
+        assert!(offer.starts_with("lno1"));
+        let quote = newest_quote(&mint, &before);
+
+        mint.pay(&quote, 300);
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().confirmed_sats, 300);
+        mint.pay(&quote, 200);
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().confirmed_sats, 500);
+
+        assert!(eventually(|| recorder.received_ids().len() == 2));
+        let ids = recorder.received_ids();
+        assert_ne!(ids[0], ids[1], "two payments to one offer are two payments");
+        assert!(ids.iter().all(|id| id.starts_with(&quote)));
+
+        let mut history: Vec<String> = w
+            .list_recent_payments(10)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.incoming)
+            .map(|p| p.id)
+            .collect();
+        let mut live = ids.clone();
+        history.sort();
+        live.sort();
+        assert_eq!(history, live, "history must rebuild the ids events used");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn paid_but_unminted_bolt12_counts_as_pending_receive() {
+        let dir = scratch("bolt12-pending");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let before = mint.mint_quote_ids();
+        w.receive(&ReceiveRequest::offer()).unwrap();
+        let quote = newest_quote(&mint, &before);
+
+        mint.pay(&quote, 300);
+        mint.fail_next("post_mint", 1);
+        assert!(w.sync_wallet().is_err(), "strict sync reports the failed mint");
+        let balance = w.balance().unwrap();
+        assert_eq!(balance.confirmed_sats, 0);
+        assert_eq!(balance.pending_receive_sats, 300, "the mint owes us 300");
+
+        w.sync_wallet().unwrap();
+        let balance = w.balance().unwrap();
+        assert_eq!(balance.confirmed_sats, 300);
+        assert_eq!(balance.pending_receive_sats, 0);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invoice_paid_after_local_expiry_is_still_minted() {
+        let dir = scratch("bolt11-expired-paid");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let before = mint.mint_quote_ids();
+        bolt11_receive(&w, 1_000);
+        let quote = newest_quote(&mint, &before);
+        set_local_expiry(&w, &quote, now_secs() - 60);
+
+        mint.pay(&quote, 1_000);
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().confirmed_sats, 1_000);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// cdk-redb creates its saga table on first write but reads it on every
+    /// sync; a wallet that has never paid or been paid must still sync.
+    #[test]
+    fn fresh_wallet_sync_succeeds_before_any_payment() {
+        let dir = scratch("fresh-sync");
+        let (w, _mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        w.sync_wallet().expect("a new wallet's first sync must not fail");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn abandoned_unpaid_invoice_is_pruned_but_recent_one_kept() {
+        let dir = scratch("bolt11-prune");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let before = mint.mint_quote_ids();
+        bolt11_receive(&w, 1_000);
+        let abandoned = newest_quote(&mint, &before);
+        let before = mint.mint_quote_ids();
+        bolt11_receive(&w, 2_000);
+        let recent = newest_quote(&mint, &before);
+
+        set_local_expiry(&w, &abandoned, now_secs() - ABANDONED_INVOICE_GRACE_SECS - 60);
+        set_local_expiry(&w, &recent, now_secs() - 60);
+        w.sync_wallet().unwrap();
+        assert!(!local_quote_exists(&w, &abandoned));
+        assert!(
+            local_quote_exists(&w, &recent),
+            "an invoice just past expiry may still settle"
         );
-        assert_eq!(
-            quoted_pending_receive_sats([(MintQuoteState::Unpaid, Some(5_000))]),
-            0
-        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
