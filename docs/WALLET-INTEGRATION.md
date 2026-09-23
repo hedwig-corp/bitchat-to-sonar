@@ -1,156 +1,190 @@
 # Wallet integration
 
-> **Direction of travel (2026-07):** the wallet contract now lives in Rust as
-> `core/sonar-wallet` (`WalletBackend` trait + nsec→seed derivation +
-> destination classification), with Breez SDK Liquid implementing it in
-> `core/sonar-wallet-breez`. The per-platform Breez integrations described
-> below are what ships today; they are scheduled for replacement by that
-> interface over a staged PR train (desktop → Android → iOS app → iOS
-> notification extension). Background and the decisions behind it:
-> [`docs/brainstorms/2026-07-26-wallet-interface-bolt12.md`](brainstorms/2026-07-26-wallet-interface-bolt12.md).
->
-> Two constraints that will not go away, and that any wallet work must respect:
->
-> 1. **`sonar-wallet-breez` is a build island, not a workspace member.**
->    `breez-sdk-liquid` ships a forked `libsqlite3-sys` (`links = "sqlite3"`,
->    plain bundled SQLite) that cannot coexist in one cargo graph with the
->    SQLCipher `libsqlite3-sys` the Marmot store uses — and must not share a
->    binary with it either, which is the symbol-shadowing class that once broke
->    iOS Marmot encryption. On iOS the Breez backend therefore has to ship as a
->    separate dynamic framework (roughly the isolation the prebuilt
->    `breez-sdk-liquid-swift` xcframework already provides), and `sonar-cli`
->    can never link it — the headless proof is
->    `core/sonar-wallet-breez/src/bin/sonar-wallet-cli.rs`.
-> 2. **The wallet seed derivation is wallet identity.**
->    HKDF-SHA256(nsec secret, salt `"sonar-wallet"`, info `"sonar-bolt12-v1"`,
->    32 bytes) handed to Breez as the *raw* seed — never via a BIP39 mnemonic,
->    which derives a different wallet. Pinned by a golden vector shared with
->    `ios/bitchatTests/Services/SonarWalletDerivationTests.swift`.
+Sonar's wallet is a **Cashu (ecash) wallet**, for every user, on every app
+surface. The **Breez** Lightning wallet that shipped before it is kept as a
+**legacy** wallet: it is never created for a new install, and it stays
+visible, spendable, and user-deletable once its funds are provably safe.
 
-## Current iOS integration (Breez SDK Liquid via unify-wallet)
+Decided 2026-09-23 (maintainer). The earlier Breez→Cashu migration engine
+and its consent UX are parked on #586 and are not part of the shipping app.
 
-Sonar embeds a Lightning wallet (Breez SDK Liquid, BOLT12/BIP-353 capable)
-by reusing the wallet slice of the **unify-wallet** KMP codebase instead of
-binding the Breez SDK directly. iOS-only: the Kotlin/Native framework has no
-macOS slice, so the macOS target builds without any wallet code.
+## Custody model
+
+Ecash proofs are bearer instruments held in a local per-account store; the
+**mint** (`https://mint.hedwig.sh`, cdk-mintd) holds the Lightning side. The
+user trusts the mint with the funds it backs. That trade is disclosed in
+Settings ("Held as ecash at mint.hedwig.sh"); there is no activation gate.
+
+What the nsec alone can recover:
+
+- **Minted proofs**: yes. Proof secrets derive from the Cashu seed (NUT-13),
+  and `connect()` runs a restore scan whenever one is owed: a new device, a
+  wipe, or a lost proof db (R-050).
+- **The published offer's pending payments**: yes, while the pointer file
+  survives. The offer's NUT-20 key is derived, not random, so `connect()`
+  re-adopts its quote after the proof db is lost.
+- **Sats paid to a quote but not yet minted, after a full reinstall**: no.
+  The quote id is gone with the store; the funds sit at the mint.
 
 ## Layers
 
 ```
-bitchat/Services/WalletBridgeService.swift   app facade (#if os(iOS), @MainActor,
-                                             no singleton; state machine
-                                             notConfigured/settingUp/ready(balanceSats))
-        │ async/await
-localPackages/SonarWalletKit  (SPM, product "WalletKit")
-  Sources/SonarWallet.swift            async façade over the callback bridge
-  Sources/KeychainWalletStorage.swift  WalletKitStorage SPI impl (Security framework,
-                                       service "chat.bitchat.sonar.wallet")
-  Frameworks/SonarWalletKit.xcframework  Kotlin/Native binary (checked in, rebuilt below)
-        │ ObjC interop (SWK* classes, swift_name-mapped)
-unify-wallet  shared/wallet-kit  (branch sonar-wallet-kit)
-  SonarWalletComponent   wallet-only composition root (KeyManager + Breez node/wallet
-                         + WalletService; storage injected by host)
-  IosWalletBridge        coroutine→callback wrapper; ALL callbacks fire on the main thread
-  WalletKitStorage       synchronous storage SPI (sync because Swift classes cannot
-                         implement Kotlin suspend interface members); adapted internally
-                         to the suspend KeyValueStore on Dispatchers.Default
-  NoOpCloudBackupProvider  no Google Drive; host owns backup policy
+apps (Swift / Kotlin)              wallet facade, balance cache, offer publication,
+                                   legacy Breez card, wipe/replace policy
+        │ UniFFI (blocking calls; never on the UI thread)
+core/sonar-ffi   wallet.rs         SonarCashuWallet, CashuWalletListener,
+                                   WalletFfiError, fetch_fiat_rates()
+core/sonar-wallet-cdk              CdkWallet: the WalletBackend over CDK 0.17.3
+                                   (cdk + cdk-redb; no sqlite, so a normal
+                                   workspace member)
+core/sonar-wallet                  WalletBackend trait, seeds, destination
+                                   classification, wipe guard, rates parsing
 ```
 
-## Rebuilding the xcframework
+The Breez backend never enters `sonar-ffi`: `breez-sdk-liquid` ships a forked
+`libsqlite3-sys` (`links = "sqlite3"`, plain SQLite) that cannot share a cargo
+graph or a binary with the SQLCipher store (the symbol-shadowing class that
+once broke iOS Marmot encryption). The apps keep Breez on their existing
+native SDKs; `core/sonar-wallet-breez` is a separate build island with a
+headless CLI.
 
-The binary framework is built from the unify-wallet repo, branch
-**`sonar-wallet-kit`** (currently local-only at `/tmp/unify-wallet`, commit
-`4e0bdf6`; it should eventually be PR'd to
-[hedwig-corp/unify-wallet](https://github.com/hedwig-corp/unify-wallet)):
+## Seeds (wallet identity: never change these)
 
-```sh
-cd /tmp/unify-wallet            # branch sonar-wallet-kit
-./gradlew :shared:wallet-kit:assembleSonarWalletKitReleaseXCFramework
-rm -rf <sonar-repo>/localPackages/SonarWalletKit/Frameworks/SonarWalletKit.xcframework
-cp -R shared/wallet-kit/build/XCFrameworks/release/SonarWalletKit.xcframework \
-      <sonar-repo>/localPackages/SonarWalletKit/Frameworks/
-```
+| Wallet | Derivation | Pinned by |
+| --- | --- | --- |
+| Breez (legacy) | HKDF-SHA256(nsec secret, salt `sonar-wallet`, info `sonar-bolt12-v1`, 32 B), raw seed, never BIP39 | `seed.rs::entropy_matches_ios_golden_vector` + `SonarWalletDerivationTests` |
+| Cashu | HKDF-SHA256(nsec secret, salt `sonar-wallet`, info `sonar-cashu-v1`, 64 B) | `seed.rs::cashu_seed_matches_golden_vector` |
+| Cashu offer NUT-20 key | HKDF-SHA256(cashu seed, salt `sonar-wallet`, info `sonar-cashu-offer-nut20-v1` ‖ 0 ‖ mint url ‖ 0 ‖ index u32 BE, 32 B) | `seed.rs::cashu_offer_key_matches_golden_vectors` |
 
-Slices: `ios-arm64` + `ios-arm64-simulator`, static. After any Kotlin API
-change, re-check `Headers/SonarWalletKit.h` — Swift names come from the
-`swift_name` attributes (e.g. `SWKIosWalletBridge` → `IosWalletBridge`).
+## Store layout
 
-## Storage SPI
+`<root>/sonar-cashu/<accountId>/mainnet`, where `accountId` is the lower-case
+hex of the first 16 bytes of SHA-256(nsec as UTF-8). Root: iOS Application
+Support (the app's own container, never the App Group, because of 0xdead10cc);
+Android `filesDir`; desktop `DesktopEnv`. The store refuses a different
+account's seed (an `O_EXCL` `cashu.account` claim), so the directory MUST be
+per account.
 
-The wallet engine persists the BIP39 mnemonic and small wallet state
-(e.g. the cached BOLT12 offer) through the host-provided `WalletKitStorage`:
+Files the wipe guard recognises (anything else in the dir blocks a wipe):
+`cashu.redb`, `cashu.account`, `cashu.restored.<mint8>`,
+`cashu.offer.<mint8>` (+ `.tmp`), and the reserved `cashu.migration.v1.*`
+names of the parked migration.
 
-```kotlin
-interface WalletKitStorage {           // implemented in Swift
-    fun getString(key: String): String?
-    fun putString(key: String, value: String)
-    fun getBytes(key: String): ByteArray?
-    fun putBytes(key: String, value: ByteArray)
-    fun remove(key: String); fun clear(); fun contains(key: String): Boolean
-}
-```
+## The FFI contract (`core/sonar-ffi/src/wallet.rs`)
 
-`KeychainWalletStorage` (in the SPM package) backs it with generic-password
-items under service **`chat.bitchat.sonar.wallet`**, accessibility
-`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`. It deliberately does NOT
-use the app's `KeychainManager` so the package stays self-contained — note
-this means `panicClearAllData()` does NOT wipe the wallet seed; call
-`KeychainWalletStorage().clear()` explicitly if wallet wipe is wanted.
+Every call blocks. Call it from a background executor.
 
-Implementations must be thread-safe: the Kotlin adapter calls them from
-background dispatchers.
+- `SonarCashuWallet(nsec, mint_url, working_dir)`: local only, no network.
+- `connect()`: mint info, NUT-13 restore when owed, recovery of melts/swaps a
+  crash interrupted, then the 5 s watcher. Idempotent, `Busy` while another
+  connect runs. Bounded: a hung mint yields `Timeout`, never a stuck call.
+- `receive_offer()`: **the** receive address hosts publish (descriptor,
+  BIP-353, BLE, Unify). One reusable amountless BOLT12 quote; stable across
+  calls and launches; answered from disk with no network once created.
+  Rotates only when the quote expires (the old quote keeps minting). A mint
+  that forgets the quote is indistinguishable from an outage and does not
+  rotate.
+- `prepare_send(dest, amount?)` returns the mint's amount and fee RESERVE.
+  Show it before consent. `send(prepared, note)` is the one spending call.
+  **`Pending` is not a failure**: past its deadline, or with a mint still
+  routing, the payment is reported Pending and its outcome arrives as an
+  event with the same `id`. Never retry a Pending send with a new quote; that
+  can pay twice.
+- Every payment to the offer is its own payment: `{quote_id}:{tx_id}`.
+- History carries the preimage (chat `⚡PAYDONE|2` needs it after a restart).
+- Errors: `WalletFfiError` is non-flat; branch on `InsufficientFunds`,
+  `NotConnected`, `Network`, `Timeout`, never on message text.
+- `fetch_fiat_rates()`: Yadio (`api.yadio.io/exrates/BTC`), about 145
+  currencies, no key, 10 s bound. Independent of any wallet.
 
-## API key
+## Apps
 
-The Breez API key is injected via build settings → Info.plist:
+| Concern | Apple (`ios/`) | Compose (`apps/sonar/`) |
+| --- | --- | --- |
+| Primary wallet | `CashuWalletService` + `CashuWallet` (`SonarWalletProviding`), FFI on one serial utility queue | `CashuWalletEngine` behind the `WalletBridge` object, FFI on `Dispatchers.IO` via `CashuNative` actuals |
+| Legacy wallet | `LegacyBreezWallet` + `SonarLegacyWalletCoordinator` | `expect object LegacyBreezWallet` + `LegacyBreezStore` |
+| Display prefs | `SonarMoneyDisplay` (UserDefaults, copied once from the Breez Keychain) | `WalletDisplayPrefs` (already app-owned) |
 
-- `Configs/Release.xcconfig` defines an empty default: `BREEZ_API_KEY =`
-- `bitchat/Info.plist` carries `BREEZ_API_KEY = $(BREEZ_API_KEY)`
-- **To enable the wallet locally**, add to the gitignored
-  `Configs/Local.xcconfig` (included by Debug.xcconfig):
+Shared behaviour, pinned by tests on both platforms:
 
-  ```
-  BREEZ_API_KEY = <your Breez API key>
-  ```
+- The wallet opens after local paint. The cached balance and the offer (from
+  disk) publish first, then connect retries with backoff. The app connects on
+  foreground and disconnects on background, never under a send in flight.
+- "Payments enabled" and the BLE payments capability mean "a Cashu offer
+  exists for this account", with no dependence on a Breez key.
+- The descriptor, BIP-353 handle and Unify use the Cashu offer and republish
+  when it changes. Difference: while an account has no offer yet, Apple skips
+  publishing, while Compose publishes the descriptor with no offer, so a
+  restored device stops advertising an offer only the old device can mint.
+- A send that returns Pending is recorded as pending and settled exactly once,
+  by the outcome event or by a lookup after reconnecting. A chat ⚡PAY sends
+  neither its `PAY` nor its `PAYDONE|2|id|preimage` line until it settles, so
+  a later failure never leaves a misleading receipt with the peer.
+- `Max` on Cashu prepares at the full balance, subtracts the quoted fee reserve
+  and prepares again. The 0.5% Breez reserve applies to the legacy wallet only.
 
-`WalletBridgeService.setupIfNeeded()` reads the key from Info.plist at
-runtime; when empty the service stays `.notConfigured`, Settings Balance
-shows **Unavailable** (Compose parity), and setup throws
-`WalletBridgeError.missingAPIKey`. Debug may omit the key; Release app
-targets refuse to build when it is empty (Xcode Run Script on
-`bitchat_iOS` / `bitchat_macOS`).
+## Legacy Breez
 
-## App facade usage
+- Opened only when its store already exists on the device. A restored account
+  gets ONE background check (builds with a Breez API key only): if the derived
+  Breez wallet has funds or history it is kept as legacy, otherwise what the
+  check created is deleted.
+- Its NDS webhook / `invoice_request` push path stays alive only while it
+  exists, against its own offer (never the published Cashu offer).
+- **Delete gate**, all of: connected with a completed sync; confirmed,
+  pending-send and pending-receive all 0; no refundable swaps; no
+  Pending/Refundable payments. Anything unknown means not safe.
+- Balances under ~1,000 sats cannot leave over Lightning (the Boltz submarine
+  swap minimum), so they stay visible and undeletable until spendable.
 
-```swift
-let wallet = WalletBridgeService()          // inject, no singleton
-try await wallet.setupIfNeeded()            // configure → create wallet on
-                                            // first run → start node
-wallet.statePublisher                       // .notConfigured / .settingUp /
-                                            // .ready(balanceSats:) — balance
-                                            // updates live via observeBalance
-let payment = try await wallet.send(destination: "user@domain", amountSats: 1000, note: "hi")
-// destination = BOLT11 / BOLT12 offer / LNURL-pay / BIP-353 (resolved by Breez)
-// payment.id / payment.feesSats feed Sonar's local activity list.
-let offer = try await wallet.createOffer()  // reusable BOLT12 receive offer
-let parsed = try await wallet.parseDestination("lno1...")
-for await payment in wallet.incomingPayments() { ... }
-```
+## Wipe and account replacement
 
-Networks: `WalletBridgeService(mainnet: false)` for testnet; default mainnet.
+- **Panic wipe** deletes everything wallet-related, every `sonar-cashu/` root
+  included. Minted proofs remain restorable from the nsec; sats paid to a
+  quote but not yet minted do not.
+- **Account replacement** never destroys a wallet that may hold funds: the old
+  account's `sonar-cashu/<accountId>/` stays on disk, and a legacy Breez store
+  that fails the delete gate is archived rather than deleted.
 
-## Gotchas
+## Testing
 
-- Link the `WalletKit` product ONLY into the iOS app target — the
-  xcframework has no macOS slice and would break the macOS link.
-- `IosWalletBridge` callbacks arrive on the **main thread** (its coroutine
-  scope is `Dispatchers.Main`); `SonarWallet` wraps them with checked
-  continuations, `WalletBridgeService` is `@MainActor`.
-- `SonarWalletComponent` is a Kotlin `object` (process-global) and its lazy
-  DI graph captures `configure(...)` values on first access — configure
-  exactly once per process, before any other call.
-- Kotlin `Boolean`/`Long?` in callbacks surface as boxed `KotlinBoolean` /
-  `KotlinLong` (`.boolValue` / `.int64Value`); `ByteArray` as
-  `KotlinByteArray` (`size`/`get`/`set` with `Int32`/`Int8`).
-- Kotlin `description` properties surface as `description_` (NSObject clash).
+`core/sonar-wallet-cdk/src/test_mint.rs` is an in-process fake mint (a
+`MintConnector` with a real keyset, real blind signatures, NUT-09 restore,
+NUT-20 enforcement, scripted melt outcomes, and injectable failures, delays,
+and hangs). Tests drive the real `connect`/watcher/`send` paths through
+`CdkWallet::with_connector`; `sonar-ffi` reuses it through the
+`test-support` feature. An in-process CDK *mint* is not an option: its
+database would bring bundled SQLite into the SQLCipher graph.
+
+Live-sats tests (receive via the offer, pay a BOLT11, a chat ⚡PAY with
+preimage) run only on explicit approval of the amounts.
+
+## Known gaps
+
+- No push notification for a Cashu receive while the app is killed. Funds
+  wait at the mint and are minted on the next foreground. Follow-up: bridge
+  the mint's quote-paid events (NUT-17) to push.
+- A full reinstall loses the offer pointer; payments to the old offer sit at
+  the mint. Follow-up: carry the offer quote id in the sealed account backup.
+- **One active device per account.** An account cannot run on two devices at
+  once today; that needs Marmot protocol work first (maintainer, 2026-09-23).
+  The Cashu wallet inherits the constraint. When multi-device lands, the wallet
+  needs its own design: both devices derive the same Cashu seed, and NUT-13
+  derives proof secrets from seed + counter, so two live stores would reuse
+  blinded outputs. The mint rejects the second device's mints and swaps, and a
+  restore can leave both devices holding the same bearer proofs. Breez synced
+  across devices; Cashu does not. Options then: a single wallet device,
+  per-device seeds, or a counter resync on `AlreadySigned`.
+- A send that came back Pending because its confirm was ambiguous, and was
+  then compensated by saga recovery, leaves no wallet record, so the app row
+  stays "Pending" although the funds are back. Follow-up: settle such rows
+  once a lookup and the balance agree the melt never happened.
+- The mint's fee reserve is checked before sending but not shown to the user
+  before they confirm.
+- Existing installs already carry a Breez seed, so they run a legacy Breez node
+  every launch until the user deletes it, even when it is empty.
+- A store that is already corrupted is not rebuilt: connect fails on every
+  retry and the wallet reads "Mint offline — retrying". The funds stay at the
+  mint and a NUT-13 restore into a fresh store would recover them. The one
+  path found that corrupts it (two redb writers, Android) is closed.
+  Follow-up: move a corrupted `cashu.redb` aside and restore, and say so.
