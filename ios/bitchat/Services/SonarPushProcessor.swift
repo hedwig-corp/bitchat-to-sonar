@@ -71,13 +71,16 @@ enum SonarPushProcessor {
     static func process(
         userInfo: [AnyHashable: Any],
         marmot: MarmotChatModel?,
-        wallet: SonarWalletProviding?,
+        legacyWallet: LegacyBreezWallet?,
         fetchCompletionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         let source = userInfo["source"] as? String ?? ""
 
         if source == "breez" || userInfo["notification_type"] != nil {
-            processBreezWakeup(wallet: wallet, completionHandler: fetchCompletionHandler)
+            // Breez NDS pushes only exist for the LEGACY wallet (its webhook is
+            // registered only while it exists). Check THAT wallet's state —
+            // never the primary Cashu wallet's.
+            processBreezWakeup(wallet: legacyWallet, completionHandler: fetchCompletionHandler)
         } else {
             processMarmotWakeup(marmot: marmot, completionHandler: fetchCompletionHandler)
         }
@@ -745,13 +748,13 @@ enum SonarPushProcessor {
 
     @MainActor
     private static func processBreezWakeup(
-        wallet: SonarWalletProviding?,
+        wallet: LegacyBreezWallet?,
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         log.info("Processing Breez push wakeup (silent)")
 
         guard let wallet else {
-            log.info("Wallet not available for Breez wakeup")
+            log.info("No legacy wallet for Breez wakeup")
             completionHandler(.noData)
             return
         }

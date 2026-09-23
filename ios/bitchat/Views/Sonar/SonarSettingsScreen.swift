@@ -27,6 +27,7 @@ struct SonarSettingsScreen: View {
     @State private var eraseAsk = false
     @State private var walletSheet = false
     @State private var currencySheet = false
+    @State private var legacyDeleteSheet = false
     @State private var exportKeySheet = false
     @State private var restoreKeySheet = false
     @State private var diagnosticsSheet = false
@@ -109,40 +110,38 @@ struct SonarSettingsScreen: View {
                             icon: .coin, tone: .gold, label: "Balance",
                             sub: walletBalanceSub,
                             value: walletValue,
-                            divider: walletKeyConfigured
+                            divider: true
                         ) {
                             if case .ready = store.walletState {
                                 store.push(.walletActivity)
-                            } else if walletKeyConfigured {
+                            } else {
                                 walletSheet = true
                             }
                         }
-                        if walletKeyConfigured {
-                            // Show balance in bitcoin (sats, the default) or fiat.
-                            SNSettingsRow(
-                                icon: .coin, tone: .gold, label: "Show balance in",
-                                value: store.displayMode == "fiat" ? "Money" : "Bitcoin",
-                                divider: true
-                            ) {
-                                store.setDisplayMode(store.displayMode == "fiat" ? "bitcoin" : "fiat")
-                            }
-                            // Currency for the fiat display.
-                            SNSettingsRow(
-                                icon: .coin, tone: .gold, label: "Currency",
-                                value: store.displayCurrency,
-                                divider: false
-                            ) {
-                                currencySheet = true
-                            }
+                        // Show balance in bitcoin (sats) or fiat.
+                        SNSettingsRow(
+                            icon: .coin, tone: .gold, label: "Show balance in",
+                            value: store.displayMode == "fiat" ? "Money" : "Bitcoin",
+                            divider: true
+                        ) {
+                            store.setDisplayMode(store.displayMode == "fiat" ? "bitcoin" : "fiat")
+                        }
+                        // Currency for the fiat display.
+                        SNSettingsRow(
+                            icon: .coin, tone: .gold, label: "Currency",
+                            value: store.displayCurrency,
+                            divider: false
+                        ) {
+                            currencySheet = true
                         }
                     }
-                    if !walletKeyConfigured {
-                        Text("This build has no Breez API key, so Lightning stays off. Chat and restore still work.")
-                            .font(SonarTheme.uiFont(size: 12))
-                            .foregroundColor(SonarTheme.text3)
-                            .padding(.horizontal, 24)
-                            .padding(.bottom, 4)
+                    // Custody disclosure: one line, no card, no activation gate.
+                    if let custody = store.walletCustodyLine {
+                        settingsNote(custody)
                     }
+
+                    // Only while the legacy Breez wallet exists on this device.
+                    SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true })
 
                     SNSectionLabel("Privacy & safety")
                     SNSettingsCard {
@@ -298,6 +297,9 @@ struct SonarSettingsScreen: View {
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
         }
+        .snSheet(isPresented: $legacyDeleteSheet, title: String(localized: "Delete old wallet")) {
+            SNLegacyWalletDeleteSheetContent(onClose: { legacyDeleteSheet = false })
+        }
         .snSheet(isPresented: $currencySheet, title: "Currency") {
             SNCurrencyPickerContent(
                 currencies: store.supportedCurrencies(),
@@ -352,25 +354,18 @@ struct SonarSettingsScreen: View {
         #endif
     }
 
-    /// Build has a non-empty Breez key — not the same as wallet lifecycle ready.
-    /// `.notConfigured` also covers transient setup failure when the key exists.
-    private var walletKeyConfigured: Bool { SonarBreezBuildConfig.hasAPIKey }
-
     private var walletBalanceSub: String {
-        walletKeyConfigured
-            ? "Pays like you message — tap to pay nearby or over the internet"
-            : "Lightning wallet unavailable in this build"
+        store.walletStatusLine
+            ?? String(localized: "Pays like you message — tap to pay nearby or over the internet")
     }
 
-    /// Real balance when the wallet is ready, in the chosen display unit;
-    /// honest affordance otherwise. Keyless builds say Unavailable (Compose parity).
-    /// Key-present + `.notConfigured` is a transient/setup gap, not a missing key.
+    /// Real balance when the wallet is ready (the cached one until the mint
+    /// answers), in the chosen display unit; honest affordance otherwise.
     private var walletValue: String {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
-        case .settingUp: return "Setting up\u{2026}"
-        case .notConfigured:
-            return walletKeyConfigured ? "Not ready" : "Unavailable"
+        case .settingUp: return String(localized: "Setting up\u{2026}")
+        case .notConfigured: return String(localized: "Not ready")
         }
     }
 

@@ -28,6 +28,135 @@
     "Record voice message" : {
 
     },
+    "%@ arriving" : {
+
+    },
+    "%@ leaving" : {
+
+    },
+    "A payment in the old wallet hasn't settled yet." : {
+
+    },
+    "A payment is still arriving in the old wallet." : {
+
+    },
+    "A payment is still in flight. Wait for it to finish and try again." : {
+
+    },
+    "A payment is still leaving the old wallet." : {
+
+    },
+    "Amount plus fee exceeds your balance." : {
+
+    },
+    "Balance" : {
+
+    },
+    "Checking…" : {
+
+    },
+    "Connect to the internet so Sonar can check the old wallet." : {
+
+    },
+    "Connecting to the mint…" : {
+
+    },
+    "Delete old wallet" : {
+
+    },
+    "Held as ecash at mint.hedwig.sh" : {
+
+    },
+    "It still holds %@. Send it out first." : {
+
+    },
+    "It's empty — safe to remove" : {
+
+    },
+    "Mint offline — retrying" : {
+
+    },
+    "Mint offline — retrying. Nothing was sent." : {
+
+    },
+    "No wallet is set up on this phone yet." : {
+
+    },
+    "Not ready" : {
+
+    },
+    "Old Lightning wallet" : {
+
+    },
+    "Old Lightning wallet removed" : {
+
+    },
+    "Old Lightning wallet · %@" : {
+
+    },
+    "Pay anyone, or move the sats to your wallet" : {
+
+    },
+    "Payment failed — you were not charged." : {
+
+    },
+    "Payment is on its way — it shows in the chat once it settles." : {
+
+    },
+    "Payments need your wallet to finish opening on this Mac. It starts once your Sonar identity is ready." : {
+
+    },
+    "Pays like you message — tap to pay nearby or over the internet" : {
+
+    },
+    "Send from old wallet" : {
+
+    },
+    "Setting up…" : {
+
+    },
+    "Sonar can't confirm the old wallet is empty yet." : {
+
+    },
+    "Sonar checked the old wallet: it holds nothing and has nothing in flight. Deleting removes it from this device. Your ecash wallet is not affected." : {
+
+    },
+    "Still checking the old wallet — try again in a moment." : {
+
+    },
+    "Syncing wallet…" : {
+
+    },
+    "That payment address can't be paid." : {
+
+    },
+    "The old wallet couldn't be removed. Restart Sonar and try again." : {
+
+    },
+    "The old wallet has a refund waiting to be claimed." : {
+
+    },
+    "This kind of payment isn't supported yet." : {
+
+    },
+    "Unavailable in this build" : {
+
+    },
+    "Wallet is not configured on this Mac yet." : {
+
+    },
+    "Wallet not ready yet — it opens once your Sonar identity is ready" : {
+
+    },
+    "Your wallet from before Sonar moved to ecash" : {
+
+    },
+    "Your wallet is busy. Try again in a moment." : {
+
+    },
+    "Your wallet is still starting. Try again in a moment." : {
+
+    },
     "%@ ahead" : {
 
     },

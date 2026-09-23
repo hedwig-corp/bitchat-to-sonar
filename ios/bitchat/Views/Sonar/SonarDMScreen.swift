@@ -608,10 +608,18 @@ struct SonarDMScreenContent: View {
                 transport: transport,
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
+                usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
                 onClose: { paySheet = false },
                 onSend: { sats in
                     Task {
                         if let message = await store.sendPay(peerId, sats: sats) {
+                            showToast(message)
+                        }
+                    }
+                },
+                onSendMax: { sats in
+                    Task {
+                        if let message = await store.sendPay(peerId, sats: sats, feeFromAmount: true) {
                             showToast(message)
                         }
                     }
