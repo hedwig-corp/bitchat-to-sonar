@@ -35,6 +35,10 @@ mod android_jni;
 
 mod logging;
 
+/// Sonar's Cashu wallet.
+mod wallet;
+pub use wallet::*;
+
 /// Flat error: only the rendered message crosses the FFI boundary
 /// (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
 #[derive(Debug, thiserror::Error, uniffi::Error)]

@@ -22,6 +22,7 @@ mod destination;
 mod error;
 mod listeners;
 mod mock;
+mod rates;
 mod seed;
 mod traits;
 mod types;
@@ -31,6 +32,7 @@ pub use destination::{classify_destination, resolve_send_amount};
 pub use error::{Result, WalletError};
 pub use listeners::ListenerRegistry;
 pub use mock::MockWallet;
+pub use rates::{parse_yadio, YADIO_BTC_RATES_URL};
 pub use seed::{
     cashu_offer_key, cashu_wallet_seed, entropy_hex, nsec_to_secret, wallet_entropy,
     CASHU_OFFER_KEY_INFO, CASHU_SEED_INFO, SEED_INFO, SEED_SALT,

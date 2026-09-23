@@ -58,6 +58,14 @@ jobs:
       - name: Build the Rust core for iOS
         run: ./core/build-ios.sh
 
+      # Regenerating alone is not enough: the app then compiles against the
+      # FRESH binding while the committed one can be stale. That hid a
+      # missing symbol and an outdated checksum on #586 — a stale xcframework
+      # paired with that file crashes at launch with apiChecksumMismatch.
+      # A diff here means: run core/build-ios.sh and commit SonarFFI.swift.
+      - name: Committed Swift bindings are current
+        run: git diff --exit-code -- ios/localPackages/SonarCore/Sources/SonarFFI.swift
+
       # `CODE_SIGNING_ALLOWED=NO` keeps this credential-free — a compile check
       # must not need the signing identity or any gitignored secret. The app
       # builds without `Local.xcconfig` / `GoogleService-Info.plist`; both are
