@@ -39,11 +39,11 @@ use cdk::wallet::types::TransactionId;
 use cdk::wallet::{MintConnector, Wallet, WalletBuilder};
 use cdk::Amount;
 use sonar_wallet::{
-    classify_destination, guard_wipe_path, resolve_send_amount, Balance, Destination,
-    DestinationKind, ExchangeRate, ListenerRegistry, Payment, PaymentStatus, PreparedSend,
-    PreparedSendToken, ReceiveMethod, ReceiveRequest, Result, TrackedReceive,
+    cashu_offer_key, classify_destination, guard_wipe_path, resolve_send_amount, Balance,
+    Destination, DestinationKind, ExchangeRate, ListenerRegistry, Payment, PaymentStatus,
+    PreparedSend, PreparedSendToken, ReceiveMethod, ReceiveRequest, Result, TrackedReceive,
     TrackedReceiveBackend, TrackedReceiveState, WalletBackend, WalletCapabilities, WalletConfig,
-    WalletError, WalletEvent, WalletEventListener,
+    WalletError, WalletEvent, WalletEventListener, Zeroizing,
 };
 
 /// File name of the redb store inside the working dir — also the wipe guard's
@@ -58,6 +58,12 @@ const DB_FILE: &str = "cashu.redb";
 /// mint still owes that mint its own scan. Absent marker for the configured
 /// mint ⇒ restore runs (idempotent) until it succeeds once.
 const RESTORED_MARKER_PREFIX: &str = "cashu.restored";
+
+/// Prefix of the per-mint pointer to the wallet's published BOLT12 offer
+/// (`cashu.offer.<hash8>`, JSON `{quote_id, offer, index}`). The offer is the
+/// receive address hosts publish (Nostr descriptor, BIP-353, BLE); it must
+/// be the same across calls and launches, and readable with no network.
+const OFFER_POINTER_PREFIX: &str = "cashu.offer";
 
 /// Fingerprint of the seed that owns this store. Cashu proofs are BEARER
 /// data: opening one account's store with another account's seed would let
@@ -101,9 +107,17 @@ fn is_our_artifact(name: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-');
     }
+    let is_mint_tag =
+        |suffix: &str| suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit());
+    if let Some(rest) = name
+        .strip_prefix(OFFER_POINTER_PREFIX)
+        .and_then(|rest| rest.strip_prefix('.'))
+    {
+        return is_mint_tag(rest.strip_suffix(".tmp").unwrap_or(rest));
+    }
     name.strip_prefix(RESTORED_MARKER_PREFIX)
         .and_then(|rest| rest.strip_prefix('.'))
-        .is_some_and(|suffix| suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()))
+        .is_some_and(is_mint_tag)
 }
 
 /// Whether a NUT-13 restore scan is still owed.
@@ -190,6 +204,9 @@ pub struct CdkWallet {
     /// Replaces CDK's HTTP client; only ever set by tests (`with_connector`).
     connector: Option<Arc<dyn MintConnector + Send + Sync>>,
     budgets: Budgets,
+    /// Serializes offer creation: two concurrent first calls must not mint
+    /// two offers and publish whichever lost.
+    offer_lock: Mutex<()>,
 }
 
 impl CdkWallet {
@@ -253,6 +270,7 @@ impl CdkWallet {
             watcher: Mutex::new(None),
             connector: None,
             budgets: Budgets::DEFAULT,
+            offer_lock: Mutex::new(()),
         })
     }
 
@@ -286,9 +304,163 @@ impl CdkWallet {
     /// so a shared store connecting to a second mint still runs that mint's
     /// NUT-13 scan.
     fn restore_marker_name(&self) -> String {
+        format!("{RESTORED_MARKER_PREFIX}.{}", self.mint_tag())
+    }
+
+    /// Short per-mint tag for this store's per-mint files.
+    fn mint_tag(&self) -> String {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(self.mint_url.as_bytes());
-        format!("{RESTORED_MARKER_PREFIX}.{}", hex::encode(&digest[..4]))
+        hex::encode(&digest[..4])
+    }
+
+    fn offer_pointer_path(&self) -> std::path::PathBuf {
+        self.config
+            .working_dir
+            .join(format!("{OFFER_POINTER_PREFIX}.{}", self.mint_tag()))
+    }
+
+    /// The published offer, from disk only. A corrupt pointer reads as
+    /// absent: a new offer is safer than an error on every receive, and the
+    /// old quote stays in the store (and keeps being minted).
+    fn read_offer_pointer(&self) -> Option<OfferPointer> {
+        let raw = std::fs::read(self.offer_pointer_path()).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        Some(OfferPointer {
+            quote_id: value.get("quote_id")?.as_str()?.to_string(),
+            offer: value.get("offer")?.as_str()?.to_string(),
+            index: u32::try_from(value.get("index")?.as_u64()?).ok()?,
+        })
+    }
+
+    /// Atomic and durable: a torn pointer would re-publish a different offer.
+    fn write_offer_pointer(&self, pointer: &OfferPointer) -> Result<()> {
+        use std::io::Write;
+        let path = self.offer_pointer_path();
+        let tmp = path.with_extension(format!(
+            "{}.tmp",
+            path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+        ));
+        let body = serde_json::json!({
+            "quote_id": pointer.quote_id,
+            "offer": pointer.offer,
+            "index": pointer.index,
+        })
+        .to_string();
+        let write = || -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            std::fs::File::open(&self.config.working_dir)?.sync_all()?;
+            Ok(())
+        };
+        write().map_err(|e| WalletError::Backend(format!("write {}: {e}", path.display())))
+    }
+
+    /// The NUT-20 key for offer `index` — derived, never random, so the
+    /// offer's quote can be re-adopted from the nsec (see
+    /// `sonar_wallet::cashu_offer_key`).
+    fn offer_secret(&self, index: u32) -> Result<cdk::nuts::SecretKey> {
+        let mint_url: cdk::mint_url::MintUrl = self
+            .mint_url
+            .parse()
+            .map_err(|e| WalletError::InvalidInput(format!("mint url: {e}")))?;
+        // Borrow the zeroizing seed in place rather than copying it out.
+        let seed: &[u8; 64] = self.config.seed[..]
+            .try_into()
+            .map_err(|_| WalletError::InvalidInput("cashu seed must be 64 bytes".into()))?;
+        let key = Zeroizing::new(cashu_offer_key(seed, &mint_url.to_string(), index));
+        cdk::nuts::SecretKey::from_slice(&key[..])
+            .map_err(|e| WalletError::Backend(format!("offer key {index}: {e}")))
+    }
+
+    /// Ask the mint for a reusable, amountless BOLT12 quote locked to the
+    /// derived key for `index`, store it, then publish the pointer. CDK's own
+    /// `mint_quote` would draw a random NUT-20 key, which cannot be
+    /// re-derived after the store is lost.
+    fn create_offer(&self, wallet: &Wallet, index: u32) -> Result<OfferPointer> {
+        use cdk::nuts::nut25::MintQuoteBolt12Request;
+        let secret = self.offer_secret(index)?;
+        let request = cdk::MintQuoteRequest::Bolt12(MintQuoteBolt12Request {
+            amount: None,
+            unit: CurrencyUnit::Sat,
+            description: None,
+            pubkey: secret.public_key(),
+        });
+        let connector = wallet.mint_connector();
+        let response = self.rt().block_on(bounded(
+            self.budgets.mint_call,
+            connector.post_mint_quote(request),
+        ))?;
+        let cdk::MintQuoteResponse::Bolt12(offer) = response else {
+            return Err(WalletError::Backend(
+                "mint answered a BOLT12 quote request with another kind".into(),
+            ));
+        };
+        let mut quote = cdk::wallet::types::MintQuote::new(
+            offer.quote.clone(),
+            wallet.mint_url.clone(),
+            PaymentMethod::Known(KnownMethod::Bolt12),
+            offer.amount,
+            CurrencyUnit::Sat,
+            offer.request.clone(),
+            offer.expiry.unwrap_or(0),
+            Some(secret),
+        );
+        quote.amount_paid = offer.amount_paid;
+        quote.amount_issued = offer.amount_issued;
+        quote.update_state_from_amounts();
+        self.rt()
+            .block_on(wallet.localstore.add_mint_quote(quote))
+            .map_err(|e| WalletError::Backend(format!("store offer quote: {e}")))?;
+        let pointer = OfferPointer {
+            quote_id: offer.quote,
+            offer: offer.request,
+            index,
+        };
+        self.write_offer_pointer(&pointer)?;
+        Ok(pointer)
+    }
+
+    /// Put the published offer's quote back in a store that lost it, with
+    /// its re-derived key, so payments made to the offer meanwhile can still
+    /// be minted.
+    fn adopt_offer(&self, wallet: &Wallet, pointer: &OfferPointer) -> Result<()> {
+        let mut quote = self.rt().block_on(bounded(
+            self.budgets.mint_call,
+            wallet.fetch_mint_quote(
+                &pointer.quote_id,
+                Some(PaymentMethod::Known(KnownMethod::Bolt12)),
+            ),
+        ))?;
+        quote.secret_key = Some(self.offer_secret(pointer.index)?);
+        self.rt()
+            .block_on(wallet.localstore.add_mint_quote(quote))
+            .map_err(|e| WalletError::Backend(format!("store adopted offer quote: {e}")))
+    }
+
+    /// Best-effort re-adoption after a restore scan: the case where the proof
+    /// db was lost but the offer pointer survived.
+    fn readopt_offer_if_lost(&self, wallet: &Wallet) {
+        let Some(pointer) = self.read_offer_pointer() else {
+            return;
+        };
+        match self
+            .rt()
+            .block_on(wallet.localstore.get_mint_quote(&pointer.quote_id))
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(e) = self.adopt_offer(wallet, &pointer) {
+                    tracing::warn!("re-adopting offer quote {}: {e}", pointer.quote_id);
+                }
+            }
+            Err(e) => tracing::warn!("reading offer quote {}: {e}", pointer.quote_id),
+        }
     }
 
     /// Non-secret fingerprint of the account seed (domain-separated, so the
@@ -808,6 +980,15 @@ fn is_abandoned_invoice(quote: &cdk::wallet::types::MintQuote, now: u64) -> bool
         && now > quote.expiry.saturating_add(ABANDONED_INVOICE_GRACE_SECS)
 }
 
+/// The published offer (see [`OFFER_POINTER_PREFIX`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfferPointer {
+    quote_id: String,
+    offer: String,
+    /// Derivation index of the quote's NUT-20 key; bumped on rotation.
+    index: u32,
+}
+
 /// Who reports a send's outcome when the caller stops waiting (see `send`).
 #[derive(Default)]
 struct SendHandoff {
@@ -1050,6 +1231,9 @@ impl WalletBackend for CdkWallet {
                     b"1",
                 )
                 .map_err(|e| WalletError::Backend(format!("write restore marker: {e}")))?;
+                // The proof db was lost; if the offer pointer survived, pull
+                // its quote back so payments made to it can still be minted.
+                self.readopt_offer_if_lost(&wallet);
             }
             // Finish or roll back whatever a crash interrupted (a melt, swap,
             // or mint mid-flight): CDK leaves those proofs Reserved/Pending
@@ -1230,6 +1414,43 @@ impl WalletBackend for CdkWallet {
 
     fn receive(&self, request: &ReceiveRequest) -> Result<String> {
         Ok(self.create_mint_quote(request)?.request)
+    }
+
+    /// The ONE offer hosts publish. Stable across calls and launches, and
+    /// answered from disk when the mint is unreachable. Rotates only when the
+    /// quote behind it has expired; the old quote stays in the store and is
+    /// still minted, so late payers are not lost. (A mint that forgets the
+    /// quote cannot be told apart from an outage — mints report both with a
+    /// generic error — so that case does not rotate.)
+    fn receive_offer(&self) -> Result<String> {
+        let wallet = match self.wallet() {
+            Ok(wallet) => wallet,
+            Err(e) => return self.read_offer_pointer().map(|p| p.offer).ok_or(e),
+        };
+        let _creating = self.offer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pointer) = self.read_offer_pointer() else {
+            return Ok(self.create_offer(&wallet, 0)?.offer);
+        };
+        let local = self
+            .rt()
+            .block_on(wallet.localstore.get_mint_quote(&pointer.quote_id))
+            .map_err(|e| WalletError::Backend(format!("read offer quote: {e}")))?;
+        match local {
+            Some(quote) if quote.expiry != 0 && quote.expiry <= now_secs() => {
+                let next = pointer
+                    .index
+                    .checked_add(1)
+                    .ok_or_else(|| WalletError::Backend("offer index exhausted".into()))?;
+                Ok(self.create_offer(&wallet, next)?.offer)
+            }
+            Some(_) => Ok(pointer.offer),
+            None => {
+                if let Err(e) = self.adopt_offer(&wallet, &pointer) {
+                    tracing::warn!("re-adopting offer quote {}: {e}", pointer.quote_id);
+                }
+                Ok(pointer.offer)
+            }
+        }
     }
 
     fn parse_destination(&self, input: &str) -> Result<Destination> {
@@ -1546,7 +1767,7 @@ impl WalletBackend for CdkWallet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sonar_wallet::{Network, Zeroizing};
+    use sonar_wallet::Network;
     use std::path::PathBuf;
 
     fn config() -> WalletConfig {
@@ -2154,7 +2375,11 @@ mod tests {
     }
 
     fn last_bolt11_options(mint: &test_mint::FakeMint) -> Option<MeltOptions> {
-        match mint.melt_quote_requests().pop().expect("a melt quote request") {
+        match mint
+            .melt_quote_requests()
+            .pop()
+            .expect("a melt quote request")
+        {
             cdk::MeltQuoteRequest::Bolt11(r) => r.options,
             other => panic!("expected a BOLT11 melt quote, got {other:?}"),
         }
@@ -2198,7 +2423,10 @@ mod tests {
         let (w, _mint) = fake_wallet(&dir);
         w.connect().unwrap();
         let prepared = prepare(&w, &test_invoice(Some(1_500)), None).unwrap();
-        assert_eq!(prepared.amount_sats, 1, "the mint's figure is what is charged");
+        assert_eq!(
+            prepared.amount_sats, 1,
+            "the mint's figure is what is charged"
+        );
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2270,11 +2498,13 @@ mod tests {
         );
         w.sync_wallet().unwrap();
         assert_eq!(w.balance().unwrap().pending_send_sats, 0);
-        assert!(eventually(|| recorder.0.lock().unwrap().iter().any(|e| matches!(
-            e,
-            WalletEvent::PaymentSent { payment: p }
-                if p.id == payment.id && p.status == PaymentStatus::Complete
-        ))));
+        assert!(eventually(|| recorder.0.lock().unwrap().iter().any(
+            |e| matches!(
+                e,
+                WalletEvent::PaymentSent { payment: p }
+                    if p.id == payment.id && p.status == PaymentStatus::Complete
+            )
+        )));
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2298,13 +2528,15 @@ mod tests {
 
         let payment = w.send(&prepared, "").expect("a slow melt is not an error");
         assert_eq!(payment.status, PaymentStatus::Pending);
-        assert!(eventually(|| recorder.0.lock().unwrap().iter().any(|e| matches!(
-            e,
-            WalletEvent::PaymentSent { payment: p }
-                if p.id == payment.id
-                    && p.status == PaymentStatus::Complete
-                    && p.preimage.as_deref() == Some(PREIMAGE)
-        ))));
+        assert!(eventually(|| recorder.0.lock().unwrap().iter().any(
+            |e| matches!(
+                e,
+                WalletEvent::PaymentSent { payment: p }
+                    if p.id == payment.id
+                        && p.status == PaymentStatus::Complete
+                        && p.preimage.as_deref() == Some(PREIMAGE)
+            )
+        )));
         assert_eq!(mint.calls("post_melt"), 1, "exactly one payment");
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2344,7 +2576,10 @@ mod tests {
         mint.hang("post_melt");
         let wallet = w.wallet().unwrap();
         w.rt().block_on(async {
-            let melt = wallet.prepare_melt(&quote_id, HashMap::new()).await.unwrap();
+            let melt = wallet
+                .prepare_melt(&quote_id, HashMap::new())
+                .await
+                .unwrap();
             let _ = tokio::time::timeout(Duration::from_millis(200), melt.confirm()).await;
         });
         assert!(
@@ -2362,5 +2597,102 @@ mod tests {
         assert_eq!(balance.pending_send_sats, 0, "{balance:?}");
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn offer_quote_id(w: &CdkWallet) -> String {
+        w.read_offer_pointer().expect("an offer pointer").quote_id
+    }
+
+    /// The offer is the receive address hosts publish; a new one per call
+    /// (the old behaviour) would republish the descriptor on every read.
+    #[test]
+    fn receive_offer_is_stable_across_calls_reconnects_and_offline() {
+        let dir = scratch("offer-stable");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let first = w.receive_offer().unwrap();
+        assert!(first.starts_with("lno1"));
+        assert_eq!(w.receive_offer().unwrap(), first);
+        assert_eq!(mint.calls("post_mint_quote"), 1, "one offer, created once");
+        drop(w);
+
+        let offline = reopen(&dir, &mint);
+        assert_eq!(
+            offline.receive_offer().unwrap(),
+            first,
+            "the published offer is readable with no mint"
+        );
+        offline.connect().unwrap();
+        assert_eq!(offline.receive_offer().unwrap(), first);
+        assert_eq!(mint.calls("post_mint_quote"), 1);
+        drop(offline);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Payments made to the published offer while the proof store is gone
+    /// must still be claimable: the quote is re-adopted with its re-derived
+    /// NUT-20 key (the fake mint enforces the signature).
+    #[test]
+    fn offer_payments_survive_a_lost_proof_db() {
+        let dir = scratch("offer-db-lost");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        w.receive_offer().unwrap();
+        let quote = offer_quote_id(&w);
+        mint.pay(&quote, 400);
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().confirmed_sats, 400);
+        drop(w);
+
+        std::fs::remove_file(dir.join(DB_FILE)).unwrap();
+        mint.pay(&quote, 100); // paid while the store was gone
+
+        let w = reopen(&dir, &mint);
+        w.connect().unwrap();
+        w.sync_wallet().unwrap();
+        assert_eq!(
+            w.balance().unwrap().confirmed_sats,
+            500,
+            "restored 400 plus the 100 paid to the offer meanwhile"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offer_rotates_only_when_expired_and_the_old_quote_still_mints() {
+        let dir = scratch("offer-rotate");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let first = w.receive_offer().unwrap();
+        let old_quote = offer_quote_id(&w);
+
+        set_local_expiry(&w, &old_quote, now_secs() + 3_600);
+        assert_eq!(
+            w.receive_offer().unwrap(),
+            first,
+            "not expired: no rotation"
+        );
+
+        set_local_expiry(&w, &old_quote, now_secs() - 1);
+        let second = w.receive_offer().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(w.read_offer_pointer().unwrap().index, 1);
+        assert_eq!(w.receive_offer().unwrap(), second, "stable again");
+
+        mint.pay(&old_quote, 50); // a late payer used the old offer
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().confirmed_sats, 50);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offer_pointer_is_an_artifact_the_wipe_may_remove() {
+        assert!(is_our_artifact("cashu.offer.00c0ffee"));
+        assert!(is_our_artifact("cashu.offer.00c0ffee.tmp"));
+        assert!(!is_our_artifact("cashu.offer.xyz"));
+        assert!(!is_our_artifact("cashu.offer.00c0ffee.bak"));
+        assert!(!is_our_artifact("cashu.offer"));
     }
 }

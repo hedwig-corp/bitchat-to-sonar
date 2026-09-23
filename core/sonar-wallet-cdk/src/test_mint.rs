@@ -481,13 +481,19 @@ impl MintConnector for FakeMint {
     ) -> Result<MintResponse, Error> {
         self.enter("post_mint").await?;
         let requested: u64 = request.outputs.iter().map(|o| u64::from(o.amount)).sum();
-        let mintable = self
+        let (mintable, pubkey) = self
             .with(|s| {
                 s.mint_quotes
                     .get(&request.quote)
-                    .map(|q| q.amount_paid.saturating_sub(q.amount_issued))
+                    .map(|q| (q.amount_paid.saturating_sub(q.amount_issued), q.pubkey))
             })
             .ok_or(Error::UnknownQuote)?;
+        // NUT-20: a locked quote mints only for the holder of its key.
+        if let Some(pubkey) = pubkey {
+            request
+                .verify_signature(pubkey)
+                .map_err(|e| Error::Custom(format!("fake mint: NUT-20 signature: {e}")))?;
+        }
         if requested > mintable {
             return Err(Error::Custom(format!(
                 "fake mint: {requested} requested, {mintable} mintable"

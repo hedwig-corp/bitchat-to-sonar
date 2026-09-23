@@ -51,6 +51,33 @@ pub fn cashu_wallet_seed(secret: &[u8; 32]) -> [u8; 64] {
     out
 }
 
+/// HKDF info prefix for the NUT-20 key that locks the wallet's published
+/// BOLT12 offer (one reusable mint quote). Deriving it from the Cashu seed,
+/// rather than letting CDK draw a random key, means the offer's quote can be
+/// re-adopted from the nsec after its local store is lost — a random key
+/// would leave every payment made to the published offer unclaimable.
+pub const CASHU_OFFER_KEY_INFO: &[u8] = b"sonar-cashu-offer-nut20-v1";
+
+/// Derive the 32-byte secret for offer number `index` at `mint_url`.
+///
+/// HKDF-SHA256(ikm = cashu seed, salt = [`SEED_SALT`], info =
+/// [`CASHU_OFFER_KEY_INFO`] ‖ 0x00 ‖ mint_url ‖ 0x00 ‖ index as u32 BE,
+/// L = 32). The NUL separators keep (mint, index) pairs unambiguous. Bumping
+/// `index` rotates the offer without reusing its key.
+pub fn cashu_offer_key(cashu_seed: &[u8; 64], mint_url: &str, index: u32) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(SEED_SALT), cashu_seed);
+    let mut info = Vec::with_capacity(CASHU_OFFER_KEY_INFO.len() + mint_url.len() + 6);
+    info.extend_from_slice(CASHU_OFFER_KEY_INFO);
+    info.push(0);
+    info.extend_from_slice(mint_url.as_bytes());
+    info.push(0);
+    info.extend_from_slice(&index.to_be_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(&info, &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
 /// Decode an account secret from `nsec1…` bech32 or 64-char hex (the same two
 /// forms `sonar-cli` accepts for identity import).
 pub fn nsec_to_secret(input: &str) -> Result<[u8; 32]> {
@@ -91,6 +118,27 @@ mod tests {
         assert_ne!(
             cashu_wallet_seed(&secret)[..32],
             wallet_entropy(&secret)[..]
+        );
+    }
+
+    /// Golden vectors from an independent HKDF (python hmac/hashlib). The
+    /// published offer's quote can only be re-adopted from the nsec if this
+    /// derivation never changes.
+    #[test]
+    fn cashu_offer_key_matches_golden_vectors() {
+        let secret: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let seed = cashu_wallet_seed(&secret);
+        assert_eq!(
+            hex::encode(cashu_offer_key(&seed, "https://mint.hedwig.sh", 0)),
+            "31b3ad97b664323c6a63174d47945b18f8fcd7cc7a5c7a9c44d5fae0b692ff41"
+        );
+        assert_eq!(
+            hex::encode(cashu_offer_key(&seed, "https://mint.hedwig.sh", 1)),
+            "badc7fb643aa520f4c8567656d78f277e43cccec75051c8b034ac43baa02435b"
+        );
+        assert_ne!(
+            cashu_offer_key(&seed, "https://mint.hedwig.sh", 0),
+            cashu_offer_key(&seed, "https://other.mint", 0)
         );
     }
 

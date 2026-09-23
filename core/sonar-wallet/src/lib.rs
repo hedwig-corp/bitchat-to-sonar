@@ -32,8 +32,8 @@ pub use error::{Result, WalletError};
 pub use listeners::ListenerRegistry;
 pub use mock::MockWallet;
 pub use seed::{
-    cashu_wallet_seed, entropy_hex, nsec_to_secret, wallet_entropy, CASHU_SEED_INFO, SEED_INFO,
-    SEED_SALT,
+    cashu_offer_key, cashu_wallet_seed, entropy_hex, nsec_to_secret, wallet_entropy,
+    CASHU_OFFER_KEY_INFO, CASHU_SEED_INFO, SEED_INFO, SEED_SALT,
 };
 pub use traits::{
     prepare_and_send, supports_receive, TrackedReceiveBackend, WalletBackend, WalletEventListener,
