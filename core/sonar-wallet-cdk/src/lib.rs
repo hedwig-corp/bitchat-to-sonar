@@ -24,6 +24,9 @@
 //! only established sessions, host callbacks run on a dedicated OS thread,
 //! and `connect` never reports someone else's in-flight attempt as success.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_mint;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
@@ -32,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::KnownMethod;
 use cdk::nuts::{CurrencyUnit, MeltOptions, MeltQuoteState, MintQuoteState, PaymentMethod};
-use cdk::wallet::{Wallet, WalletBuilder};
+use cdk::wallet::{MintConnector, Wallet, WalletBuilder};
 use cdk::Amount;
 use sonar_wallet::{
     classify_destination, guard_wipe_path, resolve_send_amount, Balance, Destination,
@@ -147,6 +150,8 @@ pub struct CdkWallet {
     events_tx: mpsc::Sender<WalletEvent>,
     /// Aborted on disconnect; watches pending mint quotes.
     watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Replaces CDK's HTTP client; only ever set by tests (`with_connector`).
+    connector: Option<Arc<dyn MintConnector + Send + Sync>>,
 }
 
 impl CdkWallet {
@@ -208,7 +213,22 @@ impl CdkWallet {
             listeners,
             events_tx,
             watcher: Mutex::new(None),
+            connector: None,
         })
+    }
+
+    /// A wallet whose mint traffic goes to `connector` instead of HTTP — the
+    /// seam that lets tests drive the real connect/watcher/send paths against
+    /// [`test_mint::FakeMint`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_connector(
+        config: WalletConfig,
+        mint_url: &str,
+        connector: Arc<dyn MintConnector + Send + Sync>,
+    ) -> Result<Self> {
+        let mut wallet = Self::new(config, mint_url)?;
+        wallet.connector = Some(connector);
+        Ok(wallet)
     }
 
     /// Restore-completion marker for THIS mint (`cashu.restored.<hash8>`),
@@ -353,10 +373,11 @@ impl CdkWallet {
         out
     }
 
-    /// Build the CDK wallet; `fresh` reports whether the store file was just
-    /// created (first run, post-wipe, or a new device) — the caller must then
-    /// run a NUT-13 restore scan, or the trait's "fully recoverable with the
-    /// seed" guarantee is a lie: for ecash the local store IS the funds.
+    /// Build the CDK wallet; the flag reports whether a NUT-13 restore scan is
+    /// owed (first run, post-wipe, a new device, a lost proof db, or an
+    /// earlier scan that failed). The caller must then run it, or the trait's
+    /// "fully recoverable with the seed" guarantee is a lie: for ecash the
+    /// local store IS the funds.
     fn build_wallet(&self) -> Result<(Wallet, bool)> {
         let mint_url: cdk::mint_url::MintUrl = self
             .mint_url
@@ -366,20 +387,36 @@ impl CdkWallet {
             .map_err(|e| WalletError::Backend(format!("create working dir: {e}")))?;
         // Before touching the store: never open another account's proofs.
         self.check_account_binding()?;
+        // Judge restore BEFORE opening: `WalletRedbDatabase::new` creates
+        // cashu.redb, so asking afterwards can never see it missing, and a
+        // surviving marker then skips NUT-13 forever over recoverable funds
+        // (regressed once already, 33c5712f1).
+        let marker = self.config.working_dir.join(self.restore_marker_name());
+        let restore_owed =
+            needs_nut13_restore(&self.config.working_dir, &self.restore_marker_name());
+        if restore_owed && marker.exists() {
+            // The proof db is gone but its marker survived. Drop the marker
+            // now: if the restore below then fails, marker + (empty) db would
+            // read as "restored" on every later connect.
+            std::fs::remove_file(&marker).map_err(|e| {
+                WalletError::Backend(format!("clear stale {}: {e}", marker.display()))
+            })?;
+        }
         let db_path = self.config.working_dir.join(DB_FILE);
         let localstore = cdk_redb::WalletRedbDatabase::new(&db_path)
             .map_err(|e| WalletError::Backend(format!("open {}: {e}", db_path.display())))?;
-        let wallet = WalletBuilder::new()
+        let mut builder = WalletBuilder::new()
             .mint_url(mint_url)
             .unit(CurrencyUnit::Sat)
             .localstore(Arc::new(localstore))
-            .seed(self.seed64())
+            .seed(self.seed64());
+        if let Some(connector) = &self.connector {
+            builder = builder.shared_client(connector.clone());
+        }
+        let wallet = builder
             .build()
             .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))?;
-        Ok((
-            wallet,
-            needs_nut13_restore(&self.config.working_dir, &self.restore_marker_name()),
-        ))
+        Ok((wallet, restore_owed))
     }
 
     /// One pass of the pending-mint-quote watcher (best-effort: errors are
@@ -711,15 +748,15 @@ impl WalletBackend for CdkWallet {
 
         // Store open + mint probe with the lock released.
         let opened = (|| {
-            let (wallet, fresh) = self.build_wallet()?;
+            let (wallet, restore_owed) = self.build_wallet()?;
             // One round-trip proves the mint is reachable and caches its
             // info/keysets; without this, "connected" would be a lie the
             // first send exposes.
             self.rt()
                 .block_on(wallet.load_mint_info())
                 .map_err(|e| WalletError::Network(format!("mint unreachable: {e}")))?;
-            if fresh {
-                // No restore marker yet: scan the mint for proofs the seed
+            if restore_owed {
+                // No valid restore marker: scan the mint for proofs the seed
                 // already owns (NUT-13). This is what makes wipe → reconnect
                 // (and new-device setup) actually recover funds instead of
                 // presenting an empty balance over live money. The marker is
@@ -731,7 +768,7 @@ impl WalletBackend for CdkWallet {
                     .block_on(wallet.restore())
                     .map_err(|e| WalletError::Backend(format!("NUT-13 restore: {e}")))?;
                 tracing::info!(
-                    "fresh store: NUT-13 restore recovered {} sats unspent ({} pending)",
+                    "NUT-13 restore recovered {} sats unspent ({} pending)",
                     u64::from(restored.unspent),
                     u64::from(restored.pending),
                 );
@@ -1158,6 +1195,109 @@ mod tests {
 
     fn wallet() -> CdkWallet {
         CdkWallet::new(config(), "https://mint.example.com").unwrap()
+    }
+
+    /// A per-test scratch dir (tests run in parallel; shared paths collide).
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sonar-cdk-{name}-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fake_wallet(dir: &Path) -> (CdkWallet, Arc<test_mint::FakeMint>) {
+        let mint = Arc::new(test_mint::FakeMint::new());
+        let mut cfg = config();
+        cfg.working_dir = dir.to_path_buf();
+        let wallet =
+            CdkWallet::with_connector(cfg, "https://mint.example.com", mint.clone()).unwrap();
+        (wallet, mint)
+    }
+
+    fn reopen(dir: &Path, mint: &Arc<test_mint::FakeMint>) -> CdkWallet {
+        let mut cfg = config();
+        cfg.working_dir = dir.to_path_buf();
+        CdkWallet::with_connector(cfg, "https://mint.example.com", mint.clone()).unwrap()
+    }
+
+    #[test]
+    fn fake_mint_bolt11_receive_mints_on_sync() {
+        let dir = scratch("smoke");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().expect("connect against the fake mint");
+        let invoice = w
+            .receive(&ReceiveRequest {
+                method: ReceiveMethod::Bolt11Invoice,
+                amount_sats: Some(1_000),
+                description: None,
+            })
+            .unwrap();
+        assert!(invoice.starts_with("lnbc1fake"));
+        let quote = mint.mint_quote_ids().pop().unwrap();
+        mint.pay(&quote, 1_000);
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().confirmed_sats, 1_000);
+        w.disconnect().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn receive_paid_bolt11(w: &CdkWallet, mint: &test_mint::FakeMint, sats: u64) {
+        let before: std::collections::HashSet<String> = mint.mint_quote_ids().into_iter().collect();
+        w.receive(&ReceiveRequest {
+            method: ReceiveMethod::Bolt11Invoice,
+            amount_sats: Some(sats),
+            description: None,
+        })
+        .unwrap();
+        let quote = mint
+            .mint_quote_ids()
+            .into_iter()
+            .find(|id| !before.contains(id))
+            .unwrap();
+        mint.pay(&quote, sats);
+        w.sync_wallet().unwrap();
+    }
+
+    /// R-050: the real connect path must re-run NUT-13 when cashu.redb is
+    /// gone, even though the per-mint marker survived — and keep owing it
+    /// after a failed attempt.
+    #[test]
+    fn connect_restores_again_after_proof_db_is_deleted() {
+        let dir = scratch("nut13-db-deleted");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        assert_eq!(w.balance().unwrap().confirmed_sats, 1_000);
+        drop(w);
+        assert!(dir.join(DB_FILE).exists());
+
+        std::fs::remove_file(dir.join(DB_FILE)).unwrap();
+        let restores_before = mint.calls("post_restore");
+
+        // First reconnect: the restore itself fails.
+        mint.fail_next("post_restore", 1);
+        let w = reopen(&dir, &mint);
+        assert!(w.connect().is_err(), "a failed restore must fail connect");
+        drop(w);
+
+        // Second reconnect: restore is still owed and brings the funds back.
+        let w = reopen(&dir, &mint);
+        w.connect().unwrap();
+        assert!(
+            mint.calls("post_restore") > restores_before + 1,
+            "NUT-13 must run again on the reconnect after the failure"
+        );
+        assert_eq!(
+            w.balance().unwrap().confirmed_sats,
+            1_000,
+            "a deleted proof db must not present 0 sats over recoverable funds"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

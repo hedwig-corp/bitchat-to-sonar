@@ -32,3 +32,13 @@ serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Only for the in-process fake mint (`test-support`); cdk already links it.
+async-trait = { version = "0.1", optional = true }
+
+[features]
+# Exposes `test_mint::FakeMint` and `CdkWallet::with_connector` to other
+# crates' tests (sonar-ffi). Never enabled by a shipping build.
+test-support = ["dep:async-trait"]
+
+[dev-dependencies]
+async-trait = "0.1"
