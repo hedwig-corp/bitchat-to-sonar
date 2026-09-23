@@ -20,9 +20,11 @@ path = "src/bin/sonar-wallet-cli.rs"
 
 [dependencies]
 sonar-wallet = { path = "../sonar-wallet" }
-# Pinned by rev, not tag: this crate signs payments, and a git tag can be
-# moved upstream. `e11d88c` is what tag 0.12.4 pointed at when this landed.
-breez-sdk-liquid = { git = "https://github.com/breez/breez-sdk-liquid", rev = "e11d88c73abf1bf00b3c909e0a238c0abebb5d6a" }
+# Vendored at upstream rev `e11d88c` (tag 0.12.4): github.com/breez/breez-sdk-liquid
+# was re-created empty on 2026-09-20 and no longer serves that commit. Pinned
+# by content, not by a tag that could move. See
+# core/vendor/breez-sdk-liquid/VENDORED.md.
+breez-sdk-liquid = { path = "../vendor/breez-sdk-liquid/lib/core" }
 async-trait = "0.1"
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hex = "0.4"
@@ -37,3 +39,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # it here to keep swap behavior identical to upstream binary releases.
 [patch.crates-io]
 secp256k1-zkp = { git = "https://github.com/breez/rust-secp256k1-zkp.git", rev = "eac2e479255a6e32b5588bc25ee53c642fdd8395" }
+
+# github.com/breez/breez-sdk started returning 404 on 2026-08-15 — deleted or
+# made private upstream. breez-sdk-liquid (every rev, including main) still
+# pulls sdk-common/sdk-macros from that URL, and neither crate was published to
+# crates.io, so without this patch the island cannot build from a cold cargo
+# cache. The two crates are vendored from a local clone taken while the repo
+# was still up, verified against the pinned SHA. Full story, provenance, and
+# removal criteria: core/vendor/breez-sdk/VENDORED.md
+[patch."https://github.com/breez/breez-sdk"]
+sdk-common = { path = "../vendor/breez-sdk/libs/sdk-common" }
+sdk-macros = { path = "../vendor/breez-sdk/libs/sdk-macros" }
