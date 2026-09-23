@@ -6218,6 +6218,7 @@ name = "sonar-wallet-cdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bitcoin",
  "cdk",
  "cdk-redb",
  "clap",

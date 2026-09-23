@@ -45,3 +45,5 @@ test-support = ["dep:async-trait"]
 
 [dev-dependencies]
 async-trait = "0.1"
+# Signs real BOLT11 invoices for melt tests (same 0.32 cdk/lightning-invoice use).
+bitcoin = { version = "0.32", features = ["secp-recovery"] }

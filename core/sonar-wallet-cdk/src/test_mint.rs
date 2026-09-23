@@ -18,10 +18,10 @@ use cdk::nuts::nut05::MeltMethodSettings;
 use cdk::nuts::nut29::{BatchCheckMintQuoteRequest, BatchMintRequest};
 use cdk::nuts::{
     BlindSignature, BlindedMessage, CheckStateRequest, CheckStateResponse, CurrencyUnit, Id,
-    KeySet, KeySetInfo, Keys, KeysetResponse, MeltQuoteBolt11Response, MeltQuoteState,
-    MeltRequest, MintInfo, MintQuoteBolt11Response, MintQuoteBolt12Response, MintQuoteState,
-    MintRequest, MintResponse, Nuts, NUT04Settings, NUT05Settings, PaymentMethod, ProofState,
-    PublicKey, RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest, SwapResponse,
+    KeySet, KeySetInfo, Keys, KeysetResponse, MeltQuoteBolt11Response, MeltQuoteState, MeltRequest,
+    MintInfo, MintQuoteBolt11Response, MintQuoteBolt12Response, MintQuoteState, MintRequest,
+    MintResponse, NUT04Settings, NUT05Settings, Nuts, PaymentMethod, ProofState, PublicKey,
+    RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest, SwapResponse,
 };
 use cdk::wallet::{AuthWallet, MintConnector};
 use cdk::{Amount, Error, MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse};
@@ -60,6 +60,7 @@ struct FakeMeltQuote {
 struct FakeState {
     calls: Vec<&'static str>,
     hang: HashSet<&'static str>,
+    delay: HashMap<&'static str, std::time::Duration>,
     fail: HashMap<&'static str, u32>,
     mint_quotes: HashMap<String, FakeMintQuote>,
     melt_quotes: HashMap<String, FakeMeltQuote>,
@@ -140,7 +141,7 @@ impl FakeMint {
 
     /// Record the call; then hang forever or fail if the test asked for it.
     async fn enter(&self, method: &'static str) -> Result<(), Error> {
-        let (hang, fail) = self.with(|s| {
+        let (hang, fail, delay) = self.with(|s| {
             s.calls.push(method);
             let fail = match s.fail.get_mut(method) {
                 Some(n) if *n > 0 => {
@@ -149,13 +150,18 @@ impl FakeMint {
                 }
                 _ => false,
             };
-            (s.hang.contains(method), fail)
+            (s.hang.contains(method), fail, s.delay.get(method).copied())
         });
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if hang {
             std::future::pending::<()>().await;
         }
         if fail {
-            return Err(Error::Custom(format!("fake mint: scripted failure of {method}")));
+            return Err(Error::Custom(format!(
+                "fake mint: scripted failure of {method}"
+            )));
         }
         Ok(())
     }
@@ -175,6 +181,13 @@ impl FakeMint {
     pub fn unhang(&self, method: &'static str) {
         self.with(|s| {
             s.hang.remove(method);
+        });
+    }
+
+    /// Answer `method` only after `delay` (a slow, not dead, mint).
+    pub fn delay(&self, method: &'static str, delay: std::time::Duration) {
+        self.with(|s| {
+            s.delay.insert(method, delay);
         });
     }
 
@@ -324,7 +337,13 @@ impl FakeMint {
     }
 
     pub fn mint_info() -> MintInfo {
-        let limits = |method| (method, Some(Amount::from(1u64)), Some(Amount::from(500_000u64)));
+        let limits = |method| {
+            (
+                method,
+                Some(Amount::from(1u64)),
+                Some(Amount::from(500_000u64)),
+            )
+        };
         let mint_methods = [KnownMethod::Bolt11, KnownMethod::Bolt12]
             .into_iter()
             .map(|m| {
@@ -514,7 +533,10 @@ impl MintConnector for FakeMint {
             MeltQuoteRequest::Bolt11(r) => {
                 let msat = match &r.options {
                     Some(options) => u64::from(options.amount_msat()),
-                    None => r.request.amount_milli_satoshis().ok_or(Error::AmountUndefined)?,
+                    None => r
+                        .request
+                        .amount_milli_satoshis()
+                        .ok_or(Error::AmountUndefined)?,
                 };
                 (
                     PaymentMethod::Known(KnownMethod::Bolt11),
@@ -649,7 +671,10 @@ impl MintConnector for FakeMint {
         Ok(Self::mint_info())
     }
 
-    async fn post_check_state(&self, request: CheckStateRequest) -> Result<CheckStateResponse, Error> {
+    async fn post_check_state(
+        &self,
+        request: CheckStateRequest,
+    ) -> Result<CheckStateResponse, Error> {
         self.enter("post_check_state").await?;
         let states = self.with(|s| {
             request

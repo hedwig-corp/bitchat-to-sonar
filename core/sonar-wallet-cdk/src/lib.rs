@@ -147,6 +147,7 @@ pub struct CdkWallet {
     watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Replaces CDK's HTTP client; only ever set by tests (`with_connector`).
     connector: Option<Arc<dyn MintConnector + Send + Sync>>,
+    budgets: Budgets,
 }
 
 impl CdkWallet {
@@ -209,7 +210,20 @@ impl CdkWallet {
             events_tx,
             watcher: Mutex::new(None),
             connector: None,
+            budgets: Budgets::DEFAULT,
         })
+    }
+
+    /// Shrink every mint deadline to `budget` so tests can exercise the
+    /// timeout paths without waiting for production deadlines.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_test_budget(&mut self, budget: Duration) {
+        self.budgets = Budgets {
+            mint_call: budget,
+            restore: budget,
+            recovery: budget,
+            send: budget,
+        };
     }
 
     /// A wallet whose mint traffic goes to `connector` instead of HTTP — the
@@ -426,10 +440,7 @@ impl CdkWallet {
     /// Ask the mint for a receive quote. An amountless BOLT12 offer is the
     /// normal receive primitive and carries no fixed amount; only a BOLT11
     /// invoice needs one.
-    fn create_mint_quote(
-        &self,
-        request: &ReceiveRequest,
-    ) -> Result<cdk::wallet::types::MintQuote> {
+    fn create_mint_quote(&self, request: &ReceiveRequest) -> Result<cdk::wallet::types::MintQuote> {
         let wallet = self.wallet()?;
         let method = match request.method {
             ReceiveMethod::Bolt11Invoice => PaymentMethod::Known(KnownMethod::Bolt11),
@@ -444,7 +455,7 @@ impl CdkWallet {
             ));
         }
         self.rt().block_on(bounded(
-            MINT_CALL_BUDGET,
+            self.budgets.mint_call,
             wallet.mint_quote(
                 method,
                 request.amount_sats.map(Amount::from),
@@ -457,8 +468,12 @@ impl CdkWallet {
     /// One pass of the pending-mint-quote watcher (best-effort: errors are
     /// logged and retried next tick, since the watcher must outlive transient
     /// mint hiccups).
-    async fn poll_mint_quotes(wallet: &Wallet, events: &mpsc::Sender<WalletEvent>) -> usize {
-        match Self::poll_mint_quotes_strict(wallet, events).await {
+    async fn poll_mint_quotes(
+        wallet: &Wallet,
+        events: &mpsc::Sender<WalletEvent>,
+        budget: Duration,
+    ) -> usize {
+        match Self::poll_mint_quotes_strict(wallet, events, budget).await {
             Ok(minted) => minted,
             Err(e) => {
                 tracing::warn!("mint-quote poll failed: {e}");
@@ -474,6 +489,7 @@ impl CdkWallet {
     async fn poll_mint_quotes_strict(
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
+        budget: Duration,
     ) -> Result<usize> {
         // The incoming (mint) and outgoing (melt) sides are reconciled
         // INDEPENDENTLY and their errors aggregated afterwards: a single
@@ -481,14 +497,14 @@ impl CdkWallet {
         // delayed melt on every pass, or its reserved proofs stay reserved
         // for as long as the bad quote exists.
         let mut errors: Vec<String> = Vec::new();
-        let minted = match Self::reconcile_mint_quotes(wallet, events).await {
+        let minted = match Self::reconcile_mint_quotes(wallet, events, budget).await {
             Ok(n) => n,
             Err(e) => {
                 errors.push(e.to_string());
                 0
             }
         };
-        let settled = match Self::reconcile_pending_melts(wallet, events).await {
+        let settled = match Self::reconcile_pending_melts(wallet, events, budget).await {
             Ok(n) => n,
             Err(e) => {
                 errors.push(e.to_string());
@@ -516,6 +532,7 @@ impl CdkWallet {
     async fn reconcile_mint_quotes(
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
+        budget: Duration,
     ) -> Result<usize> {
         let mut minted = 0;
         let quotes = wallet
@@ -527,12 +544,7 @@ impl CdkWallet {
         // stop every later quote from minting, now or on any future pass.
         let mut errors: Vec<String> = Vec::new();
         for quote in quotes {
-            let updated = match bounded(
-                MINT_CALL_BUDGET,
-                wallet.check_mint_quote_status(&quote.id),
-            )
-            .await
-            {
+            let updated = match bounded(budget, wallet.check_mint_quote_status(&quote.id)).await {
                 Ok(updated) => updated,
                 Err(e) => {
                     errors.push(format!("quote {}: {e}", quote.id));
@@ -549,12 +561,7 @@ impl CdkWallet {
                 }
                 continue;
             }
-            match bounded(
-                MINT_CALL_BUDGET,
-                wallet.mint(&quote.id, SplitTarget::default(), None),
-            )
-            .await
-            {
+            match bounded(budget, wallet.mint(&quote.id, SplitTarget::default(), None)).await {
                 Ok(proofs) => {
                     minted += 1;
                     let amount_sats = proofs.iter().map(|p| u64::from(p.amount)).sum::<u64>();
@@ -600,6 +607,7 @@ impl CdkWallet {
     async fn reconcile_pending_melts(
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
+        budget: Duration,
     ) -> Result<usize> {
         // Notes are read BEFORE finalizing, and a lookup failure aborts the
         // pass. Order matters: `finalize_pending_melts` makes a melt terminal,
@@ -618,8 +626,7 @@ impl CdkWallet {
                 Some((tx.quote_id?, note))
             })
             .collect();
-        let finalized = wallet
-            .finalize_pending_melts()
+        let finalized = bounded(budget, wallet.finalize_pending_melts())
             .await
             .map_err(|e| WalletError::Backend(format!("finalize pending melts: {e}")))?;
         let mut settled = 0;
@@ -659,15 +666,37 @@ fn refine_bolt11_amount(destination: Destination) -> Destination {
     if destination.kind != DestinationKind::Bolt11 || destination.amount_sats.is_some() {
         return destination;
     }
-    use std::str::FromStr;
-    match lightning_invoice::Bolt11Invoice::from_str(&destination.raw) {
-        Ok(invoice) => Destination {
-            amount_sats: invoice
-                .amount_milli_satoshis()
-                .map(|msat| msat.div_ceil(1_000)),
+    match bolt11_msat(&destination.raw) {
+        Some(msat) => Destination {
+            amount_sats: Some(msat.div_ceil(1_000)),
             ..destination
         },
-        Err(_) => destination,
+        None => destination,
+    }
+}
+
+/// The msat amount a BOLT11 invoice encodes, if it decodes and has one.
+fn bolt11_msat(raw: &str) -> Option<u64> {
+    use std::str::FromStr;
+    lightning_invoice::Bolt11Invoice::from_str(raw)
+        .ok()?
+        .amount_milli_satoshis()
+}
+
+/// Whether the mint's quote agrees with the amount we confirmed. Exact,
+/// except for a sub-sat BOLT11 invoice: its msat amount has two honest sat
+/// figures (we round up for display, CDK mints floor), and either rounding
+/// of the invoice's OWN amount is the same payment.
+fn quote_agrees(quoted: u64, confirmed: u64, invoice_msat: Option<u64>) -> bool {
+    if quoted == confirmed {
+        return true;
+    }
+    match invoice_msat {
+        Some(msat) if msat % 1_000 != 0 => {
+            let honest = [msat / 1_000, msat.div_ceil(1_000)];
+            honest.contains(&quoted) && honest.contains(&confirmed)
+        }
+        _ => false,
     }
 }
 
@@ -686,10 +715,29 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Upper bound on a single mint round-trip. A mint that accepts the
-/// connection and then never answers must not stall the caller (or the
-/// watcher) indefinitely.
-const MINT_CALL_BUDGET: Duration = Duration::from_secs(15);
+/// Deadlines for mint I/O. A mint that accepts the connection and then never
+/// answers must not stall the caller (or the watcher) indefinitely.
+#[derive(Debug, Clone, Copy)]
+struct Budgets {
+    /// One round-trip: mint info, a quote, a status check, one mint.
+    mint_call: Duration,
+    /// A whole NUT-13 restore scan (many batched round-trips).
+    restore: Duration,
+    /// Recovering sagas a crash interrupted.
+    recovery: Duration,
+    /// How long `send` waits before reporting the melt Pending (or, if it
+    /// never reached the irreversible step, Timeout).
+    send: Duration,
+}
+
+impl Budgets {
+    const DEFAULT: Self = Self {
+        mint_call: Duration::from_secs(15),
+        restore: Duration::from_secs(120),
+        recovery: Duration::from_secs(30),
+        send: Duration::from_secs(60),
+    };
+}
 
 /// How long past its expiry an unpaid BOLT11 invoice is still checked before
 /// it is dropped from the store. Generous: a payment in flight at expiry can
@@ -718,6 +766,90 @@ fn is_abandoned_invoice(quote: &cdk::wallet::types::MintQuote, now: u64) -> bool
         && quote.amount_paid == Amount::ZERO
         && quote.expiry != 0
         && now > quote.expiry.saturating_add(ABANDONED_INVOICE_GRACE_SECS)
+}
+
+/// Who reports a send's outcome when the caller stops waiting (see `send`).
+#[derive(Default)]
+struct SendHandoff {
+    /// The caller returned (Timeout or Pending) and is no longer listening.
+    caller_gone: bool,
+    /// The melt reached `confirm` — the irreversible step.
+    confirming: bool,
+}
+
+fn map_melt_error(e: cdk::Error) -> WalletError {
+    match e {
+        cdk::Error::InsufficientFunds => WalletError::InsufficientFunds,
+        other => WalletError::Backend(other.to_string()),
+    }
+}
+
+/// A melt that is (or may still be) in flight, reported with the figures
+/// the caller consented to.
+fn pending_payment(quote_id: &str, prepared: &PreparedSend, note: Option<String>) -> Payment {
+    Payment {
+        id: quote_id.to_string(),
+        amount_sats: prepared.amount_sats,
+        fees_sats: prepared.fees_sats,
+        incoming: false,
+        timestamp_secs: now_secs(),
+        status: PaymentStatus::Pending,
+        preimage: None,
+        note,
+    }
+}
+
+/// The payment a melt confirmation produced. Only a mint that says the
+/// payment FAILED is a failure; any other confirm error is ambiguous — the
+/// melt may have reached the mint — so it is Pending, for the watcher (or
+/// saga recovery) to settle, never an error that invites a second payment.
+/// A mint that accepted the melt asynchronously is Pending as well; the
+/// watcher's `finalize_pending_melts` emits its outcome.
+fn melt_outcome_payment(
+    quote_id: &str,
+    prepared: &PreparedSend,
+    outcome: std::result::Result<cdk::wallet::MeltOutcome<'_>, cdk::Error>,
+    note: Option<String>,
+) -> Payment {
+    let finalized = match outcome {
+        Ok(cdk::wallet::MeltOutcome::Paid(finalized)) => finalized,
+        Ok(cdk::wallet::MeltOutcome::Pending(_)) => {
+            return pending_payment(quote_id, prepared, note);
+        }
+        Err(cdk::Error::PaymentFailed) => {
+            return Payment {
+                status: PaymentStatus::Failed,
+                ..pending_payment(quote_id, prepared, note)
+            };
+        }
+        Err(e) => {
+            tracing::warn!("melt {quote_id} confirm is ambiguous, reporting Pending: {e}");
+            return pending_payment(quote_id, prepared, note);
+        }
+    };
+    Payment {
+        id: quote_id.to_string(),
+        amount_sats: u64::from(finalized.amount()),
+        fees_sats: Some(u64::from(finalized.fee_paid())),
+        incoming: false,
+        timestamp_secs: now_secs(),
+        status: match finalized.state() {
+            MeltQuoteState::Paid => PaymentStatus::Complete,
+            MeltQuoteState::Failed => PaymentStatus::Failed,
+            MeltQuoteState::Pending | MeltQuoteState::Unpaid | MeltQuoteState::Unknown => {
+                PaymentStatus::Pending
+            }
+        },
+        preimage: finalized.payment_proof().map(str::to_string),
+        note,
+    }
+}
+
+fn payment_event(payment: Payment) -> WalletEvent {
+    match payment.status {
+        PaymentStatus::Failed => WalletEvent::PaymentFailed { payment },
+        _ => WalletEvent::PaymentSent { payment },
+    }
 }
 
 /// The id hosts see for an incoming payment. A BOLT11 invoice is paid once,
@@ -848,8 +980,11 @@ impl WalletBackend for CdkWallet {
             // info/keysets; without this, "connected" would be a lie the
             // first send exposes.
             self.rt()
-                .block_on(wallet.load_mint_info())
-                .map_err(|e| WalletError::Network(format!("mint unreachable: {e}")))?;
+                .block_on(bounded(self.budgets.mint_call, wallet.load_mint_info()))
+                .map_err(|e| match e {
+                    WalletError::Timeout => WalletError::Timeout,
+                    other => WalletError::Network(format!("mint unreachable: {other}")),
+                })?;
             if restore_owed {
                 // No valid restore marker: scan the mint for proofs the seed
                 // already owns (NUT-13). This is what makes wipe → reconnect
@@ -860,8 +995,11 @@ impl WalletBackend for CdkWallet {
                 // permanently skipped.
                 let restored = self
                     .rt()
-                    .block_on(wallet.restore())
-                    .map_err(|e| WalletError::Backend(format!("NUT-13 restore: {e}")))?;
+                    .block_on(bounded(self.budgets.restore, wallet.restore()))
+                    .map_err(|e| match e {
+                        WalletError::Timeout => WalletError::Timeout,
+                        other => WalletError::Backend(format!("NUT-13 restore: {other}")),
+                    })?;
                 tracing::info!(
                     "NUT-13 restore recovered {} sats unspent ({} pending)",
                     u64::from(restored.unspent),
@@ -872,6 +1010,29 @@ impl WalletBackend for CdkWallet {
                     b"1",
                 )
                 .map_err(|e| WalletError::Backend(format!("write restore marker: {e}")))?;
+            }
+            // Finish or roll back whatever a crash interrupted (a melt, swap,
+            // or mint mid-flight): CDK leaves those proofs Reserved/Pending
+            // until this runs, and says to call it on startup. It runs HERE,
+            // before the wallet is published, so no send of ours can be in
+            // flight on this store while it compensates. Best-effort: a mint
+            // outage must not make the funds we do hold unreachable, and the
+            // next connect retries.
+            match self.rt().block_on(bounded(
+                self.budgets.recovery,
+                wallet.recover_incomplete_sagas(),
+            )) {
+                Ok(report) => {
+                    if report.recovered + report.compensated + report.failed > 0 {
+                        tracing::info!(
+                            "saga recovery: {} recovered, {} compensated, {} failed",
+                            report.recovered,
+                            report.compensated,
+                            report.failed
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("saga recovery deferred to the next connect: {e}"),
             }
             Ok(Arc::new(wallet))
         })();
@@ -900,6 +1061,7 @@ impl WalletBackend for CdkWallet {
         // forwarder; spawning cannot fail, so no rollback path exists).
         let events = self.events_tx.clone();
         let watch_wallet = wallet.clone();
+        let budget = self.budgets.mint_call;
         let handle = self.rt().spawn(async move {
             // First tick DELAYED, not immediate: a disconnect racing the
             // install below aborts this task at its first await, and an
@@ -910,7 +1072,7 @@ impl WalletBackend for CdkWallet {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                CdkWallet::poll_mint_quotes(&watch_wallet, &events).await;
+                CdkWallet::poll_mint_quotes(&watch_wallet, &events, budget).await;
             }
         });
         {
@@ -1005,10 +1167,14 @@ impl WalletBackend for CdkWallet {
                     .iter()
                     .map(|q| u64::from(q.amount_mintable())),
             );
+            // CDK's Pending proofs are the INPUTS of an in-flight melt: money
+            // on its way out, not in. Counting them as pending receive showed
+            // a send as incoming. They and the Reserved proofs of a prepared
+            // melt are both outgoing.
             Ok(Balance {
                 confirmed_sats: u64::from(confirmed),
-                pending_receive_sats: u64::from(pending).saturating_add(quoted),
-                pending_send_sats: u64::from(reserved),
+                pending_receive_sats: quoted,
+                pending_send_sats: u64::from(pending).saturating_add(u64::from(reserved)),
             })
         })
     }
@@ -1016,8 +1182,9 @@ impl WalletBackend for CdkWallet {
     fn sync_wallet(&self) -> Result<()> {
         let wallet = self.wallet()?;
         let events = self.events_tx.clone();
-        self.rt()
-            .block_on(async { CdkWallet::poll_mint_quotes_strict(&wallet, &events).await })?;
+        self.rt().block_on(async {
+            CdkWallet::poll_mint_quotes_strict(&wallet, &events, self.budgets.mint_call).await
+        })?;
         Ok(())
     }
 
@@ -1066,39 +1233,45 @@ impl WalletBackend for CdkWallet {
             resolve_send_amount(amount_sats, destination.amount_sats)?
         };
 
+        let budget = self.budgets.mint_call;
         let quote = self.rt().block_on(async {
-            match destination.kind {
-                DestinationKind::Bolt11 => {
-                    // An amount-carrying invoice needs no options; an
-                    // amountless one carries the caller's amount as msat.
-                    let options = if destination.amount_sats.is_none() {
-                        requested.map(|sats| MeltOptions::new_amountless(sats * 1_000))
-                    } else {
-                        None
-                    };
-                    wallet
-                        .melt_quote(KnownMethod::Bolt11, destination.raw.clone(), options, None)
-                        .await
+            let quote = async {
+                match destination.kind {
+                    DestinationKind::Bolt11 => {
+                        // An amount-carrying invoice needs no options; an
+                        // amountless one carries the caller's amount as msat.
+                        let options = if destination.amount_sats.is_none() {
+                            requested.map(|sats| MeltOptions::new_amountless(sats * 1_000))
+                        } else {
+                            None
+                        };
+                        wallet
+                            .melt_quote(KnownMethod::Bolt11, destination.raw.clone(), options, None)
+                            .await
+                    }
+                    DestinationKind::Bolt12Offer => {
+                        let options =
+                            requested.map(|sats| MeltOptions::new_amountless(sats * 1_000));
+                        wallet
+                            .melt_quote(KnownMethod::Bolt12, destination.raw.clone(), options, None)
+                            .await
+                    }
+                    DestinationKind::LightningAddress => {
+                        let sats = requested.ok_or(cdk::Error::AmountUndefined)?;
+                        wallet
+                            .melt_lightning_address_quote(&destination.raw, sats * 1_000)
+                            .await
+                    }
+                    // Raw LNURL-pay strings are not routed by CDK; addresses and
+                    // BIP-353 are. `lnurl_send: true` covers the address family.
+                    DestinationKind::LnurlPay | DestinationKind::Unknown => {
+                        Err(cdk::Error::UnsupportedPaymentMethod)
+                    }
                 }
-                DestinationKind::Bolt12Offer => {
-                    let options = requested.map(|sats| MeltOptions::new_amountless(sats * 1_000));
-                    wallet
-                        .melt_quote(KnownMethod::Bolt12, destination.raw.clone(), options, None)
-                        .await
-                }
-                DestinationKind::LightningAddress => {
-                    let sats = requested.ok_or(cdk::Error::AmountUndefined)?;
-                    wallet
-                        .melt_lightning_address_quote(&destination.raw, sats * 1_000)
-                        .await
-                }
-                // Raw LNURL-pay strings are not routed by CDK; addresses and
-                // BIP-353 are. `lnurl_send: true` covers the address family.
-                DestinationKind::LnurlPay | DestinationKind::Unknown => {
-                    Err(cdk::Error::UnsupportedPaymentMethod)
-                }
-            }
+            };
+            tokio::time::timeout(budget, quote).await
         });
+        let quote = quote.map_err(|_| WalletError::Timeout)?;
         let quote = quote.map_err(|e| match e {
             cdk::Error::InsufficientFunds => WalletError::InsufficientFunds,
             cdk::Error::UnsupportedPaymentMethod => {
@@ -1112,8 +1285,11 @@ impl WalletBackend for CdkWallet {
         // quote against whichever figure we hold — the caller's argument or
         // the amount decoded from the destination itself. A buggy or
         // dishonest mint must not be able to re-price a fixed invoice.
+        let invoice_msat = (destination.kind == DestinationKind::Bolt11)
+            .then(|| bolt11_msat(&destination.raw))
+            .flatten();
         if let Some(confirmed) = amount_sats.or(destination.amount_sats) {
-            if quoted_amount != confirmed {
+            if !quote_agrees(quoted_amount, confirmed, invoice_msat) {
                 return Err(WalletError::InvalidDestination(format!(
                     "mint quoted {quoted_amount} sats but the confirmed amount is {confirmed} sats"
                 )));
@@ -1136,51 +1312,89 @@ impl WalletBackend for CdkWallet {
                 "this prepared send did not come from the CDK backend".into(),
             ));
         };
-        let note_meta = (!note.is_empty()).then(|| {
-            let mut m = HashMap::new();
+        let note = (!note.is_empty()).then(|| note.to_string());
+        let mut metadata = HashMap::new();
+        if let Some(note) = &note {
             // CDK surfaces transaction metadata; the "memo" key keeps
             // list_recent_payments consistent with what we return here.
-            m.insert("memo".to_string(), note.to_string());
-            m
-        });
-        let payment = self.rt().block_on(async {
-            let prepared_melt = wallet
-                .prepare_melt(quote_id, note_meta.clone().unwrap_or_default())
-                .await
-                .map_err(|e| WalletError::Backend(e.to_string()))?;
-            let finalized = prepared_melt
-                .confirm()
-                .await
-                .map_err(|e| WalletError::Backend(e.to_string()))?;
-            let status = match finalized.state() {
-                MeltQuoteState::Paid => PaymentStatus::Complete,
-                MeltQuoteState::Pending | MeltQuoteState::Unpaid | MeltQuoteState::Unknown => {
-                    PaymentStatus::Pending
+            metadata.insert("memo".to_string(), note.clone());
+        }
+
+        // The melt runs as its own task, so a caller that stops waiting does
+        // not cancel it: dropping a melt mid-flight is a crash as far as CDK
+        // is concerned, and the payment may already be on its way. The
+        // handoff decides who reports the outcome — see `SendHandoff`.
+        let handoff = Arc::new(Mutex::new(SendHandoff::default()));
+        let task = {
+            let wallet = wallet.clone();
+            let handoff = handoff.clone();
+            let events = self.events_tx.clone();
+            let quote_id = quote_id.clone();
+            let note = note.clone();
+            let prepared = prepared.clone();
+            self.rt().spawn(async move {
+                let melt = wallet
+                    .prepare_melt(&quote_id, metadata)
+                    .await
+                    .map_err(map_melt_error)?;
+                let abandoned = {
+                    let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
+                    h.confirming = !h.caller_gone;
+                    h.caller_gone
+                };
+                if abandoned {
+                    // The caller already reported a timeout; paying now would
+                    // be a payment nobody is waiting for.
+                    if let Err(e) = melt.cancel().await {
+                        tracing::warn!("cancel abandoned melt {quote_id}: {e}");
+                    }
+                    return Err(WalletError::Timeout);
                 }
-                MeltQuoteState::Failed => PaymentStatus::Failed,
-            };
-            Ok(Payment {
-                id: quote_id.clone(),
-                amount_sats: u64::from(finalized.amount()),
-                fees_sats: Some(u64::from(finalized.fee_paid())),
-                incoming: false,
-                timestamp_secs: now_secs(),
-                status,
-                preimage: finalized.payment_proof().map(str::to_string),
-                note: (!note.is_empty()).then(|| note.to_string()),
+                // Prefer async: a mint that accepts the payment and keeps
+                // routing it answers Pending at once instead of holding the
+                // request open; the watcher finalizes it.
+                let outcome = melt.confirm_prefer_async().await;
+                let payment = melt_outcome_payment(&quote_id, &prepared, outcome, note);
+                let h = handoff.lock().unwrap_or_else(|e| e.into_inner());
+                if h.caller_gone {
+                    let _ = events.send(payment_event(payment.clone()));
+                }
+                Ok(payment)
             })
-        })?;
+        };
+
+        let mut task = task;
+        let waited = self
+            .rt()
+            .block_on(async { tokio::time::timeout(self.budgets.send, &mut task).await });
+        let joined = match waited {
+            Ok(joined) => joined,
+            Err(_) => {
+                let confirming = {
+                    let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
+                    h.caller_gone = true;
+                    h.confirming
+                };
+                if task.is_finished() {
+                    // It finished between the deadline and the handoff lock
+                    // and did not emit (it saw us still waiting): report it.
+                    self.rt().block_on(&mut task)
+                } else if confirming {
+                    // Money may be moving. Never an error here — an error
+                    // invites a retry that pays twice. The task emits the
+                    // terminal event; the watcher also finalizes the melt.
+                    return Ok(pending_payment(quote_id, prepared, note));
+                } else {
+                    // Still before the irreversible step: the task will
+                    // cancel instead of confirming.
+                    return Err(WalletError::Timeout);
+                }
+            }
+        };
+        let payment = joined.map_err(|e| WalletError::Backend(format!("send task: {e}")))??;
         // A finalized-but-failed melt must not be announced as sent; hosts
         // render the two very differently.
-        if payment.status == PaymentStatus::Failed {
-            self.emit(WalletEvent::PaymentFailed {
-                payment: payment.clone(),
-            });
-        } else {
-            self.emit(WalletEvent::PaymentSent {
-                payment: payment.clone(),
-            });
-        }
+        self.emit(payment_event(payment.clone()));
         Ok(payment)
     }
 
@@ -1246,7 +1460,10 @@ impl WalletBackend for CdkWallet {
                         incoming,
                         timestamp_secs: tx.timestamp,
                         status,
-                        preimage: None,
+                        // The preimage is the proof of an outgoing payment
+                        // (chat ⚡PAYDONE carries it); CDK keeps it on the
+                        // transaction, so history must not drop it.
+                        preimage: tx.payment_proof.clone(),
                         note: tx_note(tx.memo.as_ref(), &tx.metadata).filter(|n| !n.is_empty()),
                     }
                 })
@@ -1764,7 +1981,10 @@ mod tests {
 
         mint.pay(&quote, 300);
         mint.fail_next("post_mint", 1);
-        assert!(w.sync_wallet().is_err(), "strict sync reports the failed mint");
+        assert!(
+            w.sync_wallet().is_err(),
+            "strict sync reports the failed mint"
+        );
         let balance = w.balance().unwrap();
         assert_eq!(balance.confirmed_sats, 0);
         assert_eq!(balance.pending_receive_sats, 300, "the mint owes us 300");
@@ -1801,7 +2021,8 @@ mod tests {
         let dir = scratch("fresh-sync");
         let (w, _mint) = fake_wallet(&dir);
         w.connect().unwrap();
-        w.sync_wallet().expect("a new wallet's first sync must not fail");
+        w.sync_wallet()
+            .expect("a new wallet's first sync must not fail");
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1818,7 +2039,11 @@ mod tests {
         bolt11_receive(&w, 2_000);
         let recent = newest_quote(&mint, &before);
 
-        set_local_expiry(&w, &abandoned, now_secs() - ABANDONED_INVOICE_GRACE_SECS - 60);
+        set_local_expiry(
+            &w,
+            &abandoned,
+            now_secs() - ABANDONED_INVOICE_GRACE_SECS - 60,
+        );
         set_local_expiry(&w, &recent, now_secs() - 60);
         w.sync_wallet().unwrap();
         assert!(!local_quote_exists(&w, &abandoned));
@@ -1826,6 +2051,246 @@ mod tests {
             local_quote_exists(&w, &recent),
             "an invoice just past expiry may still settle"
         );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real, signed BOLT11 invoice; each call has a distinct payment hash.
+    fn test_invoice(msat: Option<u64>) -> String {
+        use bitcoin::hashes::{sha256, Hash};
+        use bitcoin::secp256k1::{Secp256k1, SecretKey};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let key = SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let builder = lightning_invoice::InvoiceBuilder::new(lightning_invoice::Currency::Bitcoin)
+            .description("sonar test".into())
+            .payment_hash(sha256::Hash::hash(&n.to_be_bytes()))
+            .payment_secret(lightning_invoice::PaymentSecret([42; 32]))
+            .current_timestamp()
+            .min_final_cltv_expiry_delta(144);
+        let builder = match msat {
+            Some(msat) => builder.amount_milli_satoshis(msat),
+            None => builder,
+        };
+        builder
+            .build_signed(|m| Secp256k1::new().sign_ecdsa_recoverable(m, &key))
+            .unwrap()
+            .to_string()
+    }
+
+    fn prepare(w: &CdkWallet, invoice: &str, sats: Option<u64>) -> Result<PreparedSend> {
+        let destination = w.parse_destination(invoice)?;
+        w.prepare_send(&destination, sats)
+    }
+
+    fn last_bolt11_options(mint: &test_mint::FakeMint) -> Option<MeltOptions> {
+        match mint.melt_quote_requests().pop().expect("a melt quote request") {
+            cdk::MeltQuoteRequest::Bolt11(r) => r.options,
+            other => panic!("expected a BOLT11 melt quote, got {other:?}"),
+        }
+    }
+
+    const PREIMAGE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn fixed_amount_invoice_sends_no_melt_options() {
+        let dir = scratch("melt-fixed");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        assert_eq!(prepared.amount_sats, 300);
+        assert!(
+            last_bolt11_options(&mint).is_none(),
+            "a fixed invoice must not be quoted as amountless"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn amountless_invoice_carries_the_callers_amount() {
+        let dir = scratch("melt-amountless");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let prepared = prepare(&w, &test_invoice(None), Some(250)).unwrap();
+        assert_eq!(prepared.amount_sats, 250);
+        let options = last_bolt11_options(&mint).expect("amountless needs options");
+        assert_eq!(u64::from(options.amount_msat()), 250_000);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1,500 msat: we show 2 sats (never understate), CDK's mint floors to 1.
+    /// Both are this invoice's own amount; refusing left it unpayable.
+    #[test]
+    fn sub_sat_invoice_accepts_the_mints_floor() {
+        let dir = scratch("melt-subsat");
+        let (w, _mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let prepared = prepare(&w, &test_invoice(Some(1_500)), None).unwrap();
+        assert_eq!(prepared.amount_sats, 1, "the mint's figure is what is charged");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mint_repricing_a_whole_sat_invoice_is_still_refused() {
+        assert!(quote_agrees(300, 300, Some(300_000)));
+        assert!(!quote_agrees(299, 300, Some(300_000)));
+        assert!(quote_agrees(1, 2, Some(1_500)));
+        assert!(!quote_agrees(3, 2, Some(1_500)));
+        assert!(!quote_agrees(1, 2, None));
+    }
+
+    #[test]
+    fn sent_payment_and_history_carry_the_preimage() {
+        let dir = scratch("preimage");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_outcome(test_mint::MeltOutcome::Paid {
+            preimage: Some(PREIMAGE.into()),
+        });
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        let payment = w.send(&prepared, "lunch").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Complete);
+        assert_eq!(payment.preimage.as_deref(), Some(PREIMAGE));
+
+        let outgoing = w
+            .list_recent_payments(10)
+            .unwrap()
+            .into_iter()
+            .find(|p| !p.incoming)
+            .expect("the send is in history");
+        assert_eq!(outgoing.id, payment.id);
+        assert_eq!(
+            outgoing.preimage.as_deref(),
+            Some(PREIMAGE),
+            "chat ⚡PAYDONE reads the proof from history after a restart"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Money on its way out is pending SEND. CDK's Pending proofs are the
+    /// inputs of an in-flight melt; counting them as pending receive showed
+    /// a send as incoming.
+    #[test]
+    fn in_flight_melt_is_pending_send_not_pending_receive() {
+        let dir = scratch("inflight-melt");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_outcome(test_mint::MeltOutcome::Pending);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Pending);
+
+        let balance = w.balance().unwrap();
+        assert_eq!(balance.pending_receive_sats, 0, "a send is not incoming");
+        assert!(balance.pending_send_sats >= 300, "{balance:?}");
+
+        mint.resolve_melt(
+            &payment.id,
+            test_mint::MeltOutcome::Paid {
+                preimage: Some(PREIMAGE.into()),
+            },
+        );
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().pending_send_sats, 0);
+        assert!(eventually(|| recorder.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            WalletEvent::PaymentSent { payment: p }
+                if p.id == payment.id && p.status == PaymentStatus::Complete
+        ))));
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A send that outlives its deadline is Pending — never an error, which
+    /// would invite a second payment — and its outcome still arrives.
+    #[test]
+    fn send_past_its_deadline_is_pending_then_completes() {
+        let dir = scratch("send-deadline");
+        let (mut w, mint) = fake_wallet(&dir);
+        w.set_test_budget(Duration::from_millis(400));
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_outcome(test_mint::MeltOutcome::Paid {
+            preimage: Some(PREIMAGE.into()),
+        });
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        mint.delay("post_melt", Duration::from_millis(1_500));
+
+        let payment = w.send(&prepared, "").expect("a slow melt is not an error");
+        assert_eq!(payment.status, PaymentStatus::Pending);
+        assert!(eventually(|| recorder.0.lock().unwrap().iter().any(|e| matches!(
+            e,
+            WalletEvent::PaymentSent { payment: p }
+                if p.id == payment.id
+                    && p.status == PaymentStatus::Complete
+                    && p.preimage.as_deref() == Some(PREIMAGE)
+        ))));
+        assert_eq!(mint.calls("post_melt"), 1, "exactly one payment");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_fails_fast_on_a_hung_mint_and_recovers_later() {
+        let dir = scratch("hung-mint");
+        let (mut w, mint) = fake_wallet(&dir);
+        w.set_test_budget(Duration::from_millis(300));
+        mint.hang("get_mint_info");
+        let started = std::time::Instant::now();
+        assert!(matches!(w.connect(), Err(WalletError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!w.is_connected());
+        mint.unhang("get_mint_info");
+        w.connect().expect("the next connect succeeds");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash at the irreversible step leaves the melt's proofs reserved
+    /// until saga recovery runs; connect must run it.
+    #[test]
+    fn connect_compensates_a_melt_interrupted_mid_flight() {
+        let dir = scratch("saga-recovery");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        let PreparedSendToken::Opaque(quote_id) = prepared.token.clone() else {
+            unreachable!()
+        };
+
+        // "Crash": drive CDK's melt and drop it while the mint holds the
+        // request, before any answer — the payment never happened.
+        mint.hang("post_melt");
+        let wallet = w.wallet().unwrap();
+        w.rt().block_on(async {
+            let melt = wallet.prepare_melt(&quote_id, HashMap::new()).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(200), melt.confirm()).await;
+        });
+        assert!(
+            w.balance().unwrap().confirmed_sats < 1_000,
+            "the interrupted melt holds its inputs"
+        );
+        drop(wallet);
+        drop(w);
+
+        mint.unhang("post_melt");
+        let w = reopen(&dir, &mint);
+        w.connect().unwrap();
+        let balance = w.balance().unwrap();
+        assert_eq!(balance.confirmed_sats, 1_000, "{balance:?}");
+        assert_eq!(balance.pending_send_sats, 0, "{balance:?}");
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
