@@ -71,10 +71,24 @@ fun PaySheet(
      * choose.
      */
     fixedSats: Long? = null,
+    /**
+     * What the `Max` chip proposes. The Cashu wallet passes its whole balance
+     * (the send pipeline subtracts the mint's quoted fee reserve); the legacy
+     * wallet keeps the 0.5% instant reserve, which is the default here.
+     */
+    maxSats: Long = SpendableBalance.maxSendableSats(balanceSats),
+    /**
+     * Called instead of [onSend] when the amount is still the `Max` proposal,
+     * so the wallet may take the fee out of the amount. Null: [onSend].
+     */
+    onSendMax: ((Long) -> Unit)? = null,
 ) {
     val s = sonar
     TransientBackHandler(onClose)
     var v by remember { mutableStateOf(fixedSats?.toString().orEmpty()) }
+    // True only while the amount is exactly what `Max` proposed; any edit
+    // clears it, so a typed amount is never shaved by a fee.
+    var maxPicked by remember { mutableStateOf(false) }
     val sats = fixedSats ?: (v.toLongOrNull() ?: 0L)
     // `v` is the keypad buffer and a fixed amount hides the keypad, so the
     // display must not key off `v` alone — that is what rendered "0" on iOS for
@@ -86,12 +100,13 @@ fun PaySheet(
     // that are genuinely affordable: with 100k sats and a real 100-sat fee, a
     // 99,600-sat invoice is payable but sat above the 99,500 estimate. A fixed
     // invoice cannot be lowered, so that user simply could not pay at all.
-    // `Max` still proposes the reserve-adjusted amount, and the REAL prepared
-    // fee is enforced in the send pipeline before Breez is asked to pay
-    // (WalletBridge.send -> SpendableBalance.insufficientAfterFee).
+    // `Max` proposes [maxSats], and the REAL prepared fee is enforced in the
+    // send pipeline before any wallet is asked to pay (the Cashu engine's
+    // quote check; the legacy SpendableBalance.insufficientAfterFee).
     val over = sats > balanceSats
     val can = sats > 0 && !over
     fun tap(k: String) {
+        maxPicked = false
         if (k == "del") { v = v.dropLast(1); return }
         val nv = (v + k).trimStart('0').ifEmpty { "0" } // strip leading zeros, keep one
         if (nv.length <= 7) v = nv
@@ -153,18 +168,19 @@ fun PaySheet(
                     listOf(1000L, 10000L, 21000L).forEach { c ->
                         Box(
                             Modifier.clip(RoundedCornerShape(999.dp)).background(s.goldSoft)
-                                .clickable { v = c.toString() }.padding(horizontal = 14.dp, vertical = 7.dp)
+                                .clickable { v = c.toString(); maxPicked = false }.padding(horizontal = 14.dp, vertical = 7.dp)
                         ) { Text(payFmt(c), color = s.goldDeep, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                     }
                     // "Max" = everything that can actually settle: the balance
                     // minus a fee reserve (#141 — proposing the full balance
                     // made the send fail locally with a raw InsufficientFunds).
                     // A balance at or below the reserve offers no Max at all.
-                    val maxSendable = SpendableBalance.maxSendableSats(balanceSats)
+                    val maxSendable = maxSats.coerceAtMost(balanceSats)
                     if (maxSendable > 0) {
                         Box(
                             Modifier.clip(RoundedCornerShape(999.dp)).background(s.goldFill)
-                                .clickable { v = maxSendable.toString() }.padding(horizontal = 16.dp, vertical = 7.dp)
+                                .clickable { v = maxSendable.toString(); maxPicked = true }
+                                .padding(horizontal = 16.dp, vertical = 7.dp)
                         ) { Text("Max", color = s.onGold, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                     }
                 }
@@ -192,7 +208,13 @@ fun PaySheet(
 
                 // bc-sheetactions
                 Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
-                    SendButton(mesh = mesh, enabled = can) { if (can) { onSend(sats); onClose() } }
+                    SendButton(mesh = mesh, enabled = can) {
+                        if (can) {
+                            val viaMax = onSendMax
+                            if (maxPicked && viaMax != null) viaMax(sats) else onSend(sats)
+                            onClose()
+                        }
+                    }
                     Spacer(Modifier.height(6.dp))
                     Text(
                         if (mesh) "Chat can stay on Bluetooth. The payment goes straight to $peerName's wallet over Lightning."

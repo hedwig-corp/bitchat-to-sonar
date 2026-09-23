@@ -5,7 +5,8 @@ import android.util.Log
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.wallet.InvoiceRequestPayload
 import chat.bitchat.sonar.wallet.JsonLite
-import chat.bitchat.sonar.wallet.WalletBridge
+import chat.bitchat.sonar.wallet.LegacyBreezWallet
+import chat.bitchat.sonar.wallet.cashuAccountId
 import chat.bitchat.sonar.wallet.WalletState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -84,7 +85,7 @@ internal interface InlineFallbackEffects {
  * - Breez `invoice_request`: a payer is blocked on the NDS's 60s window. A
  *   short answer attempt beats letting them time out, and every accepted-URL
  *   failure path posts an error so the payer is unblocked either way. The
- *   whole attempt runs on an ORPHAN job: `WalletBridge.ensureLiveConnection`
+ *   whole attempt runs on an ORPHAN job: `LegacyBreezWallet.ensureLiveConnection`
  *   bounds its blocking native connect with a `coroutineScope` child, which
  *   cancellation cannot preempt — awaiting an orphan is the only bound that
  *   actually returns (the repo's "coroutineScope cannot bound a blocking
@@ -249,23 +250,31 @@ internal object SonarPushInlineFallback {
                         JsonLite.encodeObject("error", "wallet unavailable"),
                     )
                 }
-                // Bound the CONNECT on a nested orphan: the outer job still
-                // owns the reply slot, so this cannot produce a second POST —
-                // it only stops a 30s blocking connect from eating the whole
-                // budget and leaving the payer with no answer at all.
-                val connect = scope.async {
-                    runCatching { WalletBridge.ensureLiveConnection(nsec) }.getOrDefault(false)
-                }
-                val live = withTimeoutOrNull(INVOICE_BUDGET_MS - INVOICE_POST_RESERVE_MS) {
-                    connect.await()
-                } ?: false
-                if (!live || WalletBridge.state() !is WalletState.Ready) {
+                // Breez is LEGACY: no store on this device means no wallet to
+                // answer with, and connecting would create one. Fail fast.
+                if (!LegacyBreezWallet.isPresent(cashuAccountId(nsec))) {
                     return@async postNdsReply(
                         req.replyUrl,
                         JsonLite.encodeObject("error", "wallet unavailable"),
                     )
                 }
-                val invoice = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest)
+                // Bound the CONNECT on a nested orphan: the outer job still
+                // owns the reply slot, so this cannot produce a second POST —
+                // it only stops a 30s blocking connect from eating the whole
+                // budget and leaving the payer with no answer at all.
+                val connect = scope.async {
+                    runCatching { LegacyBreezWallet.ensureLiveConnection(nsec) }.getOrDefault(false)
+                }
+                val live = withTimeoutOrNull(INVOICE_BUDGET_MS - INVOICE_POST_RESERVE_MS) {
+                    connect.await()
+                } ?: false
+                if (!live || LegacyBreezWallet.state() !is WalletState.Ready) {
+                    return@async postNdsReply(
+                        req.replyUrl,
+                        JsonLite.encodeObject("error", "wallet unavailable"),
+                    )
+                }
+                val invoice = LegacyBreezWallet.createBolt12Invoice(req.offer, req.invoiceRequest)
                 val body = invoice.fold(
                     onSuccess = { JsonLite.encodeObject("invoice", it) },
                     // Generic reason on purpose: the reply is relayed verbatim

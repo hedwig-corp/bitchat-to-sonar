@@ -23,7 +23,8 @@ import chat.bitchat.sonar.wallet.claimNotifiedPaymentId
 import chat.bitchat.sonar.wallet.settleWakeOutcome
 import chat.bitchat.sonar.wallet.wasPaymentNotified
 import chat.bitchat.sonar.wallet.PaymentActivityStore
-import chat.bitchat.sonar.wallet.WalletBridge
+import chat.bitchat.sonar.wallet.LegacyBreezWallet
+import chat.bitchat.sonar.wallet.cashuAccountId
 import chat.bitchat.sonar.wallet.WalletPaymentEvent
 import chat.bitchat.sonar.wallet.WalletState
 import java.net.URL
@@ -377,7 +378,7 @@ class SonarPushProcessingService : Service() {
                 // Subscribe BEFORE wallet setup so a receive claimed right after
                 // connect() can't slip past the collector.
                 val events = launch {
-                    WalletBridge.paymentEvents.collect { ev ->
+                    LegacyBreezWallet.paymentEvents.collect { ev ->
                         if (ev.incoming &&
                             handleSettledReceive(ev, prefs, seenThisWake, liveEvent = true)
                         ) {
@@ -403,13 +404,26 @@ class SonarPushProcessingService : Service() {
                     events.cancel()
                     return@coroutineScope
                 }
+                // Breez is LEGACY: its NDS path lives only while its store does.
+                // With no legacy wallet on this device there is nothing to
+                // settle or answer with (and connecting would CREATE one), so
+                // fail an invoice_request fast instead of letting the payer sit
+                // out the NDS's 60s window.
+                if (!LegacyBreezWallet.isPresent(cashuAccountId(nsec))) {
+                    Log.d(TAG, "Breez wakeup skipped: no legacy wallet on this device")
+                    if (notificationType == NOTIF_TYPE_INVOICE_REQUEST) {
+                        replyInvoiceRequestError(payload, "wallet unavailable")
+                    }
+                    events.cancel()
+                    return@coroutineScope
+                }
                 // One atomic probe+connect+reconnect under the wallet lock —
                 // handles cold-start (no SDK) and a Doze-stale reused handle,
                 // and serializes overlapping wakes onto one connection.
                 val live = withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
-                    WalletBridge.ensureLiveConnection(nsec)
+                    LegacyBreezWallet.ensureLiveConnection(nsec)
                 } ?: false
-                if (!live || WalletBridge.state() !is WalletState.Ready) {
+                if (!live || LegacyBreezWallet.state() !is WalletState.Ready) {
                     // No usable SDK — nothing can settle; don't burn the budget.
                     // But a payer blocked on an invoice_request must not be left
                     // to the NDS's 60s timeout just because our wallet is cold
@@ -441,14 +455,14 @@ class SonarPushProcessingService : Service() {
                 // Redundant on the connect path (connectLocked already did a
                 // getInfo) but needed for a reused live handle. Sequenced after
                 // the answer precisely because it is unbounded.
-                WalletBridge.refreshBalance()
+                LegacyBreezWallet.refreshBalance()
 
                 // Await a claimed receive: the first one ends this wake (each new
                 // payment gets its own push, so we don't need to drain many).
                 while (arrivals.get() == 0 &&
                     SystemClock.elapsedRealtime() < deadline
                 ) {
-                    for (ev in WalletBridge.recentIncomingReceives(wakeFloorSecs)) {
+                    for (ev in LegacyBreezWallet.recentIncomingReceives(wakeFloorSecs)) {
                         if (handleSettledReceive(ev, prefs, seenThisWake, liveEvent = false)) {
                             arrivals.incrementAndGet()
                         }
@@ -458,7 +472,7 @@ class SonarPushProcessingService : Service() {
                 }
                 events.cancel()
             }
-            if (arrivals.get() > 0) WalletBridge.refreshBalance()
+            if (arrivals.get() > 0) LegacyBreezWallet.refreshBalance()
             Log.d(TAG, "Breez wakeup done (type=$notificationType arrivals=${arrivals.get()})")
         } catch (e: Exception) {
             Log.w(TAG, "Breez wakeup failed (silent)", e)
@@ -503,7 +517,7 @@ class SonarPushProcessingService : Service() {
         // and the payer can receive "timed out" for an invoice we actually
         // produced. We only bound how long we WAIT.
         val answerJob = bailoutScope.async {
-            val invoice = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest)
+            val invoice = LegacyBreezWallet.createBolt12Invoice(req.offer, req.invoiceRequest)
             val body = invoice.fold(
                 onSuccess = { JsonLite.encodeObject("invoice", it) },
                 onFailure = {
@@ -677,13 +691,13 @@ class SonarPushProcessingService : Service() {
         // Outer bound on connect(); the SDK's own connect timeout is ~20s, so
         // 20s here avoids abandoning a connect the SDK would have completed.
         /**
-         * Outer bound on [WalletBridge.ensureLiveConnection].
+         * Outer bound on [LegacyBreezWallet.ensureLiveConnection].
          *
          * Must be >= its inner worst case, or we abandon a connect the SDK
          * would have completed and the payer gets an error for a wallet that
          * was about to be fine. That worst case is the liveness probe
          * (`CONNECTION_PROBE_TIMEOUT_MS`, 10s) followed by a full connect
-         * (`WalletBridge.CONNECT_TIMEOUT_MS`, 20s) = 30s, which only occurs for
+         * (`LegacyBreezWallet.CONNECT_TIMEOUT_MS`, 20s) = 30s, which only occurs for
          * a backgrounded reused-but-stale handle; a cold wake has no handle to
          * probe and pays connect alone. Derived from those constants rather
          * than hardcoded so the relationship cannot silently drift.
@@ -692,7 +706,7 @@ class SonarPushProcessingService : Service() {
          * importantly, inside the NDS's 60s server window.
          */
         private val WALLET_SETUP_TIMEOUT_MS =
-            WalletBridge.CONNECTION_PROBE_TIMEOUT_MS + WalletBridge.CONNECT_TIMEOUT_MS
+            LegacyBreezWallet.CONNECTION_PROBE_TIMEOUT_MS + LegacyBreezWallet.CONNECT_TIMEOUT_MS
         private const val BREEZ_SETTLE_POLL_MS = 2_500L
         // Poll floor: generous enough for connect()-latency, swap-claim time and
         // realistic clock skew vs the swap server, while excluding genuinely old

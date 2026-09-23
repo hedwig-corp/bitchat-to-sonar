@@ -229,6 +229,8 @@ fun SonarRadarScreen(state: SonarAppState) {
             fiatOf = { state.fiatOrNull(it) },
             onSend = { state.sendSatsToUnify(p.id, it); paySheet = null },
             onClose = { paySheet = null },
+            maxSats = state.maxSendableSats(),
+            onSendMax = { state.sendSatsToUnify(p.id, it, feeFromAmount = true); paySheet = null },
         )
     }
 }

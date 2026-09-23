@@ -489,7 +489,13 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             onSend = { sats ->
                 scope.launch { state.sendPay(effectiveChatId, sats)?.let { state.toast = it } }
             },
-            onClose = { paySheet = false }
+            onClose = { paySheet = false },
+            maxSats = state.maxSendableSats(),
+            onSendMax = { sats ->
+                scope.launch {
+                    state.sendPay(effectiveChatId, sats, feeFromAmount = true)?.let { state.toast = it }
+                }
+            },
         )
     }
     if (confirmDelete) {

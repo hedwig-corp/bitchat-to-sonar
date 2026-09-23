@@ -448,6 +448,8 @@ internal fun SonarScreenHost(state: SonarAppState) {
             is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
             is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
             is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
+            is Screen.SendPaymentFromLegacy ->
+                chat.bitchat.sonar.screens.SonarSendPaymentScreen(state, fromLegacy = true)
             is Screen.PaymentStatus ->
                 chat.bitchat.sonar.screens.SonarPaymentStatusScreen(state, sc.activityId)
             is Screen.Backup -> chat.bitchat.sonar.screens.SonarBackupScreen(state)
@@ -2392,7 +2394,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         mesh = screen.id.startsWith("mesh:"),
         fiatOf = { state.fiatOrNull(it) },
         onSend = { sats -> scope.launch { state.sendPay(screen.id, sats)?.let { state.toast = it } } },
-        onClose = { paySheet = false }
+        onClose = { paySheet = false },
+        maxSats = state.maxSendableSats(),
+        onSendMax = { sats ->
+            scope.launch { state.sendPay(screen.id, sats, feeFromAmount = true)?.let { state.toast = it } }
+        },
     )
     if (verifySheet) VerifySheet(
         peerName = peerName,

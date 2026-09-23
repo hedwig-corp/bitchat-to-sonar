@@ -49,7 +49,6 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.HandleClaimState
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
-import chat.bitchat.sonar.wallet.WalletState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -81,11 +80,11 @@ fun SonarProfileScreen(state: SonarAppState) {
     LaunchedEffect(paymentCopied) { if (paymentCopied) { delay(1700); paymentCopied = false } }
     val displayNick = state.nick.ifBlank { "you" }
     // Chat-only registrar claims fill bip353 before BIP-353 DNS exists — hide
-    // until the wallet is ready (re-claim attaches the offer). External
+    // until a Cashu offer exists (re-claim attaches it). External
     // name@other addresses always show.
     val paymentAddress = state.bip353.trim().takeIf { it.isNotEmpty() }?.takeIf { addr ->
         val claimed = state.coreClaimedHandle?.trim().orEmpty()
-        claimed.isEmpty() || addr != claimed || state.walletState is WalletState.Ready
+        claimed.isEmpty() || addr != claimed || state.cashuOffer != null
     }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {

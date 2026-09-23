@@ -48,6 +48,10 @@ import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonarQrScanSupported
 import chat.bitchat.sonar.wallet.bolt11AmountSats
 import chat.bitchat.sonar.ui.sonar
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.old_lightning_wallet_2
+import chat.bitchat.sonar.resources.send_from_old_wallet
+import org.jetbrains.compose.resources.stringResource
 
 /**
  * Send payment — the standalone recipient picker reached from the new-chat
@@ -64,8 +68,11 @@ import chat.bitchat.sonar.ui.sonar
  * same destinations.
  */
 @Composable
-fun SonarSendPaymentScreen(state: SonarAppState) {
+fun SonarSendPaymentScreen(state: SonarAppState, fromLegacy: Boolean = false) {
     val s = sonar
+    // The wallet this picker spends from: Cashu, or the legacy Breez wallet
+    // when opened from its card ("Send from old wallet").
+    val balanceSats = state.paymentBalanceSats(fromLegacy)
     // Recompose when a payment lands so the balance line stays honest.
     state.paymentActivityVersion
 
@@ -95,7 +102,11 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
     }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
-        SNNavHeader("Send payment", hairline = false, onBack = { state.back() })
+        SNNavHeader(
+            if (fromLegacy) stringResource(Res.string.send_from_old_wallet) else "Send payment",
+            hairline = false,
+            onBack = { state.back() },
+        )
 
         // LazyColumn, not a scrolling Column: a Column with verticalScroll
         // composes every contact row up front and recomposes them all on each
@@ -112,7 +123,8 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                 SNIcon(SNIconName.Coin, 14.dp, s.text3, weight = 2f)
                 Spacer(Modifier.width(7.dp))
                 Text(
-                    "Your balance · ${payFmt(state.walletBalanceSats())} sats",
+                    if (fromLegacy) stringResource(Res.string.old_lightning_wallet_2, "${payFmt(balanceSats)} sats")
+                    else "Your balance · ${payFmt(balanceSats)} sats",
                     color = s.text2, fontSize = 13.sp,
                 )
             }
@@ -250,17 +262,22 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
     contactTarget?.let { contact ->
         PaySheet(
             peerName = contact.name,
-            balanceSats = state.walletBalanceSats(),
+            balanceSats = balanceSats,
             mesh = contact.nearby,
             fiatOf = { state.fiatOrNull(it) },
             onSend = { sats ->
                 // Route through the chat so the peer still gets the in-chat
                 // ⚡PAY receipt, exactly as paying from inside the chat does.
                 // Detached: this screen pops on the same frame.
-                state.sendPayDetached(contact.chatId, sats)
+                state.sendPayDetached(contact.chatId, sats, fromLegacy = fromLegacy)
                 state.back()
             },
             onClose = { contactTarget = null },
+            maxSats = state.maxSendableSats(fromLegacy),
+            onSendMax = if (fromLegacy) null else { sats ->
+                state.sendPayDetached(contact.chatId, sats, feeFromAmount = true)
+                state.back()
+            },
         )
     }
 
@@ -276,27 +293,32 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
     }
 
     externalTarget?.let { destination ->
+        // An external payment has no chat thread to report into, so it gets
+        // its own status screen (design: paystatus.jsx Direction D). The send
+        // runs on the app scope, not here, so popping this picker cannot
+        // cancel it. `replaceTop` keeps Back on home: the picker's payment is
+        // already gone by then.
+        fun payExternal(sats: Long, feeFromAmount: Boolean) {
+            val name = payableDisplayName(destination)
+            externalTarget = null
+            fixedSats = null
+            val activityId = state.beginDestinationPayment(
+                destination, sats, name, fromLegacy = fromLegacy, feeFromAmount = feeFromAmount,
+            )
+            // Null means the destination was refused before anything was
+            // sent (the state toasted why) — stay on the picker to fix it.
+            if (activityId != null) state.replaceTop(Screen.PaymentStatus(activityId))
+        }
         PaySheet(
             peerName = payableDisplayName(destination),
-            balanceSats = state.walletBalanceSats(),
+            balanceSats = balanceSats,
             mesh = false,
             fixedSats = fixedSats,
             fiatOf = { state.fiatOrNull(it) },
-            onSend = { sats ->
-                // An external payment has no chat thread to report into, so it
-                // gets its own status screen (design: paystatus.jsx Direction
-                // D). The send runs on the app scope, not here, so popping this
-                // picker cannot cancel it. `replaceTop` keeps Back on home: the
-                // picker's payment is already gone by then.
-                val name = payableDisplayName(destination)
-                externalTarget = null
-                fixedSats = null
-                val activityId = state.beginDestinationPayment(destination, sats, name)
-                // Null means the destination was refused before anything was
-                // sent (the state toasted why) — stay on the picker to fix it.
-                if (activityId != null) state.replaceTop(Screen.PaymentStatus(activityId))
-            },
+            onSend = { sats -> payExternal(sats, feeFromAmount = false) },
             onClose = { externalTarget = null; fixedSats = null },
+            maxSats = state.maxSendableSats(fromLegacy),
+            onSendMax = if (fromLegacy) null else { sats -> payExternal(sats, feeFromAmount = true) },
         )
     }
 
