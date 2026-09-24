@@ -54,16 +54,20 @@ is the build under test on a dedicated QA emulator/simulator.
 ### QA-004 — Inbound-first chat appears on the list
 - **Platforms:** both (Android automated)
 - **Steps:** app on the chat list; a fresh peer messages the app's npub.
-- **Expect:** a new row with the message preview and an unread dot within 45 s.
-- **How:** `android-smoke.sh` QA-004
+- **Expect:** a new row with the message preview and an unread dot within 45 s;
+  the dot is announced as "Unread" on that row.
+- **How:** `android-smoke.sh` QA-004 (checks the "Unread" label sits on the new row)
+- **Origin:** A29 (#616) — the dot had no label, so screen readers never
+  announced unread chats and the smoke could not see it.
 
 ### QA-005 — Unread divider sits above the first unread message
 - **Platforms:** both (Android automated)
-- **Steps:** receive N messages while on the list (or backgrounded), open the
-  chat — also via the notification tap.
-- **Expect:** "Unread messages" directly above the oldest unread row; rows
-  read earlier (including ones received while the chat was open) sit above it.
-- **How:** `android-smoke.sh` QA-005
+- **Steps:** read a chat, leave it, receive TWO messages while on the list (or
+  backgrounded), open the chat — also via the notification tap.
+- **Expect:** read row < "Unread messages" < first unread < second unread, top
+  to bottom: the divider is neither above a read row nor between unread rows.
+- **How:** `android-smoke.sh` QA-005 (asserts that strict order; the
+  notification-tap entry stays manual)
 - **Origin:** A12 (#616) — seen once one row too high after a notification-tap
   open, not reproduced in 4 retries. If you see it, capture logcat first.
 
@@ -76,10 +80,10 @@ is the build under test on a dedicated QA emulator/simulator.
 
 ### QA-007 — Partial npub offers no action
 - **Platforms:** both (Android automated)
-- **Steps:** Search → type the first 9 characters of an npub.
-- **Expect:** no *Start secure chat* and no *Join channel #npub1…*; a complete
-  npub shows *Start secure chat*.
-- **How:** `android-smoke.sh` QA-007 · Guard: `SearchNpubGateTest`, `SearchNpubGateTests`
+- **Steps:** Search → type the first 9 characters of an npub; then a complete npub.
+- **Expect:** the prefix offers no *Start secure chat* and no *Join channel
+  #npub1…*; the complete npub offers *Start secure chat*.
+- **How:** `android-smoke.sh` QA-007 (both paths) · Guard: `SearchNpubGateTest`, `SearchNpubGateTests`
 - **Origin:** A18 (#616)
 
 ### QA-008 — Search rows match the chat list
@@ -161,7 +165,11 @@ is the build under test on a dedicated QA emulator/simulator.
 - **Expect:** send, attach, emoji, voice, back, call, settings, start-chat, the
   nickname, search and composer fields all have spoken labels (`android-ui.sh
   dump` shows an unlabelled field as `E!` — uiautomator's NAF flag).
-- **How:** `android-smoke.sh` QA-040 · Guard: `IconButtonAccessibilityUiTest`
+- **How:** `android-smoke.sh` QA-040 checks the chat screen (attach, emoji,
+  send/record, back, composer field), home (settings, start-chat, nearby) and
+  the search field. Manual: the nickname field (onboarding only, use
+  `android-setup.sh --fresh`) and call buttons (call-capable peers only).
+  Channel controls: QA-042. Guard: `IconButtonAccessibilityUiTest`
 - **Origin:** A9/A5/A21 (#616)
 
 ### QA-041 — Profile QR is a real, scannable code

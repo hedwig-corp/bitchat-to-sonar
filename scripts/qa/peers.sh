@@ -10,8 +10,10 @@
 #   peers.sh send <name> <to-npub> <text>     encrypted text DM
 #   peers.sh send-image <name> <to-npub> <file> [blossom-url]
 #   peers.sh listen <name> [secs]             JSON lines of inbound messages
-#   peers.sh expect <name> <substring> [secs] exit 0 once a message containing
-#                                             <substring> arrives, else 1
+#                                             (streams; runs the full window)
+#   peers.sh expect <name> <substring> [secs] print the first inbound message JSON
+#                                             containing <substring> and exit 0 the
+#                                             moment it arrives; exit 1 on timeout
 #
 # Env: QA_HOME (default $TMPDIR/sonar-qa), SONAR_CLI (default core/target/release/sonar-cli).
 #
@@ -72,16 +74,36 @@ case "$cmd" in
   listen)
     name="${1:?listen <name> [secs]}"; secs="${2:-30}"
     cli --home "$(home "$name")" listen --timeout-secs "$secs" --poll-secs 5 \
-      | grep '"type":"message"' || true ;;
+      | grep --line-buffered '"type":"message"' || true ;;
   expect)
+    # A shell pipeline (listen | grep | grep -q) block-buffers the first grep
+    # and keeps `sonar-cli listen` running to its timeout, so every match cost
+    # the full window. Match line by line and stop the listener on the hit.
     name="${1:?expect <name> <substring> [secs]}"; needle="${2:?substring}"; secs="${3:-60}"
-    start=$SECONDS
-    if cli --home "$(home "$name")" listen --timeout-secs "$secs" --poll-secs 5 \
-        | grep '"type":"message"' | grep -F -q -- "$needle"; then
-      echo "expect ok: '$needle' reached $name after $((SECONDS - start))s"
-    else
-      echo "expect TIMEOUT: '$needle' never reached $name (${secs}s)" >&2; exit 1
-    fi ;;
+    python3 - "$CLI" "$(home "$name")" "$needle" "$secs" "$name" <<'EXPECT_PY'
+import json, subprocess, sys, time
+cli, home, needle, secs, name = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+start = time.monotonic()
+proc = subprocess.Popen(
+    [cli, "--home", home, "listen", "--timeout-secs", str(secs), "--poll-secs", "5"],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+try:
+    for line in proc.stdout:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("type") == "message" and needle in msg.get("content", ""):
+            print(line.strip())
+            print(f"expect ok: '{needle}' reached {name} after "
+                  f"{time.monotonic() - start:.0f}s", file=sys.stderr)
+            sys.exit(0)
+finally:
+    proc.kill()
+print(f"expect TIMEOUT: '{needle}' never reached {name} ({secs}s)", file=sys.stderr)
+sys.exit(1)
+EXPECT_PY
+    ;;
   *)
     sed -n '2,25p' "$0"; exit 2 ;;
 esac

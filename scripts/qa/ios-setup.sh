@@ -3,6 +3,7 @@
 # (Debug, arm64), install it and start a unified-log capture. Prints the UDID.
 #
 #   scripts/qa/ios-setup.sh [--name "Sonar QA iPhone"] [--no-build] [--fresh]
+#                           [--build-core | --trust-core] [--allow-missing-config]
 #
 # Why signed, not scripts/bench/build-sim.sh: the unsigned bench build has no
 # App Group entitlement, so the Marmot store cannot open and real onboarding /
@@ -16,27 +17,80 @@
 #
 # --fresh erases this QA simulator's app (simulators are disposable; real
 # devices are never touched by this script).
+#
+# Rust core freshness: sonarffi.xcframework is gitignored, so a worktree can
+# carry one built from an OLDER core. An ABI-compatible build links fine and
+# the pass silently tests old core code. The script records the core tree it
+# was built from (`git rev-parse HEAD:core`) in Frameworks/.sonar-core-tree and
+# refuses a mismatch: --build-core runs core/build-ios.sh and writes the stamp;
+# --trust-core accepts the current framework (you checked it yourself).
+#
+# Preflight (presence only — values are never printed): BREEZ_API_KEY in
+# ios/Configs/Local.xcconfig and ios/bitchat/GoogleService-Info.plist. Debug
+# builds succeed without them, but wallet flows / offline-payment pushes are
+# silently off. Refused unless --allow-missing-config, which records the gap
+# in $QA_HOME/config-gaps.txt for the QA report.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 QA_HOME="${QA_HOME:-${TMPDIR:-/tmp}/sonar-qa}"
-NAME="Sonar QA iPhone"; BUILD=1; FRESH=0
+NAME="Sonar QA iPhone"; BUILD=1; FRESH=0; CORE=check; ALLOW_MISSING=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name) NAME="$2"; shift 2 ;;
     --no-build) BUILD=0; shift ;;
     --fresh) FRESH=1; shift ;;
+    --build-core) CORE=build; shift ;;
+    --trust-core) CORE=trust; shift ;;
+    --allow-missing-config) ALLOW_MISSING=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 mkdir -p "$QA_HOME"
 BUNDLE=sh.hedwig.sonar
 
-if [[ ! -d "$ROOT/ios/localPackages/SonarCore/Frameworks/sonarffi.xcframework" ]]; then
-  echo "sonarffi.xcframework missing — run core/build-ios.sh (or copy it from a worktree whose" >&2
-  echo "'git rev-parse HEAD:core' matches this one)." >&2
-  exit 1
+missing=()
+grep -Eq '^[[:space:]]*BREEZ_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' \
+  "$ROOT/ios/Configs/Local.xcconfig" 2>/dev/null ||
+  missing+=("BREEZ_API_KEY in ios/Configs/Local.xcconfig: wallet flows off")
+[[ -f "$ROOT/ios/bitchat/GoogleService-Info.plist" ]] ||
+  missing+=("ios/bitchat/GoogleService-Info.plist: no FCM, no offline-payment pushes")
+if (( ${#missing[@]} )); then
+  printf 'missing local config:\n' >&2; printf '  - %s\n' "${missing[@]}" >&2
+  if (( ! ALLOW_MISSING )); then
+    echo "refusing to build a QA app that silently lacks them; copy them from the primary" >&2
+    echo "checkout, or pass --allow-missing-config and report wallet/push scenarios as not run." >&2
+    exit 1
+  fi
+  for gap in "${missing[@]}"; do            # idempotent across setup reruns
+    grep -qxF "ios: $gap" "$QA_HOME/config-gaps.txt" 2>/dev/null ||
+      echo "ios: $gap" >> "$QA_HOME/config-gaps.txt"
+  done
 fi
+
+FRAMEWORKS="$ROOT/ios/localPackages/SonarCore/Frameworks"
+STAMP="$FRAMEWORKS/.sonar-core-tree"
+CORE_TREE="$(git -C "$ROOT" rev-parse HEAD:core)"
+if [[ -n "$(git -C "$ROOT" status --porcelain -- core)" ]]; then
+  CORE_TREE="$CORE_TREE+dirty"     # uncommitted core edits never match a stamp
+fi
+case "$CORE" in
+  build)
+    echo ">> building the Rust core for iOS (core/build-ios.sh)" >&2
+    "$ROOT/core/build-ios.sh" >&2
+    echo "$CORE_TREE" > "$STAMP" ;;
+  trust)
+    [[ -d "$FRAMEWORKS/sonarffi.xcframework" ]] || { echo "no sonarffi.xcframework to trust" >&2; exit 1; } ;;
+  check)
+    if [[ ! -d "$FRAMEWORKS/sonarffi.xcframework" ]]; then
+      echo "sonarffi.xcframework missing — rerun with --build-core" >&2; exit 1
+    fi
+    if [[ "$(cat "$STAMP" 2>/dev/null)" != "$CORE_TREE" ]]; then
+      echo "sonarffi.xcframework was not built from this core (stamp '$(cat "$STAMP" 2>/dev/null || echo none)'," >&2
+      echo "need '$CORE_TREE'): rerun with --build-core, or --trust-core if you verified it." >&2
+      exit 1
+    fi ;;
+esac
 
 UDID="$(xcrun simctl list devices available | sed -nE "s/^[[:space:]]+$NAME \(([0-9A-F-]+)\).*/\1/p" | head -1)"
 if [[ -z "$UDID" ]]; then
@@ -70,8 +124,16 @@ fi
 xcrun simctl install "$UDID" "$APP"
 
 LOG="$QA_HOME/ios-log-$UDID.txt"
+PIDFILE="$QA_HOME/ios-log-$UDID.pid"
+# One capture per simulator: a rerun must not add a second writer to the file.
+if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  kill "$(cat "$PIDFILE")" 2>/dev/null || true
+fi
+# chat.bitchat = BitLogger/SecureLogger (incl. SONAR_BENCH markers);
+# sh.hedwig.sonar = push registration/handling and the Breez wallet logger.
 nohup xcrun simctl spawn "$UDID" log stream --level info \
-  --predicate 'subsystem == "chat.bitchat"' > "$LOG" 2>&1 &
+  --predicate 'subsystem == "chat.bitchat" OR subsystem == "sh.hedwig.sonar"' > "$LOG" 2>&1 &
+echo $! > "$PIDFILE"
 echo ">> unified log → $LOG (pid $!)" >&2
 xcrun simctl launch "$UDID" "$BUNDLE" >/dev/null
 echo "$UDID"

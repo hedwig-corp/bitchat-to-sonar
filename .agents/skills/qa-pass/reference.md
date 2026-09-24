@@ -8,7 +8,7 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 | Tool | What it does |
 |---|---|
 | `scripts/qa/android-setup.sh` | boots the QA AVD by serial, `installDebug` in place, logcat → `$QA_HOME` |
-| `scripts/qa/ios-setup.sh` | creates/boots a named QA simulator, signed Debug build, install, log stream |
+| `scripts/qa/ios-setup.sh` | creates/boots a named QA simulator, signed Debug build, install, log stream (`chat.bitchat` + `sh.hedwig.sonar` subsystems) |
 | `scripts/qa/android-ui.sh` | adb/uiautomator driver: `dump`, `tapx`/`tapt`, `wait`, `ime`, `shot` |
 | `scripts/qa/peers.sh` | fresh `sonar-cli` peers: `new`, `send`, `send-image`, `listen`, `expect` |
 | `scripts/qa/android-smoke.sh` | scripted registry scenarios on Android; exit status = failures |
@@ -46,8 +46,10 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 
 - **Build signed, not with `scripts/bench/build-sim.sh`:** the unsigned bench
   build has no App Group, so the Marmot store never opens.
-- **Rust core:** `ios-setup.sh` needs `sonarffi.xcframework`. Copy it from a
-  worktree whose `git rev-parse HEAD:core` matches; after a core change rebuild
+- **Rust core:** `ios-setup.sh` needs `sonarffi.xcframework` built from this
+  worktree's core (stamp `Frameworks/.sonar-core-tree`; `--build-core` writes
+  it). Copying one from another worktree is fine only if `git rev-parse
+  HEAD:core` matches — then `--trust-core`. After a core change rebuild
   only the simulator slice (`cargo build --release --target aarch64-apple-ios-sim
   -p sonar-ffi --lib --features calls-audio`, `strip -x`, copy over
   `ios-arm64-simulator/libsonar_ffi.a`).

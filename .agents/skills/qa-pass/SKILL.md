@@ -50,8 +50,18 @@ export QA_HOME="$TMPDIR/sonar-qa"                                     # all arti
 # Android (boots the QA AVD, installs Debug in place, captures logcat)
 export QA_SERIAL="$(scripts/qa/android-setup.sh)"          # --fresh = new account
 # iOS (creates/boots "Sonar QA iPhone", signed Debug build, log stream)
-export QA_UDID="$(scripts/qa/ios-setup.sh)"
+export QA_UDID="$(scripts/qa/ios-setup.sh --build-core)"   # later runs: no flag
 ```
+
+Both setups refuse to continue when the Breez key or the Firebase config is
+missing (presence-only check): the Debug build would install fine but wallet
+flows and offline-payment pushes would be silently off. Copy the gitignored
+files from the primary checkout, or pass `--allow-missing-config` and list
+the gaps from `$QA_HOME/config-gaps.txt` as "not run" in the report.
+`ios-setup.sh` also refuses a `sonarffi.xcframework` not built from this
+worktree's `core/` tree (`--build-core` rebuilds, `--trust-core` overrides).
+`android-setup.sh` refuses an emulator on the port whose AVD is not the one
+requested — it may be another agent's.
 
 If the app is not onboarded yet, onboard it by hand (nickname, *Start
 chatting*, grant prompts) — that *is* scenario QA-022 on a fresh install.

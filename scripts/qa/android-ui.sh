@@ -19,7 +19,8 @@
 #   android-ui.sh tap <x> <y> | type <text> | key <code> | swipe x1 y1 x2 y2 [ms]
 #   android-ui.sh tapedit [n]        tap the n-th editable field (default 1)
 #   android-ui.sh naf                list unlabelled interactive nodes (class, bounds);
-#                                    empty output = the screen passes the a11y sweep
+#                                    exit 0 + empty output = the screen passes the sweep
+#                                    (a failed dump exits 1 — never read it as a pass)
 #   android-ui.sh longpress <x> <y>
 #   android-ui.sh ime                prints "shown" / "hidden" (soft keyboard)
 #   android-ui.sh bounds <exact>     "x1 y1 x2 y2" of first EXACT match
@@ -36,9 +37,25 @@ XML="${TMPDIR:-/tmp}/sonar-qa-ui-$SER.xml"
 ADB=(adb -s "$SER")
 mkdir -p "$SHOTS"
 
+# Delete the previous dump first: a failed `uiautomator dump` (it fails
+# transiently mid-animation) must never let a query read the LAST screen's
+# XML — waits would pass and taps would land on stale coordinates. Retry a
+# few times; on persistent failure the XML is empty, so every query misses.
 _dump_xml() {
-  "${ADB[@]}" shell uiautomator dump /sdcard/sonar-qa-ui.xml >/dev/null 2>&1 || true
-  "${ADB[@]}" exec-out cat /sdcard/sonar-qa-ui.xml > "$XML"
+  local attempt
+  : > "$XML"
+  for attempt in 1 2 3; do
+    "${ADB[@]}" shell rm -f /sdcard/sonar-qa-ui.xml >/dev/null 2>&1
+    if "${ADB[@]}" shell uiautomator dump /sdcard/sonar-qa-ui.xml 2>/dev/null | grep -q "dumped to" &&
+       "${ADB[@]}" exec-out cat /sdcard/sonar-qa-ui.xml > "$XML" 2>/dev/null &&
+       grep -q "<hierarchy" "$XML"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  : > "$XML"
+  echo "android-ui: uiautomator dump failed 3 times on $SER" >&2
+  return 1
 }
 
 _query() { # mode(dump|find|findx|bounds) [needle] [nth]
@@ -106,7 +123,8 @@ case "$cmd" in
     needle="${1:?$cmd <substr> [secs]}"; secs="${2:-20}"
     deadline=$((SECONDS + secs))
     while (( SECONDS < deadline )); do
-      _dump_xml
+      # Only judge a fresh dump: an empty XML would make `gone` pass falsely.
+      if ! _dump_xml; then sleep 1; continue; fi
       hit="$(_query find "$needle")"
       if [[ $cmd == wait && -n "$hit" ]] || [[ $cmd == gone && -z "$hit" ]]; then
         echo "$cmd ok: '$needle' after $((secs - (deadline - SECONDS)))s"; exit 0
