@@ -262,7 +262,9 @@ struct SonarHomeScreen: View {
                 icon: .lock,
                 iconSize: 24,
                 title: "No messages yet",
-                desc: "Find people nearby with the radar, or start a secure chat with the + button."
+                // The compose button is the round radar button bottom-right —
+                // there is no "+" on Home to point at.
+                desc: "Find people nearby with the radar, or start a secure chat with the round button below."
             )
             .padding(.vertical, 28)
         } else {
@@ -393,7 +395,7 @@ struct SonarHomeScreen: View {
     // ── Compose sheet: nearby peers + radar + new discussion + group ──
     private var composeContent: some View {
         let inRange = store.nearbyPeers.filter(\.inRange)
-        return ScrollView {
+        return SNFittedScrollView(maxHeight: 560) {
             VStack(spacing: 0) {
                 if inRange.isEmpty {
                     Text("Nobody in Bluetooth range right now.")
@@ -447,7 +449,6 @@ struct SonarHomeScreen: View {
                 }
             }
         }
-        .frame(maxHeight: 560)
     }
 
     /// Nested "Find someone" sheet — username / NIP-05 resolve → start chat.
@@ -460,7 +461,7 @@ struct SonarHomeScreen: View {
             if trimmed.contains("@") { return trimmed }
             return "\(trimmed)@\(SonarAppStore.handleDomain)"
         }()
-        return ScrollView {
+        return SNFittedScrollView(maxHeight: 560) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Type a username — just vincenzo for @\(SonarAppStore.handleDomain), a full name@domain, or paste a key.")
                     .font(SonarTheme.uiFont(size: 13.5))
@@ -518,29 +519,38 @@ struct SonarHomeScreen: View {
                         .font(SonarTheme.uiFont(size: 13))
                         .foregroundColor(SonarTheme.danger)
                 } else if let npub = findNpub {
+                    let isKeyInput = trimmed.hasPrefix("npub1")
+                    // What the chat will be titled. The avatar is derived from
+                    // the same string, so the card and the chat header agree.
+                    let chatTitle = store.contactTitle(forNpub: npub)
                     Button {
                         startChatFromFind(npub)
                     } label: {
                         HStack(spacing: 12) {
-                            SonarAvatar(name: trimmed.contains("@") ? String(trimmed.split(separator: "@").first ?? "user") : (trimmed.isEmpty ? "user" : trimmed), size: 46)
+                            SonarAvatar(name: chatTitle, size: 46)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(verbatim: showSuffix || (!trimmed.contains("@") && !trimmed.hasPrefix("npub1"))
-                                    ? trimmed
+                                Text(verbatim: isKeyInput
+                                    ? chatTitle
                                     : (trimmed.contains("@")
                                         ? (trimmed.split(separator: "@").first.map(String.init) ?? trimmed)
                                         : trimmed))
                                     .font(SonarTheme.uiFont(size: 16, weight: .semibold))
                                     .foregroundColor(SonarTheme.text)
+                                    .lineLimit(1)
                                 Text(verbatim: previewAddress)
                                     .font(SonarTheme.monoFont(size: 12))
                                     .foregroundColor(SonarTheme.text2)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
-                                Text(verbatim: npub.count > 22 ? String(npub.prefix(22)) + "\u{2026}" : npub)
-                                    .font(SonarTheme.monoFont(size: 11.5))
-                                    .foregroundColor(SonarTheme.text3)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
+                                // A pasted key is already the line above; only a
+                                // resolved username needs its key spelled out.
+                                if !isKeyInput {
+                                    Text(verbatim: npub.count > 22 ? String(npub.prefix(22)) + "\u{2026}" : npub)
+                                        .font(SonarTheme.monoFont(size: 11.5))
+                                        .foregroundColor(SonarTheme.text3)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             SNIcon(name: .chevron, size: 16, weight: 2.4)
@@ -584,7 +594,6 @@ struct SonarHomeScreen: View {
             }
             .padding(.horizontal, 4)
         }
-        .frame(maxHeight: 560)
     }
 
     private func startChatFromFind(_ npub: String) {

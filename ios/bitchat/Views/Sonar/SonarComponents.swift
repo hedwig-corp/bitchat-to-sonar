@@ -5145,6 +5145,42 @@ extension View {
     }
 }
 
+// MARK: - Content-hugging sheet body
+
+/// Bottom-sheet body that sizes to its content and scrolls only once the
+/// content outgrows `maxHeight`. A bare `ScrollView` is greedy: inside
+/// `.frame(maxHeight:)` it always takes the full max height, so a four-row
+/// sheet opened as a near-full-screen panel with a blank lower half.
+///
+/// One view tree in both regimes (not a `ViewThatFits` swap), so a focused
+/// TextField inside keeps its focus while a lookup result grows the content.
+struct SNFittedScrollView<Content: View>: View {
+    let maxHeight: CGFloat
+    @ViewBuilder let content: () -> Content
+
+    @State private var contentHeight: CGFloat = 0
+
+    var body: some View {
+        ScrollView {
+            // Measured with onGeometryChange, not a PreferenceKey: a preference
+            // set inside ScrollView content never reached an outer
+            // onPreferenceChange here (it only ever reported the default 0).
+            content()
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { height in
+                    contentHeight = height
+                }
+        }
+        // Once measured, pin the exact height. The `maxHeight` frame only caps
+        // the first (unmeasured) pass: a flexible frame with a max takes the
+        // PROPOSED height up to that max, not its child's, so leaving it on
+        // would re-inflate the sheet to `maxHeight` however short the content.
+        .frame(height: contentHeight > 0 ? min(contentHeight, maxHeight) : nil)
+        .frame(maxHeight: contentHeight > 0 ? nil : maxHeight)
+    }
+}
+
 // MARK: - Sheet action row (bc-actionrow)
 
 struct SNActionRow: View {
