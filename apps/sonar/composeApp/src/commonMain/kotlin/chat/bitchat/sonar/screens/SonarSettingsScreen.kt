@@ -201,7 +201,10 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 }
             }
             if (state.walletAvailable) {
-                StNote("Off by default — amounts show in your currency. Turn on to see sats, Lightning and ecash.")
+                // Both apps default to bitcoin display (Android `wallet.showFiat`
+                // = false, iOS `SonarWallet.displayMode()` = "bitcoin"); the note
+                // used to claim the opposite (QA-A23).
+                StNote("On by default — amounts show in sats, with Lightning and ecash. Turn off to see your currency instead.")
             } else {
                 StNote("This build has no Breez API key, so Lightning stays off. Chat and restore still work.")
             }
