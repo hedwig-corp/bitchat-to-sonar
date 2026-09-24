@@ -1,6 +1,5 @@
 package chat.bitchat.sonar.screens
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -36,9 +35,6 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -67,6 +63,8 @@ import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.delay
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 
 /**
  * Profile — Name edit, key share, Safety, Username claim, and Payment address.
@@ -387,12 +385,16 @@ private fun KeyShareCard(state: SonarAppState) {
         Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 14.dp, bottom = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // keyshare-qr: white card, 16dp padding, 20dp radius
+        // keyshare-qr: white card, 16dp padding, 20dp radius. A REAL QR of the
+        // npub (iOS SNShareCode does the same): the design's decorative 11×11
+        // hash pattern was drawn here while the caption asked people to scan
+        // it — nothing could (QA-A25).
         Box(
             Modifier.shadow(6.dp, RoundedCornerShape(20.dp))
                 .clip(RoundedCornerShape(20.dp)).background(Color.White).padding(16.dp)
+                .semantics { contentDescription = "Key share QR code" }
         ) {
-            KeyShareCode(key, 184.dp)
+            chat.bitchat.sonar.SNQrCode(key, 184.dp)
         }
         // keyshare-caption
         Text(
@@ -468,50 +470,3 @@ private fun KeyShareButton(
     }
 }
 
-/** JS `bcHash` (FNV-1a 32-bit) from components.jsx, for the share-code rows. */
-private fun bcHashJs(str: String): Long {
-    var h = 2166136261L
-    for (ch in str) {
-        h = h xor ch.code.toLong()
-        h = (h * 16777619L) and 0xFFFFFFFFL
-    }
-    return h
-}
-
-/**
- * settings.jsx ShareCode, drawn exactly: an 11×11 grid with three QR-style
- * finder corners, row fill bits from bcHash(seed + ':' + row), rounded
- * modules (#0B0E10 on the white keyshare-qr card).
- */
-@Composable
-private fun KeyShareCode(seed: String, size: Dp) {
-    val n = 11
-    val rows = remember(seed) { LongArray(n) { r -> bcHashJs("$seed:$r") } }
-    Canvas(Modifier.size(size)) {
-        val cs = this.size.minDimension / (n.toFloat())
-        val inset = cs * (0.3f / 4f)          // 0.3 of a 4-unit cell
-        val side = cs - inset * 2
-        val rx = cs * (0.9f / 4f)
-        val module = Color(0xFF0B0E10)
-        for (r in 0 until n) {
-            for (c in 0 until n) {
-                val finder = (r < 3 && c < 3) || (r < 3 && c >= n - 3) || (r >= n - 3 && c < 3)
-                val on = if (finder) {
-                    val lr = if (r < 3) r else r - (n - 3)
-                    val lc = if (c < 3) c else c - (n - 3)
-                    !(lr == 1 && lc == 1)
-                } else {
-                    (rows[r] shr c) and 1L == 1L
-                }
-                if (on) {
-                    drawRoundRect(
-                        module,
-                        topLeft = Offset(c * cs + inset, r * cs + inset),
-                        size = Size(side, side),
-                        cornerRadius = CornerRadius(rx, rx),
-                    )
-                }
-            }
-        }
-    }
-}
