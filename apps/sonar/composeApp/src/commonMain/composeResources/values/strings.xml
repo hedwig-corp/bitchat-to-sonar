@@ -332,6 +332,7 @@
     <string name="this_sends_a_leave_update_to_the_group">This sends a leave update to the group and removes the conversation from this device.</string>
     <string name="tip_store_it_in_a_password_manager">Tip: store it in a password manager. Sonar can’t recover it for you.</string>
     <string name="today">Today</string>
+    <string name="unread">Unread</string>
     <string name="user_domain">user@domain</string>
     <string name="username">Username</string>
     <string name="verbose_logs">Verbose logs</string>

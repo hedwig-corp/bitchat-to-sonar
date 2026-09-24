@@ -1,5 +1,8 @@
 package chat.bitchat.sonar
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.test.ExperimentalTestApi
@@ -52,5 +55,23 @@ class IconButtonAccessibilityUiTest {
         }
 
         onNodeWithContentDescription("Message Alice").assertExists()
+    }
+
+    @Test
+    fun unreadChatRowIsAnnouncedAsUnread() = runComposeUiTest {
+        // QA-A29: the unread dot was a bare Box — screen readers never heard
+        // which chats had news. The row merges its children, so the label
+        // must survive on the row node.
+        var unread by mutableStateOf(true)
+        setContent {
+            chat.bitchat.sonar.ui.SonarTheme(dark = true) {
+                ConvRow(avatar = {}, title = "Alice", sub = "hi", time = "12:00", unread = unread) {}
+            }
+        }
+
+        onNodeWithContentDescription("Unread").assertExists()
+        unread = false
+        waitForIdle()
+        onNodeWithContentDescription("Unread").assertDoesNotExist()
     }
 }

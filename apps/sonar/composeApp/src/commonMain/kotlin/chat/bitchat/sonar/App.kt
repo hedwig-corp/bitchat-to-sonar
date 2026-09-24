@@ -144,6 +144,7 @@ import chat.bitchat.sonar.resources.record_voice_message
 import chat.bitchat.sonar.resources.send
 import chat.bitchat.sonar.resources.settings
 import chat.bitchat.sonar.resources.start_a_chat
+import chat.bitchat.sonar.resources.unread
 import chat.bitchat.sonar.resources.video_call
 import chat.bitchat.sonar.resources.voice_call
 import chat.bitchat.sonar.resources.content_message_collapsed
@@ -847,7 +848,15 @@ internal fun ConvRow(
                 Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     if (!time.isNullOrEmpty()) Text(time, color = s.text3, fontSize = 12.sp)
                     if (muted) SNIcon(SNIconName.BellOff, 14.dp, s.text3, weight = 2f)
-                    else if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
+                    // Spoken as "Unread": a bare dot left screen-reader users no
+                    // way to tell which chats have news (QA-A29).
+                    else if (unread) {
+                        val unreadLabel = stringResource(Res.string.unread)
+                        Box(
+                            Modifier.size(11.dp).clip(CircleShape).background(s.accent)
+                                .semantics { contentDescription = unreadLabel }
+                        )
+                    }
                 }
             }
         }

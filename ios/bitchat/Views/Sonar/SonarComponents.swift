@@ -306,9 +306,12 @@ struct SNConvRow<Avatar: View, Sub: View>: View {
                         SNIcon(name: .bellOff, size: 14, weight: 2)
                             .foregroundColor(SonarTheme.text3)
                     } else if unread {
+                        // Spoken as "Unread" — the bare dot was invisible to
+                        // VoiceOver (QA-A29).
                         Circle()
                             .fill(SonarTheme.accent)
                             .frame(width: 11, height: 11)
+                            .accessibilityLabel(Text("Unread"))
                     }
                 }
             }
