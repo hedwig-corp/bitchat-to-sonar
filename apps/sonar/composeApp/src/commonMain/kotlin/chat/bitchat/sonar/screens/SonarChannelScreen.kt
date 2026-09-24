@@ -53,6 +53,16 @@ import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.authorColor
 import chat.bitchat.sonar.ui.sonar
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.content_accessibility_toggle_bookmark
+import chat.bitchat.sonar.resources.nearby
+import chat.bitchat.sonar.resources.send
+import org.jetbrains.compose.resources.stringResource
 
 @Composable
 fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
@@ -100,10 +110,15 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                 SNIconButton(
                     if (saved) SNIconName.BookmarkFill else SNIconName.Bookmark,
                     tint = if (saved) s.accent else s.text2,
+                    contentDescription = stringResource(Res.string.content_accessibility_toggle_bookmark, screen.geohash),
                     onClick = { state.toggleSaved(screen.geohash) }
                 )
             }
-            SNIconButton(SNIconName.Rings, onClick = { state.push(Screen.Nearby) })
+            SNIconButton(
+                SNIconName.Rings,
+                contentDescription = stringResource(Res.string.nearby),
+                onClick = { state.push(Screen.Nearby) },
+            )
         }
 
         SNBanner(
@@ -169,8 +184,11 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                 )
             }
             Spacer(Modifier.width(8.dp))
+            val sendLabel = stringResource(Res.string.send)
             Box(
                 Modifier.size(46.dp).clip(CircleShape).background(s.netFill)
+                    // The arrow glyph is decorative; announce the action (QA-A22).
+                    .semantics { contentDescription = sendLabel; role = Role.Button }
                     .clickable {
                         val d = draft
                         state.setComposerDraft(draftKey, "")
@@ -179,7 +197,12 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                         }
                     },
                 contentAlignment = Alignment.Center
-            ) { Text("↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
+            ) {
+                Text(
+                    "↑", color = s.onNet, fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clearAndSetSemantics { },
+                )
+            }
         }
     }
     authorSheet?.let { author ->
