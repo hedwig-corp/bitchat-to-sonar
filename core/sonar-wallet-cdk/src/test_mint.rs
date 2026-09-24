@@ -30,9 +30,14 @@ use cdk::{MintQuoteRequest, MintQuoteResponse};
 /// How a melt the fake mint executes ends.
 #[derive(Debug, Clone)]
 pub enum MeltOutcome {
-    Paid { preimage: Option<String> },
+    Paid {
+        preimage: Option<String>,
+    },
     Pending,
     Failed,
+    /// The mint refuses the melt with a generic error (e.g. "request already
+    /// paid") and leaves the quote Unpaid — no money moves.
+    Refused,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +217,7 @@ impl FakeMint {
                         q.preimage = preimage;
                         s.spent.extend(pending);
                     }
-                    MeltOutcome::Failed => q.state = MeltQuoteState::Unpaid,
+                    MeltOutcome::Failed | MeltOutcome::Refused => q.state = MeltQuoteState::Unpaid,
                     MeltOutcome::Pending => {
                         q.state = MeltQuoteState::Pending;
                         s.pending.extend(pending);
@@ -641,13 +646,15 @@ impl MintConnector for FakeMint {
                     q.state = MeltQuoteState::Pending;
                     s.pending.extend(ys.iter().copied());
                 }
-                MeltOutcome::Failed => q.state = MeltQuoteState::Unpaid,
+                MeltOutcome::Failed | MeltOutcome::Refused => q.state = MeltQuoteState::Unpaid,
             }
             Some(q.method.clone())
         });
         let method = method.ok_or(Error::UnknownQuote)?;
-        if matches!(outcome, MeltOutcome::Failed) {
-            return Err(Error::PaymentFailed);
+        match outcome {
+            MeltOutcome::Failed => return Err(Error::PaymentFailed),
+            MeltOutcome::Refused => return Err(Error::RequestAlreadyPaid),
+            _ => {}
         }
         let response = self.melt_response(&quote_id)?;
         Ok(match method {

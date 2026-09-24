@@ -420,15 +420,20 @@ impl SonarCashuWallet {
             .collect())
     }
 
-    /// The payment with this id, if the store still has it. Looks through
-    /// the most recent 500 payments.
+    /// The payment with this id: from history (the most recent 500), else —
+    /// for an outgoing payment history does not show, such as a send the mint
+    /// refused and the wallet rolled back — what the mint reports for its
+    /// melt quote. `None` when the wallet knows nothing about the id.
     pub fn lookup_payment(&self, id: String) -> WalletResult<Option<WalletPayment>> {
-        Ok(self
+        if let Some(found) = self
             .inner
             .list_recent_payments(500)?
             .into_iter()
             .find(|p| p.id == id)
-            .map(Into::into))
+        {
+            return Ok(Some(found.into()));
+        }
+        Ok(self.inner.outgoing_payment_outcome(&id)?.map(Into::into))
     }
 
     /// Replace the event listener (one per wallet).

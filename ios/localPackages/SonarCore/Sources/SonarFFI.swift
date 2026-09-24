@@ -1294,8 +1294,10 @@ public protocol SonarCashuWalletProtocol: AnyObject, Sendable {
     func listPayments(limit: UInt32) throws  -> [WalletPayment]
 
     /**
-     * The payment with this id, if the store still has it. Looks through
-     * the most recent 500 payments.
+     * The payment with this id: from history (the most recent 500), else —
+     * for an outgoing payment history does not show, such as a send the mint
+     * refused and the wallet rolled back — what the mint reports for its
+     * melt quote. `None` when the wallet knows nothing about the id.
      */
     func lookupPayment(id: String) throws  -> WalletPayment?
 
@@ -1488,8 +1490,10 @@ open func listPayments(limit: UInt32)throws  -> [WalletPayment]  {
 }
 
     /**
-     * The payment with this id, if the store still has it. Looks through
-     * the most recent 500 payments.
+     * The payment with this id: from history (the most recent 500), else —
+     * for an outgoing payment history does not show, such as a send the mint
+     * refused and the wallet rolled back — what the mint reports for its
+     * melt quote. `None` when the wallet knows nothing about the id.
      */
 open func lookupPayment(id: String)throws  -> WalletPayment?  {
     return try  FfiConverterOptionTypeWalletPayment.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
@@ -11145,7 +11149,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_list_payments() != 25012) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_lookup_payment() != 54663) {
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_lookup_payment() != 38504) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_parse_destination() != 33322) {
