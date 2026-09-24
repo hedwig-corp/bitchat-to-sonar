@@ -102,4 +102,20 @@ struct VideoLocationStripTests {
         #expect(data == original, "no location to strip: keep the zero-cost passthrough")
         #expect(filename == "clip.mov")
     }
+
+    /// Metadata that cannot be read must not unlock the raw-bytes fast path:
+    /// an unreadable file under the size cap used to be sent byte-for-byte.
+    @Test
+    func unreadableMetadataFailsClosed() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("VideoLocationStripTests-garbage-\(UUID().uuidString).mov")
+        try Data("not a movie, but small enough for the fast path".utf8).write(to: url)
+        #expect(await SonarAppStore.videoCarriesLocation(AVURLAsset(url: url)),
+                "unreadable metadata must count as located")
+
+        let result = await SonarAppStore.finalizeVideoForSend(url, filename: "clip.mov", mime: "video/quicktime")
+        if case .ready = result {
+            Issue.record("an unreadable video must never be sent as raw bytes")
+        }
+    }
 }

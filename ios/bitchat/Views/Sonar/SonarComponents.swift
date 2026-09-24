@@ -5195,23 +5195,54 @@ struct SNFittedScrollView<Content: View>: View {
     @State private var contentHeight: CGFloat = 0
 
     var body: some View {
-        ScrollView {
-            // Measured with onGeometryChange, not a PreferenceKey: a preference
-            // set inside ScrollView content never reached an outer
-            // onPreferenceChange here (it only ever reported the default 0).
-            content()
-                .onGeometryChange(for: CGFloat.self) { proxy in
-                    proxy.size.height
-                } action: { height in
-                    contentHeight = height
-                }
+        // Not a frame: a fixed `.frame(height:)` ignored a smaller proposal
+        // (keyboard up, landscape, short window) and pushed the bottom-aligned
+        // sheet's top off screen; a `maxHeight` frame re-inflates to the
+        // proposal because ScrollView is greedy. The layout takes exactly
+        // min(content, maxHeight, offered height).
+        SNFittedHeightLayout(contentHeight: contentHeight, maxHeight: maxHeight) {
+            ScrollView {
+                // Measured with onGeometryChange, not a PreferenceKey: a preference
+                // set inside ScrollView content never reached an outer
+                // onPreferenceChange here (it only ever reported the default 0).
+                content()
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.size.height
+                    } action: { height in
+                        contentHeight = height
+                    }
+            }
         }
-        // Once measured, pin the exact height. The `maxHeight` frame only caps
-        // the first (unmeasured) pass: a flexible frame with a max takes the
-        // PROPOSED height up to that max, not its child's, so leaving it on
-        // would re-inflate the sheet to `maxHeight` however short the content.
-        .frame(height: contentHeight > 0 ? min(contentHeight, maxHeight) : nil)
-        .frame(maxHeight: contentHeight > 0 ? nil : maxHeight)
+    }
+}
+
+/// Height a fitted sheet body takes: its measured content (0 = not measured
+/// yet, so the cap), never more than `maxHeight`, never more than the parent
+/// offers.
+func snFittedSheetHeight(content: CGFloat, maxHeight: CGFloat, available: CGFloat?) -> CGFloat {
+    let wanted = content > 0 ? min(content, maxHeight) : maxHeight
+    guard let available, available.isFinite else { return wanted }
+    return max(0, min(wanted, available))
+}
+
+private struct SNFittedHeightLayout: Layout {
+    let contentHeight: CGFloat
+    let maxHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let height = snFittedSheetHeight(content: contentHeight, maxHeight: maxHeight, available: proposal.height)
+        let width = proposal.width
+            ?? subviews.first?.sizeThatFits(ProposedViewSize(width: nil, height: height)).width
+            ?? 0
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: bounds.height)
+        )
     }
 }
 

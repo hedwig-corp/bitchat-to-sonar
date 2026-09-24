@@ -1725,9 +1725,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// True when the video names a place: QuickTime/ISO 6709 location or the
-    /// common-key location an iPhone camera writes.
+    /// common-key location an iPhone camera writes. Fails closed: metadata
+    /// that cannot be read counts as located, so the video goes through the
+    /// filtered export instead of the raw-bytes fast path.
     nonisolated static func videoCarriesLocation(_ asset: AVAsset) async -> Bool {
-        let items = (try? await asset.load(.metadata)) ?? []
+        guard let items = try? await asset.load(.metadata) else { return true }
         return items.contains { item in
             item.commonKey == .commonKeyLocation
                 || item.identifier == .quickTimeMetadataLocationISO6709
@@ -4659,9 +4661,6 @@ final class SonarAppStore: ObservableObject {
             case .ready:
                 do {
                     offer = try await self.wallet.createOffer()
-                    self.paymentMetadataRetryAttempt = 0
-                    self.paymentMetadataRetryTask?.cancel()
-                    self.paymentMetadataRetryTask = nil
                     guard case .ready = self.walletState else { return }
                 } catch {
                     SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
@@ -4688,8 +4687,12 @@ final class SonarAppStore: ObservableObject {
             if let offer {
                 await self.refreshHandleOfferIfNeeded(offer)
             }
+            // Offline relay: the reconnect path republishes, no retry needed.
             guard self.marmot.npub != nil, self.marmot.relayConnected else { return }
-            guard force || !self.publishedCallDescriptor || self.publishedBolt12Offer != offer else { return }
+            guard force || !self.publishedCallDescriptor || self.publishedBolt12Offer != offer else {
+                self.resetPaymentMetadataRetry()   // already published: nothing left to retry
+                return
+            }
             do {
                 try await self.marmot.publishSonarDescriptor(bolt12Offer: offer)
                 if offer != nil {
@@ -4697,8 +4700,13 @@ final class SonarAppStore: ObservableObject {
                 }
                 self.publishedCallDescriptor = true
                 self.publishedBolt12Offer = offer
+                self.resetPaymentMetadataRetry()
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+                // A ready wallet no longer re-publishes on every balance tick,
+                // so without this a transient relay/API error left the receive
+                // capability unpublished for the rest of the session.
+                self.schedulePaymentMetadataRetry()
             }
         }
     }
@@ -4707,6 +4715,15 @@ final class SonarAppStore: ObservableObject {
     /// at 15 min. Before this, the only retry was the wallet's 5 s balance poll
     /// re-publishing an unchanged state, which hit Boltz every 5 s while it was
     /// down. Only retries while the wallet is still ready.
+    /// The backoff resets only after the descriptor is actually published (or
+    /// already current). Resetting on offer creation alone pinned a failing
+    /// publish at the 30 s floor and re-requested an offer every 30 s.
+    private func resetPaymentMetadataRetry() {
+        paymentMetadataRetryAttempt = 0
+        paymentMetadataRetryTask?.cancel()
+        paymentMetadataRetryTask = nil
+    }
+
     private func schedulePaymentMetadataRetry() {
         paymentMetadataRetryTask?.cancel()
         let delaySecs = Self.paymentMetadataRetryDelaySecs(attempt: paymentMetadataRetryAttempt)

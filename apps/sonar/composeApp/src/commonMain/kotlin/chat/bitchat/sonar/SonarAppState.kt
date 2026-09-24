@@ -7686,11 +7686,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             // Finalize every staged item IN ORDER (lazy jpeg re-encode happens
-            // here, on send confirmation — Signal-style). GIFs and videos pass
-            // through untouched: `reencodeToJpeg` cannot decode them, and a
-            // video is already bounded by the pick-time size cap.
+            // here, on send confirmation — Signal-style). GIFs pass through
+            // untouched: `reencodeToJpeg` cannot decode them. Videos keep their
+            // encode (already bounded by the pick-time size cap) but lose any
+            // location metadata first.
             val prepared = mutableListOf<Triple<String, PickedPhoto, Boolean>>()
             var encodeFailed = false
+            var videoFailed = false
             for (preview in items) {
                 val raw = withContext(Dispatchers.IO) {
                     readTempMediaFile(preview.tempPath).also { deleteTempMediaFile(preview.tempPath) }
@@ -7698,11 +7700,23 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (preview.mime == "image/gif") {
                     prepared += Triple(preview.chatId, PickedPhoto(raw, preview.filename, preview.mime), true)
                 } else if (isVideoMime(preview.mime)) {
+                    // A clip recorded with location on names the place it was
+                    // shot (iOS finalizeVideoForSend parity). Fail closed: an
+                    // MP4/MOV whose boxes cannot be verified is not sent.
+                    val clean = when (val r = withContext(Dispatchers.Default) { stripVideoLocationMetadata(raw) }) {
+                        is VideoPrivacyResult.Clean -> r.bytes
+                        VideoPrivacyResult.NotIsoBmff -> raw
+                        VideoPrivacyResult.Malformed -> null
+                    }
+                    if (clean == null) {
+                        videoFailed = true
+                        continue
+                    }
                     // Normalize to the MDK-accepted MIME/filename set so an
                     // exotic container degrades to a file send, never an error.
                     val safeMime = encryptedAttachmentMime(preview.mime)
                     val safeFilename = encryptedAttachmentFilename(preview.filename)
-                    prepared += Triple(preview.chatId, PickedPhoto(raw, safeFilename, safeMime), true)
+                    prepared += Triple(preview.chatId, PickedPhoto(clean, safeFilename, safeMime), true)
                 } else {
                     val jpeg = withContext(Dispatchers.Default) { reencodeToJpeg(raw) }
                     if (jpeg == null) {
@@ -7713,6 +7727,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             }
             if (encodeFailed) toast = "Couldn't encode image."
+            if (videoFailed) toast = "Couldn't prepare that video — it wasn't sent."
             // Group per chat: 2+ items send as ONE album message (card deck);
             // a single item keeps the exact pre-album behavior.
             val chatsInOrder = prepared.map { it.first }.distinct()
