@@ -224,19 +224,28 @@ struct SonarDMScreenContent: View {
             banner
 
             let msgs = convo.messages
-            if msgs.isEmpty && store.isLocallyHydratingDM(peerId) {
-                ProgressView()
-                    .tint(SonarTheme.accent)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if msgs.isEmpty {
-                SNEmptyState(
-                    icon: .lock,
-                    iconSize: 24,
-                    title: "Say hi to \(peer.name)",
-                    desc: isMultiMemberMarmot
-                        ? "Messages here are end-to-end encrypted. Only group members can read them."
-                        : "Messages here are end-to-end encrypted. Only the two of you can read them."
-                )
+            if msgs.isEmpty {
+                // History may still be arriving, but typing and sending never
+                // wait on the network (XChat-style startup rule; Compose
+                // always shows its composer). An empty local transcript stays
+                // "hydrating" until the relay backfill finishes — a group you
+                // just created used to have no composer for that round trip.
+                // One branch, so the composer keeps its identity (and focus)
+                // when hydration ends and only the placeholder above swaps.
+                if store.isLocallyHydratingDM(peerId) {
+                    ProgressView()
+                        .tint(SonarTheme.accent)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    SNEmptyState(
+                        icon: .lock,
+                        iconSize: 24,
+                        title: "Say hi to \(peer.name)",
+                        desc: isMultiMemberMarmot
+                            ? "Messages here are end-to-end encrypted. Only group members can read them."
+                            : "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    )
+                }
                 dmComposer
             } else if SNTranscriptCollectionHostFlag.isEnabled {
                 // Production Signal engine (Phase 3 cutover, default ON):
