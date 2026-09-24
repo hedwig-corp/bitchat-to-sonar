@@ -929,7 +929,8 @@ private struct MacConversationPane: View {
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: !isChannel && store.canSendMedia(id),
-            onVoice: { store.sendVoiceNote(id, url: $0) }
+            onVoice: { store.sendVoiceNote(id, url: $0) },
+            focusRequest: isChannel ? nil : store.composerReply(for: id)?.parentId
         )
         }
     }

@@ -186,7 +186,8 @@ struct SonarDMScreenContent: View {
             onVoice: { store.sendVoiceNote(peerId, url: $0) },
             // Always pass the roster; SNComposer derives suggestions from the
             // bound draft locally (no store-wide mention-query publish).
-            mentionRoster: store.mentionRoster(forConversationId: peerId)
+            mentionRoster: store.mentionRoster(forConversationId: peerId),
+            focusRequest: store.composerReply(for: peerId)?.parentId
         )
         }
     }

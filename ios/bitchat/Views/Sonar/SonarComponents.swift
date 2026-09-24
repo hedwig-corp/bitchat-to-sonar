@@ -4547,6 +4547,10 @@ struct SNComposer: View {
     /// Group members the `@` picker can offer. Empty outside multi-member
     /// Marmot groups, which is what keeps the picker off 1:1 chats.
     var mentionRoster: [SNMentionCandidate] = []
+    /// Focuses the field whenever this changes to a new non-nil value — the
+    /// quoted message's id, so choosing Reply puts the cursor in the composer
+    /// (Signal behaviour) instead of leaving the user to tap it.
+    var focusRequest: String? = nil
 
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
@@ -4837,6 +4841,9 @@ struct SNComposer: View {
                     }
                     .onChange(of: text) { _ in
                         syncFieldFromStoreIfNeeded()
+                    }
+                    .onChange(of: focusRequest) { request in
+                        if request != nil { composerFocused = true }
                     }
                     .onChange(of: composerFocused) { focused in
                         if snShouldCloseEmojiTrayOnComposerFocus(

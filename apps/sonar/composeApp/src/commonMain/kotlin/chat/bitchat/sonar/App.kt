@@ -105,6 +105,8 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -1944,6 +1946,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // in both the legacy Column shell and the Phase-2 Box host.
         Column(Modifier.fillMaxWidth()) {
             val pendingReply = state.composerReply(screen.id)
+            // Choosing Reply puts the cursor in the composer (Signal behaviour;
+            // iOS SNComposer `focusRequest`). Keyed on the quoted id, so it
+            // fires once per new reply, not on every recomposition.
+            val composerFocus = remember { FocusRequester() }
+            LaunchedEffect(pendingReply?.parentId) {
+                if (pendingReply != null) runCatching { composerFocus.requestFocus() }
+            }
             if (pendingReply != null) {
                 ComposerReplyBanner(
                     reply = pendingReply,
@@ -2027,6 +2036,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             label = composerPlaceholder,
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .focusRequester(composerFocus)
                                 .onFocusChanged { focusState ->
                                     if (
                                         shouldCloseEmojiTrayOnComposerFocus(
