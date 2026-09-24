@@ -84,12 +84,20 @@ Every call blocks. Call it from a background executor.
   Rotates only when the quote expires (the old quote keeps minting). A mint
   that forgets the quote is indistinguishable from an outage and does not
   rotate.
+- `receive_invoice(amount, description?)` returns a one-time BOLT11 invoice
+  and the `payment_id` its payment will arrive under, so a host can stop
+  showing a paid invoice as payable.
 - `prepare_send(dest, amount?)` returns the mint's amount and fee RESERVE.
   Show it before consent. `send(prepared, note)` is the one spending call.
+  A fee quote for display is a `prepare_send` whose result is discarded: it
+  reserves nothing, and `send` prepares again.
   **`Pending` is not a failure**: past its deadline, or with a mint still
   routing, the payment is reported Pending and its outcome arrives as an
   event with the same `id`. Never retry a Pending send with a new quote; that
-  can pay twice.
+  can pay twice. A confirm error is only Pending when the mint's own quote
+  state says so: a quote the mint reports Unpaid or Failed (including a melt
+  saga recovery rolled back) is Failed, and `lookup_payment` answers from the
+  mint's melt quote when history no longer shows the send.
 - Every payment to the offer is its own payment: `{quote_id}:{tx_id}`.
 - History carries the preimage (chat `⚡PAYDONE|2` needs it after a restart).
 - Errors: `WalletFfiError` is non-flat; branch on `InsufficientFunds`,
@@ -122,6 +130,14 @@ Shared behaviour, pinned by tests on both platforms:
   a later failure never leaves a misleading receipt with the peer.
 - `Max` on Cashu prepares at the full balance, subtracts the quoted fee reserve
   and prepares again. The 0.5% Breez reserve applies to the legacy wallet only.
+- The Wallet screen has Receive and Send. Receive shows the reusable offer
+  (QR, Copy, Share) or, for "Request an amount", a one-time invoice; once
+  that invoice's own payment arrives (matched by `payment_id`, never by
+  amount) the sheet goes back to the offer.
+- The send sheet shows the mint's fee reserve ("Network fee: up to …") before
+  the user confirms, re-quoted 400 ms after the amount settles. The quote
+  never connects the wallet and never blocks Send; on any error the line
+  hides.
 
 ## Legacy Breez
 
@@ -175,12 +191,6 @@ preimage) run only on explicit approval of the amounts.
   restore can leave both devices holding the same bearer proofs. Breez synced
   across devices; Cashu does not. Options then: a single wallet device,
   per-device seeds, or a counter resync on `AlreadySigned`.
-- A send that came back Pending because its confirm was ambiguous, and was
-  then compensated by saga recovery, leaves no wallet record, so the app row
-  stays "Pending" although the funds are back. Follow-up: settle such rows
-  once a lookup and the balance agree the melt never happened.
-- The mint's fee reserve is checked before sending but not shown to the user
-  before they confirm.
 - Existing installs already carry a Breez seed, so they run a legacy Breez node
   every launch until the user deletes it, even when it is empty.
 - A store that is already corrupted is not rebuilt: connect fails on every
