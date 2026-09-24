@@ -4664,7 +4664,7 @@ final class SonarAppStore: ObservableObject {
                     guard case .ready = self.walletState else { return }
                 } catch {
                     SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
-                    self.schedulePaymentMetadataRetry()
+                    self.schedulePaymentMetadataRetry(force: force)
                     return
                 }
             case .settingUp:
@@ -4705,8 +4705,11 @@ final class SonarAppStore: ObservableObject {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
                 // A ready wallet no longer re-publishes on every balance tick,
                 // so without this a transient relay/API error left the receive
-                // capability unpublished for the rest of the session.
-                self.schedulePaymentMetadataRetry()
+                // capability unpublished for the rest of the session. Carry
+                // `force`: a reconnect-forced publish of an UNCHANGED offer would
+                // otherwise hit the "already published" guard on retry and never
+                // reach the new relay session.
+                self.schedulePaymentMetadataRetry(force: force)
             }
         }
     }
@@ -4724,7 +4727,7 @@ final class SonarAppStore: ObservableObject {
         paymentMetadataRetryTask = nil
     }
 
-    private func schedulePaymentMetadataRetry() {
+    private func schedulePaymentMetadataRetry(force: Bool) {
         paymentMetadataRetryTask?.cancel()
         let delaySecs = Self.paymentMetadataRetryDelaySecs(attempt: paymentMetadataRetryAttempt)
         paymentMetadataRetryAttempt += 1
@@ -4733,7 +4736,7 @@ final class SonarAppStore: ObservableObject {
             guard !Task.isCancelled, let self else { return }
             self.paymentMetadataRetryTask = nil
             guard case .ready = self.walletState else { return }
-            self.publishPaymentMetadataIfNeeded()
+            self.publishPaymentMetadataIfNeeded(force: force)
         }
     }
 

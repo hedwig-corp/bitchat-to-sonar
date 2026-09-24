@@ -1,5 +1,30 @@
 package chat.bitchat.sonar
 
+/** What the picker send path may do with a picked video. */
+internal sealed class VideoSendDecision {
+    class Send(val bytes: ByteArray) : VideoSendDecision()
+
+    /** MP4/MOV whose boxes cannot be verified clean. */
+    data object Unverifiable : VideoSendDecision()
+
+    /** WebM/MKV/AVI…: containers this sanitizer cannot read, so cannot vouch for. */
+    data object UnsupportedContainer : VideoSendDecision()
+}
+
+/**
+ * Fail closed for everything the sanitizer cannot verify: only an MP4/MOV it
+ * parsed (and cleaned) is sent as a video. Other containers can carry
+ * arbitrary tags or embedded XMP, so "we don't read this format" must never
+ * mean "send it as-is" — the user can still send such a file through
+ * "Send file", which transfers files byte-exact on both apps.
+ */
+internal fun videoBytesForSend(raw: ByteArray): VideoSendDecision =
+    when (val result = stripVideoLocationMetadata(raw)) {
+        is VideoPrivacyResult.Clean -> VideoSendDecision.Send(result.bytes)
+        VideoPrivacyResult.Malformed -> VideoSendDecision.Unverifiable
+        VideoPrivacyResult.NotIsoBmff -> VideoSendDecision.UnsupportedContainer
+    }
+
 /**
  * Remove location metadata from an ISO-BMFF / QuickTime video (MP4, MOV, 3GP)
  * before it leaves the device — the Compose counterpart of iOS
@@ -15,10 +40,9 @@ package chat.bitchat.sonar
  * re-encoded; players skip `free` boxes by definition.
  *
  * Fails closed: a file that looks like ISO-BMFF but whose boxes do not parse
- * (or whose movie header is compressed, `cmov`) is [VideoPrivacyResult.Malformed]
- * and must not be sent. Non-ISO-BMFF containers (WebM/Matroska) are
- * [VideoPrivacyResult.NotIsoBmff]: phone cameras do not write location into
- * them, and this sanitizer does not read them.
+ * (or whose movie header is compressed, `cmov`) is [VideoPrivacyResult.Malformed].
+ * Non-ISO-BMFF containers (WebM/Matroska/AVI) are [VideoPrivacyResult.NotIsoBmff]:
+ * this sanitizer does not read them, so [videoBytesForSend] refuses both.
  */
 internal sealed class VideoPrivacyResult {
     /** Safe to send; [stripped] is true when at least one box was neutralized. */

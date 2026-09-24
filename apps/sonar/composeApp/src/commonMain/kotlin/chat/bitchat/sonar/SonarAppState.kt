@@ -7693,6 +7693,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val prepared = mutableListOf<Triple<String, PickedPhoto, Boolean>>()
             var encodeFailed = false
             var videoFailed = false
+            var videoUnsupported = false
             for (preview in items) {
                 val raw = withContext(Dispatchers.IO) {
                     readTempMediaFile(preview.tempPath).also { deleteTempMediaFile(preview.tempPath) }
@@ -7701,16 +7702,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                     prepared += Triple(preview.chatId, PickedPhoto(raw, preview.filename, preview.mime), true)
                 } else if (isVideoMime(preview.mime)) {
                     // A clip recorded with location on names the place it was
-                    // shot (iOS finalizeVideoForSend parity). Fail closed: an
-                    // MP4/MOV whose boxes cannot be verified is not sent.
-                    val clean = when (val r = withContext(Dispatchers.Default) { stripVideoLocationMetadata(raw) }) {
-                        is VideoPrivacyResult.Clean -> r.bytes
-                        VideoPrivacyResult.NotIsoBmff -> raw
-                        VideoPrivacyResult.Malformed -> null
-                    }
-                    if (clean == null) {
-                        videoFailed = true
-                        continue
+                    // shot (iOS finalizeVideoForSend parity). Fail closed: only
+                    // an MP4/MOV the sanitizer verified is sent as a video.
+                    val clean = when (val d = withContext(Dispatchers.Default) { videoBytesForSend(raw) }) {
+                        is VideoSendDecision.Send -> d.bytes
+                        VideoSendDecision.Unverifiable -> { videoFailed = true; continue }
+                        VideoSendDecision.UnsupportedContainer -> { videoUnsupported = true; continue }
                     }
                     // Normalize to the MDK-accepted MIME/filename set so an
                     // exotic container degrades to a file send, never an error.
@@ -7728,6 +7725,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             if (encodeFailed) toast = "Couldn't encode image."
             if (videoFailed) toast = "Couldn't prepare that video — it wasn't sent."
+            if (videoUnsupported) {
+                toast = "Only MP4 or MOV videos are sent as video — use Send file for this one."
+            }
             // Group per chat: 2+ items send as ONE album message (card deck);
             // a single item keeps the exact pre-album behavior.
             val chatsInOrder = prepared.map { it.first }.distinct()

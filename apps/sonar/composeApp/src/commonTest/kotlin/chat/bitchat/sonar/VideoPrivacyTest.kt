@@ -137,4 +137,17 @@ class VideoPrivacyTest {
         assertIs<VideoPrivacyResult.NotIsoBmff>(stripVideoLocationMetadata(webm))
         assertIs<VideoPrivacyResult.NotIsoBmff>(stripVideoLocationMetadata(ByteArray(3)))
     }
+
+    @Test
+    fun theSendPathOnlyAcceptsVerifiedMp4s() {
+        // The picker path fails closed: unverifiable MP4/MOV and containers the
+        // sanitizer cannot read (WebM/MKV/AVI) are refused, never sent as-is.
+        val sent = videoBytesForSend(locatedMp4())
+        assertIs<VideoSendDecision.Send>(sent)
+        assertEquals(-1, sent.bytes.indexOf(bytes(location)))
+        val valid = locatedMp4()
+        assertIs<VideoSendDecision.Unverifiable>(videoBytesForSend(valid.copyOf(valid.size - 10)))
+        val webmWithXmp = byteArrayOf(0x1A, 0x45, 0xDF.toByte(), 0xA3.toByte()) + bytes("<x:xmpmeta GPSLatitude='46'/>")
+        assertIs<VideoSendDecision.UnsupportedContainer>(videoBytesForSend(webmWithXmp))
+    }
 }
