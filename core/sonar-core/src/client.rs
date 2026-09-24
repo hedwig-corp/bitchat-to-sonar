@@ -7098,10 +7098,17 @@ impl SonarClient {
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
         if let Some(ref idx) = self.conversation_index {
-            if let Err(e) = idx.lock().unwrap().mark_read(group_id_hex) {
-                tracing::warn!(%e, "index mark_read failed");
+            // Notify only when the unread count actually moved. Hosts re-mark
+            // the OPEN chat read on every change notification for it, so an
+            // unconditional notify here closed a loop — mark → notify →
+            // reload page → mark → … — that spun at ~20 Hz (DB write + page
+            // read + summaries read each turn) for as long as a chat was open.
+            let result = idx.lock().unwrap().mark_read(group_id_hex);
+            match result {
+                Ok(true) => self.notify_conversation_changed(group_id_hex),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(%e, "index mark_read failed"),
             }
-            self.notify_conversation_changed(group_id_hex);
         }
     }
 
@@ -8450,6 +8457,66 @@ mod tests {
                 .expect("summary exists")
                 .unread_count,
             2
+        );
+    }
+
+    /// R: marking an already-read conversation read must not announce a change.
+    ///
+    /// iOS re-marks the chat on screen read on every change notification for
+    /// it, so an unconditional notify made read-marking feed itself: an open
+    /// chat spun mark → notify → reload → mark at ~20 Hz, each turn a DB write
+    /// plus a page and a summaries read. Pins the real client call site.
+    #[tokio::test]
+    async fn marking_an_already_read_conversation_does_not_notify() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        client.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        client.set_conversation_change_listener(Some(listener.clone()));
+
+        let group_id = GroupId::from_slice(&[9u8; 32]);
+        let group_hex = hex::encode(group_id.as_slice());
+        let incoming = ChatMessage {
+            id: test_event_id(1),
+            group_id: group_id.clone(),
+            sender: Keys::generate().public_key(),
+            content: "hey".to_owned(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("hey"),
+            reply: None,
+        };
+        client.upsert_index_for_message(&incoming, Some("Chat"));
+        listener.changed.lock().unwrap().clear();
+
+        client.mark_conversation_read(&group_hex);
+        assert_eq!(
+            listener.changed.lock().unwrap().clone(),
+            vec![group_hex.clone()],
+            "clearing a real unread count must notify the host"
+        );
+        assert_eq!(
+            client
+                .conversation_summary(&group_hex)
+                .expect("summary exists")
+                .unread_count,
+            0
+        );
+
+        client.mark_conversation_read(&group_hex);
+        client.mark_conversation_read(&group_hex);
+        assert_eq!(
+            listener.changed.lock().unwrap().len(),
+            1,
+            "a no-op mark must not notify, or the open chat re-marks itself forever"
         );
     }
 
