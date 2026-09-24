@@ -530,7 +530,7 @@ struct SNRestoreAccountSheetContent: View {
             HStack(alignment: .top, spacing: 11) {
                 SNIcon(name: .shield, size: 18, weight: 2)
                     .foregroundColor(SonarTheme.danger)
-                Text(String(localized: "This replaces the account on this phone. Chats stored here are erased, then recovered from your encrypted Blossom backup when one exists for this nsec. Your Lightning wallet is rebuilt from the nsec you paste (same key = same balance after sync)."))
+                Text(String(localized: "This replaces the account on this phone. Chats stored here are erased, then recovered from your encrypted Blossom backup when one exists for this nsec. Your wallet is rebuilt from the nsec you paste (same key = same balance after sync)."))
                     .font(SonarTheme.uiFont(size: 13))
                     .lineSpacing(13 * 0.5)
                     .foregroundColor(SonarTheme.text)

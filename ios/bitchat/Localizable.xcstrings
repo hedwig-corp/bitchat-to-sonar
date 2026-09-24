@@ -300,7 +300,7 @@
     "Cancel" : {
 
     },
-    "This replaces the account on this phone. Chats stored here are erased, then recovered from your encrypted Blossom backup when one exists for this nsec. Your Lightning wallet is rebuilt from the nsec you paste (same key = same balance after sync)." : {
+    "This replaces the account on this phone. Chats stored here are erased, then recovered from your encrypted Blossom backup when one exists for this nsec. Your wallet is rebuilt from the nsec you paste (same key = same balance after sync)." : {
 
     },
     "Encrypted cloud backup — recover chats after reinstall" : {
@@ -345,7 +345,7 @@
     "Direct messages are end-to-end encrypted. Always." : {
 
     },
-    "Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history is recovered from your encrypted Blossom backup when one exists for this key." : {
+    "Paste your nsec private key. This restores your Sonar identity and wallet. Chat history is recovered from your encrypted Blossom backup when one exists for this key." : {
 
     },
     "nsec1..." : {
