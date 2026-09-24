@@ -28,6 +28,30 @@ class Bolt11AmountTest {
         assertEquals(1L, bolt11AmountSats("lnbc10p1pabc"))
     }
 
+    /**
+     * QA: a `lnbc2100n` invoice (210 sats) showed as 211 on iOS — floating
+     * point read it as 210.00000000000003 and rounded up. Every whole-sat
+     * nano amount must come back exact.
+     */
+    @Test
+    fun wholeSatAmountsAreExactNeverRoundedUp() {
+        assertEquals(210L, bolt11AmountSats("lnbc2100n1p4tfqn0dqq"))
+        for (sats in 1L..10_000L) {
+            assertEquals(sats, bolt11AmountSats("lnbc${sats * 10}n1pabc"), "${sats * 10}n")
+        }
+        assertEquals(250_000L, bolt11AmountSats("lnbc2500u1pabc"))
+        assertEquals(2_000_000L, bolt11AmountSats("lnbc20m1pabc"))
+        // A sub-sat remainder still rounds up: 1.5 sats → 2, 12,345,678.9 → 12,345,679.
+        assertEquals(2L, bolt11AmountSats("lnbc15n1pabc"))
+        assertEquals(12_345_679L, bolt11AmountSats("lnbc123456789n1pabc"))
+    }
+
+    @Test
+    fun unknownMultiplierOrOverflowIsNoAmount() {
+        assertNull(bolt11AmountSats("lnbc5x1pabc"))
+        assertNull(bolt11AmountSats("lnbc99999999999999999m1pabc"))
+    }
+
     @Test
     fun bareAmountIsWholeBitcoin() {
         assertEquals(100_000_000L, bolt11AmountSats("lnbc11pabc"))

@@ -335,6 +335,34 @@ final class CashuWalletUXTests: XCTestCase {
         }
     }
 
+    // MARK: BOLT11 amounts
+
+    /// QA: a `lnbc2100n` invoice (210 sats) showed as 211 sats in the send
+    /// sheet and was recorded as 211 in the ledger — `Double` read it as
+    /// 210.00000000000003 and rounded up. Mirrors Compose `Bolt11AmountTest`.
+    func testBolt11WholeSatAmountsAreExact() {
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc2100n1p4tfqn0dqq"), 210)
+        for sats in Int64(1)...10_000 {
+            XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc\(sats * 10)n1pabc"), sats, "\(sats * 10)n")
+        }
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc21u1p3k9abcdef"), 2_100)
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc2500u1pabc"), 250_000)
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc20m1pabc"), 2_000_000)
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc11pabc"), 100_000_000)
+        // A sub-sat remainder still rounds up (never underpay).
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc15n1pabc"), 2)
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc10p1pabc"), 1)
+        XCTAssertEqual(SNScannedKind.bolt11AmountSats("lnbc123456789n1pabc"), 12_345_679)
+    }
+
+    func testBolt11NoAmountCases() {
+        XCTAssertNil(SNScannedKind.bolt11AmountSats("lnbc1pabcdef"))
+        XCTAssertNil(SNScannedKind.bolt11AmountSats("lnbc0u1pabc"))
+        XCTAssertNil(SNScannedKind.bolt11AmountSats("lnbc5x1pabc"))
+        XCTAssertNil(SNScannedKind.bolt11AmountSats("lnbc99999999999999999m1pabc"))
+        XCTAssertNil(SNScannedKind.bolt11AmountSats(""))
+    }
+
     // MARK: Helpers
 
     private func openWallet(_ native: FakeCashuNative) async throws -> (CashuWalletService, CashuWallet) {
