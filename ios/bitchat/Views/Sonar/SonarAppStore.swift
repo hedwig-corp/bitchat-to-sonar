@@ -1668,7 +1668,7 @@ final class SonarAppStore: ObservableObject {
 
     /// Outcome of finalizing a staged video: distinguishes "cannot fit under
     /// the cap" from an I/O or export failure so the toast never lies.
-    private enum VideoFinalizeResult: Sendable {
+    enum VideoFinalizeResult: Sendable {
         case ready(data: Data, filename: String, mime: String)
         case tooLarge
         case failed
@@ -1679,44 +1679,110 @@ final class SonarAppStore: ObservableObject {
     /// under the receiver download cap, otherwise re-encode to a smaller
     /// H.264/AAC MP4 with `AVAssetExportSession` and send that if it fits.
     /// Consumes (deletes) the staged temp file.
-    private nonisolated static func finalizeVideoForSend(
+    nonisolated static func finalizeVideoForSend(
         _ url: URL,
         filename: String,
         mime: String
     ) async -> VideoFinalizeResult {
         defer { deleteTempMediaFile(url) }
-        if let size = fileSize(url), size <= maxMediaPlaintextBytes {
-            guard let data = readTempMediaFile(url) else { return .failed }
-            return .ready(data: data, filename: filename, mime: mime)
-        }
         let asset = AVURLAsset(url: url)
-        guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPreset960x540) else {
+        if let size = fileSize(url), size <= maxMediaPlaintextBytes {
+            // The Photos picker hands over the original file ("Location Is
+            // Included"), so a video recorded with Location Services on would
+            // tell the recipient where it was shot. Keep the original encode —
+            // a passthrough remux only drops the metadata — and fall back to
+            // the filtered re-encode below if the container cannot be remuxed.
+            guard await videoCarriesLocation(asset) else {
+                guard let data = readTempMediaFile(url) else { return .failed }
+                return .ready(data: data, filename: filename, mime: mime)
+            }
+            if let fileType = passthroughFileType(for: url),
+               let cleaned = await exportVideoWithoutPrivateMetadata(
+                   asset,
+                   presetName: AVAssetExportPresetPassthrough,
+                   fileType: fileType
+               ) {
+                defer { deleteTempMediaFile(cleaned) }
+                if let cleanedSize = fileSize(cleaned), cleanedSize <= maxMediaPlaintextBytes,
+                   let data = readTempMediaFile(cleaned) {
+                    return .ready(data: data, filename: filename, mime: mime)
+                }
+            }
+        }
+        guard let outURL = await exportVideoWithoutPrivateMetadata(
+            asset,
+            presetName: AVAssetExportPreset960x540,
+            fileType: .mp4
+        ) else {
             return .failed
         }
-        let outURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("sonar-preview")
-            .appendingPathComponent(UUID().uuidString + ".mp4")
         defer { deleteTempMediaFile(outURL) }
-        export.shouldOptimizeForNetworkUse = true
-        if #available(iOS 18.0, macOS 15.0, *) {
-            do {
-                try await export.export(to: outURL, as: .mp4)
-            } catch {
-                return .failed
-            }
-        } else {
-            export.outputURL = outURL
-            export.outputFileType = .mp4
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                export.exportAsynchronously { continuation.resume() }
-            }
-            guard export.status == .completed else { return .failed }
-        }
         guard let outSize = fileSize(outURL) else { return .failed }
         guard outSize <= maxMediaPlaintextBytes else { return .tooLarge }
         guard let data = readTempMediaFile(outURL) else { return .failed }
         let stem = (filename as NSString).deletingPathExtension
         return .ready(data: data, filename: (stem.isEmpty ? "video" : stem) + ".mp4", mime: "video/mp4")
+    }
+
+    /// True when the video names a place: QuickTime/ISO 6709 location or the
+    /// common-key location an iPhone camera writes.
+    nonisolated static func videoCarriesLocation(_ asset: AVAsset) async -> Bool {
+        let items = (try? await asset.load(.metadata)) ?? []
+        return items.contains { item in
+            item.commonKey == .commonKeyLocation
+                || item.identifier == .quickTimeMetadataLocationISO6709
+                || item.identifier == .quickTimeUserDataLocationISO6709
+        }
+    }
+
+    private nonisolated static func passthroughFileType(for url: URL) -> AVFileType? {
+        switch url.pathExtension.lowercased() {
+        case "mov": return .mov
+        case "mp4", "m4v": return .mp4
+        default: return nil
+        }
+    }
+
+    /// Export `asset` with `AVMetadataItemFilter.forSharing()`, which removes
+    /// location and other user-identifying metadata (Signal/WhatsApp parity).
+    /// Returns the temp output, or nil when the export fails.
+    private nonisolated static func exportVideoWithoutPrivateMetadata(
+        _ asset: AVAsset,
+        presetName: String,
+        fileType: AVFileType
+    ) async -> URL? {
+        guard let export = AVAssetExportSession(asset: asset, presetName: presetName) else {
+            return nil
+        }
+        let ext = fileType == .mov ? "mov" : "mp4"
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sonar-preview")
+            .appendingPathComponent(UUID().uuidString + "." + ext)
+        try? FileManager.default.createDirectory(
+            at: outURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        export.shouldOptimizeForNetworkUse = true
+        export.metadataItemFilter = .forSharing()
+        if #available(iOS 18.0, macOS 15.0, *) {
+            do {
+                try await export.export(to: outURL, as: fileType)
+            } catch {
+                deleteTempMediaFile(outURL)
+                return nil
+            }
+        } else {
+            export.outputURL = outURL
+            export.outputFileType = fileType
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                export.exportAsynchronously { continuation.resume() }
+            }
+            guard export.status == .completed else {
+                deleteTempMediaFile(outURL)
+                return nil
+            }
+        }
+        return outURL
     }
 
     private func deletePreviewTempFilesAsync(_ previews: [PendingMediaPreview]) {
