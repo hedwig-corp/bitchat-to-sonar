@@ -5,6 +5,7 @@
 # be driven headlessly (the registry says which ones are automated).
 #
 #   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003] [--max-idle-cpu 3]
+#   (set QA_APP_NPUB to run a scenario that needs the app's npub with --only)
 #
 # Preconditions: an ONBOARDED Debug build on a QA emulator
 # (scripts/qa/android-setup.sh), network access to the default relays, and the
@@ -34,7 +35,7 @@ RESULTS="$QA_HOME/smoke-$RUN.json"
 mkdir -p "$QA_HOME"
 declare -a ROWS=()
 FAILED=0
-APP_NPUB=""
+APP_NPUB="${QA_APP_NPUB:-}"      # known app npub lets --only run later scenarios alone
 
 record() { # id status detail
   ROWS+=("$1|$2|$3")
@@ -180,6 +181,22 @@ qa007() { # a partial npub offers no chat or channel action (A18)
   go_home >/dev/null
 }
 
+qa041() { # the profile "scan this to add you" code is a real QR of the npub (A25)
+  [[ -n "$APP_NPUB" ]] || { record QA-041 SKIP "needs the app npub from QA-001"; return; }
+  command -v swift >/dev/null || { record QA-041 SKIP "needs macOS swift (CoreImage) to decode"; return; }
+  go_home || { record QA-041 FAIL "could not reach the chat list"; return; }
+  ui tapx "Settings"; sleep 1.5
+  ui tapt "${APP_NPUB:0:12}"; sleep 2.5              # the profile card on Settings
+  local png; png="$("$UI" shot "qa041-$RUN")"; png="${png%.png}-full.png"
+  local decoded; decoded="$(swift "$ROOT/scripts/qa/qr-decode.swift" "$png" 2>/dev/null | tail -1)"
+  if [[ "$decoded" == "$APP_NPUB" ]]; then
+    record QA-041 PASS "profile QR decodes to the app npub"
+  else
+    record QA-041 FAIL "profile QR decodes to '${decoded:-nothing}', expected the app npub (QA-A25)"
+  fi
+  go_home >/dev/null
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -189,7 +206,7 @@ qa050() { # idle CPU on the chat list
 echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
 # QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa050; do
+for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa050; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

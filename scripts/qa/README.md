@@ -25,6 +25,7 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 | `peers.sh` | Fresh `sonar-cli` counterparties: `new`, `send`, `send-image`, `listen`, `expect`. |
 | `android-smoke.sh` | Automated registry scenarios (`qaNNN` = `QA-NNN`). |
 | `idle-cpu.sh` | Average app CPU over a window on Android or an iOS simulator. |
+| `qr-decode.swift` | Print QR payloads found in a screenshot (macOS CoreImage). |
 
 Safety: nothing here uninstalls or resets an app on a physical device; the
 Android scripts refuse non-emulators, the iOS scripts only touch the named QA

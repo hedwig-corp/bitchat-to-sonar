@@ -164,6 +164,30 @@ is the build under test on a dedicated QA emulator/simulator.
 - **How:** `android-smoke.sh` QA-040 · Guard: `IconButtonAccessibilityUiTest`
 - **Origin:** A9/A5/A21 (#616)
 
+### QA-041 — Profile QR is a real, scannable code
+- **Platforms:** both (Android automated on macOS; iOS manual)
+- **Steps:** Settings → profile card → screenshot the "Your key" card.
+- **Expect:** the code decodes (any QR reader, or
+  `swift scripts/qa/qr-decode.swift shot.png`) to the account's npub.
+- **How:** `android-smoke.sh` QA-041
+- **Origin:** A25 (#616) — Android drew the design mock's decorative pattern
+  under "Let someone scan this to add you"; nothing could scan it.
+
+### QA-042 — Channel screen controls are labelled
+- **Platforms:** Android (manual: open any location channel, `android-ui.sh dump`)
+- **Expect:** back, bookmark ("toggle bookmark for #…"), Nearby, the composer
+  ("Message <channel>") and Send are all labelled; no `E!` rows.
+- **Origin:** A22 (#616)
+
+## Settings
+
+### QA-060 — Settings copy matches behaviour
+- **Platforms:** both (manual, fresh account via `android-setup.sh --fresh`)
+- **Expect:** every "on/off by default" claim matches the toggle's state on a
+  fresh account; every setting changes something observable.
+- **Origin:** A23 (#616, "Off by default" note under a toggle that was on);
+  A24 (open: "Data usage: Wi-Fi only" is stored but never read on either app).
+
 ## Performance
 
 ### QA-050 — Idle CPU on the chat list
@@ -185,6 +209,12 @@ is the build under test on a dedicated QA emulator/simulator.
 - **Guard:** `client.rs::marking_an_already_read_conversation_does_not_notify` (#615)
 
 ## Open questions (need a product decision, not a fix)
+
+- **Data usage (A24):** "Wi-Fi only" is stored but nothing reads it on either
+  app, and the defaults differ (iOS Wi-Fi only, Android Always). Enforce it
+  (gate media auto-download on metered links) or remove it.
+- **Bitcoin mode default (A23):** both apps default to sats; the old copy
+  claimed fiat. Which one is intended?
 
 - **Fingerprint card (A3/A6):** iOS shows the Noise (mesh) key fingerprint,
   Android the nsec pubkey fingerprint — people comparing in person across
