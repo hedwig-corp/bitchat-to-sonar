@@ -58,6 +58,10 @@ import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
+import androidx.compose.foundation.LocalIndication
+import androidx.compose.foundation.indication
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.ui.semantics.Role
 
 @Composable
 fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfile) {
@@ -364,7 +368,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     icon = SNIconName.Lock,
                     tone = SNTone.Cyan,
                     label = "End-to-end encrypted",
-                    sub = "Messages are encrypted with the Signal protocol",
+                    sub = "Messages are end-to-end encrypted — MLS over the internet, Noise over Bluetooth",
                     trail = SNTrail.None,
                     divider = false
                 ) {}
@@ -520,12 +524,25 @@ private fun ActionCircle(
     onClick: () -> Unit,
 ) {
     val s = sonar
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+    // Circle + caption are ONE button: the caption is its spoken name and part
+    // of the tap target. The circle alone was an unlabelled (NAF) node and a
+    // tap on "Verify" did nothing (QA-A28). The ripple stays on the circle.
+    val interaction = remember { MutableInteractionSource() }
+    Column(
+        Modifier.clickable(
+            interactionSource = interaction,
+            indication = null,
+            enabled = enabled,
+            role = Role.Button,
+            onClick = onClick,
+        ),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
         Box(
             Modifier.size(52.dp)
                 .clip(CircleShape)
                 .background(if (enabled) s.accentSoft else s.surface2)
-                .clickable(enabled = enabled, onClick = onClick),
+                .indication(interaction, LocalIndication.current),
             contentAlignment = Alignment.Center
         ) {
             SNIcon(
