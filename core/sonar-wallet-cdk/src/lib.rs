@@ -681,6 +681,23 @@ impl CdkWallet {
         })
     }
 
+    /// A one-time BOLT11 invoice, with the id its payment will arrive under
+    /// (the mint quote id, see `incoming_payment_id`), so a host can tell
+    /// THIS invoice being paid from any other receive, and stop showing a
+    /// paid invoice as payable. Returns `(invoice, payment_id)`.
+    pub fn receive_bolt11(
+        &self,
+        amount_sats: u64,
+        description: Option<String>,
+    ) -> Result<(String, String)> {
+        let quote = self.create_mint_quote(&ReceiveRequest {
+            method: ReceiveMethod::Bolt11Invoice,
+            amount_sats: Some(amount_sats),
+            description,
+        })?;
+        Ok((quote.request, quote.id))
+    }
+
     /// Ask the mint for a receive quote. An amountless BOLT12 offer is the
     /// normal receive primitive and carries no fixed amount; only a BOLT11
     /// invoice needs one.
@@ -1961,6 +1978,35 @@ mod tests {
         w.sync_wallet().unwrap();
         assert_eq!(w.balance().unwrap().confirmed_sats, 1_000);
         w.disconnect().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host matches "this invoice was paid" by id, so the id
+    /// `receive_bolt11` hands out must be the one the payment event and
+    /// history carry.
+    #[test]
+    fn a_bolt11_invoice_is_paid_under_the_id_it_was_issued_with() {
+        let dir = scratch("bolt11-id");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+
+        let (invoice, payment_id) = w.receive_bolt11(210, None).unwrap();
+        assert!(invoice.starts_with("lnbc"));
+        mint.pay(&payment_id, 210);
+        w.sync_wallet().unwrap();
+
+        assert!(eventually(|| recorder.received_ids() == vec![payment_id.clone()]));
+        let history: Vec<String> = w
+            .list_recent_payments(10)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.incoming)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(history, vec![payment_id]);
+        drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

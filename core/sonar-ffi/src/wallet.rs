@@ -182,6 +182,15 @@ impl From<WalletDestinationKind> for DestinationKind {
     }
 }
 
+/// A one-time BOLT11 invoice from `receive_invoice`. Its payment arrives as
+/// an incoming `WalletPayment` whose `id` equals `payment_id`, so a host can
+/// tell this invoice was paid (and stop showing it as payable).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct WalletInvoice {
+    pub invoice: String,
+    pub payment_id: String,
+}
+
 /// A destination classified offline (no mint round-trip).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct WalletDestination {
@@ -355,17 +364,18 @@ impl SonarCashuWallet {
         Ok(self.inner.receive_offer()?)
     }
 
-    /// A one-off BOLT11 invoice for `amount_sats`.
+    /// A one-off BOLT11 invoice for `amount_sats`, with the id its payment
+    /// will carry.
     pub fn receive_invoice(
         &self,
         amount_sats: u64,
         description: Option<String>,
-    ) -> WalletResult<String> {
-        Ok(self.inner.receive(&sonar_wallet::ReceiveRequest {
-            method: sonar_wallet::ReceiveMethod::Bolt11Invoice,
-            amount_sats: Some(amount_sats),
-            description,
-        })?)
+    ) -> WalletResult<WalletInvoice> {
+        let (invoice, payment_id) = self.inner.receive_bolt11(amount_sats, description)?;
+        Ok(WalletInvoice {
+            invoice,
+            payment_id,
+        })
     }
 
     /// Classify what the user typed or scanned. Offline.
@@ -612,6 +622,40 @@ mod tests {
         assert!(received.incoming);
         let looked_up = wallet.lookup_payment(received.id.clone()).unwrap().unwrap();
         assert_eq!(looked_up.id, received.id);
+
+        wallet.clear_listener();
+        wallet.disconnect().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Receive sheet stops showing a one-time invoice once it is paid,
+    /// by matching the incoming payment's id against `payment_id`.
+    #[test]
+    fn a_paid_invoice_arrives_under_its_payment_id() {
+        let dir = scratch("invoice-id");
+        let (wallet, mint) = fake_wallet(&dir);
+        let events = Arc::new(Collect::default());
+        wallet.set_listener(Box::new(events.clone()));
+        wallet.connect().unwrap();
+
+        let issued = wallet.receive_invoice(210, None).unwrap();
+        assert!(issued.invoice.starts_with("lnbc"));
+        mint.pay(&issued.payment_id, 210);
+        wallet.sync().unwrap();
+
+        let received = (0..300).find_map(|_| {
+            let found = events.0.lock().unwrap().iter().find_map(|e| match e {
+                CashuWalletEvent::PaymentReceived { payment } => Some(payment.clone()),
+                _ => None,
+            });
+            if found.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            found
+        });
+        let received = received.expect("PaymentReceived reached the host listener");
+        assert_eq!(received.id, issued.payment_id);
+        assert_eq!(received.amount_sats, 210);
 
         wallet.clear_listener();
         wallet.disconnect().unwrap();

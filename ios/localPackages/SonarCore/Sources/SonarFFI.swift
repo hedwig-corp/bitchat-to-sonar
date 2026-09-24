@@ -1314,9 +1314,10 @@ public protocol SonarCashuWalletProtocol: AnyObject, Sendable {
     func prepareSend(destination: String, amountSats: UInt64?) throws  -> WalletPreparedSend
 
     /**
-     * A one-off BOLT11 invoice for `amount_sats`.
+     * A one-off BOLT11 invoice for `amount_sats`, with the id its payment
+     * will carry.
      */
-    func receiveInvoice(amountSats: UInt64, description: String?) throws  -> String
+    func receiveInvoice(amountSats: UInt64, description: String?) throws  -> WalletInvoice
 
     /**
      * THE wallet's receive offer (BOLT12, amountless, reusable) — the one
@@ -1532,10 +1533,11 @@ open func prepareSend(destination: String, amountSats: UInt64?)throws  -> Wallet
 }
 
     /**
-     * A one-off BOLT11 invoice for `amount_sats`.
+     * A one-off BOLT11 invoice for `amount_sats`, with the id its payment
+     * will carry.
      */
-open func receiveInvoice(amountSats: UInt64, description: String?)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+open func receiveInvoice(amountSats: UInt64, description: String?)throws  -> WalletInvoice  {
+    return try  FfiConverterTypeWalletInvoice_lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarcashuwallet_receive_invoice(
             self.uniffiCloneHandle(),
         FfiConverterUInt64.lower(amountSats),
@@ -6748,6 +6750,65 @@ public func FfiConverterTypeWalletDestination_lower(_ value: WalletDestination) 
 
 
 /**
+ * A one-time BOLT11 invoice from `receive_invoice`. Its payment arrives as
+ * an incoming `WalletPayment` whose `id` equals `payment_id`, so a host can
+ * tell this invoice was paid (and stop showing it as payable).
+ */
+public struct WalletInvoice: Equatable, Hashable {
+    public var invoice: String
+    public var paymentId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(invoice: String, paymentId: String) {
+        self.invoice = invoice
+        self.paymentId = paymentId
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletInvoice: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletInvoice: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletInvoice {
+        return
+            try WalletInvoice(
+                invoice: FfiConverterString.read(from: &buf),
+                paymentId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletInvoice, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.invoice, into: &buf)
+        FfiConverterString.write(value.paymentId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletInvoice_lift(_ buf: RustBuffer) throws -> WalletInvoice {
+    return try FfiConverterTypeWalletInvoice.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletInvoice_lower(_ value: WalletInvoice) -> RustBuffer {
+    return FfiConverterTypeWalletInvoice.lower(value)
+}
+
+
+/**
  * One payment, incoming or outgoing. `id` is stable: a live result, its
  * later events, and history rows for the same payment share it.
  */
@@ -11158,7 +11219,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_prepare_send() != 24537) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_invoice() != 47505) {
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_invoice() != 19291) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_offer() != 22586) {

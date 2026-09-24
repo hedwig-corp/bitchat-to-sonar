@@ -128,9 +128,9 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
         )
     }
 
-    func receiveInvoice(amountSats: UInt64, description: String?) throws -> String {
+    func receiveInvoice(amountSats: UInt64, description: String?) throws -> WalletInvoice {
         record("receiveInvoice")
-        return "lnbc\(amountSats)fake"
+        return WalletInvoice(invoice: "lnbc\(amountSats)fake", paymentId: "mint-quote-\(amountSats)")
     }
 
     func receiveOffer() throws -> String {

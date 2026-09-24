@@ -619,7 +619,7 @@ final class CashuWalletService: ObservableObject {
         guard let n = native else { throw CashuWalletError.notOpen }
         guard amountSats > 0 else { throw CashuWalletError.invalidInput("amount must be greater than zero") }
         do {
-            return try await run { try n.receiveInvoice(amountSats: UInt64(amountSats), description: description) }
+            return try await run { try n.receiveInvoice(amountSats: UInt64(amountSats), description: description).invoice }
         } catch {
             throw CashuWalletError(error)
         }

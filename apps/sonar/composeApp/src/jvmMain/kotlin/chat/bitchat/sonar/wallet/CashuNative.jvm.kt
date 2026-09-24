@@ -48,7 +48,7 @@ private class DesktopCashuNative(private val w: SonarCashuWallet) : CashuNative 
     override fun sync() = ffi { w.sync() }
     override fun receiveOffer(): String = ffi { w.receiveOffer() }
     override fun receiveInvoice(amountSats: Long, description: String?): String =
-        ffi { w.receiveInvoice(amountSats.toULong(), description) }
+        ffi { w.receiveInvoice(amountSats.toULong(), description).invoice }
     override fun parseDestination(input: String): CashuDestination = ffi {
         w.parseDestination(input).let { CashuDestination(it.raw, it.kind.common(), it.amountSats?.toLong()) }
     }
