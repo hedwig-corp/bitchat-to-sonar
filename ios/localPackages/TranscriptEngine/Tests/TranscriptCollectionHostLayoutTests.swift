@@ -194,5 +194,78 @@ struct TranscriptCollectionHostLayoutTests {
         #expect(collection.contentInset.top == 0)
         #expect(abs(gapBelowLastRow(collection)) < 1)
     }
+
+    // MARK: - Composer growth
+
+    /// Holds the draft the way SNComposer does: inside the composer, not in a
+    /// new Composer value handed to `updateComposer`.
+    private final class DraftModel: ObservableObject {
+        @Published var text = ""
+    }
+
+    private struct GrowingComposer: View {
+        @ObservedObject var draft: DraftModel
+        var body: some View {
+            TextField("", text: $draft.text, axis: .vertical)
+                .lineLimit(1...5)
+                .font(.system(size: 16))
+                .padding(.vertical, 7)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 36)
+                .padding(8)
+        }
+    }
+
+    private func makeComposerHost(
+        draft: DraftModel
+    ) async -> (window: UIWindow, vc: TranscriptCollectionHostViewController<AnyView>) {
+        let callbacks = TranscriptCollectionHostCallbacks(
+            configureCell: { _, cell, _, _ in cell.backgroundConfiguration = .clear() },
+            itemHeight: { _, _, _ in Self.rowHeight },
+            headerHeight: { _, _ in Self.headerHeight }
+        )
+        let vc = TranscriptCollectionHostViewController<AnyView>(
+            composer: { AnyView(GrowingComposer(draft: draft)) },
+            callbacks: callbacks,
+            heightKey: { _ in "k" }
+        )
+        vc.apply(
+            entries: [TranscriptHostEntry(id: "m-0", date: Date(timeIntervalSince1970: 1_700_000_000))],
+            unreadCountAtOpen: 0,
+            expectedNewestDate: nil,
+            loadOlder: nil,
+            loadNewest: nil
+        )
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        window.rootViewController = vc
+        window.makeKeyAndVisible()
+        await settle(window)
+        return (window, vc)
+    }
+
+    /// A draft that wraps must grow the bar, not scroll inside a one-line
+    /// field. The host sized the bar from the SwiftUI *ideal* size, measured at
+    /// an unconstrained width where any draft fits on one line, and the draft
+    /// changes inside the composer, so no `updateComposer` relayout ran either.
+    @Test
+    func aWrappingDraftGrowsTheComposerBar() async {
+        let draft = DraftModel()
+        let (window, vc) = await makeComposerHost(draft: draft)
+        defer { window.isHidden = true }
+        let oneLine = vc.composerContainer.bounds.height
+        #expect(oneLine > 30)
+
+        draft.text = String(repeating: "a wrapping draft ", count: 8)
+        await settle(window)
+
+        #expect(
+            vc.composerContainer.bounds.height > oneLine + 20,
+            "the bar must grow with the draft (was \(oneLine), now \(vc.composerContainer.bounds.height))"
+        )
+
+        draft.text = ""
+        await settle(window)
+        #expect(abs(vc.composerContainer.bounds.height - oneLine) < 1, "and shrink back when cleared")
+    }
 }
 #endif
