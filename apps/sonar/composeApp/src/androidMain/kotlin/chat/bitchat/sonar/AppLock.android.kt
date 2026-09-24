@@ -8,6 +8,11 @@ object ActivityBridge {
     /** Set by MainActivity: launches the confirm-device-credential flow,
      *  delivering the result to the callback. */
     @Volatile var requestUnlock: ((onResult: (Boolean) -> Unit) -> Unit)? = null
+
+    /** Set by MainActivity: shows the system prompt for one runtime
+     *  permission if it is not granted yet (no result delivered — callers
+     *  re-check on the user's next attempt). */
+    @Volatile var requestPermission: ((permission: String) -> Unit)? = null
 }
 
 actual object AppLock {

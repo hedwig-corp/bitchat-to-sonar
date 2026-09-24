@@ -52,4 +52,25 @@ struct SNComposerDraftPersistTests {
         let drafts = snUpdatedComposerDrafts(drafts: [:], chatId: "dm:a", text: "hi ")
         #expect(drafts["dm:a"] == "hi ")
     }
+
+    // QA-A19: typed while the chat was pending, lost when it reconciled.
+    @Test
+    func pendingChatDraftFollowsTheChatToItsRealId() {
+        let drafts = ["pending:x": "hello while pending", "dm:other": "keep"]
+        let moved = snMovedComposerEntry(drafts, from: "pending:x", to: "marmot:real")
+        #expect(moved == ["dm:other": "keep", "marmot:real": "hello while pending"])
+    }
+
+    @Test
+    func existingDraftOnTheRealIdWinsAndPendingKeyIsDropped() {
+        let drafts = ["pending:x": "older", "marmot:real": "newer"]
+        #expect(snMovedComposerEntry(drafts, from: "pending:x", to: "marmot:real") == ["marmot:real": "newer"])
+    }
+
+    @Test
+    func movingWithoutAPendingEntryIsANoOp() {
+        let drafts = ["dm:a": "hi"]
+        #expect(snMovedComposerEntry(drafts, from: "pending:x", to: "marmot:real") == drafts)
+        #expect(snMovedComposerEntry(drafts, from: "dm:a", to: "dm:a") == drafts)
+    }
 }

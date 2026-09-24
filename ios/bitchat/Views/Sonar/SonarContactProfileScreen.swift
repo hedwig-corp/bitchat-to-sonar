@@ -334,7 +334,7 @@ struct SonarContactProfileScreen: View {
                         SNSettingsRow(
                             icon: .lock, tone: .cyan,
                             label: "End-to-end encrypted",
-                            sub: "Messages are encrypted with the Signal protocol",
+                            sub: "Messages are end-to-end encrypted — MLS over the internet, Noise over Bluetooth",
                             trail: .none, divider: false
                         ) {}
                     }

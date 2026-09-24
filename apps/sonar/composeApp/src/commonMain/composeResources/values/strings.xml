@@ -5,6 +5,7 @@
     <string name="account_restored_chats_recovered_from">Account restored — chats recovered from backup</string>
     <string name="account_restored_chats_start_empty">Account restored — chats start empty until you back up</string>
     <string name="active">%1$s active</string>
+    <string name="add_to_your_message">Add to your message</string>
     <string name="adds_debug_detail_to_captured_logs">Adds debug detail to captured logs. Never includes your private key.</string>
     <string name="anyone_with_this_key_controls_your">Anyone with this key controls your account and wallet. Only restore from your own backup.</string>
     <string name="app_info_app_name">Sonar</string>
@@ -43,6 +44,7 @@
     <string name="are_you_sure_you_want_to_leave_this">Are you sure you want to leave this group? You won’t be able to read or send messages anymore.</string>
     <string name="audio_is_connected">Audio is connected</string>
     <string name="auto_backup">Auto-backup</string>
+    <string name="back">Back</string>
     <string name="backing_up_chats">Backing up chats…</string>
     <string name="backup_chats">Backup chats</string>
     <string name="backup_failed_try_again_when_online">Backup failed — try again when online</string>
@@ -53,6 +55,7 @@
     <string name="chat_backup_is_on_encrypted_backups">Chat backup is on — encrypted backups upload automatically. Manage in Settings.</string>
     <string name="chat_backup_uploaded">Chat backup uploaded</string>
     <string name="chat_copy">Copy</string>
+    <string name="chat_details">Chat details</string>
     <string name="chat_reply">Reply</string>
     <string name="chat_reply_cancel">Cancel reply</string>
     <string name="chat_reply_fallback">Message</string>
@@ -146,6 +149,7 @@
     <string name="decline">Decline</string>
     <string name="direct_messages_are_end_to_end">Direct messages are end-to-end encrypted. Always.</string>
     <string name="direct_sonar_and_unify_payments_will">Direct Sonar and Unify payments will appear here after you send or receive money.</string>
+    <string name="emoji_and_stickers">Emoji and stickers</string>
     <string name="encrypted_cloud_backup_recover_chats">Encrypted cloud backup — recover chats after reinstall</string>
     <string name="encrypted_cloud_backup_when_chats_change">Encrypted Marmot backup to Blossom — recovers chats after reinstall with your nsec</string>
     <string name="encryption_accessibility_establishing">establishing encryption</string>
@@ -271,6 +275,7 @@
     <string name="profile">Profile</string>
     <string name="reaches_anyone"> · reaches anyone</string>
     <string name="receive">Receive</string>
+    <string name="record_voice_message">Record voice message</string>
     <string name="recording">recording %1$s</string>
     <string name="relay_sync">Relay sync</string>
     <string name="remote_video_unavailable">Remote video unavailable</string>
@@ -297,6 +302,7 @@
     <string name="sonar_connects_phones_directly_no_phone">Sonar connects phones directly — no phone number, no account, no servers.</string>
     <string name="sonar_never_sends_this_key_anywhere_it">Sonar never sends this key anywhere — it’s decoded on this phone to unlock your identity.</string>
     <string name="speaks">Speaks %1$s</string>
+    <string name="start_a_chat">Start a chat</string>
     <string name="start_chatting">Start chatting</string>
     <string name="str_1">%1$s</string>
     <string name="str_2">* %1$s *</string>
@@ -326,6 +332,7 @@
     <string name="this_sends_a_leave_update_to_the_group">This sends a leave update to the group and removes the conversation from this device.</string>
     <string name="tip_store_it_in_a_password_manager">Tip: store it in a password manager. Sonar can’t recover it for you.</string>
     <string name="today">Today</string>
+    <string name="unread">Unread</string>
     <string name="user_domain">user@domain</string>
     <string name="username">Username</string>
     <string name="verbose_logs">Verbose logs</string>
@@ -342,6 +349,8 @@
     <string name="verified">Verified</string>
     <string name="verify_safety_numbers">Verify safety numbers</string>
     <string name="via">via %1$s</string>
+    <string name="video_call">Video call</string>
+    <string name="voice_call">Voice call</string>
     <string name="voice_notes_are_only_available_in_mesh">Voice notes are only available in mesh chats.</string>
     <string name="wallet_not_ready">Wallet not ready</string>
     <string name="works_without_internet">Works without internet</string>

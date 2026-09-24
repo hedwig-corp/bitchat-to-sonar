@@ -18,6 +18,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -26,7 +27,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -35,6 +40,8 @@ import chat.bitchat.sonar.GeoChannel
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarCore
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.search
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
@@ -42,6 +49,7 @@ import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.launch
+import org.jetbrains.compose.resources.stringResource
 
 /** Close Search before [startChat] pushes its pending/existing chat screen. */
 internal fun startSecureChatFromSearch(
@@ -75,17 +83,31 @@ fun SonarSearchScreen(state: SonarAppState) {
         if (ql.isEmpty()) out
         else out.filter { it.name.lowercase().contains(ql) || it.geohash.lowercase().contains(ql) }
     }
-    val chats: List<SonarChat> = remember(state.visibleChats, query) {
-        if (ql.isEmpty()) state.visibleChats else state.visibleChats.filter { it.name.lowercase().contains(ql) }
-    }
+    // Title + avatar seed come from the same cached row model as the home list
+    // (`marmotRow`, O(1)): the raw group name is blank for npub-only DMs, which
+    // painted an untitled row with a different avatar than Home (QA-A13/A14),
+    // and made the shown name unsearchable.
+    val chats: List<Pair<SonarChat, String>> = state.visibleChats
+        .map { it to state.marmotRow(it.id).title }
+        .let { titled ->
+            if (ql.isEmpty()) titled
+            else titled.filter { (chat, title) ->
+                title.lowercase().contains(ql) || chat.name.lowercase().contains(ql)
+            }
+        }
 
     // An invite link/token pasted (or shared) into search → request to join.
     // Matches the bare token, the sonar:// scheme, and the https universal link;
     // the core normalizes whichever form before sending the join request. Require
     // a hex payload so ordinary text mentioning "sinvite1" doesn't offer to join.
     val looksLikeInvite = chat.bitchat.sonar.INVITE_TOKEN_IN_TEXT.containsMatchIn(query)
-    val looksLikeNpub = !looksLikeInvite && ql.startsWith("npub1") && query.length > 8
+    // Offer "Start secure chat" only for a complete npub. Any `npub1` prefix
+    // used to raise the call-to-action mid-typing, and a 9-char prefix is also
+    // valid geohash alphabet, so "npub14mrp" offered to join channel
+    // "#npub14mrp" as well (QA-A18).
+    val looksLikeNpub = !looksLikeInvite && isCompleteNpub(query)
     val looksLikeGeohash = !looksLikeInvite && ql.isNotEmpty() && ql.length in 2..9 &&
+        !ql.startsWith("npub1") &&
         ql.all { it in "0123456789bcdefghjkmnpqrstuvwxyz" } &&
         channels.none { it.geohash == ql }
     // A typed nickname (`vincenzo`) or full handle (`alice@example.com`) can be
@@ -118,11 +140,18 @@ fun SonarSearchScreen(state: SonarAppState) {
                 Spacer(Modifier.width(9.dp))
                 Box(Modifier.weight(1f)) {
                     if (query.isEmpty()) Text("Search chats, channels, name, npub…", color = s.text3, fontSize = 15.sp)
+                    // Opening Search means "I want to type": focus the field like
+                    // iOS's search sheet does, and give it a spoken label — it was an
+                    // unfocused, anonymous edit box (QA-A21).
+                    val searchLabel = stringResource(Res.string.search)
+                    val focus = remember { FocusRequester() }
+                    LaunchedEffect(Unit) { focus.requestFocus() }
                     BasicTextField(
                         value = q, onValueChange = { q = it }, singleLine = true,
                         textStyle = TextStyle(color = s.text, fontSize = 15.sp),
                         cursorBrush = SolidColor(s.accent),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().focusRequester(focus)
+                            .semantics { contentDescription = searchLabel }
                     )
                 }
             }
@@ -190,16 +219,18 @@ fun SonarSearchScreen(state: SonarAppState) {
                 items(channels, key = { "ch:" + it.geohash + it.level.name }) { c ->
                     ResultRow(
                         avatar = { ChannelTile(c.geohash) },
-                        title = c.name, sub = c.level.label,
+                        // The mesh is not a place: labelling it with the
+                        // placeholder GeoLevel read "city" (QA-A8).
+                        title = c.name, sub = if (c.geohash == "mesh") "Nearby · Bluetooth" else c.level.label,
                     ) { state.openChannel(c.geohash) }
                 }
             }
             if (chats.isNotEmpty()) {
                 item { chat.bitchat.sonar.ui.SNSectionLabel("Messages") }
-                items(chats, key = { "dm:" + it.id }) { chat ->
+                items(chats, key = { "dm:" + it.first.id }) { (chat, title) ->
                     ResultRow(
-                        avatar = { SonarAvatar(chat.name, 44.dp, presence = false) },
-                        title = chat.name, sub = "Secure chat",
+                        avatar = { SonarAvatar(title, 44.dp, presence = false) },
+                        title = title, sub = "Secure chat",
                     ) { state.openChat(chat) }
                 }
             }
@@ -261,3 +292,9 @@ private fun ActionResult(icon: SNIconName, label: String, sub: String, net: Bool
         SNPrimaryButton(label, net = net) { onClick() }
     }
 }
+
+private val COMPLETE_NPUB = Regex("^npub1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58}$")
+
+/** A full bech32 npub (63 chars, bech32 alphabet). Checksum is left to the
+ *  core, which rejects a mistyped key when the chat starts. */
+internal fun isCompleteNpub(query: String): Boolean = COMPLETE_NPUB.matches(query.trim().lowercase())

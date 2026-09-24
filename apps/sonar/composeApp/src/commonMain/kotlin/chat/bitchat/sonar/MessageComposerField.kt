@@ -4,6 +4,8 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
@@ -36,9 +38,14 @@ internal fun MessageComposerTextField(
     textStyle: TextStyle,
     cursorBrush: Brush,
     modifier: Modifier = Modifier,
+    /** Spoken label (normally the visual placeholder, e.g. "Message Alice").
+     *  The placeholder is drawn beside the field, so without this TalkBack
+     *  announced an anonymous edit box (QA-A21). */
+    label: String? = null,
     onSend: (() -> Unit)? = null,
 ) {
     val enterSends = messageComposerEnterSends && onSend != null
+    val labelled = if (label != null) Modifier.semantics { contentDescription = label } else Modifier
     BasicTextField(
         value = value,
         onValueChange = onValueChange,
@@ -47,7 +54,7 @@ internal fun MessageComposerTextField(
         singleLine = false,
         maxLines = 5,
         keyboardOptions = messageComposerKeyboardOptions,
-        modifier = modifier.then(
+        modifier = modifier.then(labelled).then(
             if (enterSends) {
                 Modifier.onPreviewKeyEvent { event ->
                     val isEnter = event.key == Key.Enter || event.key == Key.NumPadEnter

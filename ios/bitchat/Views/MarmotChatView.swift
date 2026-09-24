@@ -4066,13 +4066,11 @@ final class MarmotChatModel: ObservableObject {
             createdAt: Date(),
             isMine: true,
             media: [
-                MarmotService.MarmotMedia(
+                MarmotService.MarmotMedia.localEcho(
                     url: localPreviewURL ?? "pending-media-\(UUID().uuidString)",
                     mimeType: mime,
                     filename: filename,
-                    width: nil,
-                    height: nil,
-                    durationMs: nil
+                    data: data
                 )
             ]
         )
@@ -4189,13 +4187,11 @@ final class MarmotChatModel: ObservableObject {
             createdAt: Date(),
             isMine: true,
             media: zip(items, localPreviewURLs).map { item, url in
-                MarmotService.MarmotMedia(
+                MarmotService.MarmotMedia.localEcho(
                     url: url,
                     mimeType: item.mime,
                     filename: item.filename,
-                    width: nil,
-                    height: nil,
-                    durationMs: nil
+                    data: item.data
                 )
             }
         )

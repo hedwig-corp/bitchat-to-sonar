@@ -59,7 +59,12 @@ actual class VoiceRecorder {
 
     actual suspend fun start(): Boolean {
         val ctx = AppContextHolder.ctx
-        if (ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return false
+        if (ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            // Ask in context (iOS does the same on first record); this hold
+            // still fails, the next one records once the user allows it.
+            ActivityBridge.requestPermission?.invoke(Manifest.permission.RECORD_AUDIO)
+            return false
+        }
         val file = File(ctx.cacheDir, "vn-${System.currentTimeMillis()}.m4a")
         @Suppress("DEPRECATION")
         val r = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(ctx) else MediaRecorder()

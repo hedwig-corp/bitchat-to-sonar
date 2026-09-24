@@ -95,6 +95,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLayoutResult
@@ -127,12 +128,25 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.add_to_your_message
+import chat.bitchat.sonar.resources.emoji_and_stickers
+import chat.bitchat.sonar.resources.nearby
+import chat.bitchat.sonar.resources.record_voice_message
+import chat.bitchat.sonar.resources.send
+import chat.bitchat.sonar.resources.settings
+import chat.bitchat.sonar.resources.start_a_chat
+import chat.bitchat.sonar.resources.unread
+import chat.bitchat.sonar.resources.video_call
+import chat.bitchat.sonar.resources.voice_call
 import chat.bitchat.sonar.resources.content_message_collapsed
 import chat.bitchat.sonar.resources.content_message_expanded
 import chat.bitchat.sonar.resources.content_message_show_less
@@ -276,6 +290,7 @@ object SonarLifecycle {
 @Composable
 fun App(
     onFirstLocalStateReady: () -> Unit = {},
+    onOnboarded: () -> Unit = {},
     stickerBenchmarkRequest: StickerBenchmarkRequest? = null,
 ) {
     val scope = rememberCoroutineScope()
@@ -337,6 +352,13 @@ fun App(
     LaunchedEffect(firstLocalStateReady) {
         if (firstLocalStateReady) onFirstLocalStateReady()
     }
+    // Hosts defer OS permission prompts until the account exists: firing them
+    // over the welcome screen asked for Bluetooth/location/mic before the user
+    // knew what Sonar was (QA-A1).
+    LaunchedEffect(state.onboarded) {
+        if (state.onboarded) onOnboarded()
+    }
+    SystemBarAppearance(dark = state.dark)
     SonarTheme(dark = state.dark) {
         val s = sonar
 
@@ -452,8 +474,11 @@ private fun HomeScreen(state: SonarAppState) {
                 Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                val settingsLabel = stringResource(Res.string.settings)
                 Box(
-                    Modifier.size(38.dp).clip(CircleShape).clickable { state.push(Screen.Settings) },
+                    Modifier.size(38.dp).clip(CircleShape)
+                        .semantics { contentDescription = settingsLabel; role = Role.Button }
+                        .clickable { state.push(Screen.Settings) },
                     contentAlignment = Alignment.Center
                 ) { SonarAvatar(state.nick.ifBlank { "you" }, 32.dp) }
                 Row(
@@ -476,7 +501,10 @@ private fun HomeScreen(state: SonarAppState) {
                         fontWeight = FontWeight.ExtraBold, letterSpacing = (-0.54).sp
                     )
                 }
-                SNIconButton(SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2) { state.push(Screen.Nearby) }
+                SNIconButton(
+                    SNIconName.Rings, size = 22.dp, weight = 2f, tint = s.text2,
+                    contentDescription = stringResource(Res.string.nearby),
+                ) { state.push(Screen.Nearby) }
             }
 
             // status chip — centered pill
@@ -626,8 +654,10 @@ private fun HomeScreen(state: SonarAppState) {
                 Text("Search", color = s.text3, fontSize = 15.sp)
             }
             // sn-compose → "Start a chat" sheet (1:1 with iOS SonarHomeScreen).
+            val startChatLabel = stringResource(Res.string.start_a_chat)
             Box(
                 Modifier.size(48.dp).clip(CircleShape).background(s.accentFill)
+                    .semantics { contentDescription = startChatLabel; role = Role.Button }
                     .clickable { composeSheet = true },
                 contentAlignment = Alignment.Center
             ) { SNIcon(SNIconName.Rings, 23.dp, s.onAccent, weight = 1.9f) }
@@ -818,7 +848,15 @@ internal fun ConvRow(
                 Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     if (!time.isNullOrEmpty()) Text(time, color = s.text3, fontSize = 12.sp)
                     if (muted) SNIcon(SNIconName.BellOff, 14.dp, s.text3, weight = 2f)
-                    else if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
+                    // Spoken as "Unread": a bare dot left screen-reader users no
+                    // way to tell which chats have news (QA-A29).
+                    else if (unread) {
+                        val unreadLabel = stringResource(Res.string.unread)
+                        Box(
+                            Modifier.size(11.dp).clip(CircleShape).background(s.accent)
+                                .semantics { contentDescription = unreadLabel }
+                        )
+                    }
                 }
             }
         }
@@ -1894,6 +1932,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     fun ChatBottomChrome() {
         val keyboardController = LocalSoftwareKeyboardController.current
         val focusManager = LocalFocusManager.current
+        // Icon-only composer controls need spoken labels (QA-A9).
+        val attachLabel = stringResource(Res.string.add_to_your_message)
+        val emojiLabel = stringResource(Res.string.emoji_and_stickers)
+        val voiceLabel = stringResource(Res.string.record_voice_message)
+        val sendLabel = stringResource(Res.string.send)
         // Phase-2 hosts bottomContent in a Box (overlay sibling). Multiple root
         // children would stack at top-start and overlap — tray tabs under the
         // composer, "Loading stickers…" frozen in the crushed remainder, IME
@@ -1956,9 +1999,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Spacer(Modifier.width(8.dp))
                     RecordingPill(recElapsed, recLevel, recDragX, Modifier.weight(1f))
                 } else {
-                    // bc-plusbtn: "Add to your message" sheet (bitcoin / location / verify / reactions)
+                    // bc-plusbtn: "Add to your message" sheet. Only actions that work are
+                    // listed — "coming soon" rows for location/reactions were dead ends
+                    // that iOS never showed (QA-A17).
                     Box(
-                        Modifier.size(36.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
+                        Modifier.size(36.dp).clip(CircleShape).background(s.surface2)
+                            .semantics { contentDescription = attachLabel; role = Role.Button }
+                            .clickable { addSheet = true },
                         contentAlignment = Alignment.Center
                     ) { SNIcon(SNIconName.Plus, 19.dp, s.text2, weight = 2.1f) }
                     Spacer(Modifier.width(8.dp))
@@ -1968,14 +2015,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                         contentAlignment = Alignment.CenterStart
                     ) {
+                        val composerPlaceholder = "Message $peerName" + (if (sendOverMesh) "" else " · via internet")
                         if (draft.isEmpty()) Text(
-                            "Message $peerName" + (if (sendOverMesh) "" else " · via internet"),
+                            composerPlaceholder,
                             color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                         )
                         MessageComposerTextField(
                             value = draft, onValueChange = { state.setComposerDraft(screen.id, it) },
                             textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                             cursorBrush = SolidColor(s.accent),
+                            label = composerPlaceholder,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .onFocusChanged { focusState ->
@@ -2007,6 +2056,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Spacer(Modifier.width(8.dp))
                     Box(
                         Modifier.size(34.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
+                            .semantics { contentDescription = emojiLabel; role = Role.Button }
                             .clickable {
                                 val opening = !emojiTray
                                 val usesSoftKeyboard = !messageComposerEnterSends
@@ -2037,6 +2087,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     val micFg = if (recording) (if (transport == "internet") s.onNet else s.onAccent) else s.text2
                     Box(
                         Modifier.size(34.dp).clip(CircleShape).background(micBg)
+                            .semantics { contentDescription = voiceLabel; role = Role.Button }
                             .pointerInput(screen.id) {
                                 // The pointer scope is @RestrictsSuspension, so the recorder
                                 // lifecycle runs in recScope: launch start() at down, join it on
@@ -2074,6 +2125,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     // indigo over internet when armed.
                     Box(
                         Modifier.size(34.dp).clip(CircleShape).background(sendBg)
+                            .semantics { contentDescription = sendLabel; role = Role.Button }
                             .clickable(enabled = sendEnabled) {
                                 val d = draft
                                 state.setComposerDraft(screen.id, "")
@@ -2151,10 +2203,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 // Sonar-only and use live BLE when available, otherwise White
                 // Noise signaling for that peer.
                 if (state.canCall(screen.id)) {
-                    SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
+                    SNIconButton(
+                        SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2,
+                        contentDescription = stringResource(Res.string.voice_call),
+                    ) {
                         state.placeCall(screen.id, peerName, video = false)
                     }
-                    SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
+                    SNIconButton(
+                        SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2,
+                        contentDescription = stringResource(Res.string.video_call),
+                    ) {
                         state.placeCall(screen.id, peerName, video = true)
                     }
                 }
@@ -2194,36 +2252,30 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             )
         }
 
-        if (feed.isEmpty()) {
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                chat.bitchat.sonar.ui.SNEmptyState(
-                    icon = SNIconName.Lock,
-                    title = "Say hi to $peerName",
-                    desc = if (isGroup) {
-                        "Messages here are end-to-end encrypted. Only group members can read them."
-                    } else {
-                        "Messages here are end-to-end encrypted. Only the two of you can read them."
-                    }
-                )
-            }
-            ChatBottomChrome()
-        } else if (phase2Host) {
-            // Phase 2: owned pad + IME overlay; Pin+Lockstep; top-align (not reverseLayout).
-            TranscriptPhase2HostScaffold(
-                listState = listState,
-                listKey = screen.id,
-                isPrepending = { isPrepending || unreadAnchorPending() },
-                suppressPin = { unreadAnchorPending() },
-                modifier = Modifier.weight(1f).fillMaxWidth(),
-                listContent = { bottomInset ->
-                    ChatFeedList(Modifier.fillMaxSize(), bottomInset)
-                },
-                bottomContent = { ChatBottomChrome() },
-            )
-        } else {
-            ChatFeedList(Modifier.weight(1f).fillMaxWidth(), 10.dp)
-            ChatBottomChrome()
-        }
+        // One composer slot for empty and non-empty feeds (QA-A10): see ChatTranscriptBody.
+        ChatTranscriptBody(
+            feedEmpty = feed.isEmpty(),
+            phase2Host = phase2Host,
+            listState = listState,
+            listKey = screen.id,
+            isPrepending = { isPrepending || unreadAnchorPending() },
+            suppressPin = { unreadAnchorPending() },
+            emptyState = { modifier ->
+                Box(modifier) {
+                    chat.bitchat.sonar.ui.SNEmptyState(
+                        icon = SNIconName.Lock,
+                        title = "Say hi to $peerName",
+                        desc = if (isGroup) {
+                            "Messages here are end-to-end encrypted. Only group members can read them."
+                        } else {
+                            "Messages here are end-to-end encrypted. Only the two of you can read them."
+                        }
+                    )
+                }
+            },
+            feedList = { modifier, bottomInset -> ChatFeedList(modifier, bottomInset) },
+            composer = { ChatBottomChrome() },
+        )
     }
     mediaViewer?.let { media ->
         MediaViewer(
@@ -2283,9 +2335,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     if (addSheet) AddToMessageSheet(
         peerName = peerName,
         onBitcoin = { addSheet = false; openPaySheetOrRetry() },
-        onLocation = { addSheet = false; state.toast = "Location sharing is coming soon." },
         onVerify = { addSheet = false; verifySheet = true },
-        onReactions = { addSheet = false; state.toast = "Reactions are coming soon." },
         onAddPeople = { addSheet = false; addPeopleSheet = true },
         onRemovePeople = { addSheet = false; removePeopleSheet = true },
         onClose = { addSheet = false },
@@ -2293,7 +2343,6 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         canSendFile = state.canPrepareMedia(screen.id),
         canSendPayment = state.hasDirectPaymentRoute(screen.id),
         canVerify = !state.isMultiMemberChat(screen.id),
-        canShareLocation = !state.isMultiMemberChat(screen.id),
         canManageGroup = canManageGroup,
         isGroup = isGroup,
         nudgeEnabled = state.canSendTrill(screen.id),
@@ -2337,9 +2386,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 private fun AddToMessageSheet(
     peerName: String,
     onBitcoin: () -> Unit,
-    onLocation: () -> Unit,
     onVerify: () -> Unit,
-    onReactions: () -> Unit,
     onAddPeople: () -> Unit,
     onRemovePeople: () -> Unit,
     onClose: () -> Unit,
@@ -2347,7 +2394,6 @@ private fun AddToMessageSheet(
     canSendFile: Boolean = false,
     canSendPayment: Boolean = true,
     canVerify: Boolean = true,
-    canShareLocation: Boolean = true,
     canManageGroup: Boolean = false,
     isGroup: Boolean = false,
     nudgeEnabled: Boolean = true,
@@ -2388,13 +2434,11 @@ private fun AddToMessageSheet(
                         if (nudgeEnabled) onNudge else ({}),
                     )
                 }
-                if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
                 if (canManageGroup) {
                     ActionRow(SNIconName.People, "Add people", "Invite local contacts or paste npubs", onAddPeople)
                     ActionRow(SNIconName.Trash, "Remove people", "Manage current group members", onRemovePeople)
                 }
                 if (canVerify) ActionRow(SNIconName.Shield, "Verify safety number", "Confirm this chat is secure", onVerify)
-                ActionRow(SNIconName.People, "Reactions", "A little fun, no noise", onReactions)
             }
         }
     }
@@ -2825,6 +2869,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
+                    label = "Message",
                     modifier = Modifier.fillMaxWidth(),
                     onSend = {
                         if (draft.isBlank()) return@MessageComposerTextField
@@ -4843,8 +4888,11 @@ private fun MediaSendPreview(
             horizontalArrangement = Arrangement.End,
             verticalAlignment = Alignment.CenterVertically
         ) {
+            val sendLabel = stringResource(Res.string.send)
             Row(
                 Modifier.height(52.dp).clip(RoundedCornerShape(999.dp)).background(s.accent)
+                    // Merge the count + arrow glyphs into one labelled button (QA-A9).
+                    .semantics(mergeDescendants = true) { contentDescription = sendLabel; role = Role.Button }
                     .clickable { onSend() }
                     .padding(horizontal = if (items.size > 1) 18.dp else 0.dp)
                     .widthIn(min = 52.dp),
@@ -4860,7 +4908,11 @@ private fun MediaSendPreview(
                         modifier = Modifier.padding(end = 6.dp)
                     )
                 }
-                Text("↑", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    "↑", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                    // Decorative glyph: the button is announced as "Send".
+                    modifier = Modifier.clearAndSetSemantics { },
+                )
             }
         }
     }
@@ -5264,7 +5316,7 @@ internal fun dayLabel(tsSecs: Long): String {
  * geohash levels coarsening outward. Returns the chosen channel's geohash.
  */
 @Composable
-private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
+internal fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
     val s = sonar
     if (items.isEmpty()) {
         chat.bitchat.sonar.ui.SNEmptyState(
@@ -5274,9 +5326,21 @@ private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
         )
         return
     }
-    val defaultIdx = items.indexOfFirst { it.count > 0 }.let { if (it >= 0) it else items.lastIndex }
-    var idx by remember(items.size) { mutableStateOf(defaultIdx) }
-    val sel = items[idx.coerceIn(0, items.lastIndex)]
+    // Follow the data (the most precise tier with someone there) until the user
+    // picks a tier. A one-shot default latched whichever tier's presence arrived
+    // first — the card kept naming "United States · region" after the city
+    // lit up, with that region chip scrolled out of sight (QA-A16).
+    var picked by remember(items.size) { mutableStateOf<Int?>(null) }
+    val idx = (picked ?: hereCardDefaultIndex(items)).coerceIn(0, items.lastIndex)
+    val sel = items[idx]
+    val tickScroll = rememberScrollState()
+    val tickOffsets = remember(items.size) { IntArray(items.size) }
+    LaunchedEffect(idx, items.size) {
+        // Keep the selected tick on screen: the card must never name a tier
+        // whose tick the user cannot see. One frame so the ticks are measured.
+        withFrameNanos { }
+        tickScroll.animateScrollTo((tickOffsets.getOrElse(idx) { 0 } - 24).coerceAtLeast(0))
+    }
     val cardShape = RoundedCornerShape(20.dp)
     // here-card: surface card, radius 20, hairline inset ring, margin 2/14/6.
     Column(
@@ -5309,7 +5373,7 @@ private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
         // here-scale: pill ticks — surface2/text2, selected accent-soft/accent-deep,
         // 6dp green live dot when someone's there.
         Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+            Modifier.fillMaxWidth().horizontalScroll(tickScroll)
                 .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
@@ -5317,9 +5381,11 @@ private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
             items.forEachIndexed { i, ch ->
                 val on = i == idx
                 Row(
-                    Modifier.clip(RoundedCornerShape(999.dp))
+                    Modifier
+                        .onGloballyPositioned { tickOffsets[i] = it.positionInParent().x.toInt() }
+                        .clip(RoundedCornerShape(999.dp))
                         .background(if (on) s.accentSoft else s.surface2)
-                        .clickable { idx = i }
+                        .clickable { picked = i }
                         .padding(horizontal = 11.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(5.dp)
@@ -5334,6 +5400,11 @@ private fun HereCard(items: List<HereItem>, onEnter: (String) -> Unit) {
         }
     }
 }
+
+/** Default "Around you" tier: the first (most precise) with someone there,
+ *  else the coarsest. */
+internal fun hereCardDefaultIndex(items: List<HereItem>): Int =
+    items.indexOfFirst { it.count > 0 }.let { if (it >= 0) it else items.lastIndex }
 
 /** One precision tick on the "Around you" ladder (data.js `here[]`). */
 data class HereItem(val geohash: String, val name: String, val tier: String, val short: String, val count: Int)

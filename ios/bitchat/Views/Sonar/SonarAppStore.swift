@@ -1524,6 +1524,17 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    /// Keep what the user is typing (and replying to) when a pending chat
+    /// reconciles to its real route (QA-A19). Runs before the route swap so
+    /// the real screen reads the draft on its first frame.
+    private func moveComposerState(from pendingId: String, to realId: String) {
+        composerDrafts = snMovedComposerEntry(composerDrafts, from: pendingId, to: realId)
+        let flags = snMovedComposerEntry(composerDraftHasText, from: pendingId, to: realId)
+        if flags != composerDraftHasText { composerDraftHasText = flags }
+        let replies = snMovedComposerEntry(composerReplyByChat, from: pendingId, to: realId)
+        if replies != composerReplyByChat { composerReplyByChat = replies }
+    }
+
     func setComposerDraft(_ text: String, for chatId: String) {
         let nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
         if nextFlags != composerDraftHasText { composerDraftHasText = nextFlags }
@@ -6890,6 +6901,7 @@ final class SonarAppStore: ObservableObject {
         }
         pendingMarmotChats[pendingId] = nil
         let realId = Self.marmotIDPrefix + groupId
+        moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
         if currentDMId == pendingId {
             path.removeLast()
@@ -7009,6 +7021,7 @@ final class SonarAppStore: ObservableObject {
         }
         pendingMarmotGroups[pendingId] = nil
         let realId = Self.marmotIDPrefix + groupId
+        moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
         if currentDMId == pendingId {
             path.removeLast()

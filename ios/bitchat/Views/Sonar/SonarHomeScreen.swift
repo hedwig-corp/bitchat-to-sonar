@@ -775,8 +775,11 @@ struct SNSearchSheetContent: View {
         trimmedQuery.lowercased()
     }
 
+    /// Only a complete npub raises "Start secure chat": any `npub1` prefix
+    /// used to offer it mid-typing, and tapping it on a partial key could
+    /// only fail (QA-A18).
     private var canStartSecureChat: Bool {
-        trimmedQuery.hasPrefix("npub1")
+        MarmotService.isCompleteNpub(trimmedQuery)
     }
 
     /// Show a "start chat by handle" action for plausible handle input (never

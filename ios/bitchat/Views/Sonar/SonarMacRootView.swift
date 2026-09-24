@@ -2006,8 +2006,9 @@ private struct MacCommandPalette: View {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Complete npubs only (QA-A18) — same gate as the mobile search sheet.
     private var canStartSecureChatFromQuery: Bool {
-        trimmedQuery.hasPrefix("npub1")
+        MarmotService.isCompleteNpub(trimmedQuery)
     }
 
     /// Handle action mirror of the mobile search sheet: string gate only —

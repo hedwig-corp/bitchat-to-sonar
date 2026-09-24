@@ -74,6 +74,13 @@ import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.withContext
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.chat_details
+import chat.bitchat.sonar.resources.search
+import chat.bitchat.sonar.resources.settings
+import chat.bitchat.sonar.resources.video_call
+import chat.bitchat.sonar.resources.voice_call
+import org.jetbrains.compose.resources.stringResource
 
 /**
  * Desktop application root: theme + boot + onboarding gating around
@@ -167,7 +174,7 @@ fun SonarDesktopRoot(state: SonarAppState) {
                             SonarScreenHost(state)
                             if (hasDetail) {
                                 Box(Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 12.dp)) {
-                                    SNIconButton(SNIconName.Info, size = 16.dp, tint = s.text2) {
+                                    SNIconButton(SNIconName.Info, size = 16.dp, tint = s.text2, contentDescription = stringResource(Res.string.chat_details)) {
                                         detailRailOpen = !detailRailOpen
                                     }
                                 }
@@ -248,7 +255,7 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
             Spacer(Modifier.width(8.dp))
             Text("sonar", color = s.text, fontSize = 19.sp, fontWeight = FontWeight.Black)
             Spacer(Modifier.weight(1f))
-            SNIconButton(SNIconName.Search, size = 18.dp, weight = 2f, tint = s.text2) {
+            SNIconButton(SNIconName.Search, size = 18.dp, weight = 2f, tint = s.text2, contentDescription = stringResource(Res.string.search)) {
                 state.select { push(Screen.Search) }
             }
         }
@@ -386,7 +393,9 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
                     style = chat.bitchat.sonar.ui.SonarType.mono(10.5)
                 )
             }
-            SNIconButton(SNIconName.Chevron, size = 18.dp, tint = s.text2) { state.select { push(Screen.Settings) } }
+            SNIconButton(SNIconName.Chevron, size = 18.dp, tint = s.text2, contentDescription = stringResource(Res.string.settings)) {
+                state.select { push(Screen.Settings) }
+            }
         }
     }
 }
@@ -613,10 +622,10 @@ private fun DmDetailRail(state: SonarAppState, scr: Screen.Chat) {
         // screen, failed, toasted and popped.
         if (state.canCall(scr.id)) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)) {
-                SNIconButton(SNIconName.Phone, size = 18.dp, tint = s.text2) {
+                SNIconButton(SNIconName.Phone, size = 18.dp, tint = s.text2, contentDescription = stringResource(Res.string.voice_call)) {
                     state.placeCall(scr.id, scr.name, video = false)
                 }
-                SNIconButton(SNIconName.Videocam, size = 18.dp, tint = s.text2) {
+                SNIconButton(SNIconName.Videocam, size = 18.dp, tint = s.text2, contentDescription = stringResource(Res.string.video_call)) {
                     state.placeCall(scr.id, scr.name, video = true)
                 }
             }

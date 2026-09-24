@@ -33,4 +33,27 @@ class ComposerDraftsTest {
             composerDraftKeyForGeoDm("u4pruy", "abc"),
         )
     }
+
+    @Test
+    fun pendingChatDraftFollowsTheChatToItsRealId() {
+        // QA-A19: typed while the chat was pending, lost when it reconciled.
+        val drafts = mapOf("pending:x" to "hello while pending", "dm:other" to "keep")
+        assertEquals(
+            mapOf("dm:other" to "keep", "group-real" to "hello while pending"),
+            movedComposerEntry(drafts, "pending:x", "group-real"),
+        )
+    }
+
+    @Test
+    fun existingDraftOnTheRealIdWinsAndPendingKeyIsDropped() {
+        val drafts = mapOf("pending:x" to "older", "group-real" to "newer")
+        assertEquals(mapOf("group-real" to "newer"), movedComposerEntry(drafts, "pending:x", "group-real"))
+    }
+
+    @Test
+    fun movingWithoutAPendingEntryIsANoOp() {
+        val drafts = mapOf("dm:a" to "hi")
+        assertEquals(drafts, movedComposerEntry(drafts, "pending:x", "group-real"))
+        assertEquals(drafts, movedComposerEntry(drafts, "dm:a", "dm:a"))
+    }
 }

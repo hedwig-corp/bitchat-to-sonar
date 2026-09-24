@@ -306,9 +306,12 @@ struct SNConvRow<Avatar: View, Sub: View>: View {
                         SNIcon(name: .bellOff, size: 14, weight: 2)
                             .foregroundColor(SonarTheme.text3)
                     } else if unread {
+                        // Spoken as "Unread" — the bare dot was invisible to
+                        // VoiceOver (QA-A29).
                         Circle()
                             .fill(SonarTheme.accent)
                             .frame(width: 11, height: 11)
+                            .accessibilityLabel(Text("Unread"))
                     }
                 }
             }
@@ -4168,11 +4171,17 @@ private func snLogGifReload(skipped: Bool) {
 struct SNHereCard: View {
     let channels: [SNChannelItem]
     let onEnter: (SNChannelItem) -> Void
-    @State private var idx: Int = 0
+    /// The user's explicit tier pick. Until they pick, the card follows the
+    /// data (most precise tier with someone there): a one-shot default latched
+    /// whichever tier's presence arrived first, and the card kept naming that
+    /// tier with its tick scrolled out of sight (QA-A16).
+    @State private var picked: Int? = nil
 
     private var defaultIdx: Int {
         channels.firstIndex(where: { $0.count > 0 }) ?? max(0, channels.count - 1)
     }
+
+    private var idx: Int { min(picked ?? defaultIdx, max(0, channels.count - 1)) }
 
     var body: some View {
         if channels.isEmpty {
@@ -4201,28 +4210,36 @@ struct SNHereCard: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(SNScaleStyle(scale: 0.99))
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(Array(channels.enumerated()), id: \.element.id) { i, ch in
-                            Button { idx = i } label: {
-                                HStack(spacing: 4) {
-                                    Text(verbatim: ch.tier.isEmpty ? ch.name : ch.tier)
-                                        .font(SonarTheme.uiFont(size: 12.5, weight: i == idx ? .semibold : .regular))
-                                        .foregroundColor(i == idx ? SonarTheme.text : SonarTheme.text3)
-                                    if ch.count > 0 {
-                                        Circle().fill(SonarTheme.green).frame(width: 5, height: 5)
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(Array(channels.enumerated()), id: \.element.id) { i, ch in
+                                Button { picked = i } label: {
+                                    HStack(spacing: 4) {
+                                        Text(verbatim: ch.tier.isEmpty ? ch.name : ch.tier)
+                                            .font(SonarTheme.uiFont(size: 12.5, weight: i == idx ? .semibold : .regular))
+                                            .foregroundColor(i == idx ? SonarTheme.text : SonarTheme.text3)
+                                        if ch.count > 0 {
+                                            Circle().fill(SonarTheme.green).frame(width: 5, height: 5)
+                                        }
                                     }
+                                    .padding(.horizontal, 11).padding(.vertical, 6)
+                                    .background(Capsule().fill(i == idx ? SonarTheme.surface2 : Color.clear))
                                 }
-                                .padding(.horizontal, 11).padding(.vertical, 6)
-                                .background(Capsule().fill(i == idx ? SonarTheme.surface2 : Color.clear))
+                                .buttonStyle(.plain)
+                                .id(i)
                             }
-                            .buttonStyle(.plain)
                         }
+                        .padding(.horizontal, 14).padding(.bottom, 6)
                     }
-                    .padding(.horizontal, 14).padding(.bottom, 6)
+                    // Never name a tier whose tick is off screen.
+                    .onAppear { proxy.scrollTo(idx, anchor: .center) }
+                    .onChange(of: idx) { newIdx in
+                        withAnimation { proxy.scrollTo(newIdx, anchor: .center) }
+                    }
                 }
             }
-            .onAppear { idx = defaultIdx }
+            .onChange(of: channels.count) { _ in picked = nil }
         }
     }
 }
@@ -4394,6 +4411,19 @@ func snUpdatedComposerDrafts(
     } else {
         next[chatId] = text
     }
+    return next
+}
+
+/// Carry one chat's composer entry (draft text, has-text flag, pending reply)
+/// across an id swap — a pending conversation reconciling to its real
+/// White Noise/Marmot route while the user is typing. Without it the draft
+/// typed during setup vanished when the route swapped (QA-A19). An entry
+/// already under `to` wins; the pending key is always dropped.
+func snMovedComposerEntry<V>(_ entries: [String: V], from: String, to: String) -> [String: V] {
+    guard from != to, let moving = entries[from] else { return entries }
+    var next = entries
+    next.removeValue(forKey: from)
+    if next[to] == nil { next[to] = moving }
     return next
 }
 

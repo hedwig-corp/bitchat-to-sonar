@@ -1,6 +1,33 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Unread" : {
+
+    },
+    "Chat details" : {
+
+    },
+    "Start a chat" : {
+
+    },
+    "Video call" : {
+
+    },
+    "Voice call" : {
+
+    },
+    "Add to your message" : {
+
+    },
+    "Back" : {
+
+    },
+    "Emoji and stickers" : {
+
+    },
+    "Record voice message" : {
+
+    },
     "Restoring..." : {
 
     },

@@ -118,7 +118,7 @@ struct SonarSettingsScreen: View {
                             }
                         }
                         if walletKeyConfigured {
-                            // Show balance in fiat (default) or bitcoin (sats).
+                            // Show balance in bitcoin (sats, the default) or fiat.
                             SNSettingsRow(
                                 icon: .coin, tone: .gold, label: "Show balance in",
                                 value: store.displayMode == "fiat" ? "Money" : "Bitcoin",

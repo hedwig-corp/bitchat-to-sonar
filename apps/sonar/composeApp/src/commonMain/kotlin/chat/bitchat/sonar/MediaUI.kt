@@ -95,6 +95,24 @@ expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?
 expect fun decodeImageBounds(bytes: ByteArray): Pair<Int, Int>?
 
 /**
+ * Build a [SonarMedia] for bytes we hold locally, deriving image dimensions
+ * from the bytes.
+ *
+ * Marmot media carries width/height as MIP-04 metadata, so its bubbles
+ * reserve their final box before decode (Signal pre-sizing) and the
+ * transcript never reflows. Mesh media has no metadata, and a Marmot
+ * upload's pending echo has none until the canonical row lands, so without
+ * this the bubble reserves the max box and visibly shrinks or grows — and
+ * shifts everything below it — once the real dimensions arrive (QA-A11).
+ * The header read is cheap (no pixel buffer) and happens once, off the
+ * render path, while we still hold the bytes.
+ */
+internal fun localMediaFor(url: String, mime: String, filename: String, bytes: ByteArray): SonarMedia {
+    val bounds = if (mime.startsWith("image/")) decodeImageBounds(bytes) else null
+    return SonarMedia(url, mime, filename, bounds?.first, bounds?.second, null)
+}
+
+/**
  * Extract a poster frame from a local video file for the pre-send preview
  * (null when the platform has no video decoder — callers show a generic video
  * tile instead). Runs a media decode: call from a background dispatcher only.
