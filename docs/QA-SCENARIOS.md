@@ -113,8 +113,17 @@ is the build under test on a dedicated QA emulator/simulator.
   no duplicate upload-progress rows (iOS #615).
 
 ### QA-012 — Video send strips location
-- **Platforms:** iOS (manual, #615)
-- **Expect:** the sent MP4 carries no location metadata.
+- **Platforms:** both (manual on device; guards below)
+- **Steps:** pick a video recorded with location on (fixtures:
+  `apps/sonar/composeApp/src/jvmTest/resources/video/located.{mov,mp4}`,
+  push them into the gallery), send it, and fetch it back with
+  `sonar-cli fetch` on a peer.
+- **Expect:** the received file carries no location (`udta`/`meta`/XMP) yet
+  plays; an MP4/MOV that cannot be verified, or a WebM/MKV/AVI picked as a
+  video, is refused (use *Send file*), never sent as-is.
+- **Guard:** iOS `VideoLocationStripTests` (incl. `unreadableMetadataFailsClosed`);
+  Compose `VideoPrivacyTest`, `VideoPrivacyFixtureTest`
+- **Origin:** #615 (iOS) and its review (Compose parity, fail-closed)
 
 ## Notifications and lifecycle
 
