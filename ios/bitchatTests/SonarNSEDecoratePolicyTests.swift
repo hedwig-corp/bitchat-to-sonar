@@ -473,4 +473,29 @@ struct SonarNSEDecoratePolicyTests {
         // Unicode full-width hex must not classify (core rejects it too).
         #expect(!SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|\u{FF41}\u{FF42}c"))
     }
+
+    /// `NotificationDelegate.willPresent` routes through this: an undecorated
+    /// "Open Sonar to read it." placeholder names no chat, so in the foreground
+    /// it bannered on top of the very chat it was for. Titled copy still shows.
+    @Test("foreground drops undecorated placeholders, keeps titled NSE copy")
+    func foregroundPresentationDropsOnlyUndecoratedPlaceholders() {
+        let placeholderKey = SonarNSEDecoratePolicy.nsePlaceholderUserInfoKey
+        let decoratedKey = SonarNSEDecoratePolicy.nseDecoratedUserInfoKey
+        func suppresses(_ userInfo: [AnyHashable: Any]) -> Bool {
+            SonarNSEDecoratePolicy.suppressesForegroundPresentation(userInfo: userInfo)
+        }
+        let placeholder: [AnyHashable: Any] = [placeholderKey: true]
+        let bridgedPlaceholder: [AnyHashable: Any] = [placeholderKey: NSNumber(value: true)]
+        let decoratedOverPlaceholder: [AnyHashable: Any] = [placeholderKey: true, decoratedKey: true]
+        let decorated: [AnyHashable: Any] = [decoratedKey: true]
+        let plainAPNs: [AnyHashable: Any] = ["aps": ["alert": "x"]]
+        let clearedFlag: [AnyHashable: Any] = [placeholderKey: false]
+
+        #expect(suppresses(placeholder) == true)
+        #expect(suppresses(bridgedPlaceholder) == true)
+        #expect(suppresses(decoratedOverPlaceholder) == false)
+        #expect(suppresses(decorated) == false)
+        #expect(suppresses(plainAPNs) == false)
+        #expect(suppresses(clearedFlag) == false)
+    }
 }
