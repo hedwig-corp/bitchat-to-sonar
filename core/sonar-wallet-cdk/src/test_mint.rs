@@ -18,10 +18,11 @@ use cdk::nuts::nut05::MeltMethodSettings;
 use cdk::nuts::nut29::{BatchCheckMintQuoteRequest, BatchMintRequest};
 use cdk::nuts::{
     BlindSignature, BlindedMessage, CheckStateRequest, CheckStateResponse, CurrencyUnit, Id,
-    KeySet, KeySetInfo, Keys, KeysetResponse, MeltQuoteBolt11Response, MeltQuoteState, MeltRequest,
-    MintInfo, MintQuoteBolt11Response, MintQuoteBolt12Response, MintQuoteState, MintRequest,
-    MintResponse, NUT04Settings, NUT05Settings, Nuts, PaymentMethod, ProofState, PublicKey,
-    RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest, SwapResponse,
+    KeySet, KeySetInfo, Keys, KeysetResponse, MeltQuoteBolt11Response, MeltQuoteBolt12Response,
+    MeltQuoteState, MeltRequest, MintInfo, MintQuoteBolt11Response, MintQuoteBolt12Response,
+    MintQuoteState, MintRequest, MintResponse, NUT04Settings, NUT05Settings, Nuts, PaymentMethod,
+    ProofState, PublicKey, RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest,
+    SwapResponse,
 };
 use cdk::wallet::{AuthWallet, MintConnector};
 use cdk::{Amount, Error, MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse};
@@ -300,6 +301,8 @@ impl FakeMint {
                     pubkey: q.pubkey.expect("bolt12 quotes carry a pubkey"),
                     amount_paid: Amount::from(q.amount_paid),
                     amount_issued: Amount::from(q.amount_issued),
+                    method: q.method.clone(),
+                    updated_at: now(),
                 })
             }
             _ => {
@@ -319,25 +322,48 @@ impl FakeMint {
                     state,
                     expiry: q.expiry,
                     pubkey: q.pubkey,
+                    method: q.method.clone(),
+                    amount_paid: Amount::from(q.amount_paid),
+                    amount_issued: Amount::from(q.amount_issued),
+                    updated_at: now(),
                 })
             }
         })
     }
 
-    fn melt_response(&self, id: &str) -> Result<MeltQuoteBolt11Response<String>, Error> {
+    /// The melt quote as the mint reports it: a BOLT12 quote answers with
+    /// the BOLT12 response type (CDK 0.18 types them separately).
+    fn melt_response(&self, id: &str) -> Result<MeltQuoteResponse<String>, Error> {
         let q = self
             .with(|s| s.melt_quotes.get(id).cloned())
             .ok_or(Error::UnknownQuote)?;
-        Ok(MeltQuoteBolt11Response {
-            quote: id.to_string(),
-            amount: Amount::from(q.amount),
-            fee_reserve: Amount::from(q.fee_reserve),
-            state: q.state,
-            expiry: now() + 3_600,
-            payment_preimage: q.preimage.clone(),
-            change: None,
-            request: Some(q.request.clone()),
-            unit: Some(CurrencyUnit::Sat),
+        Ok(match &q.method {
+            PaymentMethod::Known(KnownMethod::Bolt12) => {
+                MeltQuoteResponse::Bolt12(MeltQuoteBolt12Response {
+                    quote: id.to_string(),
+                    amount: Amount::from(q.amount),
+                    fee_reserve: Amount::from(q.fee_reserve),
+                    state: q.state,
+                    expiry: now() + 3_600,
+                    payment_preimage: q.preimage.clone(),
+                    change: None,
+                    request: Some(q.request.clone()),
+                    unit: Some(CurrencyUnit::Sat),
+                    method: q.method.clone(),
+                })
+            }
+            _ => MeltQuoteResponse::Bolt11(MeltQuoteBolt11Response {
+                quote: id.to_string(),
+                amount: Amount::from(q.amount),
+                fee_reserve: Amount::from(q.fee_reserve),
+                state: q.state,
+                expiry: now() + 3_600,
+                payment_preimage: q.preimage.clone(),
+                change: None,
+                request: Some(q.request.clone()),
+                unit: Some(CurrencyUnit::Sat),
+                method: q.method.clone(),
+            }),
         })
     }
 
@@ -356,6 +382,7 @@ impl FakeMint {
                 MintMethodSettings {
                     method,
                     unit: CurrencyUnit::Sat,
+                    method_name: None,
                     min_amount,
                     max_amount,
                     options: None,
@@ -369,6 +396,7 @@ impl FakeMint {
                 MeltMethodSettings {
                     method,
                     unit: CurrencyUnit::Sat,
+                    method_name: None,
                     min_amount,
                     max_amount,
                     options: None,
@@ -584,10 +612,10 @@ impl MintConnector for FakeMint {
                 },
             );
         });
-        let response = self.melt_response(&id)?;
-        Ok(match method {
-            PaymentMethod::Known(KnownMethod::Bolt12) => MeltQuoteCreateResponse::Bolt12(response),
-            _ => MeltQuoteCreateResponse::Bolt11(response),
+        Ok(match self.melt_response(&id)? {
+            MeltQuoteResponse::Bolt12(response) => MeltQuoteCreateResponse::Bolt12(response),
+            MeltQuoteResponse::Bolt11(response) => MeltQuoteCreateResponse::Bolt11(response),
+            _ => unreachable!("the fake mint only quotes bolt11 and bolt12"),
         })
     }
 
@@ -606,14 +634,7 @@ impl MintConnector for FakeMint {
         quote_id: &str,
     ) -> Result<MeltQuoteResponse<String>, Error> {
         self.enter("get_melt_quote_status").await?;
-        let method = self
-            .with(|s| s.melt_quotes.get(quote_id).map(|q| q.method.clone()))
-            .ok_or(Error::UnknownQuote)?;
-        let response = self.melt_response(quote_id)?;
-        Ok(match method {
-            PaymentMethod::Known(KnownMethod::Bolt12) => MeltQuoteResponse::Bolt12(response),
-            _ => MeltQuoteResponse::Bolt11(response),
-        })
+        self.melt_response(quote_id)
     }
 
     async fn post_melt(
@@ -650,17 +671,13 @@ impl MintConnector for FakeMint {
             }
             Some(q.method.clone())
         });
-        let method = method.ok_or(Error::UnknownQuote)?;
+        method.ok_or(Error::UnknownQuote)?;
         match outcome {
             MeltOutcome::Failed => return Err(Error::PaymentFailed),
             MeltOutcome::Refused => return Err(Error::RequestAlreadyPaid),
             _ => {}
         }
-        let response = self.melt_response(&quote_id)?;
-        Ok(match method {
-            PaymentMethod::Known(KnownMethod::Bolt12) => MeltQuoteResponse::Bolt12(response),
-            _ => MeltQuoteResponse::Bolt11(response),
-        })
+        self.melt_response(&quote_id)
     }
 
     async fn post_swap(&self, request: SwapRequest) -> Result<SwapResponse, Error> {

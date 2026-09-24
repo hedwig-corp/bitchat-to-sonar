@@ -34,7 +34,7 @@ apps (Swift / Kotlin)              wallet facade, balance cache, offer publicati
         │ UniFFI (blocking calls; never on the UI thread)
 core/sonar-ffi   wallet.rs         SonarCashuWallet, CashuWalletListener,
                                    WalletFfiError, fetch_fiat_rates()
-core/sonar-wallet-cdk              CdkWallet: the WalletBackend over CDK 0.17.3
+core/sonar-wallet-cdk              CdkWallet: the WalletBackend over CDK 0.18.1
                                    (cdk + cdk-redb; no sqlite, so a normal
                                    workspace member)
 core/sonar-wallet                  WalletBackend trait, seeds, destination

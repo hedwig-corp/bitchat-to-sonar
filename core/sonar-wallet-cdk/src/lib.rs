@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::KnownMethod;
 use cdk::nuts::{CurrencyUnit, MeltOptions, MeltQuoteState, MintQuoteState, PaymentMethod};
-use cdk::wallet::types::{MeltSagaState, TransactionId, WalletSagaState};
+use cdk::wallet::types::{MeltSagaState, TransactionId, TransactionStatus, WalletSagaState};
 use cdk::wallet::{MintConnector, Wallet, WalletBuilder};
 use cdk::Amount;
 use sonar_wallet::{
@@ -1811,14 +1811,31 @@ impl WalletBackend for CdkWallet {
                 .map(|tx| {
                     let incoming =
                         tx.direction == cdk::wallet::types::TransactionDirection::Incoming;
-                    let status = match tx.quote_id.as_ref().and_then(|q| melt_states.get(q)) {
-                        Some(MeltQuoteState::Paid) => PaymentStatus::Complete,
-                        Some(MeltQuoteState::Failed) => PaymentStatus::Failed,
-                        Some(_) => PaymentStatus::Pending,
-                        // Untracked: settled (incoming rows only exist once
-                        // their proofs are minted).
-                        None => PaymentStatus::Complete,
+                    // CDK 0.18 records a saga's transaction up front and
+                    // marks it Failed when the operation is rolled back (a
+                    // melt the mint refused or saga recovery compensated).
+                    // That row must read Failed, never "Pending" from the
+                    // quote's leftover Unpaid state.
+                    let status = match tx.status {
+                        TransactionStatus::Failed => PaymentStatus::Failed,
+                        TransactionStatus::Pending => PaymentStatus::Pending,
+                        TransactionStatus::Completed => {
+                            match tx.quote_id.as_ref().and_then(|q| melt_states.get(q)) {
+                                Some(MeltQuoteState::Paid) => PaymentStatus::Complete,
+                                Some(MeltQuoteState::Failed) => PaymentStatus::Failed,
+                                Some(_) => PaymentStatus::Pending,
+                                // Untracked: settled (incoming rows only exist
+                                // once their proofs are minted).
+                                None => PaymentStatus::Complete,
+                            }
+                        }
                     };
+                    // The proof-derived id, as live events compute it
+                    // (`TransactionId::from_proofs` on the minted proofs).
+                    // CDK 0.18's `tx.id()` switched saga-managed rows to the
+                    // saga id; using it here would give one payment two ids
+                    // and make hosts insert a duplicate row after a restart.
+                    let proof_id = TransactionId::new(tx.ys.clone());
                     // Live returns and events identify a payment by its
                     // mint/melt QUOTE id (qualified per payment for a reusable
                     // BOLT12 offer); reconstructing history any other way
@@ -1830,10 +1847,10 @@ impl WalletBackend for CdkWallet {
                             tx.payment_method
                                 .as_ref()
                                 .unwrap_or(&PaymentMethod::Known(KnownMethod::Bolt11)),
-                            Some(tx.id()),
+                            Some(proof_id),
                         ),
                         (Some(quote_id), false) => quote_id.clone(),
-                        (None, _) => tx.id().to_string(),
+                        (None, _) => proof_id.to_string(),
                     };
                     Payment {
                         id,
@@ -1997,7 +2014,9 @@ mod tests {
         mint.pay(&payment_id, 210);
         w.sync_wallet().unwrap();
 
-        assert!(eventually(|| recorder.received_ids() == vec![payment_id.clone()]));
+        assert!(eventually(
+            || recorder.received_ids() == vec![payment_id.clone()]
+        ));
         let history: Vec<String> = w
             .list_recent_payments(10)
             .unwrap()
@@ -2692,7 +2711,7 @@ mod tests {
     /// melt left no history (refused and rolled back), and a late Paid must
     /// read as Complete with its preimage.
     #[test]
-    fn outgoing_outcome_resolves_ids_history_does_not_show() {
+    fn a_refused_melt_is_failed_in_history_and_lookup() {
         let dir = scratch("outgoing-outcome");
         let (w, mint) = fake_wallet(&dir);
         w.connect().unwrap();
@@ -2705,12 +2724,23 @@ mod tests {
                 "",
             )
             .unwrap();
-        assert!(
-            !w.list_recent_payments(50)
-                .unwrap()
-                .iter()
-                .any(|p| p.id == refused.id),
-            "a rolled-back melt leaves no history row"
+        // CDK 0.18 keeps the rolled-back melt in history (0.17 dropped it).
+        // It must never read as in flight: history says Failed, and the
+        // lookup a host uses for a stuck row says Failed too.
+        let history = w.list_recent_payments(50).unwrap();
+        let row = history
+            .iter()
+            .find(|p| p.id == refused.id)
+            .expect("CDK 0.18 records the rolled-back melt");
+        assert_eq!(
+            row.status,
+            PaymentStatus::Failed,
+            "a rolled-back melt is Failed"
+        );
+        assert_eq!(
+            w.balance().unwrap().confirmed_sats,
+            1_000,
+            "nothing left the wallet"
         );
         let outcome = w.outgoing_payment_outcome(&refused.id).unwrap().unwrap();
         assert_eq!(outcome.status, PaymentStatus::Failed);
