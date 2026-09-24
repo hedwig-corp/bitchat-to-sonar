@@ -421,6 +421,32 @@ struct ConversationTranscriptWindowTests {
         #expect(refreshed.count == history.count + 1)
     }
 
+    /// The first message in an empty chat: the echo is the only existing row,
+    /// and once reconciled the candidates hold just its canonical row, stamped
+    /// a second later. Production echoes carry their group's source id (they
+    /// are built from `messagesByGroup` like real rows), so the live branch
+    /// kept the echo as an "uncovered prefix" — two identical bubbles.
+    @Test func liveRefreshDropsReconciledEchoInAnEmptyChat() {
+        var echo = message(10, source: "internet")
+        echo.id = MarmotChatModel.optimisticIDPrefix + "abc"
+        echo.mine = true
+        echo.state = "Sending"
+        var canonical = message(11, source: "internet")
+        canonical.mine = true
+        canonical.text = echo.text
+        canonical.state = "Sent"
+
+        let refreshed = SNConversationTranscriptWindow.refreshing(
+            [echo],
+            from: [canonical],
+            limit: 500,
+            preservingOlderEdge: false
+        )
+
+        #expect(refreshed.map(\.id) == [canonical.id])
+        #expect(refreshed.first?.state == "Sent")
+    }
+
     /// An echo still present in candidates is still pending: the pinned window
     /// must keep it (updated in place), not drop it.
     @Test func pinnedWindowKeepsStillPendingEcho() {

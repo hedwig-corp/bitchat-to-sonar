@@ -381,6 +381,12 @@ final class MarmotChatModel: ObservableObject {
     /// Re-fetch kind-0 profiles older than this so alias/name updates are
     /// noticed during long sessions (mirrors Android PROFILE_REFRESH_TTL_SECS).
     private static let profileRefreshTTL: TimeInterval = 30 * 60
+    /// Minimum gap between kind-0 fetches for an npub whose last fetch found
+    /// no profile (mirrors Android PROFILE_MISS_TTL_SECS). `title(for:)` calls
+    /// `ensureProfile` on every Home/header render, so without it a contact
+    /// with no published profile re-queried every relay about twice a second,
+    /// forever, on the serial Marmot work queue that sends and syncs share.
+    nonisolated static let profileMissTTL: TimeInterval = 60
     private static let localTranscriptPageLimit = TransportConfig.sonarTranscriptPageCount
     private static let localTranscriptRetainedLimit = TransportConfig.sonarTranscriptRetainedCount
     /// A summary invalidation may briefly own the same per-group loader as an
@@ -448,7 +454,14 @@ final class MarmotChatModel: ObservableObject {
     /// Noise-only; it only lets call-offer handling stop deferring forever.
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
     /// True when the current node is relay-backed, not just the local DB node.
-    @Published private(set) var relayConnected = false
+    @Published private(set) var relayConnected = false {
+        didSet {
+            // Fetches fired while the relays were still connecting miss; give
+            // them a prompt second chance instead of waiting out the miss TTL
+            // (Compose `refreshChatMemberProfiles(clearMisses = true)`).
+            if relayConnected && !oldValue { profileMissedAt = [:] }
+        }
+    }
     /// True while a foreground/push-tap catch-up sync is running. Passive UI
     /// signal only: it must never gate paint, sending, or scrolling.
     @Published private(set) var syncingInFlight = false
@@ -538,9 +551,12 @@ final class MarmotChatModel: ObservableObject {
     /// npubs whose profile fetch is in flight or done. Entries older than
     /// `profileRefreshTTL` are cleared by `refreshStaleProfiles()` so updated
     /// aliases/names get re-fetched during long sessions.
-    private var profileFetches: Set<String> = []
+    private(set) var profileFetches: Set<String> = []
     /// Last successful kind-0 profile fetch time per npub.
     private var profileFetchedAt: [String: Date] = [:]
+    /// When the last fetch for an npub found no profile; throttles re-fetches
+    /// to one per `profileMissTTL`.
+    private(set) var profileMissedAt: [String: Date] = [:]
     /// npubs whose Sonar descriptor fetch is currently in flight.
     private var descriptorFetches: Set<String> = []
     /// Last successful relay lookup time per npub. A successful nil response is
@@ -3307,6 +3323,7 @@ final class MarmotChatModel: ObservableObject {
         let key = SNMarmotProfileCache.canonicalKey(npubToFetch)
         let ownKey = npub.map(SNMarmotProfileCache.canonicalKey)
         guard !key.isEmpty, key != ownKey else { return }
+        guard !Self.profileMissThrottled(missedAt: profileMissedAt[key], now: Date()) else { return }
         let hadCachedProfile = profilesByNpub[key] != nil || profilesByNpub[npubToFetch] != nil
         guard profileFetches.insert(key).inserted else { return } // in flight
         Task {
@@ -3315,11 +3332,13 @@ final class MarmotChatModel: ObservableObject {
                 if let profile, profile.bestName != nil {
                     self.profilesByNpub[key] = profile
                     self.profileFetchedAt[key] = Date()
+                    self.profileMissedAt.removeValue(forKey: key)
                     if key != npubToFetch {
                         self.profilesByNpub.removeValue(forKey: npubToFetch)
                     }
                     self.scheduleProfileCacheWrite()
                 } else {
+                    self.profileMissedAt[key] = Date()
                     if !hadCachedProfile {
                         self.profileFetches.remove(key) // not published yet — allow retry
                     } else {
@@ -3342,6 +3361,11 @@ final class MarmotChatModel: ObservableObject {
             from: profileFetchedAt,
             cutoff: Date().addingTimeInterval(-Self.profileRefreshTTL)
         )
+        // Expired miss markers only throttle; prune them so they do not grow
+        // without bound for npubs that came and went in a long session.
+        for key in Self.staleKeys(from: profileMissedAt, cutoff: Date().addingTimeInterval(-Self.profileMissTTL)) {
+            profileMissedAt.removeValue(forKey: key)
+        }
         guard !stale.isEmpty else { return false }
         for key in stale {
             profileFetches.remove(key)
@@ -3355,6 +3379,12 @@ final class MarmotChatModel: ObservableObject {
     /// `MarmotService` or `@MainActor` instance.
     nonisolated static func staleKeys(from fetchedAt: [String: Date], cutoff: Date) -> [String] {
         fetchedAt.filter { $0.value < cutoff }.map { $0.key }
+    }
+
+    /// True while a recent profile miss should suppress another relay fetch.
+    nonisolated static func profileMissThrottled(missedAt: Date?, now: Date) -> Bool {
+        guard let missedAt else { return false }
+        return now.timeIntervalSince(missedAt) < profileMissTTL
     }
 
     /// Fetch + cache a peer's public Sonar descriptor. Not finding one keeps the
@@ -4977,6 +5007,7 @@ final class MarmotChatModel: ObservableObject {
             throw error
         }
         profileFetches = []
+        profileMissedAt = [:]
         profileFetchedAt = [:]
         installedPackCoordinates = []
     }
@@ -4994,6 +5025,7 @@ final class MarmotChatModel: ObservableObject {
             throw error
         }
         profileFetches = []
+        profileMissedAt = [:]
         profileFetchedAt = [:]
         installedPackCoordinates = []
     }
@@ -5117,6 +5149,7 @@ final class MarmotChatModel: ObservableObject {
         descriptorBolt12Offer = nil
         profilesByNpub = [:]
         profileFetches = []
+        profileMissedAt = [:]
         profileFetchedAt = [:]
         // Invalidate any in-flight syncForce slot so a post-wipe wake cannot
         // join the previous identity's FETCH_TIMEOUT park.
@@ -5198,7 +5231,10 @@ final class MarmotChatModel: ObservableObject {
         // --group-name) and must not freeze the row or shadow a rename.
         if let name = displayName(forNpub: other) { return name }
         ensureProfile(other)
-        return group.name.isEmpty ? String(other.prefix(12)) + "…" : group.name
+        // Same short form as the pending chat and the lookup card, so the
+        // header (and the name-derived avatar) do not change the moment the
+        // pending chat resolves to its real group (Compose `shortNpub`).
+        return group.name.isEmpty ? snShortNpubLabel(other) : group.name
     }
 
     func otherMembers(in group: MarmotService.MarmotGroup) -> [String] {

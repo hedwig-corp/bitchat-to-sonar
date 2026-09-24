@@ -1976,6 +1976,9 @@ final class SonarAppStore: ObservableObject {
     private var publishedBolt12Offer: String?
     private var publishingPaymentMetadata = false
     private var needsPaymentMetadataPublish = false
+    /// Backoff retry for a failed receive-offer creation (e.g. Boltz 5xx).
+    private var paymentMetadataRetryTask: Task<Void, Never>?
+    private var paymentMetadataRetryAttempt = 0
     private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
 
@@ -2229,6 +2232,8 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
                 guard let self else { return }
+                let wasReady: Bool
+                if case .ready = self.walletState { wasReady = true } else { wasReady = false }
                 self.walletState = state
                 // Gate the advertised ⚡PAY capability on a receive-capable wallet.
                 let configured: Bool
@@ -2236,7 +2241,12 @@ final class SonarAppStore: ObservableObject {
                 UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
                 // Start/stop the Unify receiver as the wallet becomes (un)ready.
                 self.updateReceiverAdvertising()
-                self.publishPaymentMetadataIfNeeded()
+                // A balance change does not change the receive offer; only a
+                // readiness change does. Re-publishing on every balance tick
+                // asked Boltz for a fresh offer each time.
+                if !(wasReady && configured) {
+                    self.publishPaymentMetadataIfNeeded()
+                }
                 self.updateWalletPaymentObservation()
                 #if os(iOS)
                 if configured, let bridged = self.wallet as? BridgedWallet {
@@ -4569,9 +4579,13 @@ final class SonarAppStore: ObservableObject {
             case .ready:
                 do {
                     offer = try await self.wallet.createOffer()
+                    self.paymentMetadataRetryAttempt = 0
+                    self.paymentMetadataRetryTask?.cancel()
+                    self.paymentMetadataRetryTask = nil
                     guard case .ready = self.walletState else { return }
                 } catch {
                     SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+                    self.schedulePaymentMetadataRetry()
                     return
                 }
             case .settingUp:
@@ -4607,6 +4621,27 @@ final class SonarAppStore: ObservableObject {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
             }
         }
+    }
+
+    /// Retry a failed receive-offer creation with backoff: 30 s, doubling, capped
+    /// at 15 min. Before this, the only retry was the wallet's 5 s balance poll
+    /// re-publishing an unchanged state, which hit Boltz every 5 s while it was
+    /// down. Only retries while the wallet is still ready.
+    private func schedulePaymentMetadataRetry() {
+        paymentMetadataRetryTask?.cancel()
+        let delaySecs = Self.paymentMetadataRetryDelaySecs(attempt: paymentMetadataRetryAttempt)
+        paymentMetadataRetryAttempt += 1
+        paymentMetadataRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delaySecs) * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.paymentMetadataRetryTask = nil
+            guard case .ready = self.walletState else { return }
+            self.publishPaymentMetadataIfNeeded()
+        }
+    }
+
+    nonisolated static func paymentMetadataRetryDelaySecs(attempt: Int) -> Int {
+        min(30 << min(max(attempt, 0), 5), 15 * 60)
     }
 
     private func updateWalletPaymentObservation() {
@@ -6903,7 +6938,8 @@ final class SonarAppStore: ObservableObject {
         let realId = Self.marmotIDPrefix + groupId
         moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
-        if currentDMId == pendingId {
+        let viewingPending = currentDMId == pendingId
+        if viewingPending {
             path.removeLast()
             push(.dm(realId))
         }
@@ -6911,7 +6947,25 @@ final class SonarAppStore: ObservableObject {
             pendingMarmotMessagesByChat[realId, default: []].append(contentsOf: echoes)
         }
         flushPendingDirectMarmot(npub: npub, groupId: groupId, realId: realId)
+        if viewingPending { handOverVisibleTranscript(from: pendingId, to: realId) }
         openedDM(realId, marmotGroupId: groupId)
+    }
+
+    /// Move store-following from the pending transcript to the real one when a
+    /// pending chat resolves while it is on screen.
+    ///
+    /// `path.removeLast(); push(.dm(realId))` at the same stack depth can land as
+    /// an in-place update of the visible DM screen, so neither
+    /// `onDisappear(pendingId)` nor `onAppear(realId)` is guaranteed to fire, and
+    /// `openedDM(realId)` runs before any view has created the real id's render
+    /// state. Without this the real transcript never followed the store: the
+    /// first message's echo was painted by the send path's direct rebuild, then
+    /// sat at "Sending" forever although the relay had acked it, and the pending
+    /// state kept rebuilding after leave (R-038). Both calls are idempotent, so a
+    /// lifecycle callback that does fire is harmless.
+    private func handOverVisibleTranscript(from pendingId: String, to realId: String) {
+        conversationViewStates[pendingId]?.deactivate()
+        conversationViewState(realId).activate()
     }
 
     private func resolvePendingSecureChats() {
@@ -7023,7 +7077,8 @@ final class SonarAppStore: ObservableObject {
         let realId = Self.marmotIDPrefix + groupId
         moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
-        if currentDMId == pendingId {
+        let viewingPending = currentDMId == pendingId
+        if viewingPending {
             path.removeLast()
             push(.dm(realId))
         }
@@ -7031,6 +7086,7 @@ final class SonarAppStore: ObservableObject {
             pendingMarmotMessagesByChat[realId, default: []].append(contentsOf: echoes)
         }
         flushPendingMarmotGroupSends(pendingId: pendingId, groupId: groupId, realId: realId)
+        if viewingPending { handOverVisibleTranscript(from: pendingId, to: realId) }
         openedDM(realId, marmotGroupId: groupId)
     }
 
