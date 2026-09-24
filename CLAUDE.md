@@ -240,6 +240,17 @@ resolve to a real, enabled test (declared in a test source set, annotated, not
 real call site, or whether it runs in CI at all — iOS tests currently do not.
 Those stay review questions.
 
+## QA Pass Rule
+
+End-to-end QA of the apps (simulator/emulator against real `sonar-cli` peers)
+follows the `qa-pass` skill (`.agents/skills/qa-pass/SKILL.md`, also linked
+from `.claude/skills`) and its harness in `scripts/qa/`. The scenario registry
+[`docs/QA-SCENARIOS.md`](docs/QA-SCENARIOS.md) is the checklist every pass
+runs, and it only grows: every bug a pass finds adds a scenario (steps,
+expectation, guarding test, origin) in the fix PR, and a scripted `qaNNN`
+step in `scripts/qa/android-smoke.sh` when it can be driven headlessly. Repeat
+the pass on the fixed build until a full round finds nothing new.
+
 ## Fix What We Break Rule
 
 When a change breaks existing behavior, fix the broken behavior directly before considering the work complete. Do not leave regressions for users to route around, and do not hide them with UI-only workarounds.

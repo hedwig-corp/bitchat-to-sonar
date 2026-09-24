@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sonar QA pass"
+  short_description: "End-to-end QA of the iOS/Android apps against real peers; fix, test, repeat"
+  default_prompt: "Use the qa-pass skill: set up the QA emulator/simulator, run scripts/qa/android-smoke.sh, walk docs/QA-SCENARIOS.md on both apps with sonar-cli peers, fix what you find with tests on both platforms, grow the registry, open a PR against main, and repeat on the fixed build until a round is clean."
