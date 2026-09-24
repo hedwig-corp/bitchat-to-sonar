@@ -334,5 +334,106 @@ class CashuWalletEngineTest {
         assertFalse(e.isOpen())
         assertEquals(SendErrorKind.NotReady, e.send("lno1", 1, "").errorKind)
         assertFailsWith<CashuWalletException> { e.receiveOffer() }
+        assertEquals(SendErrorKind.NotReady, (e.quoteFee("lno1", 1) as WalletOutcome.Failed).kind)
+        assertEquals(SendErrorKind.NotReady, (e.receiveInvoice(1) as WalletOutcome.Failed).kind)
+    }
+
+    // ── Fee before confirm (send sheet) ──
+
+    @Test
+    fun aFeeQuoteIsTheMintsReserveAndSpendsNothing() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 7)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+
+        assertEquals(WalletOutcome.Ok(7L), e.quoteFee("lno1peer", 500))
+        // amountSats 0 = the invoice speaks for its own amount, as in `send`.
+        assertEquals(WalletOutcome.Ok(7L), e.quoteFee("lnbc5u1pfake", 0))
+        assertEquals(listOf<Long?>(500L, null), native.preparedAmounts)
+        assertEquals(0, native.count("send"), "a quote never spends")
+        assertEquals(10_000L, e.refreshBalance(), "and never touches the balance")
+        e.onBackground()
+    }
+
+    @Test
+    fun aFeeQuoteRefusalIsTyped() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val cases = listOf(
+            { CashuWalletException.Network("down") } to SendErrorKind.Offline,
+            { CashuWalletException.Timeout() } to SendErrorKind.Offline,
+            { CashuWalletException.Busy("connecting") } to SendErrorKind.Busy,
+            { CashuWalletException.InvalidDestination("bad") } to SendErrorKind.InvalidDestination,
+            { CashuWalletException.Unsupported("onchain") } to SendErrorKind.Unsupported,
+            { CashuWalletException.InsufficientFunds() } to SendErrorKind.InsufficientFunds,
+            { CashuWalletException.Backend("mint 500") } to SendErrorKind.Failed,
+        )
+        for ((error, kind) in cases) {
+            native.prepareError = error
+            val r = e.quoteFee("lno1peer", 500)
+            assertEquals(kind, (r as? WalletOutcome.Failed)?.kind, "quote refused with ${error()}")
+        }
+        native.prepareError = null
+        assertEquals(SendErrorKind.InvalidDestination, (e.quoteFee("  ", 500) as WalletOutcome.Failed).kind)
+        assertEquals(0, native.count("send"))
+        e.onBackground()
+    }
+
+    @Test
+    fun aFeeQuoteNeverConnectsAnOfflineWallet() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000).apply {
+            connectError = { CashuWalletException.Network("down") }
+        }
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val connects = native.count("connect")
+        assertEquals(SendErrorKind.Offline, (e.quoteFee("lno1peer", 500) as WalletOutcome.Failed).kind)
+        assertEquals(connects, native.count("connect"), "the quote leaves connecting to the retry loop")
+        e.onBackground()
+    }
+
+    // ── Receive: one-time invoice ──
+
+    @Test
+    fun aReceiveInvoiceIsTheWalletsBolt11ForThatAmount() = walletTest {
+        val native = FakeCashuNative()
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        assertEquals(WalletOutcome.Ok(CashuInvoice("lnbc2100fake", "mint-quote-2100")), e.receiveInvoice(2_100))
+        assertEquals(listOf(2_100L), native.invoiceAmounts)
+        e.onBackground()
+    }
+
+    @Test
+    fun aReceiveInvoiceRefusalIsTyped() = walletTest {
+        val native = FakeCashuNative()
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+
+        val zero = e.receiveInvoice(0) as WalletOutcome.Failed
+        assertEquals(SendErrorKind.Failed, zero.kind)
+        assertEquals(0, native.count("receiveInvoice"), "no amount: the mint is never asked")
+
+        val cases = listOf(
+            { CashuWalletException.Network("down") } to SendErrorKind.Offline,
+            { CashuWalletException.Busy("connecting") } to SendErrorKind.Busy,
+            { CashuWalletException.InvalidInput("amount above limit") } to SendErrorKind.InvalidDestination,
+            { CashuWalletException.Unsupported("bolt11") } to SendErrorKind.Unsupported,
+            { CashuWalletException.Backend("mint 500") } to SendErrorKind.Failed,
+        )
+        for ((error, kind) in cases) {
+            native.invoiceError = error
+            assertEquals(kind, (e.receiveInvoice(1_000) as? WalletOutcome.Failed)?.kind, "invoice refused with ${error()}")
+        }
+        native.invoiceError = null
+        native.connected = false
+        assertEquals(SendErrorKind.Offline, (e.receiveInvoice(1_000) as WalletOutcome.Failed).kind)
+        e.onBackground()
     }
 }

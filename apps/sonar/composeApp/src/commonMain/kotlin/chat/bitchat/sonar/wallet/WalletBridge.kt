@@ -60,6 +60,16 @@ data class SendResult(
 )
 
 /**
+ * A wallet call that answers [Ok] or is refused with a typed reason. Callers
+ * branch on [Failed.kind] (the same [SendErrorKind] a send uses), never on
+ * [Failed.message], which is the engine's English fallback.
+ */
+sealed interface WalletOutcome<out T> {
+    data class Ok<out T>(val value: T) : WalletOutcome<T>
+    data class Failed(val kind: SendErrorKind, val message: String) : WalletOutcome<Nothing>
+}
+
+/**
  * One payment surfaced by a wallet's event listener — the Compose twin of iOS
  * `SonarWallet.incomingPaymentsStream()`'s `Payment` element. Used to record
  * `walletIncoming` rows and to resolve pending sends.
@@ -153,6 +163,22 @@ object WalletBridge {
 
     /** The reusable BOLT12 offer to receive payments. */
     suspend fun createOffer(): String = engine.receiveOffer()
+
+    /**
+     * A one-time BOLT11 invoice for [amountSats] (FFI `receive_invoice`), for
+     * wallets that cannot pay the reusable offer. Off the caller's thread;
+     * typed refusal, never a throw.
+     */
+    suspend fun receiveInvoice(amountSats: Long): WalletOutcome<CashuInvoice> =
+        engine.receiveInvoice(amountSats)
+
+    /**
+     * The mint's fee reserve for paying [amountSats] to [destination]
+     * (amountSats=0 ⇒ the invoice's own amount), via FFI `prepare_send`. The
+     * quote is discarded — [send] prepares again. Off the caller's thread.
+     */
+    suspend fun quoteFee(destination: String, amountSats: Long): WalletOutcome<Long> =
+        engine.quoteFee(destination, amountSats)
 
     /** Pay a destination. amountSats=0 ⇒ amount from the invoice. See [SendResult.pending]. */
     suspend fun send(

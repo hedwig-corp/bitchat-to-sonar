@@ -24,9 +24,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -40,12 +42,64 @@ import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.sonar
 import chat.bitchat.sonar.wallet.SpendableBalance
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.checking_the_fee
+import chat.bitchat.sonar.resources.network_fee_up_to
+import chat.bitchat.sonar.resources.pays_this_bolt12_offer
+import chat.bitchat.sonar.resources.pays_this_lightning_invoice
+import kotlinx.coroutines.delay
+import org.jetbrains.compose.resources.stringResource
 
 /** Grouped sats, like the prototype's payFmt (en-US thousands separators). */
 internal fun payFmt(sats: Long): String =
     sats.toString().reversed().chunked(3).joinToString(",").reversed()
 
 private const val COIN = "₿" // ₿
+
+/**
+ * How the pay sheet's fee line writes the fee: always sats, like the amount
+ * above it. A fee reserve is a few sats, which the fiat formatter rounded to
+ * "CHF 0.00" (QA, #614).
+ */
+internal fun feeLineAmount(sats: Long): String = "${payFmt(sats)} sats"
+
+/** Keystrokes inside this window re-quote once, not once per key. */
+private const val FEE_QUOTE_DEBOUNCE_MS = 400L
+
+/**
+ * What the send sheet's footer says about where the money goes. A raw
+ * invoice or offer names no person — "Pays lnbc5u1p4tg7…'s wallet" read as if
+ * the invoice were someone's name — so those get their own copy; contacts,
+ * usernames and Lightning addresses keep the "<name>'s wallet" line.
+ */
+internal sealed interface PayFooter {
+    data object LightningInvoice : PayFooter
+    data object Bolt12Offer : PayFooter
+    data class Named(val name: String, val mesh: Boolean) : PayFooter
+}
+
+/**
+ * Pick the footer for a sheet paying [destination] (the raw string handed to
+ * the wallet; null for a contact, whose offer the chat resolves).
+ */
+internal fun payFooter(destination: String?, peerName: String, mesh: Boolean): PayFooter {
+    val raw = destination?.trim()?.lowercase()?.removePrefix("lightning:").orEmpty()
+    return when {
+        // name@domain is an address even when its user part looks like an invoice.
+        '@' in raw -> PayFooter.Named(peerName, mesh)
+        raw.startsWith("lno1") -> PayFooter.Bolt12Offer
+        // lnbc (mainnet, incl. lnbcrt regtest), lntb/lntbs (testnet/signet), lnsb (simnet).
+        raw.startsWith("lnbc") || raw.startsWith("lntb") || raw.startsWith("lnsb") -> PayFooter.LightningInvoice
+        else -> PayFooter.Named(peerName, mesh)
+    }
+}
+
+/** The fee line under the amount (Cashu wallet only). */
+private sealed interface FeeLine {
+    data object Hidden : FeeLine
+    data object Checking : FeeLine
+    data class Known(val sats: Long) : FeeLine
+}
 
 /**
  * Bitcoin amount sheet — 1:1 reproduction of pay.jsx `PaySheet`: balance line,
@@ -82,6 +136,18 @@ fun PaySheet(
      * so the wallet may take the fee out of the amount. Null: [onSend].
      */
     onSendMax: ((Long) -> Unit)? = null,
+    /**
+     * The raw destination this sheet pays (an invoice, offer or address), or
+     * null for a contact. Picks the footer copy — see [payFooter].
+     */
+    destination: String? = null,
+    /**
+     * The mint's fee reserve for sending the given amount, or null when there
+     * is none to show. Non-null only for the Cashu (primary) wallet: the sheet
+     * then shows "Checking the fee…" / "Network fee: up to …", re-quoted
+     * [FEE_QUOTE_DEBOUNCE_MS] after the amount settles. It never gates Send.
+     */
+    feeQuote: (suspend (Long) -> Long?)? = null,
 ) {
     val s = sonar
     TransientBackHandler(onClose)
@@ -105,6 +171,23 @@ fun PaySheet(
     // quote check; the legacy SpendableBalance.insufficientAfterFee).
     val over = sats > balanceSats
     val can = sats > 0 && !over
+
+    // Fee before confirm: quote once the amount is known and affordable. A
+    // new amount cancels the pending quote (its late answer is dropped) and
+    // starts the debounce again; a refused quote just hides the line.
+    val quote by rememberUpdatedState(feeQuote)
+    val quoting = feeQuote != null && can
+    var feeLine by remember { mutableStateOf<FeeLine>(FeeLine.Hidden) }
+    LaunchedEffect(sats, quoting) {
+        if (!quoting) {
+            feeLine = FeeLine.Hidden
+            return@LaunchedEffect
+        }
+        feeLine = FeeLine.Checking
+        delay(FEE_QUOTE_DEBOUNCE_MS)
+        val fee = quote?.invoke(sats)
+        feeLine = if (fee != null) FeeLine.Known(fee) else FeeLine.Hidden
+    }
     fun tap(k: String) {
         maxPicked = false
         if (k == "del") { v = v.dropLast(1); return }
@@ -156,6 +239,18 @@ fun PaySheet(
                             fiatHint,
                             color = if (over) s.danger else s.text3, fontSize = 13.5.sp
                         )
+                    }
+                    // Fixed height so the keypad does not jump as the line
+                    // comes and goes.
+                    if (feeQuote != null) {
+                        Box(Modifier.height(18.dp).padding(top = 1.dp)) {
+                            val line = when (val f = feeLine) {
+                                FeeLine.Hidden -> null
+                                FeeLine.Checking -> stringResource(Res.string.checking_the_fee)
+                                is FeeLine.Known -> stringResource(Res.string.network_fee_up_to, feeLineAmount(f.sats))
+                            }
+                            if (line != null) Text(line, color = s.text3, fontSize = 12.5.sp)
+                        }
                     }
                 }
 
@@ -217,8 +312,13 @@ fun PaySheet(
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        if (mesh) "Chat can stay on Bluetooth. The payment goes straight to $peerName's wallet over Lightning."
-                        else "Payment goes straight to $peerName's wallet over Lightning.",
+                        when (val footer = payFooter(destination, peerName, mesh)) {
+                            PayFooter.LightningInvoice -> stringResource(Res.string.pays_this_lightning_invoice)
+                            PayFooter.Bolt12Offer -> stringResource(Res.string.pays_this_bolt12_offer)
+                            is PayFooter.Named ->
+                                if (footer.mesh) "Chat can stay on Bluetooth. The payment goes straight to ${footer.name}'s wallet over Lightning."
+                                else "Payment goes straight to ${footer.name}'s wallet over Lightning."
+                        },
                         color = s.text3, fontSize = 12.sp, lineHeight = 18.sp, textAlign = TextAlign.Center,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp)
                     )

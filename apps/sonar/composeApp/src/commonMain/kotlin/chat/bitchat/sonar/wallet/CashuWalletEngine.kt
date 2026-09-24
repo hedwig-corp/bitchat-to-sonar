@@ -2,6 +2,7 @@ package chat.bitchat.sonar.wallet
 
 import chat.bitchat.sonar.ConcurrencyLock
 import chat.bitchat.sonar.sonarLog
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -183,10 +184,54 @@ class CashuWalletEngine(
         return _offer.value ?: throw CashuWalletException.NotConnected()
     }
 
-    /** A one-off BOLT11 invoice. */
-    suspend fun receiveInvoice(amountSats: Long, description: String?): String = withContext(io) {
-        val n = native ?: throw CashuWalletException.NotConnected()
-        n.receiveInvoice(amountSats, description)
+    /**
+     * A one-time BOLT11 invoice for [amountSats] — what most outside wallets
+     * can pay. Needs the mint (it issues the mint quote behind the invoice).
+     * Typed: a refusal is [WalletOutcome.Failed], never a throw.
+     */
+    suspend fun receiveInvoice(amountSats: Long, description: String? = null): WalletOutcome<CashuInvoice> =
+        withContext(io) {
+            val n = native ?: return@withContext notReady()
+            if (amountSats <= 0) {
+                return@withContext WalletOutcome.Failed(SendErrorKind.Failed, INVOICE_AMOUNT_MESSAGE)
+            }
+            try {
+                WalletOutcome.Ok(n.receiveInvoice(amountSats, description))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: CashuWalletException) {
+                if (e.isOffline && wantOnline) startConnectLoop()
+                outcomeOf(e)
+            } catch (e: Throwable) {
+                sonarLog(TAG, "cashu receiveInvoice failed: ${e.message}")
+                WalletOutcome.Failed(SendErrorKind.Failed, PAYMENT_FAILED_MESSAGE)
+            }
+        }
+
+    /**
+     * The mint's fee RESERVE for paying [amountSats] to [destination] ([amountSats]
+     * 0: the invoice's own amount) — the most the payment can cost on top of
+     * the amount. Prices only: the melt quote is discarded (`send` prepares
+     * its own), nothing is spent and no proofs are reserved. Never connects —
+     * an offline wallet answers [SendErrorKind.Offline] and the UI hides the
+     * line; the send path does its own connect.
+     */
+    suspend fun quoteFee(destination: String, amountSats: Long): WalletOutcome<Long> = withContext(io) {
+        val n = native ?: return@withContext notReady()
+        val dest = destination.trim()
+        if (amountSats < 0 || dest.isEmpty()) {
+            return@withContext WalletOutcome.Failed(SendErrorKind.InvalidDestination, INVALID_DESTINATION_MESSAGE)
+        }
+        try {
+            WalletOutcome.Ok(n.prepareSend(dest, amountSats.takeIf { it > 0 }).feesSats ?: 0L)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: CashuWalletException) {
+            outcomeOf(e)
+        } catch (e: Throwable) {
+            sonarLog(TAG, "cashu fee quote failed: ${e.message}")
+            WalletOutcome.Failed(SendErrorKind.Failed, PAYMENT_FAILED_MESSAGE)
+        }
     }
 
     suspend fun lookupPayment(id: String): CashuPayment? = withContext(io) {
@@ -463,28 +508,38 @@ class CashuWalletEngine(
         errorKind = SendErrorKind.InsufficientFunds,
     )
 
-    private fun failureOf(e: CashuWalletException, n: CashuNative): SendResult = when (e) {
-        is CashuWalletException.InsufficientFunds -> SendResult(
-            ok = false,
-            error = SpendableBalance.insufficientBalanceMessage(
-                runCatching { n.balance().confirmedSats }.getOrDefault(_balanceSats.value),
-            ),
-            errorKind = SendErrorKind.InsufficientFunds,
+    private fun failureOf(e: CashuWalletException, n: CashuNative): SendResult {
+        val failed = if (e is CashuWalletException.InsufficientFunds) {
+            WalletOutcome.Failed(
+                SendErrorKind.InsufficientFunds,
+                SpendableBalance.insufficientBalanceMessage(
+                    runCatching { n.balance().confirmedSats }.getOrDefault(_balanceSats.value),
+                ),
+            )
+        } else {
+            outcomeOf(e)
+        }
+        return SendResult(ok = false, error = failed.message, errorKind = failed.kind)
+    }
+
+    /** THE typed mapping of a native wallet error, shared by send, quote and receive. */
+    private fun outcomeOf(e: CashuWalletException): WalletOutcome.Failed = when (e) {
+        is CashuWalletException.InsufficientFunds -> WalletOutcome.Failed(
+            SendErrorKind.InsufficientFunds,
+            SpendableBalance.insufficientBalanceMessage(_balanceSats.value),
         )
         is CashuWalletException.NotConnected,
         is CashuWalletException.Network,
-        is CashuWalletException.Timeout ->
-            SendResult(ok = false, error = MINT_OFFLINE_MESSAGE, errorKind = SendErrorKind.Offline)
-        is CashuWalletException.Busy ->
-            SendResult(ok = false, error = WALLET_BUSY_MESSAGE, errorKind = SendErrorKind.Busy)
+        is CashuWalletException.Timeout -> WalletOutcome.Failed(SendErrorKind.Offline, MINT_OFFLINE_MESSAGE)
+        is CashuWalletException.Busy -> WalletOutcome.Failed(SendErrorKind.Busy, WALLET_BUSY_MESSAGE)
         is CashuWalletException.InvalidDestination,
         is CashuWalletException.InvalidInput ->
-            SendResult(ok = false, error = INVALID_DESTINATION_MESSAGE, errorKind = SendErrorKind.InvalidDestination)
-        is CashuWalletException.Unsupported ->
-            SendResult(ok = false, error = UNSUPPORTED_MESSAGE, errorKind = SendErrorKind.Unsupported)
-        is CashuWalletException.Backend ->
-            SendResult(ok = false, error = PAYMENT_FAILED_MESSAGE, errorKind = SendErrorKind.Failed)
+            WalletOutcome.Failed(SendErrorKind.InvalidDestination, INVALID_DESTINATION_MESSAGE)
+        is CashuWalletException.Unsupported -> WalletOutcome.Failed(SendErrorKind.Unsupported, UNSUPPORTED_MESSAGE)
+        is CashuWalletException.Backend -> WalletOutcome.Failed(SendErrorKind.Failed, PAYMENT_FAILED_MESSAGE)
     }
+
+    private fun notReady() = WalletOutcome.Failed(SendErrorKind.NotReady, WALLET_STARTING_MESSAGE)
 
     companion object {
         private const val TAG = "SonarWallet"
@@ -500,6 +555,7 @@ class CashuWalletEngine(
         const val INVALID_DESTINATION_MESSAGE = "That payment address can't be paid."
         const val UNSUPPORTED_MESSAGE = "This kind of payment isn't supported yet."
         const val PAYMENT_FAILED_MESSAGE = "Payment failed — you were not charged."
+        const val INVOICE_AMOUNT_MESSAGE = "Enter an amount above zero."
     }
 }
 

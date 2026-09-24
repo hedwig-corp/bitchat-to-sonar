@@ -25,7 +25,7 @@ interface CashuNative {
     fun sync()
     /** THE published offer. Stable; answered from disk once it exists. */
     fun receiveOffer(): String
-    fun receiveInvoice(amountSats: Long, description: String?): String
+    fun receiveInvoice(amountSats: Long, description: String?): CashuInvoice
     fun parseDestination(input: String): CashuDestination
     fun prepareSend(destination: String, amountSats: Long?): CashuPreparedSend
     /** `status == Pending` is NOT a failure; see [CashuPaymentStatus.Pending]. */
@@ -77,6 +77,12 @@ data class CashuPayment(
 enum class CashuDestinationKind { Bolt11, Bolt12Offer, LightningAddress, LnurlPay, Unknown }
 
 data class CashuDestination(val raw: String, val kind: CashuDestinationKind, val amountSats: Long?)
+
+/**
+ * A one-time BOLT11 invoice. Its payment arrives as an incoming payment whose
+ * id equals [paymentId], so the Receive sheet can tell THIS invoice was paid.
+ */
+data class CashuInvoice(val invoice: String, val paymentId: String)
 
 /** A priced send from `prepareSend`: pass it back unchanged to `send`. */
 data class CashuPreparedSend(

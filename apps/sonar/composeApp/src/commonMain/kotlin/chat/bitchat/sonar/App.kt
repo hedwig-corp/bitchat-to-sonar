@@ -2399,6 +2399,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         onSendMax = { sats ->
             scope.launch { state.sendPay(screen.id, sats, feeFromAmount = true)?.let { state.toast = it } }
         },
+        feeQuote = { sats -> state.quoteChatPayFee(screen.id, sats) },
     )
     if (verifySheet) VerifySheet(
         peerName = peerName,

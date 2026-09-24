@@ -496,6 +496,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     state.sendPay(effectiveChatId, sats, feeFromAmount = true)?.let { state.toast = it }
                 }
             },
+            feeQuote = { sats -> state.quoteChatPayFee(effectiveChatId, sats) },
         )
     }
     if (confirmDelete) {

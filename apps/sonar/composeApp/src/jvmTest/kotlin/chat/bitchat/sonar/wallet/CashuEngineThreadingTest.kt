@@ -62,6 +62,9 @@ class CashuEngineThreadingTest {
                 e.receiveOffer()
                 e.send("lno1peer", 100, "n")
                 e.send("lno1peer", 1_000, "n", feeFromAmount = true)
+                // The Receive sheet's invoice and the send sheet's fee line.
+                assertTrue(e.receiveInvoice(2_100) is WalletOutcome.Ok)
+                assertTrue(e.quoteFee("lno1peer", 500) is WalletOutcome.Ok)
                 e.lookupPayment("quote-1")
                 e.onBackground()
                 e.onForeground()

@@ -278,6 +278,8 @@ fun SonarSendPaymentScreen(state: SonarAppState, fromLegacy: Boolean = false) {
                 state.sendPayDetached(contact.chatId, sats, feeFromAmount = true)
                 state.back()
             },
+            // Fee before confirm: Cashu only (the legacy card keeps its flow).
+            feeQuote = if (fromLegacy) null else { sats -> state.quoteChatPayFee(contact.chatId, sats) },
         )
     }
 
@@ -319,6 +321,8 @@ fun SonarSendPaymentScreen(state: SonarAppState, fromLegacy: Boolean = false) {
             onClose = { externalTarget = null; fixedSats = null },
             maxSats = state.maxSendableSats(fromLegacy),
             onSendMax = if (fromLegacy) null else { sats -> payExternal(sats, feeFromAmount = true) },
+            destination = destination,
+            feeQuote = if (fromLegacy) null else { sats -> state.quoteSendFee(destination, sats) },
         )
     }
 

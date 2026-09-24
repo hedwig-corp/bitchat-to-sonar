@@ -24,6 +24,8 @@ class FakeCashuNative(
     var offerError: (() -> CashuWalletException)? = null
     /** Thrown by [prepareSend] when set. */
     var prepareError: (() -> CashuWalletException)? = null
+    /** Thrown by [receiveInvoice] when set. */
+    var invoiceError: (() -> CashuWalletException)? = null
     /** The status `send` answers with. */
     var sendStatus: CashuPaymentStatus = CashuPaymentStatus.Complete
     var sendPreimage: String? = "preimage-1"
@@ -90,9 +92,16 @@ class FakeCashuNative(
         return offer ?: throw CashuWalletException.NotConnected()
     }
 
-    override fun receiveInvoice(amountSats: Long, description: String?): String {
+    /** Amounts `receiveInvoice` was asked for. */
+    val invoiceAmounts = mutableListOf<Long>()
+
+    override fun receiveInvoice(amountSats: Long, description: String?): CashuInvoice {
         record("receiveInvoice")
-        return "lnbc${amountSats}fake"
+        // Like the FFI: the invoice is a mint quote, so it needs the mint.
+        if (!connected) throw CashuWalletException.NotConnected()
+        invoiceError?.let { throw it() }
+        invoiceAmounts += amountSats
+        return CashuInvoice("lnbc${amountSats}fake", "mint-quote-$amountSats")
     }
 
     override fun parseDestination(input: String): CashuDestination {
@@ -100,9 +109,13 @@ class FakeCashuNative(
         return CashuDestination(input, CashuDestinationKind.Bolt12Offer, null)
     }
 
+    /** Amounts `prepareSend` was asked to price (null: the invoice's own). */
+    val preparedAmounts = mutableListOf<Long?>()
+
     override fun prepareSend(destination: String, amountSats: Long?): CashuPreparedSend {
         record("prepareSend")
         if (!connected) throw CashuWalletException.NotConnected()
+        preparedAmounts += amountSats
         prepareError?.let { throw it() }
         quoteSeq += 1
         return CashuPreparedSend(

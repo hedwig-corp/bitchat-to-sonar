@@ -447,9 +447,13 @@ private fun KeyShareCard(state: SonarAppState) {
     }
 }
 
-/** keyshare-btn: 13dp radius, 12dp padding, icon + 14.5/700 label. */
+/**
+ * keyshare-btn: 13dp radius, 12dp padding, icon + 14.5/700 label. Shared by
+ * the Wallet screen's Receive / Send pair and its Receive sheet's Copy /
+ * Share pair, so every such pair in the app is the same button.
+ */
 @Composable
-private fun KeyShareButton(
+internal fun KeyShareButton(
     label: String,
     bg: Color,
     fg: Color,

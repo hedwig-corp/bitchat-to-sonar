@@ -13,6 +13,7 @@ import chat.bitchat.sonar.store.MessageStore
 import chat.bitchat.sonar.unify.UnifyBIP321
 import chat.bitchat.sonar.unify.UnifyPeer
 import chat.bitchat.sonar.unify.UnifyRadio
+import chat.bitchat.sonar.wallet.CashuInvoice
 import chat.bitchat.sonar.wallet.ExchangeRate
 import chat.bitchat.sonar.wallet.LivePayment
 import chat.bitchat.sonar.wallet.FiatCurrency
@@ -37,6 +38,7 @@ import chat.bitchat.sonar.wallet.LegacyRestoreCheckOutcome
 import chat.bitchat.sonar.wallet.LegacyWalletSnapshot
 import chat.bitchat.sonar.wallet.SpendableBalance
 import chat.bitchat.sonar.wallet.WalletPaymentEvent
+import chat.bitchat.sonar.wallet.WalletOutcome
 import chat.bitchat.sonar.wallet.WalletPrefs
 import chat.bitchat.sonar.wallet.cashuAccountId
 import chat.bitchat.sonar.wallet.legacyDeleteBlockMessage
@@ -1082,6 +1084,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             localCoreReady = false; homeMessagesHydrated = false
             walletState = WalletState.NotConfigured
             walletOnline = false; walletBalanceDetails = null; cashuOffer = null
+            lastIncomingWalletPayment = null
             legacyWallet = LegacyWalletSnapshot(); legacyDeleteGate = null
             // Money prefs died with SonarCore.wipe(); mirror the defaults.
             showFiat = false; currency = FiatCurrency.USD; rate = null
@@ -2934,6 +2937,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     var cashuOffer by mutableStateOf<String?>(null)
         private set
+    /**
+     * The latest settled incoming wallet payment this session. The Receive
+     * sheet compares it with what it saw when it opened to show "Received …".
+     */
+    var lastIncomingWalletPayment by mutableStateOf<WalletPaymentEvent?>(null)
+        private set
     /** The "Old Lightning wallet" card; `present = false` hides it. */
     var legacyWallet by mutableStateOf(LegacyWalletSnapshot())
         private set
@@ -3097,7 +3106,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun onWalletPaymentEvent(ev: WalletPaymentEvent) {
         if (ev.incoming) {
             // A Cashu receive is final when PaymentReceived fires (Complete).
-            if (ev.settled) PaymentActivityStore.recordIncomingWalletPayment(ev)
+            if (ev.settled) {
+                PaymentActivityStore.recordIncomingWalletPayment(ev)
+                lastIncomingWalletPayment = ev
+            }
             return
         }
         if (ev.status != CashuPaymentStatus.Complete && ev.status != CashuPaymentStatus.Failed) return
@@ -3257,6 +3269,37 @@ class SonarAppState(private val scope: CoroutineScope) {
         SendErrorKind.NotReady -> result.error ?: getString(Res.string.your_wallet_is_still_starting_try_again)
         SendErrorKind.Failed -> getString(Res.string.payment_failed_you_were_not_charged)
         null -> result.error
+    }
+
+    /**
+     * Receive sheet: a one-time BOLT11 invoice for [sats] from the Cashu
+     * wallet. The engine runs the native call on its IO dispatcher; a
+     * refusal is typed ([WalletOutcome.Failed.kind]), never a throw.
+     */
+    suspend fun createReceiveInvoice(sats: Long): WalletOutcome<CashuInvoice> = WalletBridge.receiveInvoice(sats)
+
+    /**
+     * Send sheet fee line (Cashu wallet only): the mint's fee reserve for
+     * paying [sats] to [destination], or null when there is nothing to show —
+     * wallet not open, mint offline, quote refused. The line then hides; the
+     * send itself never waits on this. A BOLT11 invoice is quoted at its own
+     * amount, exactly as [destinationSendAmount] sends it. The quote is
+     * discarded: the send prepares its own.
+     */
+    suspend fun quoteSendFee(destination: String, sats: Long): Long? {
+        val dest = destination.trim()
+        if (dest.isEmpty() || sats <= 0 || !WalletBridge.isOpen()) return null
+        val amount = if (isBolt11Invoice(dest)) 0L else sats
+        return (WalletBridge.quoteFee(dest, amount) as? WalletOutcome.Ok)?.value
+    }
+
+    /** [quoteSendFee] for a chat pay: the contact's CACHED offer — never a descriptor fetch. */
+    suspend fun quoteChatPayFee(chatId: String, sats: Long): Long? =
+        directPaymentOffer(chatId)?.let { quoteSendFee(it, sats) }
+
+    private fun isBolt11Invoice(dest: String): Boolean {
+        val lower = dest.lowercase()
+        return lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt")
     }
 
     /** Why a send cannot start right now, or null. */
@@ -3787,7 +3830,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun destinationSendAmount(dest: String, sats: Long, fromLegacy: Boolean): DestinationCheck {
         walletSendBlockReason(fromLegacy)?.let { return DestinationCheck.Refuse(it) }
         val lower = dest.lowercase()
-        val isBolt11 = lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt")
+        val isBolt11 = isBolt11Invoice(dest)
         if (isBolt11 && chat.bitchat.sonar.wallet.bolt11AmountSats(lower) == null) {
             return DestinationCheck.Refuse(
                 "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
@@ -4483,6 +4526,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 stack = listOf(Screen.Home)
                 walletState = WalletState.NotConfigured
                 walletOnline = false; walletBalanceDetails = null; cashuOffer = null
+                lastIncomingWalletPayment = null
                 legacyWallet = LegacyWalletSnapshot(); legacyDeleteGate = null
                 refreshMeshIdentity()
                 // From Settings, onboarded was already true so LaunchedEffect(onboarded)

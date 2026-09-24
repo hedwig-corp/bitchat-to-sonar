@@ -40,8 +40,8 @@ private class AndroidCashuNative(private val w: SonarCashuWallet) : CashuNative 
     }
     override fun sync() = ffi { w.sync() }
     override fun receiveOffer(): String = ffi { w.receiveOffer() }
-    override fun receiveInvoice(amountSats: Long, description: String?): String =
-        ffi { w.receiveInvoice(amountSats.toULong(), description).invoice }
+    override fun receiveInvoice(amountSats: Long, description: String?): CashuInvoice =
+        ffi { w.receiveInvoice(amountSats.toULong(), description).let { CashuInvoice(it.invoice, it.paymentId) } }
     override fun parseDestination(input: String): CashuDestination = ffi {
         w.parseDestination(input).let { CashuDestination(it.raw, it.kind.common(), it.amountSats?.toLong()) }
     }

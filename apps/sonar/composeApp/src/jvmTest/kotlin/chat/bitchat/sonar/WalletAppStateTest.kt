@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import chat.bitchat.sonar.wallet.CashuEvent
+import chat.bitchat.sonar.wallet.CashuInvoice
 import chat.bitchat.sonar.wallet.CashuPayment
 import chat.bitchat.sonar.wallet.CashuPaymentStatus
 import chat.bitchat.sonar.wallet.CashuWalletEngine
@@ -12,6 +13,8 @@ import chat.bitchat.sonar.wallet.LegacyBreezWallet
 import chat.bitchat.sonar.wallet.MapWalletPrefs
 import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.PaymentInFlightException
+import chat.bitchat.sonar.wallet.SendErrorKind
+import chat.bitchat.sonar.wallet.WalletOutcome
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.cashuAccountId
@@ -19,14 +22,18 @@ import chat.bitchat.sonar.wallet.fetchFiatRatesNative
 import chat.bitchat.sonar.wallet.platformWalletFiles
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -89,6 +96,104 @@ class WalletAppStateTest {
             check(System.currentTimeMillis() < deadline) { "timed out waiting for: $what" }
             delay(10)
         }
+    }
+
+    /**
+     * Run [block] on a stand-in main thread and return the native calls that
+     * ran ON it — the app must make none (every native call hops to IO).
+     */
+    private suspend fun nativeCallsOnMain(block: suspend () -> Unit): List<String> {
+        val mainExec = Executors.newSingleThreadExecutor { r -> Thread(r, "fake-main") }
+        val main = mainExec.asCoroutineDispatcher()
+        val offenders = CopyOnWriteArrayList<String>()
+        // startsWith: under -ea kotlinx appends " @coroutine#N" to thread names.
+        native.onCall = { if (Thread.currentThread().name.startsWith("fake-main")) offenders += it }
+        try {
+            withContext(main) { block() }
+        } finally {
+            native.onCall = {}
+            main.close()
+            mainExec.shutdownNow()
+        }
+        return offenders.toList()
+    }
+
+    private fun seedPayableChat(s: SonarAppState, chatId: String, offer: String) = s.seedCallableChatForTest(
+        chatId,
+        "npub1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygse4sl3h",
+        SonarDescriptor(
+            schema = 1,
+            calls = false,
+            media = emptyList(),
+            signaling = listOf("marmot"),
+            transports = emptyList(),
+            callIdentity = "",
+            bolt12Offer = offer,
+            paymentReceipts = emptyList(),
+            publishedAtSecs = 0,
+        ),
+    )
+
+    @Test
+    fun theSendSheetFeeLineIsTheMintsQuotedReserveFetchedOffMain() = runBlocking {
+        native.confirmedSats = 10_000
+        native.feeReserveSats = 9
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+        seedPayableChat(s, "fee-quote-peer-group", "lno1peeroffer")
+
+        val onMain = nativeCallsOnMain {
+            assertEquals(9L, s.quoteSendFee("lno1destination", 500))
+            // A fixed invoice is quoted at its own amount — exactly how it is sent.
+            assertEquals(9L, s.quoteSendFee("lnbc5u1pfakeinvoice", 500))
+            // A contact: its cached offer, priced at the typed amount.
+            assertEquals(9L, s.quoteChatPayFee("fee-quote-peer-group", 700))
+        }
+        assertEquals(emptyList<String>(), onMain, "the fee quote must never run the native on the main thread")
+        assertEquals(listOf<Long?>(500L, null, 700L), native.preparedAmounts)
+        assertEquals(0, native.count("send"), "quoting never pays")
+
+        // No quote ⇒ no line (null), and the send is never blocked on it.
+        assertNull(s.quoteChatPayFee("no-such-chat", 700), "no cached offer: no quote, and no fetch")
+        assertNull(s.quoteSendFee("lno1destination", 0))
+        native.prepareError = { CashuWalletException.Network("mint down") }
+        assertNull(s.quoteSendFee("lno1destination", 500), "a refused quote hides the line")
+    }
+
+    @Test
+    fun theReceiveSheetInvoiceIsTypedAndAnIncomingPaymentIsSurfaced() = runBlocking {
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+
+        val onMain = nativeCallsOnMain {
+            assertEquals(WalletOutcome.Ok(CashuInvoice("lnbc2100fake", "mint-quote-2100")), s.createReceiveInvoice(2_100))
+            native.invoiceError = { CashuWalletException.Busy("syncing") }
+            assertEquals(SendErrorKind.Busy, (s.createReceiveInvoice(2_100) as WalletOutcome.Failed).kind)
+            native.invoiceError = { CashuWalletException.Network("mint down") }
+            assertEquals(SendErrorKind.Offline, (s.createReceiveInvoice(2_100) as WalletOutcome.Failed).kind)
+        }
+        assertEquals(emptyList<String>(), onMain, "the invoice call must never run the native on the main thread")
+        assertEquals(listOf(2_100L), native.invoiceAmounts)
+
+        // The sheet's "Received …" line reads this.
+        assertNull(s.lastIncomingWalletPayment)
+        native.emit(
+            CashuEvent.PaymentReceived(
+                CashuPayment("q:rx", true, 2_100, null, 1_700_000_000, CashuPaymentStatus.Pending, null, null),
+            ),
+        )
+        waitUntil("incoming surfaced") { s.lastIncomingWalletPayment?.paymentId == "q:rx" }
+        assertEquals(2_100L, s.lastIncomingWalletPayment?.amountSats)
+        // An outgoing settlement is never shown as received.
+        native.emit(
+            CashuEvent.PaymentSent(
+                CashuPayment("q:tx", false, 50, 1, 1_700_000_050, CashuPaymentStatus.Complete, "pre", null),
+            ),
+        )
+        delay(150)
+        assertEquals("q:rx", s.lastIncomingWalletPayment?.paymentId)
     }
 
     @Test
