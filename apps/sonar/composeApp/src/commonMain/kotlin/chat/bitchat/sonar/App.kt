@@ -2006,14 +2006,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                         contentAlignment = Alignment.CenterStart
                     ) {
+                        val composerPlaceholder = "Message $peerName" + (if (sendOverMesh) "" else " · via internet")
                         if (draft.isEmpty()) Text(
-                            "Message $peerName" + (if (sendOverMesh) "" else " · via internet"),
+                            composerPlaceholder,
                             color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                         )
                         MessageComposerTextField(
                             value = draft, onValueChange = { state.setComposerDraft(screen.id, it) },
                             textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                             cursorBrush = SolidColor(s.accent),
+                            label = composerPlaceholder,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .onFocusChanged { focusState ->
@@ -2858,6 +2860,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
+                    label = "Message",
                     modifier = Modifier.fillMaxWidth(),
                     onSend = {
                         if (draft.isBlank()) return@MessageComposerTextField

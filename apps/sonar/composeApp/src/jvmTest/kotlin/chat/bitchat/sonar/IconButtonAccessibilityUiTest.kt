@@ -1,10 +1,13 @@
 package chat.bitchat.sonar
 
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.runComposeUiTest
+import androidx.compose.ui.text.TextStyle
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
 import kotlin.test.Test
@@ -32,5 +35,22 @@ class IconButtonAccessibilityUiTest {
         setContent { SNIconButton(SNIconName.Phone, contentDescription = "Voice call") {} }
 
         onNodeWithContentDescription("Voice call").assertHasClickAction()
+    }
+
+    @Test
+    fun composerFieldIsAnnouncedByItsPlaceholder() = runComposeUiTest {
+        // QA-A21: the placeholder is drawn beside the field, so the field
+        // itself was an anonymous edit box to TalkBack and uiautomator.
+        setContent {
+            MessageComposerTextField(
+                value = "",
+                onValueChange = {},
+                textStyle = TextStyle(),
+                cursorBrush = SolidColor(Color.Black),
+                label = "Message Alice",
+            )
+        }
+
+        onNodeWithContentDescription("Message Alice").assertExists()
     }
 }

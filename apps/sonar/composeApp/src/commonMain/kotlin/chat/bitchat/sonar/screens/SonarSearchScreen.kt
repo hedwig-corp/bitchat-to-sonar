@@ -18,6 +18,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -26,7 +27,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -35,6 +40,8 @@ import chat.bitchat.sonar.GeoChannel
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarCore
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.search
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
@@ -42,6 +49,7 @@ import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.launch
+import org.jetbrains.compose.resources.stringResource
 
 /** Close Search before [startChat] pushes its pending/existing chat screen. */
 internal fun startSecureChatFromSearch(
@@ -132,11 +140,18 @@ fun SonarSearchScreen(state: SonarAppState) {
                 Spacer(Modifier.width(9.dp))
                 Box(Modifier.weight(1f)) {
                     if (query.isEmpty()) Text("Search chats, channels, name, npub…", color = s.text3, fontSize = 15.sp)
+                    // Opening Search means "I want to type": focus the field like
+                    // iOS's search sheet does, and give it a spoken label — it was an
+                    // unfocused, anonymous edit box (QA-A21).
+                    val searchLabel = stringResource(Res.string.search)
+                    val focus = remember { FocusRequester() }
+                    LaunchedEffect(Unit) { focus.requestFocus() }
                     BasicTextField(
                         value = q, onValueChange = { q = it }, singleLine = true,
                         textStyle = TextStyle(color = s.text, fontSize = 15.sp),
                         cursorBrush = SolidColor(s.accent),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().focusRequester(focus)
+                            .semantics { contentDescription = searchLabel }
                     )
                 }
             }
