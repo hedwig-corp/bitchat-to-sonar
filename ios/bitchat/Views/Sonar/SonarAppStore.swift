@@ -750,6 +750,20 @@ final class SNMediaUploadProgressSource: ObservableObject {
     }
 }
 
+/// Download phase/progress revision for media bubbles.
+///
+/// Collection-host cells reconfigure only when the transcript render revision
+/// changes, and a download finishing does not change it — so a received photo
+/// kept its "Tap to download" placeholder after the file had landed on disk.
+/// Bubbles observe this instead; mirrors `SNMediaUploadProgressSource` for the
+/// other direction.
+@MainActor
+final class SNMediaTransferSource: ObservableObject {
+    @Published private(set) var revision: UInt64 = 0
+
+    func bump() { revision &+= 1 }
+}
+
 /// Bridges UniFFI upload progress into the optimistic media bubble bar.
 final class SNMediaUploadListener: MediaUploadListener, @unchecked Sendable {
     private let lock = NSLock()
@@ -7334,7 +7348,12 @@ final class SonarAppStore: ObservableObject {
     /// In-memory decrypted-media cache (raw bytes), keyed by the ciphertext's
     /// Blossom URL. Cleared by `wipe()` and `eraseAllChats()`.
     private var mediaImageCache: [String: Data] = [:]
-    @Published private var mediaTransferStates: [String: SNMediaTransferState] = [:]
+    @Published private var mediaTransferStates: [String: SNMediaTransferState] = [:] {
+        didSet { mediaTransferSource.bump() }
+    }
+    /// Repaints media bubbles on download progress/phase changes; see
+    /// `SNMediaTransferSource`. Passed to bubbles through `SNMediaPipeline`.
+    let mediaTransferSource = SNMediaTransferSource()
     private var mediaDownloadTasks: [String: Task<Void, Never>] = [:]
     private var mediaDownloadListeners: [String: SNMediaDownloadListener] = [:]
     private var mediaDownloadGenerations: [String: UUID] = [:]

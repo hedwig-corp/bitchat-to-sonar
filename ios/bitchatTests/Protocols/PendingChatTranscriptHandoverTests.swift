@@ -19,37 +19,12 @@ import Testing
 struct PendingChatTranscriptHandoverTests {
     private static let peer = "npub1ghmjy6aj9kncekftjvz3dmxd73yqzrdl092f2ym2mak002dtepfqp89xna"
 
-    private func makeStore() -> (SonarAppStore, () -> Void) {
-        let suiteName = "PendingChatTranscriptHandoverTests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        let keychain = MockKeychain()
-        let idBridge = NostrIdentityBridge(keychain: MockKeychainHelper())
-        let chatViewModel = ChatViewModel(
-            keychain: keychain,
-            idBridge: idBridge,
-            identityManager: MockIdentityManager(keychain),
-            transport: MockTransport()
-        )
-        let marmot = MarmotChatModel(
-            service: MarmotService(relayUrls: []),
-            keychain: keychain,
-            defaults: defaults
-        )
-        let store = SonarAppStore(
-            chatViewModel: chatViewModel,
-            marmot: marmot,
-            keychain: keychain,
-            idBridge: idBridge
-        )
-        return (store, { defaults.removePersistentDomain(forName: suiteName) })
-    }
-
     /// Pins the real call site (`finishPendingSecureChat`, reached through the
     /// `marmot.$groups` sink): the screen's lifecycle callbacks are simulated
     /// only for the pending id, exactly as an in-place route update leaves them.
     @Test
     func resolvingTheVisiblePendingChatAttachesTheRealTranscript() async throws {
-        let (store, cleanup) = makeStore()
+        let (store, cleanup) = makeIsolatedSonarAppStore()
         defer { cleanup() }
 
         let pendingId = try #require(store.startSecureChat(npub: Self.peer))

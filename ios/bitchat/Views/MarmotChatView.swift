@@ -1741,8 +1741,13 @@ final class MarmotChatModel: ObservableObject {
         noteMediaUploadProgress(id, nil)
     }
 
-    private func noteMediaUploadProgress(_ id: String, _ fraction: Double?) {
+    func noteMediaUploadProgress(_ id: String, _ fraction: Double?) {
         if let fraction {
+            // The core ticks progress every 100 ms for the whole upload,
+            // including the wait for the Blossom response after the last byte
+            // (a minute against a slow server). Each publish below invalidates
+            // the store, so only real movement may publish.
+            guard mediaUploadProgress[id] != fraction else { return }
             #if DEBUG
             // Milestone logs for device upload timing (pair with media_upload_begin/end).
             if fraction <= 0.001 {

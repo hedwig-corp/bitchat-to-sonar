@@ -1095,6 +1095,9 @@ struct SNMediaPipeline {
     var request: (SNMediaItem) -> Void
     var cancel: (SNMediaItem) -> Void
     var loadLocal: (SNMediaItem) async -> Data?
+    /// Observed by media bubbles so a download's phase/progress repaints the
+    /// bubble without a transcript rebuild (see `SNMediaTransferSource`).
+    var transfers: SNMediaTransferSource? = nil
 
     static let unavailable = SNMediaPipeline(
         state: { _ in .notDownloaded },
@@ -1103,6 +1106,28 @@ struct SNMediaPipeline {
         cancel: { _ in },
         loadLocal: { _ in nil }
     )
+}
+
+/// Re-evaluates `content` whenever `source` publishes. With no source it
+/// renders `content` exactly as before.
+struct SNMediaTransferObserver<Content: View>: View {
+    let source: SNMediaTransferSource?
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        if let source {
+            Observing(source: source, content: content)
+        } else {
+            content()
+        }
+    }
+
+    private struct Observing: View {
+        @ObservedObject var source: SNMediaTransferSource
+        let content: () -> Content
+
+        var body: some View { content() }
+    }
 }
 
 /// O(1) identity for transcript changes that can affect the live edge.
@@ -2852,7 +2877,9 @@ struct SNMediaBubble: View {
     }
 
     var body: some View {
-        Group {
+        // Re-read transfer state (and so `loadKey`) when a download moves:
+        // collection-host cells are not reconfigured for it.
+        SNMediaTransferObserver(source: pipeline.transfers) {
             #if os(iOS)
             bubble
                 .fullScreenCover(isPresented: $viewerOpen) { viewer }
