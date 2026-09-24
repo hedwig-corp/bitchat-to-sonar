@@ -28,6 +28,51 @@
     "Record voice message" : {
 
     },
+    "Couldn't create the invoice. Try again." : {
+
+    },
+    "Copy" : {
+
+    },
+    "Copied" : {
+
+    },
+    "Share" : {
+
+    },
+    "Anyone can pay this address — any amount, as often as they like." : {
+
+    },
+    "Request an amount" : {
+
+    },
+    "Create invoice" : {
+
+    },
+    "Amount in sats" : {
+
+    },
+    "One-time invoice for %@. It can be paid once." : {
+
+    },
+    "Your wallet is still connecting to the mint." : {
+
+    },
+    "Received %@" : {
+
+    },
+    "Network fee: up to %@" : {
+
+    },
+    "Checking the fee…" : {
+
+    },
+    "Pays this Lightning invoice." : {
+
+    },
+    "Pays this Bolt12 offer." : {
+
+    },
     "%@ arriving" : {
 
     },

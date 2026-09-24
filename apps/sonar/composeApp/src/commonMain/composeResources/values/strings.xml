@@ -12,7 +12,9 @@
     <string name="add_to_your_message">Add to your message</string>
     <string name="adds_debug_detail_to_captured_logs">Adds debug detail to captured logs. Never includes your private key.</string>
     <string name="ahead">%1$s ahead</string>
+    <string name="amount_in_sats">Amount in sats</string>
     <string name="amount_plus_fee_exceeds_your_balance">Amount plus fee exceeds your balance.</string>
+    <string name="anyone_can_pay_this_address_any_amount">Anyone can pay this address — any amount, as often as they like.</string>
     <string name="anyone_with_this_key_controls_your">Anyone with this key controls your account and wallet. Only restore from your own backup.</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">close</string>
@@ -74,6 +76,7 @@
     <string name="chat_reply_them">Them</string>
     <string name="chat_reply_you">You</string>
     <string name="checking">Checking…</string>
+    <string name="checking_the_fee">Checking the fee…</string>
     <string name="choose_an_image">Choose an image</string>
     <string name="close">Close</string>
     <string name="close_2">close</string>
@@ -152,12 +155,16 @@
     <string name="content_payment_cashu">pay via cashu</string>
     <string name="content_payment_lightning">pay via lightning</string>
     <string name="continue_">Continue</string>
+    <string name="copied">Copied</string>
+    <string name="copy">Copy</string>
     <string name="could_not_load_sticker_pack">Could not load sticker pack</string>
     <string name="could_not_reopen_chats_after_backup">Could not reopen chats after backup — please restart Sonar</string>
     <string name="could_not_update_auto_backup_setting">Could not update auto-backup setting</string>
+    <string name="couldn_t_create_the_invoice_try_again">Couldn't create the invoice. Try again.</string>
     <string name="couldn_t_decode_image">Couldn't decode image</string>
     <string name="couldn_t_load_stickers">Couldn't load stickers</string>
     <string name="create_a_new_identity">Create a new identity</string>
+    <string name="create_invoice">Create invoice</string>
     <string name="decline">Decline</string>
     <string name="delete_old_wallet">Delete old wallet</string>
     <string name="direct_messages_are_end_to_end">Direct messages are end-to-end encrypted. Always.</string>
@@ -267,6 +274,7 @@
     <string name="nearby">Nearby</string>
     <string name="nearby_bluetooth">nearby · Bluetooth</string>
     <string name="nearby_on_mesh"> · %1$s nearby on mesh</string>
+    <string name="network_fee_up_to">Network fee: up to %1$s</string>
     <string name="new_discussion">New discussion</string>
     <string name="nickname">nickname</string>
     <string name="no_account_was_created_anywhere_your">No account was created anywhere — your identity lives on this phone.</string>
@@ -285,6 +293,7 @@
     <string name="old_lightning_wallet">Old Lightning wallet</string>
     <string name="old_lightning_wallet_2">Old Lightning wallet · %1$s</string>
     <string name="old_lightning_wallet_removed">Old Lightning wallet removed</string>
+    <string name="one_time_invoice_for_it_can_be_paid_once">One-time invoice for %1$s. It can be paid once.</string>
     <string name="online">Online</string>
     <string name="out_of_range_still_reachable">Out of range? Still reachable</string>
     <string name="paste_a_friend_s_npub_above_or_have">Paste a friend's npub above — or have them message yours from White Noise.</string>
@@ -298,6 +307,8 @@
     <string name="payment_is_on_its_way_it_shows_in_the">Payment is on its way — it shows in the chat once it settles.</string>
     <string name="payments_need_your_wallet_to_finish">Payments need your wallet to finish opening on this Mac. It starts once your Sonar identity is ready.</string>
     <string name="pays_like_you_message_tap_to_pay_nearby">Pays like you message — tap to pay nearby or over the internet</string>
+    <string name="pays_this_bolt12_offer">Pays this Bolt12 offer.</string>
+    <string name="pays_this_lightning_invoice">Pays this Lightning invoice.</string>
     <string name="people_in_range">%1$s people in range</string>
     <string name="people_nearby_can_send_you_money_at">People nearby can send you money at this address. It's shared with your Sonar announce — leave it empty to share nothing.</string>
     <string name="pick_a_nickname">Pick a nickname</string>
@@ -307,11 +318,13 @@
     <string name="profile">Profile</string>
     <string name="reaches_anyone"> · reaches anyone</string>
     <string name="receive">Receive</string>
+    <string name="received">Received %1$s</string>
     <string name="record_voice_message">Record voice message</string>
     <string name="recording">recording %1$s</string>
     <string name="relay_sync">Relay sync</string>
     <string name="remote_video_unavailable">Remote video unavailable</string>
     <string name="replace_this_account_with_an_nsec_from">Replace this account with an nsec from a backup</string>
+    <string name="request_an_amount">Request an amount</string>
     <string name="restore_account">Restore account</string>
     <string name="restore_your_account">Restore your account</string>
     <string name="restoring">Restoring...</string>
@@ -333,6 +346,7 @@
     <string name="setting_up">Setting up…</string>
     <string name="setting_up_secure_chat">Setting up secure chat…</string>
     <string name="settings">Settings</string>
+    <string name="share">Share</string>
     <string name="sonar">Sonar</string>
     <string name="sonar_2">sonar</string>
     <string name="sonar_can_t_confirm_the_old_wallet_is">Sonar can't confirm the old wallet is empty yet.</string>
@@ -411,5 +425,6 @@
     <string name="your_nickname_is_what_people_see_your">Your nickname is what people see. Your key stays on this device unless you explicitly export it.</string>
     <string name="your_wallet_from_before_sonar_moved_to">Your wallet from before Sonar moved to ecash</string>
     <string name="your_wallet_is_busy_try_again_in_a">Your wallet is busy. Try again in a moment.</string>
+    <string name="your_wallet_is_still_connecting_to_the">Your wallet is still connecting to the mint.</string>
     <string name="your_wallet_is_still_starting_try_again">Your wallet is still starting. Try again in a moment.</string>
 </resources>
