@@ -3,7 +3,7 @@
 # Compose app. Targets ONE device by serial; never "the" connected device.
 #
 #   export QA_SERIAL=emulator-5580          # required
-#   export QA_SHOTS=/tmp/sonar-qa/shots     # optional, default below
+#   export QA_SHOTS=/tmp/sonar-qa/shots     # optional, default $QA_HOME/shots
 #
 #   android-ui.sh shot <name>        screencap → $QA_SHOTS/<name>.png (≤900 px)
 #   android-ui.sh dump               "x,y  C|E|E!  text  desc" for every labelled node and
@@ -32,7 +32,7 @@
 set -euo pipefail
 
 SER="${QA_SERIAL:?set QA_SERIAL to the emulator/device serial (adb devices)}"
-SHOTS="${QA_SHOTS:-${TMPDIR:-/tmp}/sonar-qa/shots}"
+SHOTS="${QA_SHOTS:-${QA_HOME:-${TMPDIR:-/tmp}/sonar-qa}/shots}"
 XML="${TMPDIR:-/tmp}/sonar-qa-ui-$SER.xml"
 ADB=(adb -s "$SER")
 mkdir -p "$SHOTS"

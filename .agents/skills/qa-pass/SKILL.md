@@ -45,11 +45,11 @@ base is not `main` gets **zero CI runs**.
 
 ```bash
 cargo build -p sonar-cli --release --manifest-path core/Cargo.toml   # peers
-export QA_HOME="$TMPDIR/sonar-qa"                                     # all artifacts
+export QA_HOME="$TMPDIR/sonar-qa-$(basename "$PWD")"                 # all artifacts, per worktree
 
 # Android (boots the QA AVD, installs Debug in place, captures logcat)
 export QA_SERIAL="$(scripts/qa/android-setup.sh)"          # --fresh = new account
-# iOS (creates/boots "Sonar QA iPhone", signed Debug build, log stream)
+# iOS (creates/boots "Sonar QA <worktree>", signed Debug build, log stream)
 export QA_UDID="$(scripts/qa/ios-setup.sh --build-core)"   # later runs: no flag
 ```
 
@@ -61,7 +61,12 @@ the gaps from `$QA_HOME/config-gaps.txt` as "not run" in the report.
 `ios-setup.sh` also refuses a `sonarffi.xcframework` not built from this
 worktree's `core/` tree (`--build-core` rebuilds, `--trust-core` overrides).
 `android-setup.sh` refuses an emulator on the port whose AVD is not the one
-requested — it may be another agent's.
+requested, or one another worktree set up in the same boot — it is another
+agent's (create a second AVD and pass `--avd`/`--port`; `--take-over` only
+when that agent is gone). The iOS simulator and `QA_HOME` are per worktree by
+default, so parallel agents never share a device or artifacts. Each setup
+rewrites its platform's lines in `config-gaps.txt`, so the file always
+reflects the latest run.
 
 If the app is not onboarded yet, onboard it by hand (nickname, *Start
 chatting*, grant prompts) — that *is* scenario QA-022 on a fresh install.

@@ -15,7 +15,7 @@
 #                                             containing <substring> and exit 0 the
 #                                             moment it arrives; exit 1 on timeout
 #
-# Env: QA_HOME (default $TMPDIR/sonar-qa), SONAR_CLI (default core/target/release/sonar-cli).
+# Env: QA_HOME (default $TMPDIR/sonar-qa-<worktree>), SONAR_CLI (default core/target/release/sonar-cli).
 #
 # Known limits (see .agents/skills/qa-pass/reference.md):
 # - Only 1:1 welcomes auto-join. Multi-member group invites stay pending in the
@@ -28,7 +28,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-QA_HOME="${QA_HOME:-${TMPDIR:-/tmp}/sonar-qa}"
+QA_HOME="${QA_HOME:-${TMPDIR:-/tmp}/sonar-qa-$(basename "$ROOT")}"
 CLI="${SONAR_CLI:-$ROOT/core/target/release/sonar-cli}"
 PEERS="$QA_HOME/peers"
 mkdir -p "$PEERS"

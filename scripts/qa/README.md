@@ -8,7 +8,7 @@ and, when it can be driven headlessly, a function to `android-smoke.sh`.
 
 ```bash
 cargo build -p sonar-cli --release --manifest-path core/Cargo.toml
-export QA_HOME="$TMPDIR/sonar-qa"
+export QA_HOME="$TMPDIR/sonar-qa-$(basename "$PWD")"   # per worktree (the default)
 
 export QA_SERIAL="$(scripts/qa/android-setup.sh)"   # QA emulator + Debug build + logcat
 scripts/qa/android-smoke.sh                          # scripted scenarios, exit = failures
@@ -19,8 +19,8 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 
 | Script | Purpose |
 |---|---|
-| `android-setup.sh` | Boot the dedicated AVD (`Sonar_QA_API_36`) by serial — refusing a port owned by another AVD — `installDebug` in place, logcat to `$QA_HOME`. `--fresh` clears app data for onboarding scenarios (emulators only). Refuses a missing Breez key / `google-services.json` unless `--allow-missing-config`. |
-| `ios-setup.sh` | Create/boot the "Sonar QA iPhone" simulator, build **signed** Debug (App Group ⇒ the Marmot store opens), install, stream the unified log. Refuses a stale `sonarffi.xcframework` (`--build-core` / `--trust-core`) and missing Breez / Firebase config unless `--allow-missing-config`. |
+| `android-setup.sh` | Boot the dedicated AVD (`Sonar_QA_API_36`) by serial — refusing a port owned by another AVD, or an emulator another worktree set up in the same boot (`--take-over` overrides) — `installDebug` in place, logcat to `$QA_HOME`. `--fresh` clears app data for onboarding scenarios (emulators only). Refuses a missing Breez key / `google-services.json` unless `--allow-missing-config`. |
+| `ios-setup.sh` | Create/boot this worktree's "Sonar QA <worktree>" simulator (so parallel agents never share one), build **signed** Debug (App Group ⇒ the Marmot store opens), install, stream the unified log. Refuses a stale `sonarffi.xcframework` (`--build-core` / `--trust-core`) and missing Breez / Firebase config unless `--allow-missing-config`; `BREEZ_API_KEY` in the environment counts. |
 | `android-ui.sh` | uiautomator driver: `dump`, `tapx`/`tapt`/`tapedit`, `wait`/`gone`, `ime`, `shot`. |
 | `peers.sh` | Fresh `sonar-cli` counterparties: `new`, `send`, `send-image`, `listen`, `expect`. |
 | `android-smoke.sh` | Automated registry scenarios (`qaNNN` = `QA-NNN`). |

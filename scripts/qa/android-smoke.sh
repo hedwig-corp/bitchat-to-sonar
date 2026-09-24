@@ -19,7 +19,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export QA_SERIAL="${QA_SERIAL:?set QA_SERIAL (see scripts/qa/android-setup.sh)}"
-export QA_HOME="${QA_HOME:-${TMPDIR:-/tmp}/sonar-qa}"
+export QA_HOME="${QA_HOME:-${TMPDIR:-/tmp}/sonar-qa-$(basename "$ROOT")}"
 UI="$ROOT/scripts/qa/android-ui.sh"
 PEERS="$ROOT/scripts/qa/peers.sh"
 ONLY=""; MAX_IDLE=3
@@ -170,6 +170,10 @@ qa005() { # divider sits exactly between the last read row and the first unread 
   "$UI" wait "Back" 10 >/dev/null; sleep 2
   go_home || { record QA-005 FAIL "could not reach the chat list"; return; }
   "$PEERS" send "c-$RUN" "$APP_NPUB" "qa005 unread one $RUN" >/dev/null
+  # Messages carry second-resolution timestamps and a same-second tie is
+  # broken by message id, not send order: keep the two sends >1 s apart so
+  # "unread one" is deterministically rendered above "unread two".
+  sleep 2
   "$PEERS" send "c-$RUN" "$APP_NPUB" "qa005 unread two $RUN" >/dev/null
   "$UI" wait "qa005 unread two $RUN" 45 >/dev/null || { record QA-005 FAIL "second unread never reached the list"; return; }
   ui tapt "qa005 unread two $RUN"
@@ -194,7 +198,13 @@ qa040() { # chat, home and search controls carry spoken labels (A9/A21)
   done
   hasx "Send" || hasx "Record voice message" || missing+=("chat:Send/Record voice message")
   # uiautomator marks an edit field with no spoken label NAF (shown as E!).
-  "$UI" dump 2>/dev/null | awk -F'\t' '$2 == "E!"' | grep -q . && missing+=("chat:composer field")
+  # A failed dump is a failure, never a silent "no unlabelled field".
+  local rows
+  if rows="$("$UI" dump 2>/dev/null)"; then
+    grep -q $'\tE!\t' <<<"$rows" && missing+=("chat:composer field")
+  else
+    missing+=("chat:dump failed")
+  fi
   # Home.
   if go_home; then
     for label in "Settings" "Start a chat" "Nearby"; do hasx "$label" || missing+=("home:$label"); done
@@ -204,7 +214,11 @@ qa040() { # chat, home and search controls carry spoken labels (A9/A21)
   # Search field.
   if ui tapx "Search"; then
     sleep 1
-    "$UI" dump 2>/dev/null | awk -F'\t' '$2 == "E!"' | grep -q . && missing+=("search:field")
+    if rows="$("$UI" dump 2>/dev/null)"; then
+      grep -q $'\tE!\t' <<<"$rows" && missing+=("search:field")
+    else
+      missing+=("search:dump failed")
+    fi
   else
     missing+=("search:unreachable")
   fi
@@ -217,10 +231,12 @@ qa040() { # chat, home and search controls carry spoken labels (A9/A21)
 }
 
 qa007() { # a partial npub offers no chat or channel action (A18)
-  [[ -n "${A_NPUB:-}" ]] || A_NPUB="npub1pqm5mzn6ph0ldzd2ldflq9g9xv25yc5tqrzkyll042mggs40p5fsh2d6mz"
+  # A local copy: QA-043 reads A_NPUB as "QA-001 made a chat", so the
+  # fallback for a solo --only QA-007 run must not leak into it.
+  local npub="${A_NPUB:-npub1pqm5mzn6ph0ldzd2ldflq9g9xv25yc5tqrzkyll042mggs40p5fsh2d6mz}"
   go_home || { record QA-007 FAIL "could not reach the chat list"; return; }
   ui tapx "Search"; sleep 1; ui tapedit; sleep 0.5
-  ui type "${A_NPUB:0:9}"; sleep 1.5
+  ui type "${npub:0:9}"; sleep 1.5
   local bad=()
   hasx "Start secure chat" && bad+=("Start secure chat")
   hasx "Join channel" && bad+=("Join channel")
@@ -230,7 +246,7 @@ qa007() { # a partial npub offers no chat or channel action (A18)
   # Positive path: the complete npub must still offer the chat, or a search
   # that rejects every npub would pass the check above.
   go_home >/dev/null; ui tapx "Search"; sleep 1; ui tapedit; sleep 0.5
-  ui type "$A_NPUB"
+  ui type "$npub"
   if "$UI" wait "Start secure chat" 10 >/dev/null; then
     record QA-007 PASS "partial npub: no action; complete npub: Start secure chat"
   else
@@ -256,7 +272,7 @@ qa041() { # the profile "scan this to add you" code is a real QR of the npub (A2
 }
 
 qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
-  local bad=() entry
+  local bad=() skipped=""
   naf_check() { # label — a failed dump is a failure, never an empty (passing) sweep
     local out
     if ! out="$("$UI" naf 2>/dev/null)"; then bad+=("$1:dump-failed"); return; fi
@@ -278,16 +294,29 @@ qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
     # The row previews the chat's LATEST message: QA-002's reply after it ran.
     if ui tapt "qa002 reply $RUN" || ui tapt "qa001 hello $RUN"; then
       sleep 2; naf_check chat
-      ui tap 400 188; sleep 2; naf_check contact-profile   # header → contact profile
+      # The header's name block (right of Back) opens the contact profile.
+      # Assert a profile-only row before auditing, so a dead header cannot
+      # make the sweep audit the chat a second time under the profile's name.
+      local back; back="$("$UI" findx "Back" 2>/dev/null)"
+      if [[ -n "$back" ]] && ui tap $(( ${back% *} + 300 )) "${back#* }" &&
+         "$UI" wait "Key fingerprint" 6 >/dev/null; then
+        naf_check contact-profile
+      else
+        bad+=("contact-profile:not reached")
+      fi
     else
       bad+=("chat:QA-001/002 row not found")
     fi
     go_home >/dev/null
-  fi
-  if (( ${#bad[@]} == 0 )); then
-    record QA-043 PASS "no NAF nodes on the swept screens"
   else
-    record QA-043 FAIL "unlabelled nodes (screen:count): ${bad[*]} — run android-ui.sh naf there"
+    skipped="chat and contact-profile not swept (needs QA-001's chat)"
+  fi
+  if (( ${#bad[@]} )); then
+    record QA-043 FAIL "unlabelled nodes or unreached screens: ${bad[*]} — run android-ui.sh naf there"
+  elif [[ -n "$skipped" ]]; then
+    record QA-043 SKIP "home/search/start-chat/nearby/settings clean; $skipped"
+  else
+    record QA-043 PASS "no NAF nodes on the swept screens"
   fi
 }
 
