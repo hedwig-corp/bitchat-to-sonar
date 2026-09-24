@@ -183,8 +183,9 @@ object PayStatusCopy {
             "Your payment is hopping through the Lightning network."
         PayPhase.Slow ->
             "The first route didn’t answer. Trying another — this can take a minute."
+        // No proof claim: a payment inside one mint settles with no preimage.
         PayPhase.Sent ->
-            "They received ${amount(sats)} sats. You have cryptographic proof of payment."
+            "They received ${amount(sats)} sats."
         PayPhase.FailedSafe ->
             "No route to $payee right now. You were not charged."
         PayPhase.Refunded ->
@@ -203,7 +204,7 @@ object PayStatusCopy {
         PayPhase.Slow ->
             PayMoneyTone.Warn to "Still in flight — held, not lost"
         PayPhase.Sent ->
-            PayMoneyTone.Good to "${amount(sats)} sats delivered · proof received"
+            PayMoneyTone.Good to "${amount(sats)} sats delivered"
         PayPhase.FailedSafe ->
             PayMoneyTone.Safe to "Nothing left your wallet — balance unchanged"
         PayPhase.Refunded ->
@@ -217,7 +218,7 @@ object PayStatusCopy {
         PayPhase.Resolving -> "Resolving destination…"
         PayPhase.Paying -> "Sending · ${elapsed(elapsedSecs)}"
         PayPhase.Slow -> "Still trying · ${elapsed(elapsedSecs)}"
-        PayPhase.Sent -> "Sent · proof stored"
+        PayPhase.Sent -> "Sent · delivered"
         PayPhase.FailedSafe -> "Not sent · not charged"
         PayPhase.Refunded -> "Refunded to balance"
         PayPhase.Unknown -> "Confirming · ${elapsed(elapsedSecs)}"
@@ -292,7 +293,7 @@ object PayStatusCopy {
         PayPhase.Slow ->
             "Taking longer than usual" to "$payee · still in flight"
         PayPhase.Sent ->
-            "Sent ${amount(sats)} sats" to "$payee · proof stored"
+            "Sent ${amount(sats)} sats" to "$payee · delivered"
         PayPhase.FailedSafe ->
             "Payment didn’t go through" to "$payee · you weren’t charged"
         PayPhase.Refunded ->

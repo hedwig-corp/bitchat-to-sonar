@@ -193,7 +193,8 @@ enum SNPayStatusCopy {
         case .slow:
             return "The first route didn\u{2019}t answer. Trying another \u{2014} this can take a minute."
         case .sent:
-            return "They received \(amount(sats)) sats. You have cryptographic proof of payment."
+            // No proof claim: a payment inside one mint settles with no preimage.
+            return "They received \(amount(sats)) sats."
         case .failedSafe:
             return "No route to \(payee) right now. You were not charged."
         case .refunded:
@@ -214,7 +215,7 @@ enum SNPayStatusCopy {
         case .slow:
             return (.warn, "Still in flight \u{2014} held, not lost")
         case .sent:
-            return (.good, "\(amount(sats)) sats delivered \u{00B7} proof received")
+            return (.good, "\(amount(sats)) sats delivered")
         case .failedSafe:
             return (.safe, "Nothing left your wallet \u{2014} balance unchanged")
         case .refunded:
@@ -230,7 +231,7 @@ enum SNPayStatusCopy {
         case .resolving: return "Resolving destination\u{2026}"
         case .paying: return "Sending \u{00B7} \(elapsed(elapsedSeconds))"
         case .slow: return "Still trying \u{00B7} \(elapsed(elapsedSeconds))"
-        case .sent: return "Sent \u{00B7} proof stored"
+        case .sent: return "Sent \u{00B7} delivered"
         case .failedSafe: return "Not sent \u{00B7} not charged"
         case .refunded: return "Refunded to balance"
         case .unknown: return "Confirming \u{00B7} \(elapsed(elapsedSeconds))"
@@ -298,7 +299,7 @@ enum SNPayStatusCopy {
         case .slow:
             return ("Taking longer than usual", "\(payee) \u{00B7} still in flight")
         case .sent:
-            return ("Sent \(amount(sats)) sats", "\(payee) \u{00B7} proof stored")
+            return ("Sent \(amount(sats)) sats", "\(payee) \u{00B7} delivered")
         case .failedSafe:
             return ("Payment didn\u{2019}t go through", "\(payee) \u{00B7} you weren\u{2019}t charged")
         case .refunded:

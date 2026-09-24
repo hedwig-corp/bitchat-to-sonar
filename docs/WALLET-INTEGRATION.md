@@ -193,6 +193,10 @@ preimage) run only on explicit approval of the amounts.
   per-device seeds, or a counter resync on `AlreadySigned`.
 - Existing installs already carry a Breez seed, so they run a legacy Breez node
   every launch until the user deletes it, even when it is empty.
+- A melt the mint settles internally (Sonar to Sonar on one mint, the common
+  case) returns no preimage, so `⚡PAYDONE|2` carries none. The payment status
+  copy therefore no longer claims a "cryptographic proof" on any payment.
+  Follow-up: show the proof line again when a preimage did come back.
 - A store that is already corrupted is not rebuilt: connect fails on every
   retry and the wallet reads "Mint offline — retrying". The funds stay at the
   mint and a NUT-13 restore into a fresh store would recover them. The one

@@ -128,7 +128,7 @@ class PaymentStatusTest {
             PayPhase.Resolving to "Nothing sent yet — your sats are still yours",
             PayPhase.Paying to "2,100 sats in flight — not yet settled",
             PayPhase.Slow to "Still in flight — held, not lost",
-            PayPhase.Sent to "2,100 sats delivered · proof received",
+            PayPhase.Sent to "2,100 sats delivered",
             PayPhase.FailedSafe to "Nothing left your wallet — balance unchanged",
             PayPhase.Refunded to "2,100 sats returned to your balance",
             PayPhase.Unknown to "Sats reserved — we’ll confirm or refund automatically",
@@ -136,6 +136,18 @@ class PaymentStatusTest {
         for ((phase, text) in expected) {
             assertEquals(text, PayStatusCopy.money(phase, 2_100).second, "money line for $phase")
         }
+    }
+
+    @Test
+    fun aSettledPaymentNeverClaimsAProofItMayNotHave() {
+        // A payment inside one mint settles internally, with no preimage.
+        val lines = listOf(
+            PayStatusCopy.hint(PayPhase.Sent, "Ana", 2_100),
+            PayStatusCopy.money(PayPhase.Sent, 2_100).second,
+            PayStatusCopy.walletRow(PayPhase.Sent, 0),
+            PayStatusCopy.homeStrip(PayPhase.Sent, "Ana", 2_100).second,
+        )
+        for (line in lines) assertFalse("proof" in line, line)
     }
 
     @Test

@@ -95,7 +95,7 @@ final class SonarPaymentStatusTests: XCTestCase {
             .resolving: "Nothing sent yet — your sats are still yours",
             .paying: "\(n) sats in flight — not yet settled",
             .slow: "Still in flight — held, not lost",
-            .sent: "\(n) sats delivered · proof received",
+            .sent: "\(n) sats delivered",
             .failedSafe: "Nothing left your wallet — balance unchanged",
             .refunded: "\(n) sats returned to your balance",
             .unknown: "Sats reserved — we’ll confirm or refund automatically"
@@ -108,6 +108,19 @@ final class SonarPaymentStatusTests: XCTestCase {
         }
         // Every phase must have one — this is the design's core promise.
         XCTAssertEqual(expected.count, SNPayPhase.allCases.count)
+    }
+
+    func testASettledPaymentNeverClaimsAProofItMayNotHave() {
+        // A payment inside one mint settles internally, with no preimage.
+        let lines = [
+            SNPayStatusCopy.hint(.sent, payee: "Ana", sats: 2_100),
+            SNPayStatusCopy.money(.sent, sats: 2_100).text,
+            SNPayStatusCopy.walletRow(.sent, elapsedSeconds: 0),
+            SNPayStatusCopy.homeStrip(.sent, payee: "Ana", sats: 2_100).sub
+        ]
+        for line in lines {
+            XCTAssertFalse(line.contains("proof"), line)
+        }
     }
 
     func testHeadlinesMatchTheDesign() {
