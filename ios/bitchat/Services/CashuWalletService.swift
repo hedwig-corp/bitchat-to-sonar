@@ -615,11 +615,12 @@ final class CashuWalletService: ObservableObject {
         throw CashuWalletError.mintOffline
     }
 
-    func receiveInvoice(amountSats: Int64, description: String?) async throws -> String {
+    func receiveInvoice(amountSats: Int64, description: String?) async throws -> SonarReceiveInvoice {
         guard let n = native else { throw CashuWalletError.notOpen }
         guard amountSats > 0 else { throw CashuWalletError.invalidInput("amount must be greater than zero") }
         do {
-            return try await run { try n.receiveInvoice(amountSats: UInt64(amountSats), description: description).invoice }
+            let issued = try await run { try n.receiveInvoice(amountSats: UInt64(amountSats), description: description) }
+            return SonarReceiveInvoice(invoice: issued.invoice, paymentId: issued.paymentId)
         } catch {
             throw CashuWalletError(error)
         }
@@ -724,6 +725,38 @@ final class CashuWalletService: ObservableObject {
             }
             throw typed
         }
+    }
+
+    /// Price a send without paying it: the mint's fee RESERVE (`prepareSend`
+    /// `feesSats`) for `amountSats` to `destination` — the most the payment
+    /// can cost on top of the amount. For the send confirmation sheet only.
+    ///
+    /// The quote is DISCARDED: `send` prepares again, so a stale quote is
+    /// never what gets paid. Nothing is spent, no send is counted in flight,
+    /// and this never connects on its own — the connect loop owns that; a
+    /// disconnected wallet answers `.mintOffline` and the sheet shows no fee
+    /// line. `amountSats` 0 lets an invoice speak for its own amount. Runs on
+    /// the wallet queue; throws a typed `CashuWalletError`.
+    func quoteFee(destination: String, amountSats: Int64) async throws -> Int64 {
+        guard let n = native else { throw CashuWalletError.notOpen }
+        let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !dest.isEmpty, amountSats >= 0 else {
+            throw CashuWalletError.invalidInput("missing destination or amount")
+        }
+        let requested: UInt64? = amountSats > 0 ? UInt64(amountSats) : nil
+        let myEpoch = epoch
+        let fee: UInt64
+        do {
+            fee = try await run {
+                guard n.isConnected() else { throw WalletFfiError.NotConnected }
+                return try n.prepareSend(destination: dest, amountSats: requested).feesSats ?? 0
+            }
+        } catch {
+            throw CashuWalletError(error)
+        }
+        // An account switch while quoting: this fee belongs to another wallet.
+        guard epoch == myEpoch, native === n else { throw CashuWalletError.notOpen }
+        return Int64(clamping: fee)
     }
 
     private nonisolated static func exceeds(_ amount: UInt64, _ fee: UInt64, _ balance: UInt64) -> Bool {

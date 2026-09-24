@@ -173,6 +173,120 @@ private struct SNPayPop: ViewModifier {
     }
 }
 
+// MARK: - Destination kind + footer copy
+
+/// What a raw payment destination is, for copy and amount handling. Same
+/// prefix rules as `SNExternalDestination` / `SNScannedKind`, which hand the
+/// sheet an already-extracted rail (never a `lightning:`/`bitcoin:` URI).
+enum SNPayDestinationKind: Equatable {
+    /// BOLT11 invoice: carries its own amount.
+    case bolt11
+    /// BOLT12 offer.
+    case bolt12
+    /// A contact, username, Lightning address — anything with a name.
+    case named
+
+    init(_ destination: String?) {
+        let v = destination?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if v.hasPrefix("lno1") {
+            self = .bolt12
+        } else if v.hasPrefix("lnbc") || v.hasPrefix("lntb") || v.hasPrefix("lnbcrt") {
+            self = .bolt11
+        } else {
+            self = .named
+        }
+    }
+}
+
+/// The line under the pay sheet's Send button. A raw invoice or offer is not
+/// a person: "Pays lnbc5u1p4tg7…'s wallet directly" read as a name.
+enum SNPayFooterCopy {
+    /// `destination` is the raw rail for an external payment, nil when paying
+    /// a contact through their chat.
+    static func note(destination: String?, peerName: String, transport: SNVia) -> String {
+        switch SNPayDestinationKind(destination) {
+        case .bolt11:
+            return String(localized: "Pays this Lightning invoice.")
+        case .bolt12:
+            return String(localized: "Pays this Bolt12 offer.")
+        case .named:
+            if transport == .mesh {
+                return "Chat can stay on Bluetooth. The payment goes straight to \(peerName)\u{2019}s wallet."
+            }
+            return "Pays \(peerName)\u{2019}s wallet directly. No claim step."
+        }
+    }
+}
+
+// MARK: - Fee before confirm
+
+/// Quotes the most a send of `sats` can cost on top of the amount. Built by
+/// `SonarAppStore.feeQuoter(...)` for the primary wallet only.
+typealias SNFeeQuoter = @MainActor (_ sats: Int64) async throws -> Int64
+
+/// The pay sheet's fee line: "Checking the fee…" while a quote is pending,
+/// "Network fee: up to X" once known, nothing when there is no quote (legacy
+/// wallet, no amount) or the quote failed. It NEVER gates the Send button —
+/// the wallet re-checks the real fee at send time.
+enum SNFeeQuote {
+    enum State: Equatable {
+        case hidden
+        case checking
+        case quoted(Int64)
+    }
+
+    /// Typing on the keypad re-quotes only once the amount settles.
+    static let debounceNanos: UInt64 = 400_000_000
+
+    /// What to show the moment the amount changes, before the debounce.
+    static func initialState(sats: Int64, quote: SNFeeQuoter?) -> State {
+        (quote != nil && sats > 0) ? .checking : .hidden
+    }
+
+    /// Debounce, then quote. nil = superseded (the task was cancelled because
+    /// the amount changed again): keep whatever the newer quote shows, and
+    /// never hit the mint for an amount the user already typed past.
+    static func resolve(
+        sats: Int64,
+        quote: SNFeeQuoter?,
+        debounceNanos: UInt64 = SNFeeQuote.debounceNanos
+    ) async -> State? {
+        guard let quote, sats > 0 else { return .hidden }
+        do {
+            try await Task.sleep(nanoseconds: debounceNanos)
+        } catch {
+            return nil
+        }
+        let fee: Int64?
+        do {
+            fee = try await quote(sats)
+        } catch {
+            fee = nil
+        }
+        guard !Task.isCancelled else { return nil }
+        return fee.map { .quoted(max($0, 0)) } ?? .hidden
+    }
+
+    /// The line the pay sheet renders: always in sats, like the amount above
+    /// it. A fee reserve is a few sats, which the fiat formatter rounded to
+    /// "CHF 0.00" (QA, #614).
+    static func sheetLine(_ state: State) -> String? {
+        line(state, money: sonarFormatSats)
+    }
+
+    static func line(_ state: State, money: (Int64) -> String) -> String? {
+        switch state {
+        case .hidden:
+            return nil
+        case .checking:
+            return String(localized: "Checking the fee…")
+        case .quoted(let fee):
+            let amount = money(fee)
+            return String(localized: "Network fee: up to \(amount)")
+        }
+    }
+}
+
 // MARK: - Pay sheet (balance, big amount, quick chips, keypad, send)
 
 private let snPayKeys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0", "del"]
@@ -195,6 +309,12 @@ struct SNPaySheet: View {
     /// out of it at send time (prepare at the full balance, subtract the
     /// quoted fee reserve, prepare again). False = the legacy 0.5% reserve.
     var usesFeeInclusiveMax: Bool = false
+    /// The raw rail for an external payment (invoice / offer / address); nil
+    /// when paying a contact. Picks the footer copy — see `SNPayFooterCopy`.
+    var destination: String? = nil
+    /// Primary wallet only: prices the send so the fee shows BEFORE the user
+    /// confirms. nil = no fee line (legacy wallet, destination unknown).
+    var quoteFee: SNFeeQuoter? = nil
     let onClose: () -> Void
     let onSend: (Int64) -> Void
     /// Called instead of `onSend` when the amount is an untouched fee-inclusive
@@ -204,6 +324,7 @@ struct SNPaySheet: View {
     @State private var v = ""
     /// The amount came from a fee-inclusive `Max` tap and was not edited.
     @State private var maxSelected = false
+    @State private var feeState: SNFeeQuote.State = .hidden
 
     private var sats: Int64 { fixedSats ?? (Int64(v) ?? 0) }
     /// Whether there is an amount to show. `v` is the *keypad* buffer, and a
@@ -221,12 +342,12 @@ struct SNPaySheet: View {
     // legacy Breez: `SonarWallet.send`) before anything is paid.
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
-    private var directNote: String {
-        if transport == .mesh {
-            return "Chat can stay on Bluetooth. The payment goes straight to \(peerName)\u{2019}s wallet."
-        }
-        return "Pays \(peerName)\u{2019}s wallet directly. No claim step."
+    /// Footer under the Send button (internal so tests pin THIS call site).
+    var directNote: String {
+        SNPayFooterCopy.note(destination: destination, peerName: peerName, transport: transport)
     }
+    /// The amount to price: only a sendable one, and only with a quoter.
+    private var quoteSats: Int64 { (quoteFee != nil && can) ? sats : 0 }
     private func tap(_ k: String) {
         maxSelected = false
         if k == "del" {
@@ -355,6 +476,16 @@ struct SNPaySheet: View {
 
             // .bc-sheetactions
             VStack(spacing: 6) {
+                // The mint's fee reserve, before the user confirms. Space is
+                // reserved while a quoter exists so the button never jumps;
+                // the button itself never waits on the quote.
+                if quoteFee != nil {
+                    Text(verbatim: SNFeeQuote.sheetLine(feeState) ?? " ")
+                        .font(SonarTheme.uiFont(size: 12.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text2)
+                        .frame(maxWidth: .infinity, minHeight: 17)
+                        .accessibilityHidden(feeState == .hidden)
+                }
                 SNPrimaryButton(
                     label: "Send money",
                     net: true,
@@ -369,6 +500,14 @@ struct SNPaySheet: View {
                     .padding(EdgeInsets(top: 2, leading: 14, bottom: 0, trailing: 14))
             }
             .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
+        }
+        // Re-quote whenever the sendable amount changes; SwiftUI cancels the
+        // previous task, which is what makes the debounce work.
+        .task(id: quoteSats) {
+            feeState = SNFeeQuote.initialState(sats: quoteSats, quote: quoteFee)
+            if let next = await SNFeeQuote.resolve(sats: quoteSats, quote: quoteFee) {
+                feeState = next
+            }
         }
     }
 }

@@ -260,6 +260,7 @@ struct SonarSendPaymentScreen: View {
                     money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
                     usesFeeInclusiveMax: store.usesFeeInclusiveMax(source),
+                    quoteFee: store.feeQuoter(forContact: contact.id, source: source),
                     onClose: { contactTarget = nil },
                     onSend: { sats in
                         payContact(contact, sats: sats, feeFromAmount: false)
@@ -299,6 +300,8 @@ struct SonarSendPaymentScreen: View {
                     fiatText: { store.fiatText($0) },
                     fixedSats: fixedSats,
                     usesFeeInclusiveMax: store.usesFeeInclusiveMax(source),
+                    destination: destination,
+                    quoteFee: store.feeQuoter(destination: destination, source: source),
                     onClose: { externalTarget = nil; fixedSats = nil },
                     onSend: { sats in
                         payExternal(destination, sats: sats, feeFromAmount: false)

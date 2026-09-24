@@ -38,6 +38,11 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
     /// Status of the payment `send` returns.
     var sendStatus: WalletPaymentStatus = .complete
     var sendError: Error?
+    /// Thrown by `prepareSend` (after the connected check), e.g. a typed
+    /// `InvalidDestination` from the mint's quote.
+    var prepareError: Error?
+    /// Thrown by `receiveInvoice`.
+    var receiveInvoiceError: Error?
     var sendPreimage: String? = nil
     var lookupResult: WalletPayment?
 
@@ -119,6 +124,7 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
         record("prepareSend")
         lock.lock(); preparedAmounts.append(amountSats); lock.unlock()
         guard isConnectedLocked() else { throw WalletFfiError.NotConnected }
+        if let prepareError { throw prepareError }
         return WalletPreparedSend(
             quoteId: "quote-\(preparedAmounts.count)",
             destination: destination,
@@ -130,6 +136,7 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
 
     func receiveInvoice(amountSats: UInt64, description: String?) throws -> WalletInvoice {
         record("receiveInvoice")
+        if let receiveInvoiceError { throw receiveInvoiceError }
         return WalletInvoice(invoice: "lnbc\(amountSats)fake", paymentId: "mint-quote-\(amountSats)")
     }
 

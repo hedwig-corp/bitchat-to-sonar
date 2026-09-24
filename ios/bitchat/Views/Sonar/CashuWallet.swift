@@ -95,8 +95,12 @@ final class CashuWallet: SonarWalletProviding {
         try await service.createOffer()
     }
 
-    func receiveInvoice(amountSats: Int64, description: String?) async throws -> String {
+    func receiveInvoice(amountSats: Int64, description: String?) async throws -> SonarReceiveInvoice {
         try await service.receiveInvoice(amountSats: amountSats, description: description)
+    }
+
+    func quoteFee(destination: String, amountSats: Int64) async throws -> Int64 {
+        try await service.quoteFee(destination: destination, amountSats: amountSats)
     }
 
     func paymentUpdates() -> AsyncStream<SonarWalletPayment> {

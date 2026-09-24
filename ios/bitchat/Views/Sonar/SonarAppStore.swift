@@ -9162,6 +9162,49 @@ final class SonarAppStore: ObservableObject {
     /// the legacy Breez wallet keeps the 0.5% reserve estimate.
     func usesFeeInclusiveMax(_ source: SNPaymentSource) -> Bool { source == .primary }
 
+    /// The amount handed to the wallet for `destination`: 0 for a BOLT11
+    /// invoice (it speaks for its own amount), `sats` for everything else.
+    /// The send path and the fee quote share it, so the quote prices exactly
+    /// what `send` will prepare.
+    nonisolated static func walletAmount(forDestination destination: String, sats: Int64) -> Int64 {
+        SNPayDestinationKind(destination) == .bolt11 ? 0 : sats
+    }
+
+    /// The pay sheet's fee quote for paying `destination` from `wallet`. The
+    /// FFI call runs on the wallet's own queue (never the main thread).
+    static func feeQuoter(wallet: SonarWalletProviding, destination: String) -> SNFeeQuoter {
+        let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        return { [weak wallet] sats in
+            guard let wallet else { throw UnconfiguredWallet.WalletError.notConfigured }
+            return try await wallet.quoteFee(
+                destination: dest,
+                amountSats: walletAmount(forDestination: dest, sats: sats)
+            )
+        }
+    }
+
+    /// Fee quote for an external destination. Primary (Cashu) wallet only;
+    /// nil hides the fee line.
+    func feeQuoter(destination: String, source: SNPaymentSource = .primary) -> SNFeeQuoter? {
+        guard source == .primary else { return nil }
+        return Self.feeQuoter(wallet: wallet, destination: destination)
+    }
+
+    /// Fee quote for paying a contact: priced against the BOLT12 offer
+    /// `sendPay` will use. Cache-only — no descriptor fetch from a sheet
+    /// render; nil (no fee line) until the offer is known.
+    func feeQuoter(forContact id: String, source: SNPaymentSource = .primary) -> SNFeeQuoter? {
+        guard source == .primary, let offer = cachedPaymentOffer(id) else { return nil }
+        return feeQuoter(destination: offer, source: source)
+    }
+
+    /// A one-off BOLT11 invoice on the primary wallet, for the Receive sheet.
+    /// The wallet runs the FFI call off the main thread and throws its typed
+    /// errors (`SNReceiveSheetCopy.invoiceError` words them for a receive).
+    func receiveInvoice(sats: Int64) async throws -> SonarReceiveInvoice {
+        try await wallet.receiveInvoice(amountSats: sats, description: nil)
+    }
+
     /// Settings / wallet screen line for the primary wallet: the live
     /// balance, "Mint offline — retrying", or setup progress.
     var walletStatusLine: String? {
@@ -9382,13 +9425,14 @@ final class SonarAppStore: ObservableObject {
             return .refuse(String(localized: "Your wallet is still starting. Try again in a moment."))
         }
         let lower = dest.lowercased()
-        let isBolt11 = lower.hasPrefix("lnbc") || lower.hasPrefix("lntb") || lower.hasPrefix("lnbcrt")
+        let isBolt11 = SNPayDestinationKind(dest) == .bolt11
         if isBolt11, SNScannedKind.bolt11AmountSats(lower) == nil {
             return .refuse(
                 "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
             )
         }
-        return .send(isBolt11 ? 0 : sats)
+        // Shared with the fee quote, so the quote prices what is sent.
+        return .send(Self.walletAmount(forDestination: dest, sats: sats))
     }
 
     /// Starts paying an arbitrary Lightning destination from the send-payment

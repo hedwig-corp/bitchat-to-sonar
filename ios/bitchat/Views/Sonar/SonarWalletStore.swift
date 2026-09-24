@@ -61,6 +61,14 @@ struct SonarCurrency: Equatable, Identifiable {
     var id: String { code }
 }
 
+/// A one-time invoice from `receiveInvoice`. Its payment arrives as an
+/// incoming `SonarWalletPayment` whose `id` equals `paymentId` (nil when the
+/// wallet cannot say), so the Receive sheet can tell THIS invoice was paid.
+struct SonarReceiveInvoice: Equatable, Sendable {
+    let invoice: String
+    let paymentId: String?
+}
+
 /// Wallet payment metadata surfaced to app state after a send settles.
 /// This is intentionally independent from the Breez SDK type so UI code does
 /// not import wallet internals.
@@ -208,8 +216,15 @@ protocol SonarWalletProviding: AnyObject {
     /// The reusable receive offer (creating it the first time if needed).
     func createOffer() async throws -> String
 
-    /// A one-off BOLT11 invoice.
-    func receiveInvoice(amountSats: Int64, description: String?) async throws -> String
+    /// A one-off BOLT11 invoice, with the id its payment will carry.
+    func receiveInvoice(amountSats: Int64, description: String?) async throws -> SonarReceiveInvoice
+
+    /// Price a send WITHOUT paying: the most the payment can cost on top of
+    /// `amountSats` (Cashu: the mint's fee reserve from `prepareSend`). Shown
+    /// on the send confirmation sheet only; the quote is discarded and `send`
+    /// prepares again, so a stale quote can never be paid. `amountSats` 0 lets
+    /// an invoice speak for its own amount. Wallets without a quote throw.
+    func quoteFee(destination: String, amountSats: Int64) async throws -> Int64
 
     /// Every payment update the backend observes, both directions, in order:
     /// receives, in-flight sends, settlements and failures.
@@ -253,7 +268,12 @@ extension SonarWalletProviding {
     var receiveOfferPublisher: AnyPublisher<String?, Never> { Just(nil).eraseToAnyPublisher() }
     var custodyDescription: String? { nil }
 
-    func receiveInvoice(amountSats: Int64, description: String?) async throws -> String {
+    func receiveInvoice(amountSats: Int64, description: String?) async throws -> SonarReceiveInvoice {
+        throw UnconfiguredWallet.WalletError.notConfigured
+    }
+
+    /// No quote (unconfigured, legacy Breez): the sheet simply shows no fee line.
+    func quoteFee(destination: String, amountSats: Int64) async throws -> Int64 {
         throw UnconfiguredWallet.WalletError.notConfigured
     }
 

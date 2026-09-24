@@ -676,6 +676,7 @@ private struct MacConversationPane: View {
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
                 usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
+                quoteFee: store.feeQuoter(forContact: id),
                 onClose: { paySheet = false },
                 onSend: { sats in
                     Task {

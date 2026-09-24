@@ -457,6 +457,7 @@ struct SonarContactProfileScreen: View {
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
                 usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
+                quoteFee: store.feeQuoter(forContact: effectiveChatId),
                 onClose: { paySheet = false },
                 onSend: { sats in
                     Task {

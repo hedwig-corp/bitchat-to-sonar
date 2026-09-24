@@ -609,6 +609,7 @@ struct SonarDMScreenContent: View {
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
                 usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
+                quoteFee: store.feeQuoter(forContact: peerId),
                 onClose: { paySheet = false },
                 onSend: { sats in
                     Task {
