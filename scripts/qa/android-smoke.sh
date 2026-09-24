@@ -72,11 +72,18 @@ go_home() {
 }
 
 open_chat_by_npub() {
-  go_home || return 1
-  ui tapx "Search"; sleep 1
-  ui tapedit; sleep 0.5                 # the search field (placeholder is not exposed)
-  ui type "$1"
-  "$UI" wait "Start secure chat" 10 >/dev/null || return 1
+  local attempt
+  # One retry: keystrokes injected right after a navigation (or during a cold
+  # start) can be dropped by the harness — a known adb/uiautomator trap, not
+  # an app result. A second miss is reported as a failure.
+  for attempt in 1 2; do
+    go_home || return 1
+    ui tapx "Search"; sleep 1
+    ui tapedit; sleep 0.5               # the search field (placeholder is not exposed)
+    ui type "$1"
+    "$UI" wait "Start secure chat" 10 >/dev/null && break
+    (( attempt == 2 )) && return 1
+  done
   ui tapx "Start secure chat" -1        # the button, not the row title
   "$UI" wait "Say hi to" 15 >/dev/null
 }
@@ -268,11 +275,12 @@ qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
   sweep settings "Settings" 1.5
   if [[ -n "${A_NPUB:-}" ]]; then
     go_home >/dev/null
-    if ui tapt "qa001 hello $RUN"; then
+    # The row previews the chat's LATEST message: QA-002's reply after it ran.
+    if ui tapt "qa002 reply $RUN" || ui tapt "qa001 hello $RUN"; then
       sleep 2; naf_check chat
       ui tap 400 188; sleep 2; naf_check contact-profile   # header → contact profile
     else
-      bad+=("chat:QA-001 row not found")
+      bad+=("chat:QA-001/002 row not found")
     fi
     go_home >/dev/null
   fi
@@ -290,6 +298,10 @@ qa050() { # idle CPU on the chat list
 }
 
 echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
+# Settle first: right after (re)install the app is still cold-starting and
+# drops input injected into its first screens.
+go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
+sleep 3
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
 # QA-040 inspects the chat QA-005 left open.
 for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa050; do
