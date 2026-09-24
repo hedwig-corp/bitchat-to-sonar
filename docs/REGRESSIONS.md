@@ -2659,6 +2659,131 @@ keep it until the UIKit path has device mileage.
 - *Port every row kind to UIKit.* Media/sticker/pay/call chrome is rare on the
   scroll path and would double a large amount of layout for no measured win.
 
+## R-045 — A pending chat that resolves on screen keeps its transcript live
+
+**Invariant:** when a pending chat (started by npub, or a pending group) resolves
+to its real Marmot group while it is on screen, the real conversation's
+`ConversationViewState` is attached to store invalidations and the pending one
+is detached — by the store, not by hoping SwiftUI fires `onAppear`/`onDisappear`.
+
+**Breaks as:** the first message in a freshly started chat sits at "Sending ·
+internet" forever although the relay acked it within ~300 ms and the peer
+received it, and a reply shows its notification banner but never appears in the
+open transcript. Leaving and reopening the chat "fixes" it. Another stuck-Sending
+root cause, distinct from R-001/R-025.
+
+**Why:** `finishPendingSecureChat` swaps `path.removeLast(); push(.dm(realId))`
+at the same stack depth, which SwiftUI can apply as an in-place update of the
+visible `SonarDMScreen` — so `onAppear(realId)` never fires — and then calls
+`openedDM(realId)` before any view has created the real id's render state, so
+its `activate()` is a no-op. The send path's direct `rebuildNow()` painted the
+echo once; nothing ever rebuilt it again.
+
+**Apple call site:** `SonarAppStore.finishPendingSecureChat` /
+`SonarAppStore.finishPendingMarmotGroup` → `handOverVisibleTranscript(from:to:)`.
+
+**Compose call site:** not affected — `SonarAppState.finishPendingMarmotChat`
+rewrites the stack entry and calls `beginTranscriptSession(chatId)` explicitly
+(inferred from code; not device-verified).
+
+**Guarded by:** `PendingChatTranscriptHandoverTests.resolvingTheVisiblePendingChatAttachesTheRealTranscript`
+(drives the real `startSecureChat` → `marmot.$groups` sink → `finishPendingSecureChat`
+path; fails without the handover on both the real and the pending state).
+
+**Not guarded:** the pending-GROUP twin (`finishPendingMarmotGroup`) has the same
+two-line handover but no test of its own. iOS tests do not run in CI.
+
+**Rejected:**
+- *`.id(id)` on the `SonarDMScreen` destination (as the Mac pane does).* Forces
+  a fresh view — and fresh `@State` — on the route swap, which would drop an
+  in-flight attachment import that `snPreservesAttachmentImport` deliberately
+  keeps across exactly this replacement. The store-side handover is idempotent
+  and does not depend on view identity.
+
+## R-046 — An open transcript keeps rebuilding while the store stays busy
+
+**Invariant:** `SNTranscriptRebuildSubscription` delivers at least one rebuild
+per interval while invalidations keep arriving (throttle with `latest: true`),
+never waiting for a quiet gap.
+
+**Breaks as:** during a sync burst or any invalidation feedback loop, the open
+chat freezes: sent messages stay "Sending", replies do not appear, until the
+store goes quiet.
+
+**Why:** the subscription used `.debounce(80 ms)`. `@Published` changes on the
+store and direct `objectWillChange.send()` calls bypass R-037's coalescer, so
+gaps under 80 ms can continue indefinitely — measured at ~20 Hz during the R-047
+loop, with zero transcript rebuilds for minutes.
+
+**Apple call site:** `SNTranscriptRebuildSubscription.attach(to:onInvalidate:)`.
+
+**Compose call site:** not applicable — Compose publishes scoped `StateFlow`
+state; there is no debounced whole-store subscription.
+
+**Guarded by:** `SNTranscriptRebuildSubscriptionTests.sustainedInvalidationsStillRebuildDuringTheStorm`
+
+**Not guarded:** that every invalidation source stays inside R-037's budget; the
+throttle bounds the transcript cost, not the store's.
+
+**Rejected:**
+- *Lower the debounce interval.* Any debounce starves under a stream faster
+  than its interval; it only moves the threshold.
+
+## R-047 — Marking an already-read conversation read is not a change
+
+**Invariant:** `SonarClient.mark_conversation_read` notifies the conversation
+listener only when the unread count actually changed.
+
+**Breaks as:** with any Marmot chat open, both hosts spin: iOS re-marks the open
+chat read on every change notification for it (`scheduleConversationRefresh`),
+Compose does the same in `handleConversationChange` → `markGroupsRead`, and the
+unconditional notify fed that straight back — mark → notify → reload page → mark
+at ~20 Hz, each turn a DB write, a page read and a summaries read, plus ~1,400
+Home row rebuilds per minute on iOS. It also starved R-046.
+
+**Why:** `ConversationIndex::mark_read` was already a no-op write for a read
+chat (`WHERE unread_count != 0`), but `mark_conversation_read` announced a change
+regardless.
+
+**Core call site:** `client.rs::mark_conversation_read` (now reads the
+`ConversationIndex::mark_read` changed flag). Fixes both hosts; neither host
+call site changes.
+
+**Guarded by:** `client.rs::marking_an_already_read_conversation_does_not_notify`
+
+**Not guarded:** a host that starts marking read from a different trigger could
+build a new loop; the invariant here is only that a no-op mark is silent.
+
+**Rejected:**
+- *Guard the host re-mark instead.* Two call sites (iOS + Compose) to keep in
+  step, and any third caller would reopen it; the no-op notify is the defect.
+
+## R-048 — A contact with no profile costs one relay fetch per miss window
+
+**Invariant:** after a kind-0 fetch finds no profile, `ensureProfile` does not
+fetch that npub again for `profileMissTTL` (60 s), however often titles render.
+Relays reconnecting clears the misses.
+
+**Breaks as:** any chat with a peer who never published a kind-0 (sonar-cli
+agents, fresh White Noise users) re-queried every relay about twice a second for
+as long as the app was open — ~400 relay EOSEs per minute idle — on the SERIAL
+Marmot work queue that sends and syncs share.
+
+**Why:** `title(for:)` calls `ensureProfile` on every Home/header render, and a
+miss removed the npub from the in-flight set for an immediate retry. Compose had
+the miss throttle (`PROFILE_MISS_TTL_SECS`, #168); iOS never got the mirror.
+
+**Apple call site:** `MarmotChatModel.ensureProfile` (+ `profileMissedAt`,
+cleared in the `relayConnected` `didSet` and the identity/group teardowns).
+
+**Compose call site:** `SonarAppState.ensureProfile` — already throttled.
+
+**Guarded by:** `MarmotProfileMissThrottleTests.renderAfterAMissDoesNotRefetchTheProfile`
+(drives the real `title(for:)` → `ensureProfile` path)
+
+**Not guarded:** Compose's throttle has no test of its own. iOS tests do not run
+in CI.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
