@@ -41,4 +41,21 @@ class ImageBoundsTest {
         assertNull(decodeImageBounds("not an image".encodeToByteArray()))
         assertNull(decodeImageBounds(ByteArray(0)))
     }
+
+    @Test
+    fun pendingUploadEchoCarriesTheImageDimensions() {
+        // QA-A11: the Marmot "Uploading" echo had null width/height, so a
+        // 500x230 photo reserved the 240x300dp max box and then collapsed to
+        // its real height when the canonical MIP-04 row replaced it.
+        val media = localMediaFor("pending-media-x", "image/jpeg", "photo.jpg", png(500, 230))
+        assertEquals(500, media.width)
+        assertEquals(230, media.height)
+    }
+
+    @Test
+    fun nonImageLocalMediaHasNoDimensions() {
+        val media = localMediaFor("pending-media-x", "audio/mp4", "vn.m4a", png(10, 10))
+        assertNull(media.width)
+        assertNull(media.height)
+    }
 }

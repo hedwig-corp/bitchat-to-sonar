@@ -44,6 +44,9 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var firstLocalStateReady = false
     private var postFirstDrawStartupScheduled = false
+    private var firstDrawDone = false
+    private var onboarded = false
+    private var permissionsRequested = false
     private val debugHandler = Handler(Looper.getMainLooper())
     private var debugMeshGeneration = 0L
 
@@ -69,6 +72,10 @@ class MainActivity : ComponentActivity() {
             // Whatever the user granted, (re)try starting the mesh radio.
             startMeshRadio()
         }
+
+    /** In-context single-permission prompt (e.g. the mic on first hold-to-record). */
+    private val singlePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     /**
      * Airplane mode (and any manual Bluetooth toggle) powers the adapter down
@@ -102,6 +109,18 @@ class MainActivity : ComponentActivity() {
         val restricted = BatterySaver.enabled() || !discoverNewPeople
         MeshRadio.setDiscoveryMode(if (restricted) BleDiscoveryMode.KnownOnly else BleDiscoveryMode.Normal)
         MeshRadio.start()
+    }
+
+    /**
+     * Ask for permissions once the first frame is up AND onboarding is done.
+     * Prompting at first draw put four system dialogs on top of the welcome
+     * screen before the user had created an account (QA-A1); returning users
+     * are already onboarded, so they still get the sequence right after launch.
+     */
+    private fun maybeRequestStartupPermissions() {
+        if (!firstDrawDone || !onboarded || permissionsRequested) return
+        permissionsRequested = true
+        requestAllPermissions()
     }
 
     /** Request any not-yet-granted permission in a single dialog sequence. */
@@ -146,7 +165,8 @@ class MainActivity : ComponentActivity() {
                 if (!postFirstDrawStartupScheduled) {
                     postFirstDrawStartupScheduled = true
                     content.post {
-                        requestAllPermissions()
+                        firstDrawDone = true
+                        maybeRequestStartupPermissions()
                         Thread(::meshNoiseSmokeTest, "sonar-noise-smoke").start()
                     }
                 }
@@ -164,9 +184,20 @@ class MainActivity : ComponentActivity() {
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
         )
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
+        ActivityBridge.requestPermission = { permission ->
+            runOnUiThread {
+                if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+                    singlePermissionLauncher.launch(permission)
+                }
+            }
+        }
         setContent {
             App(
                 onFirstLocalStateReady = { firstLocalStateReady = true },
+                onOnboarded = {
+                    onboarded = true
+                    maybeRequestStartupPermissions()
+                },
                 stickerBenchmarkRequest = stickerBenchmarkRequest(intent),
             )
         }

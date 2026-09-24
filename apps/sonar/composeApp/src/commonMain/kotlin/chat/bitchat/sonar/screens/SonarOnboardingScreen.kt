@@ -32,6 +32,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -287,14 +290,22 @@ private fun StepNickname(nick: String, trimmed: String, onChange: (String) -> Un
                 Modifier.weight(1f).clip(RoundedCornerShape(16.dp)).background(s.surface2)
                     .padding(horizontal = 16.dp, vertical = 15.dp)
             ) {
-                if (nick.isEmpty()) Text(stringResource(Res.string.nickname), color = s.text3, fontSize = 21.sp, fontWeight = FontWeight.Medium)
+                val nicknameLabel = stringResource(Res.string.nickname)
+                if (nick.isEmpty()) {
+                    // Visual placeholder only; the field carries the spoken label.
+                    Text(
+                        nicknameLabel, color = s.text3, fontSize = 21.sp, fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clearAndSetSemantics { },
+                    )
+                }
                 BasicTextField(
                     value = nick,
                     onValueChange = onChange,
                     singleLine = true,
                     textStyle = TextStyle(color = s.text, fontSize = 21.sp, fontWeight = FontWeight.Bold),
                     cursorBrush = SolidColor(s.accent),
-                    modifier = Modifier.fillMaxWidth()
+                    // An unlabelled field is announced as just "edit box" (QA-A5).
+                    modifier = Modifier.fillMaxWidth().semantics { contentDescription = nicknameLabel }
                 )
             }
         }

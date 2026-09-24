@@ -10,6 +10,7 @@ import BitLogger
 import Combine
 import CryptoKit
 import Foundation
+import ImageIO
 import SonarCore
 
 /// Swift-side facade over the Rust `sonar-core` engine (Marmot protocol:
@@ -208,6 +209,36 @@ final class MarmotService: @unchecked Sendable {
         var isImage: Bool { mimeType.hasPrefix("image/") }
         var isVideo: Bool { mimeType.hasPrefix("video/") }
         var isAudio: Bool { mimeType.hasPrefix("audio/") }
+
+        /// Media for an optimistic upload echo, sized from the bytes we hold.
+        ///
+        /// The canonical row carries MIP-04 width/height, so its bubble
+        /// reserves the final box before decode. An echo built with nil
+        /// dimensions reserves the max box instead and visibly collapses (or
+        /// grows) when the canonical row replaces it (QA-A11). The header read
+        /// is ImageIO properties only — no pixel decode.
+        static func localEcho(url: String, mimeType: String, filename: String, data: Data) -> MarmotMedia {
+            let bounds = mimeType.hasPrefix("image/") ? headerPixelBounds(data) : nil
+            return MarmotMedia(
+                url: url,
+                mimeType: mimeType,
+                filename: filename,
+                width: bounds?.width,
+                height: bounds?.height,
+                durationMs: nil
+            )
+        }
+
+        static func headerPixelBounds(_ data: Data) -> (width: UInt32, height: UInt32)? {
+            let options = [kCGImageSourceShouldCache: false] as CFDictionary
+            guard let source = CGImageSourceCreateWithData(data as CFData, options),
+                  let props = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+                  let w = props[kCGImagePropertyPixelWidth] as? Int,
+                  let h = props[kCGImagePropertyPixelHeight] as? Int,
+                  w > 0, h > 0
+            else { return nil }
+            return (UInt32(w), UInt32(h))
+        }
     }
 
     struct MarmotStickerRef: Sendable, Equatable, Codable {
@@ -747,6 +778,17 @@ final class MarmotService: @unchecked Sendable {
     /// no network, no node required. False for npub1/lno1/etc. lookalikes.
     static func handleLooksValid(_ input: String) -> Bool {
         SonarCore.handleLooksValid(input: input)
+    }
+
+    /// A full bech32 npub (63 chars, bech32 alphabet) — the gate for offering
+    /// "Start secure chat" from search. Any `npub1` prefix used to raise it
+    /// mid-typing (QA-A18). The checksum is left to the core, which rejects a
+    /// mistyped key when the chat starts.
+    static func isCompleteNpub(_ input: String) -> Bool {
+        let q = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard q.count == 63, q.hasPrefix("npub1") else { return false }
+        let alphabet = Set("qpzry9x8gf2tvdw0s3jn54khce6mua7l")
+        return q.dropFirst(5).allSatisfy { alphabet.contains($0) }
     }
 
     /// Claim `handle` at the Sonar registrar (blocking network POST inside the

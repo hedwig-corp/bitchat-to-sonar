@@ -33,6 +33,12 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.back
+import org.jetbrains.compose.resources.stringResource
 import kotlin.math.abs
 
 /** Deterministic hash used for author/avatar colors (mirrors iOS snHash). */
@@ -164,11 +170,19 @@ fun SNIconButton(
     size: Dp = 21.dp,
     weight: Float = 2.1f,
     tint: Color? = null,
+    /** Spoken by TalkBack / VoiceOver-style readers. Back buttons default to
+     *  "Back"; an icon-only control without a label is unusable by screen
+     *  reader users (QA-A9). */
+    contentDescription: String? = null,
     onClick: () -> Unit,
 ) {
     val s = sonar
+    val label = contentDescription
+        ?: if (icon == SNIconName.Back) stringResource(Res.string.back) else null
     Box(
-        Modifier.size(38.dp).clip(CircleShape).clickable(onClick = onClick),
+        Modifier.size(38.dp).clip(CircleShape)
+            .clickable(onClick = onClick, role = Role.Button)
+            .then(if (label != null) Modifier.semantics { this.contentDescription = label } else Modifier),
         contentAlignment = Alignment.Center
     ) {
         SNIcon(icon, size, tint ?: s.text2, weight)

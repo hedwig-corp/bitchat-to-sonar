@@ -2832,6 +2832,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun consumeComposerReply(chatId: String): SonarReplyRef? =
         composerReplyByChat.remove(chatId)
 
+    /** Keep what the user is typing (and replying to) when a pending chat
+     *  reconciles to its real id (QA-A19). */
+    private fun moveComposerState(fromChatId: String, toChatId: String) {
+        val drafts = movedComposerEntry(composerDrafts.toMap(), fromChatId, toChatId)
+        composerDrafts.remove(fromChatId)
+        drafts[toChatId]?.let { composerDrafts[toChatId] = it }
+        val replies = movedComposerEntry(composerReplyByChat.toMap(), fromChatId, toChatId)
+        composerReplyByChat.remove(fromChatId)
+        replies[toChatId]?.let { composerReplyByChat[toChatId] = it }
+    }
+
     fun setComposerDraft(chatId: String, text: String) {
         val current = composerDrafts.toMap()
         val next = updatedComposerDrafts(current, chatId, text)
@@ -6200,23 +6211,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /**
-     * Build a BLE-mesh [SonarMedia], deriving image dimensions from the bytes.
-     *
-     * Marmot media carries width/height as MIP-04 metadata, so its bubbles
-     * reserve their final box before decode (Signal pre-sizing) and the
-     * transcript never reflows. Mesh media has no metadata, so without this the
-     * bubble reserves the fixed 216x150dp skeleton and visibly grows — and
-     * shifts everything below it — the moment the image decodes. The header
-     * read is cheap (no pixel buffer) and happens once, off the render path,
-     * while we still hold the bytes.
-     */
-    private fun meshMediaFor(url: String, mime: String, filename: String, bytes: ByteArray): SonarMedia {
-        val bounds = if (mime.startsWith("image/")) decodeImageBounds(bytes) else null
-        return SonarMedia(url, mime, filename, bounds?.first, bounds?.second, null)
-    }
-
-    /**
-     * One-time migration: mesh image media persisted before [meshMediaFor]
+     * One-time migration: mesh image media persisted before [localMediaFor]
      * derived dimensions has null width/height, so its bubbles still reserve the
      * skeleton box and grow on decode. Recover the dimensions from the stored
      * bytes on the IO path at startup and rewrite the affected transcripts.
@@ -6565,6 +6560,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = "", members = listOf(npub, peerNpub))
         moveSendEchoes(pendingChatId, chatId)
+        moveComposerState(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {
                 screen.copy(id = chatId, name = chatTitle(chat))
@@ -6703,6 +6699,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val chat = chats.firstOrNull { it.id == chatId }
             ?: SonarChat(id = chatId, name = pending.name, members = listOf(npub) + pending.members)
         moveSendEchoes(pendingChatId, chatId)
+        moveComposerState(pendingChatId, chatId)
         stack = stack.map { screen ->
             if (screen is Screen.Chat && screen.id == pendingChatId) {
                 screen.copy(id = chatId, name = chatTitle(chat))
@@ -8136,7 +8133,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 mine = true,
                 tsSecs = startedAtSecs,
                 viaInternet = true,
-                media = listOf(SonarMedia(pendingUrl, mime, filename, null, null, null)),
+                media = listOf(localMediaFor(pendingUrl, mime, filename, data)),
                 state = "Uploading",
             )
             rememberPendingMediaUpload(
@@ -8280,7 +8277,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 tsSecs = startedAtSecs,
                 viaInternet = true,
                 media = items.mapIndexed { idx, item ->
-                    SonarMedia(pendingUrls[idx], item.mime, item.filename, null, null, null)
+                    localMediaFor(pendingUrls[idx], item.mime, item.filename, item.bytes)
                 },
                 state = "Uploading",
             )
@@ -9300,7 +9297,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val routePeerId = liveMeshRoutePeerId(peerId) ?: peerId
         val mid = randomMeshId()
         val mediaUrl = meshMediaUrl(routePeerId, mid, filename)
-        val media = meshMediaFor(mediaUrl, mime, filename, data)
+        val media = localMediaFor(mediaUrl, mime, filename, data)
         // Hold bytes in memory until the durable save completes, then free
         // large payloads (>1 MB) to avoid unbounded mediaCache growth. Small
         // images stay cached for fast transcript rendering.
@@ -9377,7 +9374,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Not connected over Bluetooth yet — stay close and try again"
             return false
         }
-        val media = meshMediaFor(mediaUrl, mime, filename, data)
+        val media = localMediaFor(mediaUrl, mime, filename, data)
         mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
         val msg = SonarMsg(
@@ -11598,7 +11595,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 continue
             }
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
-            val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
+            val media = localMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
             mediaCache[mediaUrl] = m.bytes
             val msg = SonarMsg(id, m.peerId, "", mine = false, tsSecs = m.tsSecs, media = listOf(media))
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
