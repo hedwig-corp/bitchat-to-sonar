@@ -46,8 +46,31 @@ import UIKit
 /// host (Android `filesDir`, desktop root): devices that ran earlier builds
 /// already hold stores at these paths.
 enum SonarCashuStorage {
-    static let mintURL = "https://mint.hedwig.sh"
+    static let productionMintURL = "https://mint.hedwig.sh"
     static let mintHost = "mint.hedwig.sh"
+
+    /// DEBUG builds only: a `sonar.debug.cashuMintURL` default points the
+    /// wallet at another mint (e.g. a local cdk-mintd fake wallet) so
+    /// send/receive can be QA'd without real sats. Release always uses the
+    /// production mint. On a simulator, write it into the APP CONTAINER's
+    /// plist while the SIMULATOR is shut down — with it booted, cfprefsd
+    /// keeps its cached copy and rewrites the file (a plain `defaults write`
+    /// edits the Mac's own preferences, and `simctl spawn … defaults` the
+    /// device's, neither of which the app reads):
+    /// `/usr/libexec/PlistBuddy -c "Add :sonar.debug.cashuMintURL string
+    /// http://127.0.0.1:8085" "$(xcrun simctl get_app_container <udid>
+    /// sh.hedwig.sonar data)/Library/Preferences/sh.hedwig.sonar.plist"`.
+    static let debugMintOverrideKey = "sonar.debug.cashuMintURL"
+
+    static var mintURL: String {
+        #if DEBUG
+        if let override = UserDefaults.standard.string(forKey: debugMintOverrideKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            return override
+        }
+        #endif
+        return productionMintURL
+    }
     static let rootDirectoryName = "sonar-cashu"
     static let networkDirectoryName = "mainnet"
 
