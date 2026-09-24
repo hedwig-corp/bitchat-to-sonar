@@ -173,6 +173,15 @@ is the build under test on a dedicated QA emulator/simulator.
 - **Origin:** A25 (#616) — Android drew the design mock's decorative pattern
   under "Let someone scan this to add you"; nothing could scan it.
 
+### QA-043 — Accessibility sweep: no unlabelled controls
+- **Platforms:** Android automated (`android-ui.sh naf` per screen); iOS manual
+  (Accessibility Inspector audit)
+- **Expect:** zero NAF nodes on home, search, start-chat, nearby, settings, a
+  chat and its contact profile (extend the sweep when a screen is added).
+- **How:** `android-smoke.sh` QA-043
+- **Origin:** A28 (#616) — contact-profile action circles were NAF and their
+  captions were dead taps; the 2026-09-24 sweep of every main screen is clean.
+
 ### QA-042 — Channel screen controls are labelled
 - **Platforms:** Android (manual: open any location channel, `android-ui.sh dump`)
 - **Expect:** back, bookmark ("toggle bookmark for #…"), Nearby, the composer

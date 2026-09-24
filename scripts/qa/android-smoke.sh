@@ -197,6 +197,30 @@ qa041() { # the profile "scan this to add you" code is a real QR of the npub (A2
   go_home >/dev/null
 }
 
+qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
+  local bad=() screen
+  naf_check() { # label
+    local n; n="$("$UI" naf 2>/dev/null | wc -l | tr -d ' ')"
+    (( n == 0 )) || bad+=("$1:$n")
+  }
+  go_home || { record QA-043 FAIL "could not reach the chat list"; return; }
+  naf_check home
+  ui tapx "Search"; sleep 1.5; naf_check search; go_home >/dev/null
+  ui tapx "Start a chat"; sleep 1.5; naf_check start-chat; ui key 4; go_home >/dev/null
+  ui tapx "Nearby"; sleep 2; naf_check nearby; go_home >/dev/null
+  ui tapx "Settings"; sleep 1.5; naf_check settings; go_home >/dev/null
+  if [[ -n "${A_NPUB:-}" ]] && ui tapt "qa001 hello $RUN"; then
+    sleep 2; naf_check chat
+    ui tap 400 188; sleep 2; naf_check contact-profile   # header → contact profile
+    go_home >/dev/null
+  fi
+  if (( ${#bad[@]} == 0 )); then
+    record QA-043 PASS "no NAF nodes on the swept screens"
+  else
+    record QA-043 FAIL "unlabelled nodes (screen:count): ${bad[*]} — run android-ui.sh naf there"
+  fi
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -206,7 +230,7 @@ qa050() { # idle CPU on the chat list
 echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
 # QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa050; do
+for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa050; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

@@ -18,6 +18,8 @@
 #   android-ui.sh gone <substr> [s]  poll dumps until substr disappears
 #   android-ui.sh tap <x> <y> | type <text> | key <code> | swipe x1 y1 x2 y2 [ms]
 #   android-ui.sh tapedit [n]        tap the n-th editable field (default 1)
+#   android-ui.sh naf                list unlabelled interactive nodes (class, bounds);
+#                                    empty output = the screen passes the a11y sweep
 #   android-ui.sh longpress <x> <y>
 #   android-ui.sh ime                prints "shown" / "hidden" (soft keyboard)
 #   android-ui.sh bounds <exact>     "x1 y1 x2 y2" of first EXACT match
@@ -63,6 +65,13 @@ for m in node.finditer(data):
         print(cx, cy); break
     elif mode in ("findx", "bounds") and (t == needle or d == needle):
         hits.append(f"{cx} {cy}" if mode == "findx" else f"{x1} {y1} {x2} {y2}")
+if mode == "naf":
+    for n in re.finditer(r'<node [^>]*>', data):
+        tag = n.group(0)
+        if 'NAF="true"' in tag:
+            cls = re.search(r'class="([^"]*)"', tag).group(1).split(".")[-1]
+            b = re.search(r'bounds="([^"]*)"', tag).group(1)
+            print(f"{cls}\t{b}")
 if hits:
     idx = nth - 1 if nth > 0 else nth
     if -len(hits) <= idx < len(hits):
@@ -111,6 +120,8 @@ case "$cmd" in
     # shellcheck disable=SC2086
     "${ADB[@]}" shell input tap $xy
     echo "tapped edit field ${1:-1} at $xy" ;;
+  naf)       # naf — every interactive node uiautomator flags as unlabelled
+    _dump_xml; _query naf ;;
   tap)       "${ADB[@]}" shell input tap "${1:?x}" "${2:?y}" ;;
   type)      t="$*"; "${ADB[@]}" shell input text "${t// /%s}" ;;
   key)       "${ADB[@]}" shell input keyevent "${1:?keycode}" ;;
