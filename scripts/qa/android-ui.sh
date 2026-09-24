@@ -6,9 +6,9 @@
 #   export QA_SHOTS=/tmp/sonar-qa/shots     # optional, default below
 #
 #   android-ui.sh shot <name>        screencap → $QA_SHOTS/<name>.png (≤900 px)
-#   android-ui.sh dump               "x,y  C|E  text  desc" for every labelled node and
-#                                    every edit field (E; an E row with no text/desc is
-#                                    an unlabelled field — an accessibility finding)
+#   android-ui.sh dump               "x,y  C|E|E!  text  desc" for every labelled node and
+#                                    every edit field (E); E! = uiautomator flags the field
+#                                    NAF (no spoken label) — an accessibility finding
 #   android-ui.sh find <substr>      first node whose text/desc CONTAINS substr → "x y"
 #   android-ui.sh findx <exact>      first node whose text/desc EQUALS exact   → "x y"
 #   android-ui.sh tapt <substr>      tap first CONTAINS match
@@ -52,9 +52,10 @@ for m in node.finditer(data):
     t, d = html.unescape(t), html.unescape(d)
     cx, cy = (int(x1) + int(x2)) // 2, (int(y1) + int(y2)) // 2
     edit = cls.endswith("EditText")
+    naf = 'NAF="true"' in m.group(0)       # uiautomator: not accessibility-friendly
     if mode == "dump":
         if t or d or edit:
-            tag = "E" if edit else ("C" if c == "true" else " ")
+            tag = ("E!" if naf else "E") if edit else ("C" if c == "true" else " ")
             print(f"{cx},{cy}\t{tag}\t{t[:70]}\t{d[:50]}")
     elif mode == "edit" and edit:
         hits.append(f"{cx} {cy}")

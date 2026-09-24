@@ -159,8 +159,8 @@ is the build under test on a dedicated QA emulator/simulator.
 - **Platforms:** Android automated (`uiautomator dump` content-desc); iOS manual
   (VoiceOver / Accessibility Inspector)
 - **Expect:** send, attach, emoji, voice, back, call, settings, start-chat, the
-  nickname, search and composer fields all have spoken labels (an `E` row with
-  no text/desc in `android-ui.sh dump` is an unlabelled field).
+  nickname, search and composer fields all have spoken labels (`android-ui.sh
+  dump` shows an unlabelled field as `E!` — uiautomator's NAF flag).
 - **How:** `android-smoke.sh` QA-040 · Guard: `IconButtonAccessibilityUiTest`
 - **Origin:** A9/A5/A21 (#616)
 

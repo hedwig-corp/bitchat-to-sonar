@@ -153,8 +153,8 @@ qa040() { # composer and header icon controls carry spoken labels (A9)
     hasx "$label" || missing+=("$label")
   done
   hasx "Send" || hasx "Record voice message" || missing+=("Send/Record voice message")
-  # An edit field with neither text nor description is an unlabelled box (A21).
-  if "$UI" dump 2>/dev/null | awk -F'\t' '$2 == "E" && $3 == "" && $4 == ""' | grep -q .; then
+  # uiautomator marks an edit field with no spoken label NAF (shown as E!) (A21).
+  if "$UI" dump 2>/dev/null | awk -F'\t' '$2 == "E!"' | grep -q .; then
     missing+=("composer text field")
   fi
   if (( ${#missing[@]} == 0 )); then
