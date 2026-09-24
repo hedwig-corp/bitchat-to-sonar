@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::KnownMethod;
 use cdk::nuts::{CurrencyUnit, MeltOptions, MeltQuoteState, MintQuoteState, PaymentMethod};
-use cdk::wallet::types::TransactionId;
+use cdk::wallet::types::{MeltSagaState, TransactionId, WalletSagaState};
 use cdk::wallet::{MintConnector, Wallet, WalletBuilder};
 use cdk::Amount;
 use sonar_wallet::{
@@ -853,6 +853,29 @@ impl CdkWallet {
         events: &mpsc::Sender<WalletEvent>,
         budget: Duration,
     ) -> Result<usize> {
+        // This runs every watcher tick. With no melt in flight there is
+        // nothing to finalize, so skip the full-history transaction read
+        // below: the incomplete-saga table is tiny, the history is not.
+        // Same filter `finalize_pending_melts` applies.
+        let in_flight = wallet
+            .localstore
+            .get_incomplete_sagas()
+            .await
+            .map_err(|e| WalletError::Backend(format!("list sagas: {e}")))?
+            .iter()
+            .any(|s| {
+                s.mint_url == wallet.mint_url
+                    && s.unit == wallet.unit
+                    && matches!(
+                        s.state,
+                        WalletSagaState::Melt(
+                            MeltSagaState::MeltRequested | MeltSagaState::PaymentPending
+                        )
+                    )
+            });
+        if !in_flight {
+            return Ok(0);
+        }
         // Notes are read BEFORE finalizing, and a lookup failure aborts the
         // pass. Order matters: `finalize_pending_melts` makes a melt terminal,
         // so a later pass may never return it again — swallowing the error
