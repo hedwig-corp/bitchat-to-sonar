@@ -175,13 +175,62 @@ database would bring bundled SQLite into the SQLCipher graph.
 Live-sats tests (receive via the offer, pay a BOLT11, a chat ⚡PAY with
 preimage) run only on explicit approval of the amounts.
 
+## Damaged store
+
+A proof store that no longer opens (redb reports it corrupted, cannot read its
+header, or panics opening it) is renamed `cashu.redb.corrupt-<secs>` — kept,
+never deleted, and accepted by the wipe guard — and connect continues on a
+fresh store: the NUT-13 restore rebuilds the funds from the seed and the offer
+pointer re-adopts the stable offer. Any other open error (already open,
+permissions, a newer file format) is surfaced, never a reason to set the file
+aside. Before, every connect failed forever and the app read "Mint offline —
+retrying" over recoverable funds.
+
+## Offer backups
+
+The stable offer's mint quote id lives only in the local pointer file, so a
+reinstall used to publish a new offer while payments to the old one stayed at
+the mint. `CdkWallet::offer_backup` exports the pointer (`{v, mint, quote_id,
+offer, index}`); the hosts publish it to the account's relays through
+`SonarNode.publishWalletOfferBackup`: kind 30078, NIP-44 sealed to the
+account's own key (the quote id would show anyone the offer's received
+amounts), one addressable event per backup (`d` = `sonar.wallet.offer.v1:` +
+content hash) found through the `t` tag `sonar.wallet.offer.v1`, so a newer
+offer never replaces an older one's backup. On a store with no pointer the
+hosts first fetch every backup and call `restore_offer_backups`: the newest
+becomes the offer (a local one is never replaced) and every backed-up quote the
+store lacks is re-adopted, so payments to any of them are minted. Until that
+fetch succeeds once per install, the hosts never create a new offer; "no relay
+answered" is an error, never an empty list.
+
+## Receive banner
+
+A payment from outside Sonar (another wallet paying the offer or a one-time
+invoice) has no chat line, so the app posts one "Payment received"
+notification when it settles, deduplicated per payment id (iOS: the activity
+ledger's first insert; Compose: the notified-payments ring the push service
+also uses), respecting the notification settings.
+
+A chat ⚡PAY is already announced by its chat line, and the wallet cannot tell
+it from an outside payment: the payer pays the public offer, so nothing links
+the payment to the receipt's uuid. `ReceiveAnnouncer` (Compose) /
+`SonarReceiveAnnouncer` (iOS) pair them by amount, one receipt to one receive,
+so the chat line stays the only notification (Signal's model: the payment
+message is the notification):
+
+- a receipt seen first silences the next receive of its amount within 24 h
+  (the wallet mints only in the foreground, hours after a push-delivered ⚡PAY);
+- a receive seen first waits 30 s for its receipt, then posts the banner;
+- only receipts the pay ledger records for the first time count, sent within
+  24 h and not our own, so a transcript replayed after a restart never
+  silences a new outside payment.
+
 ## Known gaps
 
 - No push notification for a Cashu receive while the app is killed. Funds
-  wait at the mint and are minted on the next foreground. Follow-up: bridge
-  the mint's quote-paid events (NUT-17) to push.
-- A full reinstall loses the offer pointer; payments to the old offer sit at
-  the mint. Follow-up: carry the offer quote id in the sealed account backup.
+  wait at the mint and are minted on the next foreground, and the "Payment
+  received" banner fires then. Follow-up: bridge the mint's quote-paid events
+  (NUT-17) to push.
 - **One active device per account.** An account cannot run on two devices at
   once today; that needs Marmot protocol work first (maintainer, 2026-09-23).
   The Cashu wallet inherits the constraint. When multi-device lands, the wallet
@@ -197,8 +246,18 @@ preimage) run only on explicit approval of the amounts.
   case) returns no preimage, so `⚡PAYDONE|2` carries none. The payment status
   copy therefore no longer claims a "cryptographic proof" on any payment.
   Follow-up: show the proof line again when a preimage did come back.
-- A store that is already corrupted is not rebuilt: connect fails on every
-  retry and the wallet reads "Mint offline — retrying". The funds stay at the
-  mint and a NUT-13 restore into a fresh store would recover them. The one
-  path found that corrupts it (two redb writers, Android) is closed.
-  Follow-up: move a corrupted `cashu.redb` aside and restore, and say so.
+- A rebuilt store (see "Damaged store" above) loses what only the damaged
+  file held: an in-flight send's quote and a one-time invoice paid but not yet
+  minted. The stable offer comes back from its pointer; everything minted comes
+  back through NUT-13. The damaged file is kept for inspection.
+- The receive banner pairs a chat ⚡PAY with its payment by amount (see
+  "Receive banner"), so: an outside payment's banner comes 30 s late; a
+  receipt whose payment never reaches the Cashu wallet (paid to the legacy
+  Breez wallet, say) can silence one outside receive of the same amount within
+  24 h; a ⚡PAY that lands more than 30 s after its payment still announces
+  twice; and two chat payments minted in one wallet poll arrive as one receive
+  that neither receipt matches. An exact link needs the receipt to name the
+  payment, which the mint does not expose per payment today.
+- Offer backups need the account's relays: if none answers when a reinstalled
+  wallet first connects, no offer is created until one does (retried every
+  30 s), rather than publishing a new offer over the backed-up one.
