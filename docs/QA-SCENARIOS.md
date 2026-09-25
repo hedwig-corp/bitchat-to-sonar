@@ -328,6 +328,128 @@ share a zone with the app and report the zone the app shared with it.
   notification (no transcript rebuild loop).
 - **Guard:** `client.rs::marking_an_already_read_conversation_does_not_notify` (#615)
 
+## Wallet (Cashu)
+
+Money scenarios never need real sats: point a DEBUG iOS build at a local
+`cdk-mintd` with `ln_backend = "fakewallet"` (the `sonar.debug.cashuMintURL`
+override; recipe in `SonarCashuStorage`), and use a second fakewallet mint for
+"foreign" invoices. Steps that only read from the mint (offer, invoice, fee
+quote) are safe against `mint.hedwig.sh`. The Compose build has no mint
+override, so on Android the money-moving scenarios stay manual against the
+real mint and need the maintainer's approval of the amounts.
+
+### QA-078 — Receive shows a real, reusable offer
+- **Platforms:** both (Android automated; iOS manual)
+- **Steps:** Settings → Balance → **Receive**.
+- **Expect:** the Wallet screen does not stay on "Mint offline — retrying"
+  (the offer is cached, so a QR alone passes over a broken store); the QR
+  decodes to a BOLT12 offer (`lno1…`); Copy puts the full
+  offer on the clipboard ("Copied" for ~1.7 s); caption "Anyone can pay this
+  address — any amount, as often as they like."; with no mint yet, "Your
+  wallet is still connecting to the mint." instead of a QR.
+- **How:** `android-smoke.sh` QA-078 · Guard: `receive_offer_is_stable_across_calls_reconnects_and_offline`
+- **Origin:** #614 (the wallet had no way to be funded from outside).
+
+### QA-079 — One-time invoice for an amount, retired once paid
+- **Platforms:** both (manual, fake mint)
+- **Steps:** Receive → *Request an amount* 210 → *Create invoice* → pay it.
+- **Expect:** the QR swaps to an `lnbc…` invoice, caption "One-time invoice
+  for …"; when **that** payment lands, "Received …" shows and the sheet goes
+  back to the reusable address. A same-sized payment to the offer does not
+  retire the invoice.
+- **Guard:** `a_bolt11_invoice_is_paid_under_the_id_it_was_issued_with` (core),
+  `a_paid_invoice_arrives_under_its_payment_id` (FFI),
+  `CashuWalletUXTests.testOnlyTheShownInvoicesPaymentRetiresIt`,
+  `PayFooterTest.onlyTheShownInvoicesPaymentRetiresIt`
+- **Origin:** #614 (a paid one-time invoice stayed on screen as payable).
+
+### QA-080 — The fee is shown before confirming, in sats
+- **Platforms:** both (manual)
+- **Steps:** with fiat display on, Send → paste an invoice or offer → open the
+  confirm sheet; change the amount.
+- **Expect:** "Checking the fee…" then "Network fee: up to N **sats**" (never
+  "CHF 0.00"), re-quoted after the amount settles; Send is never blocked by
+  the quote. The footer reads "Pays this Lightning invoice." / "Pays this
+  Bolt12 offer.", never "Pays lnbc…'s wallet".
+- **Guard:** `CashuWalletUXTests.testPaySheetFeeLineIsAlwaysInSats`,
+  `testFeeLineShowsTheQuotedFee`, `testPaySheetFooterNamesInvoicesAndOffersNotPeople`,
+  `PayFooterTest.theFeeLineIsAlwaysInSats`, `aRawLightningInvoiceIsNotAName`
+- **Origin:** #614 (fee hidden until after consent; a 1-sat reserve shown as
+  "CHF 0.00"; raw invoices named as people).
+
+### QA-081 — A pasted invoice shows its exact amount
+- **Platforms:** both (manual; exhaustive by unit test)
+- **Steps:** paste a `lnbc2100n…` invoice (210 sats) into Send.
+- **Expect:** the sheet says **210** sats (not 211); after paying, the
+  activity row is −210.
+- **Guard:** `Bolt11AmountTest.wholeSatAmountsAreExactNeverRoundedUp`,
+  `CashuWalletUXTests.testBolt11WholeSatAmountsAreExact`
+- **Origin:** #614 (floating-point parse read 210.00000000000003 and rounded up).
+
+### QA-082 — A send the mint refuses settles as Failed
+- **Platforms:** both (manual, fake mint: pay an invoice the mint has already
+  paid itself)
+- **Steps:** send; relaunch the app if a row from an older build is still
+  "Taking longer than usual · still in flight".
+- **Expect:** the row reads "Failed", the amount is struck through, the
+  balance is unchanged; a stuck row settles to Failed on the next connect.
+- **Guard:** `a_melt_the_mint_refuses_is_failed_not_in_flight`,
+  `a_refused_melt_is_failed_in_history_and_lookup`,
+  `a_pending_melt_the_mint_later_fails_is_reported_and_refunded`
+- **Origin:** #614 (a refused send stayed "still in flight" forever).
+
+### QA-083 — Restore brings the ecash back
+- **Platforms:** both (manual)
+- **Steps:** Settings → Restore account with an nsec whose wallet holds ecash.
+- **Expect:** after the wallet connects, the balance matches the old wallet's
+  (NUT-13 restore); the previous account's `sonar-cashu/<id>/` stays on disk;
+  the sheet says "Your wallet is rebuilt…", not "Lightning wallet".
+- **Guard:** `connect_restores_again_after_proof_db_is_deleted`,
+  `surviving_restore_marker_does_not_skip_nut13_when_proof_db_is_gone` (R-050)
+- **Origin:** #614.
+
+### QA-084 — Chat ⚡PAY to a contact
+- **Platforms:** both (manual; the payee can be headless: a `sonar-cli` peer
+  whose descriptor carries a second wallet's offer on the same mint)
+- **Steps:** open the chat → + → *Send money* → amount → Send.
+- **Expect:** the fee line prices the contact's cached offer; the bubble reads
+  "Paid"; the peer receives `⚡PAY` then `⚡PAYDONE`; the payee's wallet
+  mints the amount. Same-mint payments settle internally and carry no
+  preimage (known gap, `docs/WALLET-INTEGRATION.md`), so the receipt says
+  "They received N sats." and never claims a "cryptographic proof".
+- **Guard:** `PaymentStatusTest.aSettledPaymentNeverClaimsAProofItMayNotHave`,
+  `SonarPaymentStatusTests.testASettledPaymentNeverClaimsAProofItMayNotHave`
+- **Origin:** #614 (QA pass: the receipt promised a proof an internal
+  settlement does not have).
+
+### QA-085 — Two Sonars in Bluetooth range, both with a wallet
+- **Platforms:** Android (two emulators share the virtual Bluetooth medium,
+  so any second running Sonar emulator is a mesh peer); iOS sends no offer in
+  its announce
+- **Steps:** onboard, let the wallet publish its offer, keep the app open
+  with another Sonar in range for 2 min.
+- **Expect:** the peer shows up ("1 here now") and the app never crashes;
+  logcat has no `max length of an attribute value`.
+- **Guard:** `WalletAppStateTest.theMeshAnnounceCarryingTheCashuOfferFitsOneBleAttribute`
+  (real `SonarAppState` → real mesh engine framing; red without the fix)
+- **Origin:** #614 QA pass — every install now has a ~400-char mint offer; the
+  0x53 announce carried it, a > 512-byte GATT notify/write threw on Android
+  13+, and the app crash-looped whenever another Sonar was near.
+
+### QA-086 — The wallet store survives background/foreground churn
+- **Platforms:** Android first (no redb file lock there), then iOS
+- **Steps:** with the wallet connected, press HOME and relaunch 40 times at
+  random 0.3–3 s intervals (throttle the emulator network,
+  `adb emu network speed gsm`, to keep syncs in flight); then open the wallet.
+- **Expect:** logcat never shows `DB corrupted` or `Database already open`;
+  the wallet reconnects and shows its balance, not "Mint offline — retrying".
+- **Guard:** `a_reconnect_while_the_old_wallet_is_still_in_use_shares_its_store`
+  (core; fails with "Database already open" without the fix)
+- **Origin:** #614 QA pass — the Android store came back "All roots are
+  corrupted" after a session of crashes and lifecycle churn: a reconnect
+  opened a second redb writer while an in-flight call held the old wallet,
+  and Rust's std has no file lock on Android to refuse it.
+
 ## Open questions (need a product decision, not a fix)
 
 - **Data usage (A24):** "Wi-Fi only" is stored but nothing reads it on either
@@ -335,8 +457,14 @@ share a zone with the app and report the zone the app shared with it.
   (gate media auto-download on metered links) or remove it.
 - **Bitcoin mode default (A23):** both apps default to sats; the old copy
   claimed fiat. Which one is intended?
+  Note (#614): on iOS the SDK fallback is sats, but the app picks fiat in the
+  locale currency on first run (`applyFirstRunMoneyDefaults` before #614,
+  `SonarMoneyDisplay` after), so a fresh iOS install shows fiat.
 
 - **Fingerprint card (A3/A6):** iOS shows the Noise (mesh) key fingerprint,
   Android the nsec pubkey fingerprint — people comparing in person across
   platforms never match. Android also shows "Generating…" on the onboarding
   done step because the nsec is created on *Start chatting*.
+- **Exact "send all" (#618):** Max leaves the mint's unused fee reserve as
+  change (5 sats in the #614 live test). A mint-side zero reserve for same-mint
+  payments is under discussion (cashubtc/cdk#2606).

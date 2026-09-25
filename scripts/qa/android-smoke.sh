@@ -317,6 +317,37 @@ qa041() { # the profile "scan this to add you" code is a real QR of the npub (A2
   go_home >/dev/null
 }
 
+qa078() { # the Cashu wallet's Receive sheet shows a real, scannable BOLT12 offer (#614)
+  command -v swift >/dev/null || { record QA-078 SKIP "needs macOS swift (CoreImage) to decode"; return; }
+  go_home || { record QA-078 FAIL "could not reach the chat list"; return; }
+  ui tapx "Settings"; sleep 1.5
+  ui tapx "Balance" || { record QA-078 FAIL "no wallet Balance row in Settings"; go_home >/dev/null; return; }
+  sleep 1.5
+  # The offer is cached, so the QR alone passes over a wallet that cannot
+  # open its store (#614 found one reading "Mint offline" forever).
+  local tries=0
+  while has "Mint offline" && (( tries < 15 )); do sleep 2; tries=$((tries + 1)); done
+  if has "Mint offline"; then
+    record QA-078 FAIL "wallet still 'Mint offline' after 30 s (logcat: cashu connect failed?)"
+    go_home >/dev/null; return
+  fi
+  ui tapx "Receive" || { record QA-078 FAIL "no Receive button on the Wallet screen"; go_home >/dev/null; return; }
+  # The offer comes from the mint on first use (network, no spend): wait for it.
+  if ! "$UI" wait "Anyone can pay this address" 45 >/dev/null; then
+    record QA-078 FAIL "no reusable offer after 45 s (still 'connecting to the mint'?)"
+    go_home >/dev/null; return
+  fi
+  sleep 1
+  local png; png="$("$UI" shot "qa078-$RUN")"; png="${png%.png}-full.png"
+  local decoded; decoded="$(swift "$ROOT/scripts/qa/qr-decode.swift" "$png" 2>/dev/null | tail -1)"
+  if [[ "$decoded" == lno1* ]]; then
+    record QA-078 PASS "Receive QR decodes to a BOLT12 offer (${#decoded} chars)"
+  else
+    record QA-078 FAIL "Receive QR decodes to '${decoded:0:24}', expected an lno1 offer"
+  fi
+  go_home >/dev/null
+}
+
 qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
   local bad=() skipped=""
   naf_check() { # label — a failed dump is a failure, never an empty (passing) sweep
@@ -432,7 +463,7 @@ go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
 # QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa050; do
+for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa078 qa043 qa070 qa071 qa072 qa050; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"
