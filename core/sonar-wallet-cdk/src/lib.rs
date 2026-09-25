@@ -115,6 +115,48 @@ fn needs_nut13_restore(working_dir: &Path, restore_marker_name: &str) -> bool {
     !working_dir.join(restore_marker_name).exists() || !working_dir.join(DB_FILE).exists()
 }
 
+/// The redb store at `path`, shared by every wallet in this process.
+///
+/// redb keeps a second `Database` off a file with an OS file lock, but Rust's
+/// std has no file locking on Android. There, a reconnect while an operation
+/// still held the old wallet (a `sync` in flight when the app went to the
+/// background) opened a second writer on the same file, and the store came
+/// back "All roots are corrupted". Reuse the live handle instead — only while
+/// it is still the file on disk, so a wiped and recreated store gets its own.
+fn open_store(path: &Path) -> Result<Arc<cdk_redb::WalletRedbDatabase>> {
+    type Open = Vec<(std::path::PathBuf, Option<(u64, u64)>, std::sync::Weak<cdk_redb::WalletRedbDatabase>)>;
+    static OPEN: Mutex<Open> = Mutex::new(Vec::new());
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    open.retain(|(_, _, db)| db.strong_count() > 0);
+    let identity = file_identity(path);
+    if let Some(db) = open
+        .iter()
+        .filter(|(p, id, _)| p == path && id.is_some() && *id == identity)
+        .find_map(|(_, _, db)| db.upgrade())
+    {
+        return Ok(db);
+    }
+    let db = Arc::new(
+        cdk_redb::WalletRedbDatabase::new(path)
+            .map_err(|e| WalletError::Backend(format!("open {}: {e}", path.display())))?,
+    );
+    open.push((path.to_path_buf(), file_identity(path), Arc::downgrade(&db)));
+    Ok(db)
+}
+
+/// Device and inode: tells the same file from one recreated at its path.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Elsewhere redb's own file lock refuses a second open: never share.
+#[cfg(not(unix))]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
 /// Connection state; one mutex, same discipline as the Breez backend.
 #[derive(Default)]
 struct Lifecycle {
@@ -411,13 +453,11 @@ impl CdkWallet {
                 WalletError::Backend(format!("clear stale {}: {e}", marker.display()))
             })?;
         }
-        let db_path = self.config.working_dir.join(DB_FILE);
-        let localstore = cdk_redb::WalletRedbDatabase::new(&db_path)
-            .map_err(|e| WalletError::Backend(format!("open {}: {e}", db_path.display())))?;
+        let localstore = open_store(&self.config.working_dir.join(DB_FILE))?;
         let mut builder = WalletBuilder::new()
             .mint_url(mint_url)
             .unit(CurrencyUnit::Sat)
-            .localstore(Arc::new(localstore))
+            .localstore(localstore)
             .seed(self.seed64());
         if let Some(connector) = &self.connector {
             builder = builder.shared_client(connector.clone());
@@ -1547,6 +1587,35 @@ mod tests {
         let mut cfg = config();
         cfg.working_dir = dir.to_path_buf();
         CdkWallet::with_connector(cfg, "https://mint.example.com", mint.clone()).unwrap()
+    }
+
+    /// Android has no redb file lock, so a second handle there wrote the same
+    /// file and corrupted it; with a lock (this host) the second open is
+    /// refused instead, which is how this test sees a second handle.
+    #[test]
+    fn a_reconnect_while_the_old_wallet_is_still_in_use_shares_its_store() {
+        fn same(a: &Wallet, b: &Wallet) -> bool {
+            std::ptr::eq(
+                Arc::as_ptr(&a.localstore) as *const (),
+                Arc::as_ptr(&b.localstore) as *const (),
+            )
+        }
+        let dir = scratch("reconnect-shared-store");
+        let (w, _mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        // What a `sync` in flight holds when the app goes to the background.
+        let in_flight = w.wallet().unwrap();
+        w.disconnect().unwrap();
+        w.connect()
+            .expect("the reconnect must reuse the open store, not open a second one");
+        assert!(same(&in_flight, &w.wallet().unwrap()), "one store, one handle");
+
+        // A store wiped and recreated at the same path is another file.
+        w.disconnect().unwrap();
+        w.wipe_local_storage().unwrap();
+        w.connect().unwrap();
+        assert!(!same(&in_flight, &w.wallet().unwrap()), "a new file gets its own handle");
+        drop(in_flight);
     }
 
     #[test]
