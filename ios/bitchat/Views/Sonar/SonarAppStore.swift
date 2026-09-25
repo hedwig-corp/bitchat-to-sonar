@@ -147,6 +147,25 @@ enum SonarLocalNotificationRouter {
         )
     }
 
+    /// A payment from outside Sonar (another wallet paying the receive offer
+    /// or a one-time invoice): no chat line announces it, so this is its only
+    /// signal. Same copy as Compose `SonarNotificationRouter.buildWalletReceive`.
+    static func walletReceive(
+        paymentId: String,
+        sats: Int64,
+        prefs: SonarLocalNotificationPrefs
+    ) -> SonarLocalNotification? {
+        guard prefs.enabled else { return nil }
+        return SonarLocalNotification(
+            title: "Payment received",
+            body: prefs.showPaymentAmount
+                ? "\(sonarFormatSats(sats)) received."
+                : "Open Sonar to view the payment.",
+            identifier: "sonar-payment-wallet-\(paymentId)",
+            userInfo: [:]
+        )
+    }
+
     private static func identifierSegment(_ kind: SonarNotificationKindInfo) -> String {
         switch kind {
         case .message: return "message"
@@ -1353,6 +1372,32 @@ final class SonarAppStore: ObservableObject {
     let payLedger: SonarPayLedger
     /// Local wallet payment activity for direct BOLT12 / Unify sends.
     let paymentActivityLedger: SonarPaymentActivityLedger
+    /// Where store-built local notifications go (the system one is silent
+    /// under XCTest, so tests capture them here).
+    var postLocalNotification: (SonarLocalNotification) -> Void = { note in
+        NotificationService.shared.sendLocalNotification(
+            title: note.title,
+            body: note.body,
+            identifier: note.identifier,
+            userInfo: note.userInfo
+        )
+    }
+    /// How long a wallet receive waits for its chat ⚡PAY line; tests shorten it.
+    var walletReceiveGraceNanos = SonarReceiveAnnouncer.defaultGraceNanos
+    /// One notification per payment: a chat ⚡PAY's own line, or the wallet banner.
+    private lazy var receiveAnnouncer = SonarReceiveAnnouncer(
+        graceNanos: { [weak self] in self?.walletReceiveGraceNanos ?? SonarReceiveAnnouncer.defaultGraceNanos },
+        announce: { [weak self] paymentId, sats in
+            guard let self,
+                  let note = SonarLocalNotificationRouter.walletReceive(
+                      paymentId: paymentId,
+                      sats: sats,
+                      prefs: self.notificationPrefs
+                  )
+            else { return }
+            self.postLocalNotification(note)
+        }
+    )
     private let keychain: KeychainManagerProtocol
     private let locationManager = LocationChannelManager.shared
     private let relayManager = NostrRelayManager.shared
@@ -5088,7 +5133,7 @@ final class SonarAppStore: ObservableObject {
     private func recordIncomingWalletPayment(_ payment: SonarWalletPayment) {
         guard payment.isIncoming else { return }
         let activityId = "wallet-\(payment.id)"
-        paymentActivityLedger.recordPending(SonarPaymentActivity(
+        let recorded = paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
             kind: .walletIncoming,
             peerKey: "wallet",
@@ -5103,6 +5148,11 @@ final class SonarAppStore: ObservableObject {
             feesSats: payment.feesSats,
             settledAt: payment.timestamp
         ))
+        // First time this receive is seen: announce it once, unless a chat
+        // ⚡PAY line already did.
+        if recorded {
+            receiveAnnouncer.walletReceive(paymentId: payment.id, sats: payment.amountSats)
+        }
     }
 
     // MARK: Connectivity (status chip + connection sheet)
@@ -9864,7 +9914,7 @@ final class SonarAppStore: ObservableObject {
                             sound: via == .mesh ? .ble : .standard
                         )
                     }
-                    handlePayLine(line, convId: peerID.id, via: via)
+                    handlePayLine(line, convId: peerID.id, via: via, sentAt: m.timestamp)
                 }
             }
         }
@@ -9874,7 +9924,7 @@ final class SonarAppStore: ObservableObject {
                 guard !scannedPayMessageIDs.contains(m.id) else { continue }
                 scannedPayMessageIDs.insert(m.id)
                 if let line = SonarPayMessage.decode(m.content) {
-                    handlePayLine(line, convId: marmotConvId(forGroup: groupId), via: .internet)
+                    handlePayLine(line, convId: marmotConvId(forGroup: groupId), via: .internet, sentAt: m.createdAt)
                 }
             }
         }
@@ -10103,13 +10153,18 @@ final class SonarAppStore: ObservableObject {
         return Self.marmotIDPrefix + groupId
     }
 
-    private func handlePayLine(_ line: SonarPayMessage, convId: String, via: SNVia) {
+    private func handlePayLine(_ line: SonarPayMessage, convId: String, via: SNVia, sentAt: Date) {
         switch line {
         case .pay(let id, let sats):
-            payLedger.record(SonarPayEntry(
+            let firstSight = payLedger.record(SonarPayEntry(
                 id: id, peerKey: convId, sats: sats,
                 direction: .incoming, state: .sealed, via: via.rawValue
             ))
+            // First sight only: a replayed transcript must not silence a new
+            // outside payment (see SonarReceiveAnnouncer).
+            if firstSight {
+                receiveAnnouncer.chatReceipt(id: id, sats: sats, sentAt: sentAt)
+            }
 
         case .done(let id, let preimage):
             payLedger.markIncomingClaimedOrPending(id, preimage: preimage)

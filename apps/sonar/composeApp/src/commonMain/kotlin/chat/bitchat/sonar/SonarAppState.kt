@@ -13,6 +13,8 @@ import chat.bitchat.sonar.store.MessageStore
 import chat.bitchat.sonar.unify.UnifyBIP321
 import chat.bitchat.sonar.unify.UnifyPeer
 import chat.bitchat.sonar.unify.UnifyRadio
+import chat.bitchat.sonar.wallet.claimNotifiedPaymentId
+import chat.bitchat.sonar.wallet.ReceiveAnnouncer
 import chat.bitchat.sonar.wallet.CashuInvoice
 import chat.bitchat.sonar.wallet.ExchangeRate
 import chat.bitchat.sonar.wallet.LivePayment
@@ -2943,6 +2945,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     var lastIncomingWalletPayment by mutableStateOf<WalletPaymentEvent?>(null)
         private set
+    /** Where state-built local notifications go; tests capture them. */
+    internal var postNotification: (SonarNotification) -> Unit = { Notifier.notify(it.id, it.title, it.body) }
+    /** How long a wallet receive waits for its chat ⚡PAY line; tests shorten it. */
+    internal var walletReceiveGraceMs = ReceiveAnnouncer.GRACE_MS
+    /** One notification per payment: a chat ⚡PAY's own line, or the wallet banner. */
+    private val receiveAnnouncer = ReceiveAnnouncer(scope, graceMs = { walletReceiveGraceMs }) { paymentId, sats ->
+        SonarNotificationRouter.buildWalletReceive(
+            idKey = "wallet-$paymentId",
+            sats = sats,
+            prefs = notificationPrefs(),
+        )?.let(postNotification)
+    }
     /** The "Old Lightning wallet" card; `present = false` hides it. */
     var legacyWallet by mutableStateOf(LegacyWalletSnapshot())
         private set
@@ -3109,6 +3123,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (ev.settled) {
                 PaymentActivityStore.recordIncomingWalletPayment(ev)
                 lastIncomingWalletPayment = ev
+                // Once per id (shared with the push service's claim), and not
+                // when a chat ⚡PAY line already announced it.
+                if (claimNotifiedPaymentId(ev.paymentId)) {
+                    receiveAnnouncer.walletReceive(ev.paymentId, ev.amountSats)
+                }
             }
             return
         }
@@ -3882,7 +3901,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         var changed = false
         for (m in msgs) {
             when (val line = PayLine.decode(m.content)) {
-                is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine, tsSecs = m.tsSecs)) changed = true
+                is PayLine.Pay -> if (payLedger.recordReceipt(line.uuid, line.sats, m.mine, tsSecs = m.tsSecs)) {
+                    changed = true
+                    // First sight only: a replayed transcript must not silence
+                    // a new outside payment (see ReceiveAnnouncer).
+                    if (!m.mine) receiveAnnouncer.chatReceipt(line.uuid, line.sats, m.tsSecs * 1_000)
+                }
                 is PayLine.Done -> if (payLedger.markClaimedOrPending(line.uuid, line.preimage)) changed = true
                 null -> {}
             }

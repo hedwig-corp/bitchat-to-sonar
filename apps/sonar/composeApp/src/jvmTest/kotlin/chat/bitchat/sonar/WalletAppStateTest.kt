@@ -196,6 +196,73 @@ class WalletAppStateTest {
         assertEquals("q:rx", s.lastIncomingWalletPayment?.paymentId)
     }
 
+    /** A payment from outside Sonar (another wallet paying the receive offer
+     *  or a one-time invoice) has no chat line, so nothing announced it. */
+    @Test
+    fun anOutsidePaymentIsAnnouncedOnceWhenItSettles() = runBlocking {
+        val s = state()
+        val posted = CopyOnWriteArrayList<SonarNotification>()
+        s.postNotification = { posted += it }
+        s.walletReceiveGraceMs = 100
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+
+        val rx = CashuPayment("q1:rx", true, 2_100, null, 1_700_000_000, CashuPaymentStatus.Complete, null, null)
+        native.emit(CashuEvent.PaymentReceived(rx))
+        native.emit(CashuEvent.PaymentReceived(rx)) // a replay
+        native.emit(
+            CashuEvent.PaymentSent(
+                CashuPayment("q3:tx", false, 90, 1, 1_700_000_010, CashuPaymentStatus.Complete, "pre", null),
+            ),
+        )
+        waitUntil("receive surfaced") { s.lastIncomingWalletPayment?.paymentId == "q1:rx" }
+        delay(400)
+
+        assertEquals(listOf("Payment received"), posted.map { it.title }, "exactly one banner, for the receive")
+        assertEquals("2,100 sats received.", posted.single().body)
+    }
+
+    /** A chat ⚡PAY is announced by its chat line; the wallet cannot link the
+     *  receive to it (the payer pays the public offer), so without pairing
+     *  every chat payment raised a second "Payment received" banner. */
+    @Test
+    fun aChatPaymentIsAnnouncedByItsChatLineOnly() = runBlocking {
+        val s = state()
+        val posted = CopyOnWriteArrayList<SonarNotification>()
+        s.postNotification = { posted += it }
+        s.walletReceiveGraceMs = 300
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+        val now = System.currentTimeMillis() / 1_000
+        fun payLine(id: String, uuid: String, sats: Long, mine: Boolean = false) =
+            SonarMsg(id, "npub1peer", PayLine.Pay(uuid, sats).encoded(), mine, now)
+        fun receive(id: String, sats: Long) = native.emit(
+            CashuEvent.PaymentReceived(
+                CashuPayment(id, true, sats, null, now, CashuPaymentStatus.Complete, null, null),
+            ),
+        )
+
+        // The chat line lands first, then the wallet mints the payment.
+        s.processPayLines("chat-a", listOf(payLine("m1", "u1", 210)))
+        receive("chatpay1:rx", 210)
+        // The wallet sees the payment before the chat line arrives.
+        receive("chatpay2:rx", 350)
+        waitUntil("second receive surfaced") { s.lastIncomingWalletPayment?.paymentId == "chatpay2:rx" }
+        s.processPayLines("chat-a", listOf(payLine("m2", "u2", 350)))
+        // Our own ⚡PAY never pairs with a receive, and a payment nobody
+        // announced still gets its banner.
+        s.processPayLines("chat-a", listOf(payLine("m3", "u3", 777, mine = true)))
+        receive("chatpay3:rx", 777)
+        waitUntil("third receive surfaced") { s.lastIncomingWalletPayment?.paymentId == "chatpay3:rx" }
+        delay(900)
+
+        assertEquals(
+            listOf("777 sats received."),
+            posted.map { it.body },
+            "only the payment no chat line announced gets a wallet banner",
+        )
+    }
+
     @Test
     fun capPayMeansACashuOfferExistsNotABreezKey() = runBlocking {
         native.offer = null
