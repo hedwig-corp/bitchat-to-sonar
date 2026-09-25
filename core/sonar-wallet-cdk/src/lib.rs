@@ -107,6 +107,16 @@ fn is_our_artifact(name: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-');
     }
+    if let Some(stamp) = name
+        .strip_prefix(DB_FILE)
+        .and_then(|rest| rest.strip_prefix(".corrupt-"))
+    {
+        let parts: Vec<&str> = stamp.split('-').collect();
+        return parts.len() <= 2
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    }
     let is_mint_tag =
         |suffix: &str| suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit());
     if let Some(rest) = name
@@ -137,8 +147,14 @@ fn needs_nut13_restore(working_dir: &Path, restore_marker_name: &str) -> bool {
 /// background) opened a second writer on the same file, and the store came
 /// back "All roots are corrupted". Reuse the live handle instead — only while
 /// it is still the file on disk, so a wiped and recreated store gets its own.
-fn open_store(path: &Path) -> Result<Arc<cdk_redb::WalletRedbDatabase>> {
-    type Open = Vec<(std::path::PathBuf, Option<(u64, u64)>, std::sync::Weak<cdk_redb::WalletRedbDatabase>)>;
+fn open_store(
+    path: &Path,
+) -> std::result::Result<Arc<cdk_redb::WalletRedbDatabase>, StoreOpenError> {
+    type Open = Vec<(
+        std::path::PathBuf,
+        Option<(u64, u64)>,
+        std::sync::Weak<cdk_redb::WalletRedbDatabase>,
+    )>;
     static OPEN: Mutex<Open> = Mutex::new(Vec::new());
     let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
     open.retain(|(_, _, db)| db.strong_count() > 0);
@@ -150,12 +166,77 @@ fn open_store(path: &Path) -> Result<Arc<cdk_redb::WalletRedbDatabase>> {
     {
         return Ok(db);
     }
-    let db = Arc::new(
-        cdk_redb::WalletRedbDatabase::new(path)
-            .map_err(|e| WalletError::Backend(format!("open {}: {e}", path.display())))?,
-    );
+    // Some damage makes redb panic while opening instead of returning an error.
+    let db = match std::panic::catch_unwind(|| cdk_redb::WalletRedbDatabase::new(path)) {
+        Ok(Ok(db)) => Arc::new(db),
+        Ok(Err(e)) if is_unreadable(&e) => return Err(StoreOpenError::Unreadable(e.to_string())),
+        Ok(Err(e)) => {
+            return Err(StoreOpenError::Other(WalletError::Backend(format!(
+                "open {}: {e}",
+                path.display()
+            ))))
+        }
+        Err(_) => {
+            return Err(StoreOpenError::Unreadable(
+                "redb panicked opening it".into(),
+            ))
+        }
+    };
     open.push((path.to_path_buf(), file_identity(path), Arc::downgrade(&db)));
     Ok(db)
+}
+
+/// Why a proof store did not open.
+enum StoreOpenError {
+    /// Not a readable redb file any more: only NUT-13 can bring its funds back.
+    Unreadable(String),
+    /// Anything else (already open, permissions, a newer file format): never
+    /// a reason to set the file aside.
+    Other(WalletError),
+}
+
+/// redb's verdict that the file itself is damaged, as opposed to an error
+/// opening a sound one.
+fn is_unreadable(e: &cdk_redb::error::Error) -> bool {
+    fn damaged(s: &redb::StorageError) -> bool {
+        match s {
+            redb::StorageError::Corrupted(_) => true,
+            redb::StorageError::Io(io) => matches!(
+                io.kind(),
+                std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
+    match e {
+        cdk_redb::error::Error::Database(d) => {
+            matches!(&**d, redb::DatabaseError::Storage(s) if damaged(s))
+        }
+        cdk_redb::error::Error::Storage(s) => damaged(s),
+        cdk_redb::error::Error::Redb(r) => matches!(&**r, redb::Error::Corrupted(_)),
+        _ => false,
+    }
+}
+
+/// Rename an unreadable store out of the way (`cashu.redb.corrupt-<secs>`),
+/// kept for inspection; the wipe guard accepts the name.
+fn set_aside_unreadable_store(db_path: &Path) -> Result<std::path::PathBuf> {
+    let stamp = now_secs();
+    for n in 0u32.. {
+        let name = if n == 0 {
+            format!("{DB_FILE}.corrupt-{stamp}")
+        } else {
+            format!("{DB_FILE}.corrupt-{stamp}-{n}")
+        };
+        let aside = db_path.with_file_name(name);
+        if !aside.exists() {
+            std::fs::rename(db_path, &aside).map_err(|e| {
+                WalletError::Backend(format!("set aside {}: {e}", db_path.display()))
+            })?;
+            return Ok(aside);
+        }
+    }
+    unreachable!("u32 names exhausted")
 }
 
 /// Device and inode: tells the same file from one recreated at its path.
@@ -615,7 +696,7 @@ impl CdkWallet {
         // surviving marker then skips NUT-13 forever over recoverable funds
         // (regressed once already, 33c5712f1).
         let marker = self.config.working_dir.join(self.restore_marker_name());
-        let restore_owed =
+        let mut restore_owed =
             needs_nut13_restore(&self.config.working_dir, &self.restore_marker_name());
         if restore_owed && marker.exists() {
             // The proof db is gone but its marker survived. Drop the marker
@@ -625,7 +706,34 @@ impl CdkWallet {
                 WalletError::Backend(format!("clear stale {}: {e}", marker.display()))
             })?;
         }
-        let localstore = open_store(&self.config.working_dir.join(DB_FILE))?;
+        let db_path = self.config.working_dir.join(DB_FILE);
+        let localstore = match open_store(&db_path) {
+            Ok(db) => db,
+            Err(StoreOpenError::Other(e)) => return Err(e),
+            Err(StoreOpenError::Unreadable(why)) => {
+                // A damaged store used to fail every connect forever over
+                // funds the seed can recover. Keep it for inspection, start
+                // an empty one, and let NUT-13 below rebuild the funds.
+                let aside = set_aside_unreadable_store(&db_path)?;
+                tracing::warn!(
+                    "proof store unreadable ({why}); moved to {} and rebuilt from the seed",
+                    aside.display()
+                );
+                restore_owed = true;
+                if marker.exists() {
+                    std::fs::remove_file(&marker).map_err(|e| {
+                        WalletError::Backend(format!("clear stale {}: {e}", marker.display()))
+                    })?;
+                }
+                open_store(&db_path).map_err(|e| match e {
+                    StoreOpenError::Other(e) => e,
+                    StoreOpenError::Unreadable(why) => WalletError::Backend(format!(
+                        "fresh store at {} is unreadable: {why}",
+                        db_path.display()
+                    )),
+                })?
+            }
+        };
         let mut builder = WalletBuilder::new()
             .mint_url(mint_url)
             .unit(CurrencyUnit::Sat)
@@ -1967,13 +2075,19 @@ mod tests {
         w.disconnect().unwrap();
         w.connect()
             .expect("the reconnect must reuse the open store, not open a second one");
-        assert!(same(&in_flight, &w.wallet().unwrap()), "one store, one handle");
+        assert!(
+            same(&in_flight, &w.wallet().unwrap()),
+            "one store, one handle"
+        );
 
         // A store wiped and recreated at the same path is another file.
         w.disconnect().unwrap();
         w.wipe_local_storage().unwrap();
         w.connect().unwrap();
-        assert!(!same(&in_flight, &w.wallet().unwrap()), "a new file gets its own handle");
+        assert!(
+            !same(&in_flight, &w.wallet().unwrap()),
+            "a new file gets its own handle"
+        );
         drop(in_flight);
     }
 
@@ -2080,6 +2194,107 @@ mod tests {
             1_000,
             "a deleted proof db must not present 0 sats over recoverable funds"
         );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Damage a closed redb file in place: flag it for recovery and zero the
+    /// user roots of both commit slots, which redb reports as `Corrupted`
+    /// (the class of "All roots are corrupted" the Android store hit).
+    fn corrupt_commit_roots(path: &Path) {
+        use std::io::{Seek, SeekFrom, Write};
+        flag_for_recovery(path);
+        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        for slot in [64u64, 192] {
+            f.seek(SeekFrom::Start(slot + 8)).unwrap();
+            f.write_all(&[0u8; 40]).unwrap();
+        }
+    }
+
+    /// Set redb's "recovery required" bit, as an unclean shutdown leaves it.
+    fn flag_for_recovery(path: &Path) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut god = [0u8; 1];
+        f.seek(SeekFrom::Start(9)).unwrap();
+        f.read_exact(&mut god).unwrap();
+        f.seek(SeekFrom::Start(9)).unwrap();
+        f.write_all(&[god[0] | 2]).unwrap();
+    }
+
+    fn quarantined(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("cashu.redb.corrupt-"))
+            .collect()
+    }
+
+    /// A proof store that no longer opened failed every connect forever, and
+    /// the app read "Mint offline — retrying" over funds the seed can
+    /// recover. It is set aside for inspection and rebuilt by NUT-13.
+    #[test]
+    fn a_corrupted_store_is_set_aside_and_rebuilt_from_the_seed() {
+        let dir = scratch("corrupted-store-rebuilt");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        w.disconnect().unwrap();
+        drop(w);
+        corrupt_commit_roots(&dir.join(DB_FILE));
+
+        let w = reopen(&dir, &mint);
+        w.connect()
+            .expect("a store that no longer opens is rebuilt, not a dead end");
+        assert_eq!(
+            w.balance().unwrap().confirmed_sats,
+            1_000,
+            "NUT-13 restores the funds"
+        );
+        assert_eq!(
+            quarantined(&dir).len(),
+            1,
+            "the damaged file is kept, not deleted"
+        );
+
+        // The set-aside file is ours: it never blocks a wipe.
+        w.disconnect().unwrap();
+        w.wipe_local_storage().unwrap();
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Some damage makes redb panic while opening instead of returning an
+    /// error; that must rebuild the store too, never unwind out of connect.
+    #[test]
+    fn a_store_that_panics_redb_on_open_is_rebuilt_too() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = scratch("panicking-store-rebuilt");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 700);
+        w.disconnect().unwrap();
+        drop(w);
+        {
+            let path = dir.join(DB_FILE);
+            flag_for_recovery(&path);
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(4096)).unwrap();
+            f.write_all(&[0u8; 4096]).unwrap();
+        }
+
+        let w = reopen(&dir, &mint);
+        let connected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.connect()));
+        assert!(
+            matches!(connected, Ok(Ok(()))),
+            "connect must rebuild, not panic or fail: {connected:?}"
+        );
+        assert_eq!(w.balance().unwrap().confirmed_sats, 700);
+        assert_eq!(quarantined(&dir).len(), 1);
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2984,6 +3199,12 @@ mod tests {
 
     #[test]
     fn offer_pointer_is_an_artifact_the_wipe_may_remove() {
+        assert!(is_our_artifact("cashu.redb.corrupt-1790312350"));
+        assert!(is_our_artifact("cashu.redb.corrupt-1790312350-2"));
+        assert!(!is_our_artifact("cashu.redb.corrupt-"));
+        assert!(!is_our_artifact("cashu.redb.corrupt-abc"));
+        assert!(!is_our_artifact("cashu.redb.corrupt-1-2-3"));
+        assert!(!is_our_artifact("cashu.redb.bak"));
         assert!(is_our_artifact("cashu.offer.00c0ffee"));
         assert!(is_our_artifact("cashu.offer.00c0ffee.tmp"));
         assert!(!is_our_artifact("cashu.offer.xyz"));

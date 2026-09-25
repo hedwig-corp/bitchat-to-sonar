@@ -22,6 +22,8 @@ sonar-wallet = { path = "../sonar-wallet" }
 # workspace CI job rightly does not have, for server code a client never runs.
 cdk = { version = "0.18.1", default-features = false, features = ["wallet", "bip353"] }
 cdk-redb = "0.18.1"
+# The store error types, to tell a damaged file from an error opening a sound one.
+redb = "3.1"
 # Same version cdk itself uses; decodes BOLT11 invoices so an amount-bearing
 # invoice satisfies resolve_send_amount without the host re-supplying it.
 lightning-invoice = "0.34"
