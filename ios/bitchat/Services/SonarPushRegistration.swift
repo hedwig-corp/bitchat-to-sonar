@@ -157,6 +157,9 @@ final class SonarPushRegistration: @unchecked Sendable {
             inFlightWebhookMarker = nil
             inFlightWebhookStartedAt = nil
             inFlightWebhookGeneration &+= 1
+            // The replacement wallet starts a fresh backoff: the old wallet's
+            // failures must not push its first retry out to the 10 min cap.
+            webhookRetryFailures = 0
         }
         UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
     }
