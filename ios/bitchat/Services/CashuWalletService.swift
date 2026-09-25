@@ -231,6 +231,18 @@ private final class CashuBackgroundTaskLease {
 }
 #endif
 
+// MARK: - Offer backups
+
+/// Where the wallet's offer backups live off the device: the account's Nostr
+/// relays, sealed to the account key (`SonarNode.publishWalletOfferBackup`).
+@MainActor
+protocol SonarOfferBackupRelay: AnyObject {
+    /// Every backup this account published; nil when no relay answered.
+    func fetch() async -> [String]?
+    /// Publish one backup; false when it did not reach a relay.
+    func publish(_ backup: String) async -> Bool
+}
+
 // MARK: - Service
 
 @MainActor
@@ -263,6 +275,12 @@ final class CashuWalletService: ObservableObject {
     /// Foreground intent. The app starts foregrounded.
     private var wantOnline: Bool
     private var connectTask: Task<Void, Never>?
+    /// Where the offer backups live off the device; nil keeps none.
+    var offerBackups: SonarOfferBackupRelay?
+    /// A pending retry of `mergeOfferBackups` after no relay answered.
+    private var backupRetryTask: Task<Void, Never>?
+    /// How long to wait before asking silent relays for the backups again.
+    var backupRetryNanos: UInt64 = 30_000_000_000
     private var connectLoopToken: UInt64 = 0
     private var sendsInFlight = 0
     private var disconnectWhenIdle = false
@@ -302,6 +320,8 @@ final class CashuWalletService: ObservableObject {
 
     static func balanceKey(_ accountId: String) -> String { "wallet.cashu.balance.\(accountId)" }
     static func offerKey(_ accountId: String) -> String { "wallet.cashu.offer.\(accountId)" }
+    static func backupsMergedKey(_ accountId: String) -> String { "wallet.cashu.offerBackupsMerged.\(accountId)" }
+    static func backupPublishedKey(_ accountId: String) -> String { "wallet.cashu.offerBackup.\(accountId)" }
     private static let cacheKeyPrefix = "wallet.cashu."
 
     // MARK: FFI hop
@@ -413,6 +433,8 @@ final class CashuWalletService: ObservableObject {
         connectTask?.cancel()
         connectTask = nil
         connectLoopToken &+= 1
+        backupRetryTask?.cancel()
+        backupRetryTask = nil
     }
 
     private func connectLoop() async {
@@ -478,7 +500,63 @@ final class CashuWalletService: ObservableObject {
             }
         }
         await refreshBalance()
+        await mergeOfferBackups()
         await refreshOffer()
+    }
+
+    /// The offer's quote id lives only on the device, so after a reinstall the
+    /// store has no offer: bring the account's backed-up offers back BEFORE a
+    /// new one is created, so the published offer stays the same and payments
+    /// to older ones are still minted. Once per account per install; when no
+    /// relay answers it retries, and meanwhile no new offer is created.
+    private func mergeOfferBackups() async {
+        guard let relay = offerBackups, let n = native, let id = accountId else { return }
+        guard !defaults.bool(forKey: Self.backupsMergedKey(id)) else { return }
+        let myEpoch = epoch
+        guard let backups = await relay.fetch() else {
+            SecureLogger.info("Cashu offer backups: no relay answered; retrying", category: .session)
+            scheduleBackupRetry()
+            return
+        }
+        guard epoch == myEpoch, native === n else { return }
+        if !backups.isEmpty {
+            do {
+                let adopted = try await run { try n.restoreOfferBackups(backups: backups) }
+                SecureLogger.info(
+                    "Cashu offer backups restored: \(backups.count) found, \(adopted) adopted",
+                    category: .session
+                )
+            } catch {
+                SecureLogger.warning("Cashu offer backups not restored: \(CashuWalletError(error))", category: .session)
+                return
+            }
+        }
+        guard epoch == myEpoch, native === n else { return }
+        defaults.set(true, forKey: Self.backupsMergedKey(id))
+    }
+
+    private func scheduleBackupRetry() {
+        guard backupRetryTask == nil else { return }
+        backupRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: self?.backupRetryNanos ?? 0)
+            guard let self, !Task.isCancelled else { return }
+            self.backupRetryTask = nil
+            guard self.wantOnline, self.connectivity == .online else { return }
+            await self.syncAndRefresh()
+        }
+    }
+
+    /// Keep the current offer's pointer backed up off the device (see
+    /// `mergeOfferBackups`); republished only when it changes.
+    private func backupOffer(_ n: SonarCashuWalletProtocol, accountId id: String) async {
+        guard let relay = offerBackups,
+              let backup = try? await run({ n.offerBackup() }),
+              defaults.string(forKey: Self.backupPublishedKey(id)) != backup
+        else { return }
+        if await relay.publish(backup) {
+            defaults.set(backup, forKey: Self.backupPublishedKey(id))
+            SecureLogger.info("Cashu offer backed up", category: .session)
+        }
     }
 
     // MARK: Events
@@ -592,14 +670,24 @@ final class CashuWalletService: ObservableObject {
     func refreshOffer() async {
         guard let n = native, let id = accountId else { return }
         let myEpoch = epoch
+        // Until this install has looked for the account's backed-up offers,
+        // only read an offer that exists: creating one now would publish a
+        // new offer over the backed-up one (see mergeOfferBackups).
+        let mayCreate = offerBackups == nil || defaults.bool(forKey: Self.backupsMergedKey(id))
         let live: String?
         do {
-            live = try await run { try n.receiveOffer() }
+            if !mayCreate, try await run({ n.offerBackup() }) == nil {
+                live = nil
+            } else {
+                live = try await run { try n.receiveOffer() }
+            }
         } catch {
             live = nil
         }
         guard epoch == myEpoch, native === n else { return }
         guard let live, !live.isEmpty else { return }
+        await backupOffer(n, accountId: id)
+        guard epoch == myEpoch, native === n else { return }
         if defaults.string(forKey: Self.offerKey(id)) != live {
             defaults.set(live, forKey: Self.offerKey(id))
         }

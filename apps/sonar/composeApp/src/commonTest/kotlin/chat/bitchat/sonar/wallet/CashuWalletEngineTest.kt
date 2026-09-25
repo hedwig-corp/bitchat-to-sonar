@@ -45,6 +45,7 @@ class CashuWalletEngineTest {
         prefs: MapWalletPrefs = MapWalletPrefs(),
         files: WalletFileOps = RecordingWalletFiles(),
         openedDirs: MutableList<String> = mutableListOf(),
+        offerBackups: OfferBackupRelay? = null,
     ) = CashuWalletEngine(
         openNative = { _, mint, dir ->
             assertEquals(CASHU_MINT_URL, mint)
@@ -56,7 +57,77 @@ class CashuWalletEngineTest {
         files = files,
         io = StandardTestDispatcher(testScheduler),
         retryDelaysMs = listOf(1_000L),
+        offerBackups = offerBackups,
     ).also { built += it }
+
+    /** The account's relays for offer backups; [answering] false = unreachable. */
+    private class FakeBackupRelay(val stored: MutableList<String> = mutableListOf()) : OfferBackupRelay {
+        var answering = true
+        val published = mutableListOf<String>()
+        override suspend fun fetch(): List<String>? = if (answering) stored.toList() else null
+        override suspend fun publish(backup: String): Boolean {
+            if (!answering) return false
+            published += backup
+            if (backup !in stored) stored += backup
+            return true
+        }
+    }
+
+    /** The offer's quote id lived only on the device: a reinstall published
+     *  a NEW offer and payments to the old one stayed at the mint. */
+    @Test
+    fun aReinstalledWalletPublishesItsBackedUpOfferNotANewOne() = walletTest {
+        val native = FakeCashuNative(offer = null).apply { createsOffer = "lno1new" }
+        val relay = FakeBackupRelay(mutableListOf(backupOf("lno1old")))
+        val e = engine(native, offerBackups = relay)
+        e.setup(nsec)
+        e.onForeground()
+        runCurrent()
+        assertEquals("lno1old", e.offer.value)
+        assertEquals(listOf(listOf(backupOf("lno1old"))), native.restoredBackups)
+        assertEquals(listOf(backupOf("lno1old")), relay.stored, "no second offer was made")
+        e.onBackground()
+    }
+
+    /** "No relay answered" must not read as "nothing backed up". */
+    @Test
+    fun noNewOfferIsCreatedUntilTheRelaysAnswer() = walletTest {
+        val native = FakeCashuNative(offer = null).apply { createsOffer = "lno1new" }
+        val relay = FakeBackupRelay(mutableListOf(backupOf("lno1old"))).apply { answering = false }
+        val e = engine(native, offerBackups = relay)
+        e.setup(nsec)
+        e.onForeground()
+        runCurrent()
+        assertNull(e.offer.value, "no offer yet, rather than a new one over the backed-up one")
+        assertNull(native.offer)
+
+        relay.answering = true
+        advanceTimeBy(31_000)
+        runCurrent()
+        assertEquals("lno1old", e.offer.value, "the retry brings the backed-up offer back")
+        e.onBackground()
+    }
+
+    @Test
+    fun theOfferIsBackedUpOnceAndAgainWhenItChanges() = walletTest {
+        val native = FakeCashuNative(offer = "lno1a")
+        val relay = FakeBackupRelay()
+        val e = engine(native, offerBackups = relay)
+        e.setup(nsec)
+        e.onForeground()
+        runCurrent()
+        assertEquals(listOf(backupOf("lno1a")), relay.published)
+
+        native.emit(CashuEvent.Synced)
+        runCurrent()
+        assertEquals(listOf(backupOf("lno1a")), relay.published, "unchanged: not republished")
+
+        native.offer = "lno1b"
+        native.emit(CashuEvent.Synced)
+        runCurrent()
+        assertEquals(listOf(backupOf("lno1a"), backupOf("lno1b")), relay.published)
+        e.onBackground()
+    }
 
     @Test
     fun accountIdIsTheSharedGoldenDerivation() {

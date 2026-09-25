@@ -1267,6 +1267,25 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Back up the wallet's receive-offer pointer (`SonarCashuWallet::offer_backup`)
+    /// to our relays, NIP-44 sealed to our own key, one event per backup.
+    pub fn publish_wallet_offer_backup(&self, backup: String) -> FfiResult<()> {
+        self.block_on_suspendable(
+            "publish_wallet_offer_backup",
+            self.client.publish_wallet_offer_backup(&backup),
+        )?;
+        Ok(())
+    }
+
+    /// Every wallet offer backup this account published, decrypted (empty
+    /// when there are none). An error means the relays did not answer.
+    pub fn fetch_wallet_offer_backups(&self) -> FfiResult<Vec<String>> {
+        self.block_on_suspendable(
+            "fetch_wallet_offer_backups",
+            self.client.fetch_wallet_offer_backups(),
+        )
+    }
+
     /// Fetch a peer's Sonar descriptor (npub or hex pubkey). `None` means the
     /// peer is not confirmed Sonar-capable through this relay set.
     pub fn fetch_sonar_descriptor(&self, npub: String) -> FfiResult<Option<SonarDescriptorInfo>> {

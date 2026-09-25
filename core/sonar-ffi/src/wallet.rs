@@ -364,6 +364,22 @@ impl SonarCashuWallet {
         Ok(self.inner.receive_offer()?)
     }
 
+    /// The published offer's pointer, for the host to back up off the device
+    /// (`SonarNode::publish_wallet_offer_backup` seals it to the account key).
+    /// Without it a reinstall publishes a new offer and payments to the old
+    /// one stay at the mint. `None` until an offer exists. Local, no network.
+    pub fn offer_backup(&self) -> Option<String> {
+        self.inner.offer_backup()
+    }
+
+    /// Bring backed-up offers back after a reinstall: the newest becomes the
+    /// published offer when this store has none, and every backed-up quote the
+    /// store lacks is re-adopted so its payments are still minted. Needs
+    /// `connect`; returns how many quotes were adopted.
+    pub fn restore_offer_backups(&self, backups: Vec<String>) -> WalletResult<u32> {
+        Ok(self.inner.restore_offer_backups(&backups)?)
+    }
+
     /// A one-off BOLT11 invoice for `amount_sats`, with the id its payment
     /// will carry.
     pub fn receive_invoice(

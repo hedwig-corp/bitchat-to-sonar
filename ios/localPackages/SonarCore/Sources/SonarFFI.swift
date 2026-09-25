@@ -1302,6 +1302,14 @@ public protocol SonarCashuWalletProtocol: AnyObject, Sendable {
     func lookupPayment(id: String) throws  -> WalletPayment?
 
     /**
+     * The published offer's pointer, for the host to back up off the device
+     * (`SonarNode::publish_wallet_offer_backup` seals it to the account key).
+     * Without it a reinstall publishes a new offer and payments to the old
+     * one stay at the mint. `None` until an offer exists. Local, no network.
+     */
+    func offerBackup()  -> String?
+
+    /**
      * Classify what the user typed or scanned. Offline.
      */
     func parseDestination(input: String) throws  -> WalletDestination
@@ -1325,6 +1333,14 @@ public protocol SonarCashuWalletProtocol: AnyObject, Sendable {
      * with no network once created. The first call needs `connect`.
      */
     func receiveOffer() throws  -> String
+
+    /**
+     * Bring backed-up offers back after a reinstall: the newest becomes the
+     * published offer when this store has none, and every backed-up quote the
+     * store lacks is re-adopted so its payments are still minted. Needs
+     * `connect`; returns how many quotes were adopted.
+     */
+    func restoreOfferBackups(backups: [String]) throws  -> UInt32
 
     /**
      * Pay a prepared send — the one spending call. A result with
@@ -1506,6 +1522,20 @@ open func lookupPayment(id: String)throws  -> WalletPayment?  {
 }
 
     /**
+     * The published offer's pointer, for the host to back up off the device
+     * (`SonarNode::publish_wallet_offer_backup` seals it to the account key).
+     * Without it a reinstall publishes a new offer and payments to the old
+     * one stay at the mint. `None` until an offer exists. Local, no network.
+     */
+open func offerBackup() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_offer_backup(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * Classify what the user typed or scanned. Offline.
      */
 open func parseDestination(input: String)throws  -> WalletDestination  {
@@ -1555,6 +1585,21 @@ open func receiveOffer()throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarcashuwallet_receive_offer(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * Bring backed-up offers back after a reinstall: the newest becomes the
+     * published offer when this store has none, and every backed-up quote the
+     * store lacks is re-adopted so its payments are still minted. Needs
+     * `connect`; returns how many quotes were adopted.
+     */
+open func restoreOfferBackups(backups: [String])throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_restore_offer_backups(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(backups),$0
     )
 })
 }
@@ -2047,6 +2092,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws  -> StickerPackInfo
 
     /**
+     * Every wallet offer backup this account published, decrypted (empty
+     * when there are none). An error means the relays did not answer.
+     */
+    func fetchWalletOfferBackups() throws  -> [String]
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -2175,6 +2226,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * ⇒ an aborted publish self-heals on the next capability change or connect.
      */
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
+
+    /**
+     * Back up the wallet's receive-offer pointer (`SonarCashuWallet::offer_backup`)
+     * to our relays, NIP-44 sealed to our own key, one event per backup.
+     */
+    func publishWalletOfferBackup(backup: String) throws
 
     /**
      * Bounded local transcript windows for the most recent groups, newest
@@ -2914,6 +2971,18 @@ open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrl
 }
 
     /**
+     * Every wallet offer backup this account published, decrypted (empty
+     * when there are none). An error means the relays did not answer.
+     */
+open func fetchWalletOfferBackups()throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_wallet_offer_backups(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
 open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
@@ -3183,6 +3252,18 @@ open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12
         FfiConverterBool.lower(callsEnabled),
         FfiConverterSequenceString.lower(signaling),
         FfiConverterOptionString.lower(bolt12Offer),$0
+    )
+}
+}
+
+    /**
+     * Back up the wallet's receive-offer pointer (`SonarCashuWallet::offer_backup`)
+     * to our relays, NIP-44 sealed to our own key, one event per backup.
+     */
+open func publishWalletOfferBackup(backup: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_wallet_offer_backup(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(backup),$0
     )
 }
 }
@@ -11006,6 +11087,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_pack() != 19095) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_wallet_offer_backups() != 44833) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11067,6 +11151,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 27940) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_wallet_offer_backup() != 45188) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
@@ -11213,6 +11300,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_lookup_payment() != 38504) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_offer_backup() != 24936) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_parse_destination() != 33322) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11223,6 +11313,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_offer() != 22586) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_restore_offer_backups() != 23246) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_send() != 43113) {

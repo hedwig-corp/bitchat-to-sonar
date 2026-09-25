@@ -3291,6 +3291,16 @@ final class MarmotChatModel: ObservableObject {
         try await service.claimHandle(handle: handle, offer: offer)
     }
 
+    /// Back up the wallet's offer pointer to our relays, sealed to our own key.
+    func publishWalletOfferBackup(_ backup: String) async throws {
+        try await service.publishWalletOfferBackup(backup)
+    }
+
+    /// Every wallet offer backup we published; throws when no relay answered.
+    func fetchWalletOfferBackups() async throws -> [String] {
+        try await service.fetchWalletOfferBackups()
+    }
+
     /// Locally stored claimed handle address (nil when never claimed).
     func claimedHandle() async -> String? {
         await service.claimedHandle()

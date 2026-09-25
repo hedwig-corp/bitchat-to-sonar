@@ -142,8 +142,37 @@ class FakeCashuNative: SonarCashuWalletProtocol, @unchecked Sendable {
 
     func receiveOffer() throws -> String {
         record("receiveOffer")
+        if offer == nil, isConnectedLocked(), let createsOffer { offer = createsOffer }
         guard let offer else { throw WalletFfiError.NotConnected }
         return offer
+    }
+
+    /// When set, a connected `receiveOffer` with no offer creates this one,
+    /// as the mint does.
+    var createsOffer: String?
+    /// Backups handed to `restoreOfferBackups`, per call.
+    private(set) var restoredBackups: [[String]] = []
+
+    /// The backup the fake publishes for `offer`.
+    static func backup(of offer: String) -> String { "{\"v\":1,\"offer\":\"\(offer)\"}" }
+
+    func offerBackup() -> String? {
+        record("offerBackup")
+        return offer.map(Self.backup(of:))
+    }
+
+    func restoreOfferBackups(backups: [String]) throws -> UInt32 {
+        record("restoreOfferBackups")
+        guard isConnectedLocked() else { throw WalletFfiError.NotConnected }
+        restoredBackups.append(backups)
+        if offer == nil {
+            offer = backups.compactMap { backup in
+                backup.range(of: #""offer":"([^"]+)""#, options: .regularExpression).map {
+                    String(backup[$0].dropFirst(9).dropLast())
+                }
+            }.last
+        }
+        return UInt32(backups.count)
     }
 
     func send(prepared: WalletPreparedSend, note: String) throws -> WalletPayment {

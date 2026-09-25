@@ -789,6 +789,66 @@ impl CdkWallet {
         })
     }
 
+    /// The published offer's pointer, for the host to keep off the device.
+    /// Its quote id exists nowhere else, so without a copy a reinstall
+    /// publishes a new offer and payments to the old one stay at the mint.
+    /// `None` until an offer exists. The quote id reveals the offer's
+    /// received amounts to anyone who asks the mint: keep it encrypted.
+    pub fn offer_backup(&self) -> Option<String> {
+        let pointer = self.read_offer_pointer()?;
+        Some(
+            serde_json::json!({
+                "v": 1,
+                "mint": self.mint_url,
+                "quote_id": pointer.quote_id,
+                "offer": pointer.offer,
+                "index": pointer.index,
+            })
+            .to_string(),
+        )
+    }
+
+    /// Bring backed-up offers back after a reinstall. The newest becomes the
+    /// published offer when this store has none (a local offer is never
+    /// replaced), and every backed-up quote the store does not hold is
+    /// re-adopted, so payments made to any of them are still minted. Backups
+    /// for another mint, or that do not parse, are skipped. Needs `connect`;
+    /// returns how many quotes were adopted.
+    pub fn restore_offer_backups(&self, backups: &[String]) -> Result<u32> {
+        let wallet = self.wallet()?;
+        let mut pointers: Vec<OfferPointer> = Vec::new();
+        for pointer in backups
+            .iter()
+            .filter_map(|b| parse_offer_backup(b, &self.mint_url))
+        {
+            if !pointers.iter().any(|p| p.quote_id == pointer.quote_id) {
+                pointers.push(pointer);
+            }
+        }
+        let Some(newest) = pointers.iter().max_by_key(|p| p.index) else {
+            return Ok(0);
+        };
+        let _creating = self.offer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.read_offer_pointer().is_none() {
+            self.write_offer_pointer(newest)?;
+        }
+        let mut adopted = 0;
+        for pointer in &pointers {
+            let held = self
+                .rt()
+                .block_on(wallet.localstore.get_mint_quote(&pointer.quote_id))
+                .map_err(|e| WalletError::Backend(format!("read offer quote: {e}")))?;
+            if held.is_some() {
+                continue;
+            }
+            match self.adopt_offer(&wallet, pointer) {
+                Ok(()) => adopted += 1,
+                Err(e) => tracing::warn!("adopting backed-up offer {}: {e}", pointer.quote_id),
+            }
+        }
+        Ok(adopted)
+    }
+
     /// A one-time BOLT11 invoice, with the id its payment will arrive under
     /// (the mint quote id, see `incoming_payment_id`), so a host can tell
     /// THIS invoice being paid from any other receive, and stop showing a
@@ -1164,6 +1224,22 @@ fn is_abandoned_invoice(quote: &cdk::wallet::types::MintQuote, now: u64) -> bool
         && quote.amount_paid == Amount::ZERO
         && quote.expiry != 0
         && now > quote.expiry.saturating_add(ABANDONED_INVOICE_GRACE_SECS)
+}
+
+/// An [`CdkWallet::offer_backup`] made for `mint`, or `None`.
+fn parse_offer_backup(raw: &str, mint: &str) -> Option<OfferPointer> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if value.get("v")?.as_u64()? != 1 {
+        return None;
+    }
+    let same_mint =
+        value.get("mint")?.as_str()?.trim_end_matches('/') == mint.trim_end_matches('/');
+    let pointer = OfferPointer {
+        quote_id: value.get("quote_id")?.as_str()?.to_string(),
+        offer: value.get("offer")?.as_str()?.to_string(),
+        index: u32::try_from(value.get("index")?.as_u64()?).ok()?,
+    };
+    (same_mint && !pointer.quote_id.is_empty() && !pointer.offer.is_empty()).then_some(pointer)
 }
 
 /// The published offer (see [`OFFER_POINTER_PREFIX`]).
@@ -3136,6 +3212,68 @@ mod tests {
         assert_eq!(offline.receive_offer().unwrap(), first);
         assert_eq!(mint.calls("post_mint_quote"), 1);
         drop(offline);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The offer's quote id lives only in the local pointer file, so a
+    /// reinstall (store and pointer both gone) published a NEW offer, and
+    /// whatever was paid to the old one stayed at the mint, unclaimed. The
+    /// pointer's backup brings the same offer back, and its payments with it.
+    #[test]
+    fn an_offer_backup_brings_the_offer_and_its_payments_back_after_a_reinstall() {
+        let dir = scratch("offer-backup-original");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let offer = w.receive_offer().unwrap();
+        let quote = mint.mint_quote_ids().pop().unwrap();
+        let backup = w.offer_backup().expect("a published offer has a backup");
+        drop(w);
+
+        // Reinstalled without the backup: a different offer.
+        let lost = scratch("offer-backup-lost");
+        let w = reopen(&lost, &mint);
+        w.connect().unwrap();
+        assert_ne!(w.receive_offer().unwrap(), offer, "premise: the gap");
+        drop(w);
+
+        // Reinstalled with it: the same offer, and a payment made to it after
+        // the reinstall is minted by the new store.
+        let restored = scratch("offer-backup-restored");
+        let w = reopen(&restored, &mint);
+        w.connect().unwrap();
+        assert_eq!(w.restore_offer_backups(&[backup]).unwrap(), 1);
+        assert_eq!(w.receive_offer().unwrap(), offer);
+        mint.pay(&quote, 300);
+        w.sync_wallet().unwrap();
+        assert_eq!(w.balance().unwrap().confirmed_sats, 300);
+        drop(w);
+        for d in [dir, lost, restored] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// A backup never replaces the offer a store already publishes, and one
+    /// made for another mint, or that does not parse, is ignored.
+    #[test]
+    fn a_backup_never_replaces_the_local_offer_or_crosses_mints() {
+        let dir = scratch("offer-backup-guards");
+        let (w, _mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let offer = w.receive_offer().unwrap();
+        let mine: serde_json::Value = serde_json::from_str(&w.offer_backup().unwrap()).unwrap();
+        let other_quote = serde_json::json!({
+            "v": 1, "mint": mine["mint"], "quote_id": "not-at-this-mint",
+            "offer": "lno1someoneelse", "index": 7,
+        });
+        let other_mint = serde_json::json!({
+            "v": 1, "mint": "https://other.example", "quote_id": "q", "offer": "lno1x", "index": 0,
+        });
+        let restored = w
+            .restore_offer_backups(&[other_quote.to_string(), other_mint.to_string(), "{".into()])
+            .unwrap();
+        assert_eq!(restored, 0, "an unknown quote is not adopted");
+        assert_eq!(w.receive_offer().unwrap(), offer, "the local offer stays");
+        drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

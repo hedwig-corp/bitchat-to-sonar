@@ -111,6 +111,7 @@ object WalletBridge {
             storageRoot = ::walletStorageRoot,
             prefs = CoreWalletPrefs,
             files = platformWalletFiles(),
+            offerBackups = NostrOfferBackups,
         )
     }
 
@@ -227,4 +228,11 @@ object WalletBridge {
         rates = emptyMap()
         engine.wipeAll()
     }
+}
+
+/** The account's relays, through the core node. */
+private object NostrOfferBackups : OfferBackupRelay {
+    override suspend fun fetch(): List<String>? = chat.bitchat.sonar.SonarCore.fetchWalletOfferBackups()
+    override suspend fun publish(backup: String): Boolean =
+        chat.bitchat.sonar.SonarCore.publishWalletOfferBackup(backup)
 }

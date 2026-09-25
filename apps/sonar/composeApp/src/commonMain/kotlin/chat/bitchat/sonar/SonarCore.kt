@@ -1125,6 +1125,13 @@ expect object SonarCore {
     /** Fetch a peer's public Sonar descriptor (npub or hex). null on miss. */
     suspend fun fetchSonarDescriptor(npub: String): SonarDescriptor?
 
+    /** Back up the wallet's offer pointer to our relays, sealed to our own
+     *  key. False when it did not publish. */
+    suspend fun publishWalletOfferBackup(backup: String): Boolean
+
+    /** Every wallet offer backup we published; null when no relay answered. */
+    suspend fun fetchWalletOfferBackups(): List<String>?
+
     // ── Geohash public channels ──
 
     /** Geohash channels the user has joined (persisted). */

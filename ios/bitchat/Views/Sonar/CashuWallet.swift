@@ -167,3 +167,23 @@ final class CashuWallet: SonarWalletProviding {
         }
     }
 }
+
+/// The account's relays for the wallet's offer backups, through the Marmot node.
+@MainActor
+final class MarmotOfferBackupRelay: SonarOfferBackupRelay {
+    private weak var marmot: MarmotChatModel?
+
+    init(marmot: MarmotChatModel) {
+        self.marmot = marmot
+    }
+
+    func fetch() async -> [String]? {
+        guard let marmot else { return nil }
+        return try? await marmot.fetchWalletOfferBackups()
+    }
+
+    func publish(_ backup: String) async -> Bool {
+        guard let marmot else { return false }
+        return (try? await marmot.publishWalletOfferBackup(backup)) != nil
+    }
+}

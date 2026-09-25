@@ -2429,6 +2429,9 @@ final class SonarAppStore: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // The wallet's offer is backed up to (and, after a reinstall, brought
+        // back from) this account's relays.
+        (wallet as? CashuWallet)?.service.offerBackups = MarmotOfferBackupRelay(marmot: marmot)
         // Payments: mirror the wallet state and watch both transcript
         // stores for incoming ⚡PAY receipt control lines.
         republish(payLedger.objectWillChange)

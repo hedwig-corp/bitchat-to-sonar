@@ -25,6 +25,13 @@ interface CashuNative {
     fun sync()
     /** THE published offer. Stable; answered from disk once it exists. */
     fun receiveOffer(): String
+    /** The published offer's pointer, to back up off the device; null until
+     *  an offer exists. Local. */
+    fun offerBackup(): String?
+    /** Bring backed-up offers back after a reinstall (the newest becomes the
+     *  offer when none exists; every quote is re-adopted). Requires [connect];
+     *  returns how many quotes were adopted. */
+    fun restoreOfferBackups(backups: List<String>): Int
     fun receiveInvoice(amountSats: Long, description: String?): CashuInvoice
     fun parseDestination(input: String): CashuDestination
     fun prepareSend(destination: String, amountSats: Long?): CashuPreparedSend

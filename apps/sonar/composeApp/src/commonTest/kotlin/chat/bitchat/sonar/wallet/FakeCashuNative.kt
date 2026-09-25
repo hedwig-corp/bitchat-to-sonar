@@ -89,7 +89,28 @@ class FakeCashuNative(
     override fun receiveOffer(): String {
         record("receiveOffer")
         offerError?.let { throw it() }
+        if (offer == null && connected) createsOffer?.let { offer = it }
         return offer ?: throw CashuWalletException.NotConnected()
+    }
+
+    /** When set, a connected [receiveOffer] with no offer creates this one,
+     *  as the mint does. */
+    var createsOffer: String? = null
+
+    /** Backups handed to [restoreOfferBackups], per call. */
+    val restoredBackups = mutableListOf<List<String>>()
+
+    override fun offerBackup(): String? {
+        record("offerBackup")
+        return offer?.let { backupOf(it) }
+    }
+
+    override fun restoreOfferBackups(backups: List<String>): Int {
+        record("restoreOfferBackups")
+        if (!connected) throw CashuWalletException.NotConnected()
+        restoredBackups += backups
+        if (offer == null) offer = backups.mapNotNull { offerIn(it) }.lastOrNull()
+        return backups.size
     }
 
     /** Amounts `receiveInvoice` was asked for. */
@@ -206,3 +227,9 @@ class RecordingWalletFiles : WalletFileOps {
     override fun readText(path: String) = written[path]
     override fun writeText(path: String, text: String): Boolean { written[path] = text; return true }
 }
+
+/** The backup the fake publishes for [offer]. */
+fun backupOf(offer: String): String = """{"v":1,"offer":"$offer"}"""
+
+private fun offerIn(backup: String): String? =
+    Regex(""""offer":"([^"]+)"""").find(backup)?.groupValues?.get(1)

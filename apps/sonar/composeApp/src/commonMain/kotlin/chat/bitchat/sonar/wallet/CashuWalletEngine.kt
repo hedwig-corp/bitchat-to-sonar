@@ -21,6 +21,17 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
 /**
+ * Where the wallet's offer backups live off the device: the account's Nostr
+ * relays, sealed to the account key (`SonarNode.publishWalletOfferBackup`).
+ */
+interface OfferBackupRelay {
+    /** Every backup this account published; null when no relay answered. */
+    suspend fun fetch(): List<String>?
+    /** Publish one backup; false when it did not reach a relay. */
+    suspend fun publish(backup: String): Boolean
+}
+
+/**
  * Sonar's Cashu wallet, host side: lifecycle, caches and the send pipeline
  * around one [CashuNative] per account. [WalletBridge] owns the production
  * instance; tests build their own with a fake native.
@@ -45,6 +56,8 @@ class CashuWalletEngine(
     private val io: CoroutineDispatcher = Dispatchers.IO,
     private val mintUrl: String = CASHU_MINT_URL,
     private val retryDelaysMs: List<Long> = DEFAULT_RETRY_DELAYS_MS,
+    /** Where the offer backups live off the device; null keeps none. */
+    private val offerBackups: OfferBackupRelay? = null,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + io)
 
@@ -69,6 +82,8 @@ class CashuWalletEngine(
     private var sendsInFlight = 0
     private var disconnectWhenIdle = false
     private var connectJob: Job? = null
+    /** A pending retry of [mergeOfferBackups] after no relay answered. */
+    private var backupRetry: Job? = null
 
     /** One balance refresh in flight, at most one trailing (event bursts). */
     private val refreshGate = Mutex()
@@ -364,7 +379,10 @@ class CashuWalletEngine(
     private suspend fun releaseLocked(n: CashuNative, close: Boolean = true) {
         epoch += 1
         native = null
-        counters.withLock { connectJob?.cancel(); connectJob = null; disconnectWhenIdle = false }
+        counters.withLock {
+            connectJob?.cancel(); connectJob = null; disconnectWhenIdle = false
+            backupRetry?.cancel(); backupRetry = null
+        }
         runCatching { n.clearListener() }
         connectOps.withLock { runCatching { n.disconnect() } }
         if (close) runCatching { n.close() }
@@ -426,7 +444,56 @@ class CashuWalletEngine(
     private suspend fun syncAndRefresh(n: CashuNative, syncFirst: Boolean = true) {
         if (syncFirst) runCatching { n.sync() }
         refreshBalance()
+        mergeOfferBackups(n)
         refreshOffer()
+    }
+
+    /**
+     * The offer's quote id lives only on the device, so after a reinstall the
+     * store has no offer: bring the account's backed-up offers back BEFORE a
+     * new one is created, so the published offer stays the same and payments
+     * to older ones are still minted. Once per account per install; when no
+     * relay answers it retries, and meanwhile no new offer is created.
+     */
+    private suspend fun mergeOfferBackups(n: CashuNative) = withContext(io) {
+        val relay = offerBackups ?: return@withContext
+        val id = accountId ?: return@withContext
+        if (prefs.get(backupsMergedKey(id)) == "1") return@withContext
+        val backups = runCatching { relay.fetch() }.getOrNull()
+        if (backups == null) {
+            sonarLog(TAG, "cashu offer backups: no relay answered; retrying")
+            scheduleBackupRetry(n)
+            return@withContext
+        }
+        if (backups.isNotEmpty()) {
+            val adopted = runCatching { n.restoreOfferBackups(backups) }
+                .onFailure { sonarLog(TAG, "cashu offer backups not restored: ${it.message}") }
+                .getOrNull() ?: return@withContext
+            sonarLog(TAG, "cashu offer backups restored: ${backups.size} found, $adopted adopted")
+        }
+        if (native === n) prefs.put(backupsMergedKey(id), "1")
+    }
+
+    private fun scheduleBackupRetry(n: CashuNative) {
+        counters.withLock {
+            if (backupRetry?.isActive == true) return@withLock
+            backupRetry = scope.launch {
+                delay(BACKUP_RETRY_MS)
+                if (wantOnline && native === n && n.isConnected()) syncAndRefresh(n, syncFirst = false)
+            }
+        }
+    }
+
+    /** Keep the current offer's pointer backed up off the device (see
+     *  [mergeOfferBackups]); republished only when it changes. */
+    private suspend fun backupOffer(n: CashuNative, id: String) {
+        val relay = offerBackups ?: return
+        val backup = runCatching { n.offerBackup() }.getOrNull() ?: return
+        if (prefs.get(backupPublishedKey(id)) == backup) return
+        if (runCatching { relay.publish(backup) }.getOrDefault(false)) {
+            prefs.put(backupPublishedKey(id), backup)
+            sonarLog(TAG, "cashu offer backed up")
+        }
     }
 
     /** Re-read the offer; publish only on change. Offline falls back to the
@@ -435,11 +502,20 @@ class CashuWalletEngine(
         val n = native ?: return@withContext
         val id = accountId ?: return@withContext
         val myEpoch = epoch
-        val live = runCatching { n.receiveOffer() }
-            .onFailure { sonarLog(TAG, "cashu receiveOffer unavailable: ${it.message}") }
-            .getOrNull()
-            ?.takeIf { it.isNotBlank() }
+        // Until this install has looked for the account's backed-up offers,
+        // only read an offer that exists: creating one now would publish a
+        // new offer over the backed-up one (see mergeOfferBackups).
+        val mayCreate = offerBackups == null || prefs.get(backupsMergedKey(id)) == "1"
+        val live = if (!mayCreate && runCatching { n.offerBackup() }.getOrNull() == null) {
+            null
+        } else {
+            runCatching { n.receiveOffer() }
+                .onFailure { sonarLog(TAG, "cashu receiveOffer unavailable: ${it.message}") }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+        }
         if (myEpoch != epoch || native !== n) return@withContext
+        if (live != null) backupOffer(n, id)
         val offer = live ?: _offer.value ?: prefs.get(offerKey(id))
         if (live != null && prefs.get(offerKey(id)) != live) prefs.put(offerKey(id), live)
         if (offer != _offer.value) _offer.value = offer
@@ -457,6 +533,8 @@ class CashuWalletEngine(
     private fun forgetCaches(id: String) {
         prefs.remove(balanceKey(id))
         prefs.remove(offerKey(id))
+        prefs.remove(backupsMergedKey(id))
+        prefs.remove(backupPublishedKey(id))
     }
 
     /** Wallet-thread callback: never block it, hop to [scope]. */
@@ -545,9 +623,12 @@ class CashuWalletEngine(
         private const val TAG = "SonarWallet"
         val DEFAULT_RETRY_DELAYS_MS = listOf(2_000L, 5_000L, 15_000L, 30_000L, 60_000L)
         private const val PANIC_SEND_GRACE_MS = 5_000L
+        private const val BACKUP_RETRY_MS = 30_000L
 
         fun balanceKey(accountId: String) = "wallet.cashu.balance.$accountId"
         fun offerKey(accountId: String) = "wallet.cashu.offer.$accountId"
+        fun backupsMergedKey(accountId: String) = "wallet.cashu.offerBackupsMerged.$accountId"
+        fun backupPublishedKey(accountId: String) = "wallet.cashu.offerBackup.$accountId"
 
         const val MINT_OFFLINE_MESSAGE = "Mint offline — retrying. Nothing was sent."
         const val WALLET_STARTING_MESSAGE = "Your wallet is still starting. Try again in a moment."
