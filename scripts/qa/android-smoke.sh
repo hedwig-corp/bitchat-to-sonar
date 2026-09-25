@@ -6,6 +6,12 @@
 #
 #   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003] [--max-idle-cpu 3]
 #   (set QA_APP_NPUB to run a scenario that needs the app's npub with --only)
+#   QA_ALLOW_WIPE=1 also runs QA-089, which CLEARS the app's data: throwaway
+#   emulators only, never a device or an emulator holding an account you need.
+#   On API 34+ images turn stylus handwriting off first
+#   (`adb shell settings put secure stylus_handwriting_enabled 0`): Gboard's
+#   "Try out your stylus" sheet otherwise opens over the app and swallows the
+#   typed key, and `uiautomator` cannot see it.
 #
 # Preconditions: an ONBOARDED Debug build on a QA emulator
 # (scripts/qa/android-setup.sh), network access to the default relays, and the
@@ -348,6 +354,116 @@ qa078() { # the Cashu wallet's Receive sheet shows a real, scannable BOLT12 offe
   go_home >/dev/null
 }
 
+qa087() { # a damaged wallet store is set aside and rebuilt, never "Mint offline" forever (#614)
+  local pkg=chat.bitchat.sonar store dir tries=0 aside
+  store="$(adb -s "$QA_SERIAL" shell "run-as $pkg sh -c 'ls files/sonar-cashu/*/mainnet/cashu.redb'" 2>/dev/null | tr -d '\r' | head -1)"
+  [[ "$store" == files/* ]] || { record QA-087 SKIP "no wallet store to damage (run-as needs a Debug build)"; return; }
+  dir="${store%/*}"
+  adb -s "$QA_SERIAL" shell am force-stop "$pkg"
+  # Overwrite redb's magic number: a store that no longer opens.
+  adb -s "$QA_SERIAL" shell "run-as $pkg sh -c 'printf XXXXXXXXX | dd of=$store bs=1 seek=0 count=9 conv=notrunc'" >/dev/null 2>&1
+  adb -s "$QA_SERIAL" shell am start -n "$pkg/.MainActivity" >/dev/null 2>&1
+  # The wallet connects a few seconds after launch; give it time to fail or rebuild.
+  sleep 20
+  go_home || { record QA-087 FAIL "could not reach the chat list"; return; }
+  ui tapx "Settings"; sleep 1.5
+  ui tapx "Balance" || { record QA-087 FAIL "no wallet Balance row in Settings"; go_home >/dev/null; return; }
+  while has "Mint offline" && (( tries < 15 )); do sleep 2; tries=$((tries + 1)); done
+  aside="$(adb -s "$QA_SERIAL" shell "run-as $pkg ls $dir" 2>/dev/null | tr -d '\r' | grep -c '^cashu.redb.corrupt-')"
+  if [[ "$aside" -lt 1 ]]; then
+    record QA-087 FAIL "the damaged store was not set aside (no cashu.redb.corrupt-*): connect keeps failing"
+  elif has "Mint offline"; then
+    record QA-087 FAIL "store set aside but the wallet still reads 'Mint offline'"
+  else
+    record QA-087 PASS "damaged store set aside, wallet rebuilt and online"
+  fi
+  go_home >/dev/null
+}
+
+# A throwaway nsec (bech32 of 32 random bytes) for the restore scenarios.
+throwaway_nsec() {
+  python3 - <<'PY_NSEC'
+import os
+C = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+def pm(v):
+    g = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]; c = 1
+    for x in v:
+        b = c >> 25; c = (c & 0x1ffffff) << 5 ^ x
+        for i in range(5):
+            c ^= g[i] if (b >> i) & 1 else 0
+    return c
+a = b = 0; d = []
+for v in os.urandom(32):
+    a = (a << 8) | v; b += 8
+    while b >= 5:
+        b -= 5; d.append((a >> b) & 31)
+if b:
+    d.append((a << (5 - b)) & 31)
+e = [ord(x) >> 5 for x in "nsec"] + [0] + [ord(x) & 31 for x in "nsec"]
+k = pm(e + d + [0] * 6) ^ 1
+print("nsec1" + "".join(C[x] for x in d + [(k >> 5 * (5 - i)) & 31 for i in range(6)]))
+PY_NSEC
+}
+
+# Clear the app, restore <nsec>, and print the Receive QR's offer.
+restore_and_read_offer() {
+  local pkg=chat.bitchat.sonar png decoded i
+  adb -s "$QA_SERIAL" shell pm clear "$pkg" >/dev/null
+  adb -s "$QA_SERIAL" logcat -c
+  adb -s "$QA_SERIAL" shell am start -n "$pkg/.MainActivity" >/dev/null 2>&1
+  "$UI" wait "Restore account" 30 >/dev/null || { echo "no welcome screen"; return 1; }
+  ui tapx "Restore account"; sleep 1.5
+  # The key field exposes no label (NAF), so focus it as the first edit field.
+  # Keystrokes sent before it has focus are dropped (the post-navigation
+  # trap): wait for the keyboard, and enter the key again while the restore
+  # screen is still up (a dropped entry leaves the field empty).
+  for i in 1 2 3; do
+    local _
+    for _ in 1 2 3; do ui tapedit; sleep 1; [[ "$("$UI" ime)" == shown ]] && break; done
+    adb -s "$QA_SERIAL" shell input text "$1"; sleep 1
+    ui tapx "Restore account" -1; sleep 5
+    has "Paste key" || break
+  done
+  has "Paste key" && { echo "the key was not accepted"; return 1; }
+  for i in 1 2 3 4 5 6; do
+    if has "While using the app"; then ui tapx "While using the app"
+    elif hasx "Allow"; then ui tapx "Allow"
+    else break; fi
+    sleep 2
+  done
+  go_home || { echo "chat list not reached after the restore"; return 1; }
+  ui tapx "Settings"; sleep 1.5
+  ui tapx "Balance" || { echo "no wallet Balance row"; return 1; }
+  sleep 1.5
+  ui tapx "Receive" || { echo "no Receive button"; return 1; }
+  "$UI" wait "Anyone can pay this address" 120 >/dev/null || { echo "no offer after 120 s"; return 1; }
+  sleep 1
+  png="$("$UI" shot "qa089-$RUN-$RANDOM")"; png="${png%.png}-full.png"
+  decoded="$(swift "$ROOT/scripts/qa/qr-decode.swift" "$png" 2>/dev/null | tail -1)"
+  [[ "$decoded" == lno1* ]] || { echo "Receive QR decodes to '${decoded:0:20}'"; return 1; }
+  # Only clear the app again once its offer is backed up to the relays.
+  for i in $(seq 1 30); do
+    adb -s "$QA_SERIAL" logcat -d 2>/dev/null | grep -q "cashu offer backed up" && break
+    sleep 2
+  done
+  echo "$decoded"
+}
+
+qa089() { # a reinstall publishes the SAME receive offer, brought back from its backup (#614)
+  [[ "${QA_ALLOW_WIPE:-0}" == 1 ]] ||
+    { record QA-089 SKIP "clears app data: set QA_ALLOW_WIPE=1 (throwaway emulator only)"; return; }
+  command -v swift >/dev/null || { record QA-089 SKIP "needs macOS swift (CoreImage) to decode"; return; }
+  local nsec first second
+  nsec="$(throwaway_nsec)"
+  first="$(restore_and_read_offer "$nsec")" || { record QA-089 FAIL "first install: $first"; return; }
+  second="$(restore_and_read_offer "$nsec")" || { record QA-089 FAIL "after the reinstall: $second"; return; }
+  if [[ "$first" == "$second" ]]; then
+    record QA-089 PASS "same offer after clearing the app and restoring the key"
+  else
+    record QA-089 FAIL "the offer changed after a reinstall: payments to the old one would be stranded"
+  fi
+}
+
 qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
   local bad=() skipped=""
   naf_check() { # label — a failed dump is a failure, never an empty (passing) sweep
@@ -462,8 +578,9 @@ echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
-# QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa078 qa043 qa070 qa071 qa072 qa050; do
+# QA-040 inspects the chat QA-005 left open. QA-089 runs last: it clears the
+# app's data (only with QA_ALLOW_WIPE=1).
+for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa078 qa087 qa043 qa070 qa071 qa072 qa050 qa089; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

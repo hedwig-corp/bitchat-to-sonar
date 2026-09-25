@@ -450,6 +450,71 @@ real mint and need the maintainer's approval of the amounts.
   opened a second redb writer while an in-flight call held the old wallet,
   and Rust's std has no file lock on Android to refuse it.
 
+### QA-087 — A damaged wallet store is rebuilt from the key
+- **Platforms:** both (Android automated; iOS manual on the fake-mint simulator)
+- **Steps:** with the app stopped, damage `sonar-cashu/<id>/mainnet/cashu.redb`
+  (Android: `run-as` + `dd` over the header; iOS: the app container), relaunch,
+  open the wallet.
+- **Expect:** the wallet comes online (never stuck on "Mint offline —
+  retrying"), the balance comes back through the NUT-13 restore, and the
+  damaged file is kept as `cashu.redb.corrupt-<secs>`.
+- **How:** `android-smoke.sh` QA-087 · Guard:
+  `a_corrupted_store_is_set_aside_and_rebuilt_from_the_seed`,
+  `a_store_that_panics_redb_on_open_is_rebuilt_too`
+- **Origin:** #614 QA pass — a corrupted store failed every connect forever;
+  some damage made redb panic inside connect.
+
+### QA-088 — A payment from outside Sonar raises a banner
+- **Platforms:** both (manual; iOS on the fake mint, whose invoices pay
+  themselves)
+- **Steps:** Receive → request an amount → create the invoice (or have an
+  outside wallet pay the offer) with the app open.
+- **Expect:** one "Payment received" notification ("N sats received."), not
+  repeated when the payment is replayed, and none for our own sends. It
+  comes about 30 s after the payment: the wallet first waits for a chat ⚡PAY
+  line that would announce it (QA-090).
+- **Guard:** `WalletReceiveNotificationTests.testAnOutsidePaymentIsAnnouncedOnceWhenItSettles`,
+  `WalletAppStateTest.anOutsidePaymentIsAnnouncedOnceWhenItSettles`
+- **Origin:** #614 — an outside payment has no chat line, so nothing
+  announced it; the money just appeared.
+
+### QA-090 — A chat ⚡PAY is announced once
+- **Platforms:** both (manual; iOS on the fake mint: a `sonar-cli` peer sends
+  the `⚡PAY|1|<hex>|<sats>` line and `sonar-cashu-cli` pays the app's offer
+  from a funded fake-mint wallet)
+- **Steps:** with the app open, (a) the peer sends ⚡PAY for N sats, then the
+  offer is paid N; (b) the offer is paid M, then within 30 s the peer sends
+  ⚡PAY for M; (c) the offer is paid K with no ⚡PAY.
+- **Expect:** no "Payment received" banner for (a) or (b), whose chat line
+  announces them; one banner for (c) after about 30 s. Check the system log
+  for `sonar-payment-wallet-<quote id>` requests.
+- **Guard:** `WalletReceiveNotificationTests.testAChatPaymentIsAnnouncedByItsChatLineOnly`,
+  `WalletAppStateTest.aChatPaymentIsAnnouncedByItsChatLineOnly`,
+  `ReceiveAnnouncerTest`
+- **Origin:** #614 — every chat payment raised the chat notification and a
+  second "Payment received" banner from the wallet.
+
+### QA-089 — A reinstall keeps the same receive offer
+- **Platforms:** both (Android automated, destructive: `QA_ALLOW_WIPE=1` on a
+  throwaway emulator; iOS manual: delete and reinstall on a throwaway
+  simulator. The simulator keeps the key in the Keychain, so the account
+  comes back without a restore; on the fake mint write the DEBUG mint
+  override before the first launch, or the wallet merges against the real
+  mint first)
+- **Steps:** restore a throwaway key, read the Receive QR, wait for the offer
+  to be backed up, clear the app (or reinstall), restore the same key, read
+  the QR again.
+- **Expect:** the same `lno1…` offer both times; a payment made to it after
+  the reinstall is minted by the new install.
+- **How:** `android-smoke.sh` QA-089 · Guard:
+  `an_offer_backup_brings_the_offer_and_its_payments_back_after_a_reinstall`,
+  `wallet_offer_backups_are_sealed_to_the_account_and_survive_a_reinstall`,
+  `CashuWalletEngineTest.aReinstalledWalletPublishesItsBackedUpOfferNotANewOne`,
+  `CashuOfferBackupTests.testAReinstalledWalletPublishesItsBackedUpOfferNotANewOne`
+- **Origin:** #614 — the offer's quote id lived only on the device, so a
+  reinstall published a new offer and payments to the old one stayed at the
+  mint, unclaimed.
+
 ## Open questions (need a product decision, not a fix)
 
 - **Data usage (A24):** "Wi-Fi only" is stored but nothing reads it on either
