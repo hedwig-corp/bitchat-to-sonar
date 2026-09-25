@@ -929,7 +929,8 @@ private struct MacConversationPane: View {
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: !isChannel && store.canSendMedia(id),
-            onVoice: { store.sendVoiceNote(id, url: $0) }
+            onVoice: { store.sendVoiceNote(id, url: $0) },
+            focusRequest: isChannel ? nil : store.composerReply(for: id)?.parentId
         )
         }
     }
@@ -3878,7 +3879,8 @@ private struct MacDMTranscript: View {
                     prepare: { store.prepareMedia($0, autoDownload: $1) },
                     request: { store.requestMediaDownload($0) },
                     cancel: { store.cancelMediaDownload($0) },
-                    loadLocal: { await store.mediaData($0) }
+                    loadLocal: { await store.mediaData($0) },
+                    transfers: store.mediaTransferSource
                 ),
                 loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                 onTapPack: onTapPack,
@@ -3948,7 +3950,8 @@ private struct MacCollectionHostDM<Composer: View>: View {
                     prepare: { store.prepareMedia($0, autoDownload: $1) },
                     request: { store.requestMediaDownload($0) },
                     cancel: { store.cancelMediaDownload($0) },
-                    loadLocal: { await store.mediaData($0) }
+                    loadLocal: { await store.mediaData($0) },
+                    transfers: store.mediaTransferSource
                 ),
                 loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                 onTapPack: onTapPack,
@@ -4021,7 +4024,8 @@ private struct MacSpikeADMHost<Composer: View>: View {
                     prepare: { store.prepareMedia($0, autoDownload: $1) },
                     request: { store.requestMediaDownload($0) },
                     cancel: { store.cancelMediaDownload($0) },
-                    loadLocal: { await store.mediaData($0) }
+                    loadLocal: { await store.mediaData($0) },
+                    transfers: store.mediaTransferSource
                 ),
                 loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                 onTapPack: onTapPack,

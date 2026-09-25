@@ -1095,6 +1095,9 @@ struct SNMediaPipeline {
     var request: (SNMediaItem) -> Void
     var cancel: (SNMediaItem) -> Void
     var loadLocal: (SNMediaItem) async -> Data?
+    /// Observed by media bubbles so a download's phase/progress repaints the
+    /// bubble without a transcript rebuild (see `SNMediaTransferSource`).
+    var transfers: SNMediaTransferSource? = nil
 
     static let unavailable = SNMediaPipeline(
         state: { _ in .notDownloaded },
@@ -1103,6 +1106,28 @@ struct SNMediaPipeline {
         cancel: { _ in },
         loadLocal: { _ in nil }
     )
+}
+
+/// Re-evaluates `content` whenever `source` publishes. With no source it
+/// renders `content` exactly as before.
+struct SNMediaTransferObserver<Content: View>: View {
+    let source: SNMediaTransferSource?
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        if let source {
+            Observing(source: source, content: content)
+        } else {
+            content()
+        }
+    }
+
+    private struct Observing: View {
+        @ObservedObject var source: SNMediaTransferSource
+        let content: () -> Content
+
+        var body: some View { content() }
+    }
 }
 
 /// O(1) identity for transcript changes that can affect the live edge.
@@ -2852,7 +2877,9 @@ struct SNMediaBubble: View {
     }
 
     var body: some View {
-        Group {
+        // Re-read transfer state (and so `loadKey`) when a download moves:
+        // collection-host cells are not reconfigured for it.
+        SNMediaTransferObserver(source: pipeline.transfers) {
             #if os(iOS)
             bubble
                 .fullScreenCover(isPresented: $viewerOpen) { viewer }
@@ -4520,6 +4547,10 @@ struct SNComposer: View {
     /// Group members the `@` picker can offer. Empty outside multi-member
     /// Marmot groups, which is what keeps the picker off 1:1 chats.
     var mentionRoster: [SNMentionCandidate] = []
+    /// Focuses the field whenever this changes to a new non-nil value — the
+    /// quoted message's id, so choosing Reply puts the cursor in the composer
+    /// (Signal behaviour) instead of leaving the user to tap it.
+    var focusRequest: String? = nil
 
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
@@ -4810,6 +4841,9 @@ struct SNComposer: View {
                     }
                     .onChange(of: text) { _ in
                         syncFieldFromStoreIfNeeded()
+                    }
+                    .onChange(of: focusRequest) { request in
+                        if request != nil { composerFocused = true }
                     }
                     .onChange(of: composerFocused) { focused in
                         if snShouldCloseEmojiTrayOnComposerFocus(
@@ -5142,6 +5176,73 @@ extension View {
         @ViewBuilder content: @escaping () -> SheetContent
     ) -> some View {
         modifier(SNSheetModifier(isPresented: isPresented, title: title, sheetContent: content))
+    }
+}
+
+// MARK: - Content-hugging sheet body
+
+/// Bottom-sheet body that sizes to its content and scrolls only once the
+/// content outgrows `maxHeight`. A bare `ScrollView` is greedy: inside
+/// `.frame(maxHeight:)` it always takes the full max height, so a four-row
+/// sheet opened as a near-full-screen panel with a blank lower half.
+///
+/// One view tree in both regimes (not a `ViewThatFits` swap), so a focused
+/// TextField inside keeps its focus while a lookup result grows the content.
+struct SNFittedScrollView<Content: View>: View {
+    let maxHeight: CGFloat
+    @ViewBuilder let content: () -> Content
+
+    @State private var contentHeight: CGFloat = 0
+
+    var body: some View {
+        // Not a frame: a fixed `.frame(height:)` ignored a smaller proposal
+        // (keyboard up, landscape, short window) and pushed the bottom-aligned
+        // sheet's top off screen; a `maxHeight` frame re-inflates to the
+        // proposal because ScrollView is greedy. The layout takes exactly
+        // min(content, maxHeight, offered height).
+        SNFittedHeightLayout(contentHeight: contentHeight, maxHeight: maxHeight) {
+            ScrollView {
+                // Measured with onGeometryChange, not a PreferenceKey: a preference
+                // set inside ScrollView content never reached an outer
+                // onPreferenceChange here (it only ever reported the default 0).
+                content()
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.size.height
+                    } action: { height in
+                        contentHeight = height
+                    }
+            }
+        }
+    }
+}
+
+/// Height a fitted sheet body takes: its measured content (0 = not measured
+/// yet, so the cap), never more than `maxHeight`, never more than the parent
+/// offers.
+func snFittedSheetHeight(content: CGFloat, maxHeight: CGFloat, available: CGFloat?) -> CGFloat {
+    let wanted = content > 0 ? min(content, maxHeight) : maxHeight
+    guard let available, available.isFinite else { return wanted }
+    return max(0, min(wanted, available))
+}
+
+private struct SNFittedHeightLayout: Layout {
+    let contentHeight: CGFloat
+    let maxHeight: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let height = snFittedSheetHeight(content: contentHeight, maxHeight: maxHeight, available: proposal.height)
+        let width = proposal.width
+            ?? subviews.first?.sizeThatFits(ProposedViewSize(width: nil, height: height)).width
+            ?? 0
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        subviews.first?.place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: bounds.height)
+        )
     }
 }
 

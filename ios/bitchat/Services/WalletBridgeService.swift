@@ -620,7 +620,12 @@ final class WalletBridgeService: ObservableObject {
         balanceTask = Task { [weak self] in
             for await sats in stream {
                 guard let self, !Task.isCancelled else { return }
-                self.state = .ready(balanceSats: sats)
+                // The stream polls every 5 s and yields the balance even when it
+                // did not move. `@Published` emits on every assignment, and each
+                // emission re-ran the whole store's wallet sink (including a
+                // Boltz offer request), so only publish an actual change.
+                let next = State.ready(balanceSats: sats)
+                if self.state != next { self.state = next }
             }
         }
     }

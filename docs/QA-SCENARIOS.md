@@ -69,7 +69,9 @@ is the build under test on a dedicated QA emulator/simulator.
 - **How:** `android-smoke.sh` QA-005 (asserts that strict order; the
   notification-tap entry stays manual)
 - **Origin:** A12 (#616) — seen once one row too high after a notification-tap
-  open, not reproduced in 4 retries. If you see it, capture logcat first.
+  open. Reproduced 3/3 on 2026-09-24 (#615 QA): the reopen painted the stale
+  leave frame and the anchor froze on the read row — R-049, guarded by
+  `TranscriptDisplayPolicyTest.reopenWithUnreadDoesNotRepaintTheLeaveFrame`.
 
 ### QA-006 — Quoted reply round trip
 - **Platforms:** both (manual)

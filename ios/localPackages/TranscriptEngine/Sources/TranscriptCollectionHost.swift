@@ -179,13 +179,29 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
 
 private final class TranscriptComposerRootStore<Composer: View>: ObservableObject {
     @Published var composer: Composer
+    /// Fired when the composer's laid-out height moves without a new Composer
+    /// value — a draft wrapping onto another line lives in the composer's own
+    /// `@State` (keystrokes stay composer-local, R-042), so nothing else tells
+    /// the host the bar must grow.
+    var onContentHeightChange: (() -> Void)?
     init(_ composer: Composer) { self.composer = composer }
 }
 
 private struct TranscriptComposerRootView<Composer: View>: View {
     @ObservedObject var store: TranscriptComposerRootStore<Composer>
     var body: some View {
-        store.composer.ignoresSafeArea(.container, edges: .bottom)
+        store.composer
+            // Lay the composer out at its ideal height for the real width, even
+            // before the host has resized the bar to match — otherwise a
+            // wrapping TextField is clamped to the old height and scrolls
+            // inside itself, and its height never changes to report.
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { [store] _ in
+                store.onContentHeightChange?()
+            }
+            .ignoresSafeArea(.container, edges: .bottom)
     }
 }
 
@@ -201,7 +217,15 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     /// before while every helper-level test stayed green.
     let collectionView: UICollectionView
     private let flowLayout: UICollectionViewFlowLayout
-    private let composerContainer = UIView()
+    /// Package-internal for the same reason as `collectionView`: layout tests
+    /// assert the bar's real height.
+    let composerContainer = UIView()
+    /// The bar's height, measured at the real width (`syncComposerHeight`).
+    /// `UIHostingController.sizingOptions = .intrinsicContentSize` alone reports
+    /// the SwiftUI *ideal* size, which is measured with an unconstrained width —
+    /// a long draft fits on one line there, so the bar never grew and the field
+    /// scrolled its first lines out of sight.
+    private var composerHeightConstraint: NSLayoutConstraint?
     private let composerStore: TranscriptComposerRootStore<Composer>
     private let composerHost: UIHostingController<TranscriptComposerRootView<Composer>>
     private var dataSource:
@@ -315,8 +339,13 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         addChild(composerHost)
         composerContainer.addSubview(composerHost.view)
         composerHost.didMove(toParent: self)
-        composerHost.view.setContentHuggingPriority(.required, for: .vertical)
-        composerHost.view.setContentCompressionResistancePriority(.required, for: .vertical)
+        // Below the measured height constraint (required): the intrinsic size
+        // only sizes the bar until the first width-aware measurement lands.
+        composerHost.view.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        composerHost.view.setContentCompressionResistancePriority(.defaultHigh, for: .vertical)
+        composerStore.onContentHeightChange = { [weak self] in
+            self?.view.setNeedsLayout()
+        }
 
         let bottomToKeyboard = composerContainer.bottomAnchor.constraint(
             equalTo: view.keyboardLayoutGuide.topAnchor
@@ -391,7 +420,29 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         if width > 0, heightCache.updateWidth(width) {
             flowLayout.invalidateLayout()
         }
+        syncComposerHeight()
         updateOwnedInsetsFromChrome()
+    }
+
+    /// Pin the bar to the composer's height at the real width. Changing the
+    /// constant schedules one more layout pass, which converges because the
+    /// measurement does not depend on the bar's current height.
+    private func syncComposerHeight() {
+        let width = composerContainer.bounds.width > 0
+            ? composerContainer.bounds.width
+            : collectionView.bounds.width
+        guard width > 0 else { return }
+        let height = composerHost.sizeThatFits(
+            in: CGSize(width: width, height: UIView.layoutFittingExpandedSize.height)
+        ).height
+        guard height > 1 else { return }
+        if let constraint = composerHeightConstraint {
+            if abs(constraint.constant - height) > 0.5 { constraint.constant = height }
+        } else {
+            let constraint = composerHost.view.heightAnchor.constraint(equalToConstant: height)
+            constraint.isActive = true
+            composerHeightConstraint = constraint
+        }
     }
 
     func apply(

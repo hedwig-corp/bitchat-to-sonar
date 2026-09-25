@@ -750,6 +750,20 @@ final class SNMediaUploadProgressSource: ObservableObject {
     }
 }
 
+/// Download phase/progress revision for media bubbles.
+///
+/// Collection-host cells reconfigure only when the transcript render revision
+/// changes, and a download finishing does not change it — so a received photo
+/// kept its "Tap to download" placeholder after the file had landed on disk.
+/// Bubbles observe this instead; mirrors `SNMediaUploadProgressSource` for the
+/// other direction.
+@MainActor
+final class SNMediaTransferSource: ObservableObject {
+    @Published private(set) var revision: UInt64 = 0
+
+    func bump() { revision &+= 1 }
+}
+
 /// Bridges UniFFI upload progress into the optimistic media bubble bar.
 final class SNMediaUploadListener: MediaUploadListener, @unchecked Sendable {
     private let lock = NSLock()
@@ -1654,7 +1668,7 @@ final class SonarAppStore: ObservableObject {
 
     /// Outcome of finalizing a staged video: distinguishes "cannot fit under
     /// the cap" from an I/O or export failure so the toast never lies.
-    private enum VideoFinalizeResult: Sendable {
+    enum VideoFinalizeResult: Sendable {
         case ready(data: Data, filename: String, mime: String)
         case tooLarge
         case failed
@@ -1665,44 +1679,97 @@ final class SonarAppStore: ObservableObject {
     /// under the receiver download cap, otherwise re-encode to a smaller
     /// H.264/AAC MP4 with `AVAssetExportSession` and send that if it fits.
     /// Consumes (deletes) the staged temp file.
-    private nonisolated static func finalizeVideoForSend(
+    nonisolated static func finalizeVideoForSend(
         _ url: URL,
         filename: String,
         mime: String
     ) async -> VideoFinalizeResult {
         defer { deleteTempMediaFile(url) }
-        if let size = fileSize(url), size <= maxMediaPlaintextBytes {
-            guard let data = readTempMediaFile(url) else { return .failed }
-            return .ready(data: data, filename: filename, mime: mime)
-        }
         let asset = AVURLAsset(url: url)
-        guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPreset960x540) else {
+        // The Photos picker hands over the original file ("Location Is
+        // Included"), so a video recorded with Location Services on would tell
+        // the recipient where it was shot. The original bytes are never sent:
+        // location can sit in asset metadata, a track's `udta` or an XMP
+        // `uuid` box, and AVFoundation only reports the first, so no metadata
+        // check can prove a file clean. A passthrough remux keeps the original
+        // encode and writes only the metadata `.forSharing()` lets through; the
+        // filtered re-encode below covers containers that cannot be remuxed.
+        if let size = fileSize(url), size <= maxMediaPlaintextBytes,
+           let fileType = passthroughFileType(for: url),
+           let cleaned = await exportVideoWithoutPrivateMetadata(
+               asset,
+               presetName: AVAssetExportPresetPassthrough,
+               fileType: fileType
+           ) {
+            defer { deleteTempMediaFile(cleaned) }
+            if let cleanedSize = fileSize(cleaned), cleanedSize <= maxMediaPlaintextBytes,
+               let data = readTempMediaFile(cleaned) {
+                return .ready(data: data, filename: filename, mime: mime)
+            }
+        }
+        guard let outURL = await exportVideoWithoutPrivateMetadata(
+            asset,
+            presetName: AVAssetExportPreset960x540,
+            fileType: .mp4
+        ) else {
             return .failed
         }
-        let outURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("sonar-preview")
-            .appendingPathComponent(UUID().uuidString + ".mp4")
         defer { deleteTempMediaFile(outURL) }
-        export.shouldOptimizeForNetworkUse = true
-        if #available(iOS 18.0, macOS 15.0, *) {
-            do {
-                try await export.export(to: outURL, as: .mp4)
-            } catch {
-                return .failed
-            }
-        } else {
-            export.outputURL = outURL
-            export.outputFileType = .mp4
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                export.exportAsynchronously { continuation.resume() }
-            }
-            guard export.status == .completed else { return .failed }
-        }
         guard let outSize = fileSize(outURL) else { return .failed }
         guard outSize <= maxMediaPlaintextBytes else { return .tooLarge }
         guard let data = readTempMediaFile(outURL) else { return .failed }
         let stem = (filename as NSString).deletingPathExtension
         return .ready(data: data, filename: (stem.isEmpty ? "video" : stem) + ".mp4", mime: "video/mp4")
+    }
+
+    private nonisolated static func passthroughFileType(for url: URL) -> AVFileType? {
+        switch url.pathExtension.lowercased() {
+        case "mov": return .mov
+        case "mp4", "m4v": return .mp4
+        default: return nil
+        }
+    }
+
+    /// Export `asset` with `AVMetadataItemFilter.forSharing()`, which removes
+    /// location and other user-identifying metadata (Signal/WhatsApp parity).
+    /// Returns the temp output, or nil when the export fails.
+    private nonisolated static func exportVideoWithoutPrivateMetadata(
+        _ asset: AVAsset,
+        presetName: String,
+        fileType: AVFileType
+    ) async -> URL? {
+        guard let export = AVAssetExportSession(asset: asset, presetName: presetName) else {
+            return nil
+        }
+        let ext = fileType == .mov ? "mov" : "mp4"
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sonar-preview")
+            .appendingPathComponent(UUID().uuidString + "." + ext)
+        try? FileManager.default.createDirectory(
+            at: outURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        export.shouldOptimizeForNetworkUse = true
+        export.metadataItemFilter = .forSharing()
+        if #available(iOS 18.0, macOS 15.0, *) {
+            do {
+                try await export.export(to: outURL, as: fileType)
+            } catch {
+                deleteTempMediaFile(outURL)
+                return nil
+            }
+        } else {
+            export.outputURL = outURL
+            export.outputFileType = fileType
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                export.exportAsynchronously { continuation.resume() }
+            }
+            guard export.status == .completed else {
+                deleteTempMediaFile(outURL)
+                return nil
+            }
+        }
+        return outURL
     }
 
     private func deletePreviewTempFilesAsync(_ previews: [PendingMediaPreview]) {
@@ -1976,6 +2043,10 @@ final class SonarAppStore: ObservableObject {
     private var publishedBolt12Offer: String?
     private var publishingPaymentMetadata = false
     private var needsPaymentMetadataPublish = false
+    /// Backoff retry for a failed receive-offer creation (e.g. Boltz 5xx).
+    private var paymentMetadataRetryTask: Task<Void, Never>?
+    private var paymentMetadataRetryAttempt = 0
+    private var paymentMetadataRetryForce = false
     private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
 
@@ -2229,6 +2300,8 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
                 guard let self else { return }
+                let wasReady: Bool
+                if case .ready = self.walletState { wasReady = true } else { wasReady = false }
                 self.walletState = state
                 // Gate the advertised ⚡PAY capability on a receive-capable wallet.
                 let configured: Bool
@@ -2236,7 +2309,12 @@ final class SonarAppStore: ObservableObject {
                 UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
                 // Start/stop the Unify receiver as the wallet becomes (un)ready.
                 self.updateReceiverAdvertising()
-                self.publishPaymentMetadataIfNeeded()
+                // A balance change does not change the receive offer; only a
+                // readiness change does. Re-publishing on every balance tick
+                // asked Boltz for a fresh offer each time.
+                if !(wasReady && configured) {
+                    self.publishPaymentMetadataIfNeeded()
+                }
                 self.updateWalletPaymentObservation()
                 #if os(iOS)
                 if configured, let bridged = self.wallet as? BridgedWallet {
@@ -4572,6 +4650,7 @@ final class SonarAppStore: ObservableObject {
                     guard case .ready = self.walletState else { return }
                 } catch {
                     SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+                    self.schedulePaymentMetadataRetry(force: force)
                     return
                 }
             case .settingUp:
@@ -4594,8 +4673,12 @@ final class SonarAppStore: ObservableObject {
             if let offer {
                 await self.refreshHandleOfferIfNeeded(offer)
             }
+            // Offline relay: the reconnect path republishes, no retry needed.
             guard self.marmot.npub != nil, self.marmot.relayConnected else { return }
-            guard force || !self.publishedCallDescriptor || self.publishedBolt12Offer != offer else { return }
+            guard force || !self.publishedCallDescriptor || self.publishedBolt12Offer != offer else {
+                self.resetPaymentMetadataRetry()   // already published: nothing left to retry
+                return
+            }
             do {
                 try await self.marmot.publishSonarDescriptor(bolt12Offer: offer)
                 if offer != nil {
@@ -4603,10 +4686,54 @@ final class SonarAppStore: ObservableObject {
                 }
                 self.publishedCallDescriptor = true
                 self.publishedBolt12Offer = offer
+                self.resetPaymentMetadataRetry()
             } catch {
                 SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
+                // A ready wallet no longer re-publishes on every balance tick,
+                // so without this a transient relay/API error left the receive
+                // capability unpublished for the rest of the session. Carry
+                // `force`: a reconnect-forced publish of an UNCHANGED offer would
+                // otherwise hit the "already published" guard on retry and never
+                // reach the new relay session.
+                self.schedulePaymentMetadataRetry(force: force)
             }
         }
+    }
+
+    /// Retry a failed receive-offer creation with backoff: 30 s, doubling, capped
+    /// at 15 min. Before this, the only retry was the wallet's 5 s balance poll
+    /// re-publishing an unchanged state, which hit Boltz every 5 s while it was
+    /// down. Only retries while the wallet is still ready.
+    /// The backoff resets only after the descriptor is actually published (or
+    /// already current). Resetting on offer creation alone pinned a failing
+    /// publish at the 30 s floor and re-requested an offer every 30 s.
+    private func resetPaymentMetadataRetry() {
+        paymentMetadataRetryAttempt = 0
+        paymentMetadataRetryTask?.cancel()
+        paymentMetadataRetryTask = nil
+        paymentMetadataRetryForce = false
+    }
+
+    private func schedulePaymentMetadataRetry(force: Bool) {
+        // Rescheduling replaces the pending retry; an unforced failure landing
+        // inside a forced retry's backoff must not drop the force.
+        let force = force || (paymentMetadataRetryTask != nil && paymentMetadataRetryForce)
+        paymentMetadataRetryForce = force
+        paymentMetadataRetryTask?.cancel()
+        let delaySecs = Self.paymentMetadataRetryDelaySecs(attempt: paymentMetadataRetryAttempt)
+        paymentMetadataRetryAttempt += 1
+        paymentMetadataRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delaySecs) * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.paymentMetadataRetryTask = nil
+            self.paymentMetadataRetryForce = false
+            guard case .ready = self.walletState else { return }
+            self.publishPaymentMetadataIfNeeded(force: force)
+        }
+    }
+
+    nonisolated static func paymentMetadataRetryDelaySecs(attempt: Int) -> Int {
+        min(30 << min(max(attempt, 0), 5), 15 * 60)
     }
 
     private func updateWalletPaymentObservation() {
@@ -6903,7 +7030,8 @@ final class SonarAppStore: ObservableObject {
         let realId = Self.marmotIDPrefix + groupId
         moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
-        if currentDMId == pendingId {
+        let viewingPending = currentDMId == pendingId
+        if viewingPending {
             path.removeLast()
             push(.dm(realId))
         }
@@ -6911,7 +7039,25 @@ final class SonarAppStore: ObservableObject {
             pendingMarmotMessagesByChat[realId, default: []].append(contentsOf: echoes)
         }
         flushPendingDirectMarmot(npub: npub, groupId: groupId, realId: realId)
+        if viewingPending { handOverVisibleTranscript(from: pendingId, to: realId) }
         openedDM(realId, marmotGroupId: groupId)
+    }
+
+    /// Move store-following from the pending transcript to the real one when a
+    /// pending chat resolves while it is on screen.
+    ///
+    /// `path.removeLast(); push(.dm(realId))` at the same stack depth can land as
+    /// an in-place update of the visible DM screen, so neither
+    /// `onDisappear(pendingId)` nor `onAppear(realId)` is guaranteed to fire, and
+    /// `openedDM(realId)` runs before any view has created the real id's render
+    /// state. Without this the real transcript never followed the store: the
+    /// first message's echo was painted by the send path's direct rebuild, then
+    /// sat at "Sending" forever although the relay had acked it, and the pending
+    /// state kept rebuilding after leave (R-038). Both calls are idempotent, so a
+    /// lifecycle callback that does fire is harmless.
+    private func handOverVisibleTranscript(from pendingId: String, to realId: String) {
+        conversationViewStates[pendingId]?.deactivate()
+        conversationViewState(realId).activate()
     }
 
     private func resolvePendingSecureChats() {
@@ -7023,7 +7169,8 @@ final class SonarAppStore: ObservableObject {
         let realId = Self.marmotIDPrefix + groupId
         moveComposerState(from: pendingId, to: realId)
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
-        if currentDMId == pendingId {
+        let viewingPending = currentDMId == pendingId
+        if viewingPending {
             path.removeLast()
             push(.dm(realId))
         }
@@ -7031,6 +7178,7 @@ final class SonarAppStore: ObservableObject {
             pendingMarmotMessagesByChat[realId, default: []].append(contentsOf: echoes)
         }
         flushPendingMarmotGroupSends(pendingId: pendingId, groupId: groupId, realId: realId)
+        if viewingPending { handOverVisibleTranscript(from: pendingId, to: realId) }
         openedDM(realId, marmotGroupId: groupId)
     }
 
@@ -7278,7 +7426,12 @@ final class SonarAppStore: ObservableObject {
     /// In-memory decrypted-media cache (raw bytes), keyed by the ciphertext's
     /// Blossom URL. Cleared by `wipe()` and `eraseAllChats()`.
     private var mediaImageCache: [String: Data] = [:]
-    @Published private var mediaTransferStates: [String: SNMediaTransferState] = [:]
+    @Published private var mediaTransferStates: [String: SNMediaTransferState] = [:] {
+        didSet { mediaTransferSource.bump() }
+    }
+    /// Repaints media bubbles on download progress/phase changes; see
+    /// `SNMediaTransferSource`. Passed to bubbles through `SNMediaPipeline`.
+    let mediaTransferSource = SNMediaTransferSource()
     private var mediaDownloadTasks: [String: Task<Void, Never>] = [:]
     private var mediaDownloadListeners: [String: SNMediaDownloadListener] = [:]
     private var mediaDownloadGenerations: [String: UUID] = [:]

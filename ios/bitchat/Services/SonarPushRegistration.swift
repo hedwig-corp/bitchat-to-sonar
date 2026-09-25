@@ -45,6 +45,8 @@ final class SonarPushRegistration: @unchecked Sendable {
     private var inFlightWebhookMarker: String?
     private var inFlightWebhookStartedAt: Date?
     private var inFlightWebhookGeneration: UInt64 = 0
+    /// Consecutive failed webhook registrations; drives the retry backoff.
+    private var webhookRetryFailures = 0
 
     private var transponderNpub: String {
         Bundle.main.infoDictionary?["TRANSPONDER_NPUB"] as? String ?? ""
@@ -123,6 +125,7 @@ final class SonarPushRegistration: @unchecked Sendable {
             self.inFlightWebhookMarker = nil
             self.inFlightWebhookStartedAt = nil
             self.inFlightWebhookGeneration &+= 1
+            self.webhookRetryFailures = 0
             self.sonarNode = nil
         }
         // Force a fresh subscribe next time (e.g. after a wallet/seed change).
@@ -154,6 +157,9 @@ final class SonarPushRegistration: @unchecked Sendable {
             inFlightWebhookMarker = nil
             inFlightWebhookStartedAt = nil
             inFlightWebhookGeneration &+= 1
+            // The replacement wallet starts a fresh backoff: the old wallet's
+            // failures must not push its first retry out to the 10 min cap.
+            webhookRetryFailures = 0
         }
         UserDefaults.standard.removeObject(forKey: Self.webhookMarkerKey)
     }
@@ -294,7 +300,8 @@ final class SonarPushRegistration: @unchecked Sendable {
                     marker: marker,
                     generation: attemptGeneration,
                     completed: false,
-                    failureMessage: "\(error)"
+                    failureMessage: "\(error)",
+                    retryWallet: wallet
                 )
             }
         }
@@ -304,7 +311,8 @@ final class SonarPushRegistration: @unchecked Sendable {
         marker: String,
         generation: UInt64,
         completed: Bool,
-        failureMessage: String? = nil
+        failureMessage: String? = nil,
+        retryWallet: WalletBridgeService? = nil
     ) {
         queue.async {
             guard self.inFlightWebhookMarker == marker,
@@ -318,11 +326,39 @@ final class SonarPushRegistration: @unchecked Sendable {
             if completed {
                 UserDefaults.standard.set(marker, forKey: Self.webhookMarkerKey)
                 self.completedSessionWebhookMarker = marker
+                self.webhookRetryFailures = 0
                 Self.log.info("Breez NDS webhook force re-subscribed for current offer (FCM)")
             } else if let failureMessage {
                 Self.log.warning("Breez NDS webhook registration failed: \(failureMessage)")
+                self.scheduleWebhookRetry(generation: generation, wallet: retryWallet)
             }
         }
+    }
+
+    /// A failed registration leaves the old webhook unregistered, so an offline
+    /// payment would never wake the app. Nothing else retries it reliably: the
+    /// wallet sink only fires on a readiness or balance change. Retry with
+    /// backoff until one attempt lands; any newer attempt, success or
+    /// unregister bumps the generation and cancels this one. Runs on `queue`.
+    private func scheduleWebhookRetry(generation: UInt64, wallet: WalletBridgeService?) {
+        guard let wallet else { return }
+        webhookRetryFailures += 1
+        let delay = Self.webhookRetryDelay(afterFailures: webhookRetryFailures)
+        Self.log.info("Breez NDS webhook retry in \(Int(delay))s")
+        queue.asyncAfter(deadline: .now() + delay) { [weak self, weak wallet] in
+            guard let self, let wallet,
+                  self.inFlightWebhookGeneration == generation,
+                  self.inFlightWebhookMarker == nil,
+                  let fcmToken = self.cachedFCMToken,
+                  let offer = self.cachedOffer
+            else { return }
+            self.subscribeBreezWebhook(offer: offer, fcmToken: fcmToken, wallet: wallet)
+        }
+    }
+
+    /// 30 s, doubling per consecutive failure, capped at 10 min.
+    static func webhookRetryDelay(afterFailures failures: Int) -> TimeInterval {
+        TimeInterval(min(30 << min(max(failures - 1, 0), 5), 600))
     }
 
     static func normalizedNdsUrl(_ rawValue: String?) -> String {

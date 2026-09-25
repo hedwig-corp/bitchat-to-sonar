@@ -123,6 +123,13 @@ enum SNConversationTranscriptWindow {
                     $0.transcriptSourceID == sourceID
                         && isOrderedBefore($0, sourceStart)
                         && ($0.pay.map { !candidatePayIDs.contains($0.id) } ?? true)
+                        // A local echo is never an uncovered DB prefix, even
+                        // though it inherits its group's source id: once it is
+                        // reconciled it leaves `candidates`, and its canonical
+                        // row (stamped a second after the tap) sorts after it —
+                        // so in an empty chat the stale echo was kept beside
+                        // its own canonical row as a duplicate bubble.
+                        && !isLocalEchoID($0.id)
                 }
             }
             let merged = ordered(uncoveredPrefixes + orderedCandidates)
@@ -329,8 +336,14 @@ final class SNTranscriptRebuildSubscription {
         onInvalidate: @escaping () -> Void
     ) where P.Output == Void, P.Failure == Never {
         guard cancellable == nil else { return }
+        // Throttle, not debounce: a debounce only fires after a quiet gap, so a
+        // store that keeps invalidating faster than the interval (a busy sync,
+        // a feedback loop) starved the open transcript completely — a sent
+        // message sat at "Sending" and replies never appeared until the storm
+        // stopped. `latest: true` still collapses a burst into one rebuild per
+        // interval, but guarantees one per interval.
         cancellable = invalidations
-            .debounce(for: debounceInterval, scheduler: DispatchQueue.main)
+            .throttle(for: debounceInterval, scheduler: DispatchQueue.main, latest: true)
             .sink { _ in onInvalidate() }
     }
 

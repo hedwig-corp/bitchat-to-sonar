@@ -279,8 +279,12 @@ impl ConversationIndex {
         Ok(())
     }
 
-    pub fn mark_read(&self, group_id_hex: &str) -> Result<()> {
-        self.db
+    /// Zero a conversation's unread count. Returns whether anything changed —
+    /// `false` when it was already read, so callers can skip change
+    /// notifications for a no-op.
+    pub fn mark_read(&self, group_id_hex: &str) -> Result<bool> {
+        let changed = self
+            .db
             .execute(
                 "UPDATE conversation_summary
                     SET unread_count = 0, version = version + 1
@@ -288,7 +292,7 @@ impl ConversationIndex {
                 params![group_id_hex],
             )
             .map_err(|e| crate::Error::Storage(format!("index mark_read: {e}")))?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     pub fn update_group_name(&self, group_id_hex: &str, name: &str) -> Result<()> {

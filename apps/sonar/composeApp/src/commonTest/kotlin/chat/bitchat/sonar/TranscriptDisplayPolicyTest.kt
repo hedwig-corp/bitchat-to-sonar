@@ -774,6 +774,25 @@ class TranscriptDisplayPolicyTest {
         assertEquals(1, firstUnreadTranscriptIndex(rows, 99))
     }
 
+    /**
+     * QA-005 (#615): read a chat, leave, receive two messages, reopen. The
+     * leave frame holds only the read row, and the anchor walk clamps onto it,
+     * so painting that frame put the divider above an already-read message.
+     */
+    @Test
+    fun reopenWithUnreadDoesNotRepaintTheLeaveFrame() {
+        val leaveFrame = listOf(message("read", 1))
+        assertEquals(
+            0,
+            firstUnreadTranscriptIndex(leaveFrame, 2),
+            "the stale frame clamps the divider onto the read row",
+        )
+        assertEquals(null, reopenTranscriptPaint(leaveFrame, unreadAtOpen = 2))
+        assertEquals(leaveFrame, reopenTranscriptPaint(leaveFrame, unreadAtOpen = 0))
+        assertEquals(null, reopenTranscriptPaint(emptyList(), unreadAtOpen = 0))
+        assertEquals(null, reopenTranscriptPaint(null, unreadAtOpen = 0))
+    }
+
     @Test
     fun firstUnreadIndexSkipsNonMessageRows() {
         // Call records merge into the transcript feed but never consume

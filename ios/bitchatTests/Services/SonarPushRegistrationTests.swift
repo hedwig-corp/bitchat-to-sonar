@@ -60,6 +60,14 @@ final class SonarPushRegistrationTests: XCTestCase {
         XCTAssertTrue(components.queryItems?.contains(URLQueryItem(name: "token", value: "token/value")) == true)
     }
 
+    /// A failed Breez webhook registration is retried on this schedule; it
+    /// used to piggyback on the 5 s balance poll, which no longer re-publishes.
+    func testWebhookRetryBacksOffAndCaps() {
+        let delays = (1...8).map { SonarPushRegistration.webhookRetryDelay(afterFailures: $0) }
+        XCTAssertEqual(delays, [30, 60, 120, 240, 480, 600, 600, 600])
+        XCTAssertEqual(SonarPushRegistration.webhookRetryDelay(afterFailures: 0), 30)
+    }
+
     func testWebhookUrlRejectsHttp() {
         XCTAssertNil(SonarPushRegistration.webhookUrl(
             ndsUrl: "http://nds.sonar.hedwig.sh",

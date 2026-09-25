@@ -509,6 +509,15 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             }
             return
         }
+        // An undecorated NSE placeholder ("Open Sonar to read it.") names no
+        // chat, so the open-chat check above cannot see it. In the foreground
+        // it is never news: the app receives the message itself and posts
+        // titled copy for chats that are not open (R-004), so the placeholder
+        // either duplicates that or bannered a message already on screen.
+        if SonarNSEDecoratePolicy.suppressesForegroundPresentation(userInfo: userInfo) {
+            completionHandler([])
+            return
+        }
         // Suppress geohash activity notification if we're already in that geohash channel
         if identifier.hasPrefix("geo-activity-"),
            let deep = userInfo["deeplink"] as? String,

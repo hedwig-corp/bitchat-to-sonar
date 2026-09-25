@@ -99,6 +99,20 @@ enum SonarNSEDecoratePolicy {
     /// userInfo marker: still the privacy placeholder (host may wipe).
     static let nsePlaceholderUserInfoKey = "sonar.nsePlaceholder"
 
+    /// Foreground presentation of an undecorated placeholder is always noise:
+    /// it names no chat, and a running app receives the message itself and
+    /// notifies titled for chats that are not open. Only called from
+    /// `willPresent`, i.e. while the app is in the foreground.
+    static func suppressesForegroundPresentation(userInfo: [AnyHashable: Any]) -> Bool {
+        let placeholder = (userInfo[nsePlaceholderUserInfoKey] as? Bool)
+            ?? (userInfo[nsePlaceholderUserInfoKey] as? NSNumber)?.boolValue
+            ?? false
+        let decorated = (userInfo[nseDecoratedUserInfoKey] as? Bool)
+            ?? (userInfo[nseDecoratedUserInfoKey] as? NSNumber)?.boolValue
+            ?? false
+        return placeholder && !decorated
+    }
+
     /// App Group mirror key for the per-chat mute map (written by
     /// `SonarChatMuteStore` as write-through; JSON-encoded `[String: Date]`).
     /// Single declaration — `SonarChatMuteStore.defaultsKey` aliases this.
