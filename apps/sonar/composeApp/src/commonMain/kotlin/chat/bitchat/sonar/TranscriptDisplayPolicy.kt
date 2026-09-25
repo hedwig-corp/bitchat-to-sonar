@@ -175,6 +175,17 @@ internal fun mergeAllTranscriptRows(source: List<SonarMsg>): List<SonarMsg> =
     mergeTranscriptRows(emptyList(), source, retainedRows = source.size)
 
 /**
+ * The leave frame to repaint on an instant reopen, or null when it must not be
+ * used. Anything unread at open arrived after that frame was taken, so it lacks
+ * exactly the rows the unread divider counts back over: [firstUnreadTranscriptIndex]
+ * clamps to its newest READ row, the host freezes the anchor there, and the
+ * divider ends up above a message the user already read. Load the local page
+ * first in that case, as a first open does.
+ */
+internal fun reopenTranscriptPaint(retained: List<SonarMsg>?, unreadAtOpen: Long): List<SonarMsg>? =
+    retained?.takeIf { it.isNotEmpty() && unreadAtOpen <= 0L }
+
+/**
  * Index of the oldest unread row: the [unreadCount]-th non-mine message counted
  * from the tail of [rows]. The core conversation index increments unread_count
  * only for incoming messages, so own sends interleave without consuming budget.

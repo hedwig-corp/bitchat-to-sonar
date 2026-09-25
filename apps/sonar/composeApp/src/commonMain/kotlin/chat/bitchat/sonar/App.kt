@@ -1948,10 +1948,14 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             val pendingReply = state.composerReply(screen.id)
             // Choosing Reply puts the cursor in the composer (Signal behaviour;
             // iOS SNComposer `focusRequest`). Keyed on the quoted id, so it
-            // fires once per new reply, not on every recomposition.
+            // fires once per new reply, not on every recomposition. The first
+            // run is the chat opening: a reply left pending from an earlier
+            // visit must not pop the keyboard (iOS focuses from `.onChange`).
             val composerFocus = remember { FocusRequester() }
+            var replyFocusArmed by remember(screen.id) { mutableStateOf(false) }
             LaunchedEffect(pendingReply?.parentId) {
-                if (pendingReply != null) runCatching { composerFocus.requestFocus() }
+                if (replyFocusArmed && pendingReply != null) runCatching { composerFocus.requestFocus() }
+                replyFocusArmed = true
             }
             if (pendingReply != null) {
                 ComposerReplyBanner(

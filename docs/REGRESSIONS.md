@@ -2784,6 +2784,51 @@ cleared in the `relayConnected` `didSet` and the identity/group teardowns).
 **Not guarded:** Compose's throttle has no test of its own. iOS tests do not run
 in CI.
 
+## R-049 — Reopening a chat with unread messages never paints the leave frame
+
+**Invariant:** a reopen whose captured unread count is above zero loads the
+local page before the transcript mounts; the retained leave frame repaints
+only a chat where nothing arrived since it was left.
+
+**Breaks as:** read a chat, leave it, receive two messages, reopen: the
+"Unread messages" divider sits ABOVE the message you had already read, and it
+stays there (QA-005: read row y=776, divider y=649, unread rows 885/994). #616
+saw it once as A12 after a notification-tap open and could not reproduce it;
+on 2026-09-24 it reproduced on every smoke run (3 of 3).
+
+**Why:** the Marmot reopen path pushed the chat with `retainedTranscriptByChat`
+(the frame taken when the chat was left) and loaded the fresh page after. A
+pure Marmot feed counts as caught up on its first paint (`feedCaughtUp` only
+gates mesh chats), so the anchor effect ran against the stale frame:
+`firstUnreadTranscriptIndex` walked 2 unread back over a frame holding only
+the read row, clamped onto it (by design — that clamp is what a window shorter
+than the unread count needs), and the anchor froze by row id before the new
+rows arrived.
+
+**Compose call site:** `SonarAppState.openChat` Marmot reopen branch, now
+gated by `reopenTranscriptPaint(retained, openChatUnread[chat.id])`.
+
+**Apple call site:** not affected — `ConversationViewState.activate()`
+rebuilds the retained window synchronously from the store before the first
+paint, so a reopen never paints the leave frame (QA-005 passed on iOS in the
+same session).
+
+**Guarded by:** `TranscriptDisplayPolicyTest.reopenWithUnreadDoesNotRepaintTheLeaveFrame`
+(fails when the gate is reverted to `retained?.takeIf { it.isNotEmpty() }`),
+and `android-smoke.sh` QA-005 end to end.
+
+**Not guarded:** the unit test pins the helper, not the `openChat` call site —
+a new reopen path that paints `retainedTranscriptByChat` directly would bring
+it back; only the smoke would notice. The mesh reopen (`openDm`) is safe
+because its feed is gated on `isTranscriptHydrated`, which open clears.
+
+**Rejected:**
+- *Make `firstUnreadTranscriptIndex` return -1 when the window holds fewer
+  incoming rows than the unread count.* That clamp is correct for a real
+  bounded window with more unread than rows; -1 would retire the divider.
+- *Blame `ee44b140f` (mark-read no longer notifies on a no-op).* The same
+  build with that commit reverted failed QA-005 identically.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

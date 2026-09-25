@@ -6098,8 +6098,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         markGroupsRead(readChatIds)
         val title = chatTitle(chat)
 
-        // Reopen: retained paint is already the last leave frame — push now.
-        retainedTranscriptByChat[chat.id]?.takeIf { it.isNotEmpty() }?.let { retained ->
+        // Reopen: retained paint is already the last leave frame — push now,
+        // unless something arrived since leaving (see reopenTranscriptPaint).
+        reopenTranscriptPaint(
+            retainedTranscriptByChat[chat.id],
+            openChatUnread[chat.id] ?: 0L,
+        )?.let { retained ->
             messages = retained
             warmOpenTranscriptThumbs(messages)
             noteTranscriptOpen("marmot", chat.id, "push-retained")

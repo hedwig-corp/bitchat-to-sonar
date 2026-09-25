@@ -1686,27 +1686,25 @@ final class SonarAppStore: ObservableObject {
     ) async -> VideoFinalizeResult {
         defer { deleteTempMediaFile(url) }
         let asset = AVURLAsset(url: url)
-        if let size = fileSize(url), size <= maxMediaPlaintextBytes {
-            // The Photos picker hands over the original file ("Location Is
-            // Included"), so a video recorded with Location Services on would
-            // tell the recipient where it was shot. Keep the original encode —
-            // a passthrough remux only drops the metadata — and fall back to
-            // the filtered re-encode below if the container cannot be remuxed.
-            guard await videoCarriesLocation(asset) else {
-                guard let data = readTempMediaFile(url) else { return .failed }
+        // The Photos picker hands over the original file ("Location Is
+        // Included"), so a video recorded with Location Services on would tell
+        // the recipient where it was shot. The original bytes are never sent:
+        // location can sit in asset metadata, a track's `udta` or an XMP
+        // `uuid` box, and AVFoundation only reports the first, so no metadata
+        // check can prove a file clean. A passthrough remux keeps the original
+        // encode and writes only the metadata `.forSharing()` lets through; the
+        // filtered re-encode below covers containers that cannot be remuxed.
+        if let size = fileSize(url), size <= maxMediaPlaintextBytes,
+           let fileType = passthroughFileType(for: url),
+           let cleaned = await exportVideoWithoutPrivateMetadata(
+               asset,
+               presetName: AVAssetExportPresetPassthrough,
+               fileType: fileType
+           ) {
+            defer { deleteTempMediaFile(cleaned) }
+            if let cleanedSize = fileSize(cleaned), cleanedSize <= maxMediaPlaintextBytes,
+               let data = readTempMediaFile(cleaned) {
                 return .ready(data: data, filename: filename, mime: mime)
-            }
-            if let fileType = passthroughFileType(for: url),
-               let cleaned = await exportVideoWithoutPrivateMetadata(
-                   asset,
-                   presetName: AVAssetExportPresetPassthrough,
-                   fileType: fileType
-               ) {
-                defer { deleteTempMediaFile(cleaned) }
-                if let cleanedSize = fileSize(cleaned), cleanedSize <= maxMediaPlaintextBytes,
-                   let data = readTempMediaFile(cleaned) {
-                    return .ready(data: data, filename: filename, mime: mime)
-                }
             }
         }
         guard let outURL = await exportVideoWithoutPrivateMetadata(
@@ -1722,19 +1720,6 @@ final class SonarAppStore: ObservableObject {
         guard let data = readTempMediaFile(outURL) else { return .failed }
         let stem = (filename as NSString).deletingPathExtension
         return .ready(data: data, filename: (stem.isEmpty ? "video" : stem) + ".mp4", mime: "video/mp4")
-    }
-
-    /// True when the video names a place: QuickTime/ISO 6709 location or the
-    /// common-key location an iPhone camera writes. Fails closed: metadata
-    /// that cannot be read counts as located, so the video goes through the
-    /// filtered export instead of the raw-bytes fast path.
-    nonisolated static func videoCarriesLocation(_ asset: AVAsset) async -> Bool {
-        guard let items = try? await asset.load(.metadata) else { return true }
-        return items.contains { item in
-            item.commonKey == .commonKeyLocation
-                || item.identifier == .quickTimeMetadataLocationISO6709
-                || item.identifier == .quickTimeUserDataLocationISO6709
-        }
     }
 
     private nonisolated static func passthroughFileType(for url: URL) -> AVFileType? {
@@ -2061,6 +2046,7 @@ final class SonarAppStore: ObservableObject {
     /// Backoff retry for a failed receive-offer creation (e.g. Boltz 5xx).
     private var paymentMetadataRetryTask: Task<Void, Never>?
     private var paymentMetadataRetryAttempt = 0
+    private var paymentMetadataRetryForce = false
     private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
 
@@ -4725,9 +4711,14 @@ final class SonarAppStore: ObservableObject {
         paymentMetadataRetryAttempt = 0
         paymentMetadataRetryTask?.cancel()
         paymentMetadataRetryTask = nil
+        paymentMetadataRetryForce = false
     }
 
     private func schedulePaymentMetadataRetry(force: Bool) {
+        // Rescheduling replaces the pending retry; an unforced failure landing
+        // inside a forced retry's backoff must not drop the force.
+        let force = force || (paymentMetadataRetryTask != nil && paymentMetadataRetryForce)
+        paymentMetadataRetryForce = force
         paymentMetadataRetryTask?.cancel()
         let delaySecs = Self.paymentMetadataRetryDelaySecs(attempt: paymentMetadataRetryAttempt)
         paymentMetadataRetryAttempt += 1
@@ -4735,6 +4726,7 @@ final class SonarAppStore: ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(delaySecs) * 1_000_000_000)
             guard !Task.isCancelled, let self else { return }
             self.paymentMetadataRetryTask = nil
+            self.paymentMetadataRetryForce = false
             guard case .ready = self.walletState else { return }
             self.publishPaymentMetadataIfNeeded(force: force)
         }
