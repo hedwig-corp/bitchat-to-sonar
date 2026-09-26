@@ -20,6 +20,23 @@ fn epoch_of(engine: &MarmotEngine, group: &GroupId) -> u64 {
         .0
 }
 
+/// Run convergence passes until `group` moves past `from`, the way a host
+/// follows `retry_after`. One pass after a fixed 1.1 s sleep left 100 ms of
+/// margin on MDK's 1 s quiescence window and failed on a loaded machine.
+async fn converge_past(engine: &MarmotEngine, group: &GroupId, from: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        engine
+            .advance_group_convergence(group)
+            .await
+            .expect("convergence pass");
+        if epoch_of(engine, group) > from || std::time::Instant::now() >= deadline {
+            return;
+        }
+    }
+}
+
 #[tokio::test]
 async fn media_sent_before_a_member_add_still_decrypts_after_it() {
     let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
@@ -67,10 +84,7 @@ async fn media_sent_before_a_member_add_still_decrypts_after_it() {
     bob.process_incoming(&update.evolution_event)
         .await
         .expect("bob ingests the add");
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    bob.advance_group_convergence(&group)
-        .await
-        .expect("bob applies the buffered commit");
+    converge_past(&bob, &group, epoch_at_send).await;
     assert!(
         epoch_of(&bob, &group) > epoch_at_send,
         "the add must move bob's epoch for this test to mean anything"

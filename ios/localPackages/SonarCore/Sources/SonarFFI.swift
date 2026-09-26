@@ -1952,7 +1952,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Report this host's current system IANA timezone. The host must only
      * call this after the user enables Share local time. Pass an empty
      * string to stop sharing. The core validates a non-empty id, remembers
-     * it for the node lifetime, and encrypts kind-449 rumors into MLS group
+     * it for the node lifetime, and encrypts timezone shares into MLS group
      * messages (kind 445) without blocking transcript reads.
      */
     func updateLocalTimezone(ianaTimezone: String) throws
@@ -3212,7 +3212,7 @@ open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithErro
      * Report this host's current system IANA timezone. The host must only
      * call this after the user enables Share local time. Pass an empty
      * string to stop sharing. The core validates a non-empty id, remembers
-     * it for the node lifetime, and encrypts kind-449 rumors into MLS group
+     * it for the node lifetime, and encrypts timezone shares into MLS group
      * messages (kind 445) without blocking transcript reads.
      */
 open func updateLocalTimezone(ianaTimezone: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -9712,7 +9712,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_uninstall_sticker_pack() != 43475) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_update_local_timezone() != 29748) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_update_local_timezone() != 26069) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_verify_nip05() != 52785) {
