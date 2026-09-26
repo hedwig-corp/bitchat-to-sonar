@@ -29,6 +29,7 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     var onCancelUpload: ((SNMessage) -> Void)?
     var uploadProgressSource: SNMediaUploadProgressSource?
     var onReply: ((SNMessage) -> Void)?
+    var onReact: ((SNMessage, String) -> Void)?
     var onJumpQuote: ((String) -> Void)?
     /// Environment-injected in SwiftUI; the UIKit cell needs it as a closure.
     var onTapMention: ((String) -> Void)?
@@ -100,6 +101,7 @@ final class SNTranscriptHostRenderContext: ObservableObject {
         onCancelUpload: ((SNMessage) -> Void)?,
         uploadProgressSource: SNMediaUploadProgressSource?,
         onReply: ((SNMessage) -> Void)?,
+        onReact: ((SNMessage, String) -> Void)?,
         onJumpQuote: ((String) -> Void)?,
         onTapMention: ((String) -> Void)?
     ) {
@@ -143,6 +145,7 @@ final class SNTranscriptHostRenderContext: ObservableObject {
         self.onCancelUpload = onCancelUpload
         self.uploadProgressSource = uploadProgressSource
         self.onReply = onReply
+        self.onReact = onReact
         self.onJumpQuote = onJumpQuote
         self.onTapMention = onTapMention
     }
@@ -166,7 +169,10 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             // a resolved name must re-measure and reconfigure exactly those.
             let nameKey = (m.trill || m.pay != nil) ? "|\(peerName)" : ""
             let replyKey = m.reply.map { "|r:\($0.parentId):\(snFNV1a(($0.author ?? "") + "\u{1}" + $0.preview))" } ?? ""
-            return "m|\(id)|\(snFNV1a(m.text))|\(m.state ?? "")|\(mediaKey)|\(bits)\(nameKey)\(replyKey)"
+            let reactionKey = m.reactions.isEmpty
+                ? ""
+                : "|rx:\(snFNV1a(m.reactions.map { "\($0.emoji):\($0.count):\($0.mine ? 1 : 0)" }.joined(separator: ",")))"
+            return "m|\(id)|\(snFNV1a(m.text))|\(m.state ?? "")|\(mediaKey)|\(bits)\(nameKey)\(replyKey)\(reactionKey)"
         }
     }
 
@@ -194,6 +200,7 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             quotedPeerName: flags.showAuthor ? nil : peerName,
             isExpanded: expandedMessageIDs.contains(id),
             authorTappable: onTapAuthor != nil,
+            reactionsEnabled: onReact != nil,
             measurementKey: key
         )
         textBubbleModels[key] = model
@@ -229,6 +236,10 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             retry: { [weak self] id in
                 guard let self, let index = self.msgIndexByID[id] else { return }
                 self.onRetry?(self.msgs[index])
+            },
+            react: { [weak self] id, emoji in
+                guard let self, let index = self.msgIndexByID[id] else { return }
+                self.onReact?(self.msgs[index], emoji)
             },
             toggleExpanded: { [weak self] id in
                 guard let self else { return }
@@ -309,6 +320,15 @@ final class SNTranscriptHostRenderContext: ObservableObject {
                 cell.configure(model: model, geometry: geometry, actions: self.textBubbleActions)
                 return cell
             },
+            cellKind: { [weak self] item in
+                // Must agree with `provideCell`: a row that gains its first
+                // reaction chip leaves the UIKit cell for the hosted one.
+                guard let self, snUIKitTextBubblesEnabled(),
+                      case .message(let id) = item,
+                      let index = self.msgIndexByID[id],
+                      SNTextBubbleModel.handles(self.msgs[index]) else { return "hosted" }
+                return "text"
+            },
             unreadAnchorResolver: { [weak self] entries, unreadCount in
                 guard let self else { return nil }
                 var remaining = unreadCount
@@ -359,6 +379,7 @@ final class SNTranscriptHostRenderContext: ObservableObject {
                     onCancelUpload: onCancelUpload,
                     uploadProgressSource: uploadProgressSource,
                     onReply: onReply,
+                    onReact: onReact,
                     onJumpQuote: onJumpQuote,
                     columnWidth: columnWidth,
                     expandedMessageIDs: expandedMessageIDs,
@@ -404,6 +425,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let onCancelUpload: ((SNMessage) -> Void)?
     let uploadProgressSource: SNMediaUploadProgressSource?
     var onReply: ((SNMessage) -> Void)? = nil
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
     let loadOlder: (() async -> Bool)?
     let loadNewest: (() async -> Void)?
@@ -461,6 +483,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
                     onCancelUpload: onCancelUpload,
                     uploadProgressSource: uploadProgressSource,
                     onReply: onReply,
+                    onReact: onReact,
                     onJumpQuote: onJumpQuote,
                     onTapMention: onTapMention
                 )
