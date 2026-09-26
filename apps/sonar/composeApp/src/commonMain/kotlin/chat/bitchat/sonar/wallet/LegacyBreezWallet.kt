@@ -58,7 +58,8 @@ expect object LegacyBreezWallet {
     /**
      * The one-time check after an account restore: open Breez from the
      * derived seed, sync, keep it if it has any balance or history, otherwise
-     * delete what the check created. Needs an API key.
+     * delete what the check created — but only once a second, later pass
+     * confirms it empty ([legacyRestoreVerdict]). Needs an API key.
      */
     suspend fun runRestoreCheck(nsec: String): LegacyRestoreCheckOutcome
 
@@ -77,9 +78,11 @@ expect object LegacyBreezWallet {
     suspend fun deleteGate(): LegacyDeleteGate
 
     /**
-     * Re-check the gate → unregister the webhook → disconnect → crash-safe
-     * marker → delete the Breez store → clear the marker. Returns the gate it
-     * acted on; nothing is deleted unless it is [LegacyDeleteGate.Safe].
+     * Re-check the gate → unregister the webhook → re-check again, and stop
+     * if anything moved in between ([legacyGateUnchanged]) → disconnect →
+     * crash-safe marker → delete the Breez store → clear the marker. Returns
+     * the gate it acted on; nothing is deleted unless it is
+     * [LegacyDeleteGate.Safe].
      */
     suspend fun deleteIfSafe(): LegacyDeleteGate
 
@@ -117,6 +120,50 @@ enum class LegacyRestoreCheckOutcome {
     /** Could not complete (network / SDK); what it created was removed. Retry later. */
     Failed,
 }
+
+/**
+ * What one pass of the post-restore check read, right after a sync.
+ * [synced]: the SDK has reported a completed sync on this connection.
+ */
+data class LegacyRestoreFacts(
+    val synced: Boolean,
+    val balanceSats: Long,
+    val pendingSendSats: Long,
+    val pendingReceiveSats: Long,
+    val hasHistory: Boolean,
+    val refundableSwaps: Int,
+) {
+    /** No funds, nothing in flight, never used. */
+    val empty: Boolean
+        get() = balanceSats == 0L && pendingSendSats == 0L && pendingReceiveSats == 0L &&
+            !hasHistory && refundableSwaps == 0
+}
+
+/** How long the restore check waits before the pass that confirms an empty wallet. */
+const val LEGACY_RESTORE_CONFIRM_DELAY_MS = 15_000L
+
+/**
+ * The post-restore check's decision. One empty pass is not proof: on a fresh
+ * device a sync can return before the wallet's history has landed locally,
+ * and a Discarded wallet is never opened again, so whatever it held would be
+ * out of the app's reach. An empty first pass is believed only when a second
+ * pass, [LEGACY_RESTORE_CONFIRM_DELAY_MS] later and after the SDK reported a
+ * completed sync, is empty too. `null` = that pass failed.
+ *
+ * - anything in either pass → Kept
+ * - a failed pass, or no completed sync → Failed, which settles nothing: the
+ *   check runs again on a later launch
+ * - two empty passes, the second synced → Discarded
+ */
+fun legacyRestoreVerdict(first: LegacyRestoreFacts?, confirm: LegacyRestoreFacts?): LegacyRestoreCheckOutcome =
+    when {
+        first == null -> LegacyRestoreCheckOutcome.Failed
+        !first.empty -> LegacyRestoreCheckOutcome.Kept
+        confirm == null -> LegacyRestoreCheckOutcome.Failed
+        !confirm.empty -> LegacyRestoreCheckOutcome.Kept
+        !confirm.synced -> LegacyRestoreCheckOutcome.Failed
+        else -> LegacyRestoreCheckOutcome.Discarded
+    }
 
 /**
  * The facts the delete gate reads. `null` = unknown (a read failed or was
@@ -157,6 +204,14 @@ sealed interface LegacyDeleteGate {
  * zero confirmed / pending-send / pending-receive, no refundable swaps and no
  * unsettled payments. Anything unknown is NOT safe.
  */
+/**
+ * The delete may proceed after the webhook is gone only when a second read
+ * still passes the gate AND nothing moved since the first: a swap that
+ * completed in between (an incoming payment, a refund) must stop the delete.
+ */
+fun legacyGateUnchanged(before: LegacyGateFacts, after: LegacyGateFacts): Boolean =
+    legacyDeleteGate(after) == LegacyDeleteGate.Safe && before == after
+
 fun legacyDeleteGate(f: LegacyGateFacts): LegacyDeleteGate {
     fun blocked(r: LegacyDeleteBlock) = LegacyDeleteGate.Blocked(r)
     if (!f.connected) return blocked(LegacyDeleteBlock.NotConnected)

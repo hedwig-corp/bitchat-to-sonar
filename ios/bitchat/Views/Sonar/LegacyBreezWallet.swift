@@ -85,6 +85,53 @@ struct SonarLegacyWalletSnapshot: Equatable {
     var hasHistory: Bool?
 }
 
+/// The one-time post-restore check's decision. Pure; unit-tested.
+///
+/// One empty pass is not proof: on a fresh device a sync can finish before
+/// the wallet's history has landed locally, and a discarded wallet is never
+/// opened again, so whatever it held would be out of the app's reach. An
+/// empty first pass is believed only when a second pass, `confirmDelay`
+/// later and synced, is empty too. Unknown decides nothing: the store is
+/// kept and the check runs again on a later launch.
+enum SonarLegacyRestoreCheck {
+    enum Verdict: Equatable {
+        case keep
+        case discard
+        case undecided
+    }
+
+    /// How long the check waits before the pass that confirms an empty wallet.
+    static let confirmDelayNanos: UInt64 = 15_000_000_000
+
+    /// Whether a synced pass saw anything at all; nil = not synced, or a
+    /// fact could not be read.
+    static func holdsAnything(_ snapshot: SonarLegacyWalletSnapshot?) -> Bool? {
+        guard let s = snapshot, s.connected, s.syncedSinceConnect,
+              let confirmed = s.confirmedSats,
+              let pendingSend = s.pendingSendSats,
+              let pendingReceive = s.pendingReceiveSats,
+              let refundables = s.refundableSwaps,
+              let unsettled = s.unsettledPayments,
+              let hasHistory = s.hasHistory
+        else { return nil }
+        return confirmed > 0 || pendingSend > 0 || pendingReceive > 0
+            || refundables > 0 || unsettled > 0 || hasHistory
+    }
+
+    static func verdict(first: SonarLegacyWalletSnapshot?, confirm: SonarLegacyWalletSnapshot?) -> Verdict {
+        switch holdsAnything(first) {
+        case .none: return .undecided
+        case .some(true): return .keep
+        case .some(false): break
+        }
+        switch holdsAnything(confirm) {
+        case .none: return .undecided
+        case .some(true): return .keep
+        case .some(false): return .discard
+        }
+    }
+}
+
 /// Whether the legacy wallet may be deleted. Pure; unit-tested as a matrix.
 /// ALL of: connected + a completed sync since connecting; confirmed == 0;
 /// pending send == 0; pending receive == 0; no refundable swaps; no
@@ -666,7 +713,15 @@ final class LegacyBreezWallet: ObservableObject, SonarWalletProviding {
     func deleteIfSafe(unregisterWebhook: (WalletBridgeService) async -> Void) async throws {
         await refreshSnapshot()
         if let blocker = deleteBlocker { throw DeleteError.blocked(blocker) }
+        let gated = currentSnapshot
         await unregisterWebhook(bridge)
+        // A payment could settle while the webhook was being removed (an
+        // incoming swap completing, say): read again, and delete only if
+        // nothing moved. If this stops here, the next push registration puts
+        // the webhook back.
+        await refreshSnapshot()
+        if let blocker = deleteBlocker { throw DeleteError.blocked(blocker) }
+        guard currentSnapshot == gated else { throw DeleteError.blocked(.unknown) }
         do {
             // Disconnect BEFORE the marker: a crash in between leaves an
             // intact wallet that simply reopens, never a half-armed delete.
@@ -733,6 +788,7 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
     private let nsecProvider: () -> String?
     private let factory: Factory
     private let unregisterWebhook: (WalletBridgeService) async -> Void
+    private let restoreConfirmDelayNanos: UInt64
     private var restoreCheckCancellable: AnyCancellable?
     private var restoreCheckAccountId: String?
 
@@ -742,6 +798,7 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
         hasAPIKey: @escaping () -> Bool = { SonarBreezBuildConfig.hasAPIKey },
         nsecProvider: @escaping () -> String?,
         unregisterWebhook: @escaping (WalletBridgeService) async -> Void = { _ in },
+        restoreConfirmDelayNanos: UInt64 = SonarLegacyRestoreCheck.confirmDelayNanos,
         factory: @escaping Factory
     ) {
         self.storage = storage
@@ -749,6 +806,7 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
         self.hasAPIKey = hasAPIKey
         self.nsecProvider = nsecProvider
         self.unregisterWebhook = unregisterWebhook
+        self.restoreConfirmDelayNanos = restoreConfirmDelayNanos
         self.factory = factory
     }
 
@@ -797,9 +855,10 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
         storage.armRestoreCheck(id)
     }
 
-    /// While this account's restore check is pending, decide as soon as a
-    /// synced snapshot exists: keep the wallet if it has any balance, pending
-    /// amount or payment history; delete what the check created otherwise.
+    /// While this account's restore check is pending, decide once a synced
+    /// snapshot exists: keep the wallet if it has any balance, pending amount
+    /// or payment history; delete what the check created only when a second
+    /// pass confirms it empty (`SonarLegacyRestoreCheck`).
     private func watchRestoreCheck(_ legacy: LegacyBreezWallet) {
         guard let id = currentAccountId, storage.restoreCheckPending(id) else { return }
         restoreCheckAccountId = id
@@ -816,12 +875,22 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
 
     private func concludeRestoreCheck(
         _ legacy: LegacyBreezWallet,
-        snapshot: SonarLegacyWalletSnapshot,
+        snapshot first: SonarLegacyWalletSnapshot,
         accountId: String
     ) async {
         guard wallet === legacy, currentAccountId == accountId else { return }
-        let empty = SonarLegacyDeleteGate.blocker(for: snapshot) == nil && snapshot.hasHistory == false
-        if empty {
+        var confirm: SonarLegacyWalletSnapshot?
+        if SonarLegacyRestoreCheck.holdsAnything(first) == false {
+            // Empty so far: look again later before deleting anything.
+            try? await Task.sleep(nanoseconds: restoreConfirmDelayNanos)
+            guard wallet === legacy, currentAccountId == accountId else { return }
+            await legacy.refreshSnapshot()
+            confirm = legacy.snapshot
+        }
+        switch SonarLegacyRestoreCheck.verdict(first: first, confirm: confirm) {
+        case .keep:
+            storage.completeRestoreCheck(accountId)
+        case .discard:
             do {
                 try await legacy.deleteIfSafe(unregisterWebhook: unregisterWebhook)
                 wallet = nil
@@ -829,8 +898,12 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
                 // Not provably empty after all: keep it as legacy.
                 SecureLogger.warning("Legacy restore check: kept wallet (\(error))", category: .session)
             }
+            storage.completeRestoreCheck(accountId)
+        case .undecided:
+            // Could not tell: keep the store and leave the check pending, so
+            // a later launch decides. Never delete on doubt.
+            SecureLogger.warning("Legacy restore check: undecided, kept the wallet for now", category: .session)
         }
-        storage.completeRestoreCheck(accountId)
         restoreCheckCancellable = nil
         restoreCheckAccountId = nil
         restoreCheckInProgress = false

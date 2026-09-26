@@ -67,6 +67,43 @@ final class SonarLegacyWalletTests: XCTestCase {
         }
     }
 
+    /// One empty pass used to discard the restored wallet for good; on a
+    /// fresh device a sync can finish before the history lands, so a funded
+    /// wallet was deleted and never opened again. Only a second, synced,
+    /// empty pass discards it; anything unknown decides nothing.
+    func testRestoreCheckDiscardsOnlyWhenASecondSyncedPassAgrees() {
+        typealias V = SonarLegacyRestoreCheck.Verdict
+        var empty = safeSnapshot()
+        empty.hasHistory = false
+        XCTAssertEqual(SonarLegacyRestoreCheck.verdict(first: empty, confirm: nil), V.undecided, "no confirming pass")
+        XCTAssertEqual(SonarLegacyRestoreCheck.verdict(first: empty, confirm: empty), V.discard)
+        XCTAssertEqual(SonarLegacyRestoreCheck.verdict(first: nil, confirm: nil), V.undecided)
+
+        var unsynced = empty
+        unsynced.syncedSinceConnect = false
+        XCTAssertEqual(SonarLegacyRestoreCheck.verdict(first: empty, confirm: unsynced), V.undecided, "the refresh failed")
+        var unknown = empty
+        unknown.unsettledPayments = nil
+        XCTAssertEqual(SonarLegacyRestoreCheck.verdict(first: empty, confirm: unknown), V.undecided)
+
+        var landedLate: [SonarLegacyWalletSnapshot] = []
+        func later(_ mutate: (inout SonarLegacyWalletSnapshot) -> Void) {
+            var s = empty
+            mutate(&s)
+            landedLate.append(s)
+        }
+        later { $0.hasHistory = true }
+        later { $0.confirmedSats = 1 }
+        later { $0.pendingSendSats = 1 }
+        later { $0.pendingReceiveSats = 1 }
+        later { $0.refundableSwaps = 1 }
+        later { $0.unsettledPayments = 1 }
+        for second in landedLate {
+            XCTAssertEqual(SonarLegacyRestoreCheck.verdict(first: empty, confirm: second), V.keep, "\(second)")
+            XCTAssertEqual(SonarLegacyRestoreCheck.verdict(first: second, confirm: nil), V.keep, "first pass \(second)")
+        }
+    }
+
     func testDeleteGateReasonsAreUserFacing() {
         let money: (Int64) -> String = { "\($0) sats" }
         XCTAssertTrue(SonarLegacyDeleteGate.message(for: .balance(1_500), money: money).contains("1500 sats"))

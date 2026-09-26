@@ -26,6 +26,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -233,15 +234,17 @@ actual object LegacyBreezWallet {
                 snapshotState.value = LegacyWalletSnapshot()
                 return@withLock LegacyRestoreCheckOutcome.Failed
             }
-            val keep = runCatching {
-                node.sync()
-                val info = node.getInfo().walletInfo
-                val history = node.listPayments(ListPaymentsRequest(limit = 1u))
-                val refundables = node.listRefundables()
-                info.balanceSat > 0u || info.pendingSendSat > 0u || info.pendingReceiveSat > 0u ||
-                    history.isNotEmpty() || refundables.isNotEmpty()
+            // One empty pass is not proof (a sync can return before the
+            // history lands): an empty wallet is confirmed by a second pass.
+            val first = runCatching { restoreFactsLocked(node) }.getOrNull()
+            val confirm = if (first?.empty == true) {
+                delay(LEGACY_RESTORE_CONFIRM_DELAY_MS)
+                runCatching { restoreFactsLocked(node) }.getOrNull()
+            } else {
+                null
             }
-            if (keep.getOrNull() == true && store.keepRestoreCheck(accountId)) {
+            val verdict = legacyRestoreVerdict(first, confirm)
+            if (verdict == LegacyRestoreCheckOutcome.Kept && store.keepRestoreCheck(accountId)) {
                 syncedSinceConnect = true
                 requestBalanceRefresh()
                 return@withLock LegacyRestoreCheckOutcome.Kept
@@ -249,8 +252,24 @@ actual object LegacyBreezWallet {
             runCatching { disconnectLocked() }
             store.deleteLive()
             snapshotState.value = LegacyWalletSnapshot()
-            if (keep.isFailure) LegacyRestoreCheckOutcome.Failed else LegacyRestoreCheckOutcome.Discarded
+            // A wallet that showed funds but could not be recorded as kept is
+            // a Failed check (retried from the seed), never a Discarded one.
+            if (verdict == LegacyRestoreCheckOutcome.Kept) LegacyRestoreCheckOutcome.Failed else verdict
         }
+    }
+
+    /** One restore-check pass: sync, then read what the wallet holds. Assumes [lock] is held. */
+    private fun restoreFactsLocked(node: BindingLiquidSdk): LegacyRestoreFacts {
+        node.sync()
+        val info = node.getInfo().walletInfo
+        return LegacyRestoreFacts(
+            synced = syncedSinceConnect,
+            balanceSats = info.balanceSat.toLong(),
+            pendingSendSats = info.pendingSendSat.toLong(),
+            pendingReceiveSats = info.pendingReceiveSat.toLong(),
+            hasHistory = node.listPayments(ListPaymentsRequest(limit = 1u)).isNotEmpty(),
+            refundableSwaps = node.listRefundables().size,
+        )
     }
 
     actual suspend fun refreshBalance(): Long = withContext(Dispatchers.IO) {
@@ -440,6 +459,10 @@ actual object LegacyBreezWallet {
         val node = sdk ?: return LegacyDeleteGate.Blocked(
             if (store.hasLiveStore()) LegacyDeleteBlock.NotConnected else LegacyDeleteBlock.Absent,
         )
+        return legacyDeleteGate(gateFactsLocked(node))
+    }
+
+    private fun gateFactsLocked(node: BindingLiquidSdk): LegacyGateFacts {
         val synced = runCatching { node.sync() }.isSuccess
         syncedSinceConnect = synced
         val info = runCatching { node.getInfo().walletInfo }.getOrNull()
@@ -447,24 +470,36 @@ actual object LegacyBreezWallet {
         val unsettled = runCatching {
             node.listPayments(ListPaymentsRequest(states = UNSETTLED_STATES)).size
         }.getOrNull()
-        return legacyDeleteGate(
-            LegacyGateFacts(
-                connected = true,
-                syncedSinceConnect = synced,
-                confirmedSats = info?.balanceSat?.toLong(),
-                pendingSendSats = info?.pendingSendSat?.toLong(),
-                pendingReceiveSats = info?.pendingReceiveSat?.toLong(),
-                refundableSwaps = refundables,
-                unsettledPayments = unsettled,
-            )
+        return LegacyGateFacts(
+            connected = true,
+            syncedSinceConnect = synced,
+            confirmedSats = info?.balanceSat?.toLong(),
+            pendingSendSats = info?.pendingSendSat?.toLong(),
+            pendingReceiveSats = info?.pendingReceiveSat?.toLong(),
+            refundableSwaps = refundables,
+            unsettledPayments = unsettled,
         )
     }
 
     actual suspend fun deleteIfSafe(): LegacyDeleteGate = withContext(Dispatchers.IO) {
         lock.withLock {
-            val gate = gateLocked()
+            val node = sdk ?: return@withLock gateLocked()
+            val before = gateFactsLocked(node)
+            val gate = legacyDeleteGate(before)
             if (gate != LegacyDeleteGate.Safe) return@withLock gate
-            runCatching { sdk?.unregisterWebhook() }
+            runCatching { node.unregisterWebhook() }
+            // A payment could settle while the webhook was being removed: read
+            // again, and delete only if nothing moved. (The webhook comes back
+            // with the next push registration if this stops here.)
+            val after = gateFactsLocked(node)
+            if (!legacyGateUnchanged(before, after)) {
+                val moved = legacyDeleteGate(after)
+                return@withLock if (moved == LegacyDeleteGate.Safe) {
+                    LegacyDeleteGate.Blocked(LegacyDeleteBlock.Unknown)
+                } else {
+                    moved
+                }
+            }
             markCleanupPendingLocked(all = false)
             disconnectLocked()
             deleteStorageLocked(all = false)

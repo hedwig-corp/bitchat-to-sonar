@@ -78,4 +78,53 @@ class LegacyDeleteGateTest {
         assertEquals(false, LegacyBreezStore.settlesRestoreCheck(LegacyRestoreCheckOutcome.Skipped))
         assertEquals(false, LegacyBreezStore.settlesRestoreCheck(LegacyRestoreCheckOutcome.Failed))
     }
+
+    private val emptyPass = LegacyRestoreFacts(
+        synced = true,
+        balanceSats = 0,
+        pendingSendSats = 0,
+        pendingReceiveSats = 0,
+        hasHistory = false,
+        refundableSwaps = 0,
+    )
+
+    /**
+     * One empty pass used to discard the restored wallet for good; on a fresh
+     * device a sync can return before the history lands, so a funded wallet
+     * was deleted and never opened again. Only a second, synced, empty pass
+     * discards it; anything unknown leaves the check to run again.
+     */
+    @Test
+    fun anEmptyRestoreIsDiscardedOnlyWhenASecondSyncedPassAgrees() {
+        assertEquals(LegacyRestoreCheckOutcome.Failed, legacyRestoreVerdict(emptyPass, null), "no confirming pass")
+        assertEquals(
+            LegacyRestoreCheckOutcome.Failed,
+            legacyRestoreVerdict(emptyPass, emptyPass.copy(synced = false)),
+            "the SDK never reported a completed sync",
+        )
+        assertEquals(LegacyRestoreCheckOutcome.Discarded, legacyRestoreVerdict(emptyPass, emptyPass))
+        assertEquals(LegacyRestoreCheckOutcome.Failed, legacyRestoreVerdict(null, null), "the first pass failed")
+        val landedLate = listOf(
+            emptyPass.copy(hasHistory = true),
+            emptyPass.copy(balanceSats = 1),
+            emptyPass.copy(pendingSendSats = 1),
+            emptyPass.copy(pendingReceiveSats = 1),
+            emptyPass.copy(refundableSwaps = 1),
+        )
+        for (second in landedLate) {
+            assertEquals(LegacyRestoreCheckOutcome.Kept, legacyRestoreVerdict(emptyPass, second), "$second")
+            assertEquals(LegacyRestoreCheckOutcome.Kept, legacyRestoreVerdict(second, null), "first pass $second")
+        }
+        // Discarded settles the check for good; so it must never come from one pass.
+        assertEquals(true, LegacyBreezStore.settlesRestoreCheck(LegacyRestoreCheckOutcome.Discarded))
+    }
+
+    /** Anything that moved while the webhook was removed stops the delete. */
+    @Test
+    fun theDeleteStopsWhenAnythingMovedAfterTheGate() {
+        assertEquals(true, legacyGateUnchanged(empty, empty))
+        assertEquals(false, legacyGateUnchanged(empty, empty.copy(pendingReceiveSats = 5)))
+        assertEquals(false, legacyGateUnchanged(empty, empty.copy(syncedSinceConnect = false)))
+        assertEquals(false, legacyGateUnchanged(empty.copy(unsettledPayments = null), empty))
+    }
 }
