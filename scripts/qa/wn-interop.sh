@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wn-interop.sh — Sonar ↔ White Noise interop QA, headless (QA-078…QA-086).
+# wn-interop.sh — Sonar ↔ White Noise interop QA, headless (QA-086…QA-095).
 #
 # White Noise iOS runs MDK's own runtime (marmot-app). The MDK checkout Sonar
 # pins ships the White Noise CLI (`crates/cli`: `wn` + daemon `wnd`) on that
@@ -89,8 +89,8 @@ sonar_accept_named() { # sonar_accept_named <home> <group-name>
 import json,sys
 for l in sys.stdin:
     i=json.loads(l)
-    if i.get('name')=='$2': print(i['id']); break")
-  [ -z "$id" ] || sonar "$1" accept "$id" >/dev/null
+    if i.get('group_name')=='$2': print(i['id']); break")
+  [ -z "$id" ] || sonar "$1" accept --id "$id" >/dev/null
 }
 
 wn_has() { # wn_has <group> <text>
@@ -107,6 +107,14 @@ sys.exit(0 if any((m.get('plaintext') or '')==sys.argv[1] for m in rows) else 1)
 sonar_rosters_are() { # sonar_rosters_are <group> <n>: a and b both see n members
   sonar_listen a 6 >/dev/null & sonar_listen b 6 >/dev/null & wait
   [ "$(sonar_members a "$1")" = "$2" ] && [ "$(sonar_members b "$1")" = "$2" ]
+}
+
+wn_chat_state() { # wn_chat_state <group>: unread, last message and list position
+  wn --account "$W" chats list 2>/dev/null | python3 -c "
+import json,sys
+for c in json.load(sys.stdin)['result']['chats']:
+    if c['group_id']=='$1':
+        print(c['unread_count'], (c.get('last_message') or {}).get('message_id_hex'), c['activity_sort_at'])"
 }
 
 wn_members() { wn --account "$W" groups members "$1" 2>/dev/null | jget 'len(d["result"]["members"])'; }
@@ -167,28 +175,28 @@ cmd_run() {
   A=$(sonar_npub a); B=$(sonar_npub b)
   for npub in "$A" "$B"; do wn keys fetch "$npub" --bootstrap-relays "$RELAY" >/dev/null 2>&1 || true; done
 
-  # QA-078: White Noise starts a DM with a Sonar user (KeyPackage accepted,
+  # QA-086: White Noise starts a DM with a Sonar user (KeyPackage accepted,
   # capabilities met, welcome routed by the kind-10050 inbox list).
   local g
   g=$(wn --account "$W" groups create "" "$A" | jget 'd["result"]["group_id"]') || g=""
   if [ -n "$g" ]; then
     wn --account "$W" messages send "$g" "wn hello $run" >/dev/null
     sonar_listen a 12 >/dev/null
-    if sonar_has a "$g" "wn hello $run"; then pass QA-078 "White Noise → Sonar DM"; else fail QA-078 "Sonar never got the DM"; fi
+    if sonar_has a "$g" "wn hello $run"; then pass QA-086 "White Noise → Sonar DM"; else fail QA-086 "Sonar never got the DM"; fi
   else
-    fail QA-078 "White Noise could not create a chat with Sonar"
+    fail QA-086 "White Noise could not create a chat with Sonar"
   fi
 
-  # QA-079: the Sonar reply lands in the same chat (no split).
+  # QA-087: the Sonar reply lands in the same chat (no split).
   local sent
   sent=$(sonar a send --to "$W" --text "sonar reply $run" | jget 'd["group_id"]' || true)
   if [ "$sent" = "$g" ] && eventually 30 wn_has "$g" "sonar reply $run"; then
-    pass QA-079 "Sonar replies in White Noise's DM"
+    pass QA-087 "Sonar replies in White Noise's DM"
   else
-    fail QA-079 "reply went to ${sent:-nowhere} (want $g) or never reached White Noise"
+    fail QA-087 "reply went to ${sent:-nowhere} (want $g) or never reached White Noise"
   fi
 
-  # QA-080: Sonar starts a DM with a White Noise user.
+  # QA-088: Sonar starts a DM with a White Noise user.
   local g2
   g2=$(sonar b send --to "$W" --text "sonar starts $run" | jget 'd["group_id"]' || true)
   sleep 4
@@ -196,12 +204,12 @@ cmd_run() {
   wn --account "$W" messages send "$g2" "wn answers $run" >/dev/null 2>&1 || true
   sonar_listen b 10 >/dev/null
   if eventually 30 wn_has "$g2" "sonar starts $run" && sonar_has b "$g2" "wn answers $run"; then
-    pass QA-080 "Sonar → White Noise DM, both directions"
+    pass QA-088 "Sonar → White Noise DM, both directions"
   else
-    fail QA-080 "Sonar-started DM did not carry both ways"
+    fail QA-088 "Sonar-started DM did not carry both ways"
   fi
 
-  # QA-081: a White Noise group with two Sonar members.
+  # QA-089: a White Noise group with two Sonar members.
   local g3
   g3=$(wn --account "$W" groups create "wn-grp-$run" "$A" "$B" | jget 'd["result"]["group_id"]' || true)
   wn --account "$W" messages send "$g3" "wn group $run" >/dev/null 2>&1 || true
@@ -210,12 +218,12 @@ cmd_run() {
   sonar_listen b 8 >/dev/null
   if sonar_has b "$g3" "wn group $run" && sonar_has b "$g3" "a in wn group $run" &&
     eventually 30 wn_has "$g3" "a in wn group $run"; then
-    pass QA-081 "White Noise group with Sonar members"
+    pass QA-089 "White Noise group with Sonar members"
   else
-    fail QA-081 "White Noise group did not deliver every way"
+    fail QA-089 "White Noise group did not deliver every way"
   fi
 
-  # QA-082: a Sonar group with a White Noise member (and it requires media V2).
+  # QA-090: a Sonar group with a White Noise member (and it requires media V2).
   local g4
   g4=$(sonar b group-create --name "sonar-grp-$run" --member "$W" --member "$A" | jget 'd["group_id"]' || true)
   sonar b group-send --group "$g4" --text "b created $run" >/dev/null
@@ -236,12 +244,12 @@ em=f(json.load(sys.stdin)) or {}
 print(em.get('component_id'), em.get('required'))")
   if eventually 30 wn_has "$g4" "b created $run" && sonar_has a "$g4" "wn in sonar group $run" &&
     [ "$media_required" = "32779 True" ]; then
-    pass QA-082 "Sonar group with a White Noise member (media V2 required)"
+    pass QA-090 "Sonar group with a White Noise member (media V2 required)"
   else
-    fail QA-082 "Sonar group interop failed (media component: $media_required)"
+    fail QA-090 "Sonar group interop failed (media component: $media_required)"
   fi
 
-  # QA-083: encrypted media both ways (MDK 0.9 encrypted-media-v2).
+  # QA-091: encrypted media both ways (MDK 0.9 encrypted-media-v2).
   png "$Q/s-$run.png" 11; png "$Q/w-$run.png" 23
   sonar a send --to "$W" --file "$Q/s-$run.png" --kind image >/dev/null
   local hs ok_s=1
@@ -259,23 +267,23 @@ for l in sys.stdin:
   [ -n "$url" ] && sonar a fetch --group "$g4" --url "$url" --out "$Q/w-got-$run.png" >/dev/null &&
     [ "$(sha "$Q/w-got-$run.png")" = "$(sha "$Q/w-$run.png")" ] || ok_w=0
   if [ "$ok_s" = 1 ] && [ "$ok_w" = 1 ]; then
-    pass QA-083 "media both ways (Sonar→WN DM, WN→Sonar in a Sonar group)"
+    pass QA-091 "media both ways (Sonar→WN DM, WN→Sonar in a Sonar group)"
   else
-    fail QA-083 "media: sonar→wn=$ok_s wn→sonar=$ok_w"
+    fail QA-091 "media: sonar→wn=$ok_s wn→sonar=$ok_w"
   fi
 
-  # QA-084: a Sonar member's leave is committed and every roster drops it.
+  # QA-092: a Sonar member's leave is committed and every roster drops it.
   local before
   before=$(sonar_members b "$g4")
   sonar a leave --group "$g4" >/dev/null
   sonar_listen b 12 >/dev/null
   if [ "$(sonar_members b "$g4")" = "$((before - 1))" ] && eventually 40 sh -c "[ \"\$('$WN_BIN/wn' --json --account '$W' groups members '$g4' 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)[\"result\"][\"members\"]))')\" = $((before - 1)) ]"; then
-    pass QA-084 "Sonar leave committed for Sonar and White Noise"
+    pass QA-092 "Sonar leave committed for Sonar and White Noise"
   else
-    fail QA-084 "leave not committed (sonar b: $(sonar_members b "$g4"), was $before)"
+    fail QA-092 "leave not committed (sonar b: $(sonar_members b "$g4"), was $before)"
   fi
 
-  # QA-086: a White Noise member's own leave is committed by the Sonar members.
+  # QA-094: a White Noise member's own leave is committed by the Sonar members.
   # Before MDK v0.9.19 every client deferred it (marmot-protocol/mdk#1736).
   local g6
   g6=$(sonar b group-create --name "wn-leaves-$run" --member "$W" --member "$A" | jget 'd["group_id"]' || true)
@@ -286,12 +294,12 @@ for l in sys.stdin:
   joined6="$(sonar_members a "$g6")/$(sonar_members b "$g6")/$(wn_members "$g6")"
   wn --account "$W" groups leave "$g6" >/dev/null 2>&1 || true
   if [ "$joined6" = "3/3/3" ] && eventually 60 sonar_rosters_are "$g6" 2; then
-    pass QA-086 "White Noise leave committed by the Sonar members"
+    pass QA-094 "White Noise leave committed by the Sonar members"
   else
-    fail QA-086 "White Noise leave not committed (before $joined6, now a=$(sonar_members a "$g6") b=$(sonar_members b "$g6"))"
+    fail QA-094 "White Noise leave not committed (before $joined6, now a=$(sonar_members a "$g6") b=$(sonar_members b "$g6"))"
   fi
 
-  # QA-085: N-member groups created by each side.
+  # QA-093: N-member groups created by each side.
   local members=() i
   for i in $(seq -w 1 $((n - 2))); do sonar_new "n$i" & done; wait
   for i in $(seq -w 1 $((n - 2))); do members+=("$(sonar_npub "n$i")"); done
@@ -307,9 +315,27 @@ for l in sys.stdin:
   local joined=0
   for i in $(seq -w 1 $((n - 2))); do sonar_has "n$i" "$gw" "hello $n $run" && joined=$((joined + 1)); done
   if [ "$joined" = "$((n - 2))" ] && eventually 40 wn_has "$gw" "n01 in wn-$n $run"; then
-    pass QA-085 "$n-member White Noise group: $joined/$((n - 2)) Sonar members joined and replied"
+    pass QA-093 "$n-member White Noise group: $joined/$((n - 2)) Sonar members joined and replied"
   else
-    fail QA-085 "$n-member group: $joined/$((n - 2)) joined"
+    fail QA-093 "$n-member group: $joined/$((n - 2)) joined"
+  fi
+
+  # QA-095: a Sonar timezone share reaches Sonar members and stays invisible
+  # in White Noise: no unread, no chat-list preview, no reorder. The first
+  # version used kind 449, MIP-05's push-token removal in the MDK 0.10 profile.
+  wn --account "$W" sync >/dev/null 2>&1 || true
+  local tz_before tz_after tz_got=0
+  tz_before=$(wn_chat_state "$g3")
+  sonar a timezone share --group "$g3" --zone Europe/Zurich >/dev/null
+  timeout 90 "$SCLI" --home "$Q/b" timezone show --from "$A" --zone Europe/Zurich \
+    --wait-secs 60 --relay "$RELAY" 2>/dev/null | grep -q '"zone":"Europe/Zurich"' && tz_got=1
+  sleep 10
+  wn --account "$W" sync >/dev/null 2>&1 || true
+  tz_after=$(wn_chat_state "$g3")
+  if [ "$tz_got" = 1 ] && [ -n "$tz_before" ] && [ "$tz_before" = "$tz_after" ]; then
+    pass QA-095 "timezone share reached Sonar and stayed invisible in White Noise"
+  else
+    fail QA-095 "timezone share: sonar got=$tz_got, White Noise chat before=[$tz_before] after=[$tz_after]"
   fi
 
   echo "failures: $FAILS"

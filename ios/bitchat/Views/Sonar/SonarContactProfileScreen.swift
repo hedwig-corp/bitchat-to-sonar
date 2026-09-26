@@ -345,6 +345,32 @@ struct SonarContactProfileScreen: View {
                         ) {}
                     }
 
+                    if store.marmotGroupId(effectiveChatId) != nil {
+                        let sharing = store.sharesLocalTime(withChatId: effectiveChatId)
+                        let overridden = store.hasShareLocalTimeOverride(forChatId: effectiveChatId)
+                        SNSectionLabel("Privacy")
+                        SNSettingsCard {
+                            SNSettingsRow(
+                                icon: .globe,
+                                label: "Share local time",
+                                sub: "This chat can show your current time. Uses this phone's timezone.",
+                                trail: .toggle(sharing),
+                                divider: false
+                            ) {
+                                store.toggleShareLocalTime(forChatId: effectiveChatId)
+                            }
+                        }
+                        Text(verbatim: snShareLocalTimeNote(
+                            sharing: sharing,
+                            overridden: overridden,
+                            zone: TimeZone.autoupdatingCurrent.identifier,
+                            peerName: peerName
+                        ))
+                            .font(SonarTheme.uiFont(size: 13))
+                            .foregroundColor(SonarTheme.text3)
+                            .padding(EdgeInsets(top: 8, leading: 16, bottom: 0, trailing: 16))
+                    }
+
                     // ── Shared groups ──
                     SNSectionLabel("Shared groups")
                     if sharedGroups.isEmpty {

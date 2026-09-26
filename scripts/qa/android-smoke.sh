@@ -93,6 +93,45 @@ focus_composer() {
   sleep 1
 }
 
+# The chat-list/header title of a peer with no nickname: npub1abcde…wxyz.
+short_npub() { printf '%s…%s' "${1:0:10}" "${1: -4}"; }
+
+# scroll_to <substring> — slow swipes until a node contains it. Fast swipes
+# are read as flings and do not move Compose sheets; `find` exits 0 even on a
+# miss, so test its output.
+scroll_to() {
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    [[ -n "$("$UI" find "$1" 2>/dev/null)" ]] && return 0
+    adb -s "$QA_SERIAL" shell input swipe 540 1900 540 1000 900
+    sleep 0.6
+  done
+  [[ -n "$("$UI" find "$1" 2>/dev/null)" ]]
+}
+
+open_chat_row() { # open an existing chat from the chat list by its row title
+  go_home || return 1
+  scroll_to "$1" || return 1
+  ui tapx "$1"; sleep 2
+  hasx "Back"
+}
+
+# From an open DM: header → contact profile → the Privacy note.
+open_contact_privacy() {
+  ui tapx "$1"; sleep 2
+  scroll_to "Share local time"
+}
+
+privacy_note() {
+  "$UI" dump 2>/dev/null | awk -F'\t' '$3 ~ /^(Sharing |Off for this chat|Off — follows)/ {print $3; exit}'
+}
+
+settings_share_row() {
+  go_home || return 1
+  ui tapx "Settings"; sleep 2
+  scroll_to "Share local time"
+}
+
 # --- scenarios ---------------------------------------------------------------
 
 qa001() { # first message in a new chat: delivered, keyboard stays up (A10)
@@ -244,14 +283,21 @@ qa007() { # a partial npub offers no chat or channel action (A18)
     record QA-007 FAIL "partial npub offered: ${bad[*]} (QA-A18)"; go_home >/dev/null; return
   fi
   # Positive path: the complete npub must still offer the chat, or a search
-  # that rejects every npub would pass the check above.
-  go_home >/dev/null; ui tapx "Search"; sleep 1; ui tapedit; sleep 0.5
-  ui type "$npub"
-  if "$UI" wait "Start secure chat" 10 >/dev/null; then
-    record QA-007 PASS "partial npub: no action; complete npub: Start secure chat"
-  else
-    record QA-007 FAIL "a complete npub no longer offers Start secure chat"
-  fi
+  # that rejects every npub would pass the check above. One retry, as in
+  # open_chat_by_npub: keystrokes injected right after go_home can be dropped
+  # (seen once in the #607 round-2 smoke; 2/2 standalone reruns passed).
+  local attempt typed=""
+  for attempt in 1 2; do
+    go_home >/dev/null; ui tapx "Search"; sleep 1; ui tapedit; sleep 0.5
+    ui type "$npub"
+    if "$UI" wait "Start secure chat" 10 >/dev/null; then
+      record QA-007 PASS "partial npub: no action; complete npub: Start secure chat"
+      go_home >/dev/null; return
+    fi
+    typed="$("$UI" dump 2>/dev/null | awk -F'\t' '$2 ~ /E/ {print $3; exit}')"
+    [[ "$typed" == "$npub" ]] && break     # the field is right: an app result, no retry
+  done
+  record QA-007 FAIL "a complete npub no longer offers Start secure chat (field held '${typed:-nothing}')"
   go_home >/dev/null
 }
 
@@ -320,6 +366,59 @@ qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
   fi
 }
 
+qa070() { # Share local time is off by default: no zone reaches a peer (#607)
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-070 SKIP "needs QA-001"; return; }
+  local title note; title="$(short_npub "$A_NPUB")"
+  if ! open_chat_row "$title" || ! open_contact_privacy "$title"; then
+    record QA-070 FAIL "could not reach the contact's Privacy section"; return
+  fi
+  note="$(privacy_note)"
+  case "$note" in
+    "Off — follows your Settings default"*) ;;
+    Sharing*) record QA-070 SKIP "this account already shares local time — not a default account"; return ;;
+    *) record QA-070 FAIL "Privacy note '${note:-none}' does not say it follows Settings (QA-U1)"; return ;;
+  esac
+  if "$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "" 20 >/dev/null 2>&1; then
+    record QA-070 FAIL "the peer received a zone although sharing is off"
+  else
+    QA070_OFF=1
+    record QA-070 PASS "off by default, note follows Settings, no zone in 20s"
+  fi
+}
+
+qa071() { # turning the Settings default on shares with existing chats (#607)
+  [[ "${QA070_OFF:-}" == 1 ]] || { record QA-071 SKIP "needs QA-070's off default"; return; }
+  local zone got
+  zone="$(adb -s "$QA_SERIAL" shell getprop persist.sys.timezone | tr -d '\r')"
+  settings_share_row || { record QA-071 FAIL "no Share local time row in Settings"; return; }
+  ui tapx "Share local time"
+  got="$("$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$zone" 60 2>/dev/null)"
+  settings_share_row && ui tapx "Share local time"      # restore the default
+  if [[ -n "$got" ]]; then
+    record QA-071 PASS "peer received $zone"
+  else
+    record QA-071 FAIL "peer never received $zone within 60s"
+  fi
+}
+
+qa072() { # a peer's zone paints the DM header, with no bubble or unread (#607)
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-072 SKIP "needs QA-001"; return; }
+  local title sub; title="$(short_npub "$A_NPUB")"
+  go_home || { record QA-072 FAIL "could not reach the chat list"; return; }
+  "$PEERS" share-tz "a-$RUN" "$APP_NPUB" "Asia/Kolkata" >/dev/null 2>&1 ||
+    { record QA-072 FAIL "the peer could not share a zone"; return; }
+  sleep 8
+  open_chat_row "$title" || { record QA-072 FAIL "could not open the chat"; return; }
+  sub="$("$UI" dump 2>/dev/null | awk -F'\t' 'NR <= 6 && $3 ~ /[0-9]:[0-9][0-9].* · .*(ahead|behind)$/ {print $3; exit}')"
+  if [[ -z "$sub" ]]; then
+    record QA-072 FAIL "no '<time> · <offset> ahead|behind' header after the share"
+  elif has "Unread messages"; then
+    record QA-072 FAIL "the share left an unread divider (R-017)"
+  else
+    record QA-072 PASS "header: $sub"
+  fi
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -333,7 +432,7 @@ go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
 # QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa050; do
+for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa050; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

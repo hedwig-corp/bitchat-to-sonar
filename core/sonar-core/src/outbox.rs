@@ -99,6 +99,11 @@ impl OutboxState {
             .map(|entry| entry.group_id_hex.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn recorded_count(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn mark_pending(
         &mut self,
         group_id_hex: String,

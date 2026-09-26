@@ -141,7 +141,7 @@ same `0xf2f1` wire, same migration) — never uninstall. "0.9" below and `09` in
 derives the DB key from it); Android through `android-ui.sh`. Seed at least one
 chat above 80 messages (the first-paint extract window) and one image.
 
-### QA-070 — In-place upgrade keeps every chat
+### QA-078 — In-place upgrade keeps every chat
 - **Platforms:** iOS (headless), Android (UI)
 - **Steps:** 0.8 app with ≥ 3 DMs from 0.8 peers (one > 80 msgs, one image) and
   a 3+ member room; install the #613 build in place; launch; wait 30 s.
@@ -156,7 +156,7 @@ chat above 80 messages (the first-paint extract window) and one image.
   store open: all recovered chats vanished ~1 s after launch, the bak and the
   transcript were gone, sync restarted from 0 and re-parked old 0.8 welcomes.
 
-### QA-071 — Older recovered history pages in
+### QA-079 — Older recovered history pages in
 - **Platforms:** Android (UI), iOS (sidecar check: `.sonar-transcript.json`
   holds every row after an idle minute)
 - **Steps:** open the > 80-message recovered chat; scroll to the top.
@@ -166,14 +166,14 @@ chat above 80 messages (the first-paint extract window) and one image.
   Also stops after the second page **and on main** (tracked separately, see
   Open questions) — run it on a chat that fits in two pages until that lands.
 
-### QA-072 — Send in a recovered chat once the peer updated
+### QA-080 — Send in a recovered chat once the peer updated
 - **Platforms:** Android (UI); iOS covered by core e2e (no headless send)
 - **Steps:** `mdk-upgrade.sh upgrade-peer <peer>`; send from the recovered row.
 - **Expect:** "Sent · internet"; the peer's 0.9 CLI receives it; one row on
   Home; the new message sits under the recovered history.
 - **Guard:** `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
 
-### QA-073 — Peer still on 0.8
+### QA-081 — Peer still on 0.8
 - **Platforms:** Android (UI)
 - **Steps:** send in the recovered chat of a peer who has not upgraded.
 - **Expect:** "Waiting for them to update Sonar" banner; no second row; no
@@ -182,7 +182,7 @@ chat above 80 messages (the first-paint extract window) and one image.
 - **Origin:** A2 (#613) — the peer's 0.8 KeyPackage reached MDK 0.9 and the
   send failed with an opaque error and "Couldn't send".
 
-### QA-074 — Upgraded peer messages first
+### QA-082 — Upgraded peer messages first
 - **Platforms:** iOS (headless), Android
 - **Steps:** `upgrade-peer <peer>`; the peer sends to the app.
 - **Expect:** the 0.9 DM auto-joins and folds onto the recovered row — still
@@ -192,22 +192,22 @@ chat above 80 messages (the first-paint extract window) and one image.
 - **Guard:** `persistence.rs::recovered_08_contact_resume_welcome_bypasses_the_stranger_budget`
 - **Origin:** i3 (#613) — recovered contacts counted as strangers.
 
-### QA-075 — A recovered room stays a room
+### QA-083 — A recovered room stays a room
 - **Platforms:** Android (UI)
 - **Steps:** send in a recovered 3+ member room with one member upgraded.
 - **Expect:** title and "only group members" banner kept; the upgraded member
   receives it in a group with the same name; no fold onto a 1:1.
 - **Guard:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm` (R-050)
 
-### QA-076 — Chat history is sealed at rest
+### QA-084 — Chat history is sealed at rest
 - **Platforms:** both (file check on the simulator App Group / `run-as`)
-- **Steps:** after QA-070/074, `grep` a message body in the store directory.
+- **Steps:** after QA-078/074, `grep` a message body in the store directory.
 - **Expect:** no match in `.sonar-transcript.json` / `.sonar-transcript.log`.
 - **Guard:** `marmot.rs::transcript_rows_are_sealed_at_rest_and_survive_reopen`
 - **Origin:** P1 (#613) — the 0.9 transcript was plaintext JSON and rewritten
   whole per message (17 ms at 10k rows).
 
-### QA-077 — The checked-in Swift binding matches the core
+### QA-085 — The checked-in Swift binding matches the core
 - **Platforms:** iOS (CI: *Checked-in SonarFFI.swift matches the core*)
 - **Expect:** `core/build-ios.sh` leaves `git status` clean.
 - **Origin:** i1 (#613) — edited `///` doc comments moved two UniFFI checksums;
@@ -223,7 +223,7 @@ serves kind-1059 without NIP-42 and accepts 64 KiB events (see the script
 header). Not covered: the White Noise iOS app UI and push, public-relay
 overlap, NIP-42 inbox relays.
 
-### QA-078 — White Noise starts a DM with a Sonar user
+### QA-086 — White Noise starts a DM with a Sonar user
 - **Platforms:** core (both apps)
 - **Expect:** `wn groups create "" <sonar-npub>` succeeds; the Sonar user
   auto-joins and receives the message.
@@ -239,23 +239,23 @@ overlap, NIP-42 inbox relays.
   (`key_package_lists_no_default_mls_capabilities`). Run the matrix against a
   `wn` built from the MDK tag White Noise iOS pins, not only Sonar's own pin.
 
-### QA-079 — The Sonar reply stays in White Noise's DM
+### QA-087 — The Sonar reply stays in White Noise's DM
 - **Platforms:** core
 - **Expect:** `sonar-cli send --to <wn-npub>` reuses the chat White Noise
   created; White Noise shows the reply in it.
 
-### QA-080 — Sonar starts a DM with a White Noise user
+### QA-088 — Sonar starts a DM with a White Noise user
 - **Platforms:** core
 - **Expect:** White Noise lists the invite; after `groups accept` both sides
   exchange messages (White Noise catches up the first one on its next sync).
 
-### QA-081 — A White Noise group with Sonar members
+### QA-089 — A White Noise group with Sonar members
 - **Platforms:** core
 - **Expect:** every Sonar member joins and sees every message; White Noise sees
   the Sonar members' messages within ~10 s (its daemon ingests on its own
   cadence).
 
-### QA-082 — A Sonar group with a White Noise member
+### QA-090 — A Sonar group with a White Noise member
 - **Platforms:** core
 - **Expect:** White Noise accepts and messages flow every way; `wn groups show`
   reports the encrypted-media component `0x800b` as required.
@@ -263,7 +263,7 @@ overlap, NIP-42 inbox relays.
 - **Origin:** W5 (#613): without it White Noise refuses media in the group
   ("group does not require encrypted media").
 
-### QA-083 — Encrypted media both ways
+### QA-091 — Encrypted media both ways
 - **Platforms:** core
 - **Expect:** a Sonar photo downloads and decrypts in White Noise, and a White
   Noise photo in a Sonar group decrypts in Sonar, byte-identical both ways.
@@ -273,7 +273,7 @@ overlap, NIP-42 inbox relays.
   read (empty bubble) and dropped White Noise's `encrypted-media-v2` photos
   (caption only).
 
-### QA-084 — A member's leave reaches everyone
+### QA-092 — A member's leave reaches everyone
 - **Platforms:** core (both apps)
 - **Expect:** after a Sonar member leaves, the remaining members' rosters (Sonar
   and White Noise) drop it within seconds, with no further input.
@@ -284,23 +284,36 @@ overlap, NIP-42 inbox relays.
 - **Not guarded:** White Noise's own `wn groups leave` proposals are deferred
   by every client, White Noise included (upstream, see Known gaps).
 
-### QA-085 — 25-member groups both ways
+### QA-093 — 25-member groups both ways
 - **Platforms:** core
 - **Expect:** a 25-member group created by either side: every member joins,
   receives the creator's message, and replies reach everyone.
 - **Guard:** `sonar-sim group-scale` (docs/GROUP-SCALE-SIM.md) for the ceiling.
 
-### QA-086 — A White Noise member's own leave reaches the Sonar members
+### QA-094 — A White Noise member's own leave reaches the Sonar members
 - **Platforms:** core (both apps)
 - **Steps:** a Sonar user creates a group with a White Noise user and a second
   Sonar user; everyone joins; the White Noise user runs `wn groups leave`.
 - **Expect:** both Sonar members' rosters drop to 2 within a minute, with no
   further input (one of them commits the SelfRemove from its convergence pass).
-- **Guard:** `wn-interop.sh run` (QA-086); core
+- **Guard:** `wn-interop.sh run` (QA-094); core
   `a_members_leave_is_committed_by_the_remaining_members` for the Sonar side.
 - **Origin:** #613 bump to MDK v0.10.4. With the 0.9.14 `wn` and Sonar,
   every client deferred a White Noise leave (upstream marmot-protocol/mdk#1736,
   fixed in v0.9.19).
+
+### QA-095 — A Sonar timezone share stays invisible in White Noise
+- **Platforms:** core (both apps)
+- **Steps:** in a White Noise group with two Sonar members, one Sonar member
+  shares its zone (`sonar-cli timezone share --group`).
+- **Expect:** the other Sonar member caches the zone; White Noise's chat keeps
+  the same unread count, last message and list position.
+- **Guard:** `wn-interop.sh run` (QA-095); core
+  `timezone_share_kind_is_not_a_marmot_protocol_kind`,
+  `a_timezone_share_needs_our_kind_and_our_d_tag`
+- **Origin:** #613 merge of #607: the share was kind 449, which the MDK 0.10
+  profile reserves for MIP-05 push-token removal, so White Noise members read
+  each share as one. Now kind 30078 with a `sonar/local-time` `d` tag.
 
 ## Notifications and lifecycle
 
@@ -382,6 +395,95 @@ overlap, NIP-42 inbox relays.
   ("Message <channel>") and Send are all labelled; no `E!` rows.
 - **Origin:** A22 (#616)
 
+## Private local time (#607)
+
+Timezone shares ride inside MLS (kind 445) as a kind-30078 app event with a
+`d` tag of `sonar/local-time`, never as a transcript row. The first version
+used kind 449, which the MDK 0.10 profile reserves for push-token removal
+(MIP-05); #613 moved it off (QA-095). `peers.sh share-tz` / `expect-tz` drive the peer side: a CLI peer can
+share a zone with the app and report the zone the app shared with it.
+
+### QA-070 — Sharing is off by default
+- **Platforms:** both (Android automated)
+- **Steps:** on an account that never touched the setting, open a chat with a
+  fresh peer and exchange a message; wait 30 s.
+- **Expect:** Settings → Privacy & safety → *Share local time* is off; the
+  peer never receives a zone (`peers.sh expect-tz` times out).
+- **How:** `android-smoke.sh` QA-070 · Guard:
+  `client.rs::timezone_share_only_publishes_to_allowlisted_groups`
+
+### QA-071 — Enabling the Settings default shares with existing chats
+- **Platforms:** both (Android automated)
+- **Steps:** with QA-070's chat, turn *Share local time* on in Settings.
+- **Expect:** the peer receives the device's IANA zone within 60 s; nothing
+  appears in the transcript on either side.
+- **How:** `android-smoke.sh` QA-071
+
+### QA-072 — A peer's zone paints the DM header, silently
+- **Platforms:** both (Android automated)
+- **Steps:** the peer runs `peers.sh share-tz <peer> <app-npub> Asia/Kolkata`
+  while the app shows the chat list, then open the chat.
+- **Expect:** the header subtitle reads `<time> · <offset> ahead|behind`
+  (`5h 30m` for a half-hour zone); no new bubble, no unread dot, no
+  notification, and the chat does not jump to the top of the list.
+- **How:** `android-smoke.sh` QA-072 · Guard:
+  `e2e.rs::timezone_share_does_not_notify_or_increment_unread`,
+  `PrivateTimezoneTest`, `SNPeerLocalTimeFormatterTests`
+
+### QA-073 — Per-chat override beats the Settings default
+- **Platforms:** both (manual)
+- **Steps:** Settings on; contact profile → Privacy → turn *Share local time*
+  off for chat A; keep chat B on. Change the device timezone (Android:
+  `adb shell service call alarm 3 s16 <zone>`; iOS simulator: host timezone).
+- **Expect:** B's peer receives the new zone; A's peer does not. The note
+  under the toggle says "Off for this chat — overrides your Settings default"
+  only when A has its own override; with Settings off and no override it says
+  "Off — follows your Settings default". Turning Settings off while A is
+  overridden *on* keeps sharing with A only.
+- **Guard:** `PrivateTimezoneTest.offNoteSaysWhetherTheChatOverridesTheDefault`,
+  `SNPeerLocalTimeFormatterTests.offNoteSaysWhetherTheChatOverridesTheDefault`
+- **Origin:** U1 (#607 QA — the "overrides" note showed on every chat that
+  simply followed an off default)
+
+### QA-074 — A device timezone change republishes
+- **Platforms:** both (manual; Android via `service call alarm 3 s16`)
+- **Steps:** sharing on; change the device timezone.
+- **Expect:** each allowed peer receives the new zone within 60 s; the
+  group-info "You" row, the contact/group notes ("Sharing <zone> …") and every
+  visible peer clock update at once, not at the next minute tick.
+- **Origin:** A2 (#607 QA — Compose read the zone during composition, so the
+  notes kept naming the old zone)
+
+### QA-075 — Group member list shows local times
+- **Platforms:** both (manual)
+- **Steps:** the app creates a group with two fresh peers (*Start a chat* →
+  *New group*); `peers.sh accept <peer>` for each; one peer runs
+  `peers.sh share-tz-group <peer> <group-hex> Europe/Lisbon` (`peers.sh groups`
+  prints the hex). Open Group info, stay on it across a minute boundary.
+- **Expect:** `Local time: <time>` under every member whose zone is known,
+  including "You"; members that never shared show no line; the "You" clock
+  keeps ticking even when no peer has shared. Turning the group's own toggle
+  on shares into the group (`peers.sh expect-tz`).
+- **Guard:** `client.rs::timezone_share_resends_when_a_member_is_swapped`
+  (a swapped-in member gets the zone)
+- **Origin:** i3 (#607 QA — the iOS "You" clock froze until a peer shared)
+
+### QA-076 — Wipe and erase clear the preference
+- **Platforms:** both (manual)
+- **Expect:** *Erase chats* drops every per-chat override (Settings default
+  survives); a full account wipe resets *Share local time* to off.
+
+### QA-077 — A restart does not re-share the zone
+- **Platforms:** both (Android: `am force-stop` + launch; iOS: `simctl
+  terminate` + launch)
+- **Steps:** sharing on and delivered (`peers.sh tz <peer>` shows the zone);
+  note its `updated_at_secs`; relaunch the app twice, 30 s each.
+- **Expect:** the peer's `updated_at_secs` does not move — a restart with the
+  same zone sends nothing. A real zone change still arrives.
+- **Guard:** `client.rs::timezone_share_is_not_repeated_after_restart`
+- **Origin:** A1/i2 (#607 QA — every launch, and every iOS store reopen,
+  re-encrypted a timezone share into every allowed group: 37 per launch)
+
 ## Settings
 
 ### QA-060 — Settings copy matches behaviour
@@ -397,6 +499,11 @@ overlap, NIP-42 inbox relays.
 - **Platforms:** both (`scripts/qa/idle-cpu.sh`)
 - **Expect:** ≤ 3 % averaged over 30–60 s with the app untouched on Home
   (baseline 2026-09-23: Android emulator 0.67 %, iOS simulator ~1.5 %).
+- **Control first:** with location channels live (emulator location set, a
+  "<city> · N here now" card on Home) geo-relay reconnects and presence
+  fetches alone put `main` at 3.6–4.1 % on the emulator (2026-09-25, #607
+  pass; ~200–300 `relay EOSE` lines/min). A number over budget is only a
+  finding when a `main` build on the same emulator/account measures lower.
 - **How:** `android-smoke.sh` QA-050
 
 ### QA-051 — Cold start paints local state first
@@ -426,7 +533,7 @@ overlap, NIP-42 inbox relays.
   (`TransportDeferred`) by every client, White Noise's own members included.
   Upstream marmot-protocol/mdk#1736, fixed by #1746 and released in v0.9.19. Not
   reproduced with the v0.10.4 `wn`. Sonar's own leave is committed by Sonar
-  and White Noise members alike (QA-084).
+  and White Noise members alike (QA-092).
 - **Sonar sends welcomes to its own relays only:** White Noise reads welcomes
   from its kind-10050 inbox relays. Invites reach White Noise users through the
   usual shared relays (damus, primal, nos.lol); a White Noise user whose inbox
@@ -436,7 +543,7 @@ overlap, NIP-42 inbox relays.
   commit is still converging (the ~1.1 s after a membership change) and
   regenerates it later. Sonar reports that send as failed ("send produced no
   application message") and does not publish the regenerated message. Leave
-  is handled (QA-084); sends need the same queued-intent lifecycle.
+  is handled (QA-092); sends need the same queued-intent lifecycle.
 
 ## Open questions (need a product decision, not a fix)
 

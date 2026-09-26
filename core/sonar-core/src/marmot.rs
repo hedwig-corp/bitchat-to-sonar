@@ -137,6 +137,20 @@ pub struct ConvergencePass {
     pub retry_after: Option<Duration>,
 }
 
+/// A timezone share decrypted from a group member, waiting for the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimezoneShareIn {
+    pub group_id: GroupId,
+    /// The authenticated MLS sender, not a claim inside the payload.
+    pub sender: PublicKey,
+    pub content: String,
+    pub created_at: Timestamp,
+}
+
+/// Bound on queued shares between drains. A host drains after every ingest
+/// batch and convergence pass; this only caps a host that stopped draining.
+const MAX_QUEUED_TIMEZONE_SHARES: usize = 1024;
+
 #[derive(Debug, Default)]
 struct ConvergenceStep {
     update: Option<GroupMembershipUpdate>,
@@ -403,6 +417,16 @@ pub enum Incoming {
     Failed,
     /// A join request was received for a group we administer.
     JoinRequest(crate::invite_link::JoinRequest),
+    /// A timezone share decrypted from MLS (see [`crate::timezone`]). Not a
+    /// transcript row — hosts must cache it locally and must not upsert
+    /// unread, notify, or push. Every decrypted share is also queued for
+    /// [`MarmotEngine::take_timezone_shares`], which is what hosts cache from.
+    TimezoneShare {
+        group_id: GroupId,
+        sender: PublicKey,
+        content: String,
+        created_at: Timestamp,
+    },
     /// The event was valid but produced nothing actionable (duplicates,
     /// ignored proposals, non-Marmot gift wraps, ...).
     None,
@@ -853,6 +877,11 @@ pub struct MarmotEngine {
     /// ingest itself does not wait. The value counts passes that left the
     /// group unsettled, so a group that never settles stops re-arming wakes.
     pending_convergence: Mutex<HashMap<GroupId, u8>>,
+    /// Timezone shares decrypted since the host last drained them. Ingest,
+    /// convergence passes and redelivery all decrypt app messages, and only
+    /// ingest returns an `Incoming`; queueing here means a share decrypted
+    /// anywhere reaches the host's cache ([`Self::take_timezone_shares`]).
+    timezone_shares: Mutex<Vec<TimezoneShareIn>>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
     historical_group_names: Mutex<HashMap<GroupId, String>>,
     /// 0.8 `groups.description` / welcome `group_description`. Needed so a
@@ -1066,6 +1095,7 @@ impl MarmotEngine {
             transcript_journal_bytes: std::sync::atomic::AtomicU64::new(loaded.journal_bytes),
             transcript_writable: std::sync::atomic::AtomicBool::new(loaded.writable),
             pending_convergence: Mutex::new(HashMap::new()),
+            timezone_shares: Mutex::new(Vec::new()),
             historical_group_names: Mutex::new(historical_group_names),
             historical_group_descriptions: Mutex::new(
                 crate::mdk08_migrate::load_historical_group_descriptions(db_path),
@@ -2516,6 +2546,40 @@ impl MarmotEngine {
         Ok((event, incoming))
     }
 
+    /// Encrypt a timezone share (a Marmot app event of
+    /// [`crate::timezone::KIND_TIMEZONE_SHARE`]) into a signed kind-445. It
+    /// never becomes a transcript row; the returned `Incoming::TimezoneShare`
+    /// is the local echo the caller checks before queueing the publish.
+    pub async fn create_and_process_timezone_share(
+        &self,
+        group_id: &GroupId,
+        payload: &str,
+    ) -> Result<(Event, Incoming)> {
+        let rumor = crate::timezone::timezone_share_rumor(payload, self.identity.public_key());
+        let app_payload = marmot_app_event_from_rumor(&rumor)?;
+        let mut lease = self.lease_session().await;
+        let _ = lease.get_mut().ensure_group_hydrated(group_id);
+        let effects = lease
+            .get_mut()
+            .send(SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: app_payload,
+                expected_epoch: None,
+            })
+            .await?;
+        drop(lease);
+        let event = event_from_app_publish(&effects)?;
+        Ok((
+            event,
+            Incoming::TimezoneShare {
+                group_id: group_id.clone(),
+                sender: rumor.pubkey,
+                content: rumor.content,
+                created_at: rumor.created_at,
+            },
+        ))
+    }
+
     pub async fn create_sticker_message(
         &self,
         group_id: &GroupId,
@@ -2989,6 +3053,28 @@ impl MarmotEngine {
         self.persist_session_effects(effects)
     }
 
+    fn queue_timezone_share(&self, share: TimezoneShareIn) {
+        let mut queue = self
+            .timezone_shares
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= MAX_QUEUED_TIMEZONE_SHARES {
+            tracing::warn!("timezone share queue full; dropping the oldest");
+            queue.remove(0);
+        }
+        queue.push(share);
+    }
+
+    /// Every timezone share decrypted since the last call, oldest first.
+    pub fn take_timezone_shares(&self) -> Vec<TimezoneShareIn> {
+        std::mem::take(
+            &mut *self
+                .timezone_shares
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     fn persist_session_effects(&self, effects: SessionEffects) -> Result<Incoming> {
         let mut last = Incoming::None;
         for ev in effects.events {
@@ -3005,6 +3091,16 @@ impl MarmotEngine {
                     // of an old kind-445 must not rewrite the transcript or
                     // surface Incoming::Message (hosts upsert + notify from that).
                     if self.is_dropped(&group_id) {
+                        continue;
+                    }
+                    if let Some(share) = timezone_share_from_payload(&group_id, &sender, &payload) {
+                        last = Incoming::TimezoneShare {
+                            group_id: share.group_id.clone(),
+                            sender: share.sender,
+                            content: share.content.clone(),
+                            created_at: share.created_at,
+                        };
+                        self.queue_timezone_share(share);
                         continue;
                     }
                     // Persist kind-9 chat rows only. `chat_from_payload` already
@@ -4187,6 +4283,25 @@ fn key_package_to_event(
         .build(identity.public_key())
         .sign_with_keys(identity.keys())?;
     Ok(event)
+}
+
+/// A timezone share inside a decrypted app message, attributed to the MLS
+/// sender. `None` for every other app event (chat, White Noise's own kinds).
+fn timezone_share_from_payload(
+    group_id: &GroupId,
+    sender: &MemberId,
+    payload: &[u8],
+) -> Option<TimezoneShareIn> {
+    let app = MarmotAppEvent::decode(payload).ok()?;
+    if !crate::timezone::is_timezone_share(app.kind, &app.tags) {
+        return None;
+    }
+    Some(TimezoneShareIn {
+        group_id: group_id.clone(),
+        sender: PublicKey::from_slice(sender.as_slice()).ok()?,
+        content: app.content,
+        created_at: Timestamp::from_secs(app.created_at),
+    })
 }
 
 fn marmot_app_event_from_rumor(rumor: &UnsignedEvent) -> Result<Vec<u8>> {

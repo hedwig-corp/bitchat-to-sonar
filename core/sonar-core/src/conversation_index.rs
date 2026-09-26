@@ -3,9 +3,38 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::marmot::MarmotEngine;
+use crate::timezone::CachedPeerTimezone;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 5;
+
+/// Private per-sender timezone metadata received over encrypted conversations
+/// (timezone shares). Keyed by the sender's Nostr pubkey hex — a person has one
+/// system timezone regardless of how many conversations we share, and the
+/// sender only ever asserts their OWN zone.
+const PEER_TIMEZONE_DDL: &str = "CREATE TABLE IF NOT EXISTS peer_timezone (
+    sender_pubkey_hex TEXT PRIMARY KEY,
+    iana_tz           TEXT NOT NULL,
+    updated_at_secs   INTEGER NOT NULL DEFAULT 0
+);";
+
+/// The zone this device last shared into each MLS group and the epoch it was
+/// encrypted at.
+const TIMEZONE_SHARE_SENT_DDL: &str = "CREATE TABLE IF NOT EXISTS timezone_share_sent (
+    group_id_hex TEXT PRIMARY KEY,
+    iana_tz      TEXT NOT NULL,
+    epoch        INTEGER NOT NULL
+);";
+
+/// Durable hist→live binds. The JSON fold sidecar can vanish while this
+/// SQLCipher file stays put. Restore only recorded pairs — do not infer a bind
+/// from members/name (R-050).
+const HISTORICAL_FOLD_DDL: &str = "CREATE TABLE IF NOT EXISTS historical_fold (
+    historical_hex TEXT PRIMARY KEY,
+    live_hex TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_historical_fold_live
+    ON historical_fold(live_hex);";
 
 pub struct ConversationIndex {
     db: Connection,
@@ -197,18 +226,35 @@ impl ConversationIndex {
         }
 
         if current < 3 {
-            // Durable hist→live binds. The JSON fold sidecar can vanish while
-            // this SQLCipher file stays put. Restore only recorded pairs —
-            // do not infer a bind from members/name (R-050).
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS historical_fold (
-                    historical_hex TEXT PRIMARY KEY,
-                    live_hex TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_historical_fold_live
-                    ON historical_fold(live_hex);",
-            )
-            .map_err(|e| crate::Error::Storage(format!("index create historical_fold: {e}")))?;
+            // `CREATE TABLE IF NOT EXISTS` keeps the step idempotent under a
+            // non-atomic partial migration.
+            tx.execute_batch(PEER_TIMEZONE_DDL)
+                .map_err(|e| crate::Error::Storage(format!("index create peer_timezone: {e}")))?;
+        }
+
+        if current < 4 {
+            // Without it every process start (and every iOS store reopen)
+            // re-encrypted a timezone share into every allowed group. Its own
+            // step, not folded into v3: builds of the timezone branch already
+            // wrote v3 databases.
+            tx.execute_batch(TIMEZONE_SHARE_SENT_DDL).map_err(|e| {
+                crate::Error::Storage(format!("index create timezone_share_sent: {e}"))
+            })?;
+        }
+
+        if current < 5 {
+            // #613 builds numbered `historical_fold` v3 before #607 took v3/v4
+            // for the timezone tables, so a v3 database may hold the fold table
+            // and neither timezone table. Every statement is IF NOT EXISTS:
+            // re-running the timezone DDL heals that lineage and is a no-op on
+            // a v4 database from main.
+            tx.execute_batch(PEER_TIMEZONE_DDL)
+                .map_err(|e| crate::Error::Storage(format!("index create peer_timezone: {e}")))?;
+            tx.execute_batch(TIMEZONE_SHARE_SENT_DDL).map_err(|e| {
+                crate::Error::Storage(format!("index create timezone_share_sent: {e}"))
+            })?;
+            tx.execute_batch(HISTORICAL_FOLD_DDL)
+                .map_err(|e| crate::Error::Storage(format!("index create historical_fold: {e}")))?;
         }
 
         tx.execute(
@@ -500,6 +546,99 @@ impl ConversationIndex {
             )
             .optional()
             .map_err(|e| crate::Error::Storage(format!("index summary: {e}")))
+    }
+
+    /// Persist a peer-authored timezone share if it is newer than the cached
+    /// value. Returns true only when the visible value changed: a newer share
+    /// of the same zone still advances `updated_at_secs` (so an older replay
+    /// stays rejected) but must not invalidate the host's chat UI.
+    pub fn upsert_peer_timezone(
+        &self,
+        sender_pubkey_hex: &str,
+        zone: &str,
+        updated_at_secs: u64,
+    ) -> Result<bool> {
+        let previous = self.peer_timezone(sender_pubkey_hex)?;
+        let written = self
+            .db
+            .execute(
+                "INSERT INTO peer_timezone (sender_pubkey_hex, iana_tz, updated_at_secs)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(sender_pubkey_hex) DO UPDATE SET
+                    iana_tz = excluded.iana_tz,
+                    updated_at_secs = excluded.updated_at_secs
+                 WHERE excluded.updated_at_secs > peer_timezone.updated_at_secs",
+                params![sender_pubkey_hex, zone, updated_at_secs as i64],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index timezone upsert: {e}")))?;
+        Ok(written != 0 && previous.is_none_or(|p| p.zone != zone))
+    }
+
+    /// Every `(group_id_hex, zone, epoch)` this device has shared its own
+    /// timezone into. v1 sends no revoke, so a row is exactly what that
+    /// group's members hold for us until the zone or the epoch moves.
+    pub fn timezone_shares_sent(&self) -> Result<Vec<(String, String, u64)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT group_id_hex, iana_tz, epoch FROM timezone_share_sent")
+            .map_err(|e| crate::Error::Storage(format!("index timezone sent read: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(|e| crate::Error::Storage(format!("index timezone sent read: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index timezone sent row: {e}")))
+    }
+
+    pub fn record_timezone_share_sent(
+        &self,
+        group_id_hex: &str,
+        zone: &str,
+        epoch: u64,
+    ) -> Result<()> {
+        self.db
+            .execute(
+                "INSERT OR REPLACE INTO timezone_share_sent (group_id_hex, iana_tz, epoch)
+                 VALUES (?1, ?2, ?3)",
+                params![group_id_hex, zone, epoch as i64],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index timezone sent write: {e}")))?;
+        Ok(())
+    }
+
+    pub fn forget_timezone_share_sent(&self, group_id_hex: &str) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM timezone_share_sent WHERE group_id_hex = ?1",
+                params![group_id_hex],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index timezone sent delete: {e}")))?;
+        Ok(())
+    }
+
+    /// Local-only lookup used by chat headers/member lists. This never scans
+    /// transcripts or waits on relay/profile state.
+    pub fn peer_timezone(&self, sender_pubkey_hex: &str) -> Result<Option<CachedPeerTimezone>> {
+        self.db
+            .query_row(
+                "SELECT iana_tz, updated_at_secs
+                 FROM peer_timezone
+                 WHERE sender_pubkey_hex = ?1",
+                params![sender_pubkey_hex],
+                |row| {
+                    Ok(CachedPeerTimezone {
+                        zone: row.get(0)?,
+                        updated_at_secs: row.get::<_, i64>(1)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| crate::Error::Storage(format!("index timezone read: {e}")))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -932,6 +1071,133 @@ mod tests {
     }
 
     #[test]
+    fn peer_timezone_cache_rejects_stale_replays_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x33u8; 32];
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        assert!(idx
+            .upsert_peer_timezone("abc123", "America/New_York", 200)
+            .unwrap());
+        assert!(!idx
+            .upsert_peer_timezone("abc123", "Europe/Zurich", 199)
+            .unwrap());
+        assert!(!idx
+            .upsert_peer_timezone("abc123", "Europe/Zurich", 200)
+            .unwrap());
+        // Same zone, newer timestamp: stored, but not a visible change.
+        assert!(!idx
+            .upsert_peer_timezone("abc123", "America/New_York", 250)
+            .unwrap());
+        assert!(!idx
+            .upsert_peer_timezone("abc123", "Europe/Zurich", 240)
+            .unwrap());
+        assert_eq!(
+            idx.peer_timezone("abc123").unwrap(),
+            Some(CachedPeerTimezone {
+                zone: "America/New_York".into(),
+                updated_at_secs: 250,
+            })
+        );
+
+        drop(idx);
+        let reopened = ConversationIndex::open(&path, key).unwrap();
+        assert_eq!(
+            reopened.peer_timezone("abc123").unwrap(),
+            Some(CachedPeerTimezone {
+                zone: "America/New_York".into(),
+                updated_at_secs: 250,
+            })
+        );
+    }
+
+    #[test]
+    fn timezone_shares_sent_survive_reopen_and_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x55u8; 32];
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        idx.record_timezone_share_sent("g1", "Europe/Zurich", 3).unwrap();
+        idx.record_timezone_share_sent("g2", "Europe/Zurich", 7).unwrap();
+        idx.record_timezone_share_sent("g1", "Asia/Tokyo", 4).unwrap();
+        idx.forget_timezone_share_sent("g2").unwrap();
+        drop(idx);
+
+        let reopened = ConversationIndex::open(&path, key).unwrap();
+        assert_eq!(
+            reopened.timezone_shares_sent().unwrap(),
+            vec![("g1".to_owned(), "Asia/Tokyo".to_owned(), 4)]
+        );
+    }
+
+    #[test]
+    fn migrates_v3_schema_adding_timezone_share_sent_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x66u8; 32];
+        {
+            // A database written by an earlier build of this branch: v3,
+            // peer_timezone present, no sent-share table.
+            let idx = ConversationIndex::open(&path, key).unwrap();
+            idx.db
+                .execute_batch(
+                    "DROP TABLE timezone_share_sent;
+                     UPDATE schema_version SET version = 3;",
+                )
+                .unwrap();
+            idx.upsert_peer_timezone("peer", "Asia/Kolkata", 9).unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        idx.record_timezone_share_sent("g", "Asia/Kolkata", 1).unwrap();
+        assert_eq!(idx.timezone_shares_sent().unwrap().len(), 1);
+        assert_eq!(
+            idx.peer_timezone("peer").unwrap().unwrap().zone,
+            "Asia/Kolkata"
+        );
+    }
+
+    #[test]
+    fn migrates_v2_schema_adding_peer_timezone_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x44u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    latest_content TEXT NOT NULL DEFAULT '',
+                    latest_sender TEXT NOT NULL DEFAULT '',
+                    latest_at_secs INTEGER NOT NULL DEFAULT 0,
+                    latest_mine INTEGER NOT NULL DEFAULT 0,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO schema_version(version) VALUES (2);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        assert!(idx
+            .upsert_peer_timezone("peer", "Pacific/Chatham", 42)
+            .unwrap());
+        assert_eq!(
+            idx.peer_timezone("peer").unwrap().unwrap().zone,
+            "Pacific/Chatham"
+        );
+    }
+
+    #[test]
     fn record_fold_roundtrips_and_remove_group_forgets_bind() {
         let idx = ConversationIndex::open_in_memory().unwrap();
         idx.record_fold("hist", "live").unwrap();
@@ -1001,6 +1267,71 @@ mod tests {
         assert_eq!(
             idx.list_folds().unwrap(),
             vec![("hist".into(), "live".into())]
+        );
+    }
+
+    /// A #613 build wrote `historical_fold` as v3, with neither timezone
+    /// table. v5 must create them, or every timezone share fails to cache.
+    #[test]
+    fn migrates_613_v3_schema_adding_timezone_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x77u8; 32];
+        {
+            let idx = ConversationIndex::open(&path, key).unwrap();
+            idx.record_fold("hist", "live").unwrap();
+            idx.db
+                .execute_batch(
+                    "DROP TABLE peer_timezone;
+                     DROP TABLE timezone_share_sent;
+                     DELETE FROM schema_version;
+                     INSERT INTO schema_version(version) VALUES (3);",
+                )
+                .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("#613 v3 must migrate");
+        assert!(idx
+            .upsert_peer_timezone("peer", "Asia/Kolkata", 9)
+            .unwrap());
+        idx.record_timezone_share_sent("g", "Asia/Kolkata", 1)
+            .unwrap();
+        assert_eq!(idx.timezone_shares_sent().unwrap().len(), 1);
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())],
+            "the recorded bind must survive the migration"
+        );
+    }
+
+    /// A main build (#607) wrote v4 with both timezone tables and no
+    /// `historical_fold`. v5 adds it and keeps the cached zones.
+    #[test]
+    fn migrates_607_v4_schema_adding_historical_fold_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x88u8; 32];
+        {
+            let idx = ConversationIndex::open(&path, key).unwrap();
+            idx.upsert_peer_timezone("peer", "Europe/Zurich", 5).unwrap();
+            idx.db
+                .execute_batch(
+                    "DROP TABLE historical_fold;
+                     DELETE FROM schema_version;
+                     INSERT INTO schema_version(version) VALUES (4);",
+                )
+                .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("#607 v4 must migrate");
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
+        assert_eq!(
+            idx.peer_timezone("peer").unwrap().unwrap().zone,
+            "Europe/Zurich"
         );
     }
 }

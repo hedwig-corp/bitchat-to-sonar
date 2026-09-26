@@ -44,6 +44,10 @@ import chat.bitchat.sonar.SonarJoinRequest
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.inviteLinkPreview
 import chat.bitchat.sonar.inviteUniversalLink
+import chat.bitchat.sonar.peerLocalTimeSnapshot
+import chat.bitchat.sonar.rememberMinuteClock
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.local_time
 import chat.bitchat.sonar.shareInviteText
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
@@ -59,6 +63,7 @@ import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
+import org.jetbrains.compose.resources.stringResource
 
 @Composable
 fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
@@ -67,6 +72,11 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     val chat = state.listedChat(chatId)
     val groupName = chat?.let { state.chatTitle(it) } ?: "Group chat"
     val members = state.allGroupMemberContacts(chatId)
+    // The "You" row always renders this phone's local time, so the clock runs
+    // even when no peer has shared a timezone yet. The zone is part of the key
+    // so an OS timezone change repaints every row at once.
+    val systemZone = state.systemTimeZoneId
+    val clockNow = rememberMinuteClock(if (members.isNotEmpty()) chatId to systemZone else null)
 
     var showAddPeople by remember { mutableStateOf(false) }
     var addDraft by remember { mutableStateOf("") }
@@ -246,6 +256,24 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                     modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 0.dp, bottom = 8.dp),
                 )
 
+                SNSectionLabel("Privacy")
+                SNSettingsCard {
+                    SNSettingsRow(
+                        icon = SNIconName.Globe,
+                        label = "Share local time",
+                        sub = "This group can see your current time. Uses this phone's timezone.",
+                        toggle = state.prefsVersion >= 0 && state.sharesLocalTimeWith(chatId),
+                        divider = false,
+                    ) { state.toggleShareLocalTimeForChat(chatId) }
+                }
+                Text(
+                    "Only your timezone ($systemZone) travels — inside the group's encryption, never a location. Overrides your Settings default for this group only.",
+                    color = s.text3,
+                    fontSize = 13.sp,
+                    lineHeight = 19.5.sp,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 0.dp),
+                )
+
                 // ── Members section ──
                 SNSectionLabel("Members (${members.size})")
 
@@ -312,6 +340,14 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                     members.forEachIndexed { index, member ->
                         val isYou = member.npub == state.npub
                         val isCreator = index == 0
+                        val memberTimezone = if (isYou) {
+                            systemZone
+                        } else {
+                            state.peerTimezone(member.npub)?.ianaIdentifier
+                        }
+                        val memberLocalTime = memberTimezone
+                            ?.let { peerLocalTimeSnapshot(it, clockNow) }
+                            ?.timeText
                         Row(
                             Modifier.fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
@@ -336,6 +372,14 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                                         member.subtitle,
                                         color = s.text2, fontSize = 12.5.sp, lineHeight = 16.sp,
                                         maxLines = 1
+                                    )
+                                }
+                                if (memberLocalTime != null) {
+                                    Text(
+                                        stringResource(Res.string.local_time, memberLocalTime),
+                                        color = s.text2, fontSize = 12.5.sp, lineHeight = 16.sp,
+                                        maxLines = 1,
+                                        modifier = Modifier.padding(top = 3.dp),
                                     )
                                 }
                             }

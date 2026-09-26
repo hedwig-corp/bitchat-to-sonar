@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # mdk-upgrade.sh — headless side of the MDK 0.8 → 0.9 upgrade QA
-# (docs/QA-SCENARIOS.md QA-070…QA-077, PR #613).
+# (docs/QA-SCENARIOS.md QA-078…QA-085, PR #613).
 #
 # The upgrade cannot be faked with one binary: the app must build history on
 # an MDK 0.8 (wire 0xf2ee) install, then be replaced IN PLACE by the #613
@@ -18,7 +18,7 @@
 #   mdk-upgrade.sh wire <name>                   0.8 / 0.9 KeyPackage wire the peer
 #                                                 publishes (0xf2ee vs 0xf2f1)
 #   mdk-upgrade.sh store [udid]                  the app's Marmot store files in the
-#                                                 simulator App Group (QA-070: after the
+#                                                 simulator App Group (QA-078: after the
 #                                                 upgrade a *.mdk08.bak must sit next
 #                                                 to the live DB)
 #
@@ -33,7 +33,7 @@
 #
 # Each peer remembers which CLI owns its home in $QA_HOME/peers/<name>/cli, so
 # `send`/`expect` never run the 0.8 binary on a migrated home (it cannot open
-# the 0.9 store) or the 0.9 binary on a home that must stay 0.8 (QA-073).
+# the 0.9 store) or the 0.9 binary on a home that must stay 0.8 (QA-081).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

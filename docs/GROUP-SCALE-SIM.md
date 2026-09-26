@@ -153,7 +153,7 @@ welcomes from N=5 to N=50.
 
 The bump itself was for White Noise interop: v0.9.21+ rejects invitee
 KeyPackages that list default MLS capabilities, which every v0.9.14 package
-did. The `wn` interop matrix (QA-078…085, including the 25-member group) passes
+did. The `wn` interop matrix (QA-086…094, including the 25-member group) passes
 against White Noise's own v0.10.4 runtime.
 
 ## Findings (2026-09-13, MDK v0.9.14 `235c8ade`)
