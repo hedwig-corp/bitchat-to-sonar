@@ -106,8 +106,9 @@ jobs:
 
       - name: Run JVM unit tests (builds desktop Rust core + BLE bridge + UniFFI bindings)
         # The BLE bridge is built for real here (no SONAR_SKIP_BLE) so the Linux
-        # sonar-ble/bluster build stays green; the peripheral role is
-        # CoreBluetooth-only, so this covers the central/scan build path.
+        # sonar-ble/bluster build stays green, BlueZ peripheral role included.
+        # DesktopMeshInteropTest drives the desktop mesh engine against the
+        # real Android engine over a simulated radio; no Bluetooth needed.
         # Also compile/test extracted transcript-engine modules so package-only
         # PRs cannot skip the new policy/host check surfaces.
         run: >

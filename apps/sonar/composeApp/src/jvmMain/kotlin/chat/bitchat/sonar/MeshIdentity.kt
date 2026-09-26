@@ -58,10 +58,14 @@ object MeshIdentity {
      */
     @Volatile private var keypairCache: NoiseKeypairHex? = null
     @Volatile private var seedCache: String? = null
+    @Volatile private var peerIdCache: String? = null
 
     internal fun resetCachesForTest() {
         keypairCache = null
         seedCache = null
+        // With the keypair: a peer id derived from the previous keypair would
+        // sign packets as someone whose Noise key we no longer hold.
+        peerIdCache = null
     }
 
     private val keypair: NoiseKeypairHex
@@ -119,7 +123,8 @@ object MeshIdentity {
     }
 
     /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
-    val peerIdHex: String by lazy { hex(Sha256.hash(unhex(keypair.publicHex)).copyOf(8)) }
+    val peerIdHex: String
+        get() = peerIdCache ?: hex(Sha256.hash(unhex(keypair.publicHex)).copyOf(8)).also { peerIdCache = it }
 
     /** Our Noise static private key (for the responder handshake). */
     fun noisePrivHex(): String = keypair.privateHex
