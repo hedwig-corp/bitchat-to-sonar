@@ -752,6 +752,25 @@ qa093() { # turning sharing off withdraws your time; a peer's revoke clears the 
   fi
 }
 
+qa127() { # the Android Mesh channel keeps its composer (#612 gates it on a capability)
+  go_home >/dev/null
+  if ! ui tapx "Search"; then record QA-127 FAIL "search unreachable"; return; fi
+  sleep 1
+  if ! ui tapx "Bluetooth mesh"; then
+    record QA-127 FAIL "no Bluetooth mesh channel row in search"
+    go_home >/dev/null; return
+  fi
+  sleep 2
+  if has "isn't available"; then
+    record QA-127 FAIL "the Mesh channel shows the unavailable notice on Android"
+  elif hasx "Message Mesh"; then
+    record QA-127 PASS "the Mesh channel offers its composer"
+  else
+    record QA-127 FAIL "no \"Message Mesh\" composer in the Mesh channel"
+  fi
+  go_home >/dev/null
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -767,7 +786,7 @@ sleep 3
 # reuse QA-001's chat, QA-005 opens QA-004's, and QA-040 inspects the chat
 # QA-005 left open. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa127 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"
