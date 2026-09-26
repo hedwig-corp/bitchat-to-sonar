@@ -14,6 +14,20 @@
 #   peers.sh expect <name> <substring> [secs] print the first inbound message JSON
 #                                             containing <substring> and exit 0 the
 #                                             moment it arrives; exit 1 on timeout
+#   peers.sh id-of <name> <substring>         id of the newest message (either side)
+#                                             whose text contains <substring>
+#   peers.sh id-of-media <name>               id of the newest media message the
+#                                             peer sent
+#   peers.sh react <name> <to-npub> <target-id> <emoji>
+#                                             encrypted NIP-25 kind-7 on a message in
+#                                             the 1:1 chat with <to-npub>; waits for
+#                                             the relay ack
+#   peers.sh expect-reaction <name> <emoji> [secs] [target-id] [count]
+#                                             print the first tally update (either a
+#                                             `reactions` line or an inbound message
+#                                             carrying chips) that shows <emoji>
+#                                             (on <target-id>, with at least <count>
+#                                             reactors when given); exit 1 on timeout
 #
 # Env: QA_HOME (default $TMPDIR/sonar-qa-<worktree>), SONAR_CLI (default core/target/release/sonar-cli).
 #
@@ -104,6 +118,71 @@ print(f"expect TIMEOUT: '{needle}' never reached {name} ({secs}s)", file=sys.std
 sys.exit(1)
 EXPECT_PY
     ;;
+  id-of)
+    name="${1:?id-of <name> <substring>}"; needle="${2:?substring}"
+    cli --home "$(home "$name")" messages | python3 -c '
+import json, sys
+needle, best = sys.argv[1], None
+for line in sys.stdin:
+    try: m = json.loads(line)
+    except ValueError: continue
+    if m.get("type") == "message" and needle in m.get("content", ""):
+        if best is None or m["created_at_secs"] >= best["created_at_secs"]: best = m
+if best is None: sys.exit("no message contains " + repr(needle))
+print(best["id"])' "$needle" ;;
+  id-of-media)
+    name="${1:?id-of-media <name>}"
+    cli --home "$(home "$name")" messages | python3 -c '
+import json, sys
+best = None
+for line in sys.stdin:
+    try: m = json.loads(line)
+    except ValueError: continue
+    if m.get("type") == "message" and m.get("mine") and m.get("media"):
+        if best is None or m["created_at_secs"] >= best["created_at_secs"]: best = m
+if best is None: sys.exit("no media message sent by this peer")
+print(best["id"])' ;;
+  react)
+    name="${1:?react <name> <to> <target-id> <emoji>}"; to="${2:?to npub}"
+    target="${3:?target id}"; emoji="${4:?emoji}"
+    cli --home "$(home "$name")" react --to "$to" --target "$target" --emoji "$emoji" \
+      | grep '"type"' ;;
+  expect-reaction)
+    name="${1:?expect-reaction <name> <emoji> [secs] [target-id] [count]}"; emoji="${2:?emoji}"
+    secs="${3:-60}"; target="${4:-}"; count="${5:-1}"
+    python3 - "$CLI" "$(home "$name")" "$emoji" "$secs" "$target" "$count" "$name" <<'EXPECT_PY'
+import json, subprocess, sys, time
+cli, home, emoji, secs, target, count, name = sys.argv[1:8]
+secs, count = int(secs), int(count)
+start = time.monotonic()
+proc = subprocess.Popen(
+    [cli, "--home", home, "listen", "--timeout-secs", str(secs), "--poll-secs", "5"],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+try:
+    for line in proc.stdout:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "reactions":
+            tallies, tid = ev.get("tallies", []), ev.get("target_id", "")
+        elif ev.get("type") == "message":
+            tallies, tid = ev.get("reactions", []), ev.get("id", "")
+        else:
+            continue
+        if target and tid != target:
+            continue
+        if any(t.get("emoji") == emoji and t.get("count", 0) >= count for t in tallies):
+            print(line.strip())
+            print(f"expect-reaction ok: {emoji} reached {name} after "
+                  f"{time.monotonic() - start:.0f}s", file=sys.stderr)
+            sys.exit(0)
+finally:
+    proc.kill()
+print(f"expect-reaction TIMEOUT: {emoji} never reached {name} ({secs}s)", file=sys.stderr)
+sys.exit(1)
+EXPECT_PY
+    ;;
   *)
-    sed -n '2,25p' "$0"; exit 2 ;;
+    sed -n '2,39p' "$0"; exit 2 ;;
 esac
