@@ -415,7 +415,18 @@ struct SNMessage: Identifiable, Equatable {
     var reply: SNReplyRef? = nil
     /// Sender npub when known (Marmot rows). Used to emit NIP-C7 `q` author.
     var senderNpub: String? = nil
+    /// Aggregated kind-7 chips. Empty when nobody has reacted.
+    var reactions: [SNReactionTally] = []
 }
+
+struct SNReactionTally: Equatable {
+    let emoji: String
+    let count: UInt32
+    let mine: Bool
+}
+
+/// Design-handoff quick picker (`BC_REACTIONS`).
+let SNQuickReactions = ["❤️", "👍", "😂", "😮", "😢", "🔥"]
 
 struct SNReplyRef: Equatable {
     let parentId: String
@@ -455,6 +466,19 @@ func snCanReply(to message: SNMessage) -> Bool {
     if message.action || message.call != nil || message.trill { return false }
     if message.state == "Sending" || message.state == "Uploading" { return false }
     return true
+}
+
+func snCanReact(to message: SNMessage) -> Bool {
+    if message.id.hasPrefix(MarmotChatModel.optimisticIDPrefix) { return false }
+    if message.id.hasPrefix(MarmotChatModel.failedOptimisticIDPrefix) { return false }
+    if message.action || message.call != nil || message.trill { return false }
+    if message.state == "Sending" || message.state == "Uploading" { return false }
+    if message.via != .internet { return false }
+    return snCanEmitNipC7(parentId: message.id, parentNpub: message.senderNpub)
+}
+
+func snReactionTallies(from message: MarmotService.MarmotMessage) -> [SNReactionTally] {
+    message.reactions.map { SNReactionTally(emoji: $0.emoji, count: $0.count, mine: $0.mine) }
 }
 
 /// Full source text for Signal-style Copy. Nil when the row is not text
@@ -1522,6 +1546,19 @@ final class SonarAppStore: ObservableObject {
     func jumpToQuotedMessage(chatId: String, parentId: String) {
         jumpMessageIdAtOpenByDM[chatId] = parentId
         objectWillChange.send()
+    }
+
+    func sendReaction(chatId: String, to message: SNMessage, emoji: String) {
+        guard snCanReact(to: message) else { return }
+        if message.reactions.contains(where: { $0.emoji == emoji && $0.mine }) { return }
+        let source = message.transcriptSourceID.flatMap {
+            $0 == SNConversationTranscriptSource.meshID ? nil : $0
+        }
+        let groupId = source
+            ?? marmotGroupId(chatId)
+            ?? resolvedSonarProfile(chatId).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        guard let groupId, let npub = message.senderNpub else { return }
+        marmot.sendReaction(emoji, to: message.id, targetNpub: npub, groupId: groupId)
     }
 
     private func consumeComposerReply(for chatId: String) -> SNReplyRef? {
@@ -6309,7 +6346,8 @@ final class SonarAppStore: ObservableObject {
                             via: .internet,
                             trill: true,
                             reply: reply,
-                            senderNpub: m.senderNpub
+                            senderNpub: m.senderNpub,
+                            reactions: snReactionTallies(from: m)
                         ))
                     case .bubble(let pay, let payVia):
                         return (m.createdAt, SNMessage(
@@ -6319,7 +6357,8 @@ final class SonarAppStore: ObservableObject {
                             via: payVia,
                             pay: pay,
                             reply: reply,
-                            senderNpub: m.senderNpub
+                            senderNpub: m.senderNpub,
+                            reactions: snReactionTallies(from: m)
                         ))
                     case .notPay:
                         return (m.createdAt, SNMessage(
@@ -6338,7 +6377,8 @@ final class SonarAppStore: ObservableObject {
                             // crosses the FFI while rendering a frame.
                             mentions: mentionInfo(content: m.content, context: mentionCtx),
                             reply: reply,
-                            senderNpub: m.senderNpub
+                            senderNpub: m.senderNpub,
+                            reactions: snReactionTallies(from: m)
                         ))
                     }
                 }
@@ -6520,7 +6560,9 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         transcriptSourceID: group.id,
                         via: .internet,
-                        trill: true
+                        trill: true,
+                        senderNpub: m.senderNpub,
+                        reactions: snReactionTallies(from: m)
                     ))
                 case .bubble(let pay, let payVia):
                     return (m.createdAt, SNMessage(
@@ -6528,7 +6570,9 @@ final class SonarAppStore: ObservableObject {
                         time: Self.clock(m.createdAt),
                         transcriptSourceID: group.id,
                         via: payVia,
-                        pay: pay
+                        pay: pay,
+                        senderNpub: m.senderNpub,
+                        reactions: snReactionTallies(from: m)
                     ))
                 case .notPay:
                     return (m.createdAt, SNMessage(
@@ -6542,7 +6586,9 @@ final class SonarAppStore: ObservableObject {
                         state: MarmotChatModel.stateText(for: m),
                         uploadProgress: marmot.mediaUploadProgress[m.id],
                         media: Self.mediaItems(m, groupId: group.id),
-                        stickerRef: m.stickerRef
+                        stickerRef: m.stickerRef,
+                        senderNpub: m.senderNpub,
+                        reactions: snReactionTallies(from: m)
                     ))
                 }
             }

@@ -81,8 +81,10 @@ It drives the app with `scripts/qa/android-ui.sh` against fresh peers and
 checks the automated registry scenarios (first message + keyboard, reply
 latency, pending draft, inbound-first, unread divider, labels, partial npub,
 profile QR decodes to the npub, idle CPU). A failure is a finding — reproduce it by hand before fixing.
-iOS has no headless driver yet: run the same scenarios through the iOS
-Simulator MCP (`mcp__Claude_Code_iOS_Simulator__control`), see reference.md.
+iOS has no scripted smoke yet: run the same scenarios with
+`scripts/qa/ios-drive.sh` (headless XCUITest step scripts, no panel needed)
+or through the iOS Simulator MCP (`mcp__Claude_Code_iOS_Simulator__control`),
+see reference.md.
 
 ## 3. Scenario pass
 

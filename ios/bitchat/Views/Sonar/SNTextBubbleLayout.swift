@@ -134,6 +134,9 @@ struct SNTextBubbleModel {
     let state: StateFooter?
     let canSwipeReply: Bool
     let canReply: Bool
+    /// Long-press offers the quick-reaction row. Rows on this cell carry no
+    /// chips yet (`handles` excludes them), so there is no "mine" state here.
+    let canReact: Bool
     let copyText: String?
     let bubbleFill: UIColor
     let bubbleInk: UIColor
@@ -153,7 +156,7 @@ extension SNTextBubbleModel {
     /// lines) keeps the SwiftUI hosting path.
     static func handles(_ m: SNMessage) -> Bool {
         m.call == nil && !m.trill && m.pay == nil && m.media.isEmpty
-            && m.stickerRef == nil && !m.action
+            && m.stickerRef == nil && !m.action && m.reactions.isEmpty
     }
 
     static func make(
@@ -164,6 +167,7 @@ extension SNTextBubbleModel {
         quotedPeerName: String?,
         isExpanded: Bool,
         authorTappable: Bool,
+        reactionsEnabled: Bool = false,
         measurementKey: String
     ) -> SNTextBubbleModel {
         let ink: UIColor = m.mine
@@ -272,6 +276,7 @@ extension SNTextBubbleModel {
             state: state,
             canSwipeReply: snCanReply(to: m),
             canReply: snCanReply(to: m),
+            canReact: reactionsEnabled && snCanReact(to: m),
             copyText: snCopyableText(of: m),
             bubbleFill: fill,
             bubbleInk: ink,

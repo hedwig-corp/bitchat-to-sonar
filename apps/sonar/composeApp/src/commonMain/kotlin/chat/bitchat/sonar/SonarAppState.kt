@@ -2829,6 +2829,38 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatJumpMessageId = openChatJumpMessageId + (chatId to parentId)
     }
 
+    fun sendReaction(chatId: String, message: SonarMsg, emoji: String) {
+        if (!sonarCanReact(message)) return
+        if (message.reactions.any { it.emoji == emoji && it.mine }) return
+        if (pendingMarmotNpub(chatId) != null || isPendingMarmotGroup(chatId)) return
+        val groupId = marmotGroupIdForReaction(chatId, message) ?: return
+        val trimmed = emoji.trim()
+        if (trimmed.isEmpty()) return
+        scope.launch {
+            runCatching {
+                runMarmotAccountOperation {
+                    SonarCore.sendReaction(groupId, message.id, message.senderNpub, trimmed)
+                }
+            }.onFailure { e ->
+                toast = e.message ?: "Couldn't react"
+            }
+            // No newest-page reload: unlike a send, a reaction adds no row at
+            // the live edge, and reacting to an old message must not scroll it
+            // away. Core's conversation-changed refresh repaints the chip in
+            // place (retained rows get a tally overlay).
+        }
+    }
+
+    /** MLS group that actually holds [message]. Mesh-folded chats are keyed by
+     *  `mesh:<peer>` — passing that to core would fail `parse_group_id`. */
+    private fun marmotGroupIdForReaction(chatId: String, message: SonarMsg): String? {
+        if (isMeshChat(chatId) && !message.viaInternet) return null
+        transcriptWindows.entries.firstOrNull { (_, window) ->
+            window.rows.any { it.id.equals(message.id, ignoreCase = true) }
+        }?.let { return it.key }
+        return resolveMarmotGroupId(chatId)
+    }
+
     private fun consumeComposerReply(chatId: String): SonarReplyRef? =
         composerReplyByChat.remove(chatId)
 
@@ -10662,7 +10694,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
 
-        val current = transcriptWindows[groupId]
+        var current = transcriptWindows[groupId]
         if (untrusted) {
             // Keep whatever is already painted; only fall through to the
             // snapshot when there is nothing to keep.
@@ -10685,11 +10717,27 @@ class SonarAppState(private val scope: CoroutineScope) {
         // drop it: send-echo reconciliation must still see an outgoing row that
         // the render window refuses to admit.
         freshCanonicalByGroup[groupId] = newest
+        // Retained rows the newest page does not cover carry stale tallies:
+        // overlay them from core's reaction index. Fetch BEFORE taking the
+        // window this refresh writes back — an older-page load can land during
+        // the suspension, and merging into a window read before it would drop
+        // its rows and write back its stale `loadingOlder`.
+        val newestIds = newest.mapTo(HashSet()) { it.id }
+        val staleIds = current?.rows.orEmpty().map { it.id }.filterNot { it in newestIds }
+        val overlay = if (staleIds.isEmpty()) {
+            emptyMap()
+        } else {
+            runCatching { SonarCore.reactionTallies(groupId, staleIds) }.getOrDefault(emptyMap())
+        }
+        current = transcriptWindows[groupId]
         val unboundedCount = (current?.rows.orEmpty() + newest).distinctBy { it.id }.size
-        val merged = refreshTranscriptRows(
-            existing = current?.rows.orEmpty(),
-            newest = newest,
-            pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
+        val merged = overlayReactionTallies(
+            refreshTranscriptRows(
+                existing = current?.rows.orEmpty(),
+                newest = newest,
+                pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
+            ),
+            overlay,
         )
         val hasMore = when {
             unboundedCount > TRANSCRIPT_RETAINED_ROWS -> true

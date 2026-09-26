@@ -717,7 +717,12 @@ struct SNComposerReplyBanner: View {
 struct SNReplyChrome<Content: View>: View {
     let m: SNMessage
     var onReply: ((SNMessage) -> Void)? = nil
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
+    /// Chips tuck 7 pt under the bubble's bottom edge (`.bc-reacts`). False
+    /// when the row ends in text below the bubble — see
+    /// `snChipsTuckUnderBubble`.
+    var chipsTuckUnderBubble: Bool = true
     @ViewBuilder var content: () -> Content
 
     @Environment(\.layoutDirection) private var layoutDirection
@@ -728,6 +733,9 @@ struct SNReplyChrome<Content: View>: View {
     private var canSwipe: Bool { snCanReply(to: m) && onReply != nil }
     private var progress: CGFloat { SNSwipeReplyMetrics.iconAlpha(dragX) }
     private var isLTR: Bool { layoutDirection == .leftToRight }
+    private var showsChips: Bool {
+        !m.reactions.isEmpty && !m.action && m.call == nil && !m.trill
+    }
 
     var body: some View {
         ZStack(alignment: isLTR ? .leading : .trailing) {
@@ -743,8 +751,19 @@ struct SNReplyChrome<Content: View>: View {
                     .offset(x: (isLTR ? 1 : -1) * (8 + abs(SNSwipeReplyMetrics.iconOffset(dragX))))
                     .allowsHitTesting(false)
             }
-            content()
-                .offset(x: canSwipe ? SNSwipeReplyMetrics.bubbleOffset(dragX) : 0)
+            VStack(alignment: m.mine ? .trailing : .leading, spacing: 0) {
+                content()
+                if showsChips {
+                    SNReactionRow(
+                        reactions: m.reactions,
+                        viaInternet: m.via == .internet,
+                        alignment: m.mine ? .trailing : .leading,
+                        topOverlap: chipsTuckUnderBubble ? 7 : -2,
+                        onTap: { emoji in onReact?(m, emoji) }
+                    )
+                }
+            }
+            .offset(x: canSwipe ? SNSwipeReplyMetrics.bubbleOffset(dragX) : 0)
         }
         .background(
             GeometryReader { geo in
@@ -758,7 +777,7 @@ struct SNReplyChrome<Content: View>: View {
             armed = false
         }
         .contentShape(Rectangle())
-        .modifier(SNMessageActionMenu(m: m, onReply: onReply))
+        .modifier(SNMessageActionMenu(m: m, onReply: onReply, onReact: onReact))
     }
 
     private var swipeGesture: some Gesture {
@@ -818,14 +837,26 @@ private struct SNSwipeReplyRowWidthKey: PreferenceKey {
 private struct SNMessageActionMenu: ViewModifier {
     let m: SNMessage
     var onReply: ((SNMessage) -> Void)?
+    var onReact: ((SNMessage, String) -> Void)?
 
     func body(content: Content) -> some View {
         let canReply = snCanReply(to: m) && onReply != nil
+        let canReact = snCanReact(to: m) && onReact != nil
         let copy = snCopyableText(of: m)
         let replyLabel = String(localized: "chat.reply", defaultValue: "Reply")
         let copyLabel = String(localized: "chat.copy", defaultValue: "Copy")
-        if canReply || copy != nil {
+        if canReply || copy != nil || canReact {
             content.contextMenu {
+                if canReact, let onReact {
+                    // Two rows of three: a SwiftUI control group lays out at
+                    // most three (more spill into list rows), and the palette
+                    // style keeps the menu open after a pick. The UIKit text
+                    // cell's menu (`snQuickReactionMenu`) is one palette row,
+                    // which does close.
+                    let mine = Set(m.reactions.filter(\.mine).map(\.emoji))
+                    SNQuickReactionGroup(emojis: Array(SNQuickReactions.prefix(3)), mine: mine) { emoji in onReact(m, emoji) }
+                    SNQuickReactionGroup(emojis: Array(SNQuickReactions.dropFirst(3)), mine: mine) { emoji in onReact(m, emoji) }
+                }
                 if canReply, let onReply {
                     Button { onReply(m) } label: {
                         Label(replyLabel, systemImage: "arrowshape.turn.up.left")
@@ -850,6 +881,151 @@ private struct SNMessageActionMenu: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+private struct SNQuickReactionGroup: View {
+    let emojis: [String]
+    /// Emojis this user already set on the message: shown selected, like the
+    /// Compose picker. Tapping one stays a no-op until retract exists.
+    let mine: Set<String>
+    let react: (String) -> Void
+
+    var body: some View {
+        ControlGroup {
+            ForEach(emojis, id: \.self) { emoji in
+                Toggle(isOn: Binding(
+                    get: { mine.contains(emoji) },
+                    set: { _ in react(emoji) }
+                )) {
+                    // Image-backed: a menu element's title alone renders at
+                    // caption size. The title is the VoiceOver label.
+                    Label {
+                        Text(verbatim: emoji)
+                    } icon: {
+                        #if os(iOS)
+                        Image(uiImage: snEmojiImage(emoji))
+                        #else
+                        Text(verbatim: emoji)
+                        #endif
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Chips tuck 7 pt under a bubble whose edge is the last thing drawn. Media
+/// and sticker rows print their time below the image, and a delivery footer
+/// ("Sent · internet") ends an outgoing row: tucking there covers that text.
+func snChipsTuckUnderBubble(_ m: SNMessage, showsState: Bool) -> Bool {
+    m.media.isEmpty && m.stickerRef == nil && !(m.mine && showsState)
+}
+
+struct SNWrappingHStack: Layout {
+    var spacing: CGFloat = 4
+    var lineSpacing: CGFloat = 4
+    var alignment: HorizontalAlignment = .leading
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
+        arrange(maxWidth: proposal.width, subviews: subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) {
+        let result = arrange(maxWidth: bounds.width, subviews: subviews)
+        for (subview, origin) in zip(subviews, result.origins) {
+            subview.place(
+                at: CGPoint(x: bounds.minX + origin.x, y: bounds.minY + origin.y),
+                proposal: .unspecified
+            )
+        }
+    }
+
+    private func arrange(maxWidth: CGFloat?, subviews: Subviews) -> (size: CGSize, origins: [CGPoint]) {
+        let cap = maxWidth ?? .infinity
+        var lineXs: [[CGFloat]] = [[]]
+        var lineWidths: [CGFloat] = [0]
+        var lineHeights: [CGFloat] = [0]
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            let line = lineXs.count - 1
+            let x = lineWidths[line]
+            if cap.isFinite, x > 0, x + size.width > cap {
+                lineXs.append([])
+                lineWidths.append(0)
+                lineHeights.append(0)
+            }
+            let current = lineXs.count - 1
+            let placedX = lineWidths[current]
+            lineXs[current].append(placedX)
+            lineWidths[current] = placedX + size.width + spacing
+            lineHeights[current] = max(lineHeights[current], size.height)
+        }
+        var origins = Array(repeating: CGPoint.zero, count: subviews.count)
+        var y: CGFloat = 0
+        var usedWidth: CGFloat = 0
+        var index = 0
+        for (line, xs) in lineXs.enumerated() {
+            let lineWidth = max(0, lineWidths[line] - spacing)
+            usedWidth = max(usedWidth, lineWidth)
+            let shift: CGFloat = {
+                guard alignment == .trailing, cap.isFinite else { return 0 }
+                return max(0, cap - lineWidth)
+            }()
+            for x in xs {
+                origins[index] = CGPoint(x: x + shift, y: y)
+                index += 1
+            }
+            y += lineHeights[line] + lineSpacing
+        }
+        let height = y == 0 ? 0 : y - lineSpacing
+        let width = cap.isFinite ? min(cap, usedWidth) : usedWidth
+        return (CGSize(width: width, height: height), origins)
+    }
+}
+
+struct SNReactionRow: View {
+    let reactions: [SNReactionTally]
+    var viaInternet: Bool = false
+    var alignment: HorizontalAlignment = .leading
+    /// Points the row rises into the view above it (negative: a gap).
+    var topOverlap: CGFloat = 7
+    var onTap: ((String) -> Void)? = nil
+
+    var body: some View {
+        SNWrappingHStack(spacing: 4, lineSpacing: 4, alignment: alignment) {
+            ForEach(reactions, id: \.emoji) { tally in
+                Button {
+                    onTap?(tally.emoji)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(verbatim: tally.emoji)
+                            .font(.system(size: 13))
+                        if tally.count > 1 {
+                            Text(verbatim: "\(tally.count)")
+                                .font(SonarTheme.uiFont(size: 11, weight: .bold))
+                                .foregroundColor(SonarTheme.text2)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(SonarTheme.surface)
+                    .clipShape(Capsule())
+                    .overlay(
+                        Capsule().strokeBorder(
+                            tally.mine
+                                ? (viaInternet ? SonarTheme.net : SonarTheme.accent)
+                                : SonarTheme.hairline,
+                            lineWidth: tally.mine ? 1.5 : 1
+                        )
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.top, -topOverlap)
+        .zIndex(2)
     }
 }
 
@@ -1740,6 +1916,8 @@ struct SNMsgList: View {
     var uploadProgressSource: SNMediaUploadProgressSource? = nil
     /// Long-press Reply; quote-chip tap Jump.
     var onReply: ((SNMessage) -> Void)? = nil
+    /// Long-press / chip tap kind-7 reaction.
+    var onReact: ((SNMessage, String) -> Void)? = nil
     var onJumpQuote: ((String) -> Void)? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
     var loadOlder: (() async -> Bool)? = nil
@@ -1960,7 +2138,16 @@ struct SNMsgList: View {
                             if m.id == unreadAnchorId {
                                 SNUnreadDivider().id("sn-unread")
                             }
-                            SNReplyChrome(m: m, onReply: onReply, onJumpQuote: onJumpQuote) {
+                            SNReplyChrome(
+                                m: m,
+                                onReply: onReply,
+                                onReact: onReact,
+                                onJumpQuote: onJumpQuote,
+                                chipsTuckUnderBubble: snChipsTuckUnderBubble(
+                                    m,
+                                    showsState: m.mine && (i == msgs.count - 1 || m.state == "Couldn't send")
+                                )
+                            ) {
                             if let call = m.call {
                                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
                             } else if m.trill {
@@ -3039,6 +3226,7 @@ struct SNMediaBubble: View {
                     }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
+                    .accessibilityLabel(Text(String(localized: "chat.reply.photo", defaultValue: "Photo")))
             } else if let thumb {
                 // Stable transcript geometry: render into the reserved box
                 // (stored dims / fixed skeleton), never the decoded size —
@@ -3056,6 +3244,9 @@ struct SNMediaBubble: View {
                     )
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
+                    // Spoken as "Photo" (it was an unlabelled image), and a
+                    // handle for scripted QA of media reactions (QA-076).
+                    .accessibilityLabel(Text(String(localized: "chat.reply.photo", defaultValue: "Photo")))
             } else if failed, pipeline.state(item).phase == .available {
                 fileChip(for: item)
             } else {

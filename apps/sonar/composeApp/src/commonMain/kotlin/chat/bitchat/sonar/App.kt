@@ -38,6 +38,8 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -68,6 +70,8 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -94,6 +98,7 @@ import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.unit.Constraints
@@ -1855,6 +1860,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                         state = state,
                                         isGroup = isGroup,
                                         peerName = peerName,
+                                        // Same rule as the rows' `showState`: a delivery
+                                        // footer ends the row, so chips must not tuck into it.
+                                        chipsTuckUnderBubble = !(m.mine &&
+                                            (feedIndex == feed.lastIndex || sonarCanRetryMessage(m))),
                                     ) { resolvedReply ->
                                     val msgMesh = isMeshRoute && !m.viaInternet
                                     // Contiguity from adjacent feed message rows only.
@@ -2863,6 +2872,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                         isGroup = false,
                         peerName = screen.name,
                         enableReply = false,
+                        enableReact = false,
                     ) { resolvedReply ->
                         MessageBubble(m, reply = resolvedReply)
                     }
@@ -2961,13 +2971,17 @@ internal fun sonarMessageMenuTopPx(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ReplyDecorated(
+internal fun ReplyDecorated(
     m: SonarMsg,
     chatId: String,
     state: SonarAppState,
     isGroup: Boolean,
     peerName: String,
     enableReply: Boolean = true,
+    enableReact: Boolean = true,
+    /** False when the row ends in a delivery-state footer ("Sent · internet"):
+     *  the chips' 7 dp tuck would land on that text, not the bubble edge. */
+    chipsTuckUnderBubble: Boolean = true,
     content: @Composable (SonarReplyRef?) -> Unit,
 ) {
     val interaction = remember { MutableInteractionSource() }
@@ -2979,9 +2993,17 @@ private fun ReplyDecorated(
     }.ifBlank { stringResource(Res.string.chat_reply_fallback) }.take(140)
     val youLabel = stringResource(Res.string.chat_reply_you)
     val canReply = enableReply && sonarCanReply(m)
+    val canReact = enableReact && sonarCanReact(m)
     val copyText = sonarCopyableText(m)
-    val showActions = canReply || copyText != null
+    val showActions = canReply || copyText != null || canReact
     var menuOpen by remember(m.id) { mutableStateOf(false) }
+    val openActionMenu: (() -> Unit)? = remember(m.id, showActions) {
+        if (showActions) {
+            { menuOpen = true }
+        } else {
+            null
+        }
+    }
     var anchorTopPx by remember(m.id) { mutableStateOf(0f) }
     val isPressed by interaction.collectIsPressedAsState()
     var pressDelayElapsed by remember(m.id) { mutableStateOf(false) }
@@ -3171,17 +3193,45 @@ private fun ReplyDecorated(
                     }
                     .offset { IntOffset(offsetPx.value.roundToInt(), 0) },
             ) {
-                content(resolvedReply)
+                // Chips sit under the bubble (design `.bc-reacts`), inside the
+                // bubble's layer so they follow the swipe and hide with it
+                // while the action sheet shows its own copy.
+                Column(horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start) {
+                    CompositionLocalProvider(LocalMessageLongPress provides openActionMenu) {
+                        content(resolvedReply)
+                    }
+                    if (m.reactions.isNotEmpty() && m.classification !is SonarMsgClass.CallControl &&
+                        !TrillLine.isTrillLine(m.content)
+                    ) {
+                        ReactionRow(
+                            reactions = m.reactions,
+                            viaInternet = m.viaInternet,
+                            mine = m.mine,
+                            onTap = { emoji -> state.sendReaction(chatId, m, emoji) },
+                            modifier = if (chipsTuckUnderBubble) {
+                                Modifier.overlapAbove(REACTION_ROW_OVERLAP)
+                            } else {
+                                Modifier.padding(top = 2.dp)
+                            },
+                        )
+                    }
+                }
             }
             SonarMessageActionSheet(
                 expanded = menuOpen,
                 mine = m.mine,
                 canReply = canReply,
+                canReact = canReact,
+                mineEmojis = m.reactions.filter { it.mine }.map { it.emoji }.toSet(),
                 copyLabel = copyText != null,
                 onDismiss = { menuOpen = false },
                 onReply = {
                     menuOpen = false
                     armReply.value()
+                },
+                onReact = { emoji ->
+                    menuOpen = false
+                    state.sendReaction(chatId, m, emoji)
                 },
                 onCopy = copyText?.let { text ->
                     {
@@ -3201,9 +3251,12 @@ private fun SonarMessageActionSheet(
     expanded: Boolean,
     mine: Boolean,
     canReply: Boolean,
+    canReact: Boolean,
+    mineEmojis: Set<String>,
     copyLabel: Boolean,
     onDismiss: () -> Unit,
     onReply: () -> Unit,
+    onReact: (String) -> Unit,
     onCopy: (() -> Unit)?,
     preview: @Composable () -> Unit,
     anchorTopPx: Float,
@@ -3257,6 +3310,13 @@ private fun SonarMessageActionSheet(
                 ) {
                     preview()
                 }
+                if (canReact) {
+                    Spacer(Modifier.height(8.dp))
+                    ReactionPickerRow(
+                        mineEmojis = mineEmojis,
+                        onReact = onReact,
+                    )
+                }
                 Spacer(Modifier.height(12.dp))
                 Column(
                     Modifier
@@ -3306,6 +3366,103 @@ private fun SonarMessageActionRow(
         SNIcon(icon, 17.dp, s.accent, weight = 2.1f)
         Spacer(Modifier.width(12.dp))
         Text(label, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
+private fun ReactionPickerRow(
+    mineEmojis: Set<String>,
+    onReact: (String) -> Unit,
+) {
+    val s = sonar
+    Row(
+        Modifier
+            .shadow(16.dp, RoundedCornerShape(50.dp))
+            .clip(RoundedCornerShape(50.dp))
+            .background(s.surface)
+            .padding(5.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        SONAR_QUICK_REACTIONS.forEach { emoji ->
+            val on = emoji in mineEmojis
+            Box(
+                Modifier
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(if (on) s.accentSoft else Color.Transparent)
+                    .clickable(role = Role.Button, onClick = { onReact(emoji) }),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(emoji, fontSize = 21.sp)
+            }
+        }
+    }
+}
+
+/** Long-press handler for message content that owns its own tap (a photo
+ *  opens the viewer, a sticker its pack). Their `clickable` consumed the
+ *  press, so the row's long-press menu — Reply, Copy and the reaction row —
+ *  never opened on media. Provided by [ReplyDecorated]; null elsewhere. */
+internal val LocalMessageLongPress = compositionLocalOf<(() -> Unit)?> { null }
+
+/** `.bc-reacts { margin-top: -7px }`: the chips tuck under the bubble edge. */
+private val REACTION_ROW_OVERLAP = 7.dp
+
+/** Pull the node up by [overlap] and give that height back to the parent, so
+ *  it overlaps the sibling above without leaving a gap below (a negative
+ *  top margin; `offset` would keep the full height). */
+private fun Modifier.overlapAbove(overlap: Dp): Modifier = layout { measurable, constraints ->
+    val placeable = measurable.measure(constraints)
+    val px = overlap.roundToPx().coerceIn(0, placeable.height)
+    layout(placeable.width, placeable.height - px) { placeable.place(0, -px) }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ReactionRow(
+    reactions: List<SonarReactionTally>,
+    viaInternet: Boolean,
+    mine: Boolean,
+    onTap: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val s = sonar
+    FlowRow(
+        modifier.padding(horizontal = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(
+            4.dp,
+            if (mine) Alignment.End else Alignment.Start,
+        ),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        reactions.forEach { tally ->
+            val mineStroke = if (viaInternet) s.net else s.accent
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(s.surface)
+                    .border(
+                        width = if (tally.mine) 1.5.dp else 1.dp,
+                        color = if (tally.mine) mineStroke else s.hairline,
+                        shape = RoundedCornerShape(50),
+                    )
+                    .clickable(role = Role.Button, onClick = { onTap(tally.emoji) })
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(tally.emoji, fontSize = 13.sp)
+                if (tally.count > 1) {
+                    Text(
+                        tally.count.toString(),
+                        color = s.text2,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -3828,6 +3985,7 @@ private fun MessageStatusFooter(m: SonarMsg, mesh: Boolean, onRetry: (() -> Unit
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun StickerBubble(
     m: SonarMsg,
@@ -3879,8 +4037,9 @@ private fun StickerBubble(
         }
         val displayFailed = failed || (imageBytes != null && image == null)
         if (image != null) {
+            val longPress = LocalMessageLongPress.current
             val tapModifier = if (onTap != null) {
-                Modifier.clickable { onTap(ref.packCoordinate) }
+                Modifier.combinedClickable(onLongClick = longPress) { onTap(ref.packCoordinate) }
             } else Modifier
             androidx.compose.foundation.Image(
                 bitmap = image,
@@ -4044,6 +4203,7 @@ private fun StickerPackPreviewSheet(state: SonarAppState, coordinate: String, on
  * image (downloaded + decrypted on appear, cached by the store) or a file chip,
  * plus an optional caption.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MediaBubble(
     m: SonarMsg,
@@ -4060,6 +4220,7 @@ private fun MediaBubble(
 ) {
     val s = sonar
     val media = m.media.first()
+    val photoLabel = stringResource(Res.string.chat_reply_photo)
     val tail = 5.dp
     val bubbleShape = RoundedCornerShape(
         topStart = 18.dp, topEnd = 18.dp,
@@ -4136,14 +4297,20 @@ private fun MediaBubble(
             Box(
                 Modifier.size(reservedSize)
                     .clip(bubbleShape).background(s.surface2)
-                    .clickable {
-                        when (transfer.phase) {
-                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
-                                state.requestMediaDownload(chatId, media)
-                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                            MediaTransferPhase.Available -> if (decoded != null) onOpen(media)
-                        }
-                    },
+                    // Spoken as "Photo" (it was an unlabelled node), and a
+                    // handle for scripted QA of media reactions (QA-076).
+                    .semantics { contentDescription = photoLabel }
+                    .combinedClickable(
+                        onLongClick = LocalMessageLongPress.current,
+                        onClick = {
+                            when (transfer.phase) {
+                                MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                                    state.requestMediaDownload(chatId, media)
+                                MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                                MediaTransferPhase.Available -> if (decoded != null) onOpen(media)
+                            }
+                        },
+                    ),
                 contentAlignment = Alignment.Center
             ) {
                 val placeholderModifier = Modifier.fillMaxSize()
@@ -4295,6 +4462,7 @@ private fun MediaDeck(
  *  unavailable / file chip like the single media bubble. [dim] darkens peek
  *  cards (which are not tappable — [onOpen] null). Tap opens the gallery (or
  *  retries a failed load). */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MediaDeckCard(
     media: SonarMedia,
@@ -4313,19 +4481,23 @@ private fun MediaDeckCard(
     val decoded = (load as? TranscriptMediaLoad.Ready)?.decoded
     val failed = transfer.phase == MediaTransferPhase.Failed ||
         load is TranscriptMediaLoad.Missing
+    val longPress = LocalMessageLongPress.current
     Box(
         modifier.clip(RoundedCornerShape(18.dp)).background(s.surface2)
             .border(1.dp, Color.Black.copy(alpha = 0.08f), RoundedCornerShape(18.dp))
             .let { m ->
                 if (onOpen != null) {
-                    m.clickable {
-                        when (transfer.phase) {
-                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
-                                state.requestMediaDownload(chatId, media)
-                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                            MediaTransferPhase.Available -> if (decoded != null) onOpen()
-                        }
-                    }
+                    m.combinedClickable(
+                        onLongClick = longPress,
+                        onClick = {
+                            when (transfer.phase) {
+                                MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                                    state.requestMediaDownload(chatId, media)
+                                MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                                MediaTransferPhase.Available -> if (decoded != null) onOpen()
+                            }
+                        },
+                    )
                 } else m
             },
         contentAlignment = Alignment.Center
@@ -4572,6 +4744,7 @@ private fun showsMediaDownloadSkeleton(
 ): Boolean = transfer.phase == MediaTransferPhase.Downloading ||
     (transfer.phase == MediaTransferPhase.NotDownloaded && state.mediaTransferKnown(media))
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun InlineMediaFileChip(
     media: SonarMedia,
@@ -4581,7 +4754,7 @@ private fun InlineMediaFileChip(
     val s = sonar
     Row(
         Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2)
-            .clickable { onAction() }
+            .combinedClickable(onLongClick = LocalMessageLongPress.current) { onAction() }
             .padding(horizontal = 12.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {

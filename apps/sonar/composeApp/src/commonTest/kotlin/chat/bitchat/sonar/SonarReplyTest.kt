@@ -75,6 +75,25 @@ class SonarReplyTest {
     }
 
     @Test
+    fun reactDisabledOnEchoSendingAndMissingNpub() {
+        val live = SonarMsg(
+            "ab".repeat(32),
+            "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "hi",
+            mine = false,
+            tsSecs = 1,
+            viaInternet = true,
+        )
+        assertTrue(sonarCanReact(live))
+        assertFalse(sonarCanReact(live.copy(id = "echo-1")))
+        assertFalse(sonarCanReact(live.copy(id = "optimistic-1")))
+        assertFalse(sonarCanReact(live.copy(state = "Sending")))
+        assertFalse(sonarCanReact(live.copy(senderNpub = "hex-not-npub")))
+        assertFalse(sonarCanReact(live.copy(classification = SonarMsgClass.CallControl)))
+        assertFalse(sonarCanReact(live.copy(viaInternet = false)))
+    }
+
+    @Test
     fun copyUsesFullSourceAndSkipsNonTextRows() {
         val live = SonarMsg("ab".repeat(32), "npub1peer", "  hello  ", mine = false, tsSecs = 1)
         assertEquals("  hello  ", sonarCopyableText(live))

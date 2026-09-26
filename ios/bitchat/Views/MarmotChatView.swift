@@ -2551,7 +2551,7 @@ final class MarmotChatModel: ObservableObject {
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
             let shouldPreserveHistoricalWindow = mode == .preserveHistoricalWindow
                 && !existingCanonical.isEmpty
-            let canonical: [MarmotService.MarmotMessage]
+            var canonical: [MarmotService.MarmotMessage]
             if shouldPreserveHistoricalWindow {
                 let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
                 let merged = Self.mergeMessages(existing: existingCanonical, incoming: page)
@@ -2586,6 +2586,11 @@ final class MarmotChatModel: ObservableObject {
                 localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
                 localTranscriptHasOlderByGroup[groupId] = rawPage.count > Self.localTranscriptPageLimit
                 localTranscriptPreservesOlderEdgeGroups.remove(groupId)
+            }
+            let staleIds = canonical.map(\.id).filter { id in !page.contains { $0.id == id } }
+            if !staleIds.isEmpty {
+                let overlay = (try? await service.reactionTallies(groupId: groupId, targetIds: staleIds)) ?? [:]
+                canonical = Self.overlayReactionTallies(canonical, tallies: overlay)
             }
             var byGroup = messagesByGroup
             byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
@@ -2791,9 +2796,13 @@ final class MarmotChatModel: ObservableObject {
             var freshRowsByGroup: [String: [MarmotService.MarmotMessage]] = [:]
             for page in pages {
                 freshRowsByGroup[page.groupId] = page.messages
+                // `recentMessagePages` is the chat-list read: core keeps it
+                // tally-free (no kind-7 scan), so its rows must not replace the
+                // chips an open transcript already painted.
                 let merged = Self.mergeMessages(
                     existing: byGroup[page.groupId] ?? [],
-                    incoming: page.messages
+                    incoming: page.messages,
+                    incomingCarriesReactions: false
                 )
                 let echoes = merged.filter(Self.isLocalTranscriptEcho)
                 let mergedCanonical = merged.filter { !Self.isLocalTranscriptEcho($0) }
@@ -2860,16 +2869,34 @@ final class MarmotChatModel: ObservableObject {
         )
     }
 
-    private static func mergeMessages(
+    nonisolated static func mergeMessages(
         existing: [MarmotService.MarmotMessage],
-        incoming: [MarmotService.MarmotMessage]
+        incoming: [MarmotService.MarmotMessage],
+        incomingCarriesReactions: Bool = true
     ) -> [MarmotService.MarmotMessage] {
         var byID: [String: MarmotService.MarmotMessage] = [:]
         for message in existing { byID[message.id] = message }
-        for message in incoming { byID[message.id] = message }
+        for message in incoming {
+            if !incomingCarriesReactions, let kept = byID[message.id], !kept.reactions.isEmpty {
+                byID[message.id] = message.replacingReactions(kept.reactions)
+            } else {
+                byID[message.id] = message
+            }
+        }
         return byID.values.sorted {
             if $0.createdAt == $1.createdAt { return $0.id < $1.id }
             return $0.createdAt < $1.createdAt
+        }
+    }
+
+    nonisolated static func overlayReactionTallies(
+        _ rows: [MarmotService.MarmotMessage],
+        tallies: [String: [MarmotService.MarmotReactionTally]]
+    ) -> [MarmotService.MarmotMessage] {
+        guard !tallies.isEmpty else { return rows }
+        return rows.map { row in
+            guard let next = tallies[row.id] else { return row }
+            return row.replacingReactions(next)
         }
     }
 
@@ -3892,6 +3919,38 @@ final class MarmotChatModel: ObservableObject {
             )
         } else {
             try await service.sendText(groupId: groupId, text: text)
+        }
+    }
+
+    func sendReaction(
+        _ emoji: String,
+        to messageId: String,
+        targetNpub: String,
+        groupId: String
+    ) {
+        guard !sendsSuspendedForAccountMutation else { return }
+        let prev = sendChain
+        let generation = sendGeneration
+        sendChain = Task { [weak self] in
+            _ = await prev?.result
+            guard let self,
+                  !Task.isCancelled,
+                  self.sendGeneration == generation,
+                  !self.sendsSuspendedForAccountMutation
+            else { return }
+            do {
+                guard await self.ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                try await self.service.sendReaction(
+                    groupId: groupId,
+                    targetIdHex: messageId,
+                    targetNpub: targetNpub,
+                    emoji: emoji
+                )
+            } catch {
+                self.errorText = Self.describe(error)
+            }
         }
     }
 

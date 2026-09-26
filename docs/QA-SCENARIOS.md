@@ -127,6 +127,105 @@ is the build under test on a dedicated QA emulator/simulator.
   Compose `VideoPrivacyTest`, `VideoPrivacyFixtureTest`
 - **Origin:** #615 (iOS) and its review (Compose parity, fail-closed)
 
+## Reactions
+
+Marmot NIP-25 kind-7 reactions (#603). Peers drive the other side with
+`peers.sh react` / `peers.sh expect-reaction`; `peers.sh id-of` finds a
+message id by its text. Retract (tapping your own chip) is a tracked gap —
+MDK has no `deleteMessage` on the current pin — so a tap on your own chip does
+nothing by design.
+
+### QA-070 — React to an inbound message
+- **Platforms:** both (Android automated; iOS via the XCUITest driver or by hand)
+- **Steps:** a peer sends a text; long-press its bubble; tap 👍 in the reaction
+  row at the top of the menu.
+- **Expect:** the row shows ❤️ 👍 😂 😮 😢 🔥 on one line; the 👍 chip appears
+  under the bubble at once (before any relay ack) with the "mine" outline, and
+  sits below the text and time instead of covering them; the app does not
+  crash; the peer sees the reaction on that exact message
+  (`peers.sh expect-reaction <peer> 👍 60 <id>`); the chat-list row keeps the
+  text preview and gains no unread badge.
+- **How:** `android-smoke.sh` QA-070 · Guard: `TranscriptCellKindChangeTests`,
+  `SNTextBubbleLayoutTests.textRowsOfferTheReactionRowOnLongPress`,
+  `ReactionRowPlacementUiTest`
+- **Origin:** #603 QA — i1 (iOS crashed with NSInternalInconsistencyException
+  when a visible UIKit text row gained its first chip: the row changed cell
+  class on `reconfigureItems`), i2 (plain text rows, drawn by the UIKit cell,
+  had no reaction row in their menu, so they could not get a first reaction),
+  A1 (Compose drew the chips over the bubble's last line and time).
+
+### QA-071 — A peer reacts to my message
+- **Platforms:** both (Android automated)
+- **Steps:** with the chat open, the app sends a text; the peer reacts 🔥 to it.
+  Then leave the chat and let the peer react 😂 while the app is on the list.
+- **Expect:** the 🔥 chip appears in the open chat within ~10 s without a reload
+  flash; on the list the row keeps the text preview, its time does not move,
+  there is no unread badge and no notification (R-017).
+- **How:** `android-smoke.sh` QA-071 · Guard: `e2e.rs::kind7_reaction_does_not_notify_or_increment_unread`
+
+### QA-072 — Several emojis and counts
+- **Platforms:** both (Android automated)
+- **Steps:** on one message the app reacts 👍 and 🔥 and the peer reacts 👍.
+- **Expect:** two chips: 👍 with count 2 (mine) and 🔥 (mine). Tapping the
+  peer-only chip of another message adds mine; tapping my own chip does
+  nothing (no duplicate kind-7 reaches the peer).
+- **How:** `android-smoke.sh` QA-072
+
+### QA-076 — React to a photo
+- **Platforms:** both (Android automated; iOS: `ios-drive.sh … "longpress:Photo;tap:😮"`)
+- **Steps:** a peer sends a photo (`peers.sh send-image`); long-press the photo;
+  tap 😮. Then tap the photo once.
+- **Expect:** the long-press opens the message menu with the reaction row (not
+  the viewer); the 😮 chip sits under the photo and the peer gets it on that
+  message (`peers.sh id-of-media`); a single tap still opens the viewer. The
+  photo is announced as "Photo".
+- **How:** `android-smoke.sh` QA-076 · Guard: `ReactionRowPlacementUiTest.longPressOnContentThatOwnsItsTapOpensTheReactionRow`
+- **Origin:** #603 QA — A5: on Android the photo's own `clickable` consumed
+  the press, so the row's long-press menu never opened on media and a photo
+  could not get a reaction (iOS could). Photos were also unlabelled for
+  screen readers on both apps.
+
+### QA-073 — Chips survive traffic in other chats
+- **Platforms:** iOS (the Compose summary refresh does not touch transcript rows)
+- **Steps:** chat A is open with a chip on a message; a second peer messages
+  the app (a different chat).
+- **Expect:** the chip in chat A stays, and tapping that emoji again does not
+  send a duplicate.
+- **Guard:** `ConversationTranscriptWindowTests.tallyFreeSummaryMergeKeepsLoadedChips`
+- **Origin:** #603 QA — i3: the chat-list summary read (`recentMessagePages`)
+  is tally-free by design, and merging it replaced the open chat's rows,
+  wiping every chip whenever any chat received a message.
+
+### QA-074 — Reacting to an older message keeps the scroll position
+- **Platforms:** both (manual)
+- **Steps:** seed a long chat: `sonar-cli --home <peer> send --to <app-npub>
+  --text "long history" --repeat 560` (one process; waits for the relays).
+  Open it, scroll to the oldest rows, and react to one of them.
+- **Expect:** the chip appears in place; the rows on screen do not move and
+  the transcript does not jump to the newest page; the peer gets the reaction.
+- **Origin:** #603 review — A2: Compose reused the send path's newest-page
+  reload for reactions. Verified 2026-09-26 on a 560-message chat (Android):
+  no jump, chip in place, delivered. A control build with the old reload did
+  not jump in the same flow either — the window-pinned state that the old
+  reload acted on was not reached with 560 rows — so the fix (a reaction no
+  longer reloads anything) is verified by construction, not by reproduction.
+
+### QA-075 — Reactions survive a relaunch, and the index is not plaintext
+- **Platforms:** both (Android: `run-as`; iOS: the simulator's app container)
+- **Steps:** after QA-072, force-stop and relaunch; open the chat. Then look at
+  `marmot.sqlite.sonar-reactions.json` beside the chat database.
+- **Expect:** the chips paint with the first local frame (no relay wait); the
+  file holds no emoji, no npub/hex pubkey and no message id in the clear, and
+  no `.sonar-reactions.dirty` marker is left once the app is idle.
+- **Guard:** `reaction.rs::sidecar_is_sealed_not_plaintext`,
+  `persistence.rs::duplicate_reaction_does_not_leave_the_index_dirty`,
+  `persistence.rs::reaction_index_survives_engine_reopen`
+- **Origin:** #603 QA — c1 (the index of who reacted with what, in which
+  group, was written as plaintext JSON next to the SQLCipher database), c2 (a
+  duplicate or failed kind-7 left the dirty marker set, so every open — and
+  every iOS notification-extension wake — rebuilt the index, and a failed
+  rebuild refused to open the account's chats).
+
 ## Notifications and lifecycle
 
 ### QA-020 — Background receive

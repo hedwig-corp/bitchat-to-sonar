@@ -391,6 +391,41 @@ struct ConversationTranscriptWindowTests {
         #expect(refreshed.last?.id == "marmot-0060")
     }
 
+    @Test func overlayReactionTalliesPatchesRetainedRows() {
+        let existing = [marmotMessage(0), marmotMessage(1)]
+        let overlaid = MarmotChatModel.overlayReactionTallies(
+            existing,
+            tallies: [
+                "marmot-0000": [MarmotService.MarmotReactionTally(emoji: "🔥", count: 1, mine: true)]
+            ]
+        )
+        #expect(overlaid[0].reactions.first?.emoji == "🔥")
+        #expect(overlaid[0].reactions.first?.mine == true)
+        #expect(overlaid[1].reactions.isEmpty)
+    }
+
+    /// `loadLocalSummaries` merges `recentMessagePages`, which core keeps
+    /// tally-free. Letting those rows replace loaded ones wiped every chip in
+    /// the open chat whenever any chat received a message.
+    @Test func tallyFreeSummaryMergeKeepsLoadedChips() {
+        let fire = [MarmotService.MarmotReactionTally(emoji: "🔥", count: 1, mine: false)]
+        let loaded = [marmotMessage(0).replacingReactions(fire), marmotMessage(1)]
+        let summary = [marmotMessage(0, content: "edited preview"), marmotMessage(1), marmotMessage(2)]
+
+        let merged = MarmotChatModel.mergeMessages(
+            existing: loaded,
+            incoming: summary,
+            incomingCarriesReactions: false
+        )
+        #expect(merged.map(\.id) == ["marmot-0000", "marmot-0001", "marmot-0002"])
+        #expect(merged[0].reactions.first?.emoji == "🔥", "the chip survives a summary refresh")
+        #expect(merged[0].content == "edited preview", "other fields still come from the fresh row")
+
+        // Cursor pages do carry tallies, so they still replace them.
+        let page = MarmotChatModel.mergeMessages(existing: loaded, incoming: [marmotMessage(0)])
+        #expect(page[0].reactions.isEmpty)
+    }
+
     /// Regression: a message sent at the live edge, followed by scrolling deep
     /// into history before the relay ack lands, pins the render window while it
     /// still contains the optimistic echo. Once the Marmot model reconciles the

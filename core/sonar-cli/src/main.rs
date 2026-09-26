@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -80,6 +80,8 @@ enum Command {
     Post(PostArgs),
     /// Send an encrypted text or media message (voice/image/video) to a peer.
     Send(SendArgs),
+    /// Send an encrypted NIP-25 kind-7 reaction to a message in a Marmot group.
+    React(ReactArgs),
     /// Download and decrypt an inbound media blob to a file or stdout.
     Fetch(FetchArgs),
     /// Poll for inbound encrypted messages and print JSON lines.
@@ -114,6 +116,11 @@ struct SendArgs {
     /// Plaintext message body. Mutually exclusive with --file/--stdin.
     #[arg(long)]
     text: Option<String>,
+    /// With --text: send N numbered copies ("<text> 0001" …) from this one
+    /// process — seeds a long history for QA (e.g. QA-074 needs >500 rows)
+    /// without a relay connect per message. Waits until none is in flight.
+    #[arg(long, default_value_t = 1, requires = "text")]
+    repeat: u32,
     /// Path to a media file to send (voice/image/video). Mutually exclusive
     /// with --text/--stdin. Repeat --file to send several photos as ONE album
     /// message (a single event carrying every attachment).
@@ -171,6 +178,26 @@ enum MediaKind {
     Image,
     /// Video clip (defaults to video/mp4).
     Video,
+}
+
+#[derive(Args, Debug)]
+struct ReactArgs {
+    /// Peer npub1... or 64-char hex public key whose 1:1 DM holds the target.
+    /// Mutually exclusive with --group.
+    #[arg(long, conflicts_with = "group", required_unless_present = "group")]
+    to: Option<String>,
+    /// Group id hex holding the target message.
+    #[arg(long)]
+    group: Option<String>,
+    /// Target message id (the 64-hex `id` printed by `listen` / `messages`).
+    #[arg(long)]
+    target: String,
+    /// Emoji to react with.
+    #[arg(long)]
+    emoji: String,
+    /// Bound for the relay-acknowledgement wait.
+    #[arg(long, default_value_t = 15)]
+    ack_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -243,6 +270,10 @@ struct AgentConfig {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct SeenState {
     message_ids: BTreeSet<String>,
+    /// Last printed kind-7 tally fingerprint per message id, so `listen`
+    /// reports a reaction on a message it already printed.
+    #[serde(default)]
+    reaction_fingerprints: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -286,6 +317,22 @@ enum Output {
         bytes: usize,
         out: String,
     },
+    Reacted {
+        group_id: String,
+        target_id: String,
+        reaction_id: String,
+        emoji: String,
+    },
+    /// Current kind-7 chips on a message whose tallies changed.
+    Reactions {
+        group_id: String,
+        target_id: String,
+        /// The target message's author (npub), so a peer can tell reactions
+        /// on its own messages apart.
+        target_sender: String,
+        target_mine: bool,
+        tallies: Vec<ReactionTallyOut>,
+    },
     PostedStickerPack {
         title: String,
         address: String,
@@ -314,7 +361,19 @@ enum Output {
         /// plain-text messages keep their pre-existing JSON shape.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         media: Vec<MediaRefOut>,
+        /// Aggregated kind-7 chips. Omitted when nobody has reacted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reactions: Vec<ReactionTallyOut>,
     },
+}
+
+/// One aggregated emoji chip in `listen`/`messages` JSON output.
+#[derive(Debug, Serialize)]
+struct ReactionTallyOut {
+    emoji: String,
+    count: u32,
+    /// True when this agent is among the reactors.
+    mine: bool,
 }
 
 /// A decrypted media attachment rendered in `listen`/`messages` JSON output.
@@ -441,7 +500,21 @@ async fn run(cli: Cli) -> Result<()> {
                 .then(|| outbound_message_ids(&client, &group_id))
                 .transpose()?;
             let to_npub = peer.to_bech32().expect("valid public key encodes as npub");
-            let output = if let Some(text) = args.text.as_deref() {
+            let output = if let Some(text) = args.text.as_deref().filter(|_| args.repeat > 1) {
+                for i in 1..=args.repeat {
+                    client.send_text(&group_id, &format!("{text} {i:04}")).await?;
+                }
+                wait_for_publishes_to_settle(
+                    &client,
+                    Duration::from_secs(60 + u64::from(args.repeat) / 2),
+                )
+                .await?;
+                print_json(&Output::Sent {
+                    to: to_npub,
+                    group_id: hex::encode(group_id.as_slice()),
+                })?;
+                return Ok(());
+            } else if let Some(text) = args.text.as_deref() {
                 client.send_text(&group_id, text).await?;
                 Output::Sent {
                     to: to_npub,
@@ -527,6 +600,53 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             print_json(&output)?;
+            Ok(())
+        }
+        Command::React(args) => {
+            if args.ack_timeout_secs == 0 {
+                return Err(CliError::Message(
+                    "--ack-timeout-secs must be greater than zero".to_owned(),
+                ));
+            }
+            let target_id = EventId::from_hex(&args.target)
+                .map_err(|e| CliError::Message(format!("target id: {e}")))?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = match (&args.group, &args.to) {
+                (Some(group), _) => parse_group_id_hex(group)?,
+                (None, Some(to)) => {
+                    let peer = PublicKey::parse(to)
+                        .map_err(|e| CliError::Message(format!("recipient pubkey: {e}")))?;
+                    find_dm_group(&client, peer)?.ok_or_else(|| {
+                        CliError::Message("no 1:1 group with that peer".to_owned())
+                    })?
+                }
+                (None, None) => unreachable!("clap requires --to or --group"),
+            };
+            let target_author = client
+                .messages(&group_id)?
+                .into_iter()
+                .find(|m| m.id == target_id)
+                .map(|m| m.sender)
+                .ok_or_else(|| {
+                    CliError::Message("target message not found in that group".to_owned())
+                })?;
+            let reaction_id = client
+                .send_reaction(&group_id, &target_id, &target_author, &args.emoji)
+                .await?;
+            wait_for_outbox_ack(
+                &client,
+                &reaction_id.to_hex(),
+                Duration::from_secs(args.ack_timeout_secs),
+            )
+            .await?;
+            print_json(&Output::Reacted {
+                group_id: hex::encode(group_id.as_slice()),
+                target_id: target_id.to_hex(),
+                reaction_id: reaction_id.to_hex(),
+                emoji: args.emoji.trim().to_owned(),
+            })?;
             Ok(())
         }
         Command::Fetch(args) => {
@@ -887,12 +1007,42 @@ fn emit_unseen_messages(
         messages.sort_by_key(|m| m.created_at);
         for msg in messages {
             let id = msg.id.to_hex();
-            if !seen.message_ids.insert(id) {
-                continue;
+            let fingerprint = reaction_fingerprint(&msg.reactions);
+            let old = seen
+                .reaction_fingerprints
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or("");
+            let reactions_changed = old != fingerprint;
+            if reactions_changed {
+                if fingerprint.is_empty() {
+                    seen.reaction_fingerprints.remove(&id);
+                } else {
+                    seen.reaction_fingerprints
+                        .insert(id.clone(), fingerprint.clone());
+                }
+                changed = true;
             }
-            changed = true;
-            if !msg.mine {
-                print_json(&message_output(&msg))?;
+            let first_sight = seen.message_ids.insert(id);
+            if first_sight {
+                changed = true;
+                if !msg.mine {
+                    print_json(&message_output(&msg))?;
+                }
+            }
+            // A new inbound message already carries its chips in the line
+            // above; otherwise report the change on its own.
+            if reactions_changed && !(first_sight && !msg.mine) {
+                print_json(&Output::Reactions {
+                    group_id: hex::encode(msg.group_id.as_slice()),
+                    target_id: msg.id.to_hex(),
+                    target_sender: msg
+                        .sender
+                        .to_bech32()
+                        .expect("valid public key encodes as npub"),
+                    target_mine: msg.mine,
+                    tallies: reaction_outputs(&msg.reactions),
+                })?;
             }
         }
     }
@@ -900,6 +1050,27 @@ fn emit_unseen_messages(
         write_private_json(seen_path, seen)?;
     }
     Ok(())
+}
+
+fn reaction_outputs(tallies: &[sonar_core::reaction::ReactionTally]) -> Vec<ReactionTallyOut> {
+    tallies
+        .iter()
+        .map(|t| ReactionTallyOut {
+            emoji: t.emoji.clone(),
+            count: t.count,
+            mine: t.mine,
+        })
+        .collect()
+}
+
+/// Order-independent summary of a message's chips; empty when none.
+fn reaction_fingerprint(tallies: &[sonar_core::reaction::ReactionTally]) -> String {
+    let mut parts: Vec<String> = tallies
+        .iter()
+        .map(|t| format!("{}:{}:{}", t.emoji, t.count, t.mine))
+        .collect();
+    parts.sort();
+    parts.join("|")
 }
 
 fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
@@ -927,6 +1098,58 @@ fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
         created_at_secs: msg.created_at.as_secs(),
         mine: msg.mine,
         media,
+        reactions: reaction_outputs(&msg.reactions),
+    }
+}
+
+/// Wait until no outbox publish is in flight for three consecutive checks
+/// (a bulk `send --repeat`); a still-failing row keeps retrying in the app's
+/// sense only while this process lives, so report a timeout instead.
+async fn wait_for_publishes_to_settle(client: &SonarClient, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    let mut idle = 0;
+    while idle < 3 {
+        if client.sync_state_snapshot().await.send_inflight == 0 {
+            idle += 1;
+        } else {
+            idle = 0;
+        }
+        if started.elapsed() >= timeout {
+            return Err(CliError::Message(format!(
+                "timed out after {}s with publishes still in flight",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
+
+/// Wait until the relay acknowledged `message_id_hex` (its outbox row is
+/// dropped). Keeps the short-lived CLI runtime alive for the publish task.
+async fn wait_for_outbox_ack(
+    client: &SonarClient,
+    message_id_hex: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match client.outbox_status(message_id_hex) {
+            None | Some(DeliveryState::Sent) => return Ok(()),
+            Some(DeliveryState::Failed) if started.elapsed() >= timeout => {
+                return Err(CliError::Message(format!(
+                    "all relays failed to accept {message_id_hex}; it remains in the local outbox for retry"
+                )));
+            }
+            _ => {}
+        }
+        if started.elapsed() >= timeout {
+            return Err(CliError::Message(format!(
+                "timed out after {}s waiting for a relay acknowledgement for {message_id_hex}",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -1503,6 +1726,7 @@ mod tests {
         SendArgs {
             to: "npub".to_owned(),
             text: None,
+            repeat: 1,
             file: file.into_iter().collect(),
             stdin: false,
             kind,
