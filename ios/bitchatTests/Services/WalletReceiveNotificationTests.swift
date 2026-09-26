@@ -22,7 +22,7 @@ private final class ScriptedPaymentsWallet: SonarWalletProviding {
         Just(state).eraseToAnyPublisher()
     }
 
-    func send(destination: String, amountSats: Int64, note: String?, feeFromAmount: Bool) async throws -> SonarWalletPayment {
+    func send(destination: String, amountSats: Int64, note: String?, feeFromAmount: Bool, maxFeeSats: Int64?) async throws -> SonarWalletPayment {
         throw UnconfiguredWallet.WalletError.notConfigured
     }
 

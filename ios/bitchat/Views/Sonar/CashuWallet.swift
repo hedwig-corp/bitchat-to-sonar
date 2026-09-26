@@ -81,13 +81,15 @@ final class CashuWallet: SonarWalletProviding {
         destination: String,
         amountSats: Int64,
         note: String?,
-        feeFromAmount: Bool
+        feeFromAmount: Bool,
+        maxFeeSats: Int64?
     ) async throws -> SonarWalletPayment {
         try await service.send(
             destination: destination,
             amountSats: amountSats,
             note: note,
-            feeFromAmount: feeFromAmount
+            feeFromAmount: feeFromAmount,
+            maxFeeSats: maxFeeSats
         )
     }
 

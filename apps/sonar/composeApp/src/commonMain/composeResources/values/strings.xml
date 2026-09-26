@@ -390,6 +390,7 @@
     <string name="tap_someone_to_chat">Tap someone to chat</string>
     <string name="that_key_couldn_t_be_imported_check_you">That key couldn't be imported. Check you pasted the full nsec1... key.</string>
     <string name="that_payment_address_can_t_be_paid">That payment address can't be paid.</string>
+    <string name="the_network_fee_is_now_up_to_nothing">The network fee is now up to %1$s. Nothing was sent — try again to pay it.</string>
     <string name="the_old_wallet_couldn_t_be_removed">The old wallet couldn't be removed. Restart Sonar and try again.</string>
     <string name="the_old_wallet_has_a_refund_waiting_to">The old wallet has a refund waiting to be claimed.</string>
     <string name="this">This </string>

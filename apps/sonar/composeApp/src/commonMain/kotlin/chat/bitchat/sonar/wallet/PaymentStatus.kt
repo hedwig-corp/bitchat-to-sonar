@@ -122,6 +122,13 @@ data class PaymentStatus(
      * only ever hashed in the ledger, so this is false after a relaunch.
      */
     val canRetry: Boolean,
+    /**
+     * A [PayPhase.FailedSafe] payment the wallet refused because the network
+     * fee rose above the one the user agreed to: the NEW fee. The screen then
+     * states it instead of "No route" — the user must read it before `Try
+     * again` pays it. Null for every other state.
+     */
+    val feeChangedSats: Long? = null,
 )
 
 /** One action button in the status card (paystatus.jsx `acts`). */
@@ -317,6 +324,8 @@ fun paymentStatusOf(
     live: LivePayment?,
     nowSecs: Long,
     canRetry: Boolean,
+    /** The new fee when the wallet refused this send because the fee rose. */
+    feeChangedSats: Long? = null,
 ): PaymentStatus {
     if (live != null && activity.status == SonarPaymentActivity.Status.Pending) {
         return PaymentStatus(
@@ -343,6 +352,9 @@ fun paymentStatusOf(
         elapsedSecs = (reference - activity.createdAtSecs).coerceAtLeast(0L).toInt(),
         preimage = activity.preimage,
         canRetry = canRetry,
+        // Only a concluded failure is "the fee changed"; a row that later
+        // settled (or is still pending) says what it is.
+        feeChangedSats = feeChangedSats.takeIf { phase == PayPhase.FailedSafe },
     )
 }
 

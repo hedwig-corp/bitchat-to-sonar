@@ -19,6 +19,9 @@
 //  - Affordability is checked against the mint's REAL fee reserve from
 //    `prepareSend` before `send`; a shortfall is the typed
 //    `CashuWalletError.insufficientFunds`.
+//  - The fee paid never exceeds the fee the user agreed to on the send
+//    sheet (`maxFeeSats`): a higher reserve is the typed
+//    `CashuWalletError.feeChanged`, refused before `send`.
 //  - Never disconnect under a send in flight; the disconnect waits.
 //  - Account replacement keeps the old account's store on disk; only a panic
 //    wipe deletes stores.
@@ -147,6 +150,17 @@ enum CashuWalletError: LocalizedError, Equatable {
     case backend(String)
     /// Refused because a payment is still in flight (e.g. account switch).
     case paymentInFlight
+    /// The fee reserve of the quote about to be paid is above the fee the
+    /// user agreed to on the send sheet. Nothing was sent; `feeSats` is the
+    /// NEW fee to ask about.
+    case feeChanged(feeSats: Int64)
+
+    /// The words for a `.feeChanged` refusal, fee written like the sheet's
+    /// fee line. Shared by the error and the payment status screen.
+    static func feeChangedMessage(feeSats: Int64) -> String {
+        let fee = sonarFormatSats(feeSats)
+        return String(localized: "The network fee is now up to \(fee). Nothing was sent — try again to pay it.")
+    }
 
     init(_ error: Error) {
         if let typed = error as? CashuWalletError {
@@ -190,6 +204,8 @@ enum CashuWalletError: LocalizedError, Equatable {
             return String(localized: "Payment failed — you were not charged.")
         case .paymentInFlight:
             return String(localized: "A payment is still in flight. Wait for it to finish and try again.")
+        case .feeChanged(let fee):
+            return Self.feeChangedMessage(feeSats: fee)
         }
     }
 }
@@ -753,13 +769,23 @@ final class CashuWalletService: ObservableObject {
     /// Pay `destination`. `amountSats` 0 lets an invoice speak for its own
     /// amount. `feeFromAmount` is `Max`: when amount + fee reserve exceeds
     /// the balance, re-quote at `amountSats - fee` instead of refusing.
+    ///
+    /// `maxFeeSats` is the fee the user agreed to — the "Network fee: up to
+    /// N" the send sheet showed, or 0 when it showed none. When the fee of
+    /// the quote about to be paid is higher (the mint re-quoted since the
+    /// sheet priced it), nothing is spent and this throws
+    /// `.feeChanged(feeSats:)` with the new fee, so the UI can ask again.
+    /// nil = no ceiling (paths that never showed a fee): the fee is then
+    /// only checked against the balance.
+    ///
     /// Throws a typed `CashuWalletError`; a `.pending` result is NOT an
     /// error and must never be retried.
     func send(
         destination: String,
         amountSats: Int64,
         note: String?,
-        feeFromAmount: Bool
+        feeFromAmount: Bool,
+        maxFeeSats: Int64?
     ) async throws -> SonarWalletPayment {
         guard let n = native else { throw CashuWalletError.notOpen }
         let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -782,6 +808,8 @@ final class CashuWalletService: ObservableObject {
         }
         let noteText = note ?? ""
         let requested: UInt64? = amountSats > 0 ? UInt64(amountSats) : nil
+        // A negative ceiling is a caller bug; treat it as "no fee agreed".
+        let ceiling: UInt64? = maxFeeSats.map { UInt64(max($0, 0)) }
         do {
             let paid: WalletPayment = try await run {
                 if !n.isConnected() { try n.connect() }
@@ -797,6 +825,12 @@ final class CashuWalletService: ObservableObject {
                     if Self.exceeds(prepared.amountSats, fee, confirmed) {
                         throw Self.shortfall(prepared.amountSats, fee, confirmed)
                     }
+                }
+                // The fee the user saw is a promise: a higher reserve on the
+                // quote about to be paid is refused BEFORE the spending call.
+                // The quote is only a price — abandoning it spends nothing.
+                if let ceiling, fee > ceiling {
+                    throw CashuWalletError.feeChanged(feeSats: Int64(clamping: fee))
                 }
                 return try n.send(prepared: prepared, note: noteText)
             }
@@ -820,11 +854,13 @@ final class CashuWalletService: ObservableObject {
     /// can cost on top of the amount. For the send confirmation sheet only.
     ///
     /// The quote is DISCARDED: `send` prepares again, so a stale quote is
-    /// never what gets paid. Nothing is spent, no send is counted in flight,
-    /// and this never connects on its own — the connect loop owns that; a
-    /// disconnected wallet answers `.mintOffline` and the sheet shows no fee
-    /// line. `amountSats` 0 lets an invoice speak for its own amount. Runs on
-    /// the wallet queue; throws a typed `CashuWalletError`.
+    /// never what gets paid — and the fee shown from this quote is the
+    /// ceiling that send enforces (`maxFeeSats`). Nothing is spent, no send
+    /// is counted in flight, and this never connects on its own — the
+    /// connect loop owns that; a disconnected wallet answers `.mintOffline`
+    /// and the sheet shows no fee line. `amountSats` 0 lets an invoice speak
+    /// for its own amount. Runs on the wallet queue; throws a typed
+    /// `CashuWalletError`.
     func quoteFee(destination: String, amountSats: Int64) async throws -> Int64 {
         guard let n = native else { throw CashuWalletError.notOpen }
         let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)

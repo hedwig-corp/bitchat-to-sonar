@@ -301,6 +301,89 @@ class CashuWalletEngineTest {
         e.onBackground()
     }
 
+    // ── The fee the user consented to (maintainer review, #614) ──
+
+    /**
+     * The sheet showed "up to 3 sats"; by the time Send runs, the mint's fee
+     * reserve for the fresh quote is 40. The send must refuse with the NEW fee
+     * and never reach the spending call, even though the balance covers it.
+     */
+    @Test
+    fun aFeeAboveTheConsentedCeilingIsRefusedWithTheNewFeeAndNothingIsSent() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 40)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        var linked: String? = null
+        val r = e.send("lno1peer", 500, "note", maxFeeSats = 3) { linked = it }
+        assertFalse(r.ok)
+        assertFalse(r.pending)
+        assertEquals(SendErrorKind.FeeChanged, r.errorKind)
+        assertEquals(40L, r.quotedFeeSats, "the refusal carries the fee the user must now agree to")
+        assertEquals(0, native.count("send"), "nothing is spent above the consented fee")
+        assertNull(linked, "a refused send never hands out a quote id to link")
+        e.onBackground()
+    }
+
+    @Test
+    fun aFeeAtOrBelowTheConsentedCeilingPays() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 3)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val atCeiling = e.send("lno1peer", 500, "note", maxFeeSats = 3)
+        assertTrue(atCeiling.ok, "a fee equal to what was shown pays")
+        val below = e.send("lno1peer", 500, "note", maxFeeSats = 10)
+        assertTrue(below.ok, "a fee below what was shown pays")
+        assertEquals(2, native.count("send"))
+        e.onBackground()
+    }
+
+    /** No fee was on screen (quote failed / hidden): ceiling 0, so any fee needs a fresh consent. */
+    @Test
+    fun aZeroCeilingRefusesAnyFee() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 1)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val r = e.send("lno1peer", 500, "note", maxFeeSats = 0)
+        assertEquals(SendErrorKind.FeeChanged, r.errorKind)
+        assertEquals(1L, r.quotedFeeSats)
+        assertEquals(0, native.count("send"))
+        native.feeReserveSats = 0
+        assertTrue(e.send("lno1peer", 500, "note", maxFeeSats = 0).ok, "a free payment needs no fee consent")
+        e.onBackground()
+    }
+
+    /** Max: the ceiling applies to the fee of the RE-prepared (reduced) quote that is actually paid. */
+    @Test
+    fun maxChecksTheCeilingAgainstTheFeeItWouldPay() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 1_000, feeReserveSats = 25)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        val refused = e.send("lno1peer", 1_000, "note", feeFromAmount = true, maxFeeSats = 5)
+        assertEquals(SendErrorKind.FeeChanged, refused.errorKind)
+        assertEquals(25L, refused.quotedFeeSats)
+        assertEquals(0, native.count("send"))
+        val paid = e.send("lno1peer", 1_000, "note", feeFromAmount = true, maxFeeSats = 25)
+        assertTrue(paid.ok)
+        assertEquals(listOf(975L), native.sentAmounts)
+        e.onBackground()
+    }
+
+    /** No ceiling (legacy / never quoted): the fee is only checked against the balance, as before. */
+    @Test
+    fun noCeilingKeepsTheBalanceOnlyCheck() = walletTest {
+        val native = FakeCashuNative(confirmedSats = 10_000, feeReserveSats = 40)
+        val e = engine(native)
+        e.setup(nsec)
+        runCurrent()
+        assertTrue(e.send("lno1peer", 500, "note", maxFeeSats = null).ok)
+        assertEquals(1, native.count("send"))
+        e.onBackground()
+    }
+
     @Test
     fun aMintOutageIsTypedOfflineAndNothingIsSent() = walletTest {
         val native = FakeCashuNative(confirmedSats = 1_000).apply {

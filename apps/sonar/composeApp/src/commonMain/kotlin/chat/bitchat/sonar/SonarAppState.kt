@@ -93,6 +93,7 @@ import chat.bitchat.sonar.resources.old_lightning_wallet_removed
 import chat.bitchat.sonar.resources.payment_failed_you_were_not_charged
 import chat.bitchat.sonar.resources.payment_is_on_its_way_it_shows_in_the
 import chat.bitchat.sonar.resources.that_payment_address_can_t_be_paid
+import chat.bitchat.sonar.resources.the_network_fee_is_now_up_to_nothing
 import chat.bitchat.sonar.resources.the_old_wallet_couldn_t_be_removed
 import chat.bitchat.sonar.resources.this_kind_of_payment_isn_t_supported_yet
 import chat.bitchat.sonar.resources.your_wallet_is_busy_try_again_in_a
@@ -3322,9 +3323,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     /**
      * The user-facing text for a refused send, localized by its typed kind
      * (the wallet's own `error` is the English fallback). An insufficient-
-     * funds refusal keeps the wallet's text, which carries the amounts.
+     * funds refusal keeps the wallet's text, which carries the amounts; a
+     * fee-changed refusal names the new fee, written like the sheet's fee line.
      */
     private suspend fun sendErrorText(result: SendResult): String? = when (result.errorKind) {
+        SendErrorKind.FeeChanged -> result.quotedFeeSats
+            ?.let { getString(Res.string.the_network_fee_is_now_up_to_nothing, feeLineAmount(it)) }
+            ?: result.error
         SendErrorKind.InsufficientFunds -> result.error ?: getString(Res.string.amount_plus_fee_exceeds_your_balance)
         SendErrorKind.Offline -> getString(Res.string.mint_offline_retrying_nothing_was_sent)
         SendErrorKind.Busy -> getString(Res.string.your_wallet_is_busy_try_again_in_a)
@@ -3345,10 +3350,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     /**
      * Send sheet fee line (Cashu wallet only): the mint's fee reserve for
      * paying [sats] to [destination], or null when there is nothing to show —
-     * wallet not open, mint offline, quote refused. The line then hides; the
-     * send itself never waits on this. A BOLT11 invoice is quoted at its own
-     * amount, exactly as [destinationSendAmount] sends it. The quote is
-     * discarded: the send prepares its own.
+     * wallet not open, mint offline, quote refused. The line then hides, and
+     * a Send from that sheet consents to no fee (`consentedFeeCeiling`). A
+     * BOLT11 invoice is quoted at its own amount, exactly as
+     * [destinationSendAmount] sends it. The quote is discarded: the send
+     * prepares its own, and pays at most the fee shown from this one.
      */
     suspend fun quoteSendFee(destination: String, sats: Long): Long? {
         val dest = destination.trim()
@@ -3377,6 +3383,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      * Pay through the chosen wallet. A Cashu send links [activityId] to its
      * wallet payment id BEFORE the spending call, so a send interrupted by a
      * process death is still settled by the reconnect lookup.
+     *
+     * [maxFeeSats] is the fee the user agreed to on the send sheet (see
+     * [WalletBridge.send]). The legacy wallet has no fee quote, so its sheet
+     * shows none and its callers pass null; it is not used there.
      */
     private suspend fun walletSend(
         activityId: String,
@@ -3385,9 +3395,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         note: String,
         fromLegacy: Boolean,
         feeFromAmount: Boolean,
+        maxFeeSats: Long?,
     ): SendResult =
         if (fromLegacy) LegacyBreezWallet.send(destination, amountSats, note)
-        else WalletBridge.send(destination, amountSats, note, feeFromAmount) { paymentId ->
+        else WalletBridge.send(
+            destination, amountSats, note, maxFeeSats = maxFeeSats, feeFromAmount = feeFromAmount,
+        ) { paymentId ->
             PaymentActivityStore.linkWalletPayment(activityId, paymentId)
         }
 
@@ -3496,6 +3509,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Activity ids paid from the legacy wallet this session (so `Try again` keeps the source). */
     private val paymentFromLegacy = mutableMapOf<String, Boolean>()
 
+    /** Activity ids sent as a fee-inclusive `Max` this session (so `Try again` keeps it). */
+    private val paymentFeeFromAmount = mutableSetOf<String>()
+
+    /**
+     * The fee ceiling each payment was sent with this session — what the send
+     * sheet showed. Absent = no ceiling (legacy wallet). `Try again` reuses it.
+     */
+    private val paymentFeeCeilings = mutableMapOf<String, Long>()
+
+    /**
+     * Payments the wallet refused because the fee rose above the one the user
+     * agreed to, with the NEW fee. The status screen states it, and `Try
+     * again` — tapped after reading it — sends with it as the ceiling.
+     */
+    private val paymentFeeChanged = mutableMapOf<String, Long>()
+
     /**
      * Starts paying an arbitrary Lightning destination from the send-payment
      * picker. Returns the activity id to open the status screen on, or null
@@ -3509,6 +3538,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         destination: String,
         sats: Long,
         displayName: String,
+        /** The fee the user agreed to on the sheet; null = none shown (legacy). See [WalletBridge.send]. */
+        maxFeeSats: Long?,
         fromLegacy: Boolean = false,
         feeFromAmount: Boolean = false,
     ): String? {
@@ -3543,6 +3574,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         paymentDestinations[payId] = dest
         if (fromLegacy) paymentFromLegacy[payId] = true
+        if (feeFromAmount) paymentFeeFromAmount += payId
+        if (maxFeeSats != null) paymentFeeCeilings[payId] = maxFeeSats
         livePayments = livePayments + (payId to LivePayment(
             id = payId,
             payeeName = payeeName,
@@ -3572,7 +3605,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             var failureMessage: String? = null
             val result = runCatching {
-                walletSend(payId, dest, amountForWallet, "Sonar payment $payId", fromLegacy, feeFromAmount)
+                walletSend(payId, dest, amountForWallet, "Sonar payment $payId", fromLegacy, feeFromAmount, maxFeeSats)
             }.getOrElse {
                 failureMessage = "Payment failed: ${it.message}"
                 SendResult(false)
@@ -3587,6 +3620,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // confirming") and the wallet's outcome event settles it.
                 trackPendingWalletSend(payId, result)
             } else {
+                if (result.errorKind == SendErrorKind.FeeChanged) {
+                    result.quotedFeeSats?.let { paymentFeeChanged[payId] = it }
+                }
                 failureMessage = failureMessage ?: sendErrorText(result)
                 // The status screen states the failure in full, and the home
                 // strip clears on a terminal state — so without this a user who
@@ -3610,11 +3646,23 @@ class SonarAppState(private val scope: CoroutineScope) {
      * as a fresh activity. Returns the new activity id, or null when the
      * destination is no longer known (a relaunch drops it — the ledger only
      * ever stored its hash).
+     *
+     * The fee ceiling is the one the user last saw: the NEW fee when the send
+     * was refused because the fee rose (the status screen states it, and
+     * tapping `Try again` after reading it is the consent), else the fee the
+     * sheet showed. A `Max` send stays a `Max` send.
      */
     fun retryDestinationPayment(activityId: String): String? {
         val destination = paymentDestinations[activityId] ?: return null
         val previous = PaymentActivityStore.get(activityId) ?: return null
-        return beginDestinationPayment(destination, previous.sats, previous.peerName, paymentFromLegacy[activityId] == true)
+        return beginDestinationPayment(
+            destination,
+            previous.sats,
+            previous.peerName,
+            maxFeeSats = paymentFeeChanged[activityId] ?: paymentFeeCeilings[activityId],
+            fromLegacy = paymentFromLegacy[activityId] == true,
+            feeFromAmount = activityId in paymentFeeFromAmount,
+        )
     }
 
     /**
@@ -3636,6 +3684,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             live = livePayments[activityId],
             nowSecs = SonarClock.nowSecs(),
             canRetry = paymentDestinations.containsKey(activityId),
+            feeChangedSats = paymentFeeChanged[activityId],
         )
     }
 
@@ -3679,6 +3728,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         livePayments = emptyMap()
         paymentDestinations.clear()
         paymentFromLegacy.clear()
+        paymentFeeFromAmount.clear()
+        paymentFeeCeilings.clear()
+        paymentFeeChanged.clear()
         cancelledPayments.clear()
     }
 
@@ -3727,6 +3779,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     suspend fun sendPay(
         chatId: String,
         sats: Long,
+        /** The fee the user agreed to on the sheet; null = none shown (legacy). See [WalletBridge.send]. */
+        maxFeeSats: Long?,
         fromLegacy: Boolean = false,
         feeFromAmount: Boolean = false,
     ): String? {
@@ -3763,7 +3817,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         scope.launch {
             var failureMessage: String? = null
-            val result = runCatching { walletSend(payId, offer, sats, "Sonar payment $payId", fromLegacy, feeFromAmount) }
+            val result = runCatching {
+                walletSend(payId, offer, sats, "Sonar payment $payId", fromLegacy, feeFromAmount, maxFeeSats)
+            }
                 .getOrElse {
                     failureMessage = "Payment failed: ${it.message}"
                     SendResult(false)
@@ -3825,10 +3881,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun sendPayDetached(
         chatId: String,
         sats: Long,
+        maxFeeSats: Long?,
         fromLegacy: Boolean = false,
         feeFromAmount: Boolean = false,
     ) {
-        scope.launch { sendPay(chatId, sats, fromLegacy, feeFromAmount)?.let { toast = it } }
+        scope.launch { sendPay(chatId, sats, maxFeeSats, fromLegacy, feeFromAmount)?.let { toast = it } }
     }
 
     /**
@@ -4066,7 +4123,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                     status = SonarPaymentActivity.Status.Pending,
                 )
             )
-            val result = WalletBridge.send(dest, amountSats, "Sonar nearby", feeFromAmount) { paymentId ->
+            // No fee ceiling: the Unify sheet shows no fee line (the peer's
+            // offer is only read over BLE after Send), so there is no quote
+            // the user saw to hold the send to. Tracked gap, same on iOS.
+            val result = WalletBridge.send(
+                dest, amountSats, "Sonar nearby", maxFeeSats = null, feeFromAmount = feeFromAmount,
+            ) { paymentId ->
                 PaymentActivityStore.linkWalletPayment(activityId, paymentId)
             }
             when {

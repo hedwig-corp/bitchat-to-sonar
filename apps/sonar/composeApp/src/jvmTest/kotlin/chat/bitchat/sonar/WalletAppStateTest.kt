@@ -159,11 +159,103 @@ class WalletAppStateTest {
         assertEquals(listOf<Long?>(500L, null, 700L), native.preparedAmounts)
         assertEquals(0, native.count("send"), "quoting never pays")
 
-        // No quote ⇒ no line (null), and the send is never blocked on it.
+        // No quote ⇒ no line (null): Send is not blocked on it, and consents to no fee.
         assertNull(s.quoteChatPayFee("no-such-chat", 700), "no cached offer: no quote, and no fetch")
         assertNull(s.quoteSendFee("lno1destination", 0))
         native.prepareError = { CashuWalletException.Network("mint down") }
         assertNull(s.quoteSendFee("lno1destination", 500), "a refused quote hides the line")
+    }
+
+    // ── The fee the user consented to (maintainer review, #614) ──
+
+    private fun feeChangedText(sats: Long) =
+        "The network fee is now up to $sats sats. Nothing was sent — try again to pay it."
+
+    /**
+     * The sheet showed "up to 3 sats"; the mint now wants 40. The payment
+     * fails with nothing sent and states the new fee — on the status screen
+     * too, where `Try again` lives — and `Try again` (tapped after reading
+     * it) sends with THAT fee as the ceiling: a further rise is refused
+     * again, the fee the user read is paid.
+     */
+    @Test
+    fun aDestinationPaymentAboveTheConsentedFeeFailsWithTheNewFeeAndTryAgainPaysIt() = runBlocking {
+        native.confirmedSats = 10_000
+        native.feeReserveSats = 40
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+
+        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 500, "Dest", maxFeeSats = 3))
+        waitUntil("refused") { PaymentActivityStore.get(id)?.status == SonarPaymentActivity.Status.Failed }
+        assertEquals(0, native.count("send"), "nothing is spent above the fee the user saw")
+        assertEquals(feeChangedText(40), PaymentActivityStore.get(id)!!.failure)
+        waitUntil("toast") { s.toast == feeChangedText(40) }
+        val status = assertNotNull(s.paymentStatus(id))
+        assertEquals(chat.bitchat.sonar.wallet.PayPhase.FailedSafe, status.phase)
+        assertEquals(40L, status.feeChangedSats, "the status screen states the new fee before Try again")
+        assertTrue(status.canRetry)
+
+        // The fee rises again before the user taps Try again: the retry's
+        // ceiling is the 40 they read, not "anything".
+        native.feeReserveSats = 41
+        val retry1 = assertNotNull(s.retryDestinationPayment(id))
+        waitUntil("retry refused") { PaymentActivityStore.get(retry1)?.status == SonarPaymentActivity.Status.Failed }
+        assertEquals(0, native.count("send"))
+        assertEquals(41L, s.paymentStatus(retry1)!!.feeChangedSats)
+
+        // Try again after reading 41: paid, once.
+        val retry2 = assertNotNull(s.retryDestinationPayment(retry1))
+        waitUntil("paid") { PaymentActivityStore.get(retry2)?.status == SonarPaymentActivity.Status.Paid }
+        assertEquals(1, native.count("send"))
+        assertEquals(listOf(500L), native.sentAmounts)
+        assertNull(s.paymentStatus(retry2)!!.feeChangedSats)
+    }
+
+    /** A fee-inclusive `Max` refused for its fee stays a `Max` on `Try again` (else it could never fit). */
+    @Test
+    fun tryAgainAfterAFeeChangeKeepsAMaxSendAMaxSend() = runBlocking {
+        native.confirmedSats = 1_000
+        native.feeReserveSats = 20
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+
+        val id = assertNotNull(
+            s.beginDestinationPayment("lno1destination", 1_000, "Dest", maxFeeSats = 5, feeFromAmount = true)
+        )
+        waitUntil("refused") { PaymentActivityStore.get(id)?.status == SonarPaymentActivity.Status.Failed }
+        assertEquals(0, native.count("send"))
+        val retry = assertNotNull(s.retryDestinationPayment(id))
+        waitUntil("paid") { PaymentActivityStore.get(retry)?.status == SonarPaymentActivity.Status.Paid }
+        assertEquals(listOf(980L), native.sentAmounts, "the fee still comes out of the amount")
+    }
+
+    /** A chat ⚡PAY has no Try again: the refusal is the toast, nothing is sent, the row fails. */
+    @Test
+    fun aChatPayAboveTheConsentedFeeIsRefusedWithTheNewFee() = runBlocking {
+        native.confirmedSats = 10_000
+        native.feeReserveSats = 9
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+        val chatId = "fee-ceiling-peer-group"
+        seedPayableChat(s, chatId, "lno1peeroffer")
+
+        assertNull(s.sendPay(chatId, 700, maxFeeSats = 2))
+        waitUntil("toast") { s.toast == feeChangedText(9) }
+        val row = PaymentActivityStore.sorted().first { it.peerKey == chatId }
+        assertEquals(SonarPaymentActivity.Status.Failed, row.status)
+        assertEquals(feeChangedText(9), row.failure)
+        assertNull(s.payStatus(row.id), "no ⚡PAY receipt for a payment that never left")
+        assertEquals(0, native.count("send"))
+
+        // Re-opened sheet shows 9; Send with 9 pays.
+        assertNull(s.sendPay(chatId, 700, maxFeeSats = 9))
+        waitUntil("paid") {
+            PaymentActivityStore.sorted().any { it.peerKey == chatId && it.status == SonarPaymentActivity.Status.Paid }
+        }
+        assertEquals(1, native.count("send"))
     }
 
     @Test
@@ -478,7 +570,7 @@ class WalletAppStateTest {
                     .any { it.peerName == "Dest" && it.status == SonarPaymentActivity.Status.Pending && it.walletPaymentId != null }
             }
         }
-        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 500, "Dest"))
+        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 500, "Dest", maxFeeSats = null))
         waitUntil("pending linked") { PaymentActivityStore.get(id)?.walletPaymentId != null }
         val row = PaymentActivityStore.get(id)!!
         assertEquals(SonarPaymentActivity.Status.Pending, row.status, "Pending is not a failure")
@@ -502,7 +594,7 @@ class WalletAppStateTest {
         val s = state()
         s.setupWallet()
         waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
-        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 400, "Dest"))
+        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 400, "Dest", maxFeeSats = null))
         waitUntil("pending linked") { PaymentActivityStore.get(id)?.walletPaymentId != null }
 
         WalletBridge.onBackground()
@@ -527,7 +619,7 @@ class WalletAppStateTest {
         val s = state()
         s.setupWallet()
         waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
-        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 600, "Dest"))
+        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 600, "Dest", maxFeeSats = null))
         waitUntil("failed") { PaymentActivityStore.get(id)?.status == SonarPaymentActivity.Status.Failed }
         val walletId = assertNotNull(PaymentActivityStore.get(id)!!.walletPaymentId, "linked before the send")
 
@@ -572,7 +664,7 @@ class WalletAppStateTest {
                 publishedAtSecs = 0,
             ),
         )
-        assertNull(s.sendPay(chatId, 700))
+        assertNull(s.sendPay(chatId, 700, maxFeeSats = null))
         // The pending branch's last step: everything it does has happened.
         waitUntil("pending branch done") { s.toast == "Payment is on its way — it shows in the chat once it settles." }
         val row = PaymentActivityStore.sorted().first { it.peerKey == chatId && it.walletPaymentId != null }
@@ -618,7 +710,7 @@ class WalletAppStateTest {
         val entered = CountDownLatch(1)
         val proceed = CountDownLatch(1)
         native.onCall = { if (it == "send") { entered.countDown(); proceed.await(5, TimeUnit.SECONDS) } }
-        val sending = async(Dispatchers.Default) { WalletBridge.send("lno1peer", 100, "n") }
+        val sending = async(Dispatchers.Default) { WalletBridge.send("lno1peer", 100, "n", maxFeeSats = null) }
         assertTrue(entered.await(5, TimeUnit.SECONDS))
         assertFailsWith<PaymentInFlightException> { state().setAsideWalletsForAccountReplacement() }
         proceed.countDown()

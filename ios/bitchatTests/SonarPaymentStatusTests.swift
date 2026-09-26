@@ -185,6 +185,38 @@ final class SonarPaymentStatusTests: XCTestCase {
         )
     }
 
+    /// A send refused because the fee rose states the NEW fee where "No
+    /// route" would be — `Try again` pays it, so it must be read first. Only
+    /// a concluded failure reads that way (Compose
+    /// `aFeeChangeIsStatedOnlyOnAFailedPayment`).
+    func testAFeeChangeIsStatedOnlyOnAFailedPayment() {
+        let failed = snPaymentStatus(
+            activity: activity(.failed), live: nil, now: Date(), canRetry: true, feeChangedSats: 40
+        )
+        XCTAssertEqual(failed.phase, .failedSafe)
+        XCTAssertEqual(failed.feeChangedSats, 40)
+        XCTAssertEqual(
+            SNPayStatusCopy.hint(for: failed),
+            "The network fee is now up to \(sonarFormatSats(40)). Nothing was sent — try again to pay it."
+        )
+        XCTAssertEqual(SNPayStatusCopy.actions(failed).map(\.label), ["Try again", "Not now"])
+
+        let paid = snPaymentStatus(
+            activity: activity(.paid), live: nil, now: Date(), canRetry: true, feeChangedSats: 40
+        )
+        XCTAssertNil(paid.feeChangedSats)
+        let inFlight = snPaymentStatus(
+            activity: activity(.pending), live: liveSend(), now: Date(), canRetry: true, feeChangedSats: 40
+        )
+        XCTAssertNil(inFlight.feeChangedSats)
+        let plainFailure = snPaymentStatus(activity: activity(.failed), live: nil, now: Date(), canRetry: true)
+        XCTAssertEqual(
+            SNPayStatusCopy.hint(for: plainFailure),
+            SNPayStatusCopy.hint(.failedSafe, payee: "Café Lumen", sats: 2_100),
+            "any other failure keeps the design's copy"
+        )
+    }
+
     // MARK: Home strip
 
     func testOnlyLivePhasesEverReachTheHomeStrip() {

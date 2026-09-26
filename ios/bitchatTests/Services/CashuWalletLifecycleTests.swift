@@ -117,7 +117,7 @@ final class CashuWalletLifecycleTests: XCTestCase {
         await service.open(nsec: CashuTestFixtures.nsecA)
         await waitUntil { service.connectivity == .online }
 
-        let send = Task { try await service.send(destination: "lno1peer", amountSats: 10, note: "", feeFromAmount: false) }
+        let send = Task { try await service.send(destination: "lno1peer", amountSats: 10, note: "", feeFromAmount: false, maxFeeSats: nil) }
         await waitUntil { native.sendStarted }
         do {
             try await service.release()

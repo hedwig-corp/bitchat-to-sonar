@@ -2393,11 +2393,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // The receipt follows the chat route; the actual payment settles over Lightning.
         mesh = screen.id.startsWith("mesh:"),
         fiatOf = { state.fiatOrNull(it) },
-        onSend = { sats -> scope.launch { state.sendPay(screen.id, sats)?.let { state.toast = it } } },
+        onSend = { sats, maxFee -> scope.launch { state.sendPay(screen.id, sats, maxFee)?.let { state.toast = it } } },
         onClose = { paySheet = false },
         maxSats = state.maxSendableSats(),
-        onSendMax = { sats ->
-            scope.launch { state.sendPay(screen.id, sats, feeFromAmount = true)?.let { state.toast = it } }
+        onSendMax = { sats, maxFee ->
+            scope.launch { state.sendPay(screen.id, sats, maxFee, feeFromAmount = true)?.let { state.toast = it } }
         },
         feeQuote = { sats -> state.quoteChatPayFee(screen.id, sats) },
     )

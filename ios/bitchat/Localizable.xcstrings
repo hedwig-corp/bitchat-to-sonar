@@ -112,6 +112,9 @@
     "Network fee: up to %@" : {
 
     },
+    "The network fee is now up to %@. Nothing was sent — try again to pay it." : {
+
+    },
     "Checking the fee…" : {
 
     },

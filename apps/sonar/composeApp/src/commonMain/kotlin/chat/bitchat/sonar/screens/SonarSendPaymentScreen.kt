@@ -265,17 +265,17 @@ fun SonarSendPaymentScreen(state: SonarAppState, fromLegacy: Boolean = false) {
             balanceSats = balanceSats,
             mesh = contact.nearby,
             fiatOf = { state.fiatOrNull(it) },
-            onSend = { sats ->
+            onSend = { sats, maxFee ->
                 // Route through the chat so the peer still gets the in-chat
                 // ⚡PAY receipt, exactly as paying from inside the chat does.
                 // Detached: this screen pops on the same frame.
-                state.sendPayDetached(contact.chatId, sats, fromLegacy = fromLegacy)
+                state.sendPayDetached(contact.chatId, sats, maxFee, fromLegacy = fromLegacy)
                 state.back()
             },
             onClose = { contactTarget = null },
             maxSats = state.maxSendableSats(fromLegacy),
-            onSendMax = if (fromLegacy) null else { sats ->
-                state.sendPayDetached(contact.chatId, sats, feeFromAmount = true)
+            onSendMax = if (fromLegacy) null else { sats, maxFee ->
+                state.sendPayDetached(contact.chatId, sats, maxFee, feeFromAmount = true)
                 state.back()
             },
             // Fee before confirm: Cashu only (the legacy card keeps its flow).
@@ -300,12 +300,13 @@ fun SonarSendPaymentScreen(state: SonarAppState, fromLegacy: Boolean = false) {
         // runs on the app scope, not here, so popping this picker cannot
         // cancel it. `replaceTop` keeps Back on home: the picker's payment is
         // already gone by then.
-        fun payExternal(sats: Long, feeFromAmount: Boolean) {
+        fun payExternal(sats: Long, maxFeeSats: Long?, feeFromAmount: Boolean) {
             val name = payableDisplayName(destination)
             externalTarget = null
             fixedSats = null
             val activityId = state.beginDestinationPayment(
-                destination, sats, name, fromLegacy = fromLegacy, feeFromAmount = feeFromAmount,
+                destination, sats, name,
+                maxFeeSats = maxFeeSats, fromLegacy = fromLegacy, feeFromAmount = feeFromAmount,
             )
             // Null means the destination was refused before anything was
             // sent (the state toasted why) — stay on the picker to fix it.
@@ -317,10 +318,10 @@ fun SonarSendPaymentScreen(state: SonarAppState, fromLegacy: Boolean = false) {
             mesh = false,
             fixedSats = fixedSats,
             fiatOf = { state.fiatOrNull(it) },
-            onSend = { sats -> payExternal(sats, feeFromAmount = false) },
+            onSend = { sats, maxFee -> payExternal(sats, maxFee, feeFromAmount = false) },
             onClose = { externalTarget = null; fixedSats = null },
             maxSats = state.maxSendableSats(fromLegacy),
-            onSendMax = if (fromLegacy) null else { sats -> payExternal(sats, feeFromAmount = true) },
+            onSendMax = if (fromLegacy) null else { sats, maxFee -> payExternal(sats, maxFee, feeFromAmount = true) },
             destination = destination,
             feeQuote = if (fromLegacy) null else { sats -> state.quoteSendFee(destination, sats) },
         )

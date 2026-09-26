@@ -160,8 +160,17 @@ Shared behaviour, pinned by tests on both platforms:
   amount) the sheet goes back to the offer.
 - The send sheet shows the mint's fee reserve ("Network fee: up to …") before
   the user confirms, re-quoted 400 ms after the amount settles. The quote
-  never connects the wallet and never blocks Send; on any error the line
-  hides.
+  never connects the wallet; on any error the line hides. Send is disabled
+  only while "Checking the fee…" shows.
+- The fee shown is the most the send may pay. Send passes it to the wallet as
+  `maxFeeSats` (0 when the sheet can quote but shows no fee; nil only for the
+  legacy wallet, which has no quote). The send prepares a fresh quote, and if
+  that quote's fee reserve is higher it refuses before the spending call:
+  `SendErrorKind.FeeChanged` / `CashuWalletError.feeChanged`, carrying the new
+  fee. Nothing is spent. The payment fails with "The network fee is now up to
+  N sats…". On the payment status screen **Try again** uses N as the new
+  ceiling. A chat ⚡PAY shows the text as a toast, and the user re-opens the
+  sheet. Unify nearby sends show no fee and have no ceiling yet.
 
 ## Legacy Breez
 

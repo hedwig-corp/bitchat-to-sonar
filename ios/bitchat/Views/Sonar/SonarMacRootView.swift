@@ -678,16 +678,18 @@ private struct MacConversationPane: View {
                 usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
                 quoteFee: store.feeQuoter(forContact: id),
                 onClose: { paySheet = false },
-                onSend: { sats in
+                onSend: { sats, maxFee in
                     Task {
-                        if let message = await store.sendPay(id, sats: sats) {
+                        if let message = await store.sendPay(id, sats: sats, maxFeeSats: maxFee) {
                             showToast(message)
                         }
                     }
                 },
-                onSendMax: { sats in
+                onSendMax: { sats, maxFee in
                     Task {
-                        if let message = await store.sendPay(id, sats: sats, feeFromAmount: true) {
+                        if let message = await store.sendPay(
+                            id, sats: sats, maxFeeSats: maxFee, feeFromAmount: true
+                        ) {
                             showToast(message)
                         }
                     }

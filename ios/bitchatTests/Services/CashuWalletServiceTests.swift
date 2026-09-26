@@ -4,8 +4,9 @@
 //
 // Pins the host-side money rules of the Cashu wallet (`CashuWalletService`,
 // `CashuWallet`, `SonarWalletPaymentReconciler`) against a fake FFI wallet:
-// threading, offline open, offer stability, Pending handling and typed
-// insufficient funds.
+// threading, offline open, offer stability, Pending handling, typed
+// insufficient funds, and the consented fee ceiling (the fee the pay sheet
+// showed is the most a send pays; `Try again` re-asks with the new fee).
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -45,7 +46,7 @@ final class CashuWalletServiceTests: XCTestCase {
 
         await service.open(nsec: CashuTestFixtures.nsecA)
         await waitUntil { service.connectivity == .online && service.balance?.isLive == true }
-        _ = try await service.send(destination: "lno1payee", amountSats: 100, note: "t", feeFromAmount: false)
+        _ = try await service.send(destination: "lno1payee", amountSats: 100, note: "t", feeFromAmount: false, maxFeeSats: nil)
         _ = await service.lookupPayment(id: "quote-1")
         _ = try await service.receiveInvoice(amountSats: 21, description: nil)
         service.setForeground(false)
@@ -161,7 +162,7 @@ final class CashuWalletServiceTests: XCTestCase {
         ledger.recordPending(chatActivity(id: "act-1", sats: 2_100))
 
         // The store's send path: wallet.send, then the reconciler.
-        let result = try await wallet.send(destination: "lno1peer", amountSats: 2_100, note: "Sonar payment act-1", feeFromAmount: false)
+        let result = try await wallet.send(destination: "lno1peer", amountSats: 2_100, note: "Sonar payment act-1", feeFromAmount: false, maxFeeSats: nil)
         XCTAssertEqual(result.status, .pending)
         let first = SonarWalletPaymentReconciler.applySendResult(
             result, activityId: "act-1", ledger: ledger, hasReceipt: { receipts.contains($0) }
@@ -254,7 +255,7 @@ final class CashuWalletServiceTests: XCTestCase {
         )))
         await waitUntil { service.latestUpdate(id: "quote-1")?.status == .complete }
         native.sendStatus = .pending
-        let result = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false)
+        let result = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: nil)
         XCTAssertEqual(result.status, .complete)
         XCTAssertEqual(service.latestUpdate(id: "quote-1")?.status, .complete)
         await service.releaseQuietly()
@@ -273,7 +274,7 @@ final class CashuWalletServiceTests: XCTestCase {
         await waitUntil { service.connectivity == .online }
 
         do {
-            _ = try await service.send(destination: "lno1peer", amountSats: 990, note: "", feeFromAmount: false)
+            _ = try await service.send(destination: "lno1peer", amountSats: 990, note: "", feeFromAmount: false, maxFeeSats: nil)
             XCTFail("expected insufficient funds")
         } catch let error as CashuWalletError {
             XCTAssertEqual(error, .insufficientFunds(amountSats: 990, feeSats: 20, balanceSats: 1_000))
@@ -296,7 +297,7 @@ final class CashuWalletServiceTests: XCTestCase {
         await waitUntil { service.connectivity == .online }
 
         do {
-            _ = try await service.send(destination: "lno1peer", amountSats: 100, note: "", feeFromAmount: false)
+            _ = try await service.send(destination: "lno1peer", amountSats: 100, note: "", feeFromAmount: false, maxFeeSats: nil)
             XCTFail("expected insufficient funds")
         } catch let error as CashuWalletError {
             XCTAssertEqual(error, .insufficientFunds(amountSats: nil, feeSats: nil, balanceSats: nil))
@@ -317,10 +318,164 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.open(nsec: CashuTestFixtures.nsecA)
         await waitUntil { service.connectivity == .online }
 
-        let paid = try await service.send(destination: "lno1peer", amountSats: 1_000, note: "", feeFromAmount: true)
+        let paid = try await service.send(destination: "lno1peer", amountSats: 1_000, note: "", feeFromAmount: true, maxFeeSats: nil)
         XCTAssertEqual(native.preparedAmounts, [1_000, 980])
         XCTAssertEqual(native.sentPrepared.map(\.amountSats), [980])
         XCTAssertEqual(paid.amountSats, 980)
+        await service.releaseQuietly()
+    }
+
+    // MARK: The fee the user consented to (maintainer review, #614)
+
+    private let feeChanged40 = "The network fee is now up to \(sonarFormatSats(40)). Nothing was sent — try again to pay it."
+
+    /// The sheet showed "up to 3 sats"; by the time Send runs, the mint's fee
+    /// reserve for the fresh quote is 40. The send must refuse with the NEW
+    /// fee and never reach the spending call, even though the balance covers it.
+    func testAFeeAboveTheConsentedCeilingIsRefusedWithTheNewFeeAndNothingIsSent() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 40
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        do {
+            _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 3)
+            XCTFail("expected the fee change to be refused")
+        } catch let error as CashuWalletError {
+            XCTAssertEqual(error, .feeChanged(feeSats: 40))
+            XCTAssertEqual(error.errorDescription, feeChanged40)
+        }
+        XCTAssertEqual(native.count("send"), 0, "nothing is spent above the consented fee")
+        await service.releaseQuietly()
+    }
+
+    func testAFeeAtOrBelowTheConsentedCeilingPays() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 3
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 3)
+        _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 10)
+        XCTAssertEqual(native.count("send"), 2, "a fee at or below what was shown pays")
+        await service.releaseQuietly()
+    }
+
+    /// No fee was on screen (quote failed / hidden): ceiling 0, so any fee
+    /// needs a fresh consent — and a free payment needs none.
+    func testAZeroCeilingRefusesAnyFee() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 1
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        do {
+            _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 0)
+            XCTFail("expected the fee change to be refused")
+        } catch let error as CashuWalletError {
+            XCTAssertEqual(error, .feeChanged(feeSats: 1))
+        }
+        XCTAssertEqual(native.count("send"), 0)
+        native.feeReserve = 0
+        _ = try await service.send(destination: "lno1peer", amountSats: 500, note: "", feeFromAmount: false, maxFeeSats: 0)
+        XCTAssertEqual(native.count("send"), 1)
+        await service.releaseQuietly()
+    }
+
+    /// Max: the ceiling applies to the fee of the RE-prepared quote that is
+    /// actually paid.
+    func testMaxChecksTheCeilingAgainstTheFeeItWouldPay() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 1_000
+        native.feeReserve = 25
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online }
+
+        do {
+            _ = try await service.send(destination: "lno1peer", amountSats: 1_000, note: "", feeFromAmount: true, maxFeeSats: 5)
+            XCTFail("expected the fee change to be refused")
+        } catch let error as CashuWalletError {
+            XCTAssertEqual(error, .feeChanged(feeSats: 25))
+        }
+        XCTAssertEqual(native.count("send"), 0)
+        let paid = try await service.send(destination: "lno1peer", amountSats: 1_000, note: "", feeFromAmount: true, maxFeeSats: 25)
+        XCTAssertEqual(paid.amountSats, 975)
+        XCTAssertEqual(native.sentPrepared.map(\.amountSats), [975])
+        await service.releaseQuietly()
+    }
+
+    /// The REAL store call sites: a destination payment begun with the fee the
+    /// sheet showed (3) fails with nothing sent when the mint now wants 40;
+    /// the status screen states the new fee; `Try again` (tapped after
+    /// reading it) holds the retry to THAT fee — a further rise is refused
+    /// again — and the fee the user read is paid.
+    func testADestinationPaymentAboveTheConsentedFeeFailsAndTryAgainPaysTheNewFee() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 40
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        let wallet = CashuWallet(keychain: MockKeychain(), service: service)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        // `.online` is published before the first balance read lands, and the
+        // store refuses a destination payment until the wallet is `.ready`.
+        await waitUntil { service.connectivity == .online && service.balance?.isLive == true }
+        let (store, cleanup) = makeIsolatedSonarAppStore(wallet: wallet)
+        defer { cleanup() }
+
+        let id = try XCTUnwrap(store.beginDestinationPayment("lno1destination", sats: 500, displayName: "Dest", maxFeeSats: 3))
+        await waitUntil { store.paymentActivityLedger.entries[id]?.status == .failed }
+        XCTAssertEqual(native.count("send"), 0, "nothing is spent above the fee the user saw")
+        XCTAssertEqual(store.paymentActivityLedger.entries[id]?.failure, feeChanged40)
+        let status = try XCTUnwrap(store.paymentStatus(id))
+        XCTAssertEqual(status.phase, .failedSafe)
+        XCTAssertEqual(status.feeChangedSats, 40)
+        XCTAssertEqual(SNPayStatusCopy.hint(for: status), feeChanged40, "the status screen states the new fee")
+        XCTAssertTrue(status.canRetry)
+
+        native.feeReserve = 41
+        let retry1 = try XCTUnwrap(store.retryDestinationPayment(id))
+        await waitUntil { store.paymentActivityLedger.entries[retry1]?.status == .failed }
+        XCTAssertEqual(native.count("send"), 0, "the retry's ceiling is the 40 the user read, not anything")
+        XCTAssertEqual(store.paymentStatus(retry1)?.feeChangedSats, 41)
+
+        let retry2 = try XCTUnwrap(store.retryDestinationPayment(retry1))
+        await waitUntil { store.paymentActivityLedger.entries[retry2]?.status == .paid }
+        XCTAssertEqual(native.count("send"), 1)
+        XCTAssertEqual(native.sentPrepared.map(\.amountSats), [500])
+        XCTAssertNil(store.paymentStatus(retry2)?.feeChangedSats)
+        await service.releaseQuietly()
+    }
+
+    /// A fee-inclusive `Max` refused for its fee stays a `Max` on `Try again`
+    /// (else it could never fit the balance).
+    func testTryAgainAfterAFeeChangeKeepsAMaxSendAMaxSend() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 1_000
+        native.feeReserve = 20
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        let wallet = CashuWallet(keychain: MockKeychain(), service: service)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        // `.online` is published before the first balance read lands, and the
+        // store refuses a destination payment until the wallet is `.ready`.
+        await waitUntil { service.connectivity == .online && service.balance?.isLive == true }
+        let (store, cleanup) = makeIsolatedSonarAppStore(wallet: wallet)
+        defer { cleanup() }
+
+        let id = try XCTUnwrap(store.beginDestinationPayment(
+            "lno1destination", sats: 1_000, displayName: "Dest", maxFeeSats: 5, feeFromAmount: true
+        ))
+        await waitUntil { store.paymentActivityLedger.entries[id]?.status == .failed }
+        XCTAssertEqual(native.count("send"), 0)
+        let retry = try XCTUnwrap(store.retryDestinationPayment(id))
+        await waitUntil { store.paymentActivityLedger.entries[retry]?.status == .paid }
+        XCTAssertEqual(native.sentPrepared.map(\.amountSats), [980], "the fee still comes out of the amount")
         await service.releaseQuietly()
     }
 

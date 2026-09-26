@@ -29,6 +29,12 @@ enum class SendErrorKind {
     NotReady,
     /** The payment itself failed; nothing left the wallet. */
     Failed,
+    /**
+     * The fee of the quote about to be paid is above the fee the user agreed
+     * to on the send sheet. Nothing was sent; [SendResult.quotedFeeSats] is
+     * the new fee to ask about.
+     */
+    FeeChanged,
 }
 
 /** Result of a wallet send: success flag plus the Lightning preimage and the
@@ -57,6 +63,11 @@ data class SendResult(
     val pending: Boolean = false,
     /** Typed reason for a refusal; null on success/pending. */
     val errorKind: SendErrorKind? = null,
+    /**
+     * With [SendErrorKind.FeeChanged]: the mint's fee reserve for the quote
+     * that was refused — the fee the user has to agree to next. Null otherwise.
+     */
+    val quotedFeeSats: Long? = null,
 )
 
 /**
@@ -176,19 +187,29 @@ object WalletBridge {
     /**
      * The mint's fee reserve for paying [amountSats] to [destination]
      * (amountSats=0 ⇒ the invoice's own amount), via FFI `prepare_send`. The
-     * quote is discarded — [send] prepares again. Off the caller's thread.
+     * quote is discarded — [send] prepares again, and the fee shown from this
+     * one is the ceiling that send enforces (`maxFeeSats`). Off the caller's
+     * thread.
      */
     suspend fun quoteFee(destination: String, amountSats: Long): WalletOutcome<Long> =
         engine.quoteFee(destination, amountSats)
 
-    /** Pay a destination. amountSats=0 ⇒ amount from the invoice. See [SendResult.pending]. */
+    /**
+     * Pay a destination. amountSats=0 ⇒ amount from the invoice. See [SendResult.pending].
+     *
+     * [maxFeeSats] is required on purpose: every caller states the fee the
+     * user agreed to (the send sheet's "up to N", 0 when it showed none), or
+     * null when no fee was ever shown for this path. A higher fee is refused
+     * as [SendErrorKind.FeeChanged] — see [CashuWalletEngine.send].
+     */
     suspend fun send(
         destination: String,
         amountSats: Long,
         note: String,
+        maxFeeSats: Long?,
         feeFromAmount: Boolean = false,
         onQuoted: ((paymentId: String) -> Unit)? = null,
-    ): SendResult = engine.send(destination, amountSats, note, feeFromAmount, onQuoted)
+    ): SendResult = engine.send(destination, amountSats, note, feeFromAmount, maxFeeSats, onQuoted)
 
     suspend fun lookupPayment(id: String): CashuPayment? = engine.lookupPayment(id)
 

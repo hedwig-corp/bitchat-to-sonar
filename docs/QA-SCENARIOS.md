@@ -374,8 +374,9 @@ real mint and need the maintainer's approval of the amounts.
 - **Steps:** with fiat display on, Send → paste an invoice or offer → open the
   confirm sheet; change the amount.
 - **Expect:** "Checking the fee…" then "Network fee: up to N **sats**" (never
-  "CHF 0.00"), re-quoted after the amount settles; Send is never blocked by
-  the quote. The footer reads "Pays this Lightning invoice." / "Pays this
+  "CHF 0.00"), re-quoted after the amount settles; Send waits only while
+  "Checking the fee…" shows (a failed quote hides the line and does not block
+  — see QA-095). The footer reads "Pays this Lightning invoice." / "Pays this
   Bolt12 offer.", never "Pays lnbc…'s wallet".
 - **Guard:** `CashuWalletUXTests.testPaySheetFeeLineIsAlwaysInSats`,
   `testFeeLineShowsTheQuotedFee`, `testPaySheetFooterNamesInvoicesAndOffersNotPeople`,
@@ -604,6 +605,35 @@ real mint and need the maintainer's approval of the amounts.
 - **Origin:** #614 review (H3) — once a Cashu offer existed, the descriptor
   publish re-claimed the public handle with it, retargeting its DNS record at
   the mint with no confirmation, and nothing ever wrote the Breez offer back.
+
+### QA-095 — The fee paid never exceeds the fee shown
+- **Platforms:** both (manual, fake mint: raise the mint's `fee_reserve`
+  between the sheet's quote and Send, e.g. restart `cdk-mintd` with a higher
+  `[fake_wallet]` `reserve_fee_min`; unit tests drive it with a scripted
+  reserve)
+- **Steps:** Send → paste an offer → type an amount, wait for "Network fee:
+  up to N sats" → raise the reserve → Send. On the status screen tap **Try
+  again**. Repeat from a chat ⚡PAY sheet; and once with the mint stopped
+  while the sheet quotes (no fee line), then started before Send.
+- **Expect:** nothing is sent; the payment fails with "The network fee is now
+  up to M sats. Nothing was sent — try again to pay it." — on the status
+  screen in place of "No route…", as a toast for a chat pay. **Try again**
+  pays with M as the new ceiling (a further rise is refused again). With no
+  fee on screen, any non-zero fee is refused the same way. The Send button
+  is disabled while "Checking the fee…" shows.
+- **Guard:** `CashuWalletEngineTest.aFeeAboveTheConsentedCeilingIsRefusedWithTheNewFeeAndNothingIsSent`,
+  `WalletAppStateTest.aDestinationPaymentAboveTheConsentedFeeFailsWithTheNewFeeAndTryAgainPaysIt`,
+  `WalletAppStateTest.aChatPayAboveTheConsentedFeeIsRefusedWithTheNewFee`,
+  `PaySheetFeeConsentTest`,
+  `CashuWalletServiceTests.testAFeeAboveTheConsentedCeilingIsRefusedWithTheNewFeeAndNothingIsSent`,
+  `CashuWalletServiceTests.testADestinationPaymentAboveTheConsentedFeeFailsAndTryAgainPaysTheNewFee`,
+  `CashuWalletUXTests.testTheConsentedCeilingIsTheFeeOnScreen`,
+  `SonarPaymentStatusTests.testAFeeChangeIsStatedOnlyOnAFailedPayment`
+- **Not covered:** the Unify nearby sheet shows no fee (its offer is read over
+  BLE after Send), so a Unify send has no ceiling on either platform.
+- **Origin:** #614 maintainer review — the sheet's "up to N" came from a
+  discarded quote and Send re-prepared and paid whatever the new reserve was,
+  checked only against the balance.
 
 ## Open questions (need a product decision, not a fix)
 

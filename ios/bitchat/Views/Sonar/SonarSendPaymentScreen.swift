@@ -262,11 +262,11 @@ struct SonarSendPaymentScreen: View {
                     usesFeeInclusiveMax: store.usesFeeInclusiveMax(source),
                     quoteFee: store.feeQuoter(forContact: contact.id, source: source),
                     onClose: { contactTarget = nil },
-                    onSend: { sats in
-                        payContact(contact, sats: sats, feeFromAmount: false)
+                    onSend: { sats, maxFee in
+                        payContact(contact, sats: sats, maxFeeSats: maxFee, feeFromAmount: false)
                     },
-                    onSendMax: { sats in
-                        payContact(contact, sats: sats, feeFromAmount: true)
+                    onSendMax: { sats, maxFee in
+                        payContact(contact, sats: sats, maxFeeSats: maxFee, feeFromAmount: true)
                     }
                 )
             }
@@ -303,11 +303,11 @@ struct SonarSendPaymentScreen: View {
                     destination: destination,
                     quoteFee: store.feeQuoter(destination: destination, source: source),
                     onClose: { externalTarget = nil; fixedSats = nil },
-                    onSend: { sats in
-                        payExternal(destination, sats: sats, feeFromAmount: false)
+                    onSend: { sats, maxFee in
+                        payExternal(destination, sats: sats, maxFeeSats: maxFee, feeFromAmount: false)
                     },
-                    onSendMax: { sats in
-                        payExternal(destination, sats: sats, feeFromAmount: true)
+                    onSendMax: { sats, maxFee in
+                        payExternal(destination, sats: sats, maxFeeSats: maxFee, feeFromAmount: true)
                     }
                 )
             }
@@ -319,10 +319,12 @@ struct SonarSendPaymentScreen: View {
     /// so the outcome must go to the app-level toast (rendered by
     /// SonarRootView). A view-local toast here is written to a dismissed view
     /// and never appears — the payment fails silently.
-    private func payContact(_ contact: SNPayableContact, sats: Int64, feeFromAmount: Bool) {
+    private func payContact(_ contact: SNPayableContact, sats: Int64, maxFeeSats: Int64?, feeFromAmount: Bool) {
         let from = source
         Task {
-            if let message = await store.sendPay(contact.id, sats: sats, source: from, feeFromAmount: feeFromAmount) {
+            if let message = await store.sendPay(
+                contact.id, sats: sats, maxFeeSats: maxFeeSats, source: from, feeFromAmount: feeFromAmount
+            ) {
                 store.showToast(message)
             }
         }
@@ -334,7 +336,7 @@ struct SonarSendPaymentScreen: View {
     /// on the store, not here, so popping this picker cannot cancel it.
     /// `replaceTop` keeps Back on home: the picker's payment is already gone
     /// by then.
-    private func payExternal(_ destination: String, sats: Int64, feeFromAmount: Bool) {
+    private func payExternal(_ destination: String, sats: Int64, maxFeeSats: Int64?, feeFromAmount: Bool) {
         let name = SNExternalDestination.displayName(destination)
         externalTarget = nil
         fixedSats = nil
@@ -342,6 +344,7 @@ struct SonarSendPaymentScreen: View {
             destination,
             sats: sats,
             displayName: name,
+            maxFeeSats: maxFeeSats,
             source: source,
             feeFromAmount: feeFromAmount
         ) else {

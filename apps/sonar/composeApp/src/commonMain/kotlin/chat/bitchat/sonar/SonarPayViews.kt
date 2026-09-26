@@ -95,10 +95,32 @@ internal fun payFooter(destination: String?, peerName: String, mesh: Boolean): P
 }
 
 /** The fee line under the amount (Cashu wallet only). */
-private sealed interface FeeLine {
+internal sealed interface FeeLine {
     data object Hidden : FeeLine
     data object Checking : FeeLine
     data class Known(val sats: Long) : FeeLine
+}
+
+/**
+ * Send waits on the fee line only while a quote is in flight (the debounce
+ * plus one `prepare_send`): tapping Send then would consent to a fee the user
+ * has not seen yet. A hidden line (no quote, or the quote failed) does not
+ * block — [consentedFeeCeiling] makes that send ask again instead.
+ */
+internal fun feeBlocksSend(line: FeeLine, hasQuoter: Boolean): Boolean =
+    hasQuoter && line == FeeLine.Checking
+
+/**
+ * The fee the user agrees to by tapping Send — what the wallet may spend on
+ * fees at most (`WalletBridge.send` `maxFeeSats`). The fee on screen when one
+ * is; 0 when the sheet can quote but shows no fee (quote failed or still
+ * pending), so any non-zero fee is refused and asked about again; null when
+ * the sheet has no quoter at all (legacy wallet), i.e. no ceiling.
+ */
+internal fun consentedFeeCeiling(line: FeeLine, hasQuoter: Boolean): Long? = when {
+    !hasQuoter -> null
+    line is FeeLine.Known -> line.sats
+    else -> 0L
 }
 
 /**
@@ -116,7 +138,12 @@ fun PaySheet(
     balanceSats: Long,
     mesh: Boolean,
     fiatOf: (Long) -> String?,
-    onSend: (Long) -> Unit,
+    /**
+     * Send [sats] with the fee the user agreed to ([consentedFeeCeiling]):
+     * pass it to the wallet send as `maxFeeSats` — null means no fee was
+     * ever shown (no [feeQuote]).
+     */
+    onSend: (sats: Long, maxFeeSats: Long?) -> Unit,
     onClose: () -> Unit,
     /**
      * Amount already fixed by the destination — a scanned Lightning invoice
@@ -135,7 +162,7 @@ fun PaySheet(
      * Called instead of [onSend] when the amount is still the `Max` proposal,
      * so the wallet may take the fee out of the amount. Null: [onSend].
      */
-    onSendMax: ((Long) -> Unit)? = null,
+    onSendMax: ((sats: Long, maxFeeSats: Long?) -> Unit)? = null,
     /**
      * The raw destination this sheet pays (an invoice, offer or address), or
      * null for a contact. Picks the footer copy — see [payFooter].
@@ -145,7 +172,9 @@ fun PaySheet(
      * The mint's fee reserve for sending the given amount, or null when there
      * is none to show. Non-null only for the Cashu (primary) wallet: the sheet
      * then shows "Checking the fee…" / "Network fee: up to …", re-quoted
-     * [FEE_QUOTE_DEBOUNCE_MS] after the amount settles. It never gates Send.
+     * [FEE_QUOTE_DEBOUNCE_MS] after the amount settles. Send waits only while
+     * it is checking ([feeBlocksSend]), and the fee shown is the most the
+     * send may pay ([consentedFeeCeiling]).
      */
     feeQuote: (suspend (Long) -> Long?)? = null,
 ) {
@@ -303,10 +332,14 @@ fun PaySheet(
 
                 // bc-sheetactions
                 Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)) {
-                    SendButton(mesh = mesh, enabled = can) {
-                        if (can) {
+                    val hasQuoter = feeQuote != null
+                    val sendable = can && !feeBlocksSend(feeLine, hasQuoter)
+                    SendButton(mesh = mesh, enabled = sendable) {
+                        if (sendable) {
+                            // The fee on screen at the tap is the consent.
+                            val maxFee = consentedFeeCeiling(feeLine, hasQuoter)
                             val viaMax = onSendMax
-                            if (maxPicked && viaMax != null) viaMax(sats) else onSend(sats)
+                            if (maxPicked && viaMax != null) viaMax(sats, maxFee) else onSend(sats, maxFee)
                             onClose()
                         }
                     }

@@ -109,6 +109,36 @@ class PaymentStatusTest {
         )
     }
 
+    /**
+     * A send refused because the fee rose carries the new fee, so the screen
+     * can state it before `Try again` pays it — but only while the row is a
+     * concluded failure: a row that settled or is still in flight never
+     * reads as "the fee changed".
+     */
+    @Test
+    fun aFeeChangeIsStatedOnlyOnAFailedPayment() {
+        val failed = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Failed, settledAtSecs = 1_010),
+            live = null, nowSecs = 2_000, canRetry = true, feeChangedSats = 40,
+        )
+        assertEquals(PayPhase.FailedSafe, failed.phase)
+        assertEquals(40L, failed.feeChangedSats)
+        assertEquals(PayAction.Effect.Retry, PayStatusCopy.actions(failed).first().effect)
+
+        val paid = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Paid, settledAtSecs = 1_004),
+            live = null, nowSecs = 2_000, canRetry = true, feeChangedSats = 40,
+        )
+        assertNull(paid.feeChangedSats)
+        val inFlight = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Pending), live(), nowSecs = 1_001, canRetry = true, feeChangedSats = 40,
+        )
+        assertNull(inFlight.feeChangedSats)
+        assertNull(
+            paymentStatusOf(activity(SonarPaymentActivity.Status.Failed), null, 2_000, canRetry = true).feeChangedSats
+        )
+    }
+
     @Test
     fun aPendingRowWithNoLiveSendIsUnknownNotFailed() {
         // The process died mid-send. We genuinely cannot say the payment

@@ -46,6 +46,8 @@ interface OfferBackupRelay {
  *    re-sent: its outcome arrives as a [WalletPaymentEvent] with the same id.
  *  - Affordability is checked against the mint's REAL fee reserve before
  *    `send`; a shortfall is the typed [SendErrorKind.InsufficientFunds].
+ *  - The fee paid never exceeds the fee the user agreed to on the send sheet:
+ *    a higher reserve is refused as [SendErrorKind.FeeChanged] before `send`.
  *  - The wallet is not disconnected while a send is in flight.
  */
 class CashuWalletEngine(
@@ -227,9 +229,10 @@ class CashuWalletEngine(
      * The mint's fee RESERVE for paying [amountSats] to [destination] ([amountSats]
      * 0: the invoice's own amount) — the most the payment can cost on top of
      * the amount. Prices only: the melt quote is discarded (`send` prepares
-     * its own), nothing is spent and no proofs are reserved. Never connects —
-     * an offline wallet answers [SendErrorKind.Offline] and the UI hides the
-     * line; the send path does its own connect.
+     * its own, and refuses it if its fee exceeds the one shown from this
+     * quote — `maxFeeSats`), nothing is spent and no proofs are reserved.
+     * Never connects — an offline wallet answers [SendErrorKind.Offline] and
+     * the UI hides the line; the send path does its own connect.
      */
     suspend fun quoteFee(destination: String, amountSats: Long): WalletOutcome<Long> = withContext(io) {
         val n = native ?: return@withContext notReady()
@@ -260,6 +263,14 @@ class CashuWalletEngine(
      * amount. [feeFromAmount] is the Cashu `Max`: prepare at [amountSats]
      * (the full balance), subtract the quoted fee reserve, prepare again.
      *
+     * [maxFeeSats] is the fee the user agreed to — the "Network fee: up to N"
+     * the send sheet showed, or 0 when it showed none. When the fee of the
+     * quote about to be paid is higher (the mint re-quoted since the sheet
+     * priced it), nothing is spent: the result is [SendErrorKind.FeeChanged]
+     * carrying the new fee in [SendResult.quotedFeeSats], so the UI can ask
+     * again. Null = no ceiling: the legacy wallet and paths that never showed
+     * a fee (the fee is then only checked against the balance).
+     *
      * The result is one of: ok (Complete, with preimage), pending (in flight —
      * NOT a failure, never retry it), or a typed failure.
      */
@@ -268,6 +279,7 @@ class CashuWalletEngine(
         amountSats: Long,
         note: String,
         feeFromAmount: Boolean = false,
+        maxFeeSats: Long? = null,
         onQuoted: ((paymentId: String) -> Unit)? = null,
     ): SendResult = withContext(io) {
         val n = native ?: return@withContext SendResult(
@@ -292,6 +304,13 @@ class CashuWalletEngine(
                 if (prepared.amountSats + fee > balance) {
                     return@withContext insufficient(prepared.amountSats, fee, balance)
                 }
+            }
+            // The fee the user saw is a promise: a higher reserve on the quote
+            // about to be paid is refused here, BEFORE the spending call and
+            // before the quote id is handed out. The quote is only a price —
+            // abandoning it spends and reserves nothing.
+            if (maxFeeSats != null && fee > maxFeeSats) {
+                return@withContext feeChanged(fee)
             }
             // The payment's id IS the quote id. Hand it out before the one
             // spending call so a caller can link its record first: if the
@@ -580,6 +599,13 @@ class CashuWalletEngine(
         }
     }
 
+    private fun feeChanged(fee: Long) = SendResult(
+        ok = false,
+        error = feeChangedMessage(fee),
+        errorKind = SendErrorKind.FeeChanged,
+        quotedFeeSats = fee,
+    )
+
     private fun insufficient(amount: Long, fee: Long, balance: Long) = SendResult(
         ok = false,
         error = SpendableBalance.insufficientMessage(amount, fee, balance),
@@ -637,6 +663,11 @@ class CashuWalletEngine(
         const val UNSUPPORTED_MESSAGE = "This kind of payment isn't supported yet."
         const val PAYMENT_FAILED_MESSAGE = "Payment failed — you were not charged."
         const val INVOICE_AMOUNT_MESSAGE = "Enter an amount above zero."
+
+        /** English fallback for [SendErrorKind.FeeChanged]; the app shows the localized resource. */
+        fun feeChangedMessage(feeSats: Long): String =
+            "The network fee is now up to ${chat.bitchat.sonar.feeLineAmount(feeSats)}. " +
+                "Nothing was sent — try again to pay it."
     }
 }
 

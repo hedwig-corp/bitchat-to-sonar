@@ -59,7 +59,7 @@ final class CashuWalletUXTests: XCTestCase {
         XCTAssertEqual(native.count("send"), 0, "a quote must never pay")
         XCTAssertEqual(native.mainThreadCalls, [], "FFI calls ran on the main thread")
 
-        _ = try await wallet.send(destination: "lno1peeroffer", amountSats: 500, note: nil, feeFromAmount: false)
+        _ = try await wallet.send(destination: "lno1peeroffer", amountSats: 500, note: nil, feeFromAmount: false, maxFeeSats: nil)
         XCTAssertEqual(native.preparedAmounts, [500, 500], "send prepares again; the quote is never reused")
         XCTAssertEqual(native.sentPrepared.map(\.quoteId), ["quote-2"])
         await releaseQuietly(service)
@@ -158,6 +158,47 @@ final class CashuWalletUXTests: XCTestCase {
         let noQuoter = await SNFeeQuote.resolve(sats: 500, quote: nil, debounceNanos: 0)
         XCTAssertEqual(noQuoter, .hidden)
         XCTAssertEqual(asked.values, [])
+    }
+
+    // MARK: Fee consent (maintainer review, #614)
+
+    /// The fee on screen is the most the send may pay; with a quoter but no
+    /// fee on screen the user agreed to none (any fee is asked about again);
+    /// with no quoter (legacy wallet) no fee was ever shown — no ceiling.
+    func testTheConsentedCeilingIsTheFeeOnScreen() {
+        XCTAssertEqual(SNFeeQuote.consentedCeiling(.quoted(3), hasQuoter: true), 3)
+        XCTAssertEqual(SNFeeQuote.consentedCeiling(.quoted(0), hasQuoter: true), 0)
+        XCTAssertEqual(SNFeeQuote.consentedCeiling(.hidden, hasQuoter: true), 0)
+        XCTAssertEqual(SNFeeQuote.consentedCeiling(.checking, hasQuoter: true), 0)
+        XCTAssertNil(SNFeeQuote.consentedCeiling(.hidden, hasQuoter: false))
+        XCTAssertNil(SNFeeQuote.consentedCeiling(.quoted(3), hasQuoter: false))
+    }
+
+    /// Send waits only while the fee is being checked — never on a failed
+    /// quote (that send asks again instead), never without a quoter.
+    func testSendWaitsOnlyWhileTheFeeIsChecking() {
+        XCTAssertTrue(SNFeeQuote.blocksSend(.checking, hasQuoter: true))
+        XCTAssertFalse(SNFeeQuote.blocksSend(.quoted(3), hasQuoter: true))
+        XCTAssertFalse(SNFeeQuote.blocksSend(.hidden, hasQuoter: true))
+        XCTAssertFalse(SNFeeQuote.blocksSend(.checking, hasQuoter: false))
+    }
+
+    /// A contact pay on the primary wallet always has a quoter, even before
+    /// the contact's offer is cached: the quote then fails, the sheet shows
+    /// no fee, and the send consents to none — instead of the old "no quoter,
+    /// no ceiling" that paid any fee unseen. The legacy wallet has none.
+    func testAContactSheetOnThePrimaryWalletAlwaysQuotes() async throws {
+        let (store, cleanup) = makeIsolatedSonarAppStore()
+        defer { cleanup() }
+        let quoter = try XCTUnwrap(store.feeQuoter(forContact: "no-offer-cached-yet"))
+        XCTAssertNil(store.feeQuoter(forContact: "no-offer-cached-yet", source: .legacy))
+        do {
+            _ = try await quoter(500)
+            XCTFail("no offer cached: the quote must fail (fee line hidden)")
+        } catch {}
+        let state = await SNFeeQuote.resolve(sats: 500, quote: quoter, debounceNanos: 0)
+        XCTAssertEqual(state, .hidden)
+        XCTAssertEqual(SNFeeQuote.consentedCeiling(state ?? .checking, hasQuoter: true), 0)
     }
 
     /// The debounce: an amount the user typed past (its task cancelled by
@@ -382,7 +423,7 @@ final class CashuWalletUXTests: XCTestCase {
             fiatText: { _ in nil },
             destination: destination,
             onClose: {},
-            onSend: { _ in }
+            onSend: { _, _ in }
         ).directNote
     }
 

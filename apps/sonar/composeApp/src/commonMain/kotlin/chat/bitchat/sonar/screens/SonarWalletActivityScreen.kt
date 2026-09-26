@@ -416,6 +416,8 @@ internal fun receiveInvoiceErrorMessage(kind: SendErrorKind): StringResource = w
     SendErrorKind.Unsupported -> Res.string.this_kind_of_payment_isn_t_supported_yet
     SendErrorKind.InsufficientFunds,
     SendErrorKind.InvalidDestination,
+    // A send-only refusal; a receive never raises it.
+    SendErrorKind.FeeChanged,
     SendErrorKind.Failed -> Res.string.couldn_t_create_the_invoice_try_again
 }
 

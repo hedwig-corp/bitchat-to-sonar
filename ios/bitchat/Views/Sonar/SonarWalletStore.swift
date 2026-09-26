@@ -205,12 +205,20 @@ protocol SonarWalletProviding: AnyObject {
     /// out of `amountSats` instead of on top of it. A returned payment with
     /// `status == .pending` is in flight, NOT failed; its outcome arrives
     /// through `paymentUpdates()` with the same id.
+    ///
+    /// `maxFeeSats` is the fee the user agreed to on the send sheet (the
+    /// "up to N" it showed, 0 when it showed none); a wallet that quotes fees
+    /// refuses a higher one with `CashuWalletError.feeChanged` before paying.
+    /// nil = no fee was ever shown for this path. Required on purpose, so
+    /// every caller states it. Wallets without a fee quote (legacy Breez)
+    /// have no sheet fee and are always called with nil.
     @discardableResult
     func send(
         destination: String,
         amountSats: Int64,
         note: String?,
-        feeFromAmount: Bool
+        feeFromAmount: Bool,
+        maxFeeSats: Int64?
     ) async throws -> SonarWalletPayment
 
     /// The reusable receive offer (creating it the first time if needed).
@@ -222,7 +230,8 @@ protocol SonarWalletProviding: AnyObject {
     /// Price a send WITHOUT paying: the most the payment can cost on top of
     /// `amountSats` (Cashu: the mint's fee reserve from `prepareSend`). Shown
     /// on the send confirmation sheet only; the quote is discarded and `send`
-    /// prepares again, so a stale quote can never be paid. `amountSats` 0 lets
+    /// prepares again, so a stale quote can never be paid — the fee shown is
+    /// the `maxFeeSats` that send holds the new quote to. `amountSats` 0 lets
     /// an invoice speak for its own amount. Wallets without a quote throw.
     func quoteFee(destination: String, amountSats: Int64) async throws -> Int64
 
@@ -256,9 +265,10 @@ protocol SonarWalletProviding: AnyObject {
 }
 
 extension SonarWalletProviding {
+    /// A plain send with no fee ceiling — for paths that never show a fee.
     @discardableResult
     func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
-        try await send(destination: destination, amountSats: amountSats, note: note, feeFromAmount: false)
+        try await send(destination: destination, amountSats: amountSats, note: note, feeFromAmount: false, maxFeeSats: nil)
     }
 
     var connectivity: SonarWalletConnectivity { .unavailable }
@@ -368,7 +378,8 @@ final class UnconfiguredWallet: SonarWalletProviding {
         destination: String,
         amountSats: Int64,
         note: String?,
-        feeFromAmount: Bool
+        feeFromAmount: Bool,
+        maxFeeSats: Int64?
     ) async throws -> SonarWalletPayment {
         throw WalletError.notConfigured
     }

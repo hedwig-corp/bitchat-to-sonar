@@ -611,16 +611,18 @@ struct SonarDMScreenContent: View {
                 usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
                 quoteFee: store.feeQuoter(forContact: peerId),
                 onClose: { paySheet = false },
-                onSend: { sats in
+                onSend: { sats, maxFee in
                     Task {
-                        if let message = await store.sendPay(peerId, sats: sats) {
+                        if let message = await store.sendPay(peerId, sats: sats, maxFeeSats: maxFee) {
                             showToast(message)
                         }
                     }
                 },
-                onSendMax: { sats in
+                onSendMax: { sats, maxFee in
                     Task {
-                        if let message = await store.sendPay(peerId, sats: sats, feeFromAmount: true) {
+                        if let message = await store.sendPay(
+                            peerId, sats: sats, maxFeeSats: maxFee, feeFromAmount: true
+                        ) {
                             showToast(message)
                         }
                     }

@@ -190,6 +190,7 @@
   "Tap someone to chat": "tap_someone_to_chat",
   "That key couldn't be imported. Check you pasted the full nsec1... key.": "that_key_couldn_t_be_imported_check_you",
   "That payment address can't be paid.": "that_payment_address_can_t_be_paid",
+  "The network fee is now up to %@. Nothing was sent — try again to pay it.": "the_network_fee_is_now_up_to_nothing",
   "The old wallet couldn't be removed. Restart Sonar and try again.": "the_old_wallet_couldn_t_be_removed",
   "The old wallet has a refund waiting to be claimed.": "the_old_wallet_has_a_refund_waiting_to",
   "This ": "this",

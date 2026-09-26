@@ -630,10 +630,13 @@ final class LegacyBreezWallet: ObservableObject, SonarWalletProviding {
         destination: String,
         amountSats: Int64,
         note: String?,
-        feeFromAmount: Bool
+        feeFromAmount: Bool,
+        maxFeeSats: Int64?
     ) async throws -> SonarWalletPayment {
         // Breez `Max` keeps the 0.5% reserve (SonarSpendableBalance); the
         // fee-from-amount mode is a Cashu mechanism and is ignored here.
+        // `maxFeeSats` too: this wallet has no fee quote, so its pay sheet
+        // shows no fee and every caller passes nil.
         let payment = try await bridge.send(destination: destination, amountSats: amountSats, note: note ?? "")
         refreshSnapshotSoon()
         return SonarWalletPayment(

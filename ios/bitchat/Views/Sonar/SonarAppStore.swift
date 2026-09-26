@@ -1425,6 +1425,15 @@ final class SonarAppStore: ObservableObject {
     private var cancelledPayments: Set<String> = []
     /// Which wallet each live external payment was sent from (memory only).
     private var paymentSources: [String: SNPaymentSource] = [:]
+    /// External payments sent as a fee-inclusive `Max` (so `Try again` keeps it).
+    private var paymentFeeFromAmount: Set<String> = []
+    /// The fee ceiling each external payment was sent with — what the send
+    /// sheet showed. Absent = no ceiling (legacy wallet). `Try again` reuses it.
+    private var paymentFeeCeilings: [String: Int64] = [:]
+    /// External payments the wallet refused because the fee rose above the
+    /// one the user agreed to, with the NEW fee. The status screen states it,
+    /// and `Try again` — tapped after reading it — sends with it as the ceiling.
+    private var paymentFeeChanged: [String: Int64] = [:]
     /// The Unify send whose sheet is waiting on a pending outcome.
     private var unifyPendingActivity: (peerId: String, activityId: String, sats: Int64)?
     /// Invalidates in-flight toast dismissals when a newer toast is shown.
@@ -9554,10 +9563,19 @@ final class SonarAppStore: ObservableObject {
 
     /// Fee quote for paying a contact: priced against the BOLT12 offer
     /// `sendPay` will use. Cache-only — no descriptor fetch from a sheet
-    /// render; nil (no fee line) until the offer is known.
+    /// render. The offer is looked up when the sheet quotes (Compose
+    /// `quoteChatPayFee` parity); with none cached yet the quote throws and
+    /// the sheet shows no fee — which then consents to NO fee (`SNFeeQuote.
+    /// consentedCeiling`), so a paid route is asked about again rather than
+    /// paid unseen. Primary wallet only: nil for the legacy wallet (no quote).
     func feeQuoter(forContact id: String, source: SNPaymentSource = .primary) -> SNFeeQuoter? {
-        guard source == .primary, let offer = cachedPaymentOffer(id) else { return nil }
-        return feeQuoter(destination: offer, source: source)
+        guard source == .primary else { return nil }
+        return { [weak self] sats in
+            guard let self, let offer = self.cachedPaymentOffer(id) else {
+                throw UnconfiguredWallet.WalletError.notConfigured
+            }
+            return try await Self.feeQuoter(wallet: self.wallet, destination: offer)(sats)
+        }
     }
 
     /// A one-off BOLT11 invoice on the primary wallet, for the Receive sheet.
@@ -9808,11 +9826,15 @@ final class SonarAppStore: ObservableObject {
     /// a toast). The send itself runs detached on the store's own task, so
     /// leaving the status screen — or the picker popping out from under it —
     /// cannot cancel a payment in flight.
+    ///
+    /// `maxFeeSats` is the fee the user agreed to on the sheet (nil = none
+    /// was shown — legacy wallet); see `SonarWalletProviding.send`.
     @discardableResult
     func beginDestinationPayment(
         _ destination: String,
         sats: Int64,
         displayName: String,
+        maxFeeSats: Int64?,
         source: SNPaymentSource = .primary,
         feeFromAmount: Bool = false
     ) -> String? {
@@ -9848,6 +9870,8 @@ final class SonarAppStore: ObservableObject {
         ))
         paymentDestinations[activityId] = dest
         paymentSources[activityId] = source
+        if feeFromAmount { paymentFeeFromAmount.insert(activityId) }
+        if let maxFeeSats { paymentFeeCeilings[activityId] = maxFeeSats }
         livePayments[activityId] = SNLivePayment(
             id: activityId,
             payeeName: payeeName,
@@ -9884,7 +9908,8 @@ final class SonarAppStore: ObservableObject {
                     destination: dest,
                     amountSats: amountForWallet,
                     note: "Sonar payment \(activityId)",
-                    feeFromAmount: feeFromAmount
+                    feeFromAmount: feeFromAmount,
+                    maxFeeSats: maxFeeSats
                 )
                 let outcome = SonarWalletPaymentReconciler.applySendResult(
                     payment,
@@ -9902,13 +9927,18 @@ final class SonarAppStore: ObservableObject {
                 }
                 self.handlePaymentOutcome(outcome)
             } catch {
+                // Recorded BEFORE the ledger publishes the failure, so the
+                // status screen's re-render already states the new fee.
+                if case .feeChanged(let fee) = error as? CashuWalletError {
+                    self.paymentFeeChanged[activityId] = fee
+                }
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 SecureLogger.error("Sonar destination payment failed: \(error)", category: .session)
                 // The status screen states the failure in full, and the home
                 // strip clears on a terminal state — so without this a user who
                 // walked away from the screen would never learn it failed.
                 if self.path.last != .paymentStatus(activityId) {
-                    self.showToast("Payment failed: \(error.localizedDescription)")
+                    self.showToast(Self.sendFailureToast(error))
                 }
             }
             // Terminal: drop out of the live set so the home strip clears and
@@ -9923,6 +9953,11 @@ final class SonarAppStore: ObservableObject {
     /// destination as a fresh activity. Returns the new activity id, or nil
     /// when the destination is no longer known (a relaunch drops it — the
     /// ledger only ever stored its hash).
+    ///
+    /// The fee ceiling is the one the user last saw: the NEW fee when the
+    /// send was refused because the fee rose (the status screen states it,
+    /// and tapping `Try again` after reading it is the consent), else the fee
+    /// the sheet showed. A `Max` send stays a `Max` send.
     @discardableResult
     func retryDestinationPayment(_ activityId: String) -> String? {
         guard let destination = paymentDestinations[activityId],
@@ -9935,8 +9970,19 @@ final class SonarAppStore: ObservableObject {
             destination,
             sats: previous.sats,
             displayName: previous.peerName,
-            source: paymentSources[activityId] ?? .primary
+            maxFeeSats: paymentFeeChanged[activityId] ?? paymentFeeCeilings[activityId],
+            source: paymentSources[activityId] ?? .primary,
+            feeFromAmount: paymentFeeFromAmount.contains(activityId)
         )
+    }
+
+    /// The toast for a send that threw. A fee that rose is its own sentence
+    /// (it asks for a new consent, it is not a "payment failed").
+    static func sendFailureToast(_ error: Error) -> String {
+        if case .feeChanged = error as? CashuWalletError {
+            return error.localizedDescription
+        }
+        return "Payment failed: \(error.localizedDescription)"
     }
 
     /// A send returned `pending`: if its outcome already arrived (before the
@@ -9969,7 +10015,8 @@ final class SonarAppStore: ObservableObject {
             activity: activity,
             live: livePayments[activityId],
             now: Date(),
-            canRetry: paymentDestinations[activityId] != nil
+            canRetry: paymentDestinations[activityId] != nil,
+            feeChangedSats: paymentFeeChanged[activityId]
         )
     }
 
@@ -10015,6 +10062,9 @@ final class SonarAppStore: ObservableObject {
         livePayments = [:]
         paymentDestinations = [:]
         paymentSources = [:]
+        paymentFeeFromAmount = []
+        paymentFeeCeilings = [:]
+        paymentFeeChanged = [:]
         cancelledPayments = []
         unifyPendingActivity = nil
     }
@@ -10023,10 +10073,16 @@ final class SonarAppStore: ObservableObject {
     /// `sonar.meta.v1` descriptor. Fetches the descriptor synchronously if
     /// missing; returns a user-facing message only when the offer is truly
     /// unavailable after the fetch.
+    ///
+    /// `maxFeeSats` is the fee the user agreed to on the sheet (nil = none
+    /// was shown — legacy wallet); see `SonarWalletProviding.send`. A higher
+    /// fee is refused and the returned message states the new one; the user
+    /// re-opens the sheet, which quotes again.
     @discardableResult
     func sendPay(
         _ id: String,
         sats: Int64,
+        maxFeeSats: Int64?,
         source: SNPaymentSource = .primary,
         feeFromAmount: Bool = false
     ) async -> String? {
@@ -10071,12 +10127,13 @@ final class SonarAppStore: ObservableObject {
                 destination: offer,
                 amountSats: sats,
                 note: "Sonar payment \(activityId)",
-                feeFromAmount: feeFromAmount
+                feeFromAmount: feeFromAmount,
+                maxFeeSats: maxFeeSats
             )
         } catch {
             paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
             SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
-            return "Payment failed: \(error.localizedDescription)"
+            return Self.sendFailureToast(error)
         }
         let outcome = SonarWalletPaymentReconciler.applySendResult(
             payment,
@@ -10613,11 +10670,16 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
+                // No fee ceiling: the Unify sheet shows no fee line (the
+                // peer's request is read over BLE, and an amount-carrying one
+                // is paid with no sheet at all), so there is no quote the user
+                // saw to hold the send to. Tracked gap, same on Compose.
                 let payment = try await self.wallet.send(
                     destination: destination,
                     amountSats: sats,
                     note: "Unify nearby payment \(activityId)",
-                    feeFromAmount: feeFromAmount
+                    feeFromAmount: feeFromAmount,
+                    maxFeeSats: nil
                 )
                 let outcome = SonarWalletPaymentReconciler.applySendResult(
                     payment,

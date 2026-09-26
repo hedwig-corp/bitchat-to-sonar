@@ -486,14 +486,14 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
             balanceSats = state.walletBalanceSats(),
             mesh = isMesh,
             fiatOf = { state.fiatOrNull(it) },
-            onSend = { sats ->
-                scope.launch { state.sendPay(effectiveChatId, sats)?.let { state.toast = it } }
+            onSend = { sats, maxFee ->
+                scope.launch { state.sendPay(effectiveChatId, sats, maxFee)?.let { state.toast = it } }
             },
             onClose = { paySheet = false },
             maxSats = state.maxSendableSats(),
-            onSendMax = { sats ->
+            onSendMax = { sats, maxFee ->
                 scope.launch {
-                    state.sendPay(effectiveChatId, sats, feeFromAmount = true)?.let { state.toast = it }
+                    state.sendPay(effectiveChatId, sats, maxFee, feeFromAmount = true)?.let { state.toast = it }
                 }
             },
             feeQuote = { sats -> state.quoteChatPayFee(effectiveChatId, sats) },
