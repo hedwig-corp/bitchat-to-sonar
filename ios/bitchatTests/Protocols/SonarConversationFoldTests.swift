@@ -2141,7 +2141,7 @@ struct SonarConversationFoldTests {
         #expect(
             snFamilyTranscriptNeedsNetworkBackfill(
                 groupId: "group-09",
-                messagesByGroup: [:],
+                messagesByGroup: [String: [String]](),
                 historicalFolds: ["group-08": "group-09"]
             )
         )
