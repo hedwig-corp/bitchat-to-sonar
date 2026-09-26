@@ -88,6 +88,60 @@ enum Command {
     Groups,
     /// Print messages for all groups or one group.
     Messages(MessagesArgs),
+    /// Share this agent's local time privately (kind-449 inside MLS), or print
+    /// the zones peers have shared with it.
+    Timezone(TimezoneArgs),
+    /// List pending multi-member group invites (1:1 welcomes auto-join).
+    Invites,
+    /// Accept pending group invites: every one, or one by welcome id.
+    Accept(AcceptArgs),
+}
+
+#[derive(Args, Debug)]
+struct AcceptArgs {
+    /// Kind-444 welcome event id (hex) from `invites`. Omit to accept all.
+    #[arg(long)]
+    id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct TimezoneArgs {
+    #[command(subcommand)]
+    action: TimezoneAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum TimezoneAction {
+    /// Share an IANA timezone with a 1:1 chat (--to) or a group (--group).
+    Share {
+        /// Recipient npub1... or 64-char hex public key: share with the
+        /// existing 1:1 group.
+        #[arg(long, conflicts_with = "group", required_unless_present = "group")]
+        to: Option<String>,
+        /// MLS group id hex: share with this (multi-member) group instead.
+        #[arg(long)]
+        group: Option<String>,
+        /// IANA identifier, e.g. Asia/Kolkata.
+        #[arg(long)]
+        zone: String,
+        /// Keep the process alive this long so the background outbox publish
+        /// reaches the relays before exit.
+        #[arg(long, default_value_t = 5)]
+        settle_secs: u64,
+    },
+    /// Sync, then print the zone each group member last shared with us.
+    Show {
+        /// Only print this member (npub1... or hex).
+        #[arg(long)]
+        from: Option<String>,
+        /// Keep syncing until --from has shared a zone (and --zone matches,
+        /// when given), or this many seconds pass.
+        #[arg(long, default_value_t = 0)]
+        wait_secs: u64,
+        /// Only accept this exact zone for --from.
+        #[arg(long, requires = "from")]
+        zone: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -301,6 +355,28 @@ enum Output {
         id: String,
         name: String,
         members: Vec<String>,
+    },
+    TimezoneShared {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+        group_id: String,
+        zone: String,
+    },
+    Invite {
+        id: String,
+        group_id: String,
+        group_name: String,
+        member_count: u32,
+        welcomer: String,
+    },
+    Accepted {
+        id: String,
+        group_id: String,
+    },
+    PeerTimezone {
+        sender: String,
+        zone: String,
+        updated_at_secs: u64,
     },
     Message {
         group_id: String,
@@ -587,6 +663,152 @@ async fn run(cli: Cli) -> Result<()> {
             client.sync().await?;
             print_messages(&client, args.group.as_deref())?;
             Ok(())
+        }
+        Command::Timezone(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            timezone(loaded, args.action).await
+        }
+        Command::Invites => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            client.drain_pending_marmot().await?;
+            for invite in client.pending_group_invites()? {
+                print_json(&Output::Invite {
+                    id: invite.id.to_hex(),
+                    group_id: hex::encode(invite.group_id.as_slice()),
+                    group_name: invite.group_name,
+                    member_count: invite.member_count,
+                    welcomer: invite
+                        .welcomer
+                        .to_bech32()
+                        .expect("valid public key encodes as npub"),
+                })?;
+            }
+            Ok(())
+        }
+        Command::Accept(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            client.drain_pending_marmot().await?;
+            let wanted = args
+                .id
+                .map(|id| {
+                    EventId::from_hex(id.trim())
+                        .map_err(|e| CliError::Message(format!("--id: {e}")))
+                })
+                .transpose()?;
+            let mut accepted = 0;
+            for invite in client.pending_group_invites()? {
+                if wanted.is_some_and(|id| id != invite.id) {
+                    continue;
+                }
+                let group_id = client.accept_group_invite(&invite.id).await?;
+                accepted += 1;
+                print_json(&Output::Accepted {
+                    id: invite.id.to_hex(),
+                    group_id: hex::encode(group_id.as_slice()),
+                })?;
+            }
+            if accepted == 0 {
+                return Err(CliError::Message("no pending invite matched".to_owned()));
+            }
+            // Accepting publishes nothing itself, but the timezone/push-token
+            // shares it triggers go out on the background outbox.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(())
+        }
+    }
+}
+
+async fn timezone(loaded: LoadedConfig, action: TimezoneAction) -> Result<()> {
+    match action {
+        TimezoneAction::Share {
+            to,
+            group,
+            zone,
+            settle_secs,
+        } => {
+            let peer = to
+                .map(|to| {
+                    PublicKey::parse(&to)
+                        .map_err(|e| CliError::Message(format!("recipient pubkey: {e}")))
+                })
+                .transpose()?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = match (peer, group) {
+                (Some(peer), _) => find_dm_group(&client, peer)?.ok_or_else(|| {
+                    CliError::Message(
+                        "no 1:1 group with that peer yet; send a message first".into(),
+                    )
+                })?,
+                (None, Some(group)) => parse_group_id_hex(&group)?,
+                (None, None) => unreachable!("clap requires --to or --group"),
+            };
+            let group_hex = hex::encode(group_id.as_slice());
+            client.set_timezone_share_groups(vec![group_hex.clone()]).await;
+            client.update_local_timezone(&zone).await?;
+            tokio::time::sleep(Duration::from_secs(settle_secs)).await;
+            print_json(&Output::TimezoneShared {
+                to: peer.map(|p| p.to_bech32().expect("valid public key encodes as npub")),
+                group_id: group_hex,
+                zone: zone.trim().to_owned(),
+            })
+        }
+        TimezoneAction::Show {
+            from,
+            wait_secs,
+            zone,
+        } => {
+            let from = from
+                .map(|f| {
+                    PublicKey::parse(&f)
+                        .map_err(|e| CliError::Message(format!("--from pubkey: {e}")))
+                })
+                .transpose()?;
+            let client = loaded.connect().await?;
+            let start = Instant::now();
+            loop {
+                client.sync().await?;
+                client.drain_pending_marmot().await?;
+                let me = client.identity().public_key();
+                let mut members = BTreeSet::new();
+                for group in client.groups()? {
+                    members.extend(client.members(&group.mls_group_id)?);
+                }
+                members.remove(&me);
+                if let Some(from) = from {
+                    members.retain(|m| *m == from);
+                }
+                let members: Vec<PublicKey> = members.into_iter().collect();
+                let cached = client.peer_timezones(&members);
+                let satisfied = match from {
+                    None => true,
+                    Some(_) => cached
+                        .iter()
+                        .any(|(_, c)| zone.as_deref().is_none_or(|z| z == c.zone)),
+                };
+                if satisfied || start.elapsed() >= Duration::from_secs(wait_secs) {
+                    for (sender, cached) in &cached {
+                        print_json(&Output::PeerTimezone {
+                            sender: sender.to_bech32().expect("valid public key encodes as npub"),
+                            zone: cached.zone.clone(),
+                            updated_at_secs: cached.updated_at_secs,
+                        })?;
+                    }
+                    if !satisfied {
+                        return Err(CliError::Message(format!(
+                            "timed out after {wait_secs}s waiting for the peer's timezone share"
+                        )));
+                    }
+                    return Ok(());
+                }
+                if client.wait_for_marmot_event(2).await {
+                    client.drain_pending_marmot().await?;
+                }
+            }
         }
     }
 }

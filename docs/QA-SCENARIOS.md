@@ -207,6 +207,93 @@ is the build under test on a dedicated QA emulator/simulator.
   ("Message <channel>") and Send are all labelled; no `E!` rows.
 - **Origin:** A22 (#616)
 
+## Private local time (#607)
+
+Kind-449 timezone shares ride inside MLS (kind 445), never as a transcript
+row. `peers.sh share-tz` / `expect-tz` drive the peer side: a CLI peer can
+share a zone with the app and report the zone the app shared with it.
+
+### QA-070 — Sharing is off by default
+- **Platforms:** both (Android automated)
+- **Steps:** on an account that never touched the setting, open a chat with a
+  fresh peer and exchange a message; wait 30 s.
+- **Expect:** Settings → Privacy & safety → *Share local time* is off; the
+  peer never receives a zone (`peers.sh expect-tz` times out).
+- **How:** `android-smoke.sh` QA-070 · Guard:
+  `client.rs::timezone_share_only_publishes_to_allowlisted_groups`
+
+### QA-071 — Enabling the Settings default shares with existing chats
+- **Platforms:** both (Android automated)
+- **Steps:** with QA-070's chat, turn *Share local time* on in Settings.
+- **Expect:** the peer receives the device's IANA zone within 60 s; nothing
+  appears in the transcript on either side.
+- **How:** `android-smoke.sh` QA-071
+
+### QA-072 — A peer's zone paints the DM header, silently
+- **Platforms:** both (Android automated)
+- **Steps:** the peer runs `peers.sh share-tz <peer> <app-npub> Asia/Kolkata`
+  while the app shows the chat list, then open the chat.
+- **Expect:** the header subtitle reads `<time> · <offset> ahead|behind`
+  (`5h 30m` for a half-hour zone); no new bubble, no unread dot, no
+  notification, and the chat does not jump to the top of the list.
+- **How:** `android-smoke.sh` QA-072 · Guard:
+  `e2e.rs::timezone_share_does_not_notify_or_increment_unread`,
+  `PrivateTimezoneTest`, `SNPeerLocalTimeFormatterTests`
+
+### QA-073 — Per-chat override beats the Settings default
+- **Platforms:** both (manual)
+- **Steps:** Settings on; contact profile → Privacy → turn *Share local time*
+  off for chat A; keep chat B on. Change the device timezone (Android:
+  `adb shell service call alarm 3 s16 <zone>`; iOS simulator: host timezone).
+- **Expect:** B's peer receives the new zone; A's peer does not. The note
+  under the toggle says "Off for this chat — overrides your Settings default"
+  only when A has its own override; with Settings off and no override it says
+  "Off — follows your Settings default". Turning Settings off while A is
+  overridden *on* keeps sharing with A only.
+- **Guard:** `PrivateTimezoneTest.offNoteSaysWhetherTheChatOverridesTheDefault`,
+  `SNPeerLocalTimeFormatterTests.offNoteSaysWhetherTheChatOverridesTheDefault`
+- **Origin:** U1 (#607 QA — the "overrides" note showed on every chat that
+  simply followed an off default)
+
+### QA-074 — A device timezone change republishes
+- **Platforms:** both (manual; Android via `service call alarm 3 s16`)
+- **Steps:** sharing on; change the device timezone.
+- **Expect:** each allowed peer receives the new zone within 60 s; the
+  group-info "You" row, the contact/group notes ("Sharing <zone> …") and every
+  visible peer clock update at once, not at the next minute tick.
+- **Origin:** A2 (#607 QA — Compose read the zone during composition, so the
+  notes kept naming the old zone)
+
+### QA-075 — Group member list shows local times
+- **Platforms:** both (manual)
+- **Steps:** the app creates a group with two fresh peers (*Start a chat* →
+  *New group*); `peers.sh accept <peer>` for each; one peer runs
+  `peers.sh share-tz-group <peer> <group-hex> Europe/Lisbon` (`peers.sh groups`
+  prints the hex). Open Group info, stay on it across a minute boundary.
+- **Expect:** `Local time: <time>` under every member whose zone is known,
+  including "You"; members that never shared show no line; the "You" clock
+  keeps ticking even when no peer has shared. Turning the group's own toggle
+  on shares into the group (`peers.sh expect-tz`).
+- **Guard:** `client.rs::timezone_share_resends_when_a_member_is_swapped`
+  (a swapped-in member gets the zone)
+- **Origin:** i3 (#607 QA — the iOS "You" clock froze until a peer shared)
+
+### QA-076 — Wipe and erase clear the preference
+- **Platforms:** both (manual)
+- **Expect:** *Erase chats* drops every per-chat override (Settings default
+  survives); a full account wipe resets *Share local time* to off.
+
+### QA-077 — A restart does not re-share the zone
+- **Platforms:** both (Android: `am force-stop` + launch; iOS: `simctl
+  terminate` + launch)
+- **Steps:** sharing on and delivered (`peers.sh tz <peer>` shows the zone);
+  note its `updated_at_secs`; relaunch the app twice, 30 s each.
+- **Expect:** the peer's `updated_at_secs` does not move — a restart with the
+  same zone sends nothing. A real zone change still arrives.
+- **Guard:** `client.rs::timezone_share_is_not_repeated_after_restart`
+- **Origin:** A1/i2 (#607 QA — every launch, and every iOS store reopen,
+  re-encrypted a kind-449 into every allowed group: 37 per launch)
+
 ## Settings
 
 ### QA-060 — Settings copy matches behaviour
@@ -222,6 +309,11 @@ is the build under test on a dedicated QA emulator/simulator.
 - **Platforms:** both (`scripts/qa/idle-cpu.sh`)
 - **Expect:** ≤ 3 % averaged over 30–60 s with the app untouched on Home
   (baseline 2026-09-23: Android emulator 0.67 %, iOS simulator ~1.5 %).
+- **Control first:** with location channels live (emulator location set, a
+  "<city> · N here now" card on Home) geo-relay reconnects and presence
+  fetches alone put `main` at 3.6–4.1 % on the emulator (2026-09-25, #607
+  pass; ~200–300 `relay EOSE` lines/min). A number over budget is only a
+  finding when a `main` build on the same emulator/account measures lower.
 - **How:** `android-smoke.sh` QA-050
 
 ### QA-051 — Cold start paints local state first
