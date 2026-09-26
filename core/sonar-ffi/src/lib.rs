@@ -542,10 +542,12 @@ pub struct GroupInfo {
     pub member_npubs: Vec<String>,
 }
 
-/// A peer's locally cached, privately shared IANA timezone.
+/// A peer's locally cached, privately shared IANA timezone in one group.
 #[derive(uniffi::Record)]
 pub struct PeerTimezoneInfo {
     pub sender_npub: String,
+    /// MLS group the zone was shared into; sharing is per chat.
+    pub group_id_hex: String,
     pub iana_timezone: String,
     pub updated_at_secs: u64,
 }
@@ -1727,22 +1729,33 @@ impl SonarNode {
         Ok(())
     }
 
-    /// Batch local-only cache lookup for visible DM/group members.
-    pub fn peer_timezones(&self, member_pubkeys: Vec<String>) -> FfiResult<Vec<PeerTimezoneInfo>> {
-        let members = parse_pubkeys(member_pubkeys, "timezone member pubkey")?;
+    /// Local-only batch read of the zones members shared into these MLS
+    /// groups (hex). Look a zone up by the chat's own group: a person can
+    /// share in one chat and not another.
+    pub fn peer_timezones(&self, group_id_hexes: Vec<String>) -> FfiResult<Vec<PeerTimezoneInfo>> {
         self.client
-            .peer_timezones(&members)
+            .peer_timezones(&group_id_hexes)
             .into_iter()
-            .map(|(sender, cached)| {
+            .map(|(sender, group_id_hex, cached)| {
                 Ok(PeerTimezoneInfo {
                     sender_npub: sender
                         .to_bech32()
                         .map_err(|e| SonarFfiError::Core(e.to_string()))?,
+                    group_id_hex,
                     iana_timezone: cached.zone,
                     updated_at_secs: cached.updated_at_secs,
                 })
             })
             .collect()
+    }
+
+    /// Withdraw this device's zone from these MLS groups (hex) when the user
+    /// turns sharing off for them. Only groups that received a share get a
+    /// revoke. Never call it for the transient empty allowlist of startup.
+    pub fn revoke_timezone_share(&self, group_id_hexes: Vec<String>) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.revoke_timezone_share(group_id_hexes));
+        Ok(())
     }
 
     /// Decrypted message history for a group, oldest first.

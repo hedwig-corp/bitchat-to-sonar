@@ -1253,13 +1253,17 @@ impl MarmotEngine {
 
     /// Encrypt a kind-449 timezone share into a signed kind-445 and process it
     /// locally under one MLS write guard (same shape as text / reactions).
+    /// `created_at` orders shares and revokes at the receiver, so the caller
+    /// passes a per-sender monotonic second rather than the wall clock.
     pub fn create_and_process_timezone_share(
         &self,
         group_id: &GroupId,
         payload: &str,
+        created_at: Timestamp,
     ) -> Result<(Event, Incoming)> {
         let _mls = self.mls_write();
         let rumor = EventBuilder::new(Kind::Custom(crate::timezone::KIND_TIMEZONE_SHARE), payload)
+            .custom_created_at(created_at)
             .build(self.identity.public_key());
         let event = dispatch!(&self.storage, |mdk| mdk
             .create_message(group_id, rumor, None))?;

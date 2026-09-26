@@ -1048,8 +1048,8 @@ async fn timezone_share_does_not_notify_or_increment_unread() {
                 .expect("drain timezone share"),
         );
         let _ = bob.sync().await;
-        cached = bob.peer_timezones(&[alice.identity().public_key()]);
-        if cached.iter().any(|(_, zone)| zone.zone == "Europe/Zurich") {
+        cached = bob.peer_timezones(&[bob_hex.clone()]);
+        if cached.iter().any(|(_, _, zone)| zone.zone == "Europe/Zurich") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -1059,7 +1059,7 @@ async fn timezone_share_does_not_notify_or_increment_unread() {
         1,
         "host allowlist + update_local_timezone must reach the peer"
     );
-    assert_eq!(cached[0].1.zone, "Europe/Zurich");
+    assert_eq!(cached[0].2.zone, "Europe/Zurich");
     assert!(
         notes.is_empty(),
         "kind-449 must not produce a push notification"
@@ -1076,4 +1076,58 @@ async fn timezone_share_does_not_notify_or_increment_unread() {
         unread_before,
         "kind-449 must not increment unread"
     );
+}
+
+/// Turning sharing off withdraws the zone through the real outbox + relay
+/// path: the peer drops it for that group, with no transcript row or push.
+#[tokio::test]
+async fn timezone_revoke_reaches_the_peer_over_the_relay() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    bob.publish_key_package().await.expect("bob publishes kp");
+    let alice_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    alice.send_text(&alice_group, "hello").await.expect("alice sends");
+    bob.sync().await.expect("bob syncs hello");
+    let bob_hex = group_hex(&bob.groups().expect("bob groups")[0].mls_group_id);
+    let alice_hex = group_hex(&alice_group);
+
+    alice.set_timezone_share_groups(vec![alice_hex.clone()]).await;
+    alice.update_local_timezone("Asia/Tokyo").await.expect("share");
+    let mut seen = false;
+    for _ in 0..50 {
+        let _ = bob.drain_pending_marmot().await;
+        let _ = bob.sync().await;
+        if !bob.peer_timezones(&[bob_hex.clone()]).is_empty() {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(seen, "the share reaches bob first");
+
+    alice.revoke_timezone_share(vec![alice_hex]).await;
+    let mut notes = Vec::new();
+    let mut gone = false;
+    for _ in 0..50 {
+        notes.extend(bob.drain_pending_marmot().await.expect("drain revoke"));
+        let _ = bob.sync().await;
+        if bob.peer_timezones(&[bob_hex.clone()]).is_empty() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(gone, "the revoke must clear alice's zone at bob");
+    assert!(notes.is_empty(), "a revoke is not a notification");
+    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    assert_eq!(bob.messages(&bob_group).expect("messages").len(), 1, "only 'hello'");
 }
