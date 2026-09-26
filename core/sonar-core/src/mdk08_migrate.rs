@@ -174,13 +174,24 @@ pub(crate) fn detect_and_extract_remainder(
 }
 
 /// Write the host sidecars **before** the 0.8 file is renamed.
-pub(crate) fn write_sidecars(db_path: &Path, extracted: &Mdk08Migration) -> Result<()> {
-    let keyed: HashMap<String, Vec<ChatMessage>> = extracted
+/// `key` is the store's SQLCipher key: the recovered transcript is sealed
+/// with it at rest ([`crate::transcript_sidecar`]), like the 0.8 file it
+/// came out of.
+pub(crate) fn write_sidecars(
+    db_path: &Path,
+    extracted: &Mdk08Migration,
+    key: &[u8; 32],
+) -> Result<()> {
+    let keyed: HashMap<String, &Vec<ChatMessage>> = extracted
         .messages
         .iter()
-        .map(|(id, msgs)| (hex::encode(id.as_slice()), msgs.clone()))
+        .map(|(id, msgs)| (hex::encode(id.as_slice()), msgs))
         .collect();
-    write_json(&sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX), &keyed)?;
+    let sealed = crate::transcript_sidecar::encode_snapshot(
+        &crate::transcript_sidecar::TranscriptKey::derive(key),
+        &keyed,
+    )?;
+    write_bytes(&sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX), &sealed)?;
 
     let names: HashMap<String, String> = extracted
         .group_names
@@ -1614,6 +1625,10 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)
         .map_err(|e| Error::Storage(format!("mdk08 sidecar encode {}: {e}", path.display())))?;
+    write_bytes(path, &bytes)
+}
+
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_file_name(format!(
         "{}.tmp",
         path.file_name()
@@ -2184,7 +2199,7 @@ mod tests {
             .get(&gid)
             .expect("media secret");
         assert_eq!(secrets, &vec![media_secret.clone()]);
-        write_sidecars(&path, &extracted).unwrap();
+        write_sidecars(&path, &extracted, &KEY).unwrap();
         let loaded = load_historical_media_secrets(&path);
         assert_eq!(
             loaded.get(&gid),

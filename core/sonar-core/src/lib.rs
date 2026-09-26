@@ -30,6 +30,7 @@ pub mod reply;
 pub mod sonar_descriptor;
 pub mod sqlcipher_runtime;
 pub mod sticker_cache;
+pub(crate) mod transcript_sidecar;
 
 pub use error::Error;
 

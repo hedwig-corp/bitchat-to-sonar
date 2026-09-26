@@ -73,7 +73,13 @@ pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
 pub(crate) const KEY_PACKAGE_SLOT_FILE_SUFFIX: &str = ".sonar-keypackage-slot";
 
 /// Host-owned chat transcript (MDK 0.9 no longer stores plaintext app events).
+/// Sealed at rest — see [`crate::transcript_sidecar`].
 pub(crate) const TRANSCRIPT_FILE_SUFFIX: &str = ".sonar-transcript.json";
+/// Sealed rows appended since the last transcript snapshot.
+pub(crate) const TRANSCRIPT_JOURNAL_FILE_SUFFIX: &str = ".sonar-transcript.log";
+/// Fold the journal into a fresh snapshot past this size (~1k rows), so the
+/// O(history) rewrite is amortized instead of paid per message.
+const TRANSCRIPT_JOURNAL_COMPACT_BYTES: u64 = 512 * 1024;
 pub(crate) const PARKED_INVITES_FILE_SUFFIX: &str = ".sonar-parked-invites.json";
 pub(crate) const DROPPED_GROUPS_FILE_SUFFIX: &str = ".sonar-dropped-groups.json";
 /// historical MLS group id hex → live 0.9 group id hex.
@@ -772,6 +778,16 @@ pub struct MarmotEngine {
     parked_invites: Mutex<HashMap<EventId, GroupInvite>>,
     dropped_groups: Mutex<HashSet<GroupId>>,
     transcript: Mutex<HashMap<GroupId, Vec<ChatMessage>>>,
+    /// Seals the transcript at rest, derived from the SQLCipher key.
+    transcript_key: crate::transcript_sidecar::TranscriptKey,
+    /// Held across a journal append and across a snapshot rewrite, so a
+    /// compaction can never delete the journal under a row appended while it
+    /// ran.
+    transcript_io: Mutex<()>,
+    transcript_journal_bytes: std::sync::atomic::AtomicU64,
+    /// False when an unreadable transcript could not be moved aside: writing
+    /// would overwrite it, so this session keeps the transcript in memory.
+    transcript_writable: std::sync::atomic::AtomicBool,
     /// Groups whose last ingest left a MIP-03 `Buffered` commit. The host
     /// (and sonar-sim) must call [`Self::apply_pending_convergence`] after
     /// the quiescence window — ingest itself does not wait.
@@ -913,7 +929,7 @@ impl MarmotEngine {
                 )))
             }
         };
-        crate::mdk08_migrate::write_sidecars(path, &extracted)?;
+        crate::mdk08_migrate::write_sidecars(path, &extracted, &key)?;
         let quarantine = crate::mdk08_migrate::quarantine_store(path)?;
         match Self::open_session(identity, path, key, true) {
             Ok(engine) => {
@@ -962,8 +978,10 @@ impl MarmotEngine {
         let session = AccountDeviceSession::open(config)?;
         let parked = load_parked(db_path);
         let dropped = load_dropped(db_path);
-        let mut transcript = load_transcript(db_path);
-        let mut transcript_healed = false;
+        let transcript_key = crate::transcript_sidecar::TranscriptKey::derive(&key);
+        let loaded = load_transcript(db_path, &transcript_key);
+        let mut transcript = loaded.rows;
+        let mut transcript_healed = loaded.needs_reseal;
         for id in &dropped {
             if transcript.remove(id).is_some() {
                 transcript_healed = true;
@@ -985,6 +1003,10 @@ impl MarmotEngine {
             parked_invites: Mutex::new(parked),
             dropped_groups: Mutex::new(dropped),
             transcript: Mutex::new(transcript),
+            transcript_key,
+            transcript_io: Mutex::new(()),
+            transcript_journal_bytes: std::sync::atomic::AtomicU64::new(loaded.journal_bytes),
+            transcript_writable: std::sync::atomic::AtomicBool::new(loaded.writable),
             pending_convergence: Mutex::new(HashSet::new()),
             historical_group_names: Mutex::new(historical_group_names),
             historical_group_descriptions: Mutex::new(
@@ -3258,17 +3280,63 @@ impl MarmotEngine {
         if self.is_dropped(&msg.group_id) {
             return;
         }
-        let mut transcript = self
-            .transcript
+        let _io = self
+            .transcript_io
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let rows = transcript.entry(msg.group_id.clone()).or_default();
-        if rows.iter().any(|m| m.id == msg.id) {
+        {
+            let mut transcript = self
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rows = transcript.entry(msg.group_id.clone()).or_default();
+            if rows.iter().any(|m| m.id == msg.id) {
+                return;
+            }
+            rows.push(msg.clone());
+        }
+        self.append_transcript_journal_locked(&msg);
+    }
+
+    /// O(1) durable write of one new row. Caller holds `transcript_io`.
+    fn append_transcript_journal_locked(&self, msg: &ChatMessage) {
+        use std::io::Write as _;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        if !self.transcript_writable.load(AtomicOrdering::Relaxed) {
             return;
         }
-        rows.push(msg);
-        drop(transcript);
-        self.persist_transcript();
+        let record =
+            match crate::transcript_sidecar::encode_journal_record(&self.transcript_key, msg) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::error!(%err, "transcript journal seal failed; rewriting the snapshot");
+                    self.persist_transcript_locked();
+                    return;
+                }
+            };
+        let appended = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(sidecar_named(path, TRANSCRIPT_JOURNAL_FILE_SUFFIX))
+            .and_then(|mut journal| journal.write_all(&record));
+        match appended {
+            Ok(()) => {
+                let total = self
+                    .transcript_journal_bytes
+                    .fetch_add(record.len() as u64, AtomicOrdering::Relaxed)
+                    + record.len() as u64;
+                if total > TRANSCRIPT_JOURNAL_COMPACT_BYTES {
+                    self.persist_transcript_locked();
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "transcript journal append failed; rewriting the snapshot");
+                self.persist_transcript_locked();
+            }
+        }
     }
 
     fn lookup_chat(&self, id: &EventId) -> Option<ChatMessage> {
@@ -3418,21 +3486,58 @@ impl MarmotEngine {
         let _ = atomic_write_json(&sidecar_named(path, DROPPED_GROUPS_FILE_SUFFIX), &ids);
     }
 
+    /// Rewrite the sealed snapshot and drop the journal it now covers.
+    /// Structural changes (purge, remainder copy, heal) call this; plain new
+    /// rows go through the O(1) journal in [`Self::store_chat`].
     fn persist_transcript(&self) {
+        let _io = self
+            .transcript_io
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.persist_transcript_locked();
+    }
+
+    /// Caller holds `transcript_io`.
+    fn persist_transcript_locked(&self) {
+        use std::sync::atomic::Ordering as AtomicOrdering;
         let Some(path) = self.db_path.as_ref() else {
             return;
         };
+        if !self.transcript_writable.load(AtomicOrdering::Relaxed) {
+            return;
+        }
         let dropped = self.dropped_group_id_set();
-        let transcript = self
-            .transcript
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let keyed: HashMap<String, Vec<ChatMessage>> = transcript
-            .iter()
-            .filter(|(id, _)| !dropped.contains(*id))
-            .map(|(id, msgs)| (hex::encode(id.as_slice()), msgs.clone()))
-            .collect();
-        let _ = atomic_write_json(&sidecar_named(path, TRANSCRIPT_FILE_SUFFIX), &keyed);
+        let sealed = {
+            let transcript = self
+                .transcript
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Borrow rows: cloning the whole transcript under the lock doubled
+            // the cost and stalled concurrent page reads.
+            let keyed: HashMap<String, &Vec<ChatMessage>> = transcript
+                .iter()
+                .filter(|(id, _)| !dropped.contains(*id))
+                .map(|(id, msgs)| (hex::encode(id.as_slice()), msgs))
+                .collect();
+            crate::transcript_sidecar::encode_snapshot(&self.transcript_key, &keyed)
+        };
+        let sealed = match sealed {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                tracing::error!(%err, "transcript seal failed; snapshot not rewritten");
+                return;
+            }
+        };
+        match atomic_write_bytes(&sidecar_named(path, TRANSCRIPT_FILE_SUFFIX), &sealed) {
+            Ok(()) => {
+                // The snapshot now holds every journaled row. A crash before
+                // this removal only replays duplicates, which load dedupes.
+                let _ = std::fs::remove_file(sidecar_named(path, TRANSCRIPT_JOURNAL_FILE_SUFFIX));
+                self.transcript_journal_bytes
+                    .store(0, AtomicOrdering::Relaxed);
+            }
+            Err(err) => tracing::warn!(%err, "transcript snapshot write failed"),
+        }
     }
 
     fn chat_from_app_rumor(
@@ -3617,6 +3722,7 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
         DM_AUTOACCEPT_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
         TRANSCRIPT_FILE_SUFFIX,
+        TRANSCRIPT_JOURNAL_FILE_SUFFIX,
         PARKED_INVITES_FILE_SUFFIX,
         crate::invite_link::INVITE_LINK_STATE_FILE_SUFFIX,
         DROPPED_GROUPS_FILE_SUFFIX,
@@ -3635,6 +3741,12 @@ fn sidecar_paths(base: &Path) -> Vec<PathBuf> {
     for suffix in atomic_sidecars {
         paths.push(base.with_file_name(format!("{name}{suffix}")));
         paths.push(base.with_file_name(format!("{name}{suffix}.tmp")));
+    }
+    // Transcripts moved aside because they did not open still hold history.
+    for suffix in [TRANSCRIPT_FILE_SUFFIX, TRANSCRIPT_JOURNAL_FILE_SUFFIX] {
+        paths.extend(unreadable_transcript_names(
+            &base.with_file_name(format!("{name}{suffix}")),
+        ));
     }
     paths
 }
@@ -3853,16 +3965,103 @@ fn load_historical_folds(db_path: &Path) -> HashMap<GroupId, GroupId> {
         .collect()
 }
 
-fn load_transcript(db_path: &Path) -> HashMap<GroupId, Vec<ChatMessage>> {
-    let path = sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX);
-    let Ok(bytes) = std::fs::read(path) else {
-        return HashMap::new();
+struct LoadedTranscript {
+    rows: HashMap<GroupId, Vec<ChatMessage>>,
+    journal_bytes: u64,
+    /// Legacy plaintext snapshot: rewrite it sealed right away.
+    needs_reseal: bool,
+    writable: bool,
+}
+
+/// Snapshot + journal. A snapshot that does not open or parse is moved aside
+/// (never overwritten — it may be the only copy of the user's history) and
+/// the session starts empty; the old `unwrap_or_default()` then persisted the
+/// empty map over it on the first new message.
+fn load_transcript(
+    db_path: &Path,
+    key: &crate::transcript_sidecar::TranscriptKey,
+) -> LoadedTranscript {
+    use crate::transcript_sidecar::{
+        decode_journal, decode_snapshot, is_sealed_snapshot, merge_rows,
     };
-    serde_json::from_slice::<HashMap<String, Vec<ChatMessage>>>(&bytes)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(hex_id, msgs)| hex::decode(hex_id).ok().map(|b| (GroupId::new(b), msgs)))
+    let snapshot_path = sidecar_named(db_path, TRANSCRIPT_FILE_SUFFIX);
+    let journal_path = sidecar_named(db_path, TRANSCRIPT_JOURNAL_FILE_SUFFIX);
+    let mut needs_reseal = false;
+    let mut writable = true;
+    let mut snapshot_unreadable = false;
+    let mut rows = match std::fs::read(&snapshot_path) {
+        Ok(bytes) => match decode_snapshot(Some(key), &bytes) {
+            Ok(rows) => {
+                needs_reseal = !is_sealed_snapshot(&bytes);
+                rows
+            }
+            Err(err) => {
+                tracing::error!(%err, "transcript snapshot unreadable; moving it aside");
+                snapshot_unreadable = true;
+                writable = preserve_unreadable_transcript(&snapshot_path);
+                Default::default()
+            }
+        },
+        Err(_) => Default::default(),
+    };
+    let mut journal_bytes = 0;
+    match std::fs::read(&journal_path) {
+        // Same key as the snapshot: keep it for recovery, do not replay it.
+        Ok(_) if snapshot_unreadable => {
+            writable &= preserve_unreadable_transcript(&journal_path);
+        }
+        Ok(bytes) => {
+            let (appended, clean) = decode_journal(key, &bytes);
+            if !clean {
+                tracing::warn!("transcript journal ends in a torn record; kept the rows before it");
+                needs_reseal = true;
+            }
+            merge_rows(&mut rows, appended);
+            journal_bytes = bytes.len() as u64;
+        }
+        Err(_) => {}
+    }
+    LoadedTranscript {
+        rows: rows
+            .into_iter()
+            .filter_map(|(hex_id, msgs)| hex::decode(hex_id).ok().map(|b| (GroupId::new(b), msgs)))
+            .collect(),
+        journal_bytes,
+        needs_reseal: needs_reseal && writable,
+        writable,
+    }
+}
+
+/// Rename an unreadable transcript file to `<file>.unreadable[.N]`. False when
+/// no free name exists, in which case the caller must not write over it.
+fn preserve_unreadable_transcript(path: &Path) -> bool {
+    for name in unreadable_transcript_names(path) {
+        if name.exists() {
+            continue;
+        }
+        return std::fs::rename(path, &name).is_ok();
+    }
+    false
+}
+
+fn unreadable_transcript_names(path: &Path) -> Vec<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("transcript");
+    std::iter::once(path.with_file_name(format!("{name}.unreadable")))
+        .chain((1..=8).map(|n| path.with_file_name(format!("{name}.unreadable.{n}"))))
         .collect()
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sidecar")
+    ));
+    std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path))
 }
 
 // Silence unused helper on the in-memory Result path used by tests.
@@ -4420,6 +4619,173 @@ mod historical_fold_tests {
         );
     }
 
+    fn on_disk(path: &Path, suffix: &str) -> Vec<u8> {
+        std::fs::read(sidecar_named(path, suffix)).unwrap_or_default()
+    }
+
+    /// #613 QA P1: after the 0.9 port the transcript is the only local copy
+    /// of every message, and it was written as plaintext JSON — the 0.8 store
+    /// it replaced was SQLCipher. Rows must be sealed at rest, appended O(1),
+    /// and read back after a reopen.
+    #[test]
+    fn transcript_rows_are_sealed_at_rest_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let group = [0x5a; 16];
+        {
+            let engine = MarmotEngine::persistent(alice.clone(), &path, [9u8; 32]).unwrap();
+            engine.push_transcript_message(chat(
+                1,
+                &group,
+                bob.public_key(),
+                "the vault code is 4471",
+                false,
+            ));
+            engine.push_transcript_message(chat(
+                2,
+                &group,
+                alice.public_key(),
+                "noted, burn this",
+                true,
+            ));
+        }
+        for suffix in [TRANSCRIPT_FILE_SUFFIX, TRANSCRIPT_JOURNAL_FILE_SUFFIX] {
+            let bytes = on_disk(&path, suffix);
+            assert!(
+                !bytes.windows(9).any(|w| w == b"vault cod")
+                    && !bytes.windows(9).any(|w| w == b"burn this"),
+                "{suffix} holds chat plaintext"
+            );
+        }
+        assert!(
+            !on_disk(&path, TRANSCRIPT_JOURNAL_FILE_SUFFIX).is_empty(),
+            "new rows append to the journal"
+        );
+
+        let reopened = MarmotEngine::persistent(alice.clone(), &path, [9u8; 32]).unwrap();
+        let rows = reopened.transcript_for(&GroupId::new(group.to_vec()));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].content, "the vault code is 4471");
+
+        // A structural rewrite folds the journal into a sealed snapshot.
+        reopened.persist_transcript();
+        assert!(on_disk(&path, TRANSCRIPT_JOURNAL_FILE_SUFFIX).is_empty());
+        assert!(crate::transcript_sidecar::is_sealed_snapshot(&on_disk(
+            &path,
+            TRANSCRIPT_FILE_SUFFIX
+        )));
+        drop(reopened);
+        let again = MarmotEngine::persistent(alice, &path, [9u8; 32]).unwrap();
+        assert_eq!(again.transcript_for(&GroupId::new(group.to_vec())).len(), 2);
+    }
+
+    /// A snapshot written by an earlier build in plaintext is read, then
+    /// resealed on open instead of staying plaintext until the next rewrite.
+    #[test]
+    fn a_legacy_plaintext_transcript_is_resealed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let alice = Identity::generate();
+        drop(MarmotEngine::persistent(alice.clone(), &path, [9u8; 32]).unwrap());
+        let legacy: HashMap<String, Vec<ChatMessage>> = HashMap::from([(
+            hex::encode([0x5b; 16]),
+            vec![chat(
+                3,
+                &[0x5b; 16],
+                alice.public_key(),
+                "old plaintext row",
+                true,
+            )],
+        )]);
+        std::fs::write(
+            sidecar_named(&path, TRANSCRIPT_FILE_SUFFIX),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let engine = MarmotEngine::persistent(alice, &path, [9u8; 32]).unwrap();
+        assert_eq!(
+            engine.transcript_for(&GroupId::new(vec![0x5b; 16])).len(),
+            1
+        );
+        assert!(crate::transcript_sidecar::is_sealed_snapshot(&on_disk(
+            &path,
+            TRANSCRIPT_FILE_SUFFIX
+        )));
+    }
+
+    /// The old loader turned an unparseable transcript into an empty map and
+    /// the next message persisted that over the file: the whole history gone.
+    /// A snapshot that does not open must be moved aside, never overwritten.
+    #[test]
+    fn an_unreadable_transcript_is_moved_aside_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let alice = Identity::generate();
+        let snapshot = sidecar_named(&path, TRANSCRIPT_FILE_SUFFIX);
+        let aside =
+            |n: &str| snapshot.with_file_name(format!("marmot.sqlite{TRANSCRIPT_FILE_SUFFIX}{n}"));
+        {
+            let engine = MarmotEngine::persistent(alice.clone(), &path, [9u8; 32]).unwrap();
+            engine.push_transcript_message(chat(
+                4,
+                &[0x5c; 16],
+                alice.public_key(),
+                "keep me",
+                true,
+            ));
+            engine.persist_transcript();
+        }
+        // Damage the sealed snapshot (bit rot, a partial restore, …).
+        let mut damaged = on_disk(&path, TRANSCRIPT_FILE_SUFFIX);
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0xff;
+        std::fs::write(&snapshot, &damaged).unwrap();
+
+        let engine = MarmotEngine::persistent(alice.clone(), &path, [9u8; 32]).unwrap();
+        assert!(engine
+            .transcript_for(&GroupId::new(vec![0x5c; 16]))
+            .is_empty());
+        engine.push_transcript_message(chat(5, &[0x5c; 16], alice.public_key(), "new row", true));
+        engine.persist_transcript();
+        assert_eq!(
+            std::fs::read(aside(".unreadable")).expect("preserved aside"),
+            damaged,
+            "the unreadable transcript is kept byte for byte, not overwritten"
+        );
+        drop(engine);
+
+        // A second bad snapshot gets its own name; the first stays untouched.
+        std::fs::write(&snapshot, b"SNTRXv1\0 not a sealed transcript").unwrap();
+        drop(MarmotEngine::persistent(alice, &path, [9u8; 32]).unwrap());
+        assert!(aside(".unreadable.1").exists());
+        assert_eq!(std::fs::read(aside(".unreadable")).unwrap(), damaged);
+    }
+
+    #[test]
+    fn a_large_journal_is_compacted_into_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marmot.sqlite");
+        let alice = Identity::generate();
+        let engine = MarmotEngine::persistent(alice.clone(), &path, [9u8; 32]).unwrap();
+        let body = "x".repeat(4096);
+        for i in 0..200u8 {
+            engine.push_transcript_message(chat(i, &[0x5d; 16], alice.public_key(), &body, true));
+        }
+        assert!(
+            (on_disk(&path, TRANSCRIPT_JOURNAL_FILE_SUFFIX).len() as u64)
+                <= TRANSCRIPT_JOURNAL_COMPACT_BYTES,
+            "the journal is folded into the snapshot once it passes the threshold"
+        );
+        drop(engine);
+        let reopened = MarmotEngine::persistent(alice, &path, [9u8; 32]).unwrap();
+        assert_eq!(
+            reopened.transcript_for(&GroupId::new(vec![0x5d; 16])).len(),
+            200
+        );
+    }
+
     /// Leave/delete marks the family dropped. A later ingest / send echo
     /// (`store_chat`) must not rewrite the transcript the user already cleared.
     #[test]
@@ -4505,9 +4871,11 @@ mod historical_fold_tests {
             "marmot.sqlite{}",
             crate::marmot::TRANSCRIPT_FILE_SUFFIX
         ));
-        let leftover: HashMap<String, serde_json::Value> =
-            serde_json::from_slice(&std::fs::read(&transcript_path).expect("healed transcript"))
-                .expect("transcript json");
+        let leftover = crate::transcript_sidecar::decode_snapshot(
+            Some(&crate::transcript_sidecar::TranscriptKey::derive(&key)),
+            &std::fs::read(&transcript_path).expect("healed transcript"),
+        )
+        .expect("transcript opens");
         assert!(
             !leftover.contains_key(&hex::encode(historical.as_slice())),
             "open must heal leftover dropped rows off the transcript sidecar"

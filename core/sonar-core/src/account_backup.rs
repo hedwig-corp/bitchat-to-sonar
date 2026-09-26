@@ -572,21 +572,41 @@ fn count_indexed_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
 fn count_restored_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
     match count_indexed_messages(db_path, db_key_hex) {
         Some(n) if n > 0 => Some(n),
-        _ => count_transcript_sidecar_messages(db_path),
+        _ => count_transcript_sidecar_messages(db_path, db_key_hex),
     }
 }
 
-fn count_transcript_sidecar_messages(db_path: &Path) -> Option<u64> {
-    let bytes = fs::read(sidecar_named(
+/// The transcript is sealed with a key derived from `db_key_hex`
+/// ([`crate::transcript_sidecar`]); snapshot + journal both count.
+fn count_transcript_sidecar_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
+    let key = crate::transcript_sidecar::TranscriptKey::from_db_key_hex(db_key_hex)?;
+    let snapshot = fs::read(sidecar_named(
         db_path,
         crate::marmot::TRANSCRIPT_FILE_SUFFIX,
     ))
-    .ok()?;
+    .ok();
+    let journal = fs::read(sidecar_named(
+        db_path,
+        crate::marmot::TRANSCRIPT_JOURNAL_FILE_SUFFIX,
+    ))
+    .ok();
+    if snapshot.is_none() && journal.is_none() {
+        return None;
+    }
+    let rows = crate::transcript_sidecar::decode_snapshot_and_journal(
+        Some(&key),
+        snapshot.as_deref(),
+        journal.as_deref(),
+    )?;
+    let counts: HashMap<String, usize> = rows
+        .iter()
+        .map(|(id, msgs)| (id.clone(), msgs.len()))
+        .collect();
     let folds: Vec<(String, String)> =
         sidecar_string_map(db_path, crate::marmot::HISTORICAL_FOLDS_FILE_SUFFIX)
             .into_iter()
             .collect();
-    count_transcript_bytes_remounted(&bytes, &folds, &dropped_group_hexes_on_disk(db_path))
+    count_transcript_counts_remounted(&counts, &folds, &dropped_group_hexes_on_disk(db_path))
 }
 
 #[cfg(test)]
@@ -594,19 +614,33 @@ fn count_transcript_bytes(bytes: &[u8]) -> Option<u64> {
     count_transcript_bytes_remounted(bytes, &[], &HashSet::new())
 }
 
+/// Plaintext-JSON form of [`count_transcript_counts_remounted`] (tests).
+#[cfg(test)]
 fn count_transcript_bytes_remounted(
     bytes: &[u8],
     folds: &[(String, String)],
     dropped: &HashSet<String>,
 ) -> Option<u64> {
     let keyed: HashMap<String, Vec<serde_json::Value>> = serde_json::from_slice(bytes).ok()?;
+    let counts: HashMap<String, usize> = keyed
+        .iter()
+        .map(|(id, msgs)| (id.clone(), msgs.len()))
+        .collect();
+    count_transcript_counts_remounted(&counts, folds, dropped)
+}
+
+fn count_transcript_counts_remounted(
+    keyed: &HashMap<String, usize>,
+    folds: &[(String, String)],
+    dropped: &HashSet<String>,
+) -> Option<u64> {
     let hidden = folded_historical_hexes(folds);
     let live_present = |live: &str| {
         let live_key = preview_hex_key(live);
         keyed.keys().any(|id| preview_hex_key(id) == live_key)
     };
     let mut total = 0u64;
-    for (id, msgs) in &keyed {
+    for (id, msgs) in keyed {
         let hex = preview_hex_key(id);
         if dropped.contains(&hex) {
             continue;
@@ -619,7 +653,7 @@ fn count_transcript_bytes_remounted(
                 continue;
             }
         }
-        let mut n = msgs.len() as u64;
+        let mut n = *msgs as u64;
         for (historical, live) in folds {
             if preview_hex_key(live) != hex {
                 continue;
@@ -630,7 +664,7 @@ fn count_transcript_bytes_remounted(
                 .find(|(other, _)| preview_hex_key(other) == hist_key)
                 .map(|(_, rows)| rows)
             {
-                n += hist_msgs.len() as u64;
+                n += *hist_msgs as u64;
             }
         }
         total += n;
@@ -993,6 +1027,7 @@ fn decode_sidecar_files(bytes: &[u8], off: &mut usize) -> Result<Vec<(String, Ve
 fn backup_sidecar_suffixes() -> &'static [&'static str] {
     &[
         crate::marmot::TRANSCRIPT_FILE_SUFFIX,
+        crate::marmot::TRANSCRIPT_JOURNAL_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_GROUPS_FILE_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_DESCRIPTIONS_SUFFIX,
         crate::mdk08_migrate::HISTORICAL_MEMBERS_FILE_SUFFIX,
@@ -2282,14 +2317,20 @@ fn preview_from_index(
 fn preview_from_recovered_sidecars(
     package: &AccountBackupPackage,
 ) -> Vec<BackupPreviewConversation> {
-    let transcript = package
-        .sidecar_files
-        .iter()
-        .find(|(name, _)| name == crate::marmot::TRANSCRIPT_FILE_SUFFIX)
-        .and_then(|(_, bytes)| {
-            serde_json::from_slice::<HashMap<String, Vec<crate::marmot::ChatMessage>>>(bytes).ok()
-        })
-        .unwrap_or_default();
+    let sidecar = |suffix: &str| {
+        package
+            .sidecar_files
+            .iter()
+            .find(|(name, _)| name == suffix)
+            .map(|(_, bytes)| bytes.as_slice())
+    };
+    // Sealed with the package's own db key ([`crate::transcript_sidecar`]).
+    let transcript = crate::transcript_sidecar::decode_snapshot_and_journal(
+        crate::transcript_sidecar::TranscriptKey::from_db_key_hex(&package.db_key_hex).as_ref(),
+        sidecar(crate::marmot::TRANSCRIPT_FILE_SUFFIX),
+        sidecar(crate::marmot::TRANSCRIPT_JOURNAL_FILE_SUFFIX),
+    )
+    .unwrap_or_default();
     let names = sidecar_historical_names(package);
     if transcript.is_empty() && names.is_empty() {
         return Vec::new();
