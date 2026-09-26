@@ -211,6 +211,78 @@ chat above 80 messages (the first-paint extract window) and one image.
 - **Origin:** i1 (#613) — edited `///` doc comments moved two UniFFI checksums;
   a build from the committed binding would fatalError at launch.
 
+## White Noise interop (#613)
+
+White Noise iOS runs MDK's own runtime (marmot-app). The pinned MDK checkout
+ships its CLI (`wn`/`wnd`) on the same runtime, so `scripts/qa/wn-interop.sh`
+drives it against `sonar-cli` headlessly: `setup`, then `run [--members N]`,
+which prints PASS/FAIL per id below. It needs a relay both clients share that
+serves kind-1059 without NIP-42 and accepts 64 KiB events (see the script
+header). Not covered: the White Noise iOS app UI and push, public-relay
+overlap, NIP-42 inbox relays.
+
+### QA-078 — White Noise starts a DM with a Sonar user
+- **Platforms:** core (both apps)
+- **Expect:** `wn groups create "" <sonar-npub>` succeeds; the Sonar user
+  auto-joins and receives the message.
+- **Guard:** `key_package_tags_match_white_noise_validation`,
+  `key_package_offers_what_white_noise_requires_of_members`,
+  `publishing_the_key_package_publishes_inbox_and_key_package_relay_lists`
+- **Origin:** W1–W3 (#613): White Noise rejected every Sonar KeyPackage
+  (`app_components` tag held `0x0001`), then required capabilities Sonar did
+  not advertise, then had no kind-10050 inbox to deliver the welcome to.
+
+### QA-079 — The Sonar reply stays in White Noise's DM
+- **Platforms:** core
+- **Expect:** `sonar-cli send --to <wn-npub>` reuses the chat White Noise
+  created; White Noise shows the reply in it.
+
+### QA-080 — Sonar starts a DM with a White Noise user
+- **Platforms:** core
+- **Expect:** White Noise lists the invite; after `groups accept` both sides
+  exchange messages (White Noise catches up the first one on its next sync).
+
+### QA-081 — A White Noise group with Sonar members
+- **Platforms:** core
+- **Expect:** every Sonar member joins and sees every message; White Noise sees
+  the Sonar members' messages within ~10 s (its daemon ingests on its own
+  cadence).
+
+### QA-082 — A Sonar group with a White Noise member
+- **Platforms:** core
+- **Expect:** White Noise accepts and messages flow every way; `wn groups show`
+  reports the encrypted-media component `0x800b` as required.
+- **Guard:** `groups_sonar_creates_require_encrypted_media_v2`
+- **Origin:** W5 (#613): without it White Noise refuses media in the group
+  ("group does not require encrypted media").
+
+### QA-083 — Encrypted media both ways
+- **Platforms:** core
+- **Expect:** a Sonar photo downloads and decrypts in White Noise, and a White
+  Noise photo in a Sonar group decrypts in Sonar, byte-identical both ways.
+- **Guard:** `new_uploads_use_the_layout_white_noise_parses`,
+  `a_white_noise_tag_parses`, `mip04_uploads_keep_their_layout_and_open`
+- **Origin:** W4 (#613): Sonar sent MIP-04 `mip04-v2` tags White Noise could not
+  read (empty bubble) and dropped White Noise's `encrypted-media-v2` photos
+  (caption only).
+
+### QA-084 — A member's leave reaches everyone
+- **Platforms:** core (both apps)
+- **Expect:** after a Sonar member leaves, the remaining members' rosters (Sonar
+  and White Noise) drop it within seconds, with no further input.
+- **Guard:** `a_members_leave_is_committed_by_the_remaining_members`,
+  `a_leave_queued_behind_a_converging_commit_still_produces_its_proposal`
+- **Origin:** L1 (#613): MDK 0.9 commits a SelfRemove only from a convergence
+  pass Sonar never ran, so the leaver stayed in every roster.
+- **Not guarded:** White Noise's own `wn groups leave` proposals are deferred
+  by every client, White Noise included (upstream, see Known gaps).
+
+### QA-085 — 25-member groups both ways
+- **Platforms:** core
+- **Expect:** a 25-member group created by either side: every member joins,
+  receives the creator's message, and replies reach everyone.
+- **Guard:** `sonar-sim group-scale` (docs/GROUP-SCALE-SIM.md) for the ceiling.
+
 ## Notifications and lifecycle
 
 ### QA-020 — Background receive
@@ -330,6 +402,21 @@ chat above 80 messages (the first-paint extract window) and one image.
   mesh peers in range (other agents' emulators) `startMeshRealtimeLoop` ran on
   the main dispatcher long enough to ANR the app. Turn Bluetooth off on a QA
   emulator that shares a host with other emulators.
+- **White Noise's own leave is never committed (upstream):** a `wn groups
+  leave` SelfRemove proposal is deferred (`TransportDeferred`) by every
+  client, White Noise's own remaining members included, so the leaver stays in
+  the roster. Sonar's leave is committed by Sonar and White Noise members alike
+  (QA-084). Seen with the MDK 0.9.14 `wn` CLI.
+- **Sonar sends welcomes to its own relays only:** White Noise reads welcomes
+  from its kind-10050 inbox relays. Invites reach White Noise users through the
+  usual shared relays (damus, primal, nos.lol); a White Noise user whose inbox
+  relays share none with Sonar's would miss them. Publish welcomes to the
+  invitee's kind-10050 relays too.
+- **Queued sends fail instead of waiting:** MDK queues a send made while a
+  commit is still converging (the ~1.1 s after a membership change) and
+  regenerates it later. Sonar reports that send as failed ("send produced no
+  application message") and does not publish the regenerated message. Leave
+  is handled (QA-084); sends need the same queued-intent lifecycle.
 
 ## Open questions (need a product decision, not a fix)
 
