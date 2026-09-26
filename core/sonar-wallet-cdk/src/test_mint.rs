@@ -78,6 +78,13 @@ struct FakeState {
     melt_quote_requests: Vec<MeltQuoteRequest>,
     fee_reserve: u64,
     next_id: u64,
+    /// The next melt request is lost: `Some(true)` = applied, answer lost;
+    /// `Some(false)` = not yet seen by the mint (kept in `in_transit_melt`).
+    lose_melt: Option<bool>,
+    /// A melt request the mint has not processed yet: (quote id, input Ys).
+    in_transit_melt: Option<(String, Vec<PublicKey>)>,
+    /// The next `post_mint` is processed and then never answers.
+    lose_mint: bool,
 }
 
 #[derive(Debug)]
@@ -226,6 +233,33 @@ impl FakeMint {
                 }
             }
         });
+    }
+
+    /// The next melt request is lost on the wire, and the wallet sees a
+    /// transport error. With `applied` the mint processed it (per the melt
+    /// outcome) and only the answer was lost; without, the mint has not seen
+    /// it yet and its quote reads Unpaid until [`Self::deliver_in_transit_melt`].
+    pub fn lose_next_melt_response(&self, applied: bool) {
+        self.with(|s| s.lose_melt = Some(applied));
+    }
+
+    /// The lost melt request finally reaches the mint, which pays it: its
+    /// inputs are spent and its quote reads Paid.
+    pub fn deliver_in_transit_melt(&self, preimage: Option<String>) {
+        self.with(|s| {
+            let (quote_id, ys) = s.in_transit_melt.take().expect("a melt in transit");
+            if let Some(q) = s.melt_quotes.get_mut(&quote_id) {
+                q.state = MeltQuoteState::Paid;
+                q.preimage = preimage;
+            }
+            s.spent.extend(ys);
+        });
+    }
+
+    /// The next `post_mint` is processed in full (signed, counted as issued)
+    /// and then never answers: a mint slower than the wallet's deadline.
+    pub fn lose_next_mint_response(&self) {
+        self.with(|s| s.lose_mint = true);
     }
 
     pub fn melt_quote_requests(&self) -> Vec<MeltQuoteRequest> {
@@ -533,11 +567,15 @@ impl MintConnector for FakeMint {
             )));
         }
         let signatures = self.sign(&request.outputs)?;
-        self.with(|s| {
+        let lost = self.with(|s| {
             if let Some(q) = s.mint_quotes.get_mut(&request.quote) {
                 q.amount_issued += requested;
             }
+            std::mem::take(&mut s.lose_mint)
         });
+        if lost {
+            std::future::pending::<()>().await;
+        }
         Ok(MintResponse { signatures })
     }
 
@@ -655,6 +693,12 @@ impl MintConnector for FakeMint {
                 .unwrap_or(MeltOutcome::Paid { preimage: None })
         });
         let quote_id = request.quote().clone();
+        let lost = self.with(|s| s.lose_melt.take());
+        let transport_error = || Error::HttpError(None, "fake mint: connection reset".into());
+        if lost == Some(false) {
+            self.with(|s| s.in_transit_melt = Some((quote_id.clone(), ys.clone())));
+            return Err(transport_error());
+        }
         let method = self.with(|s| {
             let q = s.melt_quotes.get_mut(&quote_id)?;
             match &outcome {
@@ -672,6 +716,9 @@ impl MintConnector for FakeMint {
             Some(q.method.clone())
         });
         method.ok_or(Error::UnknownQuote)?;
+        if lost == Some(true) {
+            return Err(transport_error());
+        }
         match outcome {
             MeltOutcome::Failed => return Err(Error::PaymentFailed),
             MeltOutcome::Refused => return Err(Error::RequestAlreadyPaid),

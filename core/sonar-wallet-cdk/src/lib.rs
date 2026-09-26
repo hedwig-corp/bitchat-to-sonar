@@ -24,6 +24,7 @@
 //! only established sessions, host callbacks run on a dedicated OS thread,
 //! and `connect` never reports someone else's in-flight attempt as success.
 
+mod connector;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_mint;
 
@@ -34,8 +35,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cdk::amount::SplitTarget;
 use cdk::nuts::nut00::KnownMethod;
-use cdk::nuts::{CurrencyUnit, MeltOptions, MeltQuoteState, MintQuoteState, PaymentMethod};
-use cdk::wallet::types::{MeltSagaState, TransactionId, TransactionStatus, WalletSagaState};
+use cdk::nuts::{CurrencyUnit, MeltOptions, MeltQuoteState, MintQuoteState, PaymentMethod, State};
+use cdk::wallet::types::{
+    MeltSagaState, TransactionDirection, TransactionId, TransactionStatus, WalletSagaState,
+};
 use cdk::wallet::{MintConnector, Wallet, WalletBuilder};
 use cdk::Amount;
 use sonar_wallet::{
@@ -64,6 +67,12 @@ const RESTORED_MARKER_PREFIX: &str = "cashu.restored";
 /// receive address hosts publish (Nostr descriptor, BIP-353, BLE); it must
 /// be the same across calls and launches, and readable with no network.
 const OFFER_POINTER_PREFIX: &str = "cashu.offer";
+
+/// Prefix of the per-mint journal of ambiguous melts still being settled
+/// (`cashu.unsettled.<hash8>`, JSON). It outlives the process on purpose: a
+/// send reported Pending must not read Failed after a relaunch while the
+/// mint may still pay it.
+const UNSETTLED_PREFIX: &str = "cashu.unsettled";
 
 /// Fingerprint of the seed that owns this store. Cashu proofs are BEARER
 /// data: opening one account's store with another account's seed would let
@@ -119,11 +128,13 @@ fn is_our_artifact(name: &str) -> bool {
     }
     let is_mint_tag =
         |suffix: &str| suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit());
-    if let Some(rest) = name
-        .strip_prefix(OFFER_POINTER_PREFIX)
-        .and_then(|rest| rest.strip_prefix('.'))
-    {
-        return is_mint_tag(rest.strip_suffix(".tmp").unwrap_or(rest));
+    for prefix in [OFFER_POINTER_PREFIX, UNSETTLED_PREFIX] {
+        if let Some(rest) = name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('.'))
+        {
+            return is_mint_tag(rest.strip_suffix(".tmp").unwrap_or(rest));
+        }
     }
     name.strip_prefix(RESTORED_MARKER_PREFIX)
         .and_then(|rest| rest.strip_prefix('.'))
@@ -288,6 +299,8 @@ pub struct CdkWallet {
     /// Serializes offer creation: two concurrent first calls must not mint
     /// two offers and publish whichever lost.
     offer_lock: Mutex<()>,
+    /// Shared by the watcher, `sync_wallet` and `send`; outlives reconnects.
+    reconciler: Arc<Reconciler>,
 }
 
 impl CdkWallet {
@@ -341,6 +354,9 @@ impl CdkWallet {
             })
             .map_err(|e| WalletError::Backend(format!("event thread: {e}")))?;
 
+        let journal = config
+            .working_dir
+            .join(format!("{UNSETTLED_PREFIX}.{}", mint_tag(mint_url)));
         Ok(Self {
             config,
             mint_url: mint_url.to_string(),
@@ -352,6 +368,7 @@ impl CdkWallet {
             connector: None,
             budgets: Budgets::DEFAULT,
             offer_lock: Mutex::new(()),
+            reconciler: Arc::new(Reconciler::with_journal(journal)),
         })
     }
 
@@ -364,7 +381,15 @@ impl CdkWallet {
             restore: budget,
             recovery: budget,
             send: budget,
+            melt_grace: budget,
         };
+    }
+
+    /// Shrink only the grace an ambiguous, compensated melt waits before it
+    /// is called Failed (see [`Budgets::melt_grace`]).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_test_melt_grace(&mut self, grace: Duration) {
+        self.budgets.melt_grace = grace;
     }
 
     /// A wallet whose mint traffic goes to `connector` instead of HTTP — the
@@ -390,9 +415,7 @@ impl CdkWallet {
 
     /// Short per-mint tag for this store's per-mint files.
     fn mint_tag(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(self.mint_url.as_bytes());
-        hex::encode(&digest[..4])
+        mint_tag(&self.mint_url)
     }
 
     fn offer_pointer_path(&self) -> std::path::PathBuf {
@@ -734,15 +757,21 @@ impl CdkWallet {
                 })?
             }
         };
-        let mut builder = WalletBuilder::new()
+        // CDK's own client (or the test's fake mint), recording which melt
+        // requests the mint never answered: see `connector`.
+        let inner = match &self.connector {
+            Some(connector) => connector.clone(),
+            None => connector::default_client(mint_url.clone(), localstore.clone()),
+        };
+        let wallet = WalletBuilder::new()
             .mint_url(mint_url)
             .unit(CurrencyUnit::Sat)
             .localstore(localstore)
-            .seed(self.seed64());
-        if let Some(connector) = &self.connector {
-            builder = builder.shared_client(connector.clone());
-        }
-        let wallet = builder
+            .seed(self.seed64())
+            .shared_client(Arc::new(connector::RecordingConnector {
+                inner,
+                unanswered: self.reconciler.unanswered.clone(),
+            }))
             .build()
             .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))?;
         // cdk-redb creates `wallet_sagas` lazily, on the first saga WRITE,
@@ -762,9 +791,18 @@ impl CdkWallet {
     /// leaves no transaction, so a host settling a stuck "pending" row by id
     /// would wait forever. Asks the mint (bounded) about the local melt quote
     /// with this id. `None` when no such melt quote is stored.
+    ///
+    /// The mint's answer only counts for a melt CLOSED here. This resumes
+    /// the melt's open saga (CDK finalizes or compensates it, or leaves it
+    /// open), unless a running send is still confirming it, and reads the
+    /// result: a saga still open, or an ambiguous confirm inside its grace
+    /// window, is Pending. The stored quote was written before the confirm
+    /// and still reads Unpaid, so an unreachable mint never turns it into
+    /// Failed.
     pub fn outgoing_payment_outcome(&self, quote_id: &str) -> Result<Option<Payment>> {
         let wallet = self.wallet()?;
         let budget = self.budgets.mint_call;
+        let reconciler = self.reconciler.clone();
         self.rt().block_on(async {
             let Some(local) = wallet
                 .localstore
@@ -774,17 +812,35 @@ impl CdkWallet {
             else {
                 return Ok(None);
             };
-            let quote = bounded(budget, wallet.check_melt_quote_status(quote_id))
-                .await
-                .unwrap_or(local);
             let prepared = PreparedSend {
-                destination: classify_destination(&quote.request),
-                amount_sats: u64::from(quote.amount),
-                fees_sats: Some(u64::from(quote.fee_reserve)),
-                token: PreparedSendToken::Opaque(quote.id.clone()),
+                destination: classify_destination(&local.request),
+                amount_sats: u64::from(local.amount),
+                fees_sats: Some(u64::from(local.fee_reserve)),
+                token: PreparedSendToken::Opaque(local.id.clone()),
+            };
+            let pending = || Ok(Some(pending_payment(quote_id, &prepared, None)));
+            if reconciler.is_unsettled(quote_id) {
+                return pending();
+            }
+            // A running send reports its own melt; and unknown is not safe:
+            // a store read that fails counts as open.
+            match open_melt_sagas(&wallet, quote_id).await {
+                Ok(ids) if !ids.iter().any(|id| reconciler.is_confirming(*id)) => {}
+                _ => return pending(),
+            }
+            let checked = bounded(budget, wallet.check_melt_quote_status(quote_id)).await;
+            if !matches!(melt_quote_open(&wallet, quote_id).await, Ok(false)) {
+                return pending();
+            }
+            let (state, preimage) = match checked {
+                Ok(quote) => (quote.state, quote.payment_proof),
+                Err(_) if local.state == MeltQuoteState::Paid => {
+                    (MeltQuoteState::Paid, local.payment_proof)
+                }
+                Err(_) => (MeltQuoteState::Unknown, None),
             };
             Ok(Some(resolved_melt_payment(
-                quote_id, &prepared, &quote, None,
+                quote_id, &prepared, state, preimage, None,
             )))
         })
     }
@@ -900,9 +956,10 @@ impl CdkWallet {
     async fn poll_mint_quotes(
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
-        budget: Duration,
+        budgets: Budgets,
+        reconciler: &Reconciler,
     ) -> usize {
-        match Self::poll_mint_quotes_strict(wallet, events, budget).await {
+        match Self::poll_mint_quotes_strict(wallet, events, budgets, reconciler).await {
             Ok(minted) => minted,
             Err(e) => {
                 tracing::warn!("mint-quote poll failed: {e}");
@@ -918,33 +975,110 @@ impl CdkWallet {
     async fn poll_mint_quotes_strict(
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
-        budget: Duration,
+        budgets: Budgets,
+        reconciler: &Reconciler,
     ) -> Result<usize> {
+        // One pass at a time (the watcher tick vs a host's sync_wallet): the
+        // status check that resumes a quote's open issue saga must never
+        // meet another pass's mint of that quote still in flight.
+        let _pass = reconciler.pass.lock().await;
         // The incoming (mint) and outgoing (melt) sides are reconciled
         // INDEPENDENTLY and their errors aggregated afterwards: a single
         // stale mint quote must not block finalizing an otherwise healthy
         // delayed melt on every pass, or its reserved proofs stay reserved
         // for as long as the bad quote exists.
         let mut errors: Vec<String> = Vec::new();
-        let minted = match Self::reconcile_mint_quotes(wallet, events, budget).await {
+        let minted = match Self::reconcile_mint_quotes(wallet, events, budgets.mint_call).await {
             Ok(n) => n,
             Err(e) => {
                 errors.push(e.to_string());
                 0
             }
         };
-        let settled = match Self::reconcile_pending_melts(wallet, events, budget).await {
+        let settled = match Self::reconcile_pending_melts(
+            wallet,
+            events,
+            budgets.mint_call,
+            reconciler,
+        )
+        .await
+        {
             Ok(n) => n,
             Err(e) => {
                 errors.push(e.to_string());
                 0
             }
         };
-        if minted > 0 || settled > 0 {
+        let resolved = match Self::settle_unsettled_melts(wallet, events, budgets, reconciler).await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                errors.push(e.to_string());
+                0
+            }
+        };
+        let changed = minted + settled + resolved;
+        if changed > 0 {
             let _ = events.send(WalletEvent::Synced);
         }
         if errors.is_empty() {
-            Ok(minted + settled)
+            Ok(changed)
+        } else {
+            Err(WalletError::Network(errors.join("; ")))
+        }
+    }
+
+    /// Ambiguous melts CDK had already closed when their confirm returned
+    /// (see `settle_ambiguous_confirm`): the mint decides, and the grace
+    /// window bounds how long an Unpaid answer is doubted.
+    async fn settle_unsettled_melts(
+        wallet: &Wallet,
+        events: &mpsc::Sender<WalletEvent>,
+        budgets: Budgets,
+        reconciler: &Reconciler,
+    ) -> Result<usize> {
+        let tracked = reconciler.unsettled_snapshot();
+        if tracked.is_empty() {
+            return Ok(0);
+        }
+        let mut settled = 0;
+        let mut errors: Vec<String> = Vec::new();
+        for (quote_id, melt) in tracked {
+            let quote =
+                match bounded(budgets.mint_call, wallet.check_melt_quote_status(&quote_id)).await {
+                    Ok(quote) => quote,
+                    Err(e) => {
+                        errors.push(format!("melt {quote_id}: {e}"));
+                        continue;
+                    }
+                };
+            let status = match quote.state {
+                MeltQuoteState::Paid => PaymentStatus::Complete,
+                MeltQuoteState::Failed => PaymentStatus::Failed,
+                MeltQuoteState::Unpaid if melt.grace_over(budgets.melt_grace) => {
+                    // The proofs must be ours again, not merely the saga gone.
+                    match melt_operation_open(wallet, melt.operation_id).await {
+                        Ok(false) => PaymentStatus::Failed,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            if status == PaymentStatus::Complete {
+                account_late_melt(wallet, &quote_id, quote.payment_proof.clone(), budgets).await;
+            }
+            reconciler.forget_unsettled(&quote_id);
+            settled += 1;
+            let payment = Payment {
+                status,
+                preimage: quote.payment_proof.clone(),
+                ..pending_payment(&quote_id, &melt.prepared, melt.note.clone())
+            };
+            tracing::info!("ambiguous melt {quote_id} settled {:?}", payment.status);
+            let _ = events.send(payment_event(payment));
+        }
+        if errors.is_empty() {
+            Ok(settled)
         } else {
             Err(WalletError::Network(errors.join("; ")))
         }
@@ -973,6 +1107,12 @@ impl CdkWallet {
         // stop every later quote from minting, now or on any future pass.
         let mut errors: Vec<String> = Vec::new();
         for quote in quotes {
+            // A mint call that ran out of time (the mint may have signed
+            // after we gave up) leaves the quote's issue saga open. CDK's
+            // status check below resumes it and stores the proofs, but the
+            // quote then reads issued, so nothing below announced them: the
+            // host saw no receive and no balance change until it asked.
+            let open_issue = open_issue_saga(wallet, &quote).await;
             let updated = match bounded(budget, wallet.check_mint_quote_status(&quote.id)).await {
                 Ok(updated) => updated,
                 Err(e) => {
@@ -980,6 +1120,13 @@ impl CdkWallet {
                     continue;
                 }
             };
+            if let Some(saga_id) = open_issue {
+                if let Some(payment) = completed_issue_payment(wallet, saga_id, &updated).await {
+                    tracing::info!("issue {saga_id} recovered for quote {}", updated.id);
+                    minted += 1;
+                    let _ = events.send(WalletEvent::PaymentReceived { payment });
+                }
+            }
             if updated.amount_mintable() == Amount::ZERO {
                 if is_abandoned_invoice(&updated, now) {
                     // An unpaid invoice well past its expiry can never be
@@ -1033,22 +1180,28 @@ impl CdkWallet {
     /// payment, or a restart mid-send) is finalized here — otherwise the
     /// backend never learns its outcome and reserved proofs stay reserved
     /// indefinitely.
+    ///
+    /// Saga by saga, never CDK's `finalize_pending_melts`: that resumes every
+    /// open melt, including one whose confirm a send is still awaiting. The
+    /// mint reads such a melt Unpaid until it starts on the request, so CDK
+    /// compensated the proofs of a payment the mint then made. A melt whose
+    /// confirm is still running here is skipped; its send reports it.
     async fn reconcile_pending_melts(
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
         budget: Duration,
+        reconciler: &Reconciler,
     ) -> Result<usize> {
         // This runs every watcher tick. With no melt in flight there is
         // nothing to finalize, so skip the full-history transaction read
         // below: the incomplete-saga table is tiny, the history is not.
-        // Same filter `finalize_pending_melts` applies.
-        let in_flight = wallet
+        let open: Vec<(uuid::Uuid, String)> = wallet
             .localstore
             .get_incomplete_sagas()
             .await
             .map_err(|e| WalletError::Backend(format!("list sagas: {e}")))?
-            .iter()
-            .any(|s| {
+            .into_iter()
+            .filter(|s| {
                 s.mint_url == wallet.mint_url
                     && s.unit == wallet.unit
                     && matches!(
@@ -1057,62 +1210,94 @@ impl CdkWallet {
                             MeltSagaState::MeltRequested | MeltSagaState::PaymentPending
                         )
                     )
-            });
-        if !in_flight {
+                    && !reconciler.is_confirming(s.id)
+            })
+            .filter_map(|s| match s.data {
+                cdk::wallet::types::OperationData::Melt(data) => Some((s.id, data.quote_id)),
+                _ => None,
+            })
+            .collect();
+        if open.is_empty() {
             return Ok(0);
         }
         // Notes are read BEFORE finalizing, and a lookup failure aborts the
-        // pass. Order matters: `finalize_pending_melts` makes a melt terminal,
-        // so a later pass may never return it again — swallowing the error
-        // here (it was `unwrap_or_default`) would emit a note-less terminal
-        // event under the same payment id, permanently overwriting the row the
-        // initial send wrote, while still reporting the sync as successful.
-        // Failing first keeps the whole thing retryable.
-        let notes: HashMap<String, String> = wallet
-            .list_transactions(None)
+        // pass. Order matters: finalizing makes a melt terminal, so a later
+        // pass may never return it again — swallowing the error here (it was
+        // `unwrap_or_default`) would emit a note-less terminal event under
+        // the same payment id, permanently overwriting the row the initial
+        // send wrote, while still reporting the sync as successful. Failing
+        // first keeps the whole thing retryable.
+        let history = wallet
+            .list_transactions(Some(TransactionDirection::Outgoing))
             .await
-            .map_err(|e| WalletError::Backend(format!("list transactions: {e}")))?
-            .into_iter()
-            .filter_map(|tx| {
-                let note = tx_note(tx.memo.as_ref(), &tx.metadata)?;
-                Some((tx.quote_id?, note))
-            })
-            .collect();
-        let finalized = bounded(budget, wallet.finalize_pending_melts())
-            .await
-            .map_err(|e| WalletError::Backend(format!("finalize pending melts: {e}")))?;
+            .map_err(|e| WalletError::Backend(format!("list transactions: {e}")))?;
+        let note_for = |quote_id: &str| {
+            history
+                .iter()
+                .filter(|tx| tx.quote_id.as_deref() == Some(quote_id))
+                .find_map(|tx| tx_note(tx.memo.as_ref(), &tx.metadata))
+        };
         let mut settled = 0;
-        for melt in &finalized {
-            let status = match melt.state() {
+        let mut errors: Vec<String> = Vec::new();
+        for (saga_id, quote_id) in open {
+            // Resumes THIS saga: CDK finalizes it (Paid), compensates it
+            // (Unpaid or Failed with no payment proof), or leaves it open.
+            let quote = match bounded(budget, wallet.check_melt_quote_status(&quote_id)).await {
+                Ok(quote) => quote,
+                Err(e) => {
+                    errors.push(format!("melt {quote_id}: {e}"));
+                    continue;
+                }
+            };
+            let still_open = wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .map_err(|e| WalletError::Backend(format!("read saga: {e}")))?
+                .is_some();
+            if still_open {
+                continue;
+            }
+            let status = match quote.state {
                 MeltQuoteState::Paid => PaymentStatus::Complete,
                 // CDK reports a melt the mint gave up on — and whose proofs
-                // it has just compensated back into the wallet — as UNPAID
-                // (resume_melt_saga: "so caller counts it as compensated").
+                // it has just compensated back into the wallet — as UNPAID.
                 // Skipping it as "still in flight" left the app showing money
                 // in flight forever, with no event to refresh the balance.
                 MeltQuoteState::Failed | MeltQuoteState::Unpaid => PaymentStatus::Failed,
-                // Genuinely still in flight: finalize_pending_melts does not
-                // return those, but a later pass settles them if it did.
                 MeltQuoteState::Pending | MeltQuoteState::Unknown => continue,
+            };
+            let fee_paid = match status {
+                PaymentStatus::Complete => wallet
+                    .list_transactions(Some(TransactionDirection::Outgoing))
+                    .await
+                    .ok()
+                    .and_then(|rows| {
+                        rows.into_iter()
+                            .find(|tx| tx.saga_id == Some(saga_id))
+                            .map(|tx| u64::from(tx.fee))
+                    })
+                    .unwrap_or(u64::from(quote.fee_reserve)),
+                _ => 0,
             };
             settled += 1;
             let payment = Payment {
-                id: melt.quote_id().to_string(),
-                amount_sats: u64::from(melt.amount()),
-                fees_sats: Some(u64::from(melt.fee_paid())),
+                id: quote_id.clone(),
+                amount_sats: u64::from(quote.amount),
+                fees_sats: Some(fee_paid),
                 incoming: false,
                 timestamp_secs: now_secs(),
                 status,
-                preimage: melt.payment_proof().map(str::to_string),
-                note: notes.get(melt.quote_id()).cloned(),
+                preimage: quote.payment_proof.clone(),
+                note: note_for(&quote_id),
             };
-            let _ = events.send(if status == PaymentStatus::Failed {
-                WalletEvent::PaymentFailed { payment }
-            } else {
-                WalletEvent::PaymentSent { payment }
-            });
+            let _ = events.send(payment_event(payment));
         }
-        Ok(settled)
+        if errors.is_empty() {
+            Ok(settled)
+        } else {
+            Err(WalletError::Network(errors.join("; ")))
+        }
     }
 }
 
@@ -1186,6 +1371,12 @@ struct Budgets {
     /// How long `send` waits before reporting the melt Pending (or, if it
     /// never reached the irreversible step, Timeout).
     send: Duration,
+    /// How long a melt whose confirm was ambiguous, and which CDK then
+    /// compensated because the mint read it Unpaid, stays Pending before it
+    /// is called Failed. Unpaid is also what a mint reports before it has
+    /// started on a melt request still on its way, so it is only believed
+    /// once that request can no longer be arriving.
+    melt_grace: Duration,
 }
 
 impl Budgets {
@@ -1194,7 +1385,218 @@ impl Budgets {
         restore: Duration::from_secs(120),
         recovery: Duration::from_secs(30),
         send: Duration::from_secs(60),
+        melt_grace: Duration::from_secs(60),
     };
+}
+
+/// Short per-mint tag for a store's per-mint files (`<prefix>.<hash8>`).
+fn mint_tag(mint_url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(mint_url.as_bytes());
+    hex::encode(&digest[..4])
+}
+
+/// Reconciliation state the watcher, `sync_wallet` and `send` share.
+struct Reconciler {
+    /// One reconcile pass at a time.
+    pass: tokio::sync::Mutex<()>,
+    /// Ambiguous melts CDK had already closed when their confirm returned,
+    /// by quote id, until the watcher settles them. Mirrored to `journal`.
+    unsettled: Mutex<HashMap<String, UnsettledMelt>>,
+    /// Where `unsettled` survives a relaunch; `None` in unit tests.
+    journal: Option<std::path::PathBuf>,
+    /// Melt requests the mint never answered, recorded by the connector.
+    unanswered: Arc<connector::UnansweredMelts>,
+    /// Melt operations whose confirm a send task is awaiting right now.
+    confirming: Mutex<std::collections::HashSet<uuid::Uuid>>,
+}
+
+impl Default for Reconciler {
+    fn default() -> Self {
+        Self {
+            pass: tokio::sync::Mutex::new(()),
+            unsettled: Mutex::new(HashMap::new()),
+            journal: None,
+            unanswered: Arc::new(connector::UnansweredMelts::default()),
+            confirming: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+}
+
+/// Marks a melt operation as being confirmed until dropped.
+struct Confirming<'a> {
+    reconciler: &'a Reconciler,
+    operation_id: uuid::Uuid,
+}
+
+impl Drop for Confirming<'_> {
+    fn drop(&mut self) {
+        self.reconciler
+            .confirming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.operation_id);
+    }
+}
+
+impl Reconciler {
+    /// A reconciler whose ambiguous melts are loaded from, and kept in,
+    /// `journal`. An unreadable journal reads as empty (logged): the melts it
+    /// held then settle through history and lookups, as before it existed.
+    fn with_journal(journal: std::path::PathBuf) -> Self {
+        let loaded = match std::fs::read(&journal) {
+            Ok(raw) => serde_json::from_slice::<Vec<serde_json::Value>>(&raw)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(UnsettledMelt::from_json)
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!("unreadable {}: {e}", journal.display());
+                    HashMap::new()
+                }),
+            Err(_) => HashMap::new(),
+        };
+        Self {
+            unsettled: Mutex::new(loaded),
+            journal: Some(journal),
+            ..Self::default()
+        }
+    }
+
+    fn unsettled(&self) -> std::sync::MutexGuard<'_, HashMap<String, UnsettledMelt>> {
+        self.unsettled.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn is_unsettled(&self, quote_id: &str) -> bool {
+        self.unsettled().contains_key(quote_id)
+    }
+
+    fn track_unsettled(&self, quote_id: &str, melt: UnsettledMelt) {
+        let mut map = self.unsettled();
+        map.insert(quote_id.to_string(), melt);
+        self.save_journal(&map);
+    }
+
+    fn forget_unsettled(&self, quote_id: &str) {
+        let mut map = self.unsettled();
+        if map.remove(quote_id).is_some() {
+            self.save_journal(&map);
+        }
+    }
+
+    /// Atomic, best-effort (logged): the in-memory set still works for this
+    /// process if the write fails.
+    fn save_journal(&self, map: &HashMap<String, UnsettledMelt>) {
+        use std::io::Write;
+        let Some(path) = &self.journal else { return };
+        let write = || -> std::io::Result<()> {
+            if map.is_empty() {
+                return match std::fs::remove_file(path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => Ok(()),
+                };
+            }
+            let body =
+                serde_json::Value::Array(map.iter().map(|(id, melt)| melt.to_json(id)).collect())
+                    .to_string();
+            let tmp = path.with_extension(format!(
+                "{}.tmp",
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default()
+            ));
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)
+        };
+        if let Err(e) = write() {
+            tracing::warn!("write {}: {e}", path.display());
+        }
+    }
+
+    fn confirming(&self, operation_id: uuid::Uuid) -> Confirming<'_> {
+        self.confirming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(operation_id);
+        Confirming {
+            reconciler: self,
+            operation_id,
+        }
+    }
+
+    fn is_confirming(&self, operation_id: uuid::Uuid) -> bool {
+        self.confirming
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&operation_id)
+    }
+
+    fn unsettled_snapshot(&self) -> Vec<(String, UnsettledMelt)> {
+        self.unsettled()
+            .iter()
+            .map(|(id, melt)| (id.clone(), melt.clone()))
+            .collect()
+    }
+}
+
+/// A melt whose confirm ended ambiguously after CDK had closed its saga.
+#[derive(Clone)]
+struct UnsettledMelt {
+    operation_id: uuid::Uuid,
+    prepared: PreparedSend,
+    note: Option<String>,
+    /// Wall clock, so the grace window survives a relaunch.
+    since_ms: u64,
+}
+
+impl UnsettledMelt {
+    fn to_json(&self, quote_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "quote_id": quote_id,
+            "operation_id": self.operation_id.to_string(),
+            "request": self.prepared.destination.raw,
+            "amount_sats": self.prepared.amount_sats,
+            "fees_sats": self.prepared.fees_sats,
+            "note": self.note,
+            "since_ms": self.since_ms,
+        })
+    }
+
+    fn from_json(value: &serde_json::Value) -> Option<(String, Self)> {
+        let quote_id = value.get("quote_id")?.as_str()?.to_string();
+        let melt = Self {
+            operation_id: uuid::Uuid::parse_str(value.get("operation_id")?.as_str()?).ok()?,
+            prepared: PreparedSend {
+                destination: classify_destination(value.get("request")?.as_str()?),
+                amount_sats: value.get("amount_sats")?.as_u64()?,
+                fees_sats: value.get("fees_sats").and_then(|v| v.as_u64()),
+                token: PreparedSendToken::Opaque(quote_id.clone()),
+            },
+            note: value
+                .get("note")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            since_ms: value.get("since_ms")?.as_u64()?,
+        };
+        Some((quote_id, melt))
+    }
+
+    /// The grace window has passed.
+    fn grace_over(&self, grace: Duration) -> bool {
+        now_ms().saturating_sub(self.since_ms)
+            >= u64::try_from(grace.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// How long past its expiry an unpaid BOLT11 invoice is still checked before
@@ -1328,24 +1730,246 @@ fn melt_outcome_payment(
     }
 }
 
-/// The payment as the mint reports its quote after an ambiguous confirm:
-/// Paid is complete; Unpaid/Failed never left the wallet (CDK compensated
-/// the proofs), so it is Failed, not in flight; anything else stays Pending.
+/// The payment the mint reports for a melt that is CLOSED locally — its
+/// saga gone and no proofs held under it, so CDK either finalized it or
+/// compensated its inputs back into the wallet: Paid is complete; Unpaid or
+/// Failed never left the wallet; anything else stays Pending. Callers check
+/// closedness first ([`melt_quote_open`]); an open melt is Pending whatever
+/// its quote says, because it can still be paid.
 fn resolved_melt_payment(
     quote_id: &str,
     prepared: &PreparedSend,
-    quote: &cdk::wallet::types::MeltQuote,
+    state: MeltQuoteState,
+    preimage: Option<String>,
     note: Option<String>,
 ) -> Payment {
-    let status = match quote.state {
+    let status = match state {
         MeltQuoteState::Paid => PaymentStatus::Complete,
         MeltQuoteState::Unpaid | MeltQuoteState::Failed => PaymentStatus::Failed,
         MeltQuoteState::Pending | MeltQuoteState::Unknown => PaymentStatus::Pending,
     };
     Payment {
         status,
-        preimage: quote.payment_proof.clone(),
+        preimage,
         ..pending_payment(quote_id, prepared, note)
+    }
+}
+
+/// The issue saga a mint quote is reserved by, when one is still open.
+async fn open_issue_saga(
+    wallet: &Wallet,
+    quote: &cdk::wallet::types::MintQuote,
+) -> Option<uuid::Uuid> {
+    let operation_id = uuid::Uuid::parse_str(quote.used_by_operation.as_deref()?).ok()?;
+    let saga = wallet.localstore.get_saga(&operation_id).await.ok()??;
+    matches!(saga.state, WalletSagaState::Issue(_)).then_some(saga.id)
+}
+
+/// The receive an open issue saga turned into, once CDK completed it: the
+/// saga is gone and its transaction is Completed. Same id, amount and
+/// shape the history and a normal mint give the payment.
+async fn completed_issue_payment(
+    wallet: &Wallet,
+    saga_id: uuid::Uuid,
+    quote: &cdk::wallet::types::MintQuote,
+) -> Option<Payment> {
+    if wallet.localstore.get_saga(&saga_id).await.ok()?.is_some() {
+        return None;
+    }
+    let tx = wallet
+        .list_transactions(Some(TransactionDirection::Incoming))
+        .await
+        .ok()?
+        .into_iter()
+        .find(|tx| tx.saga_id == Some(saga_id) && tx.status == TransactionStatus::Completed)?;
+    Some(Payment {
+        id: incoming_payment_id(
+            &quote.id,
+            &quote.payment_method,
+            Some(TransactionId::new(tx.ys.clone())),
+        ),
+        amount_sats: u64::from(tx.amount),
+        fees_sats: Some(0),
+        incoming: true,
+        timestamp_secs: now_secs(),
+        status: PaymentStatus::Complete,
+        preimage: None,
+        note: None,
+    })
+}
+
+/// Whether the melt `operation_id` is still unresolved in the local store:
+/// its saga is open, or proofs are still reserved or pending under it. CDK
+/// closes a melt saga only by finalizing it (Paid) or by compensating it,
+/// which puts its inputs back to Unspent.
+async fn melt_operation_open(wallet: &Wallet, operation_id: uuid::Uuid) -> Result<bool> {
+    let saga = wallet
+        .localstore
+        .get_saga(&operation_id)
+        .await
+        .map_err(|e| WalletError::Backend(format!("read saga: {e}")))?;
+    if saga.is_some() {
+        return Ok(true);
+    }
+    let held = wallet
+        .localstore
+        .get_proofs(
+            Some(wallet.mint_url.clone()),
+            Some(wallet.unit.clone()),
+            Some(vec![State::Reserved, State::Pending, State::PendingSpent]),
+            None,
+        )
+        .await
+        .map_err(|e| WalletError::Backend(format!("read proofs: {e}")))?;
+    Ok(held
+        .iter()
+        .any(|p| p.used_by_operation == Some(operation_id)))
+}
+
+/// The ids of open melt sagas naming `quote_id`.
+async fn open_melt_sagas(wallet: &Wallet, quote_id: &str) -> Result<Vec<uuid::Uuid>> {
+    let sagas = wallet
+        .localstore
+        .get_incomplete_sagas()
+        .await
+        .map_err(|e| WalletError::Backend(format!("list sagas: {e}")))?;
+    Ok(sagas
+        .iter()
+        .filter(|s| {
+            matches!(s.state, WalletSagaState::Melt(_)) && s.quote_id.as_deref() == Some(quote_id)
+        })
+        .map(|s| s.id)
+        .collect())
+}
+
+/// [`melt_operation_open`] for a melt quote, whose operation id is only
+/// known from an open saga naming it or from the quote's reservation.
+async fn melt_quote_open(wallet: &Wallet, quote_id: &str) -> Result<bool> {
+    if !open_melt_sagas(wallet, quote_id).await?.is_empty() {
+        return Ok(true);
+    }
+    let reserved_by = wallet
+        .localstore
+        .get_melt_quote(quote_id)
+        .await
+        .map_err(|e| WalletError::Backend(format!("read melt quote: {e}")))?
+        .and_then(|q| q.used_by_operation)
+        .and_then(|op| uuid::Uuid::parse_str(&op).ok());
+    match reserved_by {
+        Some(operation_id) => melt_operation_open(wallet, operation_id).await,
+        None => Ok(false),
+    }
+}
+
+/// A melt the mint paid after CDK had compensated it: its inputs were put
+/// back to Unspent locally but are spent at the mint. Drop them from the
+/// balance, and turn the history row CDK marked Failed into a Completed one
+/// carrying the preimage. Best-effort (logged): a missed pass leaves the
+/// proofs to fail their next spend, which also marks them spent. The melt's
+/// change is not recovered here — its saga, which held the change outputs,
+/// is gone — but it is derived from the seed, so a NUT-13 restore finds it.
+async fn account_late_melt(
+    wallet: &Wallet,
+    quote_id: &str,
+    preimage: Option<String>,
+    budgets: Budgets,
+) {
+    match wallet.get_unspent_proofs().await {
+        Ok(unspent) if !unspent.is_empty() => {
+            if let Err(e) = bounded(budgets.mint_call, wallet.check_proofs_spent(unspent)).await {
+                tracing::warn!("late melt {quote_id}: proof states not synced: {e}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("late melt {quote_id}: read proofs: {e}"),
+    }
+    let rows = match wallet
+        .list_transactions(Some(TransactionDirection::Outgoing))
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("late melt {quote_id}: read history: {e}");
+            return;
+        }
+    };
+    for mut tx in rows.into_iter().filter(|tx| {
+        tx.quote_id.as_deref() == Some(quote_id) && tx.status == TransactionStatus::Failed
+    }) {
+        tx.status = TransactionStatus::Completed;
+        if preimage.is_some() {
+            tx.payment_proof = preimage.clone();
+        }
+        if let Err(e) = wallet.localstore.add_transaction(tx).await {
+            tracing::warn!("late melt {quote_id}: history row not updated: {e}");
+        }
+    }
+}
+
+/// A confirm that did not end in the mint declaring the payment failed:
+/// any other error, or `PaymentFailed` over a melt request the mint never
+/// answered (`request_lost`). CDK has already handled it before handing the
+/// error back: it finalizes a melt the mint reports Paid, compensates one it
+/// reports Unpaid or Failed (with no payment proof), and leaves it open when
+/// the mint cannot be reached or still has it in flight.
+///
+/// - Open locally (saga, or proofs still held): Pending. The watcher's
+///   finalize pass settles it. The stored quote is NOT consulted: it was
+///   written before the confirm and still reads Unpaid.
+/// - Closed and the mint says Paid: Complete (a compensation the mint then
+///   paid is accounted for).
+/// - Closed and the mint says Failed: Failed.
+/// - Closed and the mint says Unpaid: Failed when the mint answered the
+///   request (it refused it, or the error came before any request). After a
+///   lost request, Pending for the grace window: a melt request still
+///   travelling to the mint reads Unpaid until the mint starts on it, and
+///   would then be paid over the compensation. The watcher decides once the
+///   window has passed.
+/// - Mint unreachable: Pending, tracked the same way.
+#[allow(clippy::too_many_arguments)]
+async fn settle_ambiguous_confirm(
+    wallet: &Wallet,
+    reconciler: &Reconciler,
+    quote_id: &str,
+    operation_id: uuid::Uuid,
+    prepared: &PreparedSend,
+    note: Option<String>,
+    request_lost: bool,
+    budgets: Budgets,
+) -> Payment {
+    if !matches!(melt_operation_open(wallet, operation_id).await, Ok(false)) {
+        return pending_payment(quote_id, prepared, note);
+    }
+    let checked = bounded(budgets.mint_call, wallet.check_melt_quote_status(quote_id)).await;
+    match checked {
+        Ok(quote) if quote.state == MeltQuoteState::Paid => {
+            account_late_melt(wallet, quote_id, quote.payment_proof.clone(), budgets).await;
+            resolved_melt_payment(
+                quote_id,
+                prepared,
+                MeltQuoteState::Paid,
+                quote.payment_proof,
+                note,
+            )
+        }
+        Ok(quote)
+            if quote.state == MeltQuoteState::Failed
+                || (quote.state == MeltQuoteState::Unpaid && !request_lost) =>
+        {
+            resolved_melt_payment(quote_id, prepared, MeltQuoteState::Failed, None, note)
+        }
+        _ => {
+            reconciler.track_unsettled(
+                quote_id,
+                UnsettledMelt {
+                    operation_id,
+                    prepared: prepared.clone(),
+                    note: note.clone(),
+                    since_ms: now_ms(),
+                },
+            );
+            pending_payment(quote_id, prepared, note)
+        }
     }
 }
 
@@ -1568,7 +2192,8 @@ impl WalletBackend for CdkWallet {
         // forwarder; spawning cannot fail, so no rollback path exists).
         let events = self.events_tx.clone();
         let watch_wallet = wallet.clone();
-        let budget = self.budgets.mint_call;
+        let budgets = self.budgets;
+        let reconciler = self.reconciler.clone();
         let handle = self.rt().spawn(async move {
             // First tick DELAYED, not immediate: a disconnect racing the
             // install below aborts this task at its first await, and an
@@ -1579,7 +2204,7 @@ impl WalletBackend for CdkWallet {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                CdkWallet::poll_mint_quotes(&watch_wallet, &events, budget).await;
+                CdkWallet::poll_mint_quotes(&watch_wallet, &events, budgets, &reconciler).await;
             }
         });
         {
@@ -1690,7 +2315,8 @@ impl WalletBackend for CdkWallet {
         let wallet = self.wallet()?;
         let events = self.events_tx.clone();
         self.rt().block_on(async {
-            CdkWallet::poll_mint_quotes_strict(&wallet, &events, self.budgets.mint_call).await
+            CdkWallet::poll_mint_quotes_strict(&wallet, &events, self.budgets, &self.reconciler)
+                .await
         })?;
         Ok(())
     }
@@ -1876,12 +2502,16 @@ impl WalletBackend for CdkWallet {
             let quote_id = quote_id.clone();
             let note = note.clone();
             let prepared = prepared.clone();
-            let status_budget = self.budgets.mint_call;
+            let budgets = self.budgets;
+            let reconciler = self.reconciler.clone();
             self.rt().spawn(async move {
                 let melt = wallet
                     .prepare_melt(&quote_id, metadata)
                     .await
                     .map_err(map_melt_error)?;
+                let operation_id = melt.operation_id();
+                // Until this task ends, the watcher leaves this melt to it.
+                let _confirming = reconciler.confirming(operation_id);
                 let abandoned = {
                     let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
                     h.confirming = !h.caller_gone;
@@ -1898,26 +2528,39 @@ impl WalletBackend for CdkWallet {
                 // Prefer async: a mint that accepts the payment and keeps
                 // routing it answers Pending at once instead of holding the
                 // request open; the watcher finalizes it.
-                let payment = match melt.confirm_prefer_async().await {
-                    // An error other than "the mint says it failed" is
-                    // ambiguous from here — but the mint knows. Ask it
-                    // (bounded) before calling the payment in flight: a
-                    // mint that refused the melt (CDK has already rolled the
-                    // proofs back) must read as Failed, or the app shows
-                    // money "in flight" forever that never left.
-                    Err(e) if !matches!(e, cdk::Error::PaymentFailed) => {
-                        tracing::warn!("melt {quote_id} confirm error, checking the mint: {e}");
-                        let checked = tokio::time::timeout(
-                            status_budget,
-                            wallet.check_melt_quote_status(&quote_id),
+                let outcome = melt.confirm_prefer_async().await;
+                // Read (and forget) whether the melt request went unanswered:
+                // CDK reports a lost answer the mint then reads as Unpaid as
+                // PaymentFailed too, after compensating the proofs.
+                let request_lost = reconciler.unanswered.take(&quote_id);
+                let payment = match outcome {
+                    // The mint itself said the payment failed; CDK has
+                    // compensated the proofs.
+                    Err(cdk::Error::PaymentFailed) if !request_lost => {
+                        melt_outcome_payment(&quote_id, &prepared, outcome, note)
+                    }
+                    // Anything else may be a request the mint has, or will
+                    // have, applied. A Failed here that the melt later
+                    // contradicts invites a second payment, so only a melt
+                    // proven closed locally and settled at the mint is
+                    // called Failed; the rest is Pending, and the watcher
+                    // reports how it ends.
+                    Err(e) => {
+                        tracing::warn!(
+                            "melt {quote_id} confirm error (request lost: {request_lost}), \
+                             checking the mint: {e}"
+                        );
+                        settle_ambiguous_confirm(
+                            &wallet,
+                            &reconciler,
+                            &quote_id,
+                            operation_id,
+                            &prepared,
+                            note,
+                            request_lost,
+                            budgets,
                         )
-                        .await;
-                        match checked {
-                            Ok(Ok(quote)) => {
-                                resolved_melt_payment(&quote_id, &prepared, &quote, note)
-                            }
-                            _ => pending_payment(&quote_id, &prepared, note),
-                        }
+                        .await
                     }
                     outcome => melt_outcome_payment(&quote_id, &prepared, outcome, note),
                 };
@@ -1966,6 +2609,12 @@ impl WalletBackend for CdkWallet {
 
     fn list_recent_payments(&self, limit: u32) -> Result<Vec<Payment>> {
         let wallet = self.wallet()?;
+        let unsettled: std::collections::HashSet<String> = self
+            .reconciler
+            .unsettled_snapshot()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         self.rt().block_on(async {
             let transactions = wallet
                 .list_transactions(None)
@@ -2001,6 +2650,14 @@ impl WalletBackend for CdkWallet {
                     // That row must read Failed, never "Pending" from the
                     // quote's leftover Unpaid state.
                     let status = match tx.status {
+                        // CDK compensated it, but the watcher still doubts
+                        // the mint's Unpaid (the grace window): the send
+                        // said Pending, and history must not say otherwise.
+                        _ if !incoming
+                            && tx.quote_id.as_ref().is_some_and(|q| unsettled.contains(q)) =>
+                        {
+                            PaymentStatus::Pending
+                        }
                         TransactionStatus::Failed => PaymentStatus::Failed,
                         TransactionStatus::Pending => PaymentStatus::Pending,
                         TransactionStatus::Completed => {
@@ -2585,7 +3242,12 @@ mod tests {
         assert!(is_our_artifact("cashu.migration.v1.json.tmp"));
         assert!(is_our_artifact("cashu.migration.v1.json.123.tmp"));
         assert!(is_our_artifact("cashu.migration.v1.lock"));
+        assert!(is_our_artifact("cashu.unsettled.00c0ffee"));
+        assert!(is_our_artifact("cashu.unsettled.00c0ffee.tmp"));
         for foreign in [
+            "cashu.unsettled",
+            "cashu.unsettled.00c0ffee.old",
+            "cashu.unsettled.xyz",
             "cashu.redb-backup",
             "cashu.restored-notes",
             "cashu.restored.",
@@ -3124,6 +3786,279 @@ mod tests {
             )
         )));
         assert_eq!(mint.calls("post_melt"), 1, "exactly one payment");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sent_outcome(recorder: &Recorder, id: &str) -> Option<Payment> {
+        recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                WalletEvent::PaymentSent { payment } | WalletEvent::PaymentFailed { payment }
+                    if payment.id == id && payment.status != PaymentStatus::Pending =>
+                {
+                    Some(payment.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// The melt reached the mint, which paid it; the answer was lost and the
+    /// mint could not be asked right after. CDK leaves the saga open, and the
+    /// stored quote — written before the confirm — still reads Unpaid. A
+    /// host's lookup of the row then came back Failed ("you were not
+    /// charged") over a payment that went through, inviting a second one.
+    #[test]
+    fn a_lost_melt_answer_is_pending_in_lookups_until_the_mint_answers() {
+        let dir = scratch("ambiguous-unreachable");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_outcome(test_mint::MeltOutcome::Paid {
+            preimage: Some(PREIMAGE.into()),
+        });
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        mint.lose_next_melt_response(true);
+        // CDK's status check inside confirm, then the host's lookup: the
+        // mint answers neither.
+        mint.fail_next("get_melt_quote_status", 2);
+
+        let payment = w.send(&prepared, "").expect("never an error after confirm");
+        assert_eq!(payment.status, PaymentStatus::Pending, "{payment:?}");
+        let lookup = w.outgoing_payment_outcome(&payment.id).unwrap().unwrap();
+        assert_eq!(
+            lookup.status,
+            PaymentStatus::Pending,
+            "the saga is still open"
+        );
+
+        // A pass may still meet the unreachable mint; the next one settles.
+        let _ = w.sync_wallet();
+        let _ = w.sync_wallet();
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id)
+            .is_some_and(
+                |p| p.status == PaymentStatus::Complete && p.preimage.as_deref() == Some(PREIMAGE)
+            )));
+        assert!(w.balance().unwrap().confirmed_sats < 1_000);
+        assert_eq!(mint.calls("post_melt"), 1, "exactly one payment");
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The melt request was still on its way when CDK asked the mint, which
+    /// read Unpaid, so CDK compensated the proofs. The request then arrived
+    /// and the mint paid it. The send must not have said Failed, and the
+    /// late payment must reach the host and leave the balance.
+    #[test]
+    fn a_compensated_melt_the_mint_pays_late_is_pending_then_paid() {
+        let dir = scratch("ambiguous-late-paid");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        mint.lose_next_melt_response(false);
+
+        let payment = w.send(&prepared, "").expect("never an error after confirm");
+        assert_eq!(payment.status, PaymentStatus::Pending, "{payment:?}");
+        let history = w.list_recent_payments(50).unwrap();
+        let row = history.iter().find(|p| p.id == payment.id);
+        assert!(
+            row.is_none_or(|p| p.status == PaymentStatus::Pending),
+            "history agrees with the send: {row:?}"
+        );
+        assert_eq!(
+            w.outgoing_payment_outcome(&payment.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            PaymentStatus::Pending
+        );
+        w.sync_wallet().unwrap();
+        assert!(
+            sent_outcome(&recorder, &payment.id).is_none(),
+            "Unpaid inside the grace window settles nothing"
+        );
+
+        mint.deliver_in_transit_melt(Some(PREIMAGE.into()));
+        w.sync_wallet().unwrap();
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id)
+            .is_some_and(|p| p.status == PaymentStatus::Complete)));
+        assert!(
+            w.balance().unwrap().confirmed_sats <= 1_000 - 300,
+            "the spent inputs left the balance: {:?}",
+            w.balance().unwrap()
+        );
+        let row = w
+            .list_recent_payments(50)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == payment.id)
+            .expect("the melt is in history");
+        assert_eq!(row.status, PaymentStatus::Complete, "{row:?}");
+        assert_eq!(row.preimage.as_deref(), Some(PREIMAGE));
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same lost request, but it never arrives: once the grace window
+    /// has passed, the mint's Unpaid is believed and the send is Failed with
+    /// the balance intact.
+    #[test]
+    fn a_compensated_melt_still_unpaid_after_the_grace_window_is_failed() {
+        let dir = scratch("ambiguous-grace-failed");
+        let (mut w, mint) = fake_wallet(&dir);
+        w.set_test_melt_grace(Duration::from_millis(300));
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        mint.lose_next_melt_response(false);
+
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Pending);
+        std::thread::sleep(Duration::from_millis(400));
+        w.sync_wallet().unwrap();
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id)
+            .is_some_and(|p| p.status == PaymentStatus::Failed)));
+        assert_eq!(w.balance().unwrap().confirmed_sats, 1_000);
+        assert_eq!(
+            w.outgoing_payment_outcome(&payment.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            PaymentStatus::Failed
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A mint that issued after the wallet gave up on it: the quote reads
+    /// issued, so the quote pass never mints it again, and the sats stayed
+    /// out of the balance — with no receive event — until the next connect.
+    #[test]
+    fn a_mint_call_that_timed_out_is_recovered_on_the_next_pass() {
+        let dir = scratch("mint-timeout-recovered");
+        let (mut w, mint) = fake_wallet(&dir);
+        w.set_test_budget(Duration::from_millis(500));
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        let before = mint.mint_quote_ids();
+        bolt11_receive(&w, 400);
+        let quote = newest_quote(&mint, &before);
+        mint.pay(&quote, 400);
+        mint.lose_next_mint_response();
+
+        assert!(w.sync_wallet().is_err(), "the mint call ran out of time");
+        assert_eq!(w.balance().unwrap().confirmed_sats, 0);
+        let _ = w.sync_wallet();
+        assert_eq!(
+            w.balance().unwrap().confirmed_sats,
+            400,
+            "recovered without a reconnect"
+        );
+        assert!(eventually(|| recorder.received_ids().contains(&quote)));
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ambiguous melt outlives the process: after a relaunch, history
+    /// must not read Failed (CDK marked the compensated melt Failed) while the
+    /// mint may still pay it, and a late payment must still be accounted for.
+    #[test]
+    fn an_ambiguous_melt_is_still_tracked_after_a_relaunch() {
+        let dir = scratch("ambiguous-relaunch");
+        let (w, mint) = fake_wallet(&dir);
+        w.connect().unwrap();
+        receive_paid_bolt11(&w, &mint, 1_000);
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        mint.lose_next_melt_response(false);
+        let payment = w.send(&prepared, "rent").unwrap();
+        assert_eq!(payment.status, PaymentStatus::Pending);
+        w.disconnect().unwrap();
+        drop(w);
+
+        mint.deliver_in_transit_melt(Some(PREIMAGE.into()));
+        let w = reopen(&dir, &mint);
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        let row = w
+            .list_recent_payments(50)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == payment.id);
+        assert!(
+            row.as_ref()
+                .is_none_or(|p| p.status != PaymentStatus::Failed),
+            "a relaunch must not turn it Failed: {row:?}"
+        );
+        w.sync_wallet().unwrap();
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id)
+            .is_some_and(
+                |p| p.status == PaymentStatus::Complete && p.note.as_deref() == Some("rent")
+            )));
+        assert!(w.balance().unwrap().confirmed_sats <= 1_000 - 300);
+        assert!(
+            !dir.join(format!("{UNSETTLED_PREFIX}.{}", w.mint_tag()))
+                .exists(),
+            "a settled journal is removed"
+        );
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pass that ran while a send still awaited its melt's answer resumed
+    /// that melt too. The mint had not started on the request, read Unpaid,
+    /// and CDK compensated the proofs of a payment the mint then made: the
+    /// host saw Failed ("you were not charged") and the wallet counted spent
+    /// proofs as its own.
+    #[test]
+    fn a_pass_during_a_confirm_in_flight_leaves_that_melt_alone() {
+        let dir = scratch("pass-during-confirm");
+        let (mut w, mint) = fake_wallet(&dir);
+        w.set_test_budget(Duration::from_millis(500));
+        w.connect().unwrap();
+        let recorder = Arc::new(Recorder::default());
+        w.add_event_listener(recorder.clone());
+        receive_paid_bolt11(&w, &mint, 1_000);
+        mint.set_melt_outcome(test_mint::MeltOutcome::Paid {
+            preimage: Some(PREIMAGE.into()),
+        });
+        mint.delay("post_melt", Duration::from_millis(1_500));
+        let prepared = prepare(&w, &test_invoice(Some(300_000)), None).unwrap();
+        let payment = w.send(&prepared, "").unwrap();
+        assert_eq!(
+            payment.status,
+            PaymentStatus::Pending,
+            "outlived its budget"
+        );
+
+        let _ = w.sync_wallet();
+        assert!(
+            sent_outcome(&recorder, &payment.id).is_none(),
+            "the pass settled a melt still in flight"
+        );
+        assert!(
+            w.balance().unwrap().pending_send_sats > 0,
+            "its proofs are still held: {:?}",
+            w.balance().unwrap()
+        );
+
+        assert!(eventually(|| sent_outcome(&recorder, &payment.id)
+            .is_some_and(|p| p.status == PaymentStatus::Complete)));
+        let balance = w.balance().unwrap();
+        assert_eq!(balance.confirmed_sats, 1_000 - 300 - 2, "{balance:?}");
+        assert_eq!(balance.pending_send_sats, 0, "{balance:?}");
         drop(w);
         let _ = std::fs::remove_dir_all(&dir);
     }

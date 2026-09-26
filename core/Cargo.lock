@@ -6151,6 +6151,8 @@ dependencies = [
  "async-trait",
  "bitcoin",
  "cdk",
+ "cdk-common",
+ "cdk-http-client",
  "cdk-redb",
  "clap",
  "hex",
