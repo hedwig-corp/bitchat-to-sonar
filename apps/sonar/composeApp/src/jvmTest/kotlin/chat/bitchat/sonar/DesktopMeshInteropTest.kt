@@ -13,7 +13,6 @@ import uniffi.sonar_ffi.meshBuildPacket
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshParseAnnounce
 import uniffi.sonar_ffi.noiseGenerateKeypair
-import java.nio.file.Files
 import java.security.SecureRandom
 import java.util.PriorityQueue
 import kotlin.test.AfterTest
@@ -51,10 +50,9 @@ class DesktopMeshInteropTest {
 
     @BeforeTest
     fun isolate() {
-        // Never the real keystore namespace: MeshIdentity mints and persists keys.
-        DesktopSecrets.useTestService("chat.bitchat.sonar.meshinterop")
-        DesktopEnv.useTestRoot(Files.createTempDirectory("sonar-mesh-interop").toFile())
-        MeshIdentity.resetCachesForTest()
+        // A generated identity, never a keystore: this runs on CI runners with
+        // no OS keyring, where minting one is (rightly) refused.
+        MeshIdentity.useIdentityForTest(noiseGenerateKeypair(), randomHex(32))
         MeshLink.stop()
         MeshLink.wipe()
         radio = SimRadio()
@@ -68,9 +66,6 @@ class DesktopMeshInteropTest {
         MeshLink.wipe()
         MeshLink.wire = defaultWire
         MeshLink.clock = System::currentTimeMillis
-        runCatching { DesktopSecrets.clear(*DesktopSecrets.MANAGED_KEYS.toTypedArray()) }
-        DesktopSecrets.resetService()
-        DesktopEnv.useTestRoot(null)
         MeshIdentity.resetCachesForTest()
     }
 
