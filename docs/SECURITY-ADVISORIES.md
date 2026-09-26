@@ -39,14 +39,16 @@ All six enter through the MLS stack and are pinned transitively:
 
 ```
 libcrux-sha3 0.0.8 ← hpke-rs 0.6.1 ← openmls_rust_crypto 0.5.1 (git pin)
-                                   ← mdk-core 0.8.0 (git pin) ← sonar-core
+                                   ← cgka-engine 0.9.14 (git pin 235c8ade) ← sonar-core
 libcrux-secrets 0.0.5 ← libcrux-traits 0.0.6 ← libcrux-sha3
 ```
 
 `hpke-rs 0.6.1` declares `libcrux-sha3 = "0.0.8"`. Cargo treats every `0.0.x`
 release as mutually incompatible, so `0.0.10` cannot satisfy that requirement:
 upgrading needs a new `hpke-rs`, which needs a new `openmls`, which needs an
-**MDK rev bump** — see "Why we are not bumping MDK" below.
+**MDK rev bump** — see "MDK 0.9.14 bump notes" below. The libcrux-sha3 0.0.8
+pin may still apply if 0.9.14's OpenMLS/hpke-rs chain has not moved; re-check
+`cargo tree -i libcrux-sha3` after this bump.
 
 **Not compiled (0124, 0209, 0211).** `libcrux-aead` is unreachable from every
 workspace member — `cargo tree -i libcrux-aead` prints nothing, for the host and
@@ -106,24 +108,54 @@ ls target/release/deps | grep -cE '^libquick_xml|^libplist'   # 0
 `netdev`/`netwatch`/`iroh` requirement chain, so the bump is not available to us
 without moving `iroh` — not worth it for a crate that is never built.
 
-## Why we are not bumping MDK for this release
+## MDK 0.9.14 bump notes
 
-Sonar is on `mdk-core 0.8.0`. The native White Noise iOS client moved to MDK 0.9,
-which is wire-incompatible in both directions (`0xf2f1` vs `0xf2ee` proof), so an
-MDK bump is a protocol migration, not a dependency update — it would break Marmot
-interop for every existing Sonar install. Per the Performance Analysis Rule in
-`CLAUDE.md`, any MDK rev bump must also re-run the device-independent group-scale
-simulation and diff the ceiling and welcome-size columns against the committed
-baseline:
+Sonar now pins MDK **v0.9.14** (`cgka-engine` / `cgka-session` / `cgka-traits`
+/ `storage-sqlite` / `transport-nostr-peeler` at
+`235c8ade2920414679e59d7a5f1a0e78651756a4`). This is a **protocol migration**, not
+a lockfile bump:
 
-```sh
-cargo run -p sonar-sim --release -- group-scale
-```
+- **Wire format** `0xf2ee` → `0xf2f1`. New installs speak White Noise's current
+  profile. A 0.8 peer and a 0.9.14 peer cannot decrypt each other's MLS traffic.
+  Kind-445 `#h` is the 32-byte `nostr_group_id` from the founding routing
+  component, not the 16-byte MLS group id hosts use as a conversation id.
+- **Existing 0.8 SQLCipher stores cannot be opened in place as MLS state.**
+  MDK 0.9 applies the key as a passphrase (`PRAGMA key = '<hex>'`), not the
+  0.8 raw-key form `PRAGMA key = "x'HEX'"`, and the Marmot wire format moved
+  `0xf2ee` → `0xf2f1`. `MarmotEngine::persistent` must **not** wipe that file.
+  It decrypts the 0.8 `messages` table with the raw key, copies plaintext
+  chat onto the host transcript sidecar, quarantines the 0.8 file as
+  `*.mdk08.bak`, and creates a fresh 0.9 store. Wrong-key opens stay a hard
+  error and must not delete or quarantine the store. Only a proven
+  unencrypted sqlite file is self-healed. MLS membership is not imported —
+  see `docs/plans/2026-09-13-mdk-09-existing-chat-migration.md`.
+- **Stage 1 of this port** keeps the host-facing `MarmotEngine` / `SonarClient`
+  API (hex group ids, publish-then-`confirm_published`). Multi-device (Stage 2)
+  is not in this change.
+- **Founding admin Leave.** `create_group` / `add_members` pass empty
+  `initial_admins`, so invitees are regular members and MIP-03 Leave works.
+  The founding admin still cannot self-remove (`EngineError::AdminCannotSelfRemove`).
+  `self_demote` returns `InvalidInput` rather than looping Leave; a real demote
+  commit is a follow-up. Do not wipe the store to work around this.
+- **MIP-03 commit ingest is buffered.** Kind-445 commits return `Buffered`
+  until the host calls `advance_group_convergence` after the ~1s quiescence
+  window. Ingest must not wait that window on the receive path (a rival
+  commit can still arrive). Tests sleep 1.1s then advance; the live client
+  still needs a scheduled drain (same shape as marmot-app's worker).
+  `advance_group_convergence` must persist `MessageReceived` events from that
+  drain: MDK may decrypt PeelDeferred application messages there, and a later
+  relay redelivery of the same ciphertext is a content-id Duplicate.
+  Same-epoch fork selection uses committer/digest, not Nostr `created_at`.
+- **Group-scale baseline is committed** in [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md)
+  (2026-09-13, MDK v0.9.14 `235c8ade`). Ceiling moved **120 → 50** because
+  `0xf2f1` welcomes are larger (N=25 is ~38.7 KB vs 0.8’s 27.8 KB). N=100
+  fails wrapping the next welcome (NIP-44). Re-run the sim after any later
+  MDK rev; do not invent numbers.
 
-Trading a confirmed interop break plus a protocol re-baseline against three
-unreachable advisories and one x86_64-desktop-only panic is the wrong call for a
-point release. The bump is tracked separately and should carry the migration and
-the sim diff together.
+The previously deferred advisories (libcrux incremental SHAKE, secrets
+`ct_swap`/`ct_select`, AVX2 SHAKE panic) remain a reachability question on the
+new OpenMLS/hpke-rs chain — re-check with `cargo audit` from `core/` after
+the bump. They were not the reason for the bump; White Noise interop was.
 
 ## Re-check triggers
 

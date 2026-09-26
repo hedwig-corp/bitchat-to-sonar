@@ -190,6 +190,9 @@ pre-open unread state must capture it **before** the open path runs:
 - Compose: `captureOpenChatUnread` runs inside `openChat`/`openDm` *before*
   `markConversationRead` fires; the captured value lives in
   `openChatUnread`/`openChatUnreadAnchor` while the chat is on the nav stack.
+  A cache miss leaves the key unset (provisional live edge) and probes
+  `conversationSummaries()` before mark-read so a failed/closed-node read
+  cannot settle `0` / jump-to-tail. Empty success still settles 0.
 - iOS: the capture runs in `push(.dm)` — **navigation time** — because SwiftUI
   fires a child view's `onAppear` before its parent screen's, so any capture in
   the screen's `onAppear` loses the race against the list's first layout.

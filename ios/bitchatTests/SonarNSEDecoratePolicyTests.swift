@@ -153,6 +153,14 @@ struct SonarNSEDecoratePolicyTests {
             SonarNSEDecoratePolicy.filterUnreadTips(groupIdHexes: ids, hintGroupIdHex: "zzz")
                 == ids
         )
+        #expect(
+            SonarNSEDecoratePolicy.filterUnreadTips(
+                groupIdHexes: ["group-09", "other"],
+                hintGroupIdHex: "group-08",
+                historicalFolds: ["group-08": "group-09"]
+            ) == ["group-09"],
+            "hist hide remounts the tip onto live; a 0.8 hint must still pin it"
+        )
     }
 
     @Test("hintGroupIdHex reads common push payload keys")
@@ -263,6 +271,49 @@ struct SonarNSEDecoratePolicyTests {
         #expect(SonarNSEDecoratePolicy.isMuted(
             groupIdHex: gid, senderNpub: "npub1x", groupName: "friends", mutesJSON: byGroup, now: now
         ))
+        // Mute stored on the recovered 0.8 id must silence a live 0.9 push.
+        let historical = String(repeating: "11", count: 32)
+        let live = String(repeating: "22", count: 32)
+        let byHistorical = try JSONEncoder().encode([historical: active])
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: live,
+            senderNpub: "",
+            groupName: "standup",
+            mutesJSON: byHistorical,
+            now: now,
+            historicalFolds: [historical: live]
+        ))
+        #expect(!SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: live,
+            senderNpub: "",
+            groupName: "standup",
+            mutesJSON: byHistorical,
+            now: now
+        ))
+        // First-resume live sibling: blob empty, FFI already knows hist→live.
+        let ffiFolds = SonarNSEDecoratePolicy.mergeWakeMuteFolds(
+            persisted: [:],
+            listedIds: [live],
+            foldAliases: { $0 == live || $0 == historical ? [live, historical] : [$0] },
+            liveFoldTarget: { $0 == live || $0 == historical ? live : nil }
+        )
+        #expect(ffiFolds == [historical: live])
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: live,
+            senderNpub: "",
+            groupName: "standup",
+            mutesJSON: byHistorical,
+            now: now,
+            historicalFolds: ffiFolds
+        ))
+        #expect(
+            SonarNSEDecoratePolicy.mergeWakeMuteFolds(
+                persisted: [historical: "stale-live"],
+                listedIds: [live],
+                foldAliases: { $0 == live || $0 == historical ? [live, historical] : [$0] },
+                liveFoldTarget: { $0 == live || $0 == historical ? live : nil }
+            ) == [historical: live]
+        )
         // 16-hex short-form store key matches too.
         let byShortForm = try JSONEncoder().encode([String(gid.prefix(16)): active])
         #expect(SonarNSEDecoratePolicy.isMuted(

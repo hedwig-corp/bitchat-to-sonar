@@ -64,7 +64,7 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     val s = sonar
     val chatId = screen.chatId
-    val chat = state.chats.firstOrNull { it.id == chatId }
+    val chat = state.listedChat(chatId)
     val groupName = chat?.let { state.chatTitle(it) } ?: "Group chat"
     val members = state.allGroupMemberContacts(chatId)
 
@@ -72,13 +72,24 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     var addDraft by remember { mutableStateOf("") }
     var showLeaveSheet by remember { mutableStateOf(false) }
     var inviteLink by remember { mutableStateOf<String?>(null) }
-    var pendingJoinRequests by remember(chatId) { mutableStateOf<List<SonarJoinRequest>>(emptyList()) }
+    // Do not `remember(chatId)`: persist-folds remounts hist→live in place
+    // and that key reset dropped recovered requests before the live probe.
+    var pendingJoinRequests by remember { mutableStateOf<List<SonarJoinRequest>>(emptyList()) }
+    var joinRequestsBoundId by remember { mutableStateOf(chatId) }
+    if (joinRequestsBoundId != chatId) {
+        pendingJoinRequests = state.pendingJoinRequestsAfterNavIdChange(
+            joinRequestsBoundId,
+            chatId,
+            pendingJoinRequests,
+        )
+        joinRequestsBoundId = chatId
+    }
     var approvingJoinRequests by remember(chatId) { mutableStateOf<Set<String>>(emptySet()) }
     val clipboard = LocalClipboardManager.current
     fun refreshPendingJoinRequests() {
-        state.loadPendingJoinRequests(chatId) { pendingJoinRequests = it }
+        state.loadPendingJoinRequests(chatId, pendingJoinRequests) { pendingJoinRequests = it }
     }
-    LaunchedEffect(chatId) { refreshPendingJoinRequests() }
+    LaunchedEffect(chatId, state.groupInfoPendingRevision) { refreshPendingJoinRequests() }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(s.bg)) {

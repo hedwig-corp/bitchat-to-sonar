@@ -496,9 +496,15 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
         if let conversationId = SonarNotificationHandoff.conversationId(from: userInfo) {
             Task { @MainActor in
-                if self.sonarStore?.isConversationOpen(conversationId) == true ||
-                    self.chatViewModel?.selectedPrivateChatPeer == PeerID(str: conversationId) {
-                    // Already viewing this chat — consume rather than banner.
+                if await self.sonarStore?.shouldSuppressForegroundNotification(conversationId) == true {
+                    // Remount family, not only the incoming id — a live
+                    // sibling push while sitting in recovered hist must
+                    // dismiss the hist shade too. Compose remount hop
+                    // uses the same remount-aware clear.
+                    self.sonarStore?.clearNotificationsForConversation(conversationId)
+                    completionHandler([])
+                } else if self.chatViewModel?.selectedPrivateChatPeer == PeerID(str: conversationId) {
+                    // Mesh-only path when Sonar has no remount pair.
                     NotificationService.shared.clearNotifications(
                         forConversationIds: [conversationId]
                     )

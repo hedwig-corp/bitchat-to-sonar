@@ -28,6 +28,7 @@ class ConversationRegressionSmokeTest {
         id = id,
         name = "",
         members = listOf(npub(ownNpubHex), npub(peerNpubHex)),
+        isDirect = true,
     )
 
     @Test

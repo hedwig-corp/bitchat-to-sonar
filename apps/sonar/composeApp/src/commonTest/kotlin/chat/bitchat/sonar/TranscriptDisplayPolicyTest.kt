@@ -793,6 +793,19 @@ class TranscriptDisplayPolicyTest {
         assertEquals(null, reopenTranscriptPaint(null, unreadAtOpen = 0))
     }
 
+    /** R-049 through #613's remounted-snapshot first paint: the Marmot
+     *  `openChat` early-paint gate refuses any unread open, whether the paint
+     *  would come from the (fold-family) leave frame or the home snapshot. */
+    @Test
+    fun earlyOpenPaintRefusesAnUnreadOpen() {
+        val leaveFrame = listOf(message("read", 1))
+        assertFalse(firstOpenPaintsBeforePage(leaveFrame, emptyList(), unreadAtOpen = 2))
+        assertFalse(firstOpenPaintsBeforePage(emptyList(), leaveFrame, unreadAtOpen = 1))
+        assertTrue(firstOpenPaintsBeforePage(leaveFrame, emptyList(), unreadAtOpen = 0))
+        assertTrue(firstOpenPaintsBeforePage(emptyList(), leaveFrame, unreadAtOpen = 0))
+        assertFalse(firstOpenPaintsBeforePage(emptyList(), emptyList(), unreadAtOpen = 0))
+    }
+
     @Test
     fun firstUnreadIndexSkipsNonMessageRows() {
         // Call records merge into the transcript feed but never consume

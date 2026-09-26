@@ -1112,10 +1112,14 @@
 				MARKETING_VERSION = "$(MARKETING_VERSION)";
 				/* BreezFFI ships plain sqlite3_*; with -dead_strip that shadows
 				   libsonar_ffi's SQLCipher and NSE hydrate fails with
-				   "SQLCipher support is not active". Force the codec symbols. */
+				   "SQLCipher support is not active". MDK 0.9 SQLCipher is
+				   OpenSSL-backed (`bundled-sqlcipher-vendored-openssl`), so
+				   `_sqlcipher_cc_setup` is not compiled. Force the OpenSSL
+				   codec plus `_sqlite3_key` (SQLCipher-only; plain sqlite
+				   cannot satisfy it). */
 				OTHER_LDFLAGS = (
 					"$(inherited)",
-					"-Wl,-u,_sqlcipher_cc_setup",
+					"-Wl,-u,_sqlcipher_openssl_setup",
 					"-Wl,-u,_sqlite3_key",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = sh.hedwig.sonar.NotificationService;
@@ -1146,7 +1150,7 @@
 				MARKETING_VERSION = "$(MARKETING_VERSION)";
 				OTHER_LDFLAGS = (
 					"$(inherited)",
-					"-Wl,-u,_sqlcipher_cc_setup",
+					"-Wl,-u,_sqlcipher_openssl_setup",
 					"-Wl,-u,_sqlite3_key",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = sh.hedwig.sonar.NotificationService;

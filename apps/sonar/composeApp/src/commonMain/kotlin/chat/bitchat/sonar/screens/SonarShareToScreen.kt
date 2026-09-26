@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.HomeMessageRow
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.conversationSearchMatches
 import chat.bitchat.sonar.mergeHomeMessageRows
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
@@ -64,17 +65,22 @@ fun SonarShareToScreen(state: SonarAppState) {
 
     var q by remember { mutableStateOf("") }
     val ql = q.trim().lowercase()
-    val rows: List<HomeMessageRow> = remember(state.meshDmRows, state.visibleChats, ql) {
+    val rows: List<HomeMessageRow> = remember(state.meshDmRows, state.visibleChats, ql, state.profilesByNpub) {
         val merged = mergeHomeMessageRows(state.meshDmRows, state.visibleChats) { chatId ->
             state.marmotRow(chatId).tsSecs
         }
         if (ql.isEmpty()) merged
         else merged.filter { row ->
-            val name = when (row) {
-                is HomeMessageRow.Mesh -> row.row.name
-                is HomeMessageRow.Marmot -> row.chat.name
+            when (row) {
+                is HomeMessageRow.Mesh ->
+                    conversationSearchMatches(ql, storedName = row.row.name, displayTitle = row.row.name)
+                is HomeMessageRow.Marmot ->
+                    conversationSearchMatches(
+                        ql,
+                        storedName = row.chat.name,
+                        displayTitle = state.chatTitle(row.chat),
+                    )
             }
-            name.lowercase().contains(ql)
         }
     }
 
@@ -152,7 +158,7 @@ fun SonarShareToScreen(state: SonarAppState) {
                 items(rows, key = { it.listKey }) { homeRow ->
                     val name = when (homeRow) {
                         is HomeMessageRow.Mesh -> homeRow.row.name
-                        is HomeMessageRow.Marmot -> homeRow.chat.name
+                        is HomeMessageRow.Marmot -> state.chatTitle(homeRow.chat)
                     }
                     Row(
                         Modifier.fillMaxWidth()

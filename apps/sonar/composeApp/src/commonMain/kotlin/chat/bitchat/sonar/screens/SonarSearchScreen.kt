@@ -40,6 +40,7 @@ import chat.bitchat.sonar.GeoChannel
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarCore
+import chat.bitchat.sonar.conversationSearchMatches
 import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.search
 import chat.bitchat.sonar.ui.SNIcon
@@ -86,13 +87,14 @@ fun SonarSearchScreen(state: SonarAppState) {
     // Title + avatar seed come from the same cached row model as the home list
     // (`marmotRow`, O(1)): the raw group name is blank for npub-only DMs, which
     // painted an untitled row with a different avatar than Home (QA-A13/A14),
-    // and made the shown name unsearchable.
+    // and made the shown name unsearchable. Recovered 0.8 1:1s also carry a
+    // blank MLS name after hide — match the painted title too.
     val chats: List<Pair<SonarChat, String>> = state.visibleChats
         .map { it to state.marmotRow(it.id).title }
         .let { titled ->
             if (ql.isEmpty()) titled
             else titled.filter { (chat, title) ->
-                title.lowercase().contains(ql) || chat.name.lowercase().contains(ql)
+                conversationSearchMatches(query, storedName = chat.name, displayTitle = title)
             }
         }
 

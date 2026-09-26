@@ -126,7 +126,7 @@ struct SonarDMScreenContent: View {
         hasher.combine(peerId)
         hasher.combine(peer.name)
         hasher.combine(transport.rawValue)
-        hasher.combine(store.composerDraftHasText[peerId] ?? false)
+        hasher.combine(!store.composerDraft(for: peerId).isEmpty)
         // Cheap roster identity — npub + cached display name only. Building
         // full `SNMentionCandidate` (bech32 suffix) on every store-driven body
         // reintroduces the cost R-042 moved out of keystrokes.
@@ -276,9 +276,10 @@ struct SonarDMScreenContent: View {
                     onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
-                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                    unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
                     expectedNewestDate: store.expectedNewestMessageDate(peerId),
-                    jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
+                    familyHasOlder: store.canLoadOlderDM(peerId),
+                    jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                     onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
                     composerVersion: composerVersion
                 ) {
@@ -311,8 +312,11 @@ struct SonarDMScreenContent: View {
                     // Captured by push() at navigation time, before this screen
                     // (and openedDM's read-marking) existed. Nil = unset —
                     // do not coerce to 0 (false live-edge chase).
-                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
-                    expectedNewestDate: store.expectedNewestMessageDate(peerId)
+                    unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
+                    expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                    familyHasOlder: store.canLoadOlderDM(peerId),
+                    jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
+                    onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
                 )
                 dmComposer
             }
@@ -535,14 +539,14 @@ struct SonarDMScreenContent: View {
 
     private var mediaPreviewPresented: Binding<Bool> {
         Binding(
-            get: { store.pendingMediaPreviews.contains { $0.peerId == peerId } },
+            get: { !store.pendingMediaPreviewsMatching(peerId).isEmpty },
             set: { if !$0 { store.cancelPreview(peerId: peerId) } }
         )
     }
 
     @ViewBuilder
     private var mediaPreviewContent: some View {
-        let previews = store.pendingMediaPreviews.filter { $0.peerId == peerId }
+        let previews = store.pendingMediaPreviewsMatching(peerId)
         if !previews.isEmpty {
             MediaSendPreviewLoaderView(
                 previews: previews,
@@ -675,6 +679,12 @@ struct SonarDMScreenContent: View {
     private var banner: some View {
         if !isMarmot && !peer.inRange {
             outOfRangeBanner
+        } else if store.recoveredChatWaitingForPeerUpdate(peerId) {
+            SNBanner(
+                icon: .globe, tone: .net,
+                bold: "Waiting for them to update Sonar",
+                rest: " — this chat’s history is here; internet send needs their new version"
+            )
         } else if verified {
             SNBanner(
                 icon: .shieldCheck, tone: .enc,

@@ -1,3 +1,5 @@
+use cgka_session::SessionError;
+use cgka_traits::error::EngineError;
 use nostr::PublicKey;
 use thiserror::Error;
 
@@ -13,7 +15,7 @@ pub enum Error {
     NostrKey(#[from] nostr::key::Error),
 
     #[error("mdk error: {0}")]
-    Mdk(#[from] mdk_core::Error),
+    Mdk(String),
 
     #[error("storage error: {0}")]
     Storage(String),
@@ -94,6 +96,23 @@ pub enum Error {
     #[error("no relay connected within timeout")]
     NoRelayConnected,
 
+    /// Recovered 0.8 ciphertext cannot be republished on the 0.9 wire.
+    /// Hosts must keep the row Failed (not Sent) and tell the user to send again.
+    #[error("this message used an older Sonar protocol; send it again")]
+    HistoricalProtocolRetry,
+
     #[error("rng error: {0}")]
     Rng(#[from] getrandom::Error),
+}
+
+impl From<SessionError> for Error {
+    fn from(err: SessionError) -> Self {
+        Error::Mdk(err.to_string())
+    }
+}
+
+impl From<EngineError> for Error {
+    fn from(err: EngineError) -> Self {
+        Error::Mdk(err.to_string())
+    }
 }

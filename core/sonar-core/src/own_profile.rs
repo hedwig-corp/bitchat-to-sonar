@@ -99,7 +99,13 @@ pub(crate) fn store_own_profile(path: &Path, metadata: &Metadata) -> Result<()> 
 /// Remove the sidecar (account wipe). Missing file is fine.
 pub(crate) fn wipe_own_profile_for_db(db_path: &Path) -> Result<()> {
     let path = own_profile_path_for_db(db_path);
-    match fs::remove_file(&path) {
+    let tmp = path.with_extension("json.tmp");
+    wipe_optional_profile_file(&path)?;
+    wipe_optional_profile_file(&tmp)
+}
+
+fn wipe_optional_profile_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::InvalidInput(format!(
@@ -130,7 +136,13 @@ mod tests {
             CacheRead::Cached(Box::new(metadata))
         );
 
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, b"leftover").unwrap();
         wipe_own_profile_for_db(&db).unwrap();
+        assert!(
+            !tmp.exists(),
+            "a crashed own-profile rename must not survive a wipe"
+        );
         wipe_own_profile_for_db(&db).unwrap(); // idempotent
         assert_eq!(load_own_profile(&path), CacheRead::Missing);
     }

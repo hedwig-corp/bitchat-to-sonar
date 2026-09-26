@@ -451,9 +451,15 @@ enum SonarPushProcessor {
         // Prefer drain metadata, then also run unread-delta so rows that land
         // via gap recovery after the returned drain list are not dropped.
         // Delta skips message tips already bannered from the drain list.
+        let muteFolds = await wakeMuteHistoricalFolds(marmot: marmot)
         var notified = 0
         if !drained.isEmpty {
-            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
+            notified = await notifyDrained(
+                drained,
+                marmot: marmot,
+                prefs: prefs,
+                historicalFolds: muteFolds
+            )
         }
         // Reload summaries so delta sees gap-recovery advances during name resolve.
         _ = await marmot.loadLocalSummaries()
@@ -461,7 +467,8 @@ enum SonarPushProcessor {
             before: beforeUnread,
             baselineHydrated: baselineHydrated,
             marmot: marmot,
-            prefs: prefs
+            prefs: prefs,
+            historicalFolds: muteFolds
         )
 
         switch (notified > 0, synced) {
@@ -493,22 +500,57 @@ enum SonarPushProcessor {
     private static func unreadFingerprint(
         marmot: MarmotChatModel
     ) -> [String: SonarPushUnreadDelta.Fingerprint] {
-        var out: [String: SonarPushUnreadDelta.Fingerprint] = [:]
+        let folds = (UserDefaults.standard.dictionary(forKey: snHistoricalFoldsDefaultsKey) as? [String: String]) ?? [:]
+        var raw: [String: SonarPushUnreadDelta.Fingerprint] = [:]
         for summary in marmot.conversationSummariesByGroup.values where summary.unreadCount > 0 {
-            out[summary.groupIdHex] = SonarPushUnreadDelta.Fingerprint(
+            raw[summary.groupIdHex] = SonarPushUnreadDelta.Fingerprint(
                 unread: summary.unreadCount,
                 latestAt: summary.latestAt,
                 content: summary.latestContent
             )
         }
-        return out
+        // Remount keeps hist for home preview. Wake must fingerprint the
+        // listed live id or a hist-only baseline banners `marmot:<0.8-id>`.
+        return SonarPushUnreadDelta.collapseFingerprints(raw, historicalFolds: folds)
+    }
+
+    /// FFI `fold_aliases` over a stale App Group blob so a mute stored
+    /// on the recovered 0.8 id still silences the first live 0.9 push.
+    @MainActor
+    private static func wakeMuteHistoricalFolds(
+        marmot: MarmotChatModel
+    ) async -> [String: String] {
+        let persisted = SonarNSEDecoratePolicy.decodeHistoricalFolds(
+            UserDefaults(suiteName: SonarChatMuteStore.appGroupId)
+        )
+        let listed = Array(marmot.conversationSummariesByGroup.keys)
+        var aliasesById: [String: [String]] = [:]
+        var liveById: [String: String] = [:]
+        for id in listed {
+            aliasesById[id] = await marmot.foldAliases(groupId: id)
+            if let live = await marmot.liveFoldTarget(groupId: id) {
+                liveById[id] = live
+            }
+        }
+        let merged = snWakeMuteHistoricalFolds(
+            persisted: persisted,
+            listedIds: listed,
+            foldAliases: { aliasesById[$0] ?? [] },
+            liveFoldTarget: { liveById[$0] }
+        )
+        if merged != persisted {
+            snPersistHistoricalFolds(merged, to: UserDefaults.standard)
+        }
+        _ = snPromoteMutedFoldSiblings(folds: merged)
+        return merged
     }
 
     @MainActor
     private static func notifyDrained(
         _ drained: [DrainNotificationInfo],
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        historicalFolds: [String: String]
     ) async -> Int {
         var notified = 0
         for notif in drained {
@@ -521,23 +563,20 @@ enum SonarPushProcessor {
                 }
             }()
             if kind == .call { continue }
-            // Per-chat mute, DM fast path only: a DM row has no meaningful
-            // group name, so match it by sender npub and skip the name
-            // resolution below. Muted GROUPS are not handled here — they are
-            // stopped by the central gate in
-            // NotificationService.sendLocalNotification, which reads the
-            // marmot:<groupId> conversation id this loop puts in userInfo.
-            // (Drained rows DO carry a group id; core sets group_id_hex on
-            // every DrainNotification.)
-            // Directness decided by the SAME helper the NSE uses. Testing
-            // `groupName.isEmpty` here while the NSE also treats the local
-            // placeholder as direct made the two disagree: a drained direct row
-            // carrying that placeholder took the DM branch in the NSE but not in
-            // this backstop, so when the NSE's mirror was stale or missing the
-            // host posted exactly the banner this backstop exists to suppress.
-            if SonarNSEDecoratePolicy.meaningfulGroupName(notif.groupName) == nil,
-               !notif.senderNpub.isEmpty,
-               SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
+            // Per-chat mute: fold family first so a mute stored on the
+            // recovered 0.8 id silences a live 0.9 drain before the host
+            // blob is rewritten. Direct chats also match the sender npub
+            // (same helper the NSE uses for the "Sonar agent DM" placeholder).
+            if SonarChatMuteStore.shared.isMuted(
+                anyOf: snMutedFoldKeys(
+                    groupIdHex: notif.groupIdHex,
+                    historicalFolds: historicalFolds
+                )
+            ) || (
+                SonarNSEDecoratePolicy.meaningfulGroupName(notif.groupName) == nil
+                && !notif.senderNpub.isEmpty
+                && SonarChatMuteStore.shared.isMuted(notif.senderNpub)
+            ) {
                 // The NSE suppresses muted chats itself, but it fails open when
                 // the App Group mute mirror is missing (app updated and never
                 // launched) or undecodable. The host is the backstop: drop the
@@ -631,29 +670,42 @@ enum SonarPushProcessor {
         before: [String: SonarPushUnreadDelta.Fingerprint],
         baselineHydrated: Bool,
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        historicalFolds folds: [String: String]
     ) async -> Int {
-        let after = marmot.conversationSummariesByGroup.values.filter { summary in
-            SonarPushUnreadDelta.isNewlyAdvanced(
-                groupId: summary.groupIdHex,
-                after: SonarPushUnreadDelta.Fingerprint(
-                    unread: summary.unreadCount,
-                    latestAt: summary.latestAt,
-                    content: summary.latestContent
-                ),
-                before: before,
-                baselineHydrated: baselineHydrated
+        var afterByGroup: [String: SonarPushUnreadDelta.Fingerprint] = [:]
+        for summary in marmot.conversationSummariesByGroup.values {
+            afterByGroup[summary.groupIdHex] = SonarPushUnreadDelta.Fingerprint(
+                unread: summary.unreadCount,
+                latestAt: summary.latestAt,
+                content: summary.latestContent
             )
         }
-        if after.isEmpty { return 0 }
+        let liveIds = SonarPushUnreadDelta.newlyUnreadLiveGroupIds(
+            afterByGroup: afterByGroup,
+            before: before,
+            baselineHydrated: baselineHydrated,
+            historicalFolds: folds
+        )
+        if liveIds.isEmpty { return 0 }
 
         var notified = 0
-        for summary in after {
+        for liveId in liveIds {
+            let family = SonarPushUnreadDelta.familyIds(id: liveId, historicalFolds: folds)
+            let candidates = marmot.conversationSummariesByGroup.values.filter {
+                family.contains($0.groupIdHex)
+            }
+            guard let summary = candidates.first(where: { $0.groupIdHex == liveId })
+                ?? candidates.max(by: { lhs, rhs in
+                    if lhs.unreadCount != rhs.unreadCount { return lhs.unreadCount < rhs.unreadCount }
+                    return lhs.latestAt < rhs.latestAt
+                })
+            else { continue }
             // Skip only when drain already bannered *this* tip message.
             // Group-level exclude dropped a second in-group advance that landed
             // via gap recovery after the drain list was returned.
             if marmot.pushWakeAlreadyNotifiedLatest(
-                groupIdHex: summary.groupIdHex,
+                groupIdHex: liveId,
                 content: summary.latestContent
             ) {
                 continue
@@ -670,20 +722,25 @@ enum SonarPushProcessor {
             if kind == .call { continue }
             // Per-chat mute: unread still accrues, no banner. Same NSE
             // fail-open backstop as the drain path above.
-            if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) {
+            if SonarChatMuteStore.shared.isMuted(
+                anyOf: snMutedFoldKeys(
+                    groupIdHex: liveId,
+                    historicalFolds: folds
+                )
+            ) {
                 await removeDeliveredNSEOwnedBanners(
                     messageIdHex: nil,
-                    conversationId: summary.groupIdHex.isEmpty ? nil : "marmot:" + summary.groupIdHex
+                    conversationId: liveId.isEmpty ? nil : "marmot:" + liveId
                 )
                 continue
             }
             // Receiver trill throttle: excess trills stay row-only.
             var sound: SonarNotificationSound = .standard
             if kind == .trill {
-                guard SonarTrillThrottle.shared.admit(chatKey: summary.groupIdHex) else {
+                guard SonarTrillThrottle.shared.admit(chatKey: liveId) else {
                     await removeDeliveredNSEOwnedBanners(
                         messageIdHex: nil,
-                        conversationId: summary.groupIdHex.isEmpty ? nil : "marmot:" + summary.groupIdHex
+                        conversationId: liveId.isEmpty ? nil : "marmot:" + liveId
                     )
                     continue
                 }
@@ -704,23 +761,23 @@ enum SonarPushProcessor {
                 return summary.name
             }()
 
-            let conversationId = summary.groupIdHex.isEmpty
-                ? nil
-                : "marmot:" + summary.groupIdHex
+            let conversationId = liveId.isEmpty ? nil : "marmot:" + liveId
             var userInfo: [String: Any] = [SonarNotificationKeys.marmotWake: true]
             if let conversationId {
                 userInfo[SonarNotificationKeys.conversationId] = conversationId
             }
 
+            let unreadCount = family.compactMap { afterByGroup[$0]?.unread }.max()
+                ?? summary.unreadCount
             guard let routed = SonarLocalNotificationRouter.make(
-                idKey: summary.groupIdHex,
+                idKey: liveId,
                 kind: kind,
                 conversationTitle: conversationTitle,
                 senderName: senderName,
                 groupName: groupName,
                 preview: summary.latestContent.isEmpty ? nil : summary.latestContent,
                 prefs: prefs,
-                unreadCount: summary.unreadCount,
+                unreadCount: unreadCount,
                 userInfo: userInfo
             ) else { continue }
 
@@ -735,7 +792,7 @@ enum SonarPushProcessor {
                 userInfo: routed.userInfo,
                 sound: sound
             )
-            marmot.notePushWakeNotified(groupIdHex: summary.groupIdHex, content: summary.latestContent)
+            marmot.notePushWakeNotified(groupIdHex: liveId, content: summary.latestContent)
             notified += 1
         }
         return notified

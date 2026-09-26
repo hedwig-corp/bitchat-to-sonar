@@ -527,9 +527,21 @@ pub(crate) fn media_staging_paths_for_db(db_path: &Path) -> (PathBuf, PathBuf) {
 
 pub(crate) fn wipe_media_staging_for_db(db_path: &Path) -> Result<()> {
     let (state, dir) = media_staging_paths_for_db(db_path);
+    let tmp = media_staging_state_tmp_path(&state);
     if state.exists() {
         fs::remove_file(&state).map_err(|e| {
-            Error::Storage(format!("remove media staging state {}: {e}", state.display()))
+            Error::Storage(format!(
+                "remove media staging state {}: {e}",
+                state.display()
+            ))
+        })?;
+    }
+    if tmp.exists() {
+        fs::remove_file(&tmp).map_err(|e| {
+            Error::Storage(format!(
+                "remove media staging state tmp {}: {e}",
+                tmp.display()
+            ))
         })?;
     }
     if dir.exists() {
@@ -591,7 +603,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("chat.db");
         let (state_path, staging_dir) = media_staging_paths_for_db(&db);
-        let mut staging = MediaStagingState::load(Some(state_path.clone()), Some(staging_dir.clone()));
+        let mut staging =
+            MediaStagingState::load(Some(state_path.clone()), Some(staging_dir.clone()));
 
         staging
             .stage(
@@ -743,9 +756,7 @@ mod tests {
                 1,
             )
             .expect("stage");
-        staging
-            .mark_failed("old", "gone".into(), 1)
-            .expect("fail");
+        staging.mark_failed("old", "gone".into(), 1).expect("fail");
         staging
             .stage(
                 "fresh".into(),
@@ -798,11 +809,7 @@ mod tests {
                 committed_event_json: None,
             }],
         };
-        fs::write(
-            &state_path,
-            serde_json::to_vec(&disk).expect("serialize"),
-        )
-        .expect("write");
+        fs::write(&state_path, serde_json::to_vec(&disk).expect("serialize")).expect("write");
         let staging = MediaStagingState::load(Some(state_path), Some(staging_dir));
         assert!(staging.entries.is_empty());
     }
@@ -840,8 +847,28 @@ mod tests {
             )
             .expect("stage");
         staging.update_progress("p", 40, 2, true).expect("p1");
-        staging.update_progress("p", 20, 3, true).expect("p2 ignored");
+        staging
+            .update_progress("p", 20, 3, true)
+            .expect("p2 ignored");
         staging.update_progress("p", 80, 4, true).expect("p3");
         assert_eq!(staging.get("p").expect("entry").bytes_sent, 80);
+    }
+
+    #[test]
+    fn wipe_removes_crashed_state_tmp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("chat.db");
+        let (state_path, staging_dir) = media_staging_paths_for_db(&db);
+        fs::create_dir_all(&staging_dir).expect("dir");
+        fs::write(&state_path, b"{}").expect("state");
+        let tmp = media_staging_state_tmp_path(&state_path);
+        fs::write(&tmp, b"{\"previous-account\":true}").expect("tmp");
+        wipe_media_staging_for_db(&db).expect("wipe");
+        assert!(!state_path.exists(), "media staging state removed");
+        assert!(
+            !tmp.exists(),
+            "a crashed media-staging rename must not survive a wipe"
+        );
+        assert!(!staging_dir.exists(), "media staging dir removed");
     }
 }

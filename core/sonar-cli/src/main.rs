@@ -347,7 +347,10 @@ async fn main() {
             "debug" => tracing::Level::DEBUG,
             "info" => tracing::Level::INFO,
             "error" => tracing::Level::ERROR,
-            _ if filter.contains("info") || filter.contains("debug") || filter.contains("trace") => {
+            _ if filter.contains("info")
+                || filter.contains("debug")
+                || filter.contains("trace") =>
+            {
                 if filter.contains("trace") {
                     tracing::Level::TRACE
                 } else if filter.contains("debug") {
@@ -841,12 +844,12 @@ async fn listen(loaded: LoadedConfig, args: ListenArgs) -> Result<()> {
 fn print_groups(client: &SonarClient) -> Result<()> {
     for group in client.groups()? {
         let members = client
-            .members(&group.mls_group_id)?
+            .members(&group.id)?
             .into_iter()
             .map(|pk| pk.to_bech32().expect("valid public key encodes as npub"))
             .collect();
         print_json(&Output::Group {
-            id: hex::encode(group.mls_group_id.as_slice()),
+            id: hex::encode(group.id.as_slice()),
             name: group.name,
             members,
         })?;
@@ -859,14 +862,11 @@ fn print_messages(client: &SonarClient, group_filter: Option<&str>) -> Result<()
     let mut matched = false;
     let groups = client.groups()?;
     for group in groups {
-        if wanted
-            .as_ref()
-            .is_some_and(|want| want != &group.mls_group_id)
-        {
+        if wanted.as_ref().is_some_and(|want| want != &group.id) {
             continue;
         }
         matched = true;
-        for msg in client.messages(&group.mls_group_id)? {
+        for msg in client.messages(&group.id)? {
             print_json(&message_output(&msg))?;
         }
     }
@@ -883,7 +883,7 @@ fn emit_unseen_messages(
 ) -> Result<()> {
     let mut changed = false;
     for group in client.groups()? {
-        let mut messages = client.messages(&group.mls_group_id)?;
+        let mut messages = client.messages(&group.id)?;
         messages.sort_by_key(|m| m.created_at);
         for msg in messages {
             let id = msg.id.to_hex();
@@ -933,10 +933,9 @@ fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
 fn find_dm_group(client: &SonarClient, peer: PublicKey) -> Result<Option<GroupId>> {
     let me = client.identity().public_key();
     for group in client.groups()? {
-        let members: BTreeSet<PublicKey> =
-            client.members(&group.mls_group_id)?.into_iter().collect();
+        let members: BTreeSet<PublicKey> = client.members(&group.id)?.into_iter().collect();
         if members.len() == 2 && members.contains(&me) && members.contains(&peer) {
-            return Ok(Some(group.mls_group_id));
+            return Ok(Some(group.id));
         }
     }
     Ok(None)
@@ -1244,7 +1243,7 @@ fn parse_group_id_hex(hex_id: &str) -> Result<GroupId> {
     if bytes.is_empty() {
         return Err(CliError::Message("group id cannot be empty".to_owned()));
     }
-    Ok(GroupId::from_slice(&bytes))
+    Ok(GroupId::new(bytes))
 }
 
 fn init_secret(args: &InitArgs) -> Result<Option<String>> {

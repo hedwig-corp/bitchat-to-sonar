@@ -83,6 +83,39 @@ final class MarmotService: @unchecked Sendable {
         let id: String
         let name: String
         let memberNpubs: [String]
+        /// Core-authored: false for rooms that currently list only one peer.
+        var isDirect: Bool
+
+        /// Default false so an omitted flag cannot fold a remounted room
+        /// onto a 1:1 (R-050). Snapshot decode matches.
+        init(id: String, name: String, memberNpubs: [String], isDirect: Bool = false) {
+            self.id = id
+            self.name = name
+            self.memberNpubs = memberNpubs
+            self.isDirect = isDirect
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id, name, memberNpubs, isDirect
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            name = try container.decode(String.self, forKey: .name)
+            memberNpubs = try container.decode([String].self, forKey: .memberNpubs)
+            // Missing key is a pre-isDirect snapshot. Default false so a
+            // two-member recovered room stays visible on first-upgrade paint.
+            isDirect = try container.decodeIfPresent(Bool.self, forKey: .isDirect) ?? false
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try container.encode(name, forKey: .name)
+            try container.encode(memberNpubs, forKey: .memberNpubs)
+            try container.encode(isDirect, forKey: .isDirect)
+        }
     }
 
     struct GroupInvite: Sendable, Equatable {
@@ -1295,9 +1328,19 @@ final class MarmotService: @unchecked Sendable {
     func groups() async throws -> [MarmotGroup] {
         try await readOnly {
             try $0.groups().map {
-                MarmotGroup(id: $0.idHex, name: $0.name, memberNpubs: $0.memberNpubs)
+                MarmotGroup(id: $0.idHex, name: $0.name, memberNpubs: $0.memberNpubs, isDirect: $0.isDirect)
             }
         }
+    }
+
+    /// Live 0.9 group that replaced a recovered 0.8 row, or nil if not folded.
+    func liveFoldTarget(groupId: String) async -> String? {
+        await readOnlyNonThrowing({ $0.liveFoldTarget(groupIdHex: groupId) }, default: nil)
+    }
+
+    /// Recovered and live ids that share one conversation after resume.
+    func foldAliases(groupId: String) async -> [String] {
+        await readOnlyNonThrowing({ $0.foldAliases(groupIdHex: groupId) }, default: [groupId])
     }
 
     /// Decrypted message history for a group, oldest first.
@@ -2214,9 +2257,9 @@ final class MarmotService: @unchecked Sendable {
 
     // MARK: - Conversation index (Signal-style summary table)
 
-    func conversationSummaries() async -> [ConversationSummary] {
-        await readOnlyNonThrowing({ node in
-            node.conversationSummaries().map {
+    func conversationSummaries() async throws -> [ConversationSummary] {
+        try await readOnly {
+            $0.conversationSummaries().map {
                 ConversationSummary(
                     groupIdHex: $0.groupIdHex,
                     name: $0.name,
@@ -2228,7 +2271,7 @@ final class MarmotService: @unchecked Sendable {
                     unreadCount: $0.unreadCount
                 )
             }
-        }, default: [])
+        }
     }
 
     func markConversationRead(groupId: String) async {
