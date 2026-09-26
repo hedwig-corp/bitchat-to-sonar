@@ -33,7 +33,7 @@ export WN_HOME="$Q/wn" WN_SECRET_STORE=file WN_ALLOW_LOOPBACK_RELAYS=1
 # A Unix socket path must stay under 104 bytes, and wnd derives a longer
 # temporary path from it: keep it short but stable per worktree.
 export WN_SOCKET="${TMPDIR:-/tmp/}"
-WN_SOCKET="${WN_SOCKET%/}/wnqa-$(printf %s "$ROOT" | cksum | cut -c1-6).sock"
+WN_SOCKET="${WN_SOCKET%/}/wnqa-$(printf %s "$Q" | cksum | cut -c1-6).sock"
 WN_BIN="$Q/wn-target/release"
 export PATH="$WN_BIN:$PATH" # `wn daemon start` spawns `wnd`
 FAILS=0
@@ -138,6 +138,10 @@ cmd_setup() {
     *'"ok":true'* | *already*) ;;
     *) die "wnd did not start: $started" ;;
   esac
+  # A daemon already on this socket must serve this home (and this build).
+  local home
+  home=$(wn daemon status 2>/dev/null | jget 'd["result"]["home"]' 2>/dev/null || true)
+  [ "$home" = "$WN_HOME" ] || die "wnd on $WN_SOCKET serves '${home:-?}', not $WN_HOME; run teardown"
   if [ ! -s "$Q/w.npub" ]; then
     wn create-identity | jget 'd["result"]["npub"]' >"$Q/w.npub"
   fi
