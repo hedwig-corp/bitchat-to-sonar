@@ -10498,10 +10498,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
 
     /**
-     * Shares that arrived while another was still being resolved. iOS keeps
-     * these as committed payloads in its App Group inbox and takes them
-     * oldest-first; this is the in-memory equivalent, so a second ACTION_SEND
-     * cannot destroy the first.
+     * Shares waiting behind the one in the picker, so a second ACTION_SEND
+     * cannot destroy the first. iOS keeps these as committed payloads in its
+     * App Group inbox; this is the in-memory equivalent.
      */
     private val queuedShares = ArrayDeque<SharedContent>()
 
@@ -10527,11 +10526,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             return
         }
-        if (pendingShare != null) {
-            // A picker is already up — queue behind it rather than replacing it.
-            queuedShares.addLast(content)
-            return
-        }
+        // A picker is already up: the share that just arrived is the one the
+        // user is looking for, so it goes first and the one on screen waits
+        // at the front of the queue — not dropped, offered next. Queueing the
+        // new share BEHIND it showed the previous file, and one tap on a chat
+        // sent that instead. iOS: `ingestPendingShares(preferring:)`.
+        pendingShare?.let { queuedShares.addFirst(it) }
         pendingShare = content
         // Never stack two ShareTo pickers: a second share arriving while one is
         // already up would leave a stale ShareTo behind after sendPendingShare's
@@ -10542,10 +10542,27 @@ class SonarAppState(private val scope: CoroutineScope) {
         push(Screen.ShareTo)
     }
 
+    /**
+     * The user left the picker without choosing a chat. Leaves the picker
+     * itself too, BEFORE promoting the next queued share: promoting while
+     * ShareTo was still on top pushed nothing, and the pop that followed left
+     * that share pending with no picker on screen.
+     */
     fun cancelPendingShare() {
         markShareResolved(pendingShare)
         pendingShare = null
+        if (screen is Screen.ShareTo) back()
         promoteQueuedShare()
+    }
+
+    /**
+     * System back. Out of the share picker it means "cancel this share", as a
+     * swipe-down does on iOS: a bare pop kept the share pending but invisible,
+     * so the next share from another app queued behind a picker nobody could
+     * see and Sonar opened with nothing to pick.
+     */
+    fun navigateBack() {
+        if (screen is Screen.ShareTo) cancelPendingShare() else back()
     }
 
     /**
