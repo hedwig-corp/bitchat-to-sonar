@@ -272,6 +272,16 @@ impl OutboxState {
         Ok(out)
     }
 
+    /// Rumor ids whose automatic publish budget is exhausted. Restart recovery
+    /// skips these; kind-7 hydrate must too, or a `mine` chip looks sent forever.
+    pub fn terminal_failed_message_ids(&self) -> Vec<String> {
+        self.entries
+            .values()
+            .filter(|entry| entry.attempts >= OUTBOX_RETRY_ATTEMPT_LIMIT)
+            .map(|entry| entry.message_id_hex.clone())
+            .collect()
+    }
+
     fn save_if_dirty(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
@@ -581,6 +591,10 @@ mod tests {
             .prepare_auto_retry("message", 3)
             .expect("prepare")
             .is_none());
+        assert_eq!(
+            outbox.terminal_failed_message_ids(),
+            vec!["message".to_string()]
+        );
     }
 
     #[test]
