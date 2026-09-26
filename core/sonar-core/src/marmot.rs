@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -24,13 +25,19 @@ use base64::Engine as _;
 use cgka_engine::account_identity_proof::{
     AccountIdentityProofRequest, AccountIdentityProofSigner,
 };
-use cgka_engine::KeyPackageMetadata;
+use cgka_engine::{FeatureRegistry, KeyPackageMetadata};
 use cgka_session::{AccountDeviceSession, PublishWork, SessionConfig, SessionEffects};
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+};
 use cgka_traits::app_components::{
-    decode_nostr_routing_v1, default_group_components, encode_nostr_routing_v1, AppComponentData,
-    NostrRoutingV1, NOSTR_ROUTING_COMPONENT_ID,
+    decode_nostr_routing_v1, default_group_components, encode_encrypted_media_policy_v2,
+    encode_nostr_routing_v1, AppComponentData, AppComponentId, EncryptedMediaPolicyV2,
+    NostrRoutingV1, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    NOSTR_ROUTING_COMPONENT_ID, PRIVATE_USE_APP_COMPONENT_ID_START,
 };
 use cgka_traits::app_event::{MarmotAppEvent, MARMOT_APP_EVENT_KIND_CHAT};
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
 use cgka_traits::engine::{
     CreateGroupRequest, GroupEvent, KeyPackage, KeyPackageSource, SendIntent,
 };
@@ -114,6 +121,34 @@ pub struct GroupCreation {
 }
 
 /// Result of a group membership update that must be published by the caller.
+/// Consecutive convergence passes that may leave a group unsettled before
+/// Sonar stops scheduling wakes for it; its next ingest starts over.
+pub const MAX_UNSETTLED_CONVERGENCE_PASSES: u8 = 8;
+/// Shortest wait before re-running a pass MDK asked for again.
+const CONVERGENCE_RETRY_FLOOR_MS: u64 = 60;
+
+/// Result of [`MarmotEngine::apply_pending_convergence`].
+#[derive(Debug, Default)]
+pub struct ConvergencePass {
+    /// Commits this client staged (e.g. a SelfRemove auto-commit) that the
+    /// host must publish and confirm.
+    pub updates: Vec<GroupMembershipUpdate>,
+    /// When the next pass is due, if a group is still converging.
+    pub retry_after: Option<Duration>,
+}
+
+#[derive(Debug, Default)]
+struct ConvergenceStep {
+    update: Option<GroupMembershipUpdate>,
+    retry_after: Option<Duration>,
+    /// Queued proposals (a Leave) MDK regenerated in this pass.
+    regenerated_proposals: Vec<Event>,
+}
+
+/// Convergence passes a queued Leave may wait through (each up to the MIP-03
+/// cutoff, ~1.1s) before the chat is dropped without its proposal.
+const QUEUED_LEAVE_MAX_PASSES: usize = 3;
+
 #[derive(Debug)]
 pub struct GroupMembershipUpdate {
     pub group_id: GroupId,
@@ -162,6 +197,27 @@ pub struct MediaRef {
     /// ChaCha20-Poly1305 nonce. Needed to decrypt; `None` on pre-0.9 rows.
     #[serde(default)]
     pub nonce: Option<[u8; 12]>,
+    /// Scheme label the blob was sealed with (imeta `v`). `None` on rows
+    /// stored before it was kept; those are all `mip04-v2`.
+    #[serde(default)]
+    pub scheme_version: Option<String>,
+    /// Per-file key, derived when the message was sent or received from the
+    /// exporter secret of the epoch it belongs to. A later commit moves the
+    /// group's exporter, so the current epoch cannot re-derive it (MDK 0.8
+    /// kept per-epoch exporter secrets for this). Lives only in the sealed
+    /// transcript. `None` on older rows, which fall back to the current epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_key: Option<MediaFileKey>,
+}
+
+/// A per-attachment ChaCha20-Poly1305 key. `Debug` never prints it.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaFileKey(pub [u8; 32]);
+
+impl std::fmt::Debug for MediaFileKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MediaFileKey(..)")
+    }
 }
 
 /// Local delivery state for a transcript row. Network/relay work updates this
@@ -202,6 +258,8 @@ impl From<&MediaReference> for MediaRef {
             duration_ms: r.duration_ms,
             original_hash: Some(r.original_hash),
             nonce: Some(r.nonce),
+            scheme_version: Some(r.scheme_version.clone()),
+            file_key: None,
         }
     }
 }
@@ -788,10 +846,13 @@ pub struct MarmotEngine {
     /// False when an unreadable transcript could not be moved aside: writing
     /// would overwrite it, so this session keeps the transcript in memory.
     transcript_writable: std::sync::atomic::AtomicBool,
-    /// Groups whose last ingest left a MIP-03 `Buffered` commit. The host
-    /// (and sonar-sim) must call [`Self::apply_pending_convergence`] after
-    /// the quiescence window — ingest itself does not wait.
-    pending_convergence: Mutex<HashSet<GroupId>>,
+    /// Groups MDK asked to converge (`SessionEffects::pending_convergence`):
+    /// a MIP-03 `Buffered` commit, a SelfRemove auto-commit not yet due, a
+    /// queued intent. The host (and sonar-sim) must call
+    /// [`Self::apply_pending_convergence`] after the quiescence window —
+    /// ingest itself does not wait. The value counts passes that left the
+    /// group unsettled, so a group that never settles stops re-arming wakes.
+    pending_convergence: Mutex<HashMap<GroupId, u8>>,
     /// Titles recovered from an MDK 0.8 store. Live 0.9 groups are not here.
     historical_group_names: Mutex<HashMap<GroupId, String>>,
     /// 0.8 `groups.description` / welcome `group_description`. Needed so a
@@ -967,11 +1028,8 @@ impl MarmotEngine {
             peeler,
         )
         .account_identity_proof_signer(Arc::new(NostrProofSigner { keys }))
-        .supported_app_components(
-            default_group_components()
-                .into_iter()
-                .chain(std::iter::once(NOSTR_ROUTING_COMPONENT_ID)),
-        );
+        .feature_registry(sonar_feature_registry())
+        .supported_app_components(sonar_supported_app_components());
         if defer_hydration {
             config = config.defer_group_hydration();
         }
@@ -1007,7 +1065,7 @@ impl MarmotEngine {
             transcript_io: Mutex::new(()),
             transcript_journal_bytes: std::sync::atomic::AtomicU64::new(loaded.journal_bytes),
             transcript_writable: std::sync::atomic::AtomicBool::new(loaded.writable),
-            pending_convergence: Mutex::new(HashSet::new()),
+            pending_convergence: Mutex::new(HashMap::new()),
             historical_group_names: Mutex::new(historical_group_names),
             historical_group_descriptions: Mutex::new(
                 crate::mdk08_migrate::load_historical_group_descriptions(db_path),
@@ -1855,6 +1913,13 @@ impl MarmotEngine {
         let routing =
             NostrRoutingV1::new(nostr_group_id, relay_urls).map_err(Error::InvalidInput)?;
         let routing_bytes = encode_nostr_routing_v1(&routing).map_err(Error::InvalidInput)?;
+        // White Noise sends and fetches media only in groups that require an
+        // encrypted-media component, and creates its own with V2.
+        let media_policy = EncryptedMediaPolicyV2::blossom_default([
+            crate::client::DEFAULT_BLOSSOM_SERVER.to_owned(),
+        ])
+        .and_then(|policy| encode_encrypted_media_policy_v2(&policy))
+        .map_err(Error::InvalidInput)?;
         // Founder is always an admin. Extra ids bootstrap co-admins
         // (MIP-03 competing commits). Default empty: invitees can Leave.
         let initial_admins = extra_admins
@@ -1866,10 +1931,16 @@ impl MarmotEngine {
             description: description.to_owned(),
             members,
             required_features: Vec::new(),
-            app_components: vec![AppComponentData {
-                component_id: NOSTR_ROUTING_COMPONENT_ID,
-                data: routing_bytes,
-            }],
+            app_components: vec![
+                AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: routing_bytes,
+                },
+                AppComponentData {
+                    component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    data: media_policy,
+                },
+            ],
             initial_admins,
         };
         let hint = WelcomeRumorHint {
@@ -1944,14 +2015,48 @@ impl MarmotEngine {
         )))
     }
 
+    /// Leave `group_id` (MIP-03 SelfRemove). [`Error::LeaveQueued`] when MDK
+    /// queued the proposal behind unresolved convergence input, or already
+    /// holds one from an earlier attempt; see
+    /// [`Self::regenerate_queued_leave`].
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
-        self.send_intent(
-            SendIntent::Leave {
-                group_id: group_id.clone(),
-            },
-            false,
-        )
-        .await
+        let leave = SendIntent::Leave {
+            group_id: group_id.clone(),
+        };
+        let mut lease = self.lease_session().await;
+        let _ = lease.get_mut().ensure_group_hydrated(group_id);
+        let sent = lease.get_mut().send(leave).await;
+        drop(lease);
+        let effects = match sent {
+            Ok(effects) => effects,
+            Err(err) if err.to_string().contains("leave already requested") => {
+                return Err(Error::LeaveQueued)
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if effects.publish.is_empty() && !effects.queued.is_empty() {
+            self.note_pending_convergence(group_id.clone());
+            return Err(Error::LeaveQueued);
+        }
+        self.effects_to_membership_update(group_id, effects, false)
+    }
+
+    /// Drive `group_id`'s convergence (bounded) until MDK regenerates a queued
+    /// Leave, and return its SelfRemove proposal for the host to publish
+    /// before it drops the chat. `None` if it did not regenerate in time: the
+    /// chat is still dropped locally, as when a leave publish fails.
+    pub async fn regenerate_queued_leave(&self, group_id: &GroupId) -> Result<Option<Event>> {
+        for _ in 0..QUEUED_LEAVE_MAX_PASSES {
+            let step = self.advance_group_convergence_step(group_id).await?;
+            if let Some(event) = step.regenerated_proposals.into_iter().next() {
+                return Ok(Some(event));
+            }
+            let Some(wait) = step.retry_after else {
+                break;
+            };
+            tokio::time::sleep(wait).await;
+        }
+        Ok(None)
     }
 
     async fn send_intent(
@@ -2091,42 +2196,97 @@ impl MarmotEngine {
     /// a later relay redelivery of the same ciphertext is a durable
     /// Duplicate keyed by content-id, which `lookup_chat` cannot find from
     /// the Nostr event id.
+    /// New input for `group_id`: (re)start its convergence passes.
     fn note_pending_convergence(&self, group_id: GroupId) {
         self.pending_convergence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(group_id);
+            .insert(group_id, 0);
     }
 
-    /// Apply MIP-03 buffered commits for every group ingest parked.
+    fn note_convergence_requested(&self, effects: &SessionEffects) {
+        for group_id in &effects.pending_convergence {
+            if !self.is_dropped(group_id) {
+                self.note_pending_convergence(group_id.clone());
+            }
+        }
+    }
+
+    /// True while some group still waits on a convergence pass.
+    pub fn has_pending_convergence(&self) -> bool {
+        !self.pending_convergence_ids().is_empty()
+    }
+
+    /// Groups still waiting on a convergence pass.
+    pub fn pending_convergence_ids(&self) -> HashSet<GroupId> {
+        self.pending_convergence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Apply MIP-03 buffered commits and due SelfRemove auto-commits for every
+    /// group MDK asked to converge, and return the commits this client must
+    /// publish plus how long to wait before the next pass is due.
     ///
     /// Call this after a relay-sync batch or, in tests/sim, after sleeping
     /// the ~1.1s quiescence window. Ingest itself must not wait on that
-    /// window (Signal-comparable receive path).
-    pub async fn apply_pending_convergence(&self) -> Result<()> {
-        let ids: Vec<GroupId> = self
-            .pending_convergence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .cloned()
-            .collect();
+    /// window (Signal-comparable receive path). A group leaves the set when a
+    /// pass no longer asks for another one, or after
+    /// [`MAX_UNSETTLED_CONVERGENCE_PASSES`] passes that did not settle it.
+    pub async fn apply_pending_convergence(&self) -> Result<ConvergencePass> {
+        let ids: Vec<GroupId> = self.pending_convergence_ids().into_iter().collect();
+        let mut pass = ConvergencePass::default();
         for id in ids {
             if self.is_dropped(&id) {
-                self.pending_convergence
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&id);
+                self.forget_pending_convergence(&id);
                 continue;
             }
-            self.advance_group_convergence(&id).await?;
+            let step = self.advance_group_convergence_step(&id).await?;
+            pass.updates.extend(step.update);
+            let Some(retry) = step.retry_after else {
+                self.forget_pending_convergence(&id);
+                continue;
+            };
+            let mut pending = self
+                .pending_convergence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let passes = pending.entry(id.clone()).or_insert(0);
+            *passes = passes.saturating_add(1);
+            if *passes > MAX_UNSETTLED_CONVERGENCE_PASSES {
+                // The next ingest for this group re-notes it.
+                pending.remove(&id);
+                continue;
+            }
+            drop(pending);
+            pass.retry_after = Some(pass.retry_after.map_or(retry, |r: Duration| r.min(retry)));
         }
-        Ok(())
+        Ok(pass)
     }
 
-    pub async fn advance_group_convergence(&self, group_id: &GroupId) -> Result<()> {
+    fn forget_pending_convergence(&self, group_id: &GroupId) {
+        self.pending_convergence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(group_id);
+    }
+
+    /// Run one convergence pass for `group_id`. Returns the commits MDK
+    /// staged for this client to publish, such as the auto-commit of another
+    /// member's SelfRemove; the caller publishes each and confirms it.
+    pub async fn advance_group_convergence(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<GroupMembershipUpdate>> {
+        Ok(self.advance_group_convergence_step(group_id).await?.update)
+    }
+
+    async fn advance_group_convergence_step(&self, group_id: &GroupId) -> Result<ConvergenceStep> {
         if self.is_dropped(group_id) {
-            return Ok(());
+            return Ok(ConvergenceStep::default());
         }
         let mut lease = self.lease_session().await;
         let _ = lease.get_mut().ensure_group_hydrated(group_id);
@@ -2136,9 +2296,55 @@ impl MarmotEngine {
         let mut effects = lease.get_mut().advance_convergence(group_id).await?;
         let drained = lease.get_mut().drain();
         merge_session_effects(&mut effects, drained);
+        // Still collecting or re-requested (an auto-commit not due yet):
+        // run another pass once MDK's cutoff has passed.
+        let cutoff = lease
+            .get_mut()
+            .prepare_convergence_cutoff_delay_ms(group_id)
+            .ok()
+            .flatten();
         drop(lease);
+        let requested_again = effects.pending_convergence.contains(group_id);
+        for other in effects
+            .pending_convergence
+            .iter()
+            .filter(|g| *g != group_id)
+        {
+            if !self.is_dropped(other) {
+                self.note_pending_convergence(other.clone());
+            }
+        }
+        let retry_after = match cutoff {
+            Some(ms) => Some(Duration::from_millis(ms.max(CONVERGENCE_RETRY_FLOOR_MS))),
+            None if requested_again => Some(Duration::from_millis(CONVERGENCE_RETRY_FLOOR_MS)),
+            None => None,
+        };
+        let update = if effects
+            .publish
+            .iter()
+            .any(|work| matches!(work, PublishWork::AutoPublish { .. }))
+        {
+            Some(self.effects_to_membership_update(group_id, effects.clone(), false)?)
+        } else {
+            None
+        };
+        let regenerated_proposals = effects
+            .publish
+            .iter()
+            .filter_map(|work| match work {
+                PublishWork::Proposal {
+                    msg,
+                    queued_intent: Some(_),
+                } => transport_to_event(msg).ok(),
+                _ => None,
+            })
+            .collect();
         let _ = self.persist_session_effects(effects)?;
-        Ok(())
+        Ok(ConvergenceStep {
+            update,
+            retry_after,
+            regenerated_proposals,
+        })
     }
 
     pub async fn clear_pending_commit(&self, group_id: &GroupId) -> Result<()> {
@@ -2198,10 +2404,63 @@ impl MarmotEngine {
             .await?;
         drop(lease);
         let event = event_from_app_publish(&effects)?;
-        if let Some(msg) = self.chat_from_app_rumor(group_id, &rumor, &event, true) {
+        if let Some(mut msg) = self.chat_from_app_rumor(group_id, &rumor, &event, true) {
+            self.attach_media_file_keys(group_id, &mut msg, None);
             self.store_chat(msg);
         }
         Ok(event)
+    }
+
+    /// Store each attachment's file key on the row while the group is still in
+    /// the epoch the message belongs to. `message_epoch` is the epoch MDK
+    /// decrypted an incoming message in; `None` for our own send, which
+    /// happens in the current epoch. A late message from an older epoch keeps
+    /// no key and falls back to the current exporter at download.
+    fn attach_media_file_keys(
+        &self,
+        group_id: &GroupId,
+        msg: &mut ChatMessage,
+        message_epoch: Option<u64>,
+    ) {
+        if msg.media.iter().all(|m| m.original_hash.is_none()) {
+            return;
+        }
+        let exported = self.with_session(|session| {
+            let (epoch, secret) = session.exporter_secret_with_epoch(
+                group_id,
+                media_crypto::ENCRYPTED_MEDIA_EXPORTER_LABEL,
+                32,
+            )?;
+            Ok((epoch.0, (*secret).clone()))
+        });
+        let (epoch, secret) = match exported {
+            Ok(exported) => exported,
+            Err(err) => {
+                tracing::warn!(%err, "media exporter unavailable; attachment keys not stored");
+                return;
+            }
+        };
+        if message_epoch.is_some_and(|e| e != epoch) {
+            return;
+        }
+        for media in &mut msg.media {
+            let Some(original_hash) = media.original_hash else {
+                continue;
+            };
+            match media_crypto::derive_file_key(
+                &secret,
+                media
+                    .scheme_version
+                    .as_deref()
+                    .unwrap_or(media_crypto::LEGACY_SCHEME_VERSION),
+                &original_hash,
+                &media.mime_type,
+                &media.filename,
+            ) {
+                Ok(key) => media.file_key = Some(MediaFileKey(key)),
+                Err(err) => tracing::warn!(%err, "attachment key derivation failed"),
+            }
+        }
     }
 
     pub async fn create_and_process_text_message(
@@ -2454,9 +2713,15 @@ impl MarmotEngine {
                         },
                         duration_ms: media.duration_ms,
                         waveform: None,
-                        scheme_version: media_crypto::DEFAULT_SCHEME_VERSION.to_owned(),
+                        scheme_version: media
+                            .scheme_version
+                            .clone()
+                            .unwrap_or_else(|| media_crypto::LEGACY_SCHEME_VERSION.to_owned()),
                         nonce,
                     };
+                    if let Some(MediaFileKey(key)) = media.file_key {
+                        return media_crypto::decrypt_with_file_key(&key, ciphertext, &reference);
+                    }
                     return media_crypto::decrypt_from_download(secret, ciphertext, &reference);
                 }
             }
@@ -2623,6 +2888,16 @@ impl MarmotEngine {
         let drained = lease.get_mut().drain();
         merge_session_effects(&mut effects, drained);
         drop(lease);
+        // A standalone proposal (MIP-03 SelfRemove: a member left) does not
+        // commit on ingest: MDK schedules the auto-commit for its next
+        // convergence pass and lists the group in `pending_convergence`.
+        // Passes only run for groups noted here.
+        self.note_convergence_requested(&effects);
+        for group_id in ingested.valid_proposal_groups {
+            if !self.is_dropped(&group_id) {
+                self.note_pending_convergence(group_id);
+            }
+        }
 
         tracing::debug!(
             ?outcome,
@@ -2689,6 +2964,7 @@ impl MarmotEngine {
                     group_id,
                     message_id,
                     sender,
+                    epoch,
                     payload,
                     ..
                 } => {
@@ -2700,9 +2976,10 @@ impl MarmotEngine {
                     }
                     // Persist kind-9 chat rows only. `chat_from_payload` already
                     // returns None for other Marmot app-event kinds.
-                    if let Some(msg) =
+                    if let Some(mut msg) =
                         self.chat_from_payload(&group_id, &message_id, &sender, &payload)
                     {
+                        self.attach_media_file_keys(&group_id, &mut msg, Some(epoch.0));
                         self.store_chat(msg.clone());
                         last = Incoming::Message(msg);
                     }
@@ -3774,6 +4051,51 @@ fn key_package_from_event(event: &Event) -> Result<KeyPackage> {
     })
 }
 
+/// App components this client advertises in its KeyPackages and leaves.
+///
+/// White Noise (marmot-app) creates every group, DMs included, requiring
+/// routing `0x8004`, agent text streams `0x8006` and encrypted media v2
+/// `0x800b`; a member missing one cannot be added at all. Sonar implements the
+/// v2 media scheme (`media_crypto`). It does not render agent streams, so it
+/// joins those groups and shows only the durable messages. Message retention
+/// `0x8005` stays unadvertised: claiming it would promise disappearing
+/// messages Sonar does not enforce.
+fn sonar_supported_app_components() -> impl Iterator<Item = AppComponentId> {
+    default_group_components().into_iter().chain([
+        NOSTR_ROUTING_COMPONENT_ID,
+        AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    ])
+}
+
+/// Features registered as marmot-app registers them, so White Noise can add
+/// Sonar to its chats. White Noise requires MIP-03 SelfRemove (MLS proposal
+/// `0x000a`) of every member, and its default agent-text-stream policy
+/// (`user_to_agent_default`) requires the receive role (`0xf2d1`). Sonar's
+/// Leave is already a SelfRemove. For the receive role Sonar gets the durable
+/// start/final messages over MLS and skips the live QUIC previews; it never
+/// takes the send or fanout role.
+fn sonar_feature_registry() -> FeatureRegistry {
+    let mut registry = FeatureRegistry::new();
+    registry.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03 SelfRemove group departure",
+        },
+    );
+    registry.register(
+        AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+        CapabilityRequirement {
+            requires: AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
+            level: RequirementLevel::Optional,
+            description: "receive QUIC-backed agent text stream previews",
+        },
+    );
+    registry
+}
+
 fn key_package_to_event(
     identity: &Identity,
     kp: &KeyPackage,
@@ -3797,9 +4119,16 @@ fn key_package_to_event(
             TagKind::custom("mls_proposals"),
             meta.mls_proposals.iter().copied().map(hex_u16),
         ),
+        // Private-use components only, as marmot-app publishes them. White
+        // Noise rejects a package whose tag is not exactly that set, so an
+        // IETF-range id here makes Sonar unreachable from White Noise.
         Tag::custom(
             TagKind::custom("app_components"),
-            meta.app_components.iter().copied().map(hex_u16),
+            meta.app_components
+                .iter()
+                .copied()
+                .filter(|id| *id >= PRIVATE_USE_APP_COMPONENT_ID_START)
+                .map(hex_u16),
         ),
     ];
     let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), BASE64.encode(&kp.bytes))
@@ -5050,6 +5379,8 @@ mod historical_fold_tests {
 
     fn photo(url: &str, hash: Option<[u8; 32]>, nonce: Option<[u8; 12]>) -> MediaRef {
         MediaRef {
+            scheme_version: None,
+            file_key: None,
             url: url.to_owned(),
             mime_type: "image/jpeg".to_owned(),
             filename: "old.jpg".to_owned(),
@@ -5123,11 +5454,12 @@ mod historical_fold_tests {
         let historical = GroupId::new(vec![0x11; 16]);
         let url = "https://blossom.example/old.bin";
         let secret = vec![0xABu8; 32];
-        let upload = crate::media_crypto::encrypt_for_upload(
+        let upload = crate::media_crypto::encrypt_with_scheme(
             &secret,
             b"photo-bytes",
             "image/jpeg",
             "old.jpg",
+            crate::media_crypto::LEGACY_SCHEME_VERSION,
         )
         .expect("encrypt with stored 0.8 exporter");
         engine.push_transcript_message(chat_with_media(
@@ -5210,11 +5542,12 @@ mod historical_fold_tests {
         let live = GroupId::new(vec![0x22; 16]);
         let url = "https://blossom.example/old.bin";
         let secret = vec![0xABu8; 32];
-        let upload = crate::media_crypto::encrypt_for_upload(
+        let upload = crate::media_crypto::encrypt_with_scheme(
             &secret,
             b"photo-bytes",
             "image/jpeg",
             "old.jpg",
+            crate::media_crypto::LEGACY_SCHEME_VERSION,
         )
         .expect("encrypt with stored 0.8 exporter");
         engine.push_transcript_message(chat_with_media(
@@ -5265,5 +5598,130 @@ mod historical_fold_tests {
             err.to_string().contains(RECOVERED_08_MEDIA_UNAVAILABLE),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_package_event_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn tag_values(event: &Event, name: &str) -> Vec<String> {
+        event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice())
+            .find(|values| values.first().is_some_and(|first| first == name))
+            .map(|values| values[1..].to_vec())
+            .unwrap_or_default()
+    }
+
+    /// White Noise's `key_package_from_record` (marmot-app) decodes the package
+    /// and requires each capability tag to equal the decoded set exactly, with
+    /// `app_components` narrowed to private-use ids. Sonar published the full
+    /// component list, so every White Noise client refused Sonar's packages
+    /// ("app_components tag does not exactly match decoded KeyPackage metadata")
+    /// and could not start a chat with a Sonar user.
+    #[tokio::test]
+    async fn key_package_tags_match_white_noise_validation() {
+        let engine = MarmotEngine::in_memory(Identity::generate());
+        let event = engine.key_package_event(Vec::new()).await.unwrap();
+        let kp = key_package_from_event(&event).unwrap();
+        let meta = engine
+            .lease_session()
+            .await
+            .get_mut()
+            .key_package_metadata(&kp)
+            .unwrap();
+        assert!(
+            meta.app_components
+                .iter()
+                .any(|id| *id < PRIVATE_USE_APP_COMPONENT_ID_START),
+            "the package must carry a non-private component for this test to bite"
+        );
+
+        let hex = |id: &u16| format!("0x{id:04x}");
+        let expected = [
+            (
+                "mls_extensions",
+                meta.mls_extensions.iter().map(hex).collect::<BTreeSet<_>>(),
+            ),
+            (
+                "mls_proposals",
+                meta.mls_proposals.iter().map(hex).collect(),
+            ),
+            (
+                "app_components",
+                meta.app_components
+                    .iter()
+                    .filter(|id| **id >= PRIVATE_USE_APP_COMPONENT_ID_START)
+                    .map(hex)
+                    .collect(),
+            ),
+        ];
+        for (name, want) in expected {
+            let values = tag_values(&event, name);
+            let got = values.iter().cloned().collect::<BTreeSet<_>>();
+            assert_eq!(values.len(), got.len(), "{name} has duplicate ids");
+            assert_eq!(got, want, "{name} tag must equal the decoded package");
+        }
+        assert_eq!(
+            tag_values(&event, "i"),
+            vec![meta.key_package_ref_hex.clone()]
+        );
+    }
+
+    /// What White Noise (marmot-app) requires of every member it adds, DMs
+    /// included: routing, identity proof, agent-text-stream and encrypted
+    /// media v2 components, the MIP-03 SelfRemove proposal, and the
+    /// agent-text-stream receive role of its default policy. Missing any of
+    /// them makes `create_group` fail with `missing_required_capabilities`.
+    #[tokio::test]
+    async fn key_package_offers_what_white_noise_requires_of_members() {
+        let engine = MarmotEngine::in_memory(Identity::generate());
+        let event = engine.key_package_event(Vec::new()).await.unwrap();
+        let components = tag_values(&event, "app_components");
+        for id in ["0x8004", "0x8006", "0x8009", "0x800b"] {
+            assert!(components.iter().any(|c| c == id), "app component {id}");
+        }
+        assert!(
+            tag_values(&event, "mls_proposals")
+                .iter()
+                .any(|p| p == "0x000a"),
+            "SelfRemove proposal"
+        );
+        assert!(
+            tag_values(&event, "mls_extensions")
+                .iter()
+                .any(|e| e == "0xf2d1"),
+            "agent-text-stream receive role"
+        );
+        // Retention is not claimed: Sonar does not enforce disappearing
+        // messages.
+        assert!(!components.iter().any(|c| c == "0x8005"));
+    }
+
+    /// White Noise sends and fetches media only in groups that require an
+    /// encrypted-media component ("group does not require encrypted media"
+    /// otherwise), so groups Sonar creates must carry V2.
+    #[tokio::test]
+    async fn groups_sonar_creates_require_encrypted_media_v2() {
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(Vec::new()).await.unwrap();
+        let creation = alice
+            .create_group("team", vec![bob_kp], Vec::new())
+            .await
+            .unwrap();
+        let group = alice
+            .groups()
+            .unwrap()
+            .into_iter()
+            .find(|g| g.id == creation.group.id)
+            .expect("created group");
+        assert!(group
+            .required_capabilities
+            .app_components
+            .contains(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID));
     }
 }

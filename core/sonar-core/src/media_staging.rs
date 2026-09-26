@@ -81,6 +81,14 @@ pub(crate) struct SealedMediaItem {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waveform: Option<Vec<u8>>,
+    /// Label the blob was sealed with. Items staged before it was stored were
+    /// all sealed with the MIP-04 label.
+    #[serde(default = "legacy_scheme_version")]
+    pub scheme_version: String,
+}
+
+fn legacy_scheme_version() -> String {
+    crate::media_crypto::LEGACY_SCHEME_VERSION.to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -597,6 +605,21 @@ pub(crate) fn new_media_staging_id() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Items staged before the scheme was stored were sealed with the MIP-04
+    /// label; resuming one after an update must keep that label, or its imeta
+    /// would name a scheme the blob was not sealed with.
+    #[test]
+    fn a_sealed_item_staged_before_the_scheme_field_reads_as_mip04() {
+        let old = r#"{"url":"https://b.example/x","filename":"a.jpg","mime":"image/jpeg",
+            "original_hash_hex":"00","encrypted_hash_hex":"00","nonce_hex":"00",
+            "original_size":1,"encrypted_size":17}"#;
+        let item: SealedMediaItem = serde_json::from_str(old).expect("old sealed item");
+        assert_eq!(
+            item.scheme_version,
+            crate::media_crypto::LEGACY_SCHEME_VERSION
+        );
+    }
 
     #[test]
     fn stage_survives_reload_and_remove_cleans_files() {

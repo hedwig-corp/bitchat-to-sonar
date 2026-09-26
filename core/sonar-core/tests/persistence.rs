@@ -2365,11 +2365,13 @@ async fn mdk08_media_exporter_secret_survives_migrate_and_backup() {
     let group_id = vec![0x88u8; 16];
     let secret = vec![0xABu8; 32];
     let url = "https://blossom.example/old.bin";
-    let upload = sonar_core::media_crypto::encrypt_for_upload(
+    // An 0.8 install sealed with the MIP-04 label.
+    let upload = sonar_core::media_crypto::encrypt_with_scheme(
         &secret,
         b"photo-bytes",
         "image/jpeg",
         "old.jpg",
+        sonar_core::media_crypto::LEGACY_SCHEME_VERSION,
     )
     .expect("encrypt recovered blob");
     let tags = serde_json::json!([[
@@ -2513,11 +2515,13 @@ async fn mdk08_bak_backfills_welcome_and_media_secrets_on_reopen() {
     let welcome_id = vec![0x77u8; 16];
     let secret = vec![0xABu8; 32];
     let url = "https://blossom.example/old.bin";
-    let upload = sonar_core::media_crypto::encrypt_for_upload(
+    // An 0.8 install sealed with the MIP-04 label.
+    let upload = sonar_core::media_crypto::encrypt_with_scheme(
         &secret,
         b"photo-bytes",
         "image/jpeg",
         "old.jpg",
+        sonar_core::media_crypto::LEGACY_SCHEME_VERSION,
     )
     .expect("encrypt");
     let tags = serde_json::json!([[

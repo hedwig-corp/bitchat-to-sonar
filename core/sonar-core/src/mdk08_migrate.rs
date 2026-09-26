@@ -1566,6 +1566,8 @@ fn lenient_media_ref(tag: &Tag) -> Option<MediaRef> {
         Some((w.parse().ok()?, h.parse().ok()?))
     });
     Some(MediaRef {
+        scheme_version: fields.get("v").cloned(),
+        file_key: None,
         url,
         mime_type: fields
             .get("m")

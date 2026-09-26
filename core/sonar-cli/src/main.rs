@@ -88,6 +88,49 @@ enum Command {
     Groups,
     /// Print messages for all groups or one group.
     Messages(MessagesArgs),
+    /// Print pending group invites (multi-member welcomes wait for accept).
+    Invites,
+    /// Accept a pending group invite by its welcome id.
+    Accept(AcceptArgs),
+    /// Create a group with the given members and deliver their welcomes.
+    GroupCreate(GroupCreateArgs),
+    /// Send a text message to an existing group.
+    GroupSend(GroupSendArgs),
+    /// Leave a group (MIP-03 SelfRemove) and drop it locally.
+    Leave(LeaveArgs),
+}
+
+#[derive(Args, Debug)]
+struct LeaveArgs {
+    /// Group id hex, as printed by `groups`.
+    #[arg(long)]
+    group: String,
+}
+
+#[derive(Args, Debug)]
+struct AcceptArgs {
+    /// Welcome id hex, as printed by `invites`.
+    id: String,
+}
+
+#[derive(Args, Debug)]
+struct GroupCreateArgs {
+    /// Group display name.
+    #[arg(long)]
+    name: String,
+    /// Member npub1... or 64-char hex public key. Repeat for each member.
+    #[arg(long = "member", required = true)]
+    members: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct GroupSendArgs {
+    /// Group id hex, as printed by `groups`.
+    #[arg(long)]
+    group: String,
+    /// Plaintext message body.
+    #[arg(long)]
+    text: String,
 }
 
 #[derive(Args, Debug)]
@@ -301,6 +344,27 @@ enum Output {
         id: String,
         name: String,
         members: Vec<String>,
+    },
+    Invite {
+        id: String,
+        group_id: String,
+        name: String,
+        welcomer: String,
+        member_count: u32,
+    },
+    Accepted {
+        group_id: String,
+    },
+    GroupCreated {
+        group_id: String,
+        name: String,
+        members: Vec<String>,
+    },
+    GroupSent {
+        group_id: String,
+    },
+    Left {
+        group_id: String,
     },
     Message {
         group_id: String,
@@ -589,6 +653,93 @@ async fn run(cli: Cli) -> Result<()> {
             let client = loaded.connect().await?;
             client.sync().await?;
             print_messages(&client, args.group.as_deref())?;
+            Ok(())
+        }
+        Command::Invites => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            for invite in client.pending_group_invites()? {
+                print_json(&Output::Invite {
+                    id: invite.id.to_hex(),
+                    group_id: hex::encode(invite.group_id.as_slice()),
+                    name: invite.group_name,
+                    welcomer: invite
+                        .welcomer
+                        .to_bech32()
+                        .expect("valid public key encodes as npub"),
+                    member_count: invite.member_count,
+                })?;
+            }
+            Ok(())
+        }
+        Command::Accept(args) => {
+            let welcome_id = EventId::from_hex(&args.id)
+                .map_err(|e| CliError::Message(format!("welcome id: {e}")))?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = client.accept_group_invite(&welcome_id).await?;
+            print_json(&Output::Accepted {
+                group_id: hex::encode(group_id.as_slice()),
+            })?;
+            Ok(())
+        }
+        Command::GroupCreate(args) => {
+            let members = args
+                .members
+                .iter()
+                .map(|m| {
+                    PublicKey::parse(m).map_err(|e| CliError::Message(format!("member {m}: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = client.start_group(members.clone(), &args.name).await?;
+            print_json(&Output::GroupCreated {
+                group_id: hex::encode(group_id.as_slice()),
+                name: args.name,
+                members: members
+                    .iter()
+                    .map(|pk| pk.to_bech32().expect("valid public key encodes as npub"))
+                    .collect(),
+            })?;
+            Ok(())
+        }
+        Command::GroupSend(args) => {
+            let group_id = parse_group_id_hex(&args.group)?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            // Publishing finishes after send_text returns; exiting first would
+            // leave the message in the local outbox (same wait as `send`).
+            let message_ids_before = outbound_message_ids(&client, &group_id)?;
+            client.send_text(&group_id, &args.text).await?;
+            wait_for_new_outbound_ack(
+                &client,
+                &group_id,
+                &message_ids_before,
+                Duration::from_secs(15),
+            )
+            .await?;
+            print_json(&Output::GroupSent {
+                group_id: args.group,
+            })?;
+            Ok(())
+        }
+        Command::Leave(args) => {
+            let group_id = parse_group_id_hex(&args.group)?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            client.leave_group(&group_id).await?;
+            // The SelfRemove proposal is published by a spawned task; keep the
+            // runtime alive long enough for it to reach the relays.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            print_json(&Output::Left {
+                group_id: args.group,
+            })?;
             Ok(())
         }
     }

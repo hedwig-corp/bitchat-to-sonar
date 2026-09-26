@@ -50,6 +50,11 @@ pub enum Error {
     #[error("encrypted media error: {0}")]
     Media(String),
 
+    /// MDK accepted the Leave but queued it behind unresolved convergence
+    /// input; it regenerates the SelfRemove proposal on a later pass.
+    #[error("leave queued until the group converges")]
+    LeaveQueued,
+
     #[error("media too large: {bytes} bytes (max {max})")]
     MediaTooLarge { bytes: u64, max: u64 },
 

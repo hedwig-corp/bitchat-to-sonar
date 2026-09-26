@@ -242,6 +242,7 @@ fn upload_to_sealed(upload: &EncryptedMediaUpload, url: &str) -> SealedMediaItem
         thumbhash: upload.thumbhash.clone(),
         duration_ms: upload.duration_ms,
         waveform: upload.waveform.clone(),
+        scheme_version: upload.scheme_version.clone(),
     }
 }
 
@@ -273,6 +274,7 @@ fn sealed_item_to_upload(sealed: SealedMediaItem) -> Result<EncryptedMediaUpload
         duration_ms: sealed.duration_ms,
         waveform: sealed.waveform,
         nonce,
+        scheme_version: sealed.scheme_version,
     })
 }
 
@@ -883,9 +885,39 @@ fn retryable_media_http_error(error: &Error) -> bool {
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// MDK's MIP-03 quiescence window is ~1.1s; wake the drain after it.
+const CONVERGENCE_WAKE_DELAY: Duration = Duration::from_millis(1_500);
 /// Per-relay bound for [`SonarClient::fetch_key_package`]: enough to see past
 /// a newer MDK 0.8 package from the same account's not-yet-updated install.
 const NEWEST_KEY_PACKAGE_FETCH_LIMIT: usize = 4;
+
+/// NIP-17 inbox relays: where this account reads gift-wrapped welcomes.
+pub const INBOX_RELAYS_KIND: u16 = 10050;
+/// MIP-00 KeyPackage relays: where this account publishes its KeyPackages.
+pub const KEY_PACKAGE_RELAYS_KIND: u16 = 10051;
+
+/// The kind-10050 and kind-10051 relay lists naming `relays`, signed by
+/// `identity`. White Noise (marmot-app) sends a welcome only to the invitee's
+/// kind-10050 list and has no fallback, so without it a White Noise user's
+/// invite to a Sonar user is never delivered. Empty when there are no relays:
+/// an empty list would tell peers this account reads nowhere.
+pub(crate) fn relay_list_events(identity: &Identity, relays: &[RelayUrl]) -> Result<Vec<Event>> {
+    if relays.is_empty() {
+        return Ok(Vec::new());
+    }
+    [INBOX_RELAYS_KIND, KEY_PACKAGE_RELAYS_KIND]
+        .into_iter()
+        .map(|kind| {
+            let tags = relays
+                .iter()
+                .map(|relay| Tag::custom(TagKind::custom("relay"), [relay.to_string()]));
+            Ok(EventBuilder::new(Kind::Custom(kind), "")
+                .tags(tags)
+                .build(identity.public_key())
+                .sign_with_keys(identity.keys())?)
+        })
+        .collect()
+}
 
 /// Relay-side cap when pulling ALL of an author's KeyPackages. `author` can be
 /// attacker-chosen, and this query is unbounded otherwise. Note it bounds the
@@ -2479,12 +2511,16 @@ impl SonarClient {
         &self.engine
     }
 
-    /// Publish our kind-30443 KeyPackage so others can start groups with us.
+    /// Publish our kind-30443 KeyPackage so others can start groups with us,
+    /// with the kind-10050/10051 relay lists White Noise routes welcomes by.
     /// Waits for the relay OK acks — callers that need durability (a peer is
     /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone()).await?;
         self.nostr.send_event(&event).await?;
+        for list in relay_list_events(self.identity(), &self.relays)? {
+            self.nostr.send_event(&list).await?;
+        }
         Ok(())
     }
 
@@ -2499,10 +2535,16 @@ impl SonarClient {
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone()).await?;
+        let lists = relay_list_events(self.identity(), &self.relays)?;
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
             if let Err(err) = nostr.send_event(&event).await {
                 tracing::warn!(%err, "background KeyPackage publish failed");
+            }
+            for list in lists {
+                if let Err(err) = nostr.send_event(&list).await {
+                    tracing::warn!(%err, kind = list.kind.as_u16(), "background relay list publish failed");
+                }
             }
         });
         Ok(())
@@ -2642,7 +2684,9 @@ impl SonarClient {
             Some(event) => Ok(event),
             None => {
                 if saw_legacy {
-                    tracing::info!("peer only publishes MDK 0.8 KeyPackages; waiting for them to update");
+                    tracing::info!(
+                        "peer only publishes MDK 0.8 KeyPackages; waiting for them to update"
+                    );
                 }
                 Err(Error::KeyPackageNotFound(author))
             }
@@ -3315,8 +3359,27 @@ impl SonarClient {
             .live_fold_target(group_id)
             .filter(|live| self.engine.is_live_group(live).unwrap_or(false))
             .unwrap_or_else(|| group_id.clone());
+        let mut queued_leave_event = None;
         let leave_update = match self.engine.leave_group(&leave_id).await {
             Ok(update) => Some(update),
+            // MDK queued the SelfRemove behind unresolved convergence input.
+            // Converge now so the proposal goes out before the chat is dropped.
+            Err(Error::LeaveQueued) => {
+                queued_leave_event = self
+                    .engine
+                    .regenerate_queued_leave(&leave_id)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(%err, "queued leave did not regenerate");
+                        None
+                    });
+                if queued_leave_event.is_none() {
+                    tracing::warn!(
+                        "queued leave not regenerated in time; dropping the chat locally"
+                    );
+                }
+                None
+            }
             Err(err) if is_admin_self_remove_blocked(&err) => {
                 let demote = self.engine.self_demote(&leave_id).await?;
                 self.best_effort_membership_publish(demote, "self-demote before leave")
@@ -3340,6 +3403,14 @@ impl SonarClient {
         self.schedule_resubscribe_marmot_groups_if_live();
         if let Some(leave_update) = leave_update {
             self.schedule_best_effort_leave_publish(leave_update);
+        }
+        if let Some(event) = queued_leave_event {
+            self.schedule_best_effort_leave_publish(GroupMembershipUpdate {
+                group_id: leave_id.clone(),
+                evolution_event: event,
+                welcomes: Vec::new(),
+                requires_commit_merge: false,
+            });
         }
         Ok(())
     }
@@ -6915,11 +6986,35 @@ impl SonarClient {
         let mut notifications: Vec<DrainNotification> = Vec::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
         let mut sticker_refs: Vec<StickerRef> = Vec::new();
-        // Replay MIP-03 buffered commits from an earlier ingest. Ingest
-        // itself returns immediately (Buffered → GroupUpdated); applying
-        // here keeps the quiescence wait off the receive path.
-        if let Err(err) = self.engine.apply_pending_convergence().await {
-            tracing::debug!(%err, context, "pending MIP-03 convergence apply failed");
+        // Replay MIP-03 buffered commits and due SelfRemove auto-commits from
+        // an earlier ingest. Ingest itself returns immediately (Buffered →
+        // GroupUpdated); applying here keeps the quiescence wait off the
+        // receive path.
+        let convergence_before = self.engine.pending_convergence_ids();
+        let mut convergence_retry = None;
+        match self.engine.apply_pending_convergence().await {
+            Ok(pass) => {
+                convergence_retry = pass.retry_after;
+                for update in pass.updates {
+                    let group_hex = hex::encode(update.group_id.as_slice());
+                    // Same exclusion as any membership change: no sends
+                    // while the commit is staged.
+                    let _epoch = self.membership_gate.write().await;
+                    match self.publish_membership_update(update).await {
+                        Ok(()) => {
+                            changed_groups.insert(group_hex);
+                        }
+                        Err(err) => tracing::debug!(
+                            %err,
+                            context,
+                            "convergence auto-commit publish failed; MDK restores it on the next pass"
+                        ),
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(%err, context, "pending MIP-03 convergence apply failed");
+            }
         }
         let group_names: HashMap<Vec<u8>, String> = self
             .engine
@@ -7155,6 +7250,24 @@ impl SonarClient {
             sticker_refs,
             STICKER_REF_PREFETCH_BATCH_LIMIT,
         ));
+        // A proposal or buffered commit noted during this batch converges after
+        // MDK's quiescence window, and a pass MDK asked to repeat is due after
+        // its cutoff. Wake the host's drain loop for it. The engine stops
+        // asking after a bounded number of unsettled passes, so an input that
+        // never settles cannot keep the device awake.
+        let newly_noted = self
+            .engine
+            .pending_convergence_ids()
+            .iter()
+            .any(|id| !convergence_before.contains(id));
+        let wake_after = convergence_retry.or(newly_noted.then_some(CONVERGENCE_WAKE_DELAY));
+        if let Some(delay) = wake_after {
+            let notify = self.marmot_notify.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                notify.notify_one();
+            });
+        }
         (report, notifications)
     }
 
@@ -7252,7 +7365,9 @@ impl SonarClient {
         let mut events: Vec<Event> = {
             let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
             let mut groups = self.pending_marmot_groups.lock().unwrap();
-            if giftwraps.is_empty() && groups.is_empty() {
+            // Nothing buffered still drains when a convergence pass is due
+            // (a member's leave waits on it to be committed).
+            if giftwraps.is_empty() && groups.is_empty() && !self.engine.has_pending_convergence() {
                 return Ok(notifications);
             }
             let mut out = std::mem::take(&mut *giftwraps);
@@ -10457,6 +10572,8 @@ mod tests {
     #[test]
     fn index_preview_labels_media_only_messages() {
         let media_ref = |mime: &str, filename: &str| crate::marmot::MediaRef {
+            scheme_version: None,
+            file_key: None,
             url: "https://blossom.test/x".to_owned(),
             mime_type: mime.to_owned(),
             filename: filename.to_owned(),
@@ -10808,6 +10925,8 @@ mod tests {
             mine: true,
             delivery_state: DeliveryState::Sent,
             media: vec![crate::marmot::MediaRef {
+                scheme_version: None,
+                file_key: None,
                 url: url.to_owned(),
                 mime_type: "image/jpeg".to_owned(),
                 filename: "old.jpg".to_owned(),
@@ -10848,6 +10967,8 @@ mod tests {
             mine: true,
             delivery_state: DeliveryState::Sent,
             media: vec![crate::marmot::MediaRef {
+                scheme_version: None,
+                file_key: None,
                 url: url.to_owned(),
                 mime_type: "image/jpeg".to_owned(),
                 filename: "old.jpg".to_owned(),
@@ -10933,6 +11054,8 @@ mod tests {
             mine: true,
             delivery_state: DeliveryState::Sent,
             media: vec![crate::marmot::MediaRef {
+                scheme_version: None,
+                file_key: None,
                 url: url.to_owned(),
                 mime_type: "image/jpeg".to_owned(),
                 filename: "old.jpg".to_owned(),

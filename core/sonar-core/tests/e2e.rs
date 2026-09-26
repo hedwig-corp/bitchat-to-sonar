@@ -509,6 +509,133 @@ async fn leave_group_removes_local_chat() {
     );
 }
 
+/// White Noise (marmot-app) delivers a welcome only to the invitee's
+/// kind-10050 inbox relays, with no fallback, and finds KeyPackages through
+/// kind-10051. Publishing the KeyPackage must publish both lists naming the
+/// relays this client reads.
+#[tokio::test]
+async fn publishing_the_key_package_publishes_inbox_and_key_package_relay_lists() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let identity = Identity::generate();
+    let author = identity.public_key();
+    let alice = SonarClient::connect_in_memory(identity, vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    alice.publish_key_package().await.expect("publish");
+
+    let reader = NostrClient::default();
+    reader
+        .add_relay(relay_url.clone())
+        .await
+        .expect("add relay");
+    reader.connect().await;
+    for kind in [
+        sonar_core::client::INBOX_RELAYS_KIND,
+        sonar_core::client::KEY_PACKAGE_RELAYS_KIND,
+    ] {
+        let events = reader
+            .fetch_events(
+                Filter::new().kind(Kind::Custom(kind)).author(author),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("fetch relay list");
+        let event = events.into_iter().next().unwrap_or_else(|| {
+            panic!("kind {kind} relay list must be published with the KeyPackage")
+        });
+        let relays: Vec<String> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice())
+            .filter(|values| values.first().is_some_and(|name| name == "relay"))
+            .filter_map(|values| values.get(1).cloned())
+            .collect();
+        assert_eq!(relays, vec![relay_url.to_string()], "kind {kind}");
+    }
+}
+
+/// Drive `client`'s host loop (wait → drain) until `gone` is no longer a
+/// member of `group`, or `secs` elapse.
+async fn drain_until_member_gone(
+    client: &SonarClient,
+    group: &sonar_core::GroupId,
+    gone: nostr::PublicKey,
+    secs: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    client.sync().await.expect("sync");
+    while std::time::Instant::now() < deadline {
+        if !client.members(group).expect("members").contains(&gone) {
+            return true;
+        }
+        if client.wait_for_marmot_event(1).await {
+            client.drain_pending_marmot().await.expect("drain");
+        }
+    }
+    !client.members(group).expect("members").contains(&gone)
+}
+
+/// A member's Leave is a MIP-03 SelfRemove proposal. MDK 0.9 does not commit
+/// it on ingest: it schedules an auto-commit for the next convergence pass.
+/// The remaining member must run that pass, publish the commit, and everyone
+/// else must apply it; otherwise the leaver stays in the roster for good.
+#[tokio::test]
+async fn a_members_leave_is_committed_by_the_remaining_members() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let charlie = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("charlie connects");
+    bob.publish_key_package().await.expect("bob publishes kp");
+    charlie
+        .publish_key_package()
+        .await
+        .expect("charlie publishes kp");
+    let group = alice
+        .start_group(
+            vec![bob.identity().public_key(), charlie.identity().public_key()],
+            "field team",
+        )
+        .await
+        .expect("alice starts group");
+    for member in [&bob, &charlie] {
+        member.sync().await.expect("sync welcome");
+        let invite = member
+            .pending_group_invites()
+            .expect("invites")
+            .into_iter()
+            .next()
+            .expect("group invite");
+        member
+            .accept_group_invite(&invite.id)
+            .await
+            .expect("accept");
+    }
+
+    let charlie_pk = charlie.identity().public_key();
+    charlie.leave_group(&group).await.expect("charlie leaves");
+    // The SelfRemove proposal is published by a spawned task.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        drain_until_member_gone(&alice, &group, charlie_pk, 20).await,
+        "alice must commit charlie's SelfRemove and drop charlie"
+    );
+    assert!(
+        drain_until_member_gone(&bob, &group, charlie_pk, 20).await,
+        "bob must apply the commit that removes charlie"
+    );
+    assert_eq!(alice.members(&group).expect("alice members").len(), 2);
+    assert_eq!(bob.members(&group).expect("bob members").len(), 2);
+}
+
 /// Two instances in the same geohash channel exchange public messages, with
 /// correct nickname tags, mine-detection, and channel isolation.
 #[tokio::test]
@@ -1389,7 +1516,9 @@ async fn recovered_08_resume_uses_a_09_package_behind_a_newer_08_one() {
     let bob = SonarClient::connect_in_memory(bob_identity.clone(), vec![relay_url.clone()])
         .await
         .expect("bob connects");
-    bob.publish_key_package().await.expect("bob's 0.9 install publishes");
+    bob.publish_key_package()
+        .await
+        .expect("bob's 0.9 install publishes");
 
     let newer_08 = EventBuilder::new(
         Kind::Custom(KEY_PACKAGE_KIND),
@@ -1410,7 +1539,10 @@ async fn recovered_08_resume_uses_a_09_package_behind_a_newer_08_one() {
     let bob_08 = NostrClient::new(bob_identity.keys().clone());
     bob_08.add_relay(relay_url).await.expect("add mock relay");
     bob_08.connect().await;
-    let published = bob_08.send_event(&newer_08).await.expect("publish 0.8 package");
+    let published = bob_08
+        .send_event(&newer_08)
+        .await
+        .expect("publish 0.8 package");
     assert!(!published.success.is_empty(), "{:?}", published.failed);
 
     alice
