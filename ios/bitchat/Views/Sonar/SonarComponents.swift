@@ -5470,6 +5470,33 @@ enum SNSettingsTrail {
     /// Selected item in a picker sheet (design: `trail="check"`).
     case check
     case none
+
+    /// Spoken value of a toggle row. `SNSwitch` is only a picture, so without
+    /// it VoiceOver read "Share local time, button" and never said on or off.
+    var accessibilityToggleValue: String? {
+        if case .toggle(let on) = self {
+            return on ? String(localized: "On") : String(localized: "Off")
+        }
+        return nil
+    }
+}
+
+/// Toggle rows speak as a switch with its state; other rows are unchanged.
+private struct SNSettingsTrailAccessibility: ViewModifier {
+    let trail: SNSettingsTrail
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let value = trail.accessibilityToggleValue {
+            if #available(iOS 17.0, macOS 14.0, *) {
+                content.accessibilityValue(Text(verbatim: value)).accessibilityAddTraits(.isToggle)
+            } else {
+                content.accessibilityValue(Text(verbatim: value))
+            }
+        } else {
+            content
+        }
+    }
 }
 
 struct SNSettingsRow: View {
@@ -5538,6 +5565,7 @@ struct SNSettingsRow: View {
             }
         }
         .buttonStyle(SNRowPressStyle())
+        .modifier(SNSettingsTrailAccessibility(trail: trail))
     }
 }
 

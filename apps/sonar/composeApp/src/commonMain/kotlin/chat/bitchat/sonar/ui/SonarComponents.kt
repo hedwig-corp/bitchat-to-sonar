@@ -6,6 +6,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -366,7 +367,7 @@ fun SNSettingsRow(
     }
     Column {
         Row(
-            Modifier.fillMaxWidth().clickable(onClick = onClick)
+            Modifier.fillMaxWidth().snSettingsRowClick(toggle, onClick)
                 .padding(horizontal = 14.dp, vertical = 11.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -393,6 +394,17 @@ fun SNSettingsRow(
         if (divider) Box(Modifier.fillMaxWidth().padding(start = 60.dp).height(1.dp).background(s.hairline))
     }
 }
+
+/** A settings row's tap target. A toggle row is one `Role.Switch` node that
+ *  reports on/off, so TalkBack says "Share local time, switch, on" instead of
+ *  an unlabelled tap, and uiautomator sees `checked`. The whole row stays the
+ *  tap target; [SNSwitch] is only the visual. */
+fun Modifier.snSettingsRowClick(toggle: Boolean?, onClick: () -> Unit): Modifier =
+    if (toggle != null) {
+        toggleable(value = toggle, role = Role.Switch, onValueChange = { onClick() })
+    } else {
+        clickable(onClick = onClick)
+    }
 
 /** iOS-style toggle (st-switch): cyan track when on, neutral when off. */
 @Composable

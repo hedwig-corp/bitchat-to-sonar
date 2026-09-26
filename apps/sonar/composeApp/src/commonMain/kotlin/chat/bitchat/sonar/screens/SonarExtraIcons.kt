@@ -1,5 +1,7 @@
 package chat.bitchat.sonar.screens
 
+import chat.bitchat.sonar.ui.snSettingsRowClick
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -71,7 +73,7 @@ internal fun SNXSettingsRow(
     }
     Column {
         Row(
-            Modifier.fillMaxWidth().clickable(onClick = onClick)
+            Modifier.fillMaxWidth().snSettingsRowClick(toggle, onClick)
                 .padding(horizontal = 14.dp, vertical = 11.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
