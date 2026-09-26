@@ -572,6 +572,10 @@ class WalletAppStateTest {
         }
         val id = assertNotNull(s.beginDestinationPayment("lno1destination", 500, "Dest", maxFeeSats = null))
         waitUntil("pending linked") { PaymentActivityStore.get(id)?.walletPaymentId != null }
+        // The link lands BEFORE the spending call by design, so the send is
+        // recorded a moment later on the wallet's thread: wait for it rather
+        // than race it (a missing send still fails, by timeout).
+        waitUntil("sent") { native.count("send") == 1 }
         val row = PaymentActivityStore.get(id)!!
         assertEquals(SonarPaymentActivity.Status.Pending, row.status, "Pending is not a failure")
         assertEquals(1, native.count("send"))
