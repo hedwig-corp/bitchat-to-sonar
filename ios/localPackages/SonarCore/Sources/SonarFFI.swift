@@ -1649,7 +1649,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func geohashPresenceCount(geohash: String) throws  -> UInt32
 
     /**
-     * All groups this identity belongs to.
+     * All groups this identity belongs to, including recovered 0.8 history
+     * that is not a live 0.9 MLS group. Hosts fold those rows by npub.
      */
     func groups() throws  -> [GroupInfo]
 
@@ -1808,8 +1809,10 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
 
     /**
      * Retry one failed outgoing message from the durable local outbox. The
-     * original encrypted event is republished, so retry cannot duplicate the
-     * plaintext transcript row or mutate MLS state a second time.
+     * original encrypted event is republished when it is still live 0.9
+     * ciphertext, so retry cannot duplicate the plaintext transcript row
+     * or mutate MLS state a second time. Recovered 0.8 rows refuse with
+     * `HistoricalProtocolRetry` and stay Failed.
      */
     func retryMessage(messageIdHex: String) throws  -> String
 
@@ -2536,7 +2539,8 @@ open func geohashPresenceCount(geohash: String)throws  -> UInt32  {
 }
 
     /**
-     * All groups this identity belongs to.
+     * All groups this identity belongs to, including recovered 0.8 history
+     * that is not a live 0.9 MLS group. Hosts fold those rows by npub.
      */
 open func groups()throws  -> [GroupInfo]  {
     return try  FfiConverterSequenceTypeGroupInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -2865,8 +2869,10 @@ open func resumePendingMediaUploadsQuiet()throws  -> UInt32  {
 
     /**
      * Retry one failed outgoing message from the durable local outbox. The
-     * original encrypted event is republished, so retry cannot duplicate the
-     * plaintext transcript row or mutate MLS state a second time.
+     * original encrypted event is republished when it is still live 0.9
+     * ciphertext, so retry cannot duplicate the plaintext transcript row
+     * or mutate MLS state a second time. Recovered 0.8 rows refuse with
+     * `HistoricalProtocolRetry` and stay Failed.
      */
 open func retryMessage(messageIdHex: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -4338,7 +4344,11 @@ public struct GroupInfo: Equatable, Hashable {
     public init(
         /**
          * Hex of the MLS group id (stable; use it for `send_text`/`messages`).
-         */idHex: String, name: String, memberNpubs: [String], isDirect: Bool) {
+         */idHex: String, name: String, memberNpubs: [String],
+        /**
+         * False for recovered/live rooms, even when only one other member is listed.
+         * Hosts must not fold those onto a 1:1 by npub.
+         */isDirect: Bool) {
         self.idHex = idHex
         self.name = name
         self.memberNpubs = memberNpubs
@@ -9409,7 +9419,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geohash_presence_count() != 20097) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_groups() != 48990) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_groups() != 3660) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {
@@ -9484,7 +9494,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_resume_pending_media_uploads_quiet() != 56734) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 65232) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 21048) {
