@@ -84,3 +84,28 @@ jobs:
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO
+
+      # Run the unit suite, not just compile it. Nothing in CI executed
+      # `bitchatTests_iOS` before this step: a #607 test broke on iOS 26 and
+      # eleven were red on main without anyone seeing it. Serial on purpose:
+      # the suites share app singletons and NotificationCenter, and parallel
+      # Swift Testing runs failed ten of them on timing alone. Unsigned like
+      # the build above; keychain-dependent cases skip themselves.
+      - name: iOS unit tests (Simulator)
+        run: |
+          set -euo pipefail
+          UDID="$(xcrun simctl list devices available -j \
+            | jq -r '[.devices | to_entries[] | select(.key | test("iOS")) | .value[]
+                      | select(.deviceTypeIdentifier | test("iPhone"))][0].udid')"
+          test -n "$UDID" && test "$UDID" != null
+          xcodebuild test \
+            -project ios/bitchat.xcodeproj \
+            -scheme 'bitchat (iOS)' \
+            -configuration Debug \
+            -destination "id=$UDID" \
+            -only-testing:bitchatTests_iOS \
+            -parallel-testing-enabled NO \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            EXCLUDED_ARCHS=x86_64 \
+            CODE_SIGNING_ALLOWED=NO
