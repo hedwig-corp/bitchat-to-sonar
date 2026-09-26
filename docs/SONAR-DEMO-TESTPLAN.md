@@ -56,8 +56,8 @@ logged in with a Nostr identity.
 
 - Marmot state is in-memory: a Sonar restart loses Marmot groups (sqlite
   storage is M2 work). Re-running B2 after restart needs a fresh DM.
-- Marmot sync is poll-based (no live subscription yet) — pull-to-refresh or
-  reopening the chat triggers sync.
+- Marmot keeps a live kind-445 / giftwrap subscription; catch-up is a
+  background watermarked sync, not a chat-open gate.
 - Welcomes are auto-accepted (no invite UX yet).
 
 ## Results log
