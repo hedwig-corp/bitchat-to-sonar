@@ -83,10 +83,9 @@ fun SonarShareToScreen(state: SonarAppState) {
             Modifier.fillMaxWidth().padding(start = 6.dp, end = 14.dp, top = 10.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            SNIconButton(SNIconName.Back, onClick = {
-                state.cancelPendingShare()
-                state.back()
-            })
+            // cancelPendingShare leaves the picker itself (and then offers any
+            // queued share in a fresh one).
+            SNIconButton(SNIconName.Back, onClick = { state.cancelPendingShare() })
             Spacer(Modifier.width(4.dp))
             Text("Send to…", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         }

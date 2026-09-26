@@ -6,6 +6,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import os
 import UIKit
 import UniformTypeIdentifiers
 
@@ -23,6 +24,11 @@ final class ShareViewController: UIViewController {
     // local dev builds can use a team-registrable group id.
     private static let groupID =
         Bundle.main.object(forInfoDictionaryKey: "AppGroupID") as? String ?? "group.chat.bitchat"
+
+    /// Provider SHAPES only (type identifiers, whether a name was offered) —
+    /// never names or contents. What a source app registers decides how a share
+    /// is staged, and it differs per app, so this is what a field report needs.
+    private static let log = Logger(subsystem: "chat.bitchat", category: "share")
 
     private enum Strings {
         static let nothingToShare = String(localized: "share.status.nothing_to_share", comment: "Shown when the share extension receives no content")
@@ -106,13 +112,21 @@ final class ShareViewController: UIViewController {
 
         let providers = items.flatMap { $0.attachments ?? [] }
         let payloadID = UUID().uuidString
+        for provider in providers {
+            Self.log.info(
+                "share provider types=\(provider.registeredTypeIdentifiers, privacy: .public) named=\(provider.suggestedName?.isEmpty == false, privacy: .public) file=\(snStagesAsFile(provider), privacy: .public)"
+            )
+        }
+        // A document is staged as a file and is never ALSO the message body:
+        // reading plain text from a text document can return the whole file.
+        let (fileProviders, bodyProviders) = snPartitionShareProviders(providers)
 
-        loadURLOrText(from: providers) { [weak self] loadedText in
+        loadURLOrText(from: bodyProviders) { [weak self] loadedText in
             guard let self else { return }
             if let loadedText, !loadedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 text = loadedText
             }
-            self.loadFiles(from: providers, payloadID: payloadID) { staged in
+            self.loadFiles(fileProviders, payloadID: payloadID) { staged in
                 if text == nil, staged.items.isEmpty {
                     // Nothing usable in the attachments — fall back to a title.
                     let title = items
@@ -148,15 +162,15 @@ final class ShareViewController: UIViewController {
 
     // MARK: - Text / URL
 
+    /// Read the text/link body. `providers` holds only the non-file providers
+    /// (`snPartitionShareProviders`), so a file URL never becomes a link to
+    /// send and a document's contents never become the message.
     private func loadURLOrText(
         from providers: [NSItemProvider],
         completion: @escaping (String?) -> Void
     ) {
-        // A file URL is content to stage, not a link to send — leave it to the
-        // file path so shared documents keep their bytes.
         let urlProviders = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.url.identifier)
-                && !$0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
         }
         if let provider = urlProviders.first {
             provider.loadItem(forTypeIdentifier: UTType.url.identifier, options: nil) { item, _ in
@@ -199,34 +213,13 @@ final class ShareViewController: UIViewController {
 
     // MARK: - Files
 
+    /// Stage the file providers (`snPartitionShareProviders` already chose
+    /// them — the decision is testable there without a share sheet).
     private func loadFiles(
-        from providers: [NSItemProvider],
+        _ fileProviders: [NSItemProvider],
         payloadID: String,
         completion: @escaping (StagedFiles) -> Void
     ) {
-        let concreteTypes = [
-            UTType.image.identifier,
-            UTType.movie.identifier,
-            UTType.audio.identifier,
-            UTType.pdf.identifier,
-            UTType.fileURL.identifier,
-        ]
-        // The decision itself lives in `snShouldStageAsFile` so it is testable
-        // without an NSItemProvider — see SonarSharePayloadTests.
-        let fileProviders = providers.filter { provider in
-            let isFileURL = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-            return snShouldStageAsFile(
-                isConcreteFileType: concreteTypes.contains {
-                    provider.hasItemConformingToTypeIdentifier($0)
-                },
-                isText: provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
-                    || provider.hasItemConformingToTypeIdentifier(UTType.text.identifier),
-                isNonFileURL: provider.hasItemConformingToTypeIdentifier(UTType.url.identifier)
-                    && !isFileURL,
-                isData: provider.hasItemConformingToTypeIdentifier(UTType.data.identifier),
-                hasSuggestedName: provider.suggestedName?.isEmpty == false
-            )
-        }
         guard !fileProviders.isEmpty else {
             completion(StagedFiles())
             return
@@ -251,8 +244,13 @@ final class ShareViewController: UIViewController {
         var remainingBytes = SonarShareInbox.maxStagedBytes
         let queue = DispatchQueue(label: "chat.bitchat.share.staging")
         let group = DispatchGroup()
+        // Keyed by the provider's position, not by completion order: the load
+        // callbacks finish in any order, and indexing by "items staged so far"
+        // shuffled a multi-file share — the picker and the recipient saw the
+        // files in a different order than the user picked them.
+        var stagedByIndex: [(index: Int, item: SonarSharedItem)] = []
 
-        for provider in fileProviders.prefix(SonarShareInbox.maxStagedItems) {
+        for (index, provider) in fileProviders.prefix(SonarShareInbox.maxStagedItems).enumerated() {
             // A concrete media type first (it is also what names the fallback
             // file), then whatever byte-bearing type the provider registered.
             let typeID = Self.fileTypeIdentifiers.first {
@@ -277,14 +275,14 @@ final class ShareViewController: UIViewController {
                     switch self.copyIntoPayload(
                         source: url,
                         directory: directory,
-                        index: staged.items.count,
+                        index: index,
                         typeID: typeID,
                         suggestedName: provider.suggestedName,
                         maxBytes: remainingBytes
                     ) {
                     case .staged(let item):
                         remainingBytes -= item.byteCount
-                        staged.items.append(item)
+                        stagedByIndex.append((index, item))
                     case .tooLarge:
                         staged.oversizedCount += 1
                     case .unreadable:
@@ -306,6 +304,7 @@ final class ShareViewController: UIViewController {
         }
 
         group.notify(queue: .global(qos: .userInitiated)) {
+            staged.items = stagedByIndex.sorted { $0.index < $1.index }.map(\.item)
             staged.unreadableCount += max(0, fileProviders.count - SonarShareInbox.maxStagedItems)
             completion(staged)
         }
@@ -499,6 +498,9 @@ final class ShareViewController: UIViewController {
             guard let self, let context = self.extensionContext else { return }
             self.statusLabel.text = Strings.openingSonar
             context.open(url) { opened in
+                // Share extensions are usually refused here; the app then picks
+                // the payload up when the user switches to it (newest first).
+                Self.log.info("share hand-off open=\(opened, privacy: .public)")
                 DispatchQueue.main.async {
                     self.finish(
                         message: opened ? Strings.openingSonar : Strings.openSonarToSend,

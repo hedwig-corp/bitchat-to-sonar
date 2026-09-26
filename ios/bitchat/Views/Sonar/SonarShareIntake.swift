@@ -28,6 +28,51 @@ struct SNPendingShare: Identifiable, Equatable {
     }
 }
 
+/// Which staged payload the picker offers next: the one the user just made.
+///
+/// That is the payload a `sonar://share?id=…` hand-off names when there is
+/// one — but the extension usually CANNOT open the app (`extensionContext.open`
+/// is refused for share extensions), so the user switches to Sonar by hand and
+/// the scan has no id. The newest staged payload is then the share just made.
+///
+/// Taking the oldest instead meant a share abandoned earlier — the app was
+/// killed with its picker up, so the payload stayed staged for up to 24 h — was
+/// offered in place of the file the user had just shared, and one tap on a
+/// chat sent last time's file. Older payloads are not dropped: each is offered
+/// again once the newer one resolves.
+func snNextSharePayload(
+    _ pending: [SonarSharePayload],
+    preferring preferredID: String?
+) -> SonarSharePayload? {
+    if let preferredID, let match = pending.first(where: { $0.id == preferredID }) {
+        return match
+    }
+    return pending.max { $0.createdAt < $1.createdAt }
+}
+
+/// Whether `next` should take over a picker already showing `current`: it is
+/// the payload the hand-off named, or a share made after the one on screen.
+/// Never swaps for an older payload, so repeated foreground scans cannot flap.
+func snShouldReplaceOfferedShare(
+    current: SonarSharePayload,
+    with next: SonarSharePayload,
+    preferring preferredID: String?
+) -> Bool {
+    guard next.id != current.id else { return false }
+    return next.id == preferredID || next.createdAt > current.createdAt
+}
+
+/// The payload id a `sonar://share?id=<uuid>` hand-off names, if any.
+func snSharePayloadID(from url: URL) -> String? {
+    guard let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+        .queryItems?.first(where: { $0.name == "id" })?.value,
+        !id.isEmpty
+    else {
+        return nil
+    }
+    return id
+}
+
 extension SonarAppStore {
     /// The App Group both processes agree on. Read from the build-injected
     /// Info.plist value rather than derived from the bundle id, which drifts
@@ -43,18 +88,28 @@ extension SonarAppStore {
     /// Never sends on its own. The old behaviour blind-sent into whatever chat
     /// happened to be selected, which with no selection meant broadcasting the
     /// user's shared link to the public mesh.
-    func ingestPendingShares() {
+    ///
+    /// The picker offers the share the user just made (`snNextSharePayload`):
+    /// the payload a `sonar://share?id=` hand-off names, else the newest. When
+    /// a picker is already up with an OLDER payload, the newer one replaces it
+    /// — the foreground that follows a share also fires `didBecomeActive`, so
+    /// an older payload may be on screen already. The replaced one stays staged
+    /// and is offered again after this one resolves.
+    func ingestPendingShares(preferring preferredID: String? = nil) {
         // Before onboarding there is no identity to send from — leave the
         // payload staged rather than dropping it.
         guard onboarded else { return }
-        // A picker is already up; the next scan happens after it resolves.
-        guard pendingShare == nil else { return }
 
         let groupID = Self.shareAppGroupID
         let payloads = SonarShareInbox.pendingPayloads(appGroupID: groupID)
             .filter { !inFlightSharePayloadIDs.contains($0.id) }
-        guard let payload = payloads.first else {
-            ingestLegacySharedContent()
+        guard let payload = snNextSharePayload(payloads, preferring: preferredID) else {
+            if pendingShare == nil { ingestLegacySharedContent() }
+            return
+        }
+        // A picker is already up: keep it unless a newer share is waiting.
+        if let current = pendingShare?.payload,
+           !snShouldReplaceOfferedShare(current: current, with: payload, preferring: preferredID) {
             return
         }
 

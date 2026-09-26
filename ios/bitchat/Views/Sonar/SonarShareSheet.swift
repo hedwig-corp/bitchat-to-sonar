@@ -140,7 +140,10 @@ enum SNShareByteCount {
     static func string(_ bytes: Int) -> String {
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
-        formatter.allowedUnits = [.useKB, .useMB]
+        // Bytes included: a 300-byte CSV rendered as "0 KB" read as an empty
+        // file on the one screen that confirms what is about to be sent.
+        // Android's `shareByteLabel` already prints "300 B".
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB]
         return formatter.string(fromByteCount: Int64(bytes))
     }
 }
