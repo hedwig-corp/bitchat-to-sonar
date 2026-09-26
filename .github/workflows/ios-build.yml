@@ -128,13 +128,15 @@ jobs:
             -only-testing:bitchatTests_iOS/SonarMoneyDisplayTests \
             -only-testing:bitchatTests_iOS/CashuOfferBackupTests \
             -only-testing:bitchatTests_iOS/WalletReceiveNotificationTests \
+            -only-testing:bitchatTests_iOS/SonarHandleAddressTests \
+            -only-testing:bitchatTests_iOS/SonarPaymentStatusTests \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
             | tee "$RUNNER_TEMP/wallet-tests.log"
           # A selector that matches nothing still "succeeds": prove the
           # classes actually ran.
-          for suite in CashuWalletServiceTests CashuWalletLifecycleTests CashuWalletUXTests SonarLegacyWalletTests SonarMoneyDisplayTests CashuOfferBackupTests WalletReceiveNotificationTests; do
+          for suite in CashuWalletServiceTests CashuWalletLifecycleTests CashuWalletUXTests SonarLegacyWalletTests SonarMoneyDisplayTests CashuOfferBackupTests WalletReceiveNotificationTests SonarHandleAddressTests SonarPaymentStatusTests; do
             grep -q "Test Suite '$suite' passed" "$RUNNER_TEMP/wallet-tests.log" \
               || { echo "wallet test suite $suite did not run/pass" >&2; exit 1; }
           done
