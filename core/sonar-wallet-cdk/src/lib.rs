@@ -759,19 +759,28 @@ impl CdkWallet {
         };
         // CDK's own client (or the test's fake mint), recording which melt
         // requests the mint never answered: see `connector`.
-        let inner = match &self.connector {
-            Some(connector) => connector.clone(),
-            None => connector::default_client(mint_url.clone(), localstore.clone()),
+        let (inner, rebuild): (_, Option<connector::Rebuild>) = match &self.connector {
+            Some(connector) => (connector.clone(), None),
+            None => {
+                let (url, store) = (mint_url.clone(), localstore.clone());
+                (
+                    connector::default_client(mint_url.clone(), localstore.clone()),
+                    Some(Box::new(move || {
+                        connector::default_client(url.clone(), store.clone())
+                    })),
+                )
+            }
         };
         let wallet = WalletBuilder::new()
             .mint_url(mint_url)
             .unit(CurrencyUnit::Sat)
             .localstore(localstore)
             .seed(self.seed64())
-            .shared_client(Arc::new(connector::RecordingConnector {
+            .shared_client(Arc::new(connector::RecordingConnector::new(
                 inner,
-                unanswered: self.reconciler.unanswered.clone(),
-            }))
+                rebuild,
+                self.reconciler.unanswered.clone(),
+            )))
             .build()
             .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))?;
         // cdk-redb creates `wallet_sagas` lazily, on the first saga WRITE,

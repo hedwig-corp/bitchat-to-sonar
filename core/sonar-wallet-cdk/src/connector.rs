@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cdk::mint_url::MintUrl;
@@ -108,11 +109,92 @@ pub(crate) fn default_client(
     ))
 }
 
-/// `inner` with unanswered melt requests recorded in `unanswered`.
-#[derive(Debug)]
+/// Builds a fresh `inner` client; see [`RecordingConnector`].
+pub(crate) type Rebuild = Box<dyn Fn() -> Arc<dyn MintConnector + Send + Sync> + Send + Sync>;
+
+/// `inner` with two things added:
+///
+/// - Melt requests the mint never answered are recorded in `unanswered`
+///   (see the module doc).
+/// - A call abandoned mid-flight (its future dropped, as the wallet's
+///   deadlines do) rebuilds `inner` before the next call. The HTTP client
+///   under CDK (bitreq 0.3) keeps one cached connection per host, and a
+///   request dropped after it was written but before its answer was read
+///   leaves that connection with an open request for good: every later
+///   request on it waits for that answer, and times out in turn. One slow
+///   mint answer left the wallet unable to reach the mint until the whole
+///   wallet was rebuilt. A fresh client means a fresh connection pool.
 pub(crate) struct RecordingConnector {
-    pub(crate) inner: Arc<dyn MintConnector + Send + Sync>,
-    pub(crate) unanswered: Arc<UnansweredMelts>,
+    inner: std::sync::RwLock<Arc<dyn MintConnector + Send + Sync>>,
+    rebuild: Option<Rebuild>,
+    /// A call was abandoned mid-flight since `inner` was built.
+    tainted: AtomicBool,
+    unanswered: Arc<UnansweredMelts>,
+}
+
+impl std::fmt::Debug for RecordingConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingConnector")
+            .field("tainted", &self.tainted.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+/// Marks the connector tainted if the call it guards never finished.
+struct InFlight<'a> {
+    tainted: &'a AtomicBool,
+    finished: bool,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.tainted.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl RecordingConnector {
+    /// `rebuild`: how to make a fresh `inner` after an abandoned call; `None`
+    /// keeps `inner` (an in-process test mint has no connection to poison).
+    pub(crate) fn new(
+        inner: Arc<dyn MintConnector + Send + Sync>,
+        rebuild: Option<Rebuild>,
+        unanswered: Arc<UnansweredMelts>,
+    ) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(inner),
+            rebuild,
+            tainted: AtomicBool::new(false),
+            unanswered,
+        }
+    }
+
+    /// The client for the next call: a fresh one if a call was abandoned.
+    fn client(&self) -> Arc<dyn MintConnector + Send + Sync> {
+        if self.tainted.swap(false, Ordering::AcqRel) {
+            if let Some(rebuild) = &self.rebuild {
+                tracing::warn!("a mint call was abandoned mid-flight: opening a fresh connection");
+                let fresh = rebuild();
+                *self.inner.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+            }
+        }
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Run one call on the current client, noting it if it never finishes.
+    async fn call<T, F>(&self, f: impl FnOnce(Arc<dyn MintConnector + Send + Sync>) -> F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let mut guard = InFlight {
+            tainted: &self.tainted,
+            finished: false,
+        };
+        let out = f(self.client()).await;
+        guard.finished = true;
+        out
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -123,11 +205,11 @@ impl MintConnector for RecordingConnector {
         mint_url: MintUrl,
         cat: Option<AuthToken>,
     ) -> Arc<dyn AuthMintConnector + Send + Sync> {
-        self.inner.auth_connector(mint_url, cat)
+        self.client().auth_connector(mint_url, cat)
     }
 
     fn oidc_client(&self, openid_discovery: String, client_id: Option<String>) -> OidcClient {
-        self.inner.oidc_client(openid_discovery, client_id)
+        self.client().oidc_client(openid_discovery, client_id)
     }
 
     async fn connect_websocket(
@@ -141,39 +223,46 @@ impl MintConnector for RecordingConnector {
         ),
         cdk_common::ws_client::WsError,
     > {
-        self.inner.connect_websocket(url, headers).await
+        self.call(|c| async move { c.connect_websocket(url, headers).await })
+            .await
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     async fn resolve_dns_txt(&self, domain: &str) -> Result<Vec<String>, Error> {
-        self.inner.resolve_dns_txt(domain).await
+        self.call(|c| async move { c.resolve_dns_txt(domain).await })
+            .await
     }
 
     async fn fetch_lnurl_pay_request(&self, url: &str) -> Result<LnurlPayResponse, Error> {
-        self.inner.fetch_lnurl_pay_request(url).await
+        self.call(|c| async move { c.fetch_lnurl_pay_request(url).await })
+            .await
     }
 
     async fn fetch_lnurl_invoice(&self, url: &str) -> Result<LnurlPayInvoiceResponse, Error> {
-        self.inner.fetch_lnurl_invoice(url).await
+        self.call(|c| async move { c.fetch_lnurl_invoice(url).await })
+            .await
     }
 
     async fn get_mint_keys(&self) -> Result<Vec<KeySet>, Error> {
-        self.inner.get_mint_keys().await
+        self.call(|c| async move { c.get_mint_keys().await }).await
     }
 
     async fn get_mint_keyset(&self, keyset_id: Id) -> Result<KeySet, Error> {
-        self.inner.get_mint_keyset(keyset_id).await
+        self.call(|c| async move { c.get_mint_keyset(keyset_id).await })
+            .await
     }
 
     async fn get_mint_keysets(&self) -> Result<KeysetResponse, Error> {
-        self.inner.get_mint_keysets().await
+        self.call(|c| async move { c.get_mint_keysets().await })
+            .await
     }
 
     async fn post_mint_quote(
         &self,
         request: MintQuoteRequest,
     ) -> Result<MintQuoteResponse<String>, Error> {
-        self.inner.post_mint_quote(request).await
+        self.call(|c| async move { c.post_mint_quote(request).await })
+            .await
     }
 
     async fn post_mint(
@@ -181,7 +270,8 @@ impl MintConnector for RecordingConnector {
         method: &PaymentMethod,
         request: MintRequest<String>,
     ) -> Result<MintResponse, Error> {
-        self.inner.post_mint(method, request).await
+        self.call(|c| async move { c.post_mint(method, request).await })
+            .await
     }
 
     async fn post_batch_check_mint_quote_status(
@@ -189,8 +279,7 @@ impl MintConnector for RecordingConnector {
         method: &PaymentMethod,
         request: BatchCheckMintQuoteRequest<String>,
     ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
-        self.inner
-            .post_batch_check_mint_quote_status(method, request)
+        self.call(|c| async move { c.post_batch_check_mint_quote_status(method, request).await })
             .await
     }
 
@@ -199,14 +288,16 @@ impl MintConnector for RecordingConnector {
         method: &PaymentMethod,
         request: BatchMintRequest<String>,
     ) -> Result<MintResponse, Error> {
-        self.inner.post_batch_mint(method, request).await
+        self.call(|c| async move { c.post_batch_mint(method, request).await })
+            .await
     }
 
     async fn post_melt_quote(
         &self,
         request: MeltQuoteRequest,
     ) -> Result<MeltQuoteCreateResponse<String>, Error> {
-        self.inner.post_melt_quote(request).await
+        self.call(|c| async move { c.post_melt_quote(request).await })
+            .await
     }
 
     async fn get_mint_quote_status(
@@ -214,7 +305,8 @@ impl MintConnector for RecordingConnector {
         method: PaymentMethod,
         quote_id: &str,
     ) -> Result<MintQuoteResponse<String>, Error> {
-        self.inner.get_mint_quote_status(method, quote_id).await
+        self.call(|c| async move { c.get_mint_quote_status(method, quote_id).await })
+            .await
     }
 
     async fn get_melt_quote_status(
@@ -222,7 +314,8 @@ impl MintConnector for RecordingConnector {
         method: PaymentMethod,
         quote_id: &str,
     ) -> Result<MeltQuoteResponse<String>, Error> {
-        self.inner.get_melt_quote_status(method, quote_id).await
+        self.call(|c| async move { c.get_melt_quote_status(method, quote_id).await })
+            .await
     }
 
     async fn post_melt(
@@ -231,7 +324,9 @@ impl MintConnector for RecordingConnector {
         request: MeltRequest<String>,
     ) -> Result<MeltQuoteResponse<String>, Error> {
         let quote_id = request.quote().clone();
-        let result = self.inner.post_melt(method, request).await;
+        let result = self
+            .call(|c| async move { c.post_melt(method, request).await })
+            .await;
         match &result {
             Err(e) if !mint_answered(e) => {
                 tracing::warn!("melt {quote_id}: no answer from the mint ({e})");
@@ -243,29 +338,88 @@ impl MintConnector for RecordingConnector {
     }
 
     async fn post_swap(&self, request: SwapRequest) -> Result<SwapResponse, Error> {
-        self.inner.post_swap(request).await
+        self.call(|c| async move { c.post_swap(request).await })
+            .await
     }
 
     async fn get_mint_info(&self) -> Result<MintInfo, Error> {
-        self.inner.get_mint_info().await
+        self.call(|c| async move { c.get_mint_info().await }).await
     }
 
     async fn post_check_state(
         &self,
         request: CheckStateRequest,
     ) -> Result<CheckStateResponse, Error> {
-        self.inner.post_check_state(request).await
+        self.call(|c| async move { c.post_check_state(request).await })
+            .await
     }
 
     async fn post_restore(&self, request: RestoreRequest) -> Result<RestoreResponse, Error> {
-        self.inner.post_restore(request).await
+        self.call(|c| async move { c.post_restore(request).await })
+            .await
     }
 
     async fn get_auth_wallet(&self) -> Option<AuthWallet> {
-        self.inner.get_auth_wallet().await
+        self.call(|c| async move { c.get_auth_wallet().await })
+            .await
     }
 
     async fn set_auth_wallet(&self, wallet: Option<AuthWallet>) {
-        self.inner.set_auth_wallet(wallet).await
+        self.call(|c| async move { c.set_auth_wallet(wallet).await })
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_mint::FakeMint;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    /// One abandoned call rebuilds the client before the next one; finished
+    /// calls (successful or failed) never do.
+    #[test]
+    fn a_call_abandoned_mid_flight_rebuilds_the_client_once() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mint = Arc::new(FakeMint::new());
+        let builds = Arc::new(AtomicUsize::new(0));
+        let rebuild: Rebuild = {
+            let mint = mint.clone();
+            let builds = builds.clone();
+            Box::new(move || {
+                builds.fetch_add(1, Ordering::SeqCst);
+                mint.clone()
+            })
+        };
+        let conn = RecordingConnector::new(
+            mint.clone(),
+            Some(rebuild),
+            Arc::new(UnansweredMelts::default()),
+        );
+        rt.block_on(async {
+            conn.get_mint_info().await.unwrap();
+            mint.fail_next("get_mint_info", 1);
+            assert!(conn.get_mint_info().await.is_err());
+            assert_eq!(
+                builds.load(Ordering::SeqCst),
+                0,
+                "finished calls keep the client"
+            );
+
+            mint.hang("get_mint_info");
+            let abandoned =
+                tokio::time::timeout(Duration::from_millis(100), conn.get_mint_info()).await;
+            assert!(abandoned.is_err(), "the deadline dropped the call");
+            mint.unhang("get_mint_info");
+            conn.get_mint_info().await.unwrap();
+            assert_eq!(
+                builds.load(Ordering::SeqCst),
+                1,
+                "a fresh client after the abandoned call"
+            );
+            conn.get_mint_info().await.unwrap();
+            assert_eq!(builds.load(Ordering::SeqCst), 1, "and only once");
+        });
     }
 }
