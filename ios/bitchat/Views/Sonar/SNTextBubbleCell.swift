@@ -28,6 +28,8 @@ struct SNTextBubbleActions {
     var tapMention: (String) -> Void = { _ in }
     var openURL: (URL) -> Void = { _ in }
     var retry: (String) -> Void = { _ in }
+    /// (message id, emoji) from the long-press quick-reaction row.
+    var react: (String, String) -> Void = { _, _ in }
     var toggleExpanded: (String) -> Void = { _ in }
 }
 
@@ -618,6 +620,16 @@ final class SNTextBubbleContentView: UIView {
                 return true
             })
         }
+        if model.canReact {
+            // VoiceOver reads the emoji ("red heart", "thumbs up", …).
+            for emoji in SNQuickReactions {
+                custom.append(UIAccessibilityCustomAction(name: emoji) { [weak self] _ in
+                    guard let self, let model = self.model else { return false }
+                    self.actions.react(model.id, emoji)
+                    return true
+                })
+            }
+        }
         accessibilityCustomActions = custom
     }
 
@@ -676,7 +688,10 @@ extension SNTextBubbleCell: UIContextMenuInteractionDelegate {
     ) -> UIContextMenuConfiguration? {
         guard let model = content.contextMenuModel else { return nil }
         let actions = content.contextMenuActions
-        var items: [UIAction] = []
+        var items: [UIMenuElement] = []
+        if model.canReact {
+            items.append(snQuickReactionMenu { emoji in actions.react(model.id, emoji) })
+        }
         if model.canReply {
             items.append(UIAction(
                 title: String(localized: "chat.reply", defaultValue: "Reply"),
@@ -699,6 +714,33 @@ extension SNTextBubbleCell: UIContextMenuInteractionDelegate {
             actionProvider: { _ in UIMenu(children: items) }
         )
     }
+}
+
+/// The six quick reactions as one inline row at the top of a context menu
+/// (Signal/iMessage). iOS 17 lays out a palette — one horizontal row that
+/// fits all six; iOS 16 falls back to small inline elements.
+func snQuickReactionMenu(_ react: @escaping (String) -> Void) -> UIMenu {
+    // Palette and small elements draw the image, not the title: render each
+    // emoji as the image and keep the title for VoiceOver.
+    let actions = SNQuickReactions.map { emoji in
+        UIAction(title: emoji, image: snEmojiImage(emoji)) { _ in react(emoji) }
+    }
+    if #available(iOS 17.0, *) {
+        return UIMenu(title: "", options: [.displayInline, .displayAsPalette], children: actions)
+    }
+    let menu = UIMenu(title: "", options: .displayInline, children: actions)
+    menu.preferredElementSize = .small
+    return menu
+}
+
+func snEmojiImage(_ emoji: String) -> UIImage {
+    let font = UIFont.systemFont(ofSize: 26)
+    let text = emoji as NSString
+    let size = text.size(withAttributes: [.font: font])
+    return UIGraphicsImageRenderer(size: size).image { _ in
+        text.draw(at: .zero, withAttributes: [.font: font])
+    }
+    .withRenderingMode(.alwaysOriginal)
 }
 
 /// Lifted bubble preview (Signal/iMessage): the bubble only, not the full row.
