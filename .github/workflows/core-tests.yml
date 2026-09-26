@@ -34,7 +34,7 @@ jobs:
       # invocation or it is never compiled by CI at all. Running it here on
       # macOS covers the CoreBluetooth peripheral path, which is cfg'd out on
       # Linux and would otherwise ship unbuilt; compose-tests covers the Linux
-      # (BlueZ) central path.
+      # (BlueZ) peripheral path and the central link.
       - name: Build + test the desktop BLE bridge (CoreBluetooth path)
         run: cargo test
         working-directory: core/sonar-ble

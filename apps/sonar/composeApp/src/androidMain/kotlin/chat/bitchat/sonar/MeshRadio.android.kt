@@ -27,6 +27,12 @@ import java.util.concurrent.ConcurrentHashMap
  */
 actual object MeshRadio {
 
+    // Android runs both roles: it advertises a GATT server and scans.
+    actual val meshMessagingSupported: Boolean = true
+
+    // The Rust engine sends and relays 0x02 (MeshGatt.broadcastPublic).
+    actual val meshBroadcastSupported: Boolean = true
+
     private const val TAG = "MeshRadio"
 
     // bitchat mainnet service + payload characteristic (from iOS BLEService).

@@ -262,6 +262,33 @@ internal inline fun shouldExpireAnnouncedMeshPeer(
  * `iosMain` (later, at the CMP shift) provides a CoreBluetooth `actual`.
  */
 expect object MeshRadio {
+    /**
+     * Whether this build can exchange private mesh messages (Noise DMs) at all,
+     * as opposed to merely seeing that peers exist.
+     *
+     * True on Android and on desktop macOS/Linux, where `sonar-ble` carries mesh
+     * traffic as a GATT server or, when the controller refuses to advertise, as a
+     * central. False where the bridge has neither role (Windows), or did not
+     * load: the radio may still scan there, so peers appear in presence counts
+     * while nothing can be delivered.
+     *
+     * [available] is a different question: it asks whether the radio hardware and
+     * permissions are there. Both can be true while this is false.
+     */
+    val meshMessagingSupported: Boolean
+
+    /**
+     * Whether the public Mesh channel works here: [sendMeshBroadcast] reaches
+     * people and [drainMeshBroadcast] hears them.
+     *
+     * Separate from [meshMessagingSupported] because the two are wired
+     * separately. Desktop carries Noise DMs over the mesh but has no 0x02
+     * public-message path yet, so its Mesh channel would echo a send locally,
+     * promise it "will reach people as they connect", and never deliver it or
+     * show anyone else's. The channel screen asks this, not the DM capability.
+     */
+    val meshBroadcastSupported: Boolean
+
     /** True when BLE hardware + runtime permissions are available. */
     fun available(): Boolean
     /** Restrict open discovery while keeping known chat peers reachable. */
