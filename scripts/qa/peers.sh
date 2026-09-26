@@ -20,6 +20,9 @@
 #                                             exit 0 once <from> has shared a zone
 #                                             (== <zone> when given); prints it
 #   peers.sh tz <name>                        print every zone peers shared (JSON)
+#   peers.sh revoke-tz <name> <to-npub>       withdraw the zone from the 1:1 chat
+#   peers.sh expect-no-tz <name> <from-npub> [secs]
+#                                             exit 0 once <from> shows NO zone
 #   peers.sh share-tz-group <name> <group-hex> <zone>
 #                                             share a zone with a multi-member group
 #   peers.sh accept <name>                    accept every pending group invite
@@ -125,6 +128,12 @@ EXPECT_PY
     cli --home "$(home "$name")" "${args[@]}" | grep '"type"' ;;
   tz)
     cli --home "$(home "${1:?tz <name>}")" timezone show | grep '"type"' || true ;;
+  revoke-tz)
+    name="${1:?revoke-tz <name> <to>}"; to="${2:?to npub}"
+    cli --home "$(home "$name")" timezone revoke --to "$to" | grep '"type"' ;;
+  expect-no-tz)
+    name="${1:?expect-no-tz <name> <from> [secs]}"; from="${2:?from npub}"; secs="${3:-60}"
+    cli --home "$(home "$name")" timezone show --from "$from" --absent --wait-secs "$secs" >/dev/null ;;
   share-tz-group)
     name="${1:?share-tz-group <name> <group-hex> <zone>}"; group="${2:?group hex}"; zone="${3:?IANA zone}"
     cli --home "$(home "$name")" timezone share --group "$group" --zone "$zone" | grep '"type"' ;;
@@ -133,5 +142,5 @@ EXPECT_PY
   groups)
     cli --home "$(home "${1:?groups <name>}")" groups | grep '"type"' ;;
   *)
-    sed -n '2,36p' "$0"; exit 2 ;;
+    sed -n '2,39p' "$0"; exit 2 ;;
 esac

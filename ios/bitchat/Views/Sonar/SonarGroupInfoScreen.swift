@@ -222,7 +222,8 @@ struct SonarGroupInfoScreen: View {
                                             .font(SonarTheme.uiFont(size: 12.5))
                                             .foregroundColor(SonarTheme.text2)
                                             .lineLimit(1)
-                                        if let zone = store.marmot.peerTimezone(for: member.npub),
+                                        if let groupId = store.marmotGroupId(peerId),
+                                           let zone = store.marmot.peerTimezone(for: member.npub, inGroup: groupId),
                                            let localTime = localTimeText(
                                                zoneIdentifier: zone.ianaIdentifier
                                            ) {

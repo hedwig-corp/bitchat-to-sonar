@@ -13,6 +13,8 @@ data class SonarChat(
 /** A peer's most recent valid timezone share from the encrypted local cache. */
 data class SonarPeerTimezone(
     val senderNpub: String,
+    /** MLS group the zone was shared into; sharing is per chat. */
+    val groupIdHex: String,
     val ianaIdentifier: String,
     val updatedAtSecs: Long,
 )
@@ -1018,8 +1020,13 @@ expect object SonarCore {
     /** Restrict timezone shares to these MLS group ids. Empty shares with nobody. */
     suspend fun setTimezoneShareGroups(groupIdHexes: List<String>)
 
-    /** Read cached peer timezones without any relay or history dependency. */
-    suspend fun peerTimezones(memberPubkeys: List<String>): List<SonarPeerTimezone>
+    /** Zones members shared into these MLS groups (hex), from the local cache —
+     *  no relay or history dependency. */
+    suspend fun peerTimezones(groupIdHexes: List<String>): List<SonarPeerTimezone>
+
+    /** Withdraw this device's zone from these MLS groups after the user turns
+     *  sharing off for them. */
+    suspend fun revokeTimezoneShare(groupIdHexes: List<String>)
 
     /** Reset unread count for a chat to 0. */
     suspend fun markConversationRead(chatId: String)

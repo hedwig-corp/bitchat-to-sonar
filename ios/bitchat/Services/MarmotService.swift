@@ -87,6 +87,8 @@ final class MarmotService: @unchecked Sendable {
 
     struct PeerTimezone: Sendable, Equatable {
         let senderNpub: String
+        /// MLS group the zone was shared into; sharing is per chat.
+        let groupId: String
         let ianaIdentifier: String
         let updatedAt: Date
     }
@@ -1330,14 +1332,24 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    /// Local-only batch read for visible group members.
-    func peerTimezones(memberNpubs: [String]) async -> [PeerTimezone] {
-        let members = Array(Set(memberNpubs.filter { !$0.isEmpty }))
-        guard !members.isEmpty else { return [] }
+    /// Withdraw this device's zone from these groups after the user turns
+    /// sharing off for them. Only groups that received a share get a revoke.
+    func revokeTimezoneShare(_ groupIdHexes: [String]) async {
+        guard !groupIdHexes.isEmpty else { return }
+        _ = try? await run {
+            try $0.requireNode().revokeTimezoneShare(groupIdHexes: groupIdHexes)
+        }
+    }
+
+    /// Local-only batch read of the zones members shared into these groups.
+    func peerTimezones(groupIds: [String]) async -> [PeerTimezone] {
+        let groups = Array(Set(groupIds.filter { !$0.isEmpty }))
+        guard !groups.isEmpty else { return [] }
         return await readOnlyNonThrowing({ node in
-            (try? node.peerTimezones(memberPubkeys: members).map {
+            (try? node.peerTimezones(groupIdHexes: groups).map {
                 PeerTimezone(
                     senderNpub: $0.senderNpub,
+                    groupId: $0.groupIdHex.lowercased(),
                     ianaIdentifier: $0.ianaTimezone,
                     updatedAt: Date(timeIntervalSince1970: TimeInterval($0.updatedAtSecs))
                 )

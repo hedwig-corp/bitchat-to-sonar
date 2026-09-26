@@ -510,16 +510,22 @@ actual object SonarCore {
             node?.setTimezoneShareGroups(groupIdHexes)
         }
 
-    actual suspend fun peerTimezones(memberPubkeys: List<String>): List<SonarPeerTimezone> =
+    actual suspend fun peerTimezones(groupIdHexes: List<String>): List<SonarPeerTimezone> =
         withContext(Dispatchers.IO) {
             val n = node ?: return@withContext emptyList()
-            n.peerTimezones(memberPubkeys).map {
+            n.peerTimezones(groupIdHexes).map {
                 SonarPeerTimezone(
                     senderNpub = it.senderNpub,
+                    groupIdHex = it.groupIdHex,
                     ianaIdentifier = it.ianaTimezone,
                     updatedAtSecs = it.updatedAtSecs.toLong(),
                 )
             }
+        }
+
+    actual suspend fun revokeTimezoneShare(groupIdHexes: List<String>): Unit =
+        withContext(Dispatchers.IO) {
+            node?.revokeTimezoneShare(groupIdHexes)
         }
 
     actual suspend fun markConversationRead(chatId: String) = withContext(Dispatchers.IO) {

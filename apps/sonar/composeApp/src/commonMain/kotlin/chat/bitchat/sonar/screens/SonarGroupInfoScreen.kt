@@ -332,7 +332,7 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                         val memberTimezone = if (isYou) {
                             systemZone
                         } else {
-                            state.peerTimezone(member.npub)?.ianaIdentifier
+                            state.peerTimezone(chatId, member.npub)?.ianaIdentifier
                         }
                         val memberLocalTime = memberTimezone
                             ?.let { peerLocalTimeSnapshot(it, clockNow) }
