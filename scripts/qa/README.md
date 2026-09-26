@@ -25,12 +25,15 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 | `peers.sh` | Fresh `sonar-cli` counterparties: `new`, `send`, `send-image`, `listen`, `expect`. |
 | `android-smoke.sh` | Automated registry scenarios (`qaNNN` = `QA-NNN`). |
 | `idle-cpu.sh` | Average app CPU over a window on Android or an iOS simulator. |
+| `ios-drive.sh` | Headless iOS UI driver: one XCUITest (generated from `ios-driver/`, outside the app's Xcode project) runs a `;`-separated step script — `launch`, `tapc:<label>`, `longpress:<text>`, `tap:👍`, `expect:<text>`, `count:<text>=n`, `shot`, `tree` — against the installed app by UDID. No Simulator panel needed. |
 | `qr-decode.swift` | Print QR payloads found in a screenshot (macOS CoreImage). |
 
 Safety: nothing here uninstalls or resets an app on a physical device; the
 Android scripts refuse non-emulators, the iOS scripts only touch the named QA
 simulator. See the CLAUDE.md "Never Uninstall Device Apps" rule.
 
-iOS has no headless UI driver yet: agents drive it through the iOS Simulator
-MCP. A future `ios-smoke` would need an XCUITest target — track it as a gap
-rather than faking it with coordinates.
+iOS is driven headlessly with `ios-drive.sh` (or by hand through the iOS
+Simulator MCP when the panel is available). There is no scripted `ios-smoke`
+yet: scenario steps are composed per pass from the registry. Read labels from
+the `tree:` dump, never coordinates off a screenshot; `tapid:`/`tapxy:` exist
+only for controls that have no label (itself an accessibility finding).

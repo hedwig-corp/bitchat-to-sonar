@@ -13,6 +13,7 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 | `scripts/qa/peers.sh` | fresh `sonar-cli` peers: `new`, `send`, `send-image`, `listen`, `expect` |
 | `scripts/qa/android-smoke.sh` | scripted registry scenarios on Android; exit status = failures |
 | `scripts/qa/idle-cpu.sh` | average CPU of the app over a window (Android `/proc`, iOS host `ps`) |
+| `scripts/qa/ios-drive.sh` | headless iOS steps via XCUITest: `launch`/`activate`, `tap`/`tapc`/`longpress`, `expect`/`count`, `shot`/`tree`, `sbtap` (system alerts) |
 | iOS Simulator MCP | `attach` first, then `tap`/`text`/`swipe`/`screenshot` in **points** |
 
 ## Android traps
@@ -43,6 +44,14 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
   `PIPESTATUS` does not exist — use explicit commands and `set -o pipefail`.
 
 ## iOS traps
+
+- **Headless driver (`ios-drive.sh`):** it drives the app by bundle id from
+  its own generated project, so it never touches `ios/bitchat.xcodeproj`.
+  A test method named `testRun` collides with XCTest's `testRun` property
+  and "passes" without running a step. Permission alerts belong to
+  SpringBoard (`sbtap:Allow`), not the app. Steps pass parameters through
+  `TEST_RUNNER_*` environment variables; screenshots land directly in
+  `$QA_HOME/idrive/<name>/`.
 
 - **Build signed, not with `scripts/bench/build-sim.sh`:** the unsigned bench
   build has no App Group, so the Marmot store never opens.
