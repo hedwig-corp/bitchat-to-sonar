@@ -185,7 +185,7 @@ struct SendArgs {
     #[arg(long)]
     text: Option<String>,
     /// With --text: send N numbered copies ("<text> 0001" …) from this one
-    /// process — seeds a long history for QA (e.g. QA-074 needs >500 rows)
+    /// process — seeds a long history for QA (e.g. QA-104 needs >500 rows)
     /// without a relay connect per message. Waits until none is in flight.
     #[arg(long, default_value_t = 1, requires = "text")]
     repeat: u32,

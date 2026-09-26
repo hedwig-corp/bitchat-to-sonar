@@ -186,6 +186,114 @@ qa002() { # reply arrives in the open chat
   fi
 }
 
+# Reaction scenarios run in QA-001's chat, which QA-002 left open.
+reaction_chip_below() { # <message text> <emoji> — the chip sits under that bubble
+  local my cy
+  my="$(ycoord find "$1")"; cy="$("$UI" findx "$2" 2>/dev/null | awk '{print $2}')"
+  [[ -n "$my" && -n "$cy" ]] && (( cy > my && cy < my + 250 ))
+}
+
+qa100() { # long-press → 👍 on an inbound message: picker, chip, peer receives (#603 i1/i2/A1)
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-100 SKIP "needs QA-001"; return; }
+  local text="qa100 react to me $RUN" e missing=() id
+  "$PEERS" send "a-$RUN" "$APP_NPUB" "$text" >/dev/null
+  "$UI" wait "$text" 30 >/dev/null || { record QA-100 FAIL "peer message never arrived"; return; }
+  sleep 1
+  ui longpress $("$UI" find "$text")
+  "$UI" wait "Reply" 5 >/dev/null || { record QA-100 FAIL "long-press opened no menu"; return; }
+  for e in "❤️" "👍" "😂" "😮" "😢" "🔥"; do hasx "$e" || missing+=("$e"); done
+  (( ${#missing[@]} == 0 )) || { record QA-100 FAIL "reaction row lacks ${missing[*]}"; ui key 4; return; }
+  ui tapx "👍"
+  sleep 2
+  reaction_chip_below "$text" "👍" || { record QA-100 FAIL "no 👍 chip under the bubble after tapping it"; return; }
+  id="$("$PEERS" id-of "a-$RUN" "$text")" || { record QA-100 FAIL "peer does not have the message"; return; }
+  if "$PEERS" expect-reaction "a-$RUN" "👍" 60 "$id" >/dev/null 2>&1; then
+    record QA-100 PASS "picker has all six; chip under the bubble; peer got 👍 on that message"
+  else
+    record QA-100 FAIL "chip shown locally but the peer never received the reaction"
+  fi
+}
+
+qa101() { # a peer reacts to my message: chip in the open chat; list row unchanged (R-017)
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-101 SKIP "needs QA-001"; return; }
+  local text="qa101 mine $RUN" id ry t0
+  focus_composer
+  ui type "$text"
+  ui tapx "Send" || { record QA-101 FAIL "no Send control"; return; }
+  "$PEERS" expect "a-$RUN" "$text" 60 >/dev/null || { record QA-101 FAIL "peer never got the message"; return; }
+  id="$("$PEERS" id-of "a-$RUN" "$text")" || { record QA-101 FAIL "peer does not have the message"; return; }
+  t0=$SECONDS
+  "$PEERS" react "a-$RUN" "$APP_NPUB" "$id" "🔥" >/dev/null || { record QA-101 FAIL "peer react failed"; return; }
+  "$UI" wait "🔥" 30 >/dev/null && reaction_chip_below "$text" "🔥" ||
+    { record QA-101 FAIL "peer's 🔥 never showed under my message"; return; }
+  local t1=$((SECONDS - t0))
+  go_home || { record QA-101 FAIL "could not reach the chat list"; return; }
+  "$PEERS" react "a-$RUN" "$APP_NPUB" "$id" "😂" >/dev/null
+  sleep 12
+  ry="$(ycoord find "$text")"
+  if [[ -z "$ry" ]]; then
+    record QA-101 FAIL "the chat-list preview no longer shows the message text after a reaction"
+  elif near_label "Unread" "$ry" 120; then
+    record QA-101 FAIL "a reaction marked the chat unread (R-017)"
+  else
+    record QA-101 PASS "chip after ${t1}s (incl. CLI publish); list preview kept, no unread"
+  fi
+}
+
+qa102() { # counts across senders; tapping my own chip sends nothing
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-102 SKIP "needs QA-001"; return; }
+  local text="qa101 mine $RUN" id log="$QA_HOME/logcat-$QA_SERIAL.txt" before after
+  has "$text" || { record QA-102 SKIP "needs QA-101"; return; }
+  ui tapt "$text"
+  "$UI" wait "Back" 10 >/dev/null; sleep 2
+  "$UI" wait "😂" 20 >/dev/null || { record QA-102 FAIL "the peer's 😂 chip is missing on reopen"; return; }
+  ui tapx "🔥"                                   # the peer's chip: adds mine
+  sleep 2
+  hasx "2" || { record QA-102 FAIL "tapping the peer's 🔥 chip did not make it 2"; return; }
+  id="$("$PEERS" id-of "a-$RUN" "$text")"
+  "$PEERS" expect-reaction "a-$RUN" "🔥" 60 "$id" 2 >/dev/null 2>&1 ||
+    { record QA-102 FAIL "peer never saw 🔥 count 2"; return; }
+  if [[ -f "$log" ]]; then
+    before="$(grep -c send_publish_start "$log")"
+    ui tapx "🔥"                                 # mine now: must be a no-op
+    sleep 3
+    after="$(grep -c send_publish_start "$log")"
+    (( after == before )) || { record QA-102 FAIL "tapping my own chip published again ($before → $after)"; return; }
+  fi
+  record QA-102 PASS "🔥 2 across two senders; own-chip tap sent nothing"
+}
+
+qa106() { # long-press a photo → reaction row; chip under the photo (#603 A5)
+  [[ -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] || { record QA-106 SKIP "needs QA-001"; return; }
+  local img="$QA_HOME/qa106-$RUN.png" id xy py cy t
+  python3 - "$img" <<'PNG'
+import struct, sys, zlib
+w, h = 320, 180
+raw = b"".join(b"\x00" + b"".join(bytes([x * 255 // w, y * 255 // h, 120]) for x in range(w)) for y in range(h))
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+open(sys.argv[1], "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+PNG
+  "$PEERS" send-image "a-$RUN" "$APP_NPUB" "$img" >/dev/null || { record QA-106 FAIL "peer could not send the photo"; return; }
+  for t in $(seq 1 60); do hasx "Photo" && break; sleep 1; done
+  xy="$("$UI" findx "Photo" 2>/dev/null)" || true
+  [[ -n "$xy" ]] || { record QA-106 FAIL "the photo never showed (no node labelled Photo)"; return; }
+  sleep 2
+  ui longpress $xy
+  "$UI" wait "Reply" 5 >/dev/null || { record QA-106 FAIL "long-press on the photo opened no menu (it opened the viewer?)"; ui key 4; return; }
+  hasx "😮" || { record QA-106 FAIL "the photo's menu has no reaction row"; ui key 4; return; }
+  ui tapx "😮"
+  sleep 2
+  py="${xy#* }"; cy="$("$UI" findx "😮" 2>/dev/null | awk '{print $2}')"
+  [[ -n "$cy" ]] && (( cy > py && cy < py + 400 )) || { record QA-106 FAIL "no 😮 chip under the photo"; return; }
+  id="$("$PEERS" id-of-media "a-$RUN")" || { record QA-106 FAIL "peer has no media message"; return; }
+  if "$PEERS" expect-reaction "a-$RUN" "😮" 60 "$id" >/dev/null 2>&1; then
+    record QA-106 PASS "photo long-press opened the menu; chip under the photo; peer got 😮"
+  else
+    record QA-106 FAIL "chip shown locally but the peer never received the reaction"
+  fi
+}
+
 qa003() { # draft typed while the chat is pending survives reconcile (A19)
   local b; b="$("$PEERS" new "b-$RUN")" || { record QA-003 FAIL "peer init failed"; return; }
   open_chat_by_npub "$b" || { record QA-003 FAIL "could not open chat"; return; }
@@ -366,8 +474,11 @@ qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
   fi
   if [[ -n "${A_NPUB:-}" ]]; then
     go_home >/dev/null
-    # The row previews the chat's LATEST message: QA-002's reply after it ran.
-    if ui tapt "qa002 reply $RUN" || ui tapt "qa001 hello $RUN"; then
+    # QA-001's chat is titled with the peer's shortened npub ("npub1abcde…wxyz");
+    # its preview changes with every scenario that posts there (QA-002's reply,
+    # QA-101's send, QA-106's "Image"), so the title is the stable handle.
+    if ui tapt "${A_NPUB:0:10}" || ui tapt "qa101 mine $RUN" ||
+       ui tapt "qa002 reply $RUN" || ui tapt "qa001 hello $RUN"; then
       sleep 2; naf_check chat
       # The header's name block (right of Back) opens the contact profile.
       # Assert a profile-only row before auditing, so a dead header cannot
@@ -380,7 +491,7 @@ qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
         bad+=("contact-profile:not reached")
       fi
     else
-      bad+=("chat:QA-001/002 row not found")
+      bad+=("chat:QA-001 chat row not found")
     fi
     go_home >/dev/null
   else
@@ -497,9 +608,10 @@ echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 # drops input injected into its first screens.
 go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
-# Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
-# QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa093 qa050; do
+# Order matters: QA-002 and the reaction scenarios (QA-100..102, QA-106)
+# reuse QA-001's chat, QA-005 opens QA-004's, and QA-040 inspects the chat
+# QA-005 left open.
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa093 qa050; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

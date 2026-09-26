@@ -11,7 +11,7 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 | `scripts/qa/ios-setup.sh` | creates/boots a named QA simulator, signed Debug build, install, log stream (`chat.bitchat` + `sh.hedwig.sonar` subsystems) |
 | `scripts/qa/ios-share-smoke.sh` | iOS share sheet end to end (Files, Photos, a stand-in third-party app) → picker → peer; asserts name/MIME/sha256 on the recipient. Traps: scripts/qa/README.md |
 | `scripts/qa/android-ui.sh` | adb/uiautomator driver: `dump`, `tapx`/`tapt`, `wait`, `ime`, `shot` |
-| `scripts/qa/peers.sh` | fresh `sonar-cli` peers: `new`, `send`, `send-image`, `listen`, `expect`, `accept`/`groups`, timezone `share-tz`/`expect-tz`/`tz`/`revoke-tz`/`expect-no-tz` |
+| `scripts/qa/peers.sh` | fresh `sonar-cli` peers: `new`, `send`, `send-image`, `listen`, `expect`, `accept`/`groups`, timezone `share-tz`/`expect-tz`/`tz`/`revoke-tz`/`expect-no-tz`, `id-of`, `react`, `expect-reaction` |
 | `scripts/qa/android-smoke.sh` | scripted registry scenarios on Android; exit status = failures |
 | `scripts/qa/idle-cpu.sh` | average CPU of the app over a window (Android `/proc`, iOS host `ps`) |
 | `scripts/qa/ios-drive.sh` | headless iOS steps via XCUITest: `launch`/`activate`, `tap`/`tapc`/`longpress`, `expect`/`count`, `shot`/`tree`, `sbtap` (system alerts) |
@@ -43,6 +43,20 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
   `core/build-android.sh` and check a new symbol with `strings`.
 - **zsh:** `A="adb -s X"; $A shell …` does not word-split (nothing runs), and
   `PIPESTATUS` does not exist — use explicit commands and `set -o pipefail`.
+
+## Android: shared virtual Bluetooth
+
+- All local emulators share one virtual BLE radio (netsim). With other
+  agents' emulators running Sonar, the QA app sees them as mesh peers and the
+  scan callbacks flood the main thread (2026-09-26: 23-26 % idle CPU and
+  repeated ANRs on Home, identical on a `main` build). Symptoms in the smoke:
+  QA-001 "could not open a chat by npub" (keystrokes dropped while the app
+  was not responding), "could not reach the chat list", QA-050 far over
+  budget. For scenarios that do not need the mesh, turn Bluetooth off:
+  `adb -s $QA_SERIAL shell cmd bluetooth_manager disable`. Pull ANR stacks
+  with `adb bugreport` (`FS/data/anr/trace_*`); `debuggerd -j` needs root.
+- `android-ui.sh type` sends long text in 12-character chunks: one long
+  `input text` lost its tail under load (an npub without its last 2 chars).
 
 ## iOS traps
 
@@ -91,6 +105,10 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 
 ## Peers (`sonar-cli`)
 
+- Seed a long history in one process (one relay connect):
+  `sonar-cli --home <peer> send --to <npub> --text "long history" --repeat 560`
+  (messages sent within one second sort by id, not by their number).
+
 - Only **1:1 welcomes auto-join**; a multi-member group invite stays pending
   until `peers.sh accept <name>` (then `peers.sh groups <name>` lists it).
 - `peers.sh` rebuilds `core/target/release/sonar-cli` when any `core/` source
@@ -109,7 +127,9 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 - Notification body "Open Sonar to read it." — message previews are **off by
   default** (`notifPreview`).
 - A chat titled "Sonar agent DM" — that is `sonar-cli`'s default group name.
-- No reaction bar on long-press — reactions are not implemented on either app.
+- Tapping your own reaction chip does nothing — retract is a tracked gap (no
+  MDK `deleteMessage` on the current pin). Reactions exist only on White
+  Noise/Marmot rows; BLE (mesh) rows and channels offer no reaction row.
 - "N here now" counts include you.
 
 ## CI notes

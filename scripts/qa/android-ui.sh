@@ -141,7 +141,15 @@ case "$cmd" in
   naf)       # naf — every interactive node uiautomator flags as unlabelled
     _dump_xml; _query naf ;;
   tap)       "${ADB[@]}" shell input tap "${1:?x}" "${2:?y}" ;;
-  type)      t="$*"; "${ADB[@]}" shell input text "${t// /%s}" ;;
+  type)      # Chunked: under host load one long `input text` drops its tail
+             # (a 63-char npub arrived without its last 2 characters, so Search
+             # offered no chat). Split the raw text, then escape each chunk, so
+             # a `%s` space escape is never cut in half.
+    t="$*"
+    while [[ -n "$t" ]]; do
+      c="${t:0:12}"; t="${t:12}"
+      "${ADB[@]}" shell input text "${c// /%s}"
+    done ;;
   key)       "${ADB[@]}" shell input keyevent "${1:?keycode}" ;;
   swipe)     "${ADB[@]}" shell input swipe "$1" "$2" "$3" "$4" "${5:-300}" ;;
   longpress) "${ADB[@]}" shell input swipe "$1" "$2" "$1" "$2" 900 ;;
