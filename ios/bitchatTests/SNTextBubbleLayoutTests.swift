@@ -74,6 +74,60 @@ struct SNTextBubbleLayoutTests {
         var pay = message()
         pay.pay = SNPayInfo(id: "p", sats: 21, state: .claimed)
         #expect(!SNTextBubbleModel.handles(pay))
+        var reacted = message()
+        reacted.reactions = [SNReactionTally(emoji: "👍", count: 1, mine: true)]
+        #expect(!SNTextBubbleModel.handles(reacted))
+    }
+
+    /// Chips tuck under a bubble's edge only when nothing is printed below
+    /// it: media/sticker times and the "Sent · internet" footer stay readable.
+    @Test
+    func chipsTuckOnlyUnderABareBubbleEdge() {
+        var text = message()
+        #expect(snChipsTuckUnderBubble(text, showsState: false))
+        text.mine = true
+        #expect(!snChipsTuckUnderBubble(text, showsState: true))
+        var photo = message()
+        photo.media = [SNMediaItem(url: "https://x/y", mime: "image/png", filename: "y.png", groupId: "g")]
+        #expect(!snChipsTuckUnderBubble(photo, showsState: false))
+    }
+
+    /// Plain text rows live on this UIKit cell, so its long-press menu is the
+    /// only way to react to them: without `canReact` a text message could not
+    /// get its first reaction on iOS.
+    @Test
+    func textRowsOfferTheReactionRowOnLongPress() {
+        var live = message(id: String(repeating: "ab", count: 32))
+        live.senderNpub = "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+        let enabled = SNTextBubbleModel.make(
+            message: live,
+            isContinuation: false,
+            showAuthor: false,
+            showState: false,
+            quotedPeerName: nil,
+            isExpanded: false,
+            authorTappable: true,
+            reactionsEnabled: true,
+            measurementKey: "react|on"
+        )
+        #expect(enabled.canReact)
+        // Surfaces without a react handler (e.g. channels) must not offer it.
+        #expect(!model(live).canReact)
+        var sending = live
+        sending.state = "Sending"
+        let pending = SNTextBubbleModel.make(
+            message: sending,
+            isContinuation: false,
+            showAuthor: false,
+            showState: false,
+            quotedPeerName: nil,
+            isExpanded: false,
+            authorTappable: true,
+            reactionsEnabled: true,
+            measurementKey: "react|sending"
+        )
+        #expect(!pending.canReact)
+        #expect(snQuickReactionMenu { _ in }.children.count == SNQuickReactions.count)
     }
 
     // MARK: Heights
