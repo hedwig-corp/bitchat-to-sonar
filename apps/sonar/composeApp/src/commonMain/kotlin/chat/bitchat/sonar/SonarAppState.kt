@@ -1362,6 +1362,29 @@ internal fun loadOlderPageHasOlder(
     return previousHasOlder
 }
 
+/** A short load-older page that admitted rows proves this source has nothing
+ *  older: core `messages_cursor_page` copies 0.8 remainder out of the bak
+ *  before it answers, so no older row can appear later in the session. An
+ *  empty page that admitted nothing proves nothing ([loadOlderPageHasOlder]). */
+internal fun cursorPageExhaustsSource(
+    rawPageCount: Int,
+    pageSize: Int,
+    admittedNewRows: Boolean,
+): Boolean = admittedNewRows && !(pageSize > 0 && rawPageCount > pageSize)
+
+/** Load-older gate for one transcript source. The fold-family cache
+ *  heuristic ([hasOlderForFoldFamily]'s `cachedCount > page`) keeps a seeded
+ *  window armed, but it counts rows the window ALREADY holds, so once a cursor
+ *  page proved the source exhausted it must not re-arm it: `loadOlderMessages`
+ *  kept asking for an expansion it could never get and returned before
+ *  prepending the rows it had. Every Compose chat stopped paging after the
+ *  first older page (#613 QA A1; iOS never passes a cache count). */
+internal fun transcriptSourceHasOlder(
+    olderExhausted: Boolean,
+    windowHasMore: Boolean,
+    familyHasOlder: () -> Boolean,
+): Boolean = !olderExhausted && (windowHasMore || familyHasOlder())
+
 /** iOS `dmMsgs` formats only `sourceMessageLimit` rows per Marmot source.
  *  After persist-folds the first-paint extract (80) is already in the
  *  family cache, but load-older that re-reads the same page reports
@@ -5047,6 +5070,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val hasMore: Boolean,
         val loadingOlder: Boolean = false,
         val pinnedToOlderEdge: Boolean = false,
+        /** A load-older cursor page admitted rows and came back short: this
+         *  source has nothing older than [rows]. See [transcriptSourceHasOlder]. */
+        val olderExhausted: Boolean = false,
     )
 
     private val transcriptWindows = mutableMapOf<String, TranscriptGroupWindow>()
@@ -16020,6 +16046,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             hasMore = hasMore,
             loadingOlder = current?.loadingOlder == true,
             pinnedToOlderEdge = current?.pinnedToOlderEdge == true,
+            // A newest-page refresh moves the newer edge only.
+            olderExhausted = current?.olderExhausted == true,
         )
         return merged
     }
@@ -16269,7 +16297,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             .flatMap { transcriptWindows[it]?.rows.orEmpty() }
             .distinctBy { it.id }
             .size
-        return (window?.hasMore == true) ||
+        return transcriptSourceHasOlder(
+            olderExhausted = window?.olderExhausted == true,
+            windowHasMore = window?.hasMore == true,
+        ) {
             hasOlderForFoldFamily(
                 groupId,
                 transcriptWindows.mapValues { it.value.hasMore },
@@ -16286,6 +16317,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 openedConversationId = opened,
                 openedConversationPaneId = pane,
             )
+        }
     }
 
     private fun transcriptGroupIds(chatId: String): List<String> {
@@ -16518,6 +16550,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                         previousHasOlder = latest.hasMore,
                     ),
                     pinnedToOlderEdge = latest.pinnedToOlderEdge || trimsNewerEdge,
+                    olderExhausted = latest.olderExhausted || cursorPageExhaustsSource(
+                        rawPageCount = fetched.size,
+                        pageSize = TRANSCRIPT_PAGE_SIZE,
+                        admittedNewRows = admittedNewRows,
+                    ),
                 )
             }
         }
