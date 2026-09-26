@@ -419,6 +419,25 @@ qa072() { # a peer's zone paints the DM header, with no bubble or unread (#607)
   fi
 }
 
+qa081() { # the Android Mesh channel keeps its composer (#612 gates it on a capability)
+  go_home >/dev/null
+  if ! ui tapx "Search"; then record QA-081 FAIL "search unreachable"; return; fi
+  sleep 1
+  if ! ui tapx "Bluetooth mesh"; then
+    record QA-081 FAIL "no Bluetooth mesh channel row in search"
+    go_home >/dev/null; return
+  fi
+  sleep 2
+  if has "isn't available"; then
+    record QA-081 FAIL "the Mesh channel shows the unavailable notice on Android"
+  elif hasx "Message Mesh"; then
+    record QA-081 PASS "the Mesh channel offers its composer"
+  else
+    record QA-081 FAIL "no \"Message Mesh\" composer in the Mesh channel"
+  fi
+  go_home >/dev/null
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -432,7 +451,7 @@ go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
 # QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa050; do
+for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa081 qa050; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

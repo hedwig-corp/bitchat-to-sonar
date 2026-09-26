@@ -294,6 +294,103 @@ share a zone with the app and report the zone the app shared with it.
 - **Origin:** A1/i2 (#607 QA — every launch, and every iOS store reopen,
   re-encrypted a kind-449 into every allowed group: 37 per launch)
 
+## Desktop Bluetooth mesh (#612)
+
+The desktop mesh engine (`MeshLink.kt`) is driven headlessly against the REAL
+Android phone engine (`MeshLinkEngine`, the Rust `mesh_engine`) by
+`DesktopMeshInteropTest`: a simulated radio with both GATT roles, virtual time
+and per-hop latency. It runs in `:composeApp:jvmTest`, so CI covers it. The
+hardware legs need a desktop plus real phones; debug both ends with
+`SONAR_BLE_DEBUG=1` (the log lands in `~/Library/Logs/sonar/sonar-ble.log` or
+`~/.local/state/sonar/sonar-ble.log`) and `adb logcat -s MeshGatt:* MeshRadio:*`.
+Which role the desktop plays is in the log: `advertise: started` means phones
+dial it (QA-085); `start_advertising REFUSED` or `register_gatt FAILED` means it
+dials them (`link <tag>: up`, QA-082…084).
+
+### QA-080 — The desktop Mesh channel tells the truth
+- **Platforms:** desktop (automated + manual)
+- **Steps:** desktop app → Mesh channel.
+- **Expect:** "The Mesh channel isn't available here yet", naming Bluetooth
+  DMs as still working; no composer, only "Sending is unavailable on Bluetooth
+  mesh here." Desktop has no 0x02 public-message path, so a composer there only
+  ever echoed locally and promised the send "will reach people as they connect".
+- **Guard:** `DesktopMeshChannelNoticeTest.theDesktopMeshChannelSaysWhatStillWorks`
+  (asks the real desktop capability, not an override)
+- **Origin:** D1 (#612 QA — the channel was gated on the DM capability, so every
+  machine where Bluetooth DMs work got the composer back, i.e. #609 unfixed)
+
+### QA-081 — The Android Mesh channel keeps its composer
+- **Platforms:** Android (automated)
+- **Steps:** home → *Mesh* card → the Mesh channel.
+- **Expect:** "Bluetooth mesh" empty state and the "Message Mesh" composer; no
+  "isn't available" notice.
+- **How:** `android-smoke.sh` QA-081 · Guard:
+  `DesktopMeshChannelNoticeTest.aWorkingMeshRadioGetsANormalChannel`
+
+### QA-082 — A desktop that dials a phone links and carries DMs both ways
+- **Platforms:** desktop Linux ↔ Android (automated; hardware manual)
+- **Steps:** a Linux desktop whose controller refuses to advertise, a phone in
+  range with Sonar open; wait for the phone on the desktop radar; DM each way.
+- **Expect:** `Noise handshake started` then `ESTABLISHED` on the desktop, the
+  phone shows the desktop as in range, both DMs arrive over Bluetooth.
+- **Guard:** `DesktopMeshInteropTest.aDesktopThatDialsAPhoneStartsTheHandshake`
+
+### QA-083 — A dropped link is re-handshaken, not left half-dead
+- **Platforms:** desktop Linux ↔ Android (automated; hardware manual)
+- **Steps:** QA-082 linked; toggle Bluetooth on the phone (or walk out of range
+  and back); DM each way once the phone reappears.
+- **Expect:** `link to <name> dropped → Noise session reset`, a fresh handshake
+  on the new link, both DMs delivered. Android drops its Noise state with the
+  GATT connection and never initiates toward a central, so a kept session
+  showed the phone in range while every DM was silently discarded.
+- **Guard:** `DesktopMeshInteropTest.aDroppedLinkIsRehandshakenNotLeftHalfDead`
+- **Origin:** D2 (#612 QA)
+
+### QA-084 — Two phones in range link independently
+- **Platforms:** desktop Linux ↔ 2× Android (automated; hardware manual)
+- **Expect:** both phones link; a DM to one never reaches the other. Android
+  answers a handshake whatever its recipient id says, so an m1 written to every
+  link reset the other phone's responder.
+- **Guard:** `DesktopMeshInteropTest.twoPhonesLinkIndependently`, `sonar-ble`
+  `a_routed_packet_reaches_only_its_link` / `a_broadcast_reaches_every_link`
+- **Origin:** D3 (#612 QA)
+
+### QA-085 — A phone that dials the desktop links without a stall (macOS)
+- **Platforms:** desktop macOS ↔ Android / iPhone (automated; hardware manual)
+- **Steps:** macOS desktop (advertising works) and a phone; DM each way.
+- **Expect:** the phone initiates and the desktop answers (`ESTABLISHED`
+  without `handshake started` on the desktop), within a few seconds. An m1 from
+  the desktop on this path reset the phone's own initiator, which retries only
+  after 8 s.
+- **Guard:** `DesktopMeshInteropTest.aPhoneThatDialsTheDesktopLinksWithoutAStall`
+- **Origin:** D4 (#612 QA)
+
+### QA-086 — A lost handshake message is retried
+- **Platforms:** desktop (automated only)
+- **Expect:** a handshake that stops moving is abandoned after 8 s and, on a
+  link the desktop dialed, restarted at once.
+- **Guard:** `DesktopMeshInteropTest.aLostHandshakeMessageIsRetried`
+- **Origin:** D5 (#612 QA — one lost m1 left the session in flight forever)
+
+### QA-087 — An iPhone on a link the desktop dialed
+- **Platforms:** desktop Linux ↔ iPhone (automated model; hardware manual)
+- **Steps:** as QA-082 with an iPhone; send a DM from the iPhone first.
+- **Expect:** one handshake completes (`simultaneous Noise open … keeping
+  ours` may appear once); both ends can decrypt.
+- **Guard:** `DesktopMeshInteropTest.aSimultaneousOpenWithIosConverges` (iOS
+  modelled from `NoiseSessionManager.swift`, not run)
+- **Origin:** D6 (#612 QA)
+
+### QA-088 — A long DM crosses in both directions
+- **Platforms:** desktop ↔ Android / iPhone (automated; hardware manual)
+- **Steps:** once linked (QA-082 or QA-085), send a ~500-character DM each way.
+- **Expect:** both arrive whole. Anything over 480 bytes travels as 0x20
+  fragments of 205 bytes, which the desktop neither reassembled nor produced,
+  so every long DM from a phone vanished silently.
+- **Guard:** `DesktopMeshInteropTest.aLongDmCrossesInBothDirections` (the
+  simulated radio enforces a 517-byte ATT MTU)
+- **Origin:** D7 (#612 QA — pre-existing, older than the central link)
+
 ## Settings
 
 ### QA-060 — Settings copy matches behaviour
