@@ -43,21 +43,31 @@ actual object MeshRadio {
     }
 
     /**
-     * Forces [meshMessagingSupported] for tests.
+     * Forces [meshMessagingSupported] / [meshBroadcastSupported] for tests.
      *
-     * The notice this gates used to be testable simply because Linux could never
-     * do mesh; now that it can, the only way to exercise the unsupported path is
-     * to say so. Testing "the notice appears on Linux" would now pin the platform
-     * rather than the behaviour, and would go green for the wrong reason on any
-     * machine whose adapter happens to refuse advertising.
+     * The notice these gate used to be testable simply because Linux could never
+     * do mesh; now that it can, the only way to exercise each path is to say so.
+     * Testing "the notice appears on Linux" would pin the platform rather than
+     * the behaviour.
      */
     @Volatile
     internal var meshMessagingOverrideForTest: Boolean? = null
+
+    @Volatile
+    internal var meshBroadcastOverrideForTest: Boolean? = null
 
     // The central link carries messages; advertising only decides whether a phone
     // can find us first. See the expect declaration.
     actual val meshMessagingSupported: Boolean
         get() = meshMessagingOverrideForTest ?: BleBridge.meshSupported
+
+    // sendMeshBroadcast / drainMeshBroadcast below are not wired (no 0x02 path in
+    // MeshLink), so the public Mesh channel cannot work here whatever the radio
+    // can do. Flip this when they are.
+    actual val meshBroadcastSupported: Boolean
+        get() = meshBroadcastOverrideForTest ?: false
+
+    private val advertisingCheckScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
 
     actual fun start() {
         if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) return
@@ -71,15 +81,20 @@ actual object MeshRadio {
         // be connected to. An adapter that refuses it does not stop mesh working.
         if (BleBridge.advertisingSupported) {
             BleBridge.startAdvertising()
-            Thread({
-                Thread.sleep(6_000)
-                if (!BleBridge.advertisingSupported) {
-                    sonarLog(
-                        "MeshRadio",
-                        "BLE adapter refused to advertise: this desktop reaches peers by connecting to them, but phones cannot initiate",
-                    )
-                }
-            }, "sonar-mesh-advcheck").apply { isDaemon = true }.start()
+            // Once per process: start() runs on every discovery-mode change,
+            // known-peer change and foreground transition, and a refusal is
+            // final for the run (the bridge does not retry a refused role).
+            if (advertisingCheckScheduled.compareAndSet(false, true)) {
+                Thread({
+                    Thread.sleep(6_000)
+                    if (!BleBridge.advertisingSupported) {
+                        sonarLog(
+                            "MeshRadio",
+                            "BLE adapter refused to advertise: this desktop reaches peers by connecting to them, but phones cannot initiate",
+                        )
+                    }
+                }, "sonar-mesh-advcheck").apply { isDaemon = true }.start()
+            }
         } else {
             sonarLog(
                 "MeshRadio",

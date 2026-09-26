@@ -17,12 +17,11 @@ import kotlin.test.assertTrue
 /**
  * The Mesh channel must not claim to work where it cannot.
  *
- * `sonar-ble` implements the peripheral/GATT-server role only for CoreBluetooth, so
- * off Apple platforms `run_peripheral()` returns an error, `MeshLink` never starts,
- * phones cannot discover the desktop and the desktop cannot receive mesh messages.
- * The radio still scans, so peers appear in the presence count — which is what made
- * this read as broken sync rather than an unimplemented transport. The channel
- * meanwhile invited the user to "Say hi".
+ * The channel is the public 0x02 broadcast. Desktop now carries private Noise DMs
+ * over Bluetooth on macOS and Linux, but `sendMeshBroadcast` / `drainMeshBroadcast`
+ * are still unwired there, so the channel can neither send nor hear anyone. It used
+ * to invite the user to "Say hi", echo the send locally and promise it "will reach
+ * people as they connect" (#609).
  *
  * Rendered rather than asserted on the flag alone. A test that only checked
  * `meshMessagingSupported` would stay green with the whole notice deleted, which is
@@ -40,17 +39,20 @@ class DesktopMeshChannelNoticeTest {
     fun restore() {
         DesktopEnv.useTestRoot(null)
         MeshRadio.meshMessagingOverrideForTest = null
+        MeshRadio.meshBroadcastOverrideForTest = null
     }
 
     @Test
     fun theCapabilityIsAskedOfTheRadioRatherThanThePlatform() {
         // Before the BlueZ peripheral role existed this was "Linux is always
-        // false". It is now a property of the adapter, so the notice must follow
+        // false". It is now a property of the build, so the notice must follow
         // the capability, which is what the rest of these tests drive.
         MeshRadio.meshMessagingOverrideForTest = false
         assertFalse(MeshRadio.meshMessagingSupported)
         MeshRadio.meshMessagingOverrideForTest = true
         assertTrue(MeshRadio.meshMessagingSupported)
+        // And the channel's own capability is not the DM one.
+        assertFalse(MeshRadio.meshBroadcastSupported, "desktop has no 0x02 path yet")
     }
 
     @Test
@@ -91,12 +93,40 @@ class DesktopMeshChannelNoticeTest {
         onNodeWithText("Sending is unavailable on Bluetooth mesh here.").assertIsDisplayed()
     }
 
+    /**
+     * The desktop as it ships on macOS and Linux: mesh DMs work, the channel does
+     * not. Asked of the REAL desktop capability (no broadcast override), so this
+     * goes red the moment the channel is gated on the DM capability again, which
+     * is what the first version of this fix did: it offered the composer on every
+     * machine where Bluetooth DMs work, i.e. exactly the machines #609 was about.
+     */
+    @Test
+    fun theDesktopMeshChannelSaysWhatStillWorks() = runComposeUiTest {
+        MeshRadio.meshMessagingOverrideForTest = true
+        setContent {
+            SonarTheme(dark = true) {
+                SonarChannelScreen(state(), Screen.Channel("mesh"))
+            }
+        }
+        onNodeWithText("The Mesh channel isn't available here yet").assertIsDisplayed()
+        assertTrue(
+            onAllNodesWithText("privately over Bluetooth", substring = true).fetchSemanticsNodes().isNotEmpty(),
+            "DMs over Bluetooth do work here, and the notice must not imply otherwise",
+        )
+        assertTrue(
+            onAllNodesWithText("Message Mesh").fetchSemanticsNodes().isEmpty(),
+            "a send here only ever produces a local echo",
+        )
+        onNodeWithText("Sending is unavailable on Bluetooth mesh here.").assertIsDisplayed()
+    }
+
     @Test
     fun aWorkingMeshRadioGetsANormalChannel() = runComposeUiTest {
-        // The other half, untestable before the peripheral role existed: where the
-        // adapter can advertise, the Mesh channel must behave like any other and
-        // keep its composer.
+        // The other half: where the channel is wired (Android today, desktop once
+        // 0x02 lands), the Mesh channel must behave like any other and keep its
+        // composer.
         MeshRadio.meshMessagingOverrideForTest = true
+        MeshRadio.meshBroadcastOverrideForTest = true
         setContent {
             SonarTheme(dark = true) {
                 SonarChannelScreen(state(), Screen.Channel("mesh"))

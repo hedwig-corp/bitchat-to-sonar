@@ -263,21 +263,31 @@ internal inline fun shouldExpireAnnouncedMeshPeer(
  */
 expect object MeshRadio {
     /**
-     * Whether this build can exchange mesh messages at all, as opposed to merely
-     * seeing that peers exist.
+     * Whether this build can exchange private mesh messages (Noise DMs) at all,
+     * as opposed to merely seeing that peers exist.
      *
-     * False off Apple platforms. `sonar-ble` implements the peripheral/GATT-server
-     * role only for CoreBluetooth, and without it a phone can never subscribe, so
-     * it never writes its announce, so [MeshLink] has nothing to pump and no Noise
-     * session forms. The radio still scans, so peers appear in presence counts —
-     * which is exactly why this needs to be askable: a channel that lists people
-     * and delivers nothing reads as broken sync rather than an unimplemented
-     * transport.
+     * True on Android and on desktop macOS/Linux, where `sonar-ble` carries mesh
+     * traffic as a GATT server or, when the controller refuses to advertise, as a
+     * central. False where the bridge has neither role (Windows), or did not
+     * load: the radio may still scan there, so peers appear in presence counts
+     * while nothing can be delivered.
      *
      * [available] is a different question: it asks whether the radio hardware and
      * permissions are there. Both can be true while this is false.
      */
     val meshMessagingSupported: Boolean
+
+    /**
+     * Whether the public Mesh channel works here: [sendMeshBroadcast] reaches
+     * people and [drainMeshBroadcast] hears them.
+     *
+     * Separate from [meshMessagingSupported] because the two are wired
+     * separately. Desktop carries Noise DMs over the mesh but has no 0x02
+     * public-message path yet, so its Mesh channel would echo a send locally,
+     * promise it "will reach people as they connect", and never deliver it or
+     * show anyone else's. The channel screen asks this, not the DM capability.
+     */
+    val meshBroadcastSupported: Boolean
 
     /** True when BLE hardware + runtime permissions are available. */
     fun available(): Boolean
