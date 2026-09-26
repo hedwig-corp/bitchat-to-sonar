@@ -902,6 +902,13 @@ fn retryable_media_http_error(error: &Error) -> bool {
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// MDK's MIP-03 quiescence window is ~1.1s; wake the drain after it.
 const CONVERGENCE_WAKE_DELAY: Duration = Duration::from_millis(1_500);
+
+/// A leftover 0.8 member of a resumed room is re-probed for a 0.9 KeyPackage
+/// at most this often on the background paths (`ensure_subscriptions`,
+/// `sync`). Hosts call those every few seconds, and a member who never
+/// updates cost a KeyPackage query on every relay each time: 16-21 % idle CPU
+/// on Android (QA-050). A local send still fetches immediately.
+const LATE_RESUME_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Convergence passes a refused media send waits through before retrying.
 const MEDIA_EPOCH_SETTLE_PASSES: usize = 3;
 /// Per-relay bound for [`SonarClient::fetch_key_package`]: enough to see past
@@ -1929,6 +1936,9 @@ pub struct SonarClient {
     preferred_catchup_group: Arc<Mutex<Option<String>>>,
     /// Rate-limit ensure_subscriptions welcome/group resubscribes (P2 churn).
     last_ensure_subscriptions_at: Arc<Mutex<Option<Instant>>>,
+    /// Leftover 0.8 members of a resumed room whose last background probe
+    /// found no 0.9 KeyPackage, and when. See [`LATE_RESUME_PROBE_INTERVAL`].
+    late_resume_probed_at: Arc<Mutex<HashMap<PublicKey, Instant>>>,
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
@@ -2519,6 +2529,7 @@ impl SonarClient {
             initial_group_message_catchup_scanned,
             preferred_catchup_group,
             last_ensure_subscriptions_at,
+            late_resume_probed_at: Arc::new(Mutex::new(HashMap::new())),
             allow_geo_relays,
             conversation_index,
             local_timezone: Arc::new(Mutex::new(None)),
@@ -7781,11 +7792,37 @@ impl SonarClient {
     /// time they publish a 0.9 KeyPackage. Failure must not block the send
     /// to people already in the live group.
     async fn maybe_add_late_resume_members(&self, live: &GroupId) {
-        let missing = self.missing_resume_peers(live);
+        let now = Instant::now();
+        let missing: Vec<PublicKey> = {
+            let probed = self.late_resume_probed_at.lock().unwrap();
+            self.missing_resume_peers(live)
+                .into_iter()
+                .filter(|member| {
+                    probed
+                        .get(member)
+                        .is_none_or(|at| now.duration_since(*at) >= LATE_RESUME_PROBE_INTERVAL)
+                })
+                .collect()
+        };
         if missing.is_empty() {
             return;
         }
-        let Ok(packages) = self.fetch_resume_key_packages(&missing).await else {
+        let packages = self.fetch_resume_key_packages(&missing).await;
+        {
+            // Not found, or the relays failed: back off either way. Members
+            // who did publish are added below and leave the missing set.
+            let found: HashSet<PublicKey> = packages
+                .as_ref()
+                .map(|events| events.iter().map(|event| event.pubkey).collect())
+                .unwrap_or_default();
+            let mut probed = self.late_resume_probed_at.lock().unwrap();
+            for member in &missing {
+                if !found.contains(member) {
+                    probed.insert(*member, now);
+                }
+            }
+        }
+        let Ok(packages) = packages else {
             return;
         };
         if packages.is_empty() {
@@ -14636,7 +14673,10 @@ mod tests {
         alice.engine.merge_pending_commit(&group_id).await.unwrap();
         alice
             .engine
-            .add_members(&group_id, vec![dave.key_package_event(relays).await.unwrap()])
+            .add_members(
+                &group_id,
+                vec![dave.key_package_event(relays).await.unwrap()],
+            )
             .await
             .unwrap();
         alice.engine.merge_pending_commit(&group_id).await.unwrap();

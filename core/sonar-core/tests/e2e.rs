@@ -2356,6 +2356,64 @@ async fn recovered_08_group_adds_late_member_on_sync_without_a_local_send() {
     assert_eq!(carol.groups().expect("carol joined").len(), 1);
 }
 
+/// QA-050: hosts call `ensure_subscriptions` every few seconds. A leftover
+/// member who has not updated must not be re-probed on every tick: each probe
+/// is a KeyPackage query on every relay (16-21 % idle CPU on Android). After
+/// one miss the member waits out `LATE_RESUME_PROBE_INTERVAL`, even if they
+/// update in between.
+#[tokio::test]
+async fn recovered_08_leftover_member_is_not_reprobed_on_every_idle_tick() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let carol_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let historical = write_mdk08_alice_bob_carol_store(
+        &db_path,
+        bob_identity.public_key(),
+        carol_identity.public_key(),
+    );
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates");
+    let bob = SonarClient::connect_in_memory(bob_identity, vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let carol = SonarClient::connect_in_memory(carol_identity, vec![relay_url])
+        .await
+        .expect("carol connects");
+
+    bob.publish_key_package().await.expect("bob kp");
+    alice
+        .send_text(&historical, "bob already updated")
+        .await
+        .expect("partial resume");
+    let live = alice.groups().expect("live")[0].id.clone();
+
+    alice
+        .ensure_subscriptions()
+        .await
+        .expect("idle tick probes carol, who has not updated");
+    carol.publish_key_package().await.expect("carol updates");
+    alice.ensure_subscriptions().await.expect("next idle tick");
+    assert!(
+        !alice
+            .members(&live)
+            .expect("members")
+            .contains(&carol.identity().public_key()),
+        "a leftover member missed once must wait out the probe interval, not be re-queried every tick"
+    );
+}
+
 /// Persist-folds can remount a mixed-resume room after the core fold
 /// sidecar is gone. Idle `ensure_subscriptions` must rebuild the bind
 /// and invite leftover members — a send on the listed live id never

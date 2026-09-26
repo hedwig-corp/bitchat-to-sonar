@@ -505,6 +505,14 @@ share a zone with the app and report the zone the app shared with it.
   pass; ~200–300 `relay EOSE` lines/min). A number over budget is only a
   finding when a `main` build on the same emulator/account measures lower.
 - **How:** `android-smoke.sh` QA-050
+- **Also seen (#613, 2026-09-26):** 16–21 % on the Android emulator, with
+  location off. The account had a recovered 0.8 room with a member who never
+  updated, and `reconcile_historical_resume_members` re-queried that member's
+  KeyPackage on every relay on every idle tick (logcat: `peer only publishes
+  MDK 0.8 KeyPackages` about every 10 s, ~300 `relay EOSE` lines a minute).
+  No `main` control exists: `main` cannot open an upgraded store. Fixed with a
+  5-minute per-member probe floor ·
+  `e2e.rs::recovered_08_leftover_member_is_not_reprobed_on_every_idle_tick`.
 
 ### QA-051 — Cold start paints local state first
 - **Platforms:** iOS (`scripts/bench/provision-and-bench.sh`), Android
