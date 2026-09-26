@@ -253,6 +253,19 @@ internal inline fun shouldExpireAnnouncedMeshPeer(
     hasLiveLink: () -> Boolean,
 ): Boolean = nowMs - lastSeenMs > staleMs && !hasLiveLink()
 
+/** Minimum gap between two full passes over sightings of the same address.
+ * A LOW_LATENCY + ALL_MATCHES scan re-reports every advertisement (several a
+ * second per device); a full pass crosses into the Rust mesh engine. */
+internal const val MESH_RESIGHT_MIN_INTERVAL_MS = 1_000L
+
+/** Whether a scan sighting gets a full pass (dial / re-dial decisions over the
+ * FFI) or is only recorded as "still here". A first sighting always does. */
+internal fun shouldProcessMeshSighting(
+    lastProcessedMs: Long?,
+    nowMs: Long,
+    minIntervalMs: Long = MESH_RESIGHT_MIN_INTERVAL_MS,
+): Boolean = lastProcessedMs == null || nowMs - lastProcessedMs >= minIntervalMs
+
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
  * nearby Sonar/bitchat phones discover each other over Bluetooth. This is the
