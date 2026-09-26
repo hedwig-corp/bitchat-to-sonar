@@ -127,6 +127,131 @@ is the build under test on a dedicated QA emulator/simulator.
   Compose `VideoPrivacyTest`, `VideoPrivacyFixtureTest`
 - **Origin:** #615 (iOS) and its review (Compose parity, fail-closed)
 
+## Share sheet (#559)
+
+Sharing INTO Sonar from another app. iOS stages the share in the App Group
+(`bitchatShareExtension`) and tries to open `sonar://share?id=…` — refused for
+share extensions, so the extension says "Open Sonar to send" and the user
+switches to Sonar, whose "Send to…" picker sends it. Android receives
+`ACTION_SEND` directly.
+
+`scripts/qa/ios-share-smoke.sh` drives all of it on the iOS simulator: the real
+system share sheet, from the Files app and from a stand-in third-party app
+(`scripts/qa/ios-share/QAShareHost`, a `UIActivityViewController` over file
+URLs), picks the chat with a fresh `sonar-cli` peer and asserts on **what the
+peer received** — filename, MIME and sha256 of the decrypted bytes — and that no
+stray text message rode along. Every app-side screen looked fine while #559's
+bug delivered a path, so the recipient is the only honest oracle.
+
+Wire MIME: the app keeps MDK's allowlist (`snEncryptedAttachmentMime`) and sends
+every other type as `application/octet-stream` with the extension intact — a
+CSV arriving as `application/octet-stream` named `report.csv` is correct.
+
+### QA-080 — A document from Files arrives as the file, not its path
+- **Platforms:** iOS (automated); Android structurally immune (reads the
+  `content://` stream, no type negotiation)
+- **Steps:** Files → On My iPhone → long-press `report.csv` → Share → Sonar →
+  pick the chat.
+- **Expect:** picker lists `report.csv` (never `file URL`, never an `0-` prefix);
+  the peer receives `report.csv`, bytes identical, and no text message.
+- **How:** `ios-share-smoke.sh` QA-080 · Guard: `SonarSharePayloadTests.stagingNeverAsksAURLIdentifierForBytes`
+- **Origin:** #559 — `loadFileRepresentation("public.file-url")` vends the
+  path string; csv/txt/zip/docx shares delivered a ~110-byte blob named `file URL`.
+
+### QA-081 — Documents from a third-party app keep names and bytes
+- **Platforms:** iOS (automated)
+- **Steps:** QA share host shares `data.json` + `archive.zip` → Sonar → chat.
+- **Expect:** both arrive under their own names, bytes identical.
+- **How:** `ios-share-smoke.sh` QA-081 · Guard: `SonarSharePayloadTests.stagedFilenamePrefersTheProviderName`
+
+### QA-082 — Two same-named files both arrive, unprefixed, in order
+- **Platforms:** iOS (automated); Android sends the `EXTRA_STREAM` list as-is
+- **Steps:** host shares `dup1/IMG_0001.txt` + `dup2/IMG_0001.txt`.
+- **Expect:** picker shows `IMG_0001.txt` twice, in the order shared, no
+  `0-`/`1-`; the peer receives two `IMG_0001.txt` with the two distinct contents.
+- **How:** `ios-share-smoke.sh` QA-082 · Guard: `SonarSharePayloadTests.stagedPathKeepsTheIndexOutOfTheFilename`
+- **Origin:** #559 (index prefix leaked into the delivered name); order: QA
+  pass on #559 — staging indexed by completion order shuffled multi-file shares.
+
+### QA-083 — A photo file keeps its real name
+- **Platforms:** iOS (automated)
+- **Steps:** host shares `photo.png`.
+- **Expect:** `photo.png`, `image/png`, same pixel dimensions. Not the same
+  bytes: MDK strips EXIF by re-encoding every image it encrypts
+  (`mdk-core` `encrypted_media/metadata.rs`), so a byte match is the wrong oracle.
+- **How:** `ios-share-smoke.sh` QA-083
+
+### QA-084 — An in-app text export is a file, never also the message
+- **Platforms:** iOS (automated); Android N/A (text comes only from `EXTRA_TEXT`)
+- **Steps:** the QA host exports `export.txt` from memory — its own
+  `NSItemProvider`, bytes registered as `public.plain-text` plus a
+  `suggestedName` (the usual "Export CSV" shape) → Sonar → chat.
+- **Expect:** the picker preview shows the filename only, not the document's
+  text; the peer receives `export.txt` and **no** text message.
+- **How:** `ios-share-smoke.sh` QA-084 · Guard: `SonarSharePayloadTests.anInAppTextExportIsStagedAndNeverReadAsTheMessageBody`
+- **Origin:** QA pass on #559 — the body reader read every provider, and a
+  plain-text load of that provider returns the bytes: the staged manifest held
+  `text` = the whole document AND the file. Files and file-URL shares do not
+  show it (across the process boundary they vend a URL) — QA-091 keeps it so.
+
+### QA-085 — A shared folder never copies the tree
+- **Platforms:** iOS (automated)
+- **Steps:** Files → long-press `Folder QA` → Share → Sonar.
+- **Expect:** the extension says "no shareable content"; no picker; nothing in
+  `SharedInbox` holds a directory; the peer receives nothing.
+- **How:** `ios-share-smoke.sh` QA-085
+- **Origin:** #559 review — `attributesOfItem[.size]` of a directory is its
+  entry (~96 B), so it passed every size guard and `copyItem` copied the tree.
+
+### QA-086 — A web link arrives as text, never as a file
+- **Platforms:** both (iOS automated)
+- **Steps:** host shares `https://sonar.hedwig.sh/qa-share-link`.
+- **Expect:** the peer receives the link as text; no file.
+- **How:** `ios-share-smoke.sh` QA-086 · Guard: `SonarSharePayloadTests` link cases
+- **Origin:** #447 (links were staged twice, once as a file)
+
+### QA-087 — An extension-less document keeps its name
+- **Platforms:** iOS (automated)
+- **Steps:** host shares `README`.
+- **Expect:** the peer receives `README` (not `attachment`, not a type name).
+- **How:** `ios-share-smoke.sh` QA-087
+
+### QA-088 — An oversized file is refused before the picker
+- **Platforms:** iOS (automated)
+- **Steps:** host shares a 26 MiB file (cap: 25 MiB).
+- **Expect:** "file is too large to share"; no picker; nothing left staged.
+- **How:** `ios-share-smoke.sh` QA-088
+
+### QA-089 — An abandoned share does not replace the one just made
+- **Platforms:** both (iOS automated; Android by jvmTest)
+- **Steps:** share `old-draft.csv`, switch to Sonar, leave its picker up and
+  relaunch Sonar (the payload stays staged, as after a crash — the picker comes
+  back); then share `fresh.csv` and switch to Sonar.
+- **Expect:** the picker offers `fresh.csv`; the peer receives `fresh.csv`;
+  `old-draft.csv` is offered again afterwards, not lost.
+- **How:** `ios-share-smoke.sh` QA-089 · Guard: `SonarSharePayloadTests.theShareJustMadeIsOfferedBeforeAnOlderStagedOne`,
+  `SonarSharePayloadTests.aNewerShareTakesOverAPickerShowingAnOlderOne`,
+  `ShareQueueOrderTest` (Android)
+- **Origin:** QA pass on #559 — the picker took the OLDEST staged payload and
+  kept any picker already up, so it offered `old-draft.csv` and one tap sent
+  it. The extension cannot open Sonar (`extensionContext.open` is refused for
+  share extensions), so the app gets no payload id and must prefer the newest.
+  Android queued a new share behind the open picker, and its Back button /
+  system back stranded a queued share with no picker on screen.
+
+### QA-090 — A photo from the Photos app arrives as an image
+- **Platforms:** iOS (automated); Android manual (gallery → Share → Sonar)
+- **Steps:** `simctl addmedia`, Photos → photo → Share → Sonar → chat.
+- **Expect:** an `image/*` file with a real filename (Photos may re-encode, so
+  bytes are not compared).
+- **How:** `ios-share-smoke.sh` QA-090
+
+### QA-091 — A text document from Files arrives as the file only
+- **Platforms:** iOS (automated)
+- **Steps:** Files → `notes.txt` → Share → Sonar → chat.
+- **Expect:** `notes.txt`, `text/plain`, bytes identical, no text message.
+- **How:** `ios-share-smoke.sh` QA-091
+
 ## Notifications and lifecycle
 
 ### QA-020 — Background receive
