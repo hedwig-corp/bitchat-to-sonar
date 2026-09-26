@@ -4309,7 +4309,7 @@ private fun MediaBubble(
                 Modifier.size(reservedSize)
                     .clip(bubbleShape).background(s.surface2)
                     // Spoken as "Photo" (it was an unlabelled node), and a
-                    // handle for scripted QA of media reactions (QA-076).
+                    // handle for scripted QA of media reactions (QA-106).
                     .semantics { contentDescription = photoLabel }
                     .combinedClickable(
                         onLongClick = LocalMessageLongPress.current,

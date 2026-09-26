@@ -3245,7 +3245,7 @@ struct SNMediaBubble: View {
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
                     // Spoken as "Photo" (it was an unlabelled image), and a
-                    // handle for scripted QA of media reactions (QA-076).
+                    // handle for scripted QA of media reactions (QA-106).
                     .accessibilityLabel(Text(String(localized: "chat.reply.photo", defaultValue: "Photo")))
             } else if failed, pipeline.state(item).phase == .available {
                 fileChip(for: item)
