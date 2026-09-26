@@ -607,10 +607,11 @@ real mint and need the maintainer's approval of the amounts.
   the mint with no confirmation, and nothing ever wrote the Breez offer back.
 
 ### QA-095 — The fee paid never exceeds the fee shown
-- **Platforms:** both (manual, fake mint: raise the mint's `fee_reserve`
-  between the sheet's quote and Send, e.g. restart `cdk-mintd` with a higher
-  `[fake_wallet]` `reserve_fee_min`; unit tests drive it with a scripted
-  reserve)
+- **Platforms:** both (manual, fake mint: raise the fee reserve between the
+  sheet's quote and Send with `mint-proxy.py arm inflate-melt-fee 40`, which
+  rewrites the next melt quote's answer; unit tests drive it with a scripted
+  reserve). Passed on the iOS simulator in #614 QA round 4: "up to 3 sats"
+  on the sheet, refused at 40, Try again paid with a 3-sat fee.
 - **Steps:** Send → paste an offer → type an amount, wait for "Network fee:
   up to N sats" → raise the reserve → Send. On the status screen tap **Try
   again**. Repeat from a chat ⚡PAY sheet; and once with the mint stopped

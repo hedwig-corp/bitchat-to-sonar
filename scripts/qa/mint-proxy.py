@@ -15,6 +15,7 @@ sats only: use it with a `cdk-mintd` fakewallet mint, never a real one.
     scripts/qa/mint-proxy.py discard                   # ...or forget it: it never arrives
     scripts/qa/mint-proxy.py arm delay-melt 12         # forward after 12 s (the app waits)
     scripts/qa/mint-proxy.py arm delay-mint-answer 20  # mint issues at once, answer after 20 s
+    scripts/qa/mint-proxy.py arm inflate-melt-fee 40   # next melt quote answers a 40-sat fee reserve
     scripts/qa/mint-proxy.py status | disarm
 
 Each fault fires once, on the next matching request, then the proxy is back
@@ -32,6 +33,7 @@ import time
 import urllib.request
 
 MELT = ("/v1/melt/bolt11", "/v1/melt/bolt12")
+MELT_QUOTE = ("/v1/melt/quote/bolt11", "/v1/melt/quote/bolt12")
 MINT = ("/v1/mint/bolt11", "/v1/mint/bolt12")
 
 state = {"fault": None, "arg": None, "held": None, "log": []}
@@ -79,6 +81,19 @@ def close_answer(answer: bytes) -> bytes:
     return ("\r\n".join(head) + "\r\nConnection: close\r\n\r\n").encode("latin-1") + answer[sep + 4:]
 
 
+def with_fee_reserve(answer: bytes, fee: int) -> bytes:
+    """The same HTTP answer with the JSON body's fee_reserve replaced."""
+    sep = answer.find(b"\r\n\r\n")
+    head, body = answer[:sep].decode("latin-1"), answer[sep + 4:]
+    if "transfer-encoding: chunked" in head.lower():
+        raise ValueError("chunked melt quote answer: not rewritten")
+    data = json.loads(body)
+    data["fee_reserve"] = fee
+    body = json.dumps(data).encode()
+    lines = [l for l in head.split("\r\n") if not l.lower().startswith("content-length:")]
+    return ("\r\n".join(lines) + f"\r\nContent-Length: {len(body)}\r\n\r\n").encode("latin-1") + body
+
+
 def take(fault: str):
     if state["fault"] != fault:
         return None
@@ -95,6 +110,7 @@ async def handle(reader, writer, upstream: int):
         return
     is_melt = method == "POST" and path.startswith(MELT)
     is_mint = method == "POST" and path.startswith(MINT) and "/quote/" not in path
+    is_melt_quote = method == "POST" and path.startswith(MELT_QUOTE)
     try:
         if is_melt and take("drop-melt"):
             state["held"] = (head, body)
@@ -109,6 +125,9 @@ async def handle(reader, writer, upstream: int):
             log(f"lose-melt-answer: {path} applied by the mint, answer dropped")
             writer.close()
             return
+        if is_melt_quote and (fee := take("inflate-melt-fee")):
+            answer = with_fee_reserve(answer, int(fee))
+            log(f"inflate-melt-fee: {path} answered with fee_reserve {fee}")
         if is_mint and (delay := take("delay-mint-answer")):
             log(f"delay-mint-answer: {path} issued by the mint, answer held {delay} s")
             await asyncio.sleep(float(delay))
