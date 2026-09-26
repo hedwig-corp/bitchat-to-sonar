@@ -6,15 +6,18 @@
 //! disproves the "JVM can't do BLE" idea: the radio runs in native code that the
 //! JVM loads.
 //!
-//! Scope today: the **central** role — continuous scan + discovery of nearby BLE
-//! peripherals, surfacing the ones advertising the bitchat mesh service so the
-//! desktop radar lights up with real mesh devices. The peripheral/GATT-server
-//! role (advertising, so phones can discover the desktop) and the Noise-over-GATT
-//! transport are the next stages toward full mesh interop.
+//! Both roles carry mesh packets: the **peripheral** role (advertise + GATT
+//! server, CoreBluetooth and BlueZ) lets phones dial us, and when the controller
+//! refuses to advertise the **central** role dials them instead (scan, connect,
+//! subscribe, write). The Noise protocol runs in the JVM (`MeshLink.kt`); this
+//! crate only moves bytes and says which link they came from.
 //!
-//! C ABI (all thread-safe; the scan runs on its own tokio thread):
+//! C ABI (all thread-safe; each role runs on its own tokio thread):
 //!   sonar_ble_start()          -> begin scanning (idempotent)
 //!   sonar_ble_peers_json()     -> *malloc'd UTF-8 JSON array of fresh mesh peers
+//!   sonar_ble_drain_rx_json()  -> packets + link-down events, per link
+//!   sonar_ble_notify(p, n)     -> a packet for every link (broadcast)
+//!   sonar_ble_send_link(l,p,n) -> a packet for one central link
 //!   sonar_ble_free(ptr)        -> free a string returned above
 //!   sonar_ble_stop()           -> stop scanning + clear state
 
@@ -63,15 +66,137 @@ static ADVERTISE_OK: AtomicBool = AtomicBool::new(false);
 /// "tried and failed" instead of reading a not-yet-started run as broken.
 static ADVERTISE_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-/// Packets centrals wrote to our GATT characteristic (their announce / handshake).
-/// Drained by the JVM, which decodes the announce to name + dedupe a peer — this
-/// is how the desktop learns a phone that connected to it (the phone suppresses
-/// its own advertising while connected, so scanning alone can't see it).
-static RX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+/// What the radio heard, in arrival order, for the JVM mesh engine to drain:
+/// packets centrals wrote to our GATT characteristic, notifications from peers
+/// we linked to as a central, and those links going down.
+///
+/// Every item names its link. `0` is the GATT server, which cannot tell its
+/// centrals apart; a central link uses its [`TX`] outbox id. The JVM needs the
+/// attribution for three things the protocol does per ROUTE, not per peer:
+/// replying on the link a peer is actually on (Android answers a handshake
+/// whatever its recipient id says, so a broadcast m1 resets every other phone's
+/// responder), initiating only where we are the central (Android never
+/// initiates on its server side), and dropping a Noise session when its link
+/// drops (Android drops its half, and never tells us).
+static RX_PACKETS: Lazy<Mutex<Vec<RxItem>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-/// Packets the JVM mesh engine wants pushed to subscribed centrals (Noise
-/// handshake replies, encrypted DMs). The advertise loop drains + notifies them.
-static TX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+/// The GATT server's link id: writes from centrals cannot be attributed.
+const SERVER_LINK: u64 = 0;
+const RX_QUEUE_MAX: usize = 256;
+
+enum RxItem {
+    Packet { link: u64, bytes: Vec<u8> },
+    LinkDown { link: u64 },
+}
+
+fn rx_push(link: u64, bytes: Vec<u8>) {
+    if let Ok(mut q) = RX_PACKETS.lock() {
+        if q.len() < RX_QUEUE_MAX {
+            q.push(RxItem::Packet { link, bytes });
+        }
+    }
+}
+
+/// Never dropped for a full queue: a lost down event would leave the JVM
+/// holding a session the phone has already thrown away.
+fn rx_link_down(link: u64) {
+    if let Ok(mut q) = RX_PACKETS.lock() {
+        q.push(RxItem::LinkDown { link });
+    }
+}
+
+fn rx_json(items: Vec<RxItem>) -> String {
+    let items: Vec<serde_json::Value> = items
+        .into_iter()
+        .map(|i| match i {
+            RxItem::Packet { link, bytes } => serde_json::json!({ "l": link, "p": hex_encode(&bytes) }),
+            RxItem::LinkDown { link } => serde_json::json!({ "l": link, "d": true }),
+        })
+        .collect();
+    serde_json::Value::Array(items).to_string()
+}
+
+/// Packets the JVM mesh engine wants on the air (announce-driven handshakes,
+/// Noise replies, encrypted DMs, 0x53), one queue per radio consumer.
+///
+/// Every consumer (each central link, the advertise loop) gets its OWN copy of
+/// every packet. The JVM addresses packets by bitchat recipient id, not by radio
+/// link, so the bridge cannot route and has to broadcast, which is what the
+/// peripheral's notify-to-every-subscriber already did; phones drop packets
+/// addressed to someone else. A single queue drained with `mem::take` instead
+/// handed each packet to whichever consumer woke first, so with two phones in
+/// range a handshake or DM for one of them was written to the other and lost.
+static TX: Lazy<Mutex<TxFanout>> = Lazy::new(|| Mutex::new(TxFanout::default()));
+
+/// Per-consumer bound, matching the RX queue. A consumer that stops draining
+/// (a wedged link) loses its newest packets, not everyone's.
+const TX_QUEUE_MAX: usize = 256;
+
+#[derive(Default)]
+struct TxFanout {
+    next_id: u64,
+    outboxes: HashMap<u64, Vec<Vec<u8>>>,
+    /// Queued while nothing was on the air; handed to the next consumer to
+    /// register, as the old single queue held them until someone subscribed.
+    backlog: Vec<Vec<u8>>,
+}
+
+impl TxFanout {
+    fn register(&mut self) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.outboxes.insert(id, std::mem::take(&mut self.backlog));
+        id
+    }
+
+    fn unregister(&mut self, id: u64) {
+        self.outboxes.remove(&id);
+    }
+
+    fn push(&mut self, pkt: Vec<u8>) {
+        if self.outboxes.is_empty() {
+            if self.backlog.len() < TX_QUEUE_MAX {
+                self.backlog.push(pkt);
+            }
+            return;
+        }
+        for q in self.outboxes.values_mut() {
+            if q.len() < TX_QUEUE_MAX {
+                q.push(pkt.clone());
+            }
+        }
+    }
+
+    /// Queue for ONE consumer. False when it is gone (the link dropped), so
+    /// the caller knows the packet went nowhere.
+    fn push_to(&mut self, id: u64, pkt: Vec<u8>) -> bool {
+        match self.outboxes.get_mut(&id) {
+            Some(q) if q.len() < TX_QUEUE_MAX => {
+                q.push(pkt);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn take(&mut self, id: u64) -> Vec<Vec<u8>> {
+        self.outboxes.get_mut(&id).map(std::mem::take).unwrap_or_default()
+    }
+}
+
+fn tx_register() -> u64 {
+    TX.lock().map(|mut t| t.register()).unwrap_or(0)
+}
+
+fn tx_unregister(id: u64) {
+    if let Ok(mut t) = TX.lock() {
+        t.unregister(id);
+    }
+}
+
+fn tx_take(id: u64) -> Vec<Vec<u8>> {
+    TX.lock().map(|mut t| t.take(id)).unwrap_or_default()
+}
 
 fn hex_encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
@@ -173,9 +298,11 @@ static DEVICES: Lazy<Mutex<HashMap<String, Seen>>> = Lazy::new(|| Mutex::new(Has
 /// and connect, which every adapter does. Advertising is the fragile half — some
 /// controllers refuse to register an advertisement at all — and it is only needed
 /// so a phone can find US first.
-static LINKED: Lazy<Mutex<HashMap<String, ()>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-/// True once a central link has delivered or accepted mesh traffic.
-static CENTRAL_LINK_OK: AtomicBool = AtomicBool::new(false);
+///
+/// Keyed by `PeripheralId`, never by `address()`: CoreBluetooth hides addresses
+/// and btleplug returns `00:00:00:00:00:00` for every peripheral there, so an
+/// address key let the first link on macOS block every other phone.
+static LINKED: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Begin a continuous background scan (idempotent). Spawns a dedicated thread
@@ -234,17 +361,14 @@ pub extern "C" fn sonar_ble_peers_json() -> *mut c_char {
     CString::new(json).unwrap_or_default().into_raw()
 }
 
-/// JSON array of hex-encoded packets written to our GATT characteristic by
-/// connected centrals (their announce / handshake), draining the queue. The JVM
-/// decodes these to learn + name the peer. Free with [`sonar_ble_free`].
+/// JSON array of everything the radio heard since the last call, in order:
+/// `{"l":<link>,"p":"<hex packet>"}` or `{"l":<link>,"d":true}` for a link that
+/// went down. See [`RX_PACKETS`] for what the link id means. Free with
+/// [`sonar_ble_free`].
 #[no_mangle]
 pub extern "C" fn sonar_ble_drain_rx_json() -> *mut c_char {
-    let items: Vec<serde_json::Value> = RX_PACKETS
-        .lock()
-        .map(|mut q| q.drain(..).map(|b| serde_json::Value::String(hex_encode(&b))).collect())
-        .unwrap_or_default();
-    let json = serde_json::Value::Array(items).to_string();
-    CString::new(json).unwrap_or_default().into_raw()
+    let items = RX_PACKETS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+    CString::new(rx_json(items)).unwrap_or_default().into_raw()
 }
 
 /// Free a string returned by [`sonar_ble_peers_json`] / [`sonar_ble_drain_rx_json`].
@@ -288,24 +412,18 @@ async fn scan_loop() {
         // 1s timeout so a stop() is noticed even when no advertisements arrive.
         match tokio::time::timeout(Duration::from_secs(1), events.next()).await {
             Ok(Some(ev)) => {
-                handle_event(&central, ev).await;
-                // The desktop takes part as a CENTRAL: link to any bitchat peer
-                // we are not already linked to. One task per peer, ending when
-                // the link drops so the next sighting relinks.
-                if let Ok(peers) = central.peripherals().await {
-                    for p in peers {
-                        let addr = p.address().to_string();
-                        let already = LINKED.lock().map(|l| l.contains_key(&addr)).unwrap_or(true);
-                        if already {
-                            continue;
-                        }
-                        let is_mesh = match p.properties().await {
-                            Ok(Some(props)) => props.services.contains(&BITCHAT_SERVICE),
-                            _ => false,
-                        };
-                        if is_mesh {
-                            LINKED.lock().map(|mut l| l.insert(addr.clone(), ())).ok();
-                            tokio::spawn(run_central_link(p, addr));
+                // The desktop takes part as a CENTRAL: link to the bitchat peer
+                // this event is about, if we are not linked to it yet. One task
+                // per peer, ending when the link drops so the next sighting
+                // relinks. Only the event's own peripheral: walking every known
+                // peripheral and awaiting its properties on EVERY advertisement
+                // made the scan loop's cost grow with the room.
+                if let Some(p) = handle_event(&central, ev).await {
+                    if should_link_out() {
+                        let key = p.id().to_string();
+                        let fresh = LINKED.lock().map(|mut l| l.insert(key.clone())).unwrap_or(false);
+                        if fresh {
+                            tokio::spawn(run_central_link(p, key));
                         }
                     }
                 }
@@ -338,33 +456,46 @@ async fn scan_loop() {
 /// receive; being discoverable is not required to take part.
 ///
 /// Runs until the link drops, then returns so the scan loop can relink when the
-/// peer is seen again.
-async fn run_central_link(peer: btleplug::platform::Peripheral, addr: String) {
+/// peer is seen again. `key` is the peripheral id the scan loop registered in
+/// [`LINKED`]; every exit path releases it (see [`LinkGuard`]).
+async fn run_central_link(peer: btleplug::platform::Peripheral, key: String) {
     use futures::StreamExt as _;
 
+    let mut guard = LinkGuard { key: key.clone(), tx: None };
+    let tag = peer_tag(&key);
+
     if peer.connect().await.is_err() {
-        dbg_log(&format!("link {addr}: connect failed"));
+        dbg_log(&format!("link {tag}: connect failed"));
         return;
     }
     if peer.discover_services().await.is_err() {
-        dbg_log(&format!("link {addr}: service discovery failed"));
+        dbg_log(&format!("link {tag}: service discovery failed"));
         let _ = peer.disconnect().await;
         return;
     }
     let Some(ch) = peer.characteristics().into_iter().find(|c| c.uuid == BITCHAT_CHAR) else {
         // Advertised the service but does not serve the characteristic: not a
         // mesh peer we can talk to.
-        dbg_log(&format!("link {addr}: no bitchat characteristic"));
+        dbg_log(&format!("link {tag}: no bitchat characteristic"));
+        let _ = peer.disconnect().await;
+        return;
+    };
+    // Open the notification stream BEFORE subscribing: the phone answers a
+    // subscribe with its announce burst, and a stream opened afterwards starts
+    // after that burst, so the desktop would not learn the phone until its next
+    // periodic announce.
+    let Ok(mut notifications) = peer.notifications().await else {
         let _ = peer.disconnect().await;
         return;
     };
     if peer.subscribe(&ch).await.is_err() {
-        dbg_log(&format!("link {addr}: subscribe failed"));
+        dbg_log(&format!("link {tag}: subscribe failed"));
         let _ = peer.disconnect().await;
         return;
     }
-    LINKED.lock().map(|mut l| l.insert(addr.clone(), ())).ok();
-    dbg_log(&format!("link {addr}: up (subscribed)"));
+    let tx = tx_register();
+    guard.tx = Some(tx);
+    dbg_log(&format!("link {tag}: up (subscribed)"));
 
     // Announce ourselves immediately: this write is how the peer learns we
     // exist, since it never saw us advertise.
@@ -373,25 +504,17 @@ async fn run_central_link(peer: btleplug::platform::Peripheral, addr: String) {
         let _ = peer.write(&ch, &ann, WriteType::WithoutResponse).await;
     }
 
-    let Ok(mut notifications) = peer.notifications().await else {
-        let _ = peer.disconnect().await;
-        LINKED.lock().map(|mut l| l.remove(&addr)).ok();
-        return;
-    };
-
     let mut last_announce = Instant::now();
-    while RUNNING.load(Ordering::SeqCst) {
-        // Drain anything the mesh engine queued for the wire.
-        let queued: Vec<Vec<u8>> = TX_PACKETS
-            .lock()
-            .map(|mut q| std::mem::take(&mut *q))
-            .unwrap_or_default();
-        for pkt in queued {
+    'link: while RUNNING.load(Ordering::SeqCst) {
+        // Drain what the mesh engine queued for the wire. This link's own copy:
+        // see [`TX`] for why the queue is fanned out rather than shared.
+        for pkt in tx_take(tx) {
             if peer.write(&ch, &pkt, WriteType::WithoutResponse).await.is_err() {
-                dbg_log(&format!("link {addr}: write failed, dropping link"));
-                break;
+                // The rest of this batch goes with the link; the Noise layer
+                // restarts the handshake on the next announce.
+                dbg_log(&format!("link {tag}: write failed, dropping link"));
+                break 'link;
             }
-            CENTRAL_LINK_OK.store(true, Ordering::SeqCst);
         }
         // Re-announce periodically so a peer that restarts its app re-learns us.
         if last_announce.elapsed() >= Duration::from_secs(10) {
@@ -403,14 +526,7 @@ async fn run_central_link(peer: btleplug::platform::Peripheral, addr: String) {
         }
 
         match tokio::time::timeout(Duration::from_millis(200), notifications.next()).await {
-            Ok(Some(n)) => {
-                CENTRAL_LINK_OK.store(true, Ordering::SeqCst);
-                if let Ok(mut q) = RX_PACKETS.lock() {
-                    if q.len() < 256 {
-                        q.push(n.value);
-                    }
-                }
-            }
+            Ok(Some(n)) => rx_push(tx, n.value),
             Ok(None) => break, // peer went away
             Err(_) => {
                 if !peer.is_connected().await.unwrap_or(false) {
@@ -420,9 +536,46 @@ async fn run_central_link(peer: btleplug::platform::Peripheral, addr: String) {
         }
     }
 
-    dbg_log(&format!("link {addr}: down"));
-    LINKED.lock().map(|mut l| l.remove(&addr)).ok();
+    dbg_log(&format!("link {tag}: down"));
     let _ = peer.disconnect().await;
+}
+
+/// Releases a central link's slot in [`LINKED`] and its TX outbox on EVERY exit
+/// path. The early returns (connect, discovery, subscribe failures) used to
+/// leave the peer marked linked, so one failed connect stopped the desktop from
+/// ever relinking that phone.
+struct LinkGuard {
+    key: String,
+    tx: Option<u64>,
+}
+
+impl Drop for LinkGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.tx {
+            tx_unregister(id);
+            rx_link_down(id);
+        }
+        if let Ok(mut l) = LINKED.lock() {
+            l.remove(&self.key);
+        }
+    }
+}
+
+/// Whether the scan loop should connect OUT to the phones it sees.
+///
+/// Only while the peripheral role is not up. When phones can find and dial us,
+/// linking out as well gives every phone two routes to this desktop, and the
+/// two ends do not agree on what that means: Android keeps a Noise session per
+/// ROUTE (and never initiates on its server side), `MeshLink` keeps one per
+/// peer. So each phone gets exactly one route: theirs when we advertise, ours
+/// when the controller refuses to (the case this path exists for). It also
+/// keeps macOS, where advertising works, on the verified phone-initiates path.
+fn should_link_out() -> bool {
+    link_out_policy(sonar_ble_advertising_supported())
+}
+
+fn link_out_policy(advertising: bool) -> bool {
+    !advertising
 }
 
 async fn init_central() -> Option<btleplug::platform::Adapter> {
@@ -453,15 +606,18 @@ fn advertises_bitchat(props: &btleplug::api::PeripheralProperties) -> bool {
         || props.service_data.contains_key(&BITCHAT_SERVICE)
 }
 
-async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
-    let id = match &ev {
-        CentralEvent::DeviceDiscovered(id)
-        | CentralEvent::DeviceUpdated(id)
-        | CentralEvent::DeviceConnected(id)
-        | CentralEvent::DeviceDisconnected(id) => id.clone(),
-        _ => return,
+/// Record a scan event on the radar. Returns the peripheral when the event is a
+/// sighting (discovered/updated) of a bitchat peer, so the caller can link to it.
+async fn handle_event(
+    central: &btleplug::platform::Adapter,
+    ev: CentralEvent,
+) -> Option<btleplug::platform::Peripheral> {
+    let (id, sighting) = match &ev {
+        CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => (id.clone(), true),
+        CentralEvent::DeviceConnected(id) | CentralEvent::DeviceDisconnected(id) => (id.clone(), false),
+        _ => return None,
     };
-    let Ok(p) = central.peripheral(&id).await else { return };
+    let Ok(p) = central.peripheral(&id).await else { return None };
     let props = p.properties().await.ok().flatten();
     let name = props.as_ref().and_then(|pr| pr.local_name.clone());
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
@@ -488,7 +644,7 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
             peer_tag(&id.to_string()),
             props.as_ref().map(|pr| pr.services.len()).unwrap_or(0),
         ));
-        return;
+        return None;
     }
     dbg_log(&format!(
         "discovered BITCHAT peer {} rssi={rssi}",
@@ -528,6 +684,7 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
         }
         d.insert(key, Seen { name, rssi, at: now });
     }
+    sighting.then_some(p)
 }
 
 // ── Peripheral role: advertise the bitchat service + serve the announce ──
@@ -550,20 +707,39 @@ pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
     }
 }
 
-/// Whether this build can play the peripheral/advertise role at all, so the host
-/// can tell the user "scan only" instead of presenting a desktop that silently
-/// never becomes discoverable. See `run_peripheral`: the GATT side channel it
-/// needs exists only in bluster's CoreBluetooth backend.
+/// Whether phones can discover this desktop: the peripheral/advertise role, on
+/// a platform that implements it (CoreBluetooth, BlueZ) and a controller that
+/// has not refused it. Mesh traffic does not depend on it; see
+/// [`sonar_ble_mesh_supported`].
 #[no_mangle]
 pub extern "C" fn sonar_ble_advertising_supported() -> bool {
-    if !cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux")) {
-        return false;
-    }
-    // Optimistic until proven otherwise: the host calls this before the radio
-    // starts, and answering false there would hide mesh on a machine that can
-    // do it. Once an attempt has completed, the answer is what actually
-    // happened.
-    !ADVERTISE_ATTEMPTED.load(Ordering::SeqCst) || ADVERTISE_OK.load(Ordering::SeqCst)
+    advertising_capability(
+        PERIPHERAL_ROLE_IMPLEMENTED,
+        ADVERTISE_ATTEMPTED.load(Ordering::SeqCst),
+        ADVERTISE_OK.load(Ordering::SeqCst),
+    )
+}
+
+const PERIPHERAL_ROLE_IMPLEMENTED: bool =
+    cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux"));
+
+/// Optimistic until proven otherwise: the host asks before the radio starts,
+/// and answering false there would hide a role the machine may well have. Once
+/// an attempt has completed, the answer is what actually happened.
+///
+/// Pure so the tests can cover every state without racing each other on the
+/// process-wide atomics (they did: two tests writing `ADVERTISE_ATTEMPTED` in
+/// parallel failed about 1 run in 130).
+fn advertising_capability(implemented: bool, attempted: bool, ok: bool) -> bool {
+    implemented && (!attempted || ok)
+}
+
+/// Publish the outcome of an advertising attempt. `ADVERTISE_OK` is written
+/// first so a concurrent reader never sees "attempted" paired with a stale
+/// "not ok" on the success path.
+fn record_advertise_result(ok: bool) {
+    ADVERTISE_OK.store(ok, Ordering::SeqCst);
+    ADVERTISE_ATTEMPTED.store(true, Ordering::SeqCst);
 }
 
 /// Whether this build can take part in the mesh at all.
@@ -617,8 +793,9 @@ pub extern "C" fn sonar_ble_stop_advertising() {
     ADVERTISING.store(false, Ordering::SeqCst);
 }
 
-/// Queue a raw packet to notify to subscribed centrals (the JVM mesh engine sends
-/// Noise handshake replies + encrypted DMs this way). The advertise loop flushes it.
+/// Queue a raw packet for every peer on the air (the JVM mesh engine sends
+/// handshakes, encrypted DMs and 0x53 this way): each central link writes it and
+/// the advertise loop notifies it to its subscribers. See [`TX`].
 ///
 /// # Safety
 /// `ptr` must point to `len` readable bytes, or be null.
@@ -628,21 +805,78 @@ pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) {
         return;
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
-    if let Ok(mut q) = TX_PACKETS.lock() {
-        if q.len() < 256 {
-            q.push(bytes);
-        }
+    if let Ok(mut t) = TX.lock() {
+        t.push(bytes);
     }
 }
 
-/// Peripheral role is CoreBluetooth-only for now. The notify/write-drain side
-/// channel `run_peripheral` relies on (`Peripheral::notify`/`take_writes`) is a
-/// Sonar patch that exists solely in bluster's CoreBluetooth backend; the BlueZ
-/// backend carries no equivalent, and its cross-platform `gatt::event` channel
-/// is a different mechanism that has to be wired separately. Keeping the full
-/// C ABI on every target (the JVM `BleLib` binds all of it via JNA) and failing
-/// here means Linux gets the central/scan radar with advertising reported
-/// unavailable, rather than the whole crate failing to build.
+/// Queue a packet for ONE central link, the one the JVM last heard its
+/// recipient on (see [`RX_PACKETS`]). Returns false when that link is gone.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn sonar_ble_send_link(link: u64, ptr: *const u8, len: usize) -> bool {
+    if ptr.is_null() || len == 0 || link == SERVER_LINK {
+        return false;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    TX.lock().map(|mut t| t.push_to(link, bytes)).unwrap_or(false)
+}
+
+/// Unregisters a TX outbox when its consumer loop ends, however it ends.
+struct TxOutbox(u64);
+
+impl Drop for TxOutbox {
+    fn drop(&mut self) {
+        tx_unregister(self.0);
+    }
+}
+
+/// One subscribed central on the BlueZ GATT server, with what it is still owed.
+///
+/// bluster hands each subscriber a notification channel of capacity 1, so
+/// `try_send` fails whenever the previous notification has not drained. A full
+/// channel is not a dead one, and the packet that did not fit has to WAIT here:
+/// retrying only the subscriber and dropping the packet lost whichever handshake
+/// step or DM happened to arrive in a burst. Only a closed channel prunes.
+///
+/// Compiled everywhere so its unit tests run on the macOS job too.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct NotifySub {
+    tx: futures::channel::mpsc::Sender<Vec<u8>>,
+    pending: std::collections::VecDeque<Vec<u8>>,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl NotifySub {
+    fn new(tx: futures::channel::mpsc::Sender<Vec<u8>>) -> Self {
+        Self { tx, pending: std::collections::VecDeque::new() }
+    }
+
+    fn queue(&mut self, pkt: Vec<u8>) {
+        if self.pending.len() < TX_QUEUE_MAX {
+            self.pending.push_back(pkt);
+        }
+    }
+
+    /// Hand the channel as much as it will take, in order. False once the
+    /// channel is closed (the central went away), so the caller can prune it.
+    fn flush(&mut self) -> bool {
+        while let Some(pkt) = self.pending.pop_front() {
+            match self.tx.try_send(pkt) {
+                Ok(()) => {}
+                Err(e) if e.is_full() => {
+                    self.pending.push_front(e.into_inner());
+                    return true;
+                }
+                Err(_) => return false,
+            }
+        }
+        !self.tx.is_closed()
+    }
+}
+
 /// BlueZ (Linux) peripheral role.
 ///
 /// Same job as the CoreBluetooth version below, driven through a different
@@ -658,12 +892,10 @@ pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) {
 ///   the oneshot until we reply, so dropping it wedges the writing central.
 /// - **The notification channel has capacity 1** (`mpsc::channel(1)` inside
 ///   bluster), so a `try_send` fails whenever the previous notification has not
-///   drained. Subscribers that fail are retried on the next tick rather than
-///   dropped, and a closed channel is what prunes them.
+///   drained. Each subscriber keeps what did not fit ([`NotifySub`]) and the
+///   next tick retries it; a closed channel is what prunes them.
 #[cfg(target_os = "linux")]
 async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
-    use futures::SinkExt;
-
     let svc = Uuid08::from_u128(BITCHAT_SERVICE_U128);
     let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
 
@@ -671,9 +903,11 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     // call, and a single "advertise: ERR" line cannot tell you which. Diagnosing
     // it without these took a bisect through D-Bus errors.
     dbg_log("advertise: creating BlueZ peripheral");
-    let peripheral = Peripheral::new()
-        .await
-        .map_err(|e| { dbg_log(&format!("advertise: Peripheral::new FAILED ({e}); is the adapter blocked or powered off?")); e })?;
+    let peripheral = Peripheral::new().await.map_err(|e| {
+        dbg_log(&format!("advertise: Peripheral::new FAILED ({e}); is the adapter blocked or powered off?"));
+        record_advertise_result(false);
+        e
+    })?;
 
     // BlueZ rejects RegisterApplication while the adapter is down, and the app
     // may start before the user powers Bluetooth on.
@@ -704,94 +938,82 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     let mut chars = HashSet::new();
     chars.insert(characteristic);
     peripheral.add_service(&Service::new(svc, true, chars))?;
-    peripheral
-        .register_gatt()
-        .await
-        .map_err(|e| { dbg_log(&format!("advertise: register_gatt FAILED ({e})")); e })?;
+    // A controller that refuses the GATT application refuses the role just as
+    // much as one that refuses the advertisement, and it is the more common of
+    // the two (the controller this was developed on stops here). Record both, or
+    // the capability stays at its optimistic "not tried yet" answer forever.
+    peripheral.register_gatt().await.map_err(|e| {
+        dbg_log(&format!("advertise: register_gatt FAILED ({e})"));
+        record_advertise_result(false);
+        e
+    })?;
     dbg_log("advertise: GATT application registered");
-    let started = peripheral.start_advertising("Sonar", &[svc]).await;
-    ADVERTISE_ATTEMPTED.store(true, Ordering::SeqCst);
-    if let Err(e) = started {
+    if let Err(e) = peripheral.start_advertising("Sonar", &[svc]).await {
         // Adapter present and powered, controller still refuses. Record it so
-        // the host stops claiming mesh works and shows the scan-only notice.
-        ADVERTISE_OK.store(false, Ordering::SeqCst);
+        // the host stops claiming phones can find us.
+        record_advertise_result(false);
         dbg_log(&format!(
-            "advertise: start_advertising REFUSED by the adapter ({e}); mesh stays scan-only"
+            "advertise: start_advertising REFUSED by the adapter ({e}); reachable only as a central"
         ));
         return Err(e.into());
     }
-    ADVERTISE_OK.store(true, Ordering::SeqCst);
+    record_advertise_result(true);
     dbg_log("advertise: started on BlueZ (bitchat service)");
 
     fn announce() -> Vec<u8> {
         ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
     }
 
-    // One sender per subscribed central.
-    let mut subs: Vec<futures::channel::mpsc::Sender<Vec<u8>>> = Vec::new();
-
-    // Push to every subscriber, dropping only those whose channel has closed.
-    // A full channel is not a dead one: capacity is 1, so a burst outruns it
-    // routinely and the next tick retries.
-    fn push(subs: &mut Vec<futures::channel::mpsc::Sender<Vec<u8>>>, payload: &[u8]) -> usize {
-        let mut delivered = 0;
-        subs.retain_mut(|s| match s.try_send(payload.to_vec()) {
-            Ok(()) => {
-                delivered += 1;
-                true
-            }
-            Err(e) if e.is_full() => true,
-            Err(_) => false, // disconnected
-        });
-        delivered
-    }
+    // One entry per subscribed central, each with its own backlog.
+    let mut subs: Vec<NotifySub> = Vec::new();
+    let outbox = TxOutbox(tx_register());
 
     let mut last_notify = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
     while ADVERTISING.load(Ordering::SeqCst) {
         // Re-announce on a timer like the CoreBluetooth path: a central that
-        // subscribes between ticks is caught by the next one.
+        // subscribes between ticks is caught by the next one. Skipped for a
+        // subscriber that is still behind, so announces cannot pile up in front
+        // of real traffic.
         if last_notify.elapsed() >= Duration::from_secs(2) && !subs.is_empty() {
             let ann = announce();
             if !ann.is_empty() {
-                let n = push(&mut subs, &ann);
-                dbg_log(&format!(
-                    "advertise: notify announce ({} bytes) to {}/{} subscriber(s)",
-                    ann.len(),
-                    n,
-                    subs.len()
-                ));
+                for s in subs.iter_mut().filter(|s| s.pending.is_empty()) {
+                    s.queue(ann.clone());
+                }
             }
             last_notify = Instant::now();
         }
 
-        // Packets the JVM mesh engine queued (handshake replies, DMs). Taken
-        // only when someone is subscribed, so they are not dropped on the floor
+        // Packets the JVM mesh engine queued (handshakes, DMs), to every
+        // subscriber: notify cannot be attributed to one central. Taken only
+        // when someone is subscribed, so they are not dropped on the floor
         // before a phone connects.
         if !subs.is_empty() {
-            let queued: Vec<Vec<u8>> = TX_PACKETS
-                .lock()
-                .map(|mut q| std::mem::take(&mut *q))
-                .unwrap_or_default();
-            for pkt in queued {
-                push(&mut subs, &pkt);
+            for pkt in tx_take(outbox.0) {
+                for s in subs.iter_mut() {
+                    s.queue(pkt.clone());
+                }
             }
         }
+        subs.retain_mut(NotifySub::flush);
 
         match tokio::time::timeout(Duration::from_millis(120), rx.next()).await {
             Ok(Some(ev)) => match ev {
                 Event::NotifySubscribe(sub) => {
                     dbg_log("advertise: central subscribed");
-                    let mut s = sub.notification;
-                    // Send our announce immediately: this is the moment the
-                    // phone is waiting for to show this desktop as a peer.
-                    let _ = s.send(announce()).await;
-                    subs.push(s);
+                    // Our announce first: this is the moment the phone is
+                    // waiting for to show this desktop as a peer.
+                    let mut s = NotifySub::new(sub.notification);
+                    s.queue(announce());
+                    if s.flush() {
+                        subs.push(s);
+                    }
                 }
                 Event::NotifyUnsubscribe => {
                     dbg_log("advertise: central unsubscribed");
-                    subs.retain(|s| !s.is_closed());
+                    subs.retain(|s| !s.tx.is_closed());
                 }
                 Event::ReadRequest(req) => {
                     let _ = req.response.send(Response::Success(announce()));
@@ -800,11 +1022,7 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                     // A central's packet: its announce, a handshake step, or a
                     // DM. Hand it to the JVM mesh engine through RX_PACKETS.
                     dbg_log(&format!("advertise: rx write {} bytes from central", req.data.len()));
-                    if let Ok(mut q) = RX_PACKETS.lock() {
-                        if q.len() < 256 {
-                            q.push(req.data);
-                        }
-                    }
+                    rx_push(SERVER_LINK, req.data);
                     // Must answer, or BlueZ leaves the central blocked.
                     let _ = req.response.send(Response::Success(vec![]));
                 }
@@ -864,7 +1082,9 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     peripheral.start_advertising("Sonar", &[svc]).await?;
+    record_advertise_result(true);
     dbg_log("advertise: started (bitchat service)");
+    let outbox = TxOutbox(tx_register());
 
     fn announce() -> Vec<u8> {
         ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
@@ -888,8 +1108,7 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
             last_notify = Instant::now();
         }
         // Flush packets the JVM mesh engine queued (handshake replies, DMs).
-        let tx: Vec<Vec<u8>> = TX_PACKETS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
-        for pkt in tx {
+        for pkt in tx_take(outbox.0) {
             peripheral.notify(&pkt);
         }
         // Drain packets centrals wrote to us (bluster's event channel is a no-op
@@ -897,12 +1116,8 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
         let writes = peripheral.take_writes();
         if !writes.is_empty() {
             dbg_log(&format!("advertise: rx {} write packet(s) from central", writes.len()));
-            if let Ok(mut q) = RX_PACKETS.lock() {
-                for w in writes {
-                    if q.len() < 256 {
-                        q.push(w);
-                    }
-                }
+            for w in writes {
+                rx_push(SERVER_LINK, w);
             }
         }
         // Short tick so handshake replies / DMs queued by the JVM flush quickly.
@@ -970,11 +1185,9 @@ mod tests {
     /// implementation, since the host uses it to decide whether to promise
     /// discoverability. BlueZ joined CoreBluetooth here.
     #[test]
-    fn advertising_supported_covers_every_implemented_platform() {
-        // Reset: another test in this binary may have recorded an attempt.
-        ADVERTISE_ATTEMPTED.store(false, Ordering::SeqCst);
+    fn advertising_is_implemented_on_every_platform_with_a_peripheral_role() {
         assert_eq!(
-            sonar_ble_advertising_supported(),
+            PERIPHERAL_ROLE_IMPLEMENTED,
             cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux"))
         );
     }
@@ -994,30 +1207,121 @@ mod tests {
     /// An adapter can be present, powered and unblocked and still refuse every LE
     /// advertisement — an Intel AX201 does exactly that on the machine this was
     /// written on, rejecting `bluetoothctl advertise on` too. Reporting the
-    /// compile-time answer there would tell the app mesh works while nothing is
-    /// discoverable, which is the bug the UI notice exists to prevent, one layer
-    /// down.
+    /// compile-time answer there would tell the app phones can find it while
+    /// nothing is discoverable.
+    ///
+    /// Asked of the pure function, not the process-wide atomics: two tests
+    /// writing `ADVERTISE_ATTEMPTED` in parallel failed about 1 run in 130.
     #[test]
     fn a_refused_advertisement_downgrades_the_capability() {
-        ADVERTISE_ATTEMPTED.store(false, Ordering::SeqCst);
-        ADVERTISE_OK.store(false, Ordering::SeqCst);
-        assert!(
-            sonar_ble_advertising_supported() == cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux")),
-            "before an attempt the answer is the platform's"
-        );
+        assert!(advertising_capability(true, false, false), "before an attempt the answer is the platform's");
+        assert!(!advertising_capability(true, true, false), "a refusal must downgrade it");
+        assert!(advertising_capability(true, true, true), "a success keeps it");
+        assert!(!advertising_capability(false, false, false), "no implementation, no claim");
+    }
 
-        // The adapter refused.
-        ADVERTISE_ATTEMPTED.store(true, Ordering::SeqCst);
-        ADVERTISE_OK.store(false, Ordering::SeqCst);
-        assert!(!sonar_ble_advertising_supported(), "a refusal must downgrade it");
+    /// Each phone gets exactly one route: we link out only while phones cannot
+    /// dial us. Two routes to one phone means two Noise sessions on Android and
+    /// one in MeshLink.
+    #[test]
+    fn links_out_only_while_not_advertising() {
+        assert!(!link_out_policy(true));
+        assert!(link_out_policy(false));
+    }
 
-        // And a later success restores it.
-        ADVERTISE_OK.store(true, Ordering::SeqCst);
-        assert_eq!(
-            sonar_ble_advertising_supported(),
-            cfg!(any(target_os = "macos", target_os = "ios", target_os = "linux"))
-        );
-        ADVERTISE_ATTEMPTED.store(false, Ordering::SeqCst);
+    /// Every consumer gets every broadcast. A single queue drained with
+    /// `mem::take` handed each packet to whichever link task woke first, so with
+    /// two phones linked a packet for one of them went to the other.
+    #[test]
+    fn a_broadcast_reaches_every_link() {
+        let mut t = TxFanout::default();
+        let a = t.register();
+        let b = t.register();
+        t.push(vec![1]);
+        t.push(vec![2]);
+        assert_eq!(t.take(a), vec![vec![1], vec![2]]);
+        assert_eq!(t.take(b), vec![vec![1], vec![2]], "the second link must not be starved");
+        assert!(t.take(a).is_empty(), "take drains");
+    }
+
+    /// A routed packet reaches its link only: Android answers a handshake
+    /// whatever its recipient id says, so an m1 written to every phone resets
+    /// the other phones' responders.
+    #[test]
+    fn a_routed_packet_reaches_only_its_link() {
+        let mut t = TxFanout::default();
+        let a = t.register();
+        let b = t.register();
+        assert!(t.push_to(b, vec![7]));
+        assert!(t.take(a).is_empty());
+        assert_eq!(t.take(b), vec![vec![7]]);
+        t.unregister(b);
+        assert!(!t.push_to(b, vec![8]), "a dropped link must report the packet went nowhere");
+        assert!(!t.push_to(999, vec![9]));
+    }
+
+    /// Packets queued while nothing was on the air go to the next consumer,
+    /// as the old queue held them until a phone subscribed.
+    #[test]
+    fn packets_queued_before_any_link_go_to_the_first_one() {
+        let mut t = TxFanout::default();
+        t.push(vec![1]);
+        let a = t.register();
+        let b = t.register();
+        assert_eq!(t.take(a), vec![vec![1]]);
+        assert!(t.take(b).is_empty(), "the backlog is handed over once");
+    }
+
+    /// A consumer that stops draining loses its own newest packets, not the
+    /// others'.
+    #[test]
+    fn a_stalled_link_does_not_block_the_others() {
+        let mut t = TxFanout::default();
+        let stalled = t.register();
+        let live = t.register();
+        for i in 0..(TX_QUEUE_MAX + 10) {
+            t.push(vec![i as u8]);
+            if i % 2 == 0 {
+                assert!(!t.take(live).is_empty());
+            }
+        }
+        assert_eq!(t.take(stalled).len(), TX_QUEUE_MAX);
+    }
+
+    /// bluster's notification channel holds one value, so a burst does not fit.
+    /// What did not fit must wait, in order. The previous code kept the
+    /// subscriber and dropped the PACKET, losing whichever handshake step or DM
+    /// arrived second.
+    #[test]
+    fn a_full_notification_channel_delays_packets_instead_of_dropping_them() {
+        let (tx, mut rx) = futures::channel::mpsc::channel::<Vec<u8>>(1);
+        let mut sub = NotifySub::new(tx);
+        for i in 0..5u8 {
+            sub.queue(vec![i]);
+        }
+        let mut got = Vec::new();
+        for _ in 0..10 {
+            assert!(sub.flush(), "a full channel is not a closed one");
+            while let Ok(Some(v)) = rx.try_next() {
+                got.push(v[0]);
+            }
+        }
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+        drop(rx);
+        sub.queue(vec![5]);
+        assert!(!sub.flush(), "a closed channel prunes the subscriber");
+    }
+
+    /// The JVM parses this shape by hand (no JSON dependency on the desktop
+    /// classpath); `BleBridge.drainRx` has the matching test.
+    #[test]
+    fn rx_items_name_their_link() {
+        let json = rx_json(vec![
+            RxItem::Packet { link: SERVER_LINK, bytes: vec![0xab, 0x01] },
+            RxItem::Packet { link: 7, bytes: vec![0xff] },
+            RxItem::LinkDown { link: 7 },
+        ]);
+        assert_eq!(json, r#"[{"l":0,"p":"ab01"},{"l":7,"p":"ff"},{"d":true,"l":7}]"#);
     }
 
     /// The debug log must never be a fixed path in a shared directory: it records
