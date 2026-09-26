@@ -1364,6 +1364,62 @@ async fn recovered_08_resume_with_a_peer_still_on_08_waits_for_their_update() {
     );
 }
 
+/// Transition-period account with an updated AND a not-yet-updated install:
+/// each republishes its own KeyPackage slot, and the 0.8 one can be newer.
+/// Taking only the newest package read that peer as "not updated" although
+/// a usable 0.9 package was on the relay.
+#[tokio::test]
+async fn recovered_08_resume_uses_a_09_package_behind_a_newer_08_one() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, _old_event) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates the 0.8 store");
+    let bob = SonarClient::connect_in_memory(bob_identity.clone(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    bob.publish_key_package().await.expect("bob's 0.9 install publishes");
+
+    let newer_08 = EventBuilder::new(
+        Kind::Custom(KEY_PACKAGE_KIND),
+        "AAEAAkDwAAEAAQAABkAA0ZxHs3h8OdW0fXTdbV3sEWUfd9uP0bX3+JqZ8HjP0w==",
+    )
+    .tags([
+        Tag::identifier("0000000000000000000000000000000000000000000000000000000000000008"),
+        Tag::parse(["mls_protocol_version", "1.0"]).unwrap(),
+        Tag::parse(["mls_ciphersuite", "0x0001"]).unwrap(),
+        Tag::parse(["mls_extensions", "0x000a", "0xf2ee"]).unwrap(),
+        Tag::parse(["client", "MDK/0.8.0"]).unwrap(),
+        Tag::parse(["encoding", "base64"]).unwrap(),
+    ])
+    .custom_created_at(Timestamp::from_secs(Timestamp::now().as_secs() + 60))
+    .build(bob_identity.public_key())
+    .sign_with_keys(bob_identity.keys())
+    .expect("sign newer 0.8 package");
+    let bob_08 = NostrClient::new(bob_identity.keys().clone());
+    bob_08.add_relay(relay_url).await.expect("add mock relay");
+    bob_08.connect().await;
+    let published = bob_08.send_event(&newer_08).await.expect("publish 0.8 package");
+    assert!(!published.success.is_empty(), "{:?}", published.failed);
+
+    alice
+        .send_text(&historical, "resume on the updated install")
+        .await
+        .expect("the 0.9 package behind the newer 0.8 one resumes the chat");
+    assert_eq!(alice.groups().expect("live groups").len(), 1);
+}
+
 /// Two first-resume sends (text+media, double-tap) must share one 0.9 group.
 /// Without `resume_mint_lock` both pass the unbound check, each mint, and
 /// `record_resume_fold` steals history onto the second.

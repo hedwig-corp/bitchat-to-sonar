@@ -883,6 +883,9 @@ fn retryable_media_http_error(error: &Error) -> bool {
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-relay bound for [`SonarClient::fetch_key_package`]: enough to see past
+/// a newer MDK 0.8 package from the same account's not-yet-updated install.
+const NEWEST_KEY_PACKAGE_FETCH_LIMIT: usize = 4;
 
 /// Relay-side cap when pulling ALL of an author's KeyPackages. `author` can be
 /// attacker-chosen, and this query is unbounded otherwise. Note it bounds the
@@ -2611,29 +2614,39 @@ impl SonarClient {
     /// not silently change meaning if that ordering ever does.
     ///
     /// The `limit` is a relay-side bound and must stay: `author` is
-    /// attacker-chosen on the join-request path. One event per relay is enough,
-    /// because the globally newest event is by definition the newest on whatever
-    /// relay carries it.
+    /// attacker-chosen on the join-request path. A few events per relay, not
+    /// one: during the MDK 0.8 → 0.9 transition an account can run both an
+    /// updated and a not-yet-updated install, each republishing its own slot,
+    /// and a newer 0.8 package must not hide the 0.9 one.
     ///
-    /// A peer whose newest package is still MDK 0.8 has not updated: MDK 0.9
-    /// can never admit that package, so it reads as not found. Hosts map that
-    /// to "Waiting for them to update Sonar" — handing it to MLS instead
-    /// failed the resume with an opaque capability error (#613 QA A2).
+    /// A peer with only MDK 0.8 packages has not updated: MDK 0.9 can never
+    /// admit one, so it reads as not found. Hosts map that to "Waiting for them
+    /// to update Sonar" — handing it to MLS instead failed the resume with an
+    /// opaque capability error (#613 QA A2).
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
-            .limit(1);
+            .limit(NEWEST_KEY_PACKAGE_FETCH_LIMIT);
         let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        let mut saw_legacy = false;
         let newest = events
             .into_iter()
-            .max_by_key(|e| e.created_at)
-            .ok_or(Error::KeyPackageNotFound(author))?;
-        if is_legacy_mdk08_key_package(&newest) {
-            tracing::info!("peer's newest KeyPackage is MDK 0.8; waiting for them to update");
-            return Err(Error::KeyPackageNotFound(author));
+            .filter(|event| {
+                let legacy = is_legacy_mdk08_key_package(event);
+                saw_legacy |= legacy;
+                !legacy
+            })
+            .max_by_key(|e| e.created_at);
+        match newest {
+            Some(event) => Ok(event),
+            None => {
+                if saw_legacy {
+                    tracing::info!("peer only publishes MDK 0.8 KeyPackages; waiting for them to update");
+                }
+                Err(Error::KeyPackageNotFound(author))
+            }
         }
-        Ok(newest)
     }
 
     /// Fetch the exact KeyPackage advertised by a join request.
