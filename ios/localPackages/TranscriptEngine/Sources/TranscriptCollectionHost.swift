@@ -33,6 +33,12 @@ public struct TranscriptCollectionHostCallbacks {
     /// default cell, which is how an app mixes cheap UIKit rows with hosted
     /// SwiftUI rows in the same transcript.
     public var provideCell: ((UICollectionView, IndexPath, TranscriptDayRow) -> UICollectionViewCell?)?
+    /// Which cell class `provideCell` (or the default cell) serves for a row.
+    /// UIKit forbids a different cell class on `reconfigureItems`
+    /// (NSInternalInconsistencyException), so a row whose kind changes — a text
+    /// row that gains its first reaction chip moves from the app's UIKit cell
+    /// to the hosted one — is reloaded instead. Nil: kinds never change.
+    public var cellKind: ((TranscriptDayRow) -> String)?
     /// Sticky day header chrome. When nil, the host falls back to a plain `UILabel`.
     /// Apps with custom pills (Sonar `SNStickyDayHeader`) must supply this so measure
     /// (`headerHeight`) and display stay on the same object graph.
@@ -48,12 +54,14 @@ public struct TranscriptCollectionHostCallbacks {
         configureHeader: ((UICollectionView, UICollectionViewCell, IndexPath, String) -> Void)? = nil,
         registerCells: ((UICollectionView) -> Void)? = nil,
         provideCell: ((UICollectionView, IndexPath, TranscriptDayRow) -> UICollectionViewCell?)? = nil,
+        cellKind: ((TranscriptDayRow) -> String)? = nil,
         unreadAnchorResolver: TranscriptUnreadAnchorResolver? = nil
     ) {
         self.configureCell = configureCell
         self.configureHeader = configureHeader
         self.registerCells = registerCells
         self.provideCell = provideCell
+        self.cellKind = cellKind
         self.itemHeight = itemHeight
         self.headerHeight = headerHeight
         self.unreadAnchorResolver = unreadAnchorResolver
@@ -264,6 +272,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
 
     private let heightCache = TranscriptRowHeightCache()
     private var appliedHeightKeys: [TranscriptDayRow: String] = [:]
+    /// Cell kind each row was last applied with (see `callbacks.cellKind`).
+    private var appliedCellKinds: [TranscriptDayRow: String] = [:]
 
     init(
         composer: () -> Composer,
@@ -638,7 +648,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         )
         var snapshot = NSDiffableDataSourceSnapshot<TranscriptDaySection, TranscriptDayRow>()
         var newHeightKeys: [TranscriptDayRow: String] = [:]
+        var newCellKinds: [TranscriptDayRow: String] = [:]
         var reconfigure: [TranscriptDayRow] = []
+        var reload: [TranscriptDayRow] = []
+        let cellKind = callbacks.cellKind
         for var section in sections {
             let rows = section.rows
             section.rows = []
@@ -647,6 +660,15 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             for item in rows {
                 let key = heightKeyForItem(item)
                 newHeightKeys[item] = key
+                if let cellKind {
+                    let kind = cellKind(item)
+                    newCellKinds[item] = kind
+                    if let applied = appliedCellKinds[item], applied != kind {
+                        // A new cell class: only a reload may dequeue it.
+                        reload.append(item)
+                        continue
+                    }
+                }
                 if forceReconfigureAll || appliedHeightKeys[item] != key {
                     reconfigure.append(item)
                 }
@@ -655,6 +677,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         if !reconfigure.isEmpty {
             snapshot.reconfigureItems(reconfigure)
         }
+        if !reload.isEmpty {
+            snapshot.reloadItems(reload)
+        }
+        appliedCellKinds = newCellKinds
         let layoutChanged = forceReconfigureAll || newHeightKeys != appliedHeightKeys
         appliedHeightKeys = newHeightKeys
         dataSource.apply(snapshot, animatingDifferences: false)
