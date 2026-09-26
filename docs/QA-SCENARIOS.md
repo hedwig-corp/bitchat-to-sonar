@@ -333,7 +333,13 @@ share a zone with the app and report the zone the app shared with it.
 Money scenarios never need real sats: point a DEBUG iOS build at a local
 `cdk-mintd` with `ln_backend = "fakewallet"` (the `sonar.debug.cashuMintURL`
 override; recipe in `SonarCashuStorage`), and use a second fakewallet mint for
-"foreign" invoices. Steps that only read from the mint (offer, invoice, fee
+"foreign" invoices. The DEBUG override is also read from the launch arguments
+(`simctl launch <udid> sh.hedwig.sonar -sonar.debug.cashuMintURL <url>`). To
+reproduce what a real network does to a payment, put
+`scripts/qa/mint-proxy.py` between the app and the mint and arm one fault at
+a time (a lost melt answer, a melt request that arrives late or never, a mint
+answer past the wallet's deadline); `sonar-cashu-cli --mint <proxy>` drives
+the same core headlessly. Steps that only read from the mint (offer, invoice, fee
 quote) are safe against `mint.hedwig.sh`. The Compose build has no mint
 override, so on Android the money-moving scenarios stay manual against the
 real mint and need the maintainer's approval of the amounts.
@@ -514,6 +520,64 @@ real mint and need the maintainer's approval of the amounts.
 - **Origin:** #614 — the offer's quote id lived only on the device, so a
   reinstall published a new offer and payments to the old one stayed at the
   mint, unclaimed.
+
+### QA-091 — A send whose melt request is lost is never reported Failed
+- **Platforms:** both (one Rust core; iOS on the fake mint through
+  `scripts/qa/mint-proxy.py`; headless with `sonar-cashu-cli --mint <proxy>`)
+- **Steps:** fund the wallet, get a foreign invoice from the second fake mint,
+  `mint-proxy.py arm drop-melt` (the melt POST is cut off before the mint
+  sees it and held), pay the invoice. Then either `mint-proxy.py deliver`
+  (the request reaches the mint late and is paid) or `mint-proxy.py discard`
+  (it never arrives). Repeat once with an app relaunch before `deliver`.
+- **Expect:** while the request is out the payment reads "Taking longer than
+  usual … Still in flight — held, not lost", never "Payment failed — you
+  were not charged". After `deliver`: "Paid … They received N sats" within a
+  watcher pass, balance down by the amount and fee, the mint's melt quote
+  PAID. After `discard`: "Couldn't send … not charged" once 60 s have passed,
+  balance unchanged. A relaunch in between changes nothing.
+- **Guard:** `a_compensated_melt_the_mint_pays_late_is_pending_then_paid`,
+  `a_compensated_melt_still_unpaid_after_the_grace_window_is_failed`,
+  `an_ambiguous_melt_is_still_tracked_after_a_relaunch`,
+  `a_lost_melt_answer_is_pending_in_lookups_until_the_mint_answers`;
+  app side `aSendReportedFailedIsPaidWhenTheWalletLaterCompletesIt`,
+  `testASendReportedFailedIsPaidByALaterCompleteForItsWalletPayment`
+- **Origin:** #614 review (High). CDK compensates a melt whose POST got no
+  answer when the mint then reads Unpaid, and returns `PaymentFailed`, the
+  same error as a real failure. With the proxy, the build before the fix said
+  Failed, the mint then paid 210 sats, and the wallet kept counting them.
+- **Known limit:** a request that reaches the mint more than 60 s after its
+  connection dropped is paid over a Failed row. HTTP stacks time requests
+  out long before that; `discard` exists so a pass never delivers one late.
+
+### QA-092 — A melt still on its way to the mint is left to its send
+- **Platforms:** both (headless or iOS through the proxy)
+- **Steps:** `mint-proxy.py arm delay-melt 12`, pay a foreign invoice.
+- **Expect:** in flight for about 12 s, then paid; never Failed; the balance
+  is exact afterwards.
+- **Guard:** `a_pass_during_a_confirm_in_flight_leaves_that_melt_alone`
+- **Origin:** #614 review. The watcher's `finalize_pending_melts` resumed
+  every open melt, including one whose confirm a send was still awaiting;
+  the mint read Unpaid and CDK compensated a payment it then made. End to
+  end the race does not show through CDK's own HTTP client, which queued the
+  watcher's status check behind the melt POST in this pass; the unit test
+  against the in-process fake mint is the guard.
+
+### QA-093 — A mint that answers after the wallet's deadline does not cut it off
+- **Platforms:** both (one Rust core; iOS on the fake mint through the proxy)
+- **Steps:** `mint-proxy.py arm delay-mint-answer 20` (the mint issues at once,
+  its answer arrives after the wallet's 15 s deadline), then Receive → request
+  an amount; the fake mint pays the invoice.
+- **Expect:** "Received N sats" shows within about 20 s; the log has one
+  "a mint call was abandoned mid-flight: opening a fresh connection" and no
+  stream of "mint-quote poll failed … timed out" afterwards. Sends and
+  receives keep working without a relaunch.
+- **Guard:** `connector::tests::a_call_abandoned_mid_flight_rebuilds_the_client_once`,
+  `a_mint_call_that_timed_out_is_recovered_on_the_next_pass`
+- **Origin:** #614 QA pass (round 4). After one timed-out mint call every later
+  request to the mint timed out, every watcher pass, until the app was
+  relaunched: the HTTP client under CDK (bitreq 0.3) keeps a cached
+  connection waiting forever for an answer nobody reads. The build before
+  the review fixes behaves the same.
 
 ## Open questions (need a product decision, not a fix)
 
