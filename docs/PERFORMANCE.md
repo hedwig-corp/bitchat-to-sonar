@@ -736,8 +736,8 @@ cargo run -p sonar-sim --release -- group-scale \
   --ramp 2,5,10,25,50,100,110,120,130 --mode incremental --batch 25 --chaos --out /tmp/scale.json
 ```
 
-Headline result (MDK v0.9.14 `235c8ade`, wire `0xf2f1`, `--batch 25`): the
-group-size ceiling is **50 members**, still gated by the **welcome, not the
+Headline result (MDK v0.10.4 `fcc85edd`, wire `0xf2f1`, `--batch 25`; the same
+on the previous v0.9.14 `235c8ade` pin): the group-size ceiling is **50 members**, still gated by the **welcome, not the
 relay** — `add_members` fails with `nip44 encryption error: message too long`
 once the welcome plaintext crosses NIP-44's 65535-byte cap. The wrapped
 welcome is 38.7 KB at N=25 and 66.0 KB at N=50 (0.8 at N=25 was 27.8 KB).

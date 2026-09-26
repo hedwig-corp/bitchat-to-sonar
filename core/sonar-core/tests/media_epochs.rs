@@ -86,3 +86,57 @@ async fn media_sent_before_a_member_add_still_decrypts_after_it() {
         .expect("sender opens its own photo from an earlier epoch");
     assert_eq!(plain, b"photo before the add");
 }
+
+/// Receivers derive an attachment's key from the epoch of the message that
+/// carries its imeta. Media sealed in epoch N and sent after the group moved
+/// to N+1 would be unreadable for everyone, so the send is pinned to N and
+/// refused (MDK `expected_epoch`); the host re-encrypts for the new epoch.
+#[tokio::test]
+async fn media_sealed_before_an_epoch_change_is_refused_not_sent_unreadable() {
+    let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+    let alice = MarmotEngine::in_memory(Identity::generate());
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    let charlie = MarmotEngine::in_memory(Identity::generate());
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
+    let creation = alice
+        .create_group("", vec![bob_kp], relays.clone())
+        .await
+        .expect("alice creates the chat");
+    let group = creation.group.id.clone();
+    alice
+        .merge_pending_commit(&group)
+        .await
+        .expect("merge creation");
+
+    let upload = alice
+        .encrypt_media(&group, b"sealed in epoch N", "image/png", "n.png")
+        .expect("encrypt");
+    assert_eq!(upload.source_epoch, Some(epoch_of(&alice, &group)));
+
+    let charlie_kp = charlie.key_package_event(relays).await.expect("charlie kp");
+    alice
+        .add_members(&group, vec![charlie_kp])
+        .await
+        .expect("alice adds charlie");
+    alice
+        .merge_pending_commit(&group)
+        .await
+        .expect("merge the add");
+    assert!(epoch_of(&alice, &group) > upload.source_epoch.unwrap());
+
+    let sent = alice
+        .create_media_event(&group, &upload, "https://blossom.example/n", "")
+        .await;
+    assert!(
+        matches!(sent, Err(sonar_core::Error::MediaEpochMoved)),
+        "a stale-epoch media send must be refused, got {sent:?}"
+    );
+
+    let fresh = alice
+        .encrypt_media(&group, b"sealed in epoch N+1", "image/png", "n1.png")
+        .expect("re-encrypt for the current epoch");
+    alice
+        .create_media_event(&group, &fresh, "https://blossom.example/n1", "")
+        .await
+        .expect("media sealed in the current epoch sends");
+}

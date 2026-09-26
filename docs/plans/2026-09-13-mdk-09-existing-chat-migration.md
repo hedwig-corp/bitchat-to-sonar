@@ -4,6 +4,15 @@ Date: 2026-09-13
 PR: [#613](https://github.com/hedwig-corp/bitchat-to-sonar/pull/613)
 Parent plan: [#327](https://github.com/hedwig-corp/bitchat-to-sonar/issues/327) / `docs/plans/2026-07-18-mdk-09-multi-device.md`
 
+> **Update 2026-09-26:** #613 now pins MDK **v0.10.4** (`fcc85edd`), the
+> release White Noise iOS ships. v0.9.21+ White Noise rejects KeyPackages that
+> list default MLS capabilities, which every 0.9.14 package did. The wire
+> (`0xf2f1`) and this 0.8 → 0.9 migration are unchanged. The group-scale
+> ceiling is still 50 (`docs/GROUP-SCALE-SIM.md`). A store written by a
+> 0.9.14 build is carried forward by MDK's own storage migrations (0052…0089,
+> including `0057_openmls_values_msgpack`, which re-encodes the stored MLS
+> state). "0.9.14" below is the pin this plan was written against.
+
 This is the missing Stage 1 storage step. The protocol port is already on
 `cursor/mdk-v0.9.14`. Without this path, shipping 0.9.14 as a silent replace
 would lock existing users out of their White Noise / Marmot transcripts.

@@ -127,10 +127,12 @@ is the build under test on a dedicated QA emulator/simulator.
   Compose `VideoPrivacyTest`, `VideoPrivacyFixtureTest`
 - **Origin:** #615 (iOS) and its review (Compose parity, fail-closed)
 
-## MDK 0.8 → 0.9.14 upgrade (#613)
+## MDK 0.8 → 0.10 upgrade (#613)
 
 Build history on an MDK 0.8 install, then replace it **in place** with the
-0.9.14 build — never uninstall. Needs two apps and two CLIs: build `main`
+#613 build (MDK v0.10.4; it was v0.9.14 until the White Noise interop bump —
+same `0xf2f1` wire, same migration) — never uninstall. "0.9" below and `09` in
+`mdk-upgrade.sh` mean that post-port build. Needs two apps and two CLIs: build `main`
 (pre-#613, 0.8) from a second checkout (`git worktree add --detach <dir>
 <pre-613 commit>`) for both the app and `sonar-cli`, and this branch for the
 0.9 ones. `scripts/qa/mdk-upgrade.sh` drives the peers (`peer <name> 08|09`,
@@ -142,7 +144,7 @@ chat above 80 messages (the first-paint extract window) and one image.
 ### QA-070 — In-place upgrade keeps every chat
 - **Platforms:** iOS (headless), Android (UI)
 - **Steps:** 0.8 app with ≥ 3 DMs from 0.8 peers (one > 80 msgs, one image) and
-  a 3+ member room; install the 0.9.14 build in place; launch; wait 30 s.
+  a 3+ member room; install the #613 build in place; launch; wait 30 s.
 - **Expect:** first paint shows the same rows, previews and unread dots
   (`SONAR_BENCH t1_local_paint groups=N`), and they are still there after relay
   attach (`t4_first_drain`, `home_rows … rows=N`); `mdk-upgrade.sh store` lists
@@ -231,6 +233,11 @@ overlap, NIP-42 inbox relays.
 - **Origin:** W1–W3 (#613): White Noise rejected every Sonar KeyPackage
   (`app_components` tag held `0x0001`), then required capabilities Sonar did
   not advertise, then had no kind-10050 inbox to deliver the welcome to.
+  W6: White Noise on MDK v0.9.21+ (iOS ships v0.10.4) rejects an invitee
+  KeyPackage that lists a default MLS capability, and every MDK 0.9.14
+  package listed `0x0003` — fixed by the bump to v0.10.4
+  (`key_package_lists_no_default_mls_capabilities`). Run the matrix against a
+  `wn` built from the MDK tag White Noise iOS pins, not only Sonar's own pin.
 
 ### QA-079 — The Sonar reply stays in White Noise's DM
 - **Platforms:** core
@@ -282,6 +289,18 @@ overlap, NIP-42 inbox relays.
 - **Expect:** a 25-member group created by either side: every member joins,
   receives the creator's message, and replies reach everyone.
 - **Guard:** `sonar-sim group-scale` (docs/GROUP-SCALE-SIM.md) for the ceiling.
+
+### QA-086 — A White Noise member's own leave reaches the Sonar members
+- **Platforms:** core (both apps)
+- **Steps:** a Sonar user creates a group with a White Noise user and a second
+  Sonar user; everyone joins; the White Noise user runs `wn groups leave`.
+- **Expect:** both Sonar members' rosters drop to 2 within a minute, with no
+  further input (one of them commits the SelfRemove from its convergence pass).
+- **Guard:** `wn-interop.sh run` (QA-086); core
+  `a_members_leave_is_committed_by_the_remaining_members` for the Sonar side.
+- **Origin:** #613 bump to MDK v0.10.4. With the 0.9.14 `wn` and Sonar,
+  every client deferred a White Noise leave (upstream marmot-protocol/mdk#1736,
+  fixed in v0.9.19).
 
 ## Notifications and lifecycle
 
@@ -402,11 +421,12 @@ overlap, NIP-42 inbox relays.
   mesh peers in range (other agents' emulators) `startMeshRealtimeLoop` ran on
   the main dispatcher long enough to ANR the app. Turn Bluetooth off on a QA
   emulator that shares a host with other emulators.
-- **White Noise's own leave is never committed (upstream):** a `wn groups
-  leave` SelfRemove proposal is deferred (`TransportDeferred`) by every
-  client, White Noise's own remaining members included, so the leaver stays in
-  the roster. Sonar's leave is committed by Sonar and White Noise members alike
-  (QA-084). Seen with the MDK 0.9.14 `wn` CLI.
+- **White Noise's own leave was never committed (upstream, fixed):** with the
+  MDK 0.9.14 `wn` CLI, a `wn groups leave` SelfRemove proposal was deferred
+  (`TransportDeferred`) by every client, White Noise's own members included.
+  Upstream marmot-protocol/mdk#1736, fixed by #1746 and released in v0.9.19. Not
+  reproduced with the v0.10.4 `wn`. Sonar's own leave is committed by Sonar
+  and White Noise members alike (QA-084).
 - **Sonar sends welcomes to its own relays only:** White Noise reads welcomes
   from its kind-10050 inbox relays. Invites reach White Noise users through the
   usual shared relays (damus, primal, nos.lol); a White Noise user whose inbox

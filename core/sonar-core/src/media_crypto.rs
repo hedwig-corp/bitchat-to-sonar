@@ -47,6 +47,10 @@ pub struct EncryptedMediaUpload {
     pub nonce: [u8; 12],
     /// Label the blob was sealed with; picks the imeta layout.
     pub scheme_version: String,
+    /// Epoch of the exporter secret that sealed it. The message carrying the
+    /// imeta must be sent in this epoch. `None` for staged uploads that
+    /// predate it.
+    pub source_epoch: Option<u64>,
 }
 
 /// Reference to an encrypted blob, parsed from an imeta tag.
@@ -262,6 +266,7 @@ pub fn encrypt_with_scheme(
         waveform: None,
         nonce,
         scheme_version: scheme_version.to_owned(),
+        source_epoch: None,
     })
 }
 

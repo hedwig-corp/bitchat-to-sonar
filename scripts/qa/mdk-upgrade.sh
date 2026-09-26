@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mdk-upgrade.sh — headless side of the MDK 0.8 → 0.9.14 upgrade QA
+# mdk-upgrade.sh — headless side of the MDK 0.8 → 0.9 upgrade QA
 # (docs/QA-SCENARIOS.md QA-070…QA-077, PR #613).
 #
 # The upgrade cannot be faked with one binary: the app must build history on
-# an MDK 0.8 (wire 0xf2ee) install, then be replaced IN PLACE by the 0.9.14
-# build (wire 0xf2f1). Peers are the same: an 0.8 `sonar-cli` home is later
+# an MDK 0.8 (wire 0xf2ee) install, then be replaced IN PLACE by the #613
+# build (wire 0xf2f1; MDK v0.10.4, was v0.9.14 — "0.9"/`09` below means it). Peers are the same: an 0.8 `sonar-cli` home is later
 # "upgraded" by running the 0.9 `sonar-cli` on the same --home.
 #
 #   mdk-upgrade.sh peer <name> [08|09]          fresh peer on that CLI (default 08)
@@ -29,7 +29,7 @@
 #               from a second checkout:
 #                 git worktree add --detach <dir> <pre-613 commit>
 #                 cargo build --release -p sonar-cli --manifest-path <dir>/core/Cargo.toml
-#   SONAR_CLI   the 0.9.14 sonar-cli (default core/target/release/sonar-cli)
+#   SONAR_CLI   the #613 sonar-cli (default core/target/release/sonar-cli)
 #
 # Each peer remembers which CLI owns its home in $QA_HOME/peers/<name>/cli, so
 # `send`/`expect` never run the 0.8 binary on a migrated home (it cannot open

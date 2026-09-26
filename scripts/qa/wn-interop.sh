@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wn-interop.sh — Sonar ↔ White Noise interop QA, headless (QA-078…QA-085).
+# wn-interop.sh — Sonar ↔ White Noise interop QA, headless (QA-078…QA-086).
 #
 # White Noise iOS runs MDK's own runtime (marmot-app). The MDK checkout Sonar
 # pins ships the White Noise CLI (`crates/cli`: `wn` + daemon `wnd`) on that
@@ -102,6 +102,11 @@ import json,sys
 d=json.load(sys.stdin); r=d.get('result')
 rows=r if isinstance(r,list) else (r or {}).get('messages',[])
 sys.exit(0 if any((m.get('plaintext') or '')==sys.argv[1] for m in rows) else 1)" "$2"
+}
+
+sonar_rosters_are() { # sonar_rosters_are <group> <n>: a and b both see n members
+  sonar_listen a 6 >/dev/null & sonar_listen b 6 >/dev/null & wait
+  [ "$(sonar_members a "$1")" = "$2" ] && [ "$(sonar_members b "$1")" = "$2" ]
 }
 
 wn_members() { wn --account "$W" groups members "$1" 2>/dev/null | jget 'len(d["result"]["members"])'; }
@@ -268,6 +273,22 @@ for l in sys.stdin:
     pass QA-084 "Sonar leave committed for Sonar and White Noise"
   else
     fail QA-084 "leave not committed (sonar b: $(sonar_members b "$g4"), was $before)"
+  fi
+
+  # QA-086: a White Noise member's own leave is committed by the Sonar members.
+  # Before MDK v0.9.19 every client deferred it (marmot-protocol/mdk#1736).
+  local g6
+  g6=$(sonar b group-create --name "wn-leaves-$run" --member "$W" --member "$A" | jget 'd["group_id"]' || true)
+  sleep 4
+  wn --account "$W" groups accept "$g6" >/dev/null 2>&1 || true
+  sonar_listen a 8 >/dev/null; sonar_accept_named a "wn-leaves-$run"; sonar_listen a 8 >/dev/null
+  local joined6
+  joined6="$(sonar_members a "$g6")/$(sonar_members b "$g6")/$(wn_members "$g6")"
+  wn --account "$W" groups leave "$g6" >/dev/null 2>&1 || true
+  if [ "$joined6" = "3/3/3" ] && eventually 60 sonar_rosters_are "$g6" 2; then
+    pass QA-086 "White Noise leave committed by the Sonar members"
+  else
+    fail QA-086 "White Noise leave not committed (before $joined6, now a=$(sonar_members a "$g6") b=$(sonar_members b "$g6"))"
   fi
 
   # QA-085: N-member groups created by each side.

@@ -19,6 +19,21 @@ reach a shipped binary. It does not mean the lockfile is advisory-free.
 
 ## Summary
 
+> **Status at the MDK v0.10.4 bump (#613, 2026-09-26):** the six libcrux
+> advisories below no longer match the lockfile. The MDK 0.9 port moved the
+> chain to `hpke-rs 0.7.0` / `libcrux-sha3 0.0.10` / `libcrux-secrets 0.0.6` /
+> `libcrux-aead 0.0.9`, and `cargo audit -f core/Cargo.lock` with no ignore list
+> reports none of them. Their ignores were removed from `core/.cargo/audit.toml`,
+> so a regression to a vulnerable version fails the audit again. quick-xml
+> (0194, 0195) is unchanged and stays ignored.
+>
+> Four newer advisories are **not** ignored and fail `cd core && cargo audit` —
+> on `main` as well; the bump neither adds nor fixes them:
+> RUSTSEC-2026-0224, -0231 and -0232 (`nostr-relay-pool 0.44.1`, fixed in
+> 0.44.3, and 0.44.1 is yanked) and RUSTSEC-2026-0258 (`h2 0.4.15`, fixed in
+> 0.4.16). Tracked as a separate lockfile bump. The table below is the
+> analysis as of the 0.8 lockfile.
+
 After the lockfile bumps in this PR (`nostr`, `quinn-proto`, `crossbeam-epoch`),
 eight advisories remain. **None of them reach a shipped mobile binary.**
 
@@ -39,16 +54,17 @@ All six enter through the MLS stack and are pinned transitively:
 
 ```
 libcrux-sha3 0.0.8 ← hpke-rs 0.6.1 ← openmls_rust_crypto 0.5.1 (git pin)
-                                   ← cgka-engine 0.9.14 (git pin 235c8ade) ← sonar-core
+                                   ← mdk-core 0.8.0 (git pin e8cd584) ← sonar-core
 libcrux-secrets 0.0.5 ← libcrux-traits 0.0.6 ← libcrux-sha3
 ```
 
 `hpke-rs 0.6.1` declares `libcrux-sha3 = "0.0.8"`. Cargo treats every `0.0.x`
 release as mutually incompatible, so `0.0.10` cannot satisfy that requirement:
 upgrading needs a new `hpke-rs`, which needs a new `openmls`, which needs an
-**MDK rev bump** — see "MDK 0.9.14 bump notes" below. The libcrux-sha3 0.0.8
-pin may still apply if 0.9.14's OpenMLS/hpke-rs chain has not moved; re-check
-`cargo tree -i libcrux-sha3` after this bump.
+**MDK rev bump**. It did move with the MDK 0.9 port: `cargo tree -i
+libcrux-sha3` now shows `libcrux-sha3 0.0.10 ← hpke-rs 0.7.0 ←
+openmls_rust_crypto 0.5.1 ← cgka-engine`, and none of the six advisories match
+(see the status note in the Summary). The analysis below is kept for the record.
 
 **Not compiled (0124, 0209, 0211).** `libcrux-aead` is unreachable from every
 workspace member — `cargo tree -i libcrux-aead` prints nothing, for the host and
@@ -108,9 +124,37 @@ ls target/release/deps | grep -cE '^libquick_xml|^libplist'   # 0
 `netdev`/`netwatch`/`iroh` requirement chain, so the bump is not available to us
 without moving `iroh` — not worth it for a crate that is never built.
 
+## MDK v0.10.4 bump notes
+
+Sonar pins MDK **v0.10.4** (`fcc85edd8dbd07c8293c899ee52230f72c54c897`, the
+release White Noise iOS ships as MarmotKit v0.10.4). Same wire (`0xf2f1`), same
+`openmls` rev (`59e7d3b`), same `nostr` 0.44 and `rusqlite` 0.40.1. The only new
+lockfile entries are `rmp` / `rmp-serde` (MDK's msgpack OpenMLS value store).
+
+- **Why:** MDK v0.9.21+ rejects invitee KeyPackages that list default MLS
+  capabilities (RFC 9420 §7.2, `validate_invitee_capabilities`). Every v0.9.14
+  package listed `0x0003`, so no current White Noise user could add a Sonar
+  user. Pinned by `key_package_lists_no_default_mls_capabilities`.
+- **Consequence:** the same check runs in Sonar's own engine now, so a v0.10.4
+  build cannot *add* someone still on a v0.9.14 build until they update.
+  Existing groups keep working (same wire).
+- **Storage:** a store written by a v0.9.14 build is carried forward by MDK's
+  own migrations 0052…0089, including `0057_openmls_values_msgpack`, which
+  re-encodes the stored MLS state. MLS state is not re-keyed. The 0.8 → 0.9
+  import below is unchanged.
+- **Media epoch pinning:** `SendIntent::AppMessage` now takes an
+  `expected_epoch`. Sonar pins a media message to the epoch its attachments were
+  encrypted in, and MDK refuses it (`AppMessageEpochMismatch` /
+  `AppMessageEpochUnsettled` → `Error::MediaEpochMoved`) if the epoch moved
+  during the upload. The client settles the convergence and re-encrypts once
+  instead of sending a message no member can decrypt.
+- **Advisories:** see the status note in the Summary.
+- **Group scale:** unchanged — ceiling 50, byte-identical welcomes N=5…50
+  ([`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md)).
+
 ## MDK 0.9.14 bump notes
 
-Sonar now pins MDK **v0.9.14** (`cgka-engine` / `cgka-session` / `cgka-traits`
+Sonar pinned MDK **v0.9.14** (`cgka-engine` / `cgka-session` / `cgka-traits`
 / `storage-sqlite` / `transport-nostr-peeler` at
 `235c8ade2920414679e59d7a5f1a0e78651756a4`). This is a **protocol migration**, not
 a lockfile bump:
@@ -153,9 +197,9 @@ a lockfile bump:
   MDK rev; do not invent numbers.
 
 The previously deferred advisories (libcrux incremental SHAKE, secrets
-`ct_swap`/`ct_select`, AVX2 SHAKE panic) remain a reachability question on the
-new OpenMLS/hpke-rs chain — re-check with `cargo audit` from `core/` after
-the bump. They were not the reason for the bump; White Noise interop was.
+`ct_swap`/`ct_select`, AVX2 SHAKE panic) were closed by this port's
+`hpke-rs 0.7.0` chain — re-checked at the v0.10.4 bump (see the Summary). They
+were not the reason for the bump; White Noise interop was.
 
 ## Re-check triggers
 

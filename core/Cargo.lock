@@ -504,11 +504,13 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "cgka-engine"
-version = "0.9.14"
-source = "git+https://github.com/marmot-protocol/mdk?rev=235c8ade2920414679e59d7a5f1a0e78651756a4#235c8ade2920414679e59d7a5f1a0e78651756a4"
+version = "0.10.4"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fcc85edd8dbd07c8293c899ee52230f72c54c897#fcc85edd8dbd07c8293c899ee52230f72c54c897"
 dependencies = [
  "async-trait",
  "cgka-traits",
+ "futures",
+ "gloo-timers",
  "hex",
  "k256",
  "marmot-forensics",
@@ -526,12 +528,13 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tracing",
+ "web-time",
 ]
 
 [[package]]
 name = "cgka-session"
-version = "0.9.14"
-source = "git+https://github.com/marmot-protocol/mdk?rev=235c8ade2920414679e59d7a5f1a0e78651756a4#235c8ade2920414679e59d7a5f1a0e78651756a4"
+version = "0.10.4"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fcc85edd8dbd07c8293c899ee52230f72c54c897#fcc85edd8dbd07c8293c899ee52230f72c54c897"
 dependencies = [
  "cgka-engine",
  "cgka-traits",
@@ -543,8 +546,8 @@ dependencies = [
 
 [[package]]
 name = "cgka-traits"
-version = "0.9.14"
-source = "git+https://github.com/marmot-protocol/mdk?rev=235c8ade2920414679e59d7a5f1a0e78651756a4#235c8ade2920414679e59d7a5f1a0e78651756a4"
+version = "0.10.4"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fcc85edd8dbd07c8293c899ee52230f72c54c897#fcc85edd8dbd07c8293c899ee52230f72c54c897"
 dependencies = [
  "async-trait",
  "hex",
@@ -1435,8 +1438,8 @@ dependencies = [
 
 [[package]]
 name = "fs-private"
-version = "0.9.14"
-source = "git+https://github.com/marmot-protocol/mdk?rev=235c8ade2920414679e59d7a5f1a0e78651756a4#235c8ade2920414679e59d7a5f1a0e78651756a4"
+version = "0.10.4"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fcc85edd8dbd07c8293c899ee52230f72c54c897#fcc85edd8dbd07c8293c899ee52230f72c54c897"
 dependencies = [
  "libc",
 ]
@@ -2972,12 +2975,15 @@ dependencies = [
 
 [[package]]
 name = "marmot-forensics"
-version = "0.9.14"
-source = "git+https://github.com/marmot-protocol/mdk?rev=235c8ade2920414679e59d7a5f1a0e78651756a4#235c8ade2920414679e59d7a5f1a0e78651756a4"
+version = "0.10.4"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fcc85edd8dbd07c8293c899ee52230f72c54c897#fcc85edd8dbd07c8293c899ee52230f72c54c897"
 dependencies = [
  "fs-private",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "web-time",
 ]
 
 [[package]]
@@ -3739,6 +3745,7 @@ name = "openmls"
 version = "0.8.1"
 source = "git+https://github.com/erskingardner/openmls.git?rev=59e7d3b27a7e95237879dd5478de1fd90eff7ada#59e7d3b27a7e95237879dd5478de1fd90eff7ada"
 dependencies = [
+ "getrandom 0.4.2",
  "log",
  "openmls_serialization_helpers",
  "openmls_traits",
@@ -3747,6 +3754,7 @@ dependencies = [
  "serde_bytes",
  "thiserror 2.0.18",
  "tls_codec",
+ "web-time",
  "zeroize",
 ]
 
@@ -4597,6 +4605,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5415,17 +5442,19 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage-sqlite"
-version = "0.9.14"
-source = "git+https://github.com/marmot-protocol/mdk?rev=235c8ade2920414679e59d7a5f1a0e78651756a4#235c8ade2920414679e59d7a5f1a0e78651756a4"
+version = "0.10.4"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fcc85edd8dbd07c8293c899ee52230f72c54c897#fcc85edd8dbd07c8293c899ee52230f72c54c897"
 dependencies = [
  "cgka-traits",
  "fs-private",
  "hex",
  "openmls",
  "openmls_traits",
+ "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tracing",
  "zeroize",
@@ -5989,8 +6018,8 @@ dependencies = [
 
 [[package]]
 name = "transport-nostr-peeler"
-version = "0.9.14"
-source = "git+https://github.com/marmot-protocol/mdk?rev=235c8ade2920414679e59d7a5f1a0e78651756a4#235c8ade2920414679e59d7a5f1a0e78651756a4"
+version = "0.10.4"
+source = "git+https://github.com/marmot-protocol/mdk?rev=fcc85edd8dbd07c8293c899ee52230f72c54c897#fcc85edd8dbd07c8293c899ee52230f72c54c897"
 dependencies = [
  "async-trait",
  "cgka-traits",
@@ -6002,6 +6031,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "web-time",
 ]
 
 [[package]]
@@ -6477,6 +6507,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

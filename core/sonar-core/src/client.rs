@@ -243,6 +243,7 @@ fn upload_to_sealed(upload: &EncryptedMediaUpload, url: &str) -> SealedMediaItem
         duration_ms: upload.duration_ms,
         waveform: upload.waveform.clone(),
         scheme_version: upload.scheme_version.clone(),
+        source_epoch: upload.source_epoch,
     }
 }
 
@@ -275,6 +276,7 @@ fn sealed_item_to_upload(sealed: SealedMediaItem) -> Result<EncryptedMediaUpload
         waveform: sealed.waveform,
         nonce,
         scheme_version: sealed.scheme_version,
+        source_epoch: sealed.source_epoch,
     })
 }
 
@@ -887,6 +889,8 @@ fn retryable_media_http_error(error: &Error) -> bool {
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// MDK's MIP-03 quiescence window is ~1.1s; wake the drain after it.
 const CONVERGENCE_WAKE_DELAY: Duration = Duration::from_millis(1_500);
+/// Convergence passes a refused media send waits through before retrying.
+const MEDIA_EPOCH_SETTLE_PASSES: usize = 3;
 /// Per-relay bound for [`SonarClient::fetch_key_package`]: enough to see past
 /// a newer MDK 0.8 package from the same account's not-yet-updated install.
 const NEWEST_KEY_PACKAGE_FETCH_LIMIT: usize = 4;
@@ -5140,7 +5144,7 @@ impl SonarClient {
         }
 
         match self
-            .complete_staged_media_upload(&entry_id, group_id, observer)
+            .complete_staged_media_upload_settling(&entry_id, group_id, observer)
             .await
         {
             Ok(()) => Ok(()),
@@ -5246,7 +5250,7 @@ impl SonarClient {
                 obs.on_progress(&progress_id, 0, total);
             }
             match self
-                .complete_staged_media_upload(&id, &group_id, observer)
+                .complete_staged_media_upload_settling(&id, &group_id, observer)
                 .await
             {
                 Ok(()) => {}
@@ -5405,6 +5409,54 @@ impl SonarClient {
             urls.iter()
                 .all(|url| message.media.iter().any(|m| m.url == *url))
         }))
+    }
+
+    /// Media messages are pinned to the epoch their attachments were sealed
+    /// in. When MDK refuses one (the group was converging, or moved on while
+    /// the upload ran), let the group settle and try once more: reuse the
+    /// upload if the epoch is still the sealed one, otherwise forget it so the
+    /// retry re-encrypts and re-uploads for the current epoch.
+    async fn complete_staged_media_upload_settling(
+        &self,
+        entry_id: &str,
+        group_id: &GroupId,
+        observer: Option<&dyn MediaUploadObserver>,
+    ) -> Result<()> {
+        match self
+            .complete_staged_media_upload(entry_id, group_id, observer)
+            .await
+        {
+            Err(Error::MediaEpochMoved) => {}
+            other => return other,
+        }
+        let send_group = self.resolve_send_group(group_id).await?;
+        for _ in 0..MEDIA_EPOCH_SETTLE_PASSES {
+            self.engine.request_convergence(&send_group);
+            tokio::time::sleep(CONVERGENCE_WAKE_DELAY).await;
+            let (changed, retry) = self.apply_convergence_and_publish("media epoch").await;
+            self.notify_conversations_changed(&changed);
+            if retry.is_none() {
+                break;
+            }
+        }
+        let sealed_epoch = self
+            .media_staging
+            .lock()
+            .unwrap()
+            .get(entry_id)
+            .and_then(|entry| entry.sealed_items.as_ref())
+            .and_then(|items| items.first())
+            .and_then(|item| item.source_epoch);
+        if sealed_epoch.is_none() || sealed_epoch != self.engine.group_epoch(&send_group) {
+            let staging = self.media_staging.clone();
+            let id = entry_id.to_string();
+            let now = Timestamp::now().as_secs();
+            tokio::task::spawn_blocking(move || staging.lock().unwrap().clear_sealed(&id, now))
+                .await
+                .map_err(|e| Error::Storage(format!("media unseal join: {e}")))??;
+        }
+        self.complete_staged_media_upload(entry_id, group_id, observer)
+            .await
     }
 
     async fn complete_staged_media_upload(
@@ -6977,6 +7029,40 @@ impl SonarClient {
         })
     }
 
+    /// Run the due convergence passes and publish the commits they staged
+    /// (a SelfRemove auto-commit). Returns the groups that changed and when
+    /// the next pass is due.
+    async fn apply_convergence_and_publish(
+        &self,
+        context: &'static str,
+    ) -> (HashSet<String>, Option<Duration>) {
+        let mut changed = HashSet::new();
+        let pass = match self.engine.apply_pending_convergence().await {
+            Ok(pass) => pass,
+            Err(err) => {
+                tracing::debug!(%err, context, "pending MIP-03 convergence apply failed");
+                return (changed, None);
+            }
+        };
+        for update in pass.updates {
+            let group_hex = hex::encode(update.group_id.as_slice());
+            // Same exclusion as any membership change: no sends while the
+            // commit is staged.
+            let _epoch = self.membership_gate.write().await;
+            match self.publish_membership_update(update).await {
+                Ok(()) => {
+                    changed.insert(group_hex);
+                }
+                Err(err) => tracing::debug!(
+                    %err,
+                    context,
+                    "convergence auto-commit publish failed; MDK restores it on the next pass"
+                ),
+            }
+        }
+        (changed, pass.retry_after)
+    }
+
     async fn process_marmot_events(
         &self,
         events: impl IntoIterator<Item = Event>,
@@ -6991,31 +7077,9 @@ impl SonarClient {
         // GroupUpdated); applying here keeps the quiescence wait off the
         // receive path.
         let convergence_before = self.engine.pending_convergence_ids();
-        let mut convergence_retry = None;
-        match self.engine.apply_pending_convergence().await {
-            Ok(pass) => {
-                convergence_retry = pass.retry_after;
-                for update in pass.updates {
-                    let group_hex = hex::encode(update.group_id.as_slice());
-                    // Same exclusion as any membership change: no sends
-                    // while the commit is staged.
-                    let _epoch = self.membership_gate.write().await;
-                    match self.publish_membership_update(update).await {
-                        Ok(()) => {
-                            changed_groups.insert(group_hex);
-                        }
-                        Err(err) => tracing::debug!(
-                            %err,
-                            context,
-                            "convergence auto-commit publish failed; MDK restores it on the next pass"
-                        ),
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::debug!(%err, context, "pending MIP-03 convergence apply failed");
-            }
-        }
+        let (convergence_changed, convergence_retry) =
+            self.apply_convergence_and_publish(context).await;
+        changed_groups.extend(convergence_changed);
         let group_names: HashMap<Vec<u8>, String> = self
             .engine
             .groups()

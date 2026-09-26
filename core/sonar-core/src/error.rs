@@ -55,6 +55,13 @@ pub enum Error {
     #[error("leave queued until the group converges")]
     LeaveQueued,
 
+    /// A media message is pinned to the epoch its attachments were encrypted
+    /// in (MDK `expected_epoch`), and the group is unsettled or has moved on.
+    /// Receivers derive the media key from the message's epoch, so the
+    /// attachments must be re-encrypted for the new epoch.
+    #[error("the group's epoch moved while the media was uploading")]
+    MediaEpochMoved,
+
     #[error("media too large: {bytes} bytes (max {max})")]
     MediaTooLarge { bytes: u64, max: u64 },
 
@@ -112,12 +119,19 @@ pub enum Error {
 
 impl From<SessionError> for Error {
     fn from(err: SessionError) -> Self {
-        Error::Mdk(err.to_string())
+        match err {
+            SessionError::Engine(engine) => engine.into(),
+            other => Error::Mdk(other.to_string()),
+        }
     }
 }
 
 impl From<EngineError> for Error {
     fn from(err: EngineError) -> Self {
-        Error::Mdk(err.to_string())
+        match err {
+            EngineError::AppMessageEpochMismatch { .. }
+            | EngineError::AppMessageEpochUnsettled { .. } => Error::MediaEpochMoved,
+            other => Error::Mdk(other.to_string()),
+        }
     }
 }

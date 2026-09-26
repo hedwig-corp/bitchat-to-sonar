@@ -2894,7 +2894,7 @@ flag cannot fold an empty-topic remounted room onto the welcomer 1:1.
 
 ## R-051 — A recovered 0.8 pending send must not paint delivered
 
-**Invariant:** After a 0.8 → 0.9.14 upgrade, a still-pending outbound row
+**Invariant:** After a 0.8 → 0.9 upgrade (MDK v0.10.4 today), a still-pending outbound row
 stays on disk, paints Failed (not Sent, not eternal Sending), and a user
 tap on retry refuses to republish the 0.8 wrapper.
 

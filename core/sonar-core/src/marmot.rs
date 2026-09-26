@@ -48,7 +48,7 @@ use cgka_traits::group_context::GroupContextSnapshot;
 use cgka_traits::ingest::{IngestOutcome, InputRejectionCategory, PeeledMessage};
 use cgka_traits::peeler::{GroupMessageMetadata, TransportPeeler};
 use cgka_traits::transport::{EncryptedPayload, TransportEnvelope, TransportMessage};
-use cgka_traits::types::{GroupId, MemberId, MessageId};
+use cgka_traits::types::{EpochId, GroupId, MemberId, MessageId};
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 use storage_sqlite::SqlCipherKey;
@@ -2212,6 +2212,23 @@ impl MarmotEngine {
         }
     }
 
+    /// Ask for a convergence pass on `group_id` (a pinned send was refused
+    /// while the group was unsettled).
+    pub fn request_convergence(&self, group_id: &GroupId) {
+        if !self.is_dropped(group_id) {
+            self.note_pending_convergence(group_id.clone());
+        }
+    }
+
+    /// The group's current epoch, if it is active.
+    pub fn group_epoch(&self, group_id: &GroupId) -> Option<u64> {
+        self.groups()
+            .ok()?
+            .into_iter()
+            .find(|g| &g.id == group_id)
+            .map(|g| g.epoch.0)
+    }
+
     /// True while some group still waits on a convergence pass.
     pub fn has_pending_convergence(&self) -> bool {
         !self.pending_convergence_ids().is_empty()
@@ -2380,16 +2397,20 @@ impl MarmotEngine {
         text: &str,
         reply: Option<&ReplyTo>,
     ) -> Result<Event> {
-        self.create_app_event(group_id, text, Vec::new(), reply)
+        self.create_app_event(group_id, text, Vec::new(), reply, None)
             .await
     }
 
+    /// `expected_epoch` pins the message to the epoch its attachments were
+    /// sealed in (receivers derive the media key from the message's epoch);
+    /// MDK refuses a pinned send the group has moved past. `None` for text.
     async fn create_app_event(
         &self,
         group_id: &GroupId,
         text: &str,
         extra_tags: Vec<Tag>,
         reply: Option<&ReplyTo>,
+        expected_epoch: Option<u64>,
     ) -> Result<Event> {
         let rumor = self.kind9_rumor(text, extra_tags, reply)?;
         let payload = marmot_app_event_from_rumor(&rumor)?;
@@ -2400,6 +2421,7 @@ impl MarmotEngine {
             .send(SendIntent::AppMessage {
                 group_id: group_id.clone(),
                 payload,
+                expected_epoch: expected_epoch.map(EpochId),
             })
             .await?;
         drop(lease);
@@ -2510,7 +2532,8 @@ impl MarmotEngine {
         reply: Option<&ReplyTo>,
     ) -> Result<Event> {
         let tag = build_sticker_ref_tag(sticker_ref);
-        self.create_app_event(group_id, "", vec![tag], reply).await
+        self.create_app_event(group_id, "", vec![tag], reply, None)
+            .await
     }
 
     pub async fn create_and_process_sticker_message(
@@ -2551,8 +2574,17 @@ impl MarmotEngine {
         mime: &str,
         filename: &str,
     ) -> Result<EncryptedMediaUpload> {
-        let secret = self.media_exporter_secret(group_id)?;
-        media_crypto::encrypt_for_upload(&secret, data, mime, filename)
+        let (epoch, secret) = self.with_session(|session| {
+            let (epoch, secret) = session.exporter_secret_with_epoch(
+                group_id,
+                media_crypto::ENCRYPTED_MEDIA_EXPORTER_LABEL,
+                32,
+            )?;
+            Ok((epoch.0, (*secret).clone()))
+        })?;
+        let mut upload = media_crypto::encrypt_for_upload(&secret, data, mime, filename)?;
+        upload.source_epoch = Some(epoch);
+        Ok(upload)
     }
 
     fn media_exporter_secret(&self, group_id: &GroupId) -> Result<Vec<u8>> {
@@ -2601,7 +2633,8 @@ impl MarmotEngine {
             .iter()
             .map(|&(upload, url)| media_crypto::create_imeta_tag(upload, url))
             .collect();
-        self.create_app_event(group_id, caption, imetas, reply)
+        let expected_epoch = media_send_epoch(uploads)?;
+        self.create_app_event(group_id, caption, imetas, reply, expected_epoch)
             .await
     }
 
@@ -4036,6 +4069,24 @@ fn validate_existing_d_tag(d: &str) -> Result<()> {
             "KeyPackage d tag must be 64 ASCII hex characters".into(),
         ))
     }
+}
+
+/// The epoch a media message must be sent in: the one every attachment was
+/// sealed in. `None` when none of them recorded it (uploads staged before the
+/// field existed), which leaves the send unpinned.
+fn media_send_epoch(uploads: &[(&EncryptedMediaUpload, &str)]) -> Result<Option<u64>> {
+    let mut epochs = uploads.iter().filter_map(|(upload, _)| upload.source_epoch);
+    let Some(first) = epochs.next() else {
+        return Ok(None);
+    };
+    if epochs.any(|epoch| epoch != first)
+        || uploads
+            .iter()
+            .any(|(upload, _)| upload.source_epoch.is_none())
+    {
+        return Err(Error::MediaEpochMoved);
+    }
+    Ok(Some(first))
 }
 
 fn key_package_from_event(event: &Event) -> Result<KeyPackage> {
@@ -5668,6 +5719,34 @@ mod key_package_event_tests {
         assert_eq!(
             tag_values(&event, "i"),
             vec![meta.key_package_ref_hex.clone()]
+        );
+    }
+
+    /// White Noise on MDK v0.9.21+ refuses to add an invitee whose
+    /// KeyPackage lists a default MLS capability (RFC 9420 §7.2: extensions
+    /// 0x0001–0x0005 and proposals 0x0001–0x0007 are implied, never listed).
+    /// Every MDK 0.9.14 package listed 0x0003, so no White Noise user could
+    /// start a chat with Sonar until the bump to v0.10.4.
+    #[tokio::test]
+    async fn key_package_lists_no_default_mls_capabilities() {
+        let engine = MarmotEngine::in_memory(Identity::generate());
+        let event = engine.key_package_event(Vec::new()).await.unwrap();
+        let kp = key_package_from_event(&event).unwrap();
+        let meta = engine
+            .lease_session()
+            .await
+            .get_mut()
+            .key_package_metadata(&kp)
+            .unwrap();
+        assert!(
+            !meta.mls_extensions.iter().any(|id| (1..=5).contains(id)),
+            "default MLS extension listed: {:?}",
+            meta.mls_extensions
+        );
+        assert!(
+            !meta.mls_proposals.iter().any(|id| (1..=7).contains(id)),
+            "default MLS proposal listed: {:?}",
+            meta.mls_proposals
         );
     }
 

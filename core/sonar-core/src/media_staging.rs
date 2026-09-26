@@ -85,6 +85,9 @@ pub(crate) struct SealedMediaItem {
     /// all sealed with the MIP-04 label.
     #[serde(default = "legacy_scheme_version")]
     pub scheme_version: String,
+    /// Epoch the blob was sealed in; the media message must go out in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epoch: Option<u64>,
 }
 
 fn legacy_scheme_version() -> String {
@@ -301,6 +304,21 @@ impl MediaStagingState {
             return Ok(());
         }
         entry.sealed_items = Some(sealed_items);
+        entry.updated_at_secs = now_secs;
+        self.dirty = true;
+        self.save_if_dirty()
+    }
+
+    /// Forget the uploaded blobs so a resume re-encrypts and re-uploads, for
+    /// when the group left the epoch they were sealed in.
+    pub fn clear_sealed(&mut self, id: &str, now_secs: u64) -> Result<()> {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return Ok(());
+        };
+        if entry.state == MediaStagingStatus::Committed {
+            return Ok(());
+        }
+        entry.sealed_items = None;
         entry.updated_at_secs = now_secs;
         self.dirty = true;
         self.save_if_dirty()

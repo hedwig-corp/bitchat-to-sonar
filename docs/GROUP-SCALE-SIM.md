@@ -83,19 +83,20 @@ Interpreting a run against a previous one (the "numbers when updating" case):
 - A moved ceiling after an **MDK rev bump** is the signal to watch: it means the
   wire format changed, which is exactly what can break White Noise interop.
 
-**Current pin: MDK v0.9.14 (`235c8ade`, wire `0xf2f1`).** The live baseline is
-[Findings (2026-09-13)](#findings-2026-09-13-mdk-v0914-235c8ade). The 0.8
-table under [Findings (2026-07)](#findings-2026-07-mdk-rev-e8cd584) is
-historical only.
+**Current pin: MDK v0.10.4 (`fcc85edd`, wire `0xf2f1`).** The live baseline is
+[Findings (2026-09-26)](#findings-2026-09-26-mdk-v0104-fcc85edd). The v0.9.14
+table under [Findings (2026-09-13)](#findings-2026-09-13-mdk-v0914-235c8ade)
+is the previous pin, and the 0.8 table under
+[Findings (2026-07)](#findings-2026-07-mdk-rev-e8cd584) is historical only.
 
 Reproduce the current baseline (`--no-nip11` keeps the run machine-local;
-`--chaos` is expected not to stage on 0.9.14 — see Finding 2):
+`--chaos` is expected not to stage on 0.9.14 or v0.10.4 — see Finding 2):
 
 ```sh
 cargo run -p sonar-sim --release -- group-scale \
   --ramp 2,5,10,25,50,100,110,120,130 \
   --mode incremental --batch 25 --chaos --no-nip11 \
-  --out /tmp/scale-mdk09.json
+  --out /tmp/scale-mdk.json
 ```
 
 MDK 0.9 leaves kind-445 commits `Buffered` until the MIP-03 quiescence
@@ -119,11 +120,45 @@ re-measure and report:
 >    the first failing N failed; the `--chaos` `converged`/`post_race_fanout_ok`
 >    values and branch populations; and the welcome-bytes column.
 > 4. Compare against the **current-rev** baseline table in
->    `docs/GROUP-SCALE-SIM.md` (v0.9.14 section). Flag structural outcomes
+>    `docs/GROUP-SCALE-SIM.md` (the current-pin section). Flag structural outcomes
 >    (ceiling N, `ok`, `converged`, welcome bytes). Ignore `build`/`fanout`
 >    timings (machine-bound). Note the current MDK rev from `core/Cargo.toml`.
 
+## Findings (2026-09-26, MDK v0.10.4 `fcc85edd`)
+
+Measured with `--batch 25 --mode incremental --no-nip11 --chaos`, the same
+command as the v0.9.14 run below, on the bump from v0.9.14. **No structural
+change**: same ceiling, same failure, same chaos outcome, byte-identical
+welcomes from N=5 to N=50.
+
+| N   | welcome (wrapped) | Δ vs 0.9.14 | evolution | Δ vs 0.9.14 | result |
+| --- | ----------------- | ----------- | --------- | ----------- | ------ |
+| 2   | 5 969 B           | +684 B      | —         |             | ok     |
+| 5   | 11 429 B          | 0           | —         |             | ok     |
+| 10  | 16 893 B          | 0           | —         |             | ok     |
+| 25  | 38 737 B          | 0           | —         |             | ok     |
+| 50  | 66 045 B          | 0           | 18 800 B  | +200 B      | ok     |
+| 100 | 66 045 B          | 0           | 19 412 B  | +208 B      | welcome too long |
+
+- **Ceiling stays at 50.** N=100 fails the same way:
+  `add_members(at 50): wrap failed: nip44 encryption error: message too long`.
+- **N=2 +684 B** is one NIP-44 padding step. Between 2 and 4 KiB of plaintext,
+  NIP-44 pads in 512 B chunks, and 512 B is about 683 B after base64. So a few
+  more bytes in the seal crossed a chunk boundary. Neither the ratchet tree
+  nor the welcome format grew: N=5…50 are byte-identical.
+- **Evolution +200 B** at N=50 is the commit only, not the welcome. It does
+  not move any limit.
+- **Chaos**: `concurrent add_members failed to stage` at every N,
+  `converged=false`, `post_race_fanout_ok=false` — Finding 2 below, unchanged.
+
+The bump itself was for White Noise interop: v0.9.21+ rejects invitee
+KeyPackages that list default MLS capabilities, which every v0.9.14 package
+did. The `wn` interop matrix (QA-078…085, including the 25-member group) passes
+against White Noise's own v0.10.4 runtime.
+
 ## Findings (2026-09-13, MDK v0.9.14 `235c8ade`)
+
+> Previous pin. Kept for the diff: the v0.10.4 section above is the baseline.
 
 Measured on this PR with `--batch 25 --mode incremental --no-nip11 --chaos`.
 `sonar-sim` settles MIP-03 buffered commits after each add-batch.
@@ -169,7 +204,7 @@ forks would look like the 0.8 finding again.
 
 ## Findings (2026-07, MDK rev `e8cd584` — 0.8 historical baseline)
 
-> Historical only. **Do not treat this table as the v0.9.14 baseline.** The
+> Historical only. **Do not treat this table as the current baseline.** The
 > protocol profile and welcome/commit encoding changed with the MDK 0.9 port.
 
 ### 1. Hard ceiling ≈ 120 members, gated by the welcome — not the relay

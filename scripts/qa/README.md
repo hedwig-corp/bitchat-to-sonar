@@ -23,8 +23,8 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 | `ios-setup.sh` | Create/boot this worktree's "Sonar QA <worktree>" simulator (so parallel agents never share one), build **signed** Debug (App Group ⇒ the Marmot store opens), install, stream the unified log. Refuses a stale `sonarffi.xcframework` (`--build-core` / `--trust-core`) and missing Breez / Firebase config unless `--allow-missing-config`; `BREEZ_API_KEY` in the environment counts. |
 | `android-ui.sh` | uiautomator driver: `dump`, `tapx`/`tapt`/`tapedit`, `wait`/`gone`, `ime`, `shot`. |
 | `peers.sh` | Fresh `sonar-cli` counterparties: `new`, `send`, `send-image`, `listen`, `expect`. |
-| `mdk-upgrade.sh` | MDK 0.8 → 0.9.14 upgrade peers (QA-070…077): `peer <name> 08\|09`, `seed`, `upgrade-peer` (migrates a 0.8 CLI home with the 0.9 CLI), per-peer `send`/`expect`, `store` (the app's Marmot files on the simulator). Needs `MDK08_CLI` from a pre-#613 checkout. |
-| `wn-interop.sh` | Sonar ↔ White Noise interop (QA-078…085) against MDK's own `wn` CLI: `setup` builds `wn`/`wnd` from the pinned MDK rev and creates the White Noise identity, `run [--members N]` prints PASS/FAIL per scenario. Needs `RELAY` serving kind-1059 without NIP-42 and 64 KiB events. |
+| `mdk-upgrade.sh` | MDK 0.8 → 0.9 upgrade peers (QA-070…077; the #613 build pins MDK v0.10.4): `peer <name> 08\|09`, `seed`, `upgrade-peer` (migrates a 0.8 CLI home with the 0.9 CLI), per-peer `send`/`expect`, `store` (the app's Marmot files on the simulator). Needs `MDK08_CLI` from a pre-#613 checkout. |
+| `wn-interop.sh` | Sonar ↔ White Noise interop (QA-078…086) against MDK's own `wn` CLI: `setup` builds `wn`/`wnd` from the pinned MDK rev (also check the tag White Noise iOS pins) and creates the White Noise identity, `run [--members N]` prints PASS/FAIL per scenario. Needs `RELAY` serving kind-1059 without NIP-42 and 64 KiB events. |
 | `android-smoke.sh` | Automated registry scenarios (`qaNNN` = `QA-NNN`). |
 | `idle-cpu.sh` | Average app CPU over a window on Android or an iOS simulator. |
 | `qr-decode.swift` | Print QR payloads found in a screenshot (macOS CoreImage). |
