@@ -7,6 +7,7 @@
 
 import Testing
 import Foundation
+import UniformTypeIdentifiers
 @testable import Sonar
 
 /// Pins the staging contract between the share extension and the app.
@@ -203,5 +204,256 @@ struct SonarSharePayloadTests {
     func sharedFilenameIsBounded() {
         let long = String(repeating: "a", count: 500) + ".jpg"
         #expect(snSafeSharedFilename(long).count <= 120)
+    }
+
+    // MARK: - Which type identifier carries the bytes
+
+    /// THE regression: sharing any non-media document into Sonar delivered the
+    /// file's PATH instead of the file.
+    ///
+    /// `loadFileRepresentation(forTypeIdentifier: "public.file-url")` does not
+    /// vend the document — it vends a temp file named `file URL` whose contents
+    /// are the `file://` path string (measured: 111 bytes for a 11-byte
+    /// `notes.txt`). `public.file-url` sat ahead of `public.data` in the probe
+    /// order, so every csv/txt/json/zip/docx share hit it. Photos and PDFs
+    /// dodged it by matching a concrete type first, which is why the bug read as
+    /// "some files work".
+    @Test
+    func stagingNeverAsksAURLIdentifierForBytes() {
+        // Exactly what NSItemProvider(contentsOf:) registers for a document.
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.comma-separated-values-text", "public.file-url", "public.url",
+        ]) == "public.comma-separated-values-text")
+
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.zip-archive", "public.file-url", "public.url",
+        ]) == "public.zip-archive")
+
+        // Order must not rescue us: a provider that lists the URL type first is
+        // still asked for its content type.
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.file-url", "public.url", "public.plain-text",
+        ]) == "public.plain-text")
+
+        // Generic data is the floor, not a miss: a provider whose only
+        // byte-carrying type IS `public.data` must stage from it — every case
+        // above would also pass an implementation that only ranked CONCRETE
+        // types over `public.file-url` and skipped the generic one.
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.file-url", "public.data", "public.url",
+        ]) == "public.data")
+    }
+
+    @Test
+    func urlOnlyProviderHasNoStagingTypeAndFallsBackToTheFileURL() {
+        // nil is the signal for "resolve the file URL and copy the real file"
+        // — never "ask public.file-url for bytes".
+        #expect(snStagingTypeIdentifier(
+            registeredTypeIdentifiers: ["public.file-url", "public.url"]
+        ) == nil)
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: []) == nil)
+    }
+
+    @Test
+    func dynamicUTIStillStages() {
+        // An unknown extension yields a `dyn.…` identifier. Dropping it would
+        // lose the file, so the non-URL fallback keeps it.
+        let dynamic = UTType(filenameExtension: "sonartestext")?.identifier ?? "dyn.test"
+        #expect(snStagingTypeIdentifier(
+            registeredTypeIdentifiers: [dynamic, "public.file-url"]
+        ) == dynamic)
+    }
+
+    @Test
+    func urlIdentifiersAreRecognised() {
+        #expect(snIsURLTypeIdentifier("public.file-url"))
+        #expect(snIsURLTypeIdentifier("public.url"))
+        #expect(!snIsURLTypeIdentifier("public.plain-text"))
+        #expect(!snIsURLTypeIdentifier("public.jpeg"))
+    }
+
+    // MARK: - Staged names
+
+    @Test
+    func stagedFilenamePrefersTheProviderName() {
+        // The temp file is named after the TYPE whenever the bytes came from a
+        // data representation, so `report.csv` would otherwise be delivered as
+        // "comma-separated values.csv".
+        #expect(snStagedFilename(
+            suggestedName: "report.csv",
+            temporaryName: "comma-separated values.csv",
+            fallback: "attachment"
+        ) == "report.csv")
+    }
+
+    @Test
+    func stagedFilenameBorrowsTheExtensionWhenTheProviderNameHasNone() {
+        #expect(snStagedFilename(
+            suggestedName: "report",
+            temporaryName: "comma-separated values.csv",
+            fallback: "attachment"
+        ) == "report.csv")
+    }
+
+    @Test
+    func stagedFilenameFallsBackWhenThereIsNoProviderName() {
+        #expect(snStagedFilename(
+            suggestedName: nil,
+            temporaryName: "IMG_0001.HEIC",
+            fallback: "photo.jpg"
+        ) == "IMG_0001.HEIC")
+        #expect(snStagedFilename(
+            suggestedName: "   ",
+            temporaryName: "",
+            fallback: "photo.jpg"
+        ) == "photo.jpg")
+    }
+
+    @Test
+    func stagedFilenameCannotEscapeThePayloadDirectory() {
+        // The suggested name comes from another app and is attacker-influenced,
+        // so it goes through the same single-component sanitiser as before.
+        // (`.bin` is then borrowed from the temp name, which has no extension of
+        // its own after sanitising — the point here is that no separator and no
+        // `..` survives.)
+        let name = snStagedFilename(
+            suggestedName: "../../../etc/passwd",
+            temporaryName: "data.bin",
+            fallback: "attachment"
+        )
+        #expect(name == "passwd.bin")
+        #expect(!name.contains("/"))
+        #expect(!name.contains(".."))
+
+        // And the relative path it feeds is still one directory + one name.
+        let path = snStagedRelativePath(index: 0, filename: name)
+        #expect(path == "0/passwd.bin")
+        #expect((path as NSString).pathComponents.count == 2)
+    }
+
+    // MARK: - Which staged share the picker offers
+
+    private func payload(_ id: String, at secs: TimeInterval) -> SonarSharePayload {
+        SonarSharePayload(
+            id: id, createdAt: Date(timeIntervalSince1970: secs), text: nil, items: [item("\(id).csv")]
+        )
+    }
+
+    /// QA finding on #559: a share abandoned earlier (the app was killed with
+    /// its picker up) stays staged for 24 h. The picker took the OLDEST staged
+    /// payload, so the user who had just shared `fresh.csv` saw last time's
+    /// `old-draft.csv`, and a tap on a chat sent it. The extension cannot open
+    /// the app (`extensionContext.open` is refused for share extensions), so
+    /// most scans carry no hand-off id: newest must win on its own.
+    @Test
+    func theShareJustMadeIsOfferedBeforeAnOlderStagedOne() {
+        let old = payload("old", at: 100)
+        let new = payload("new", at: 200)
+        #expect(snNextSharePayload([old, new], preferring: nil)?.id == "new")
+        #expect(snNextSharePayload([new, old], preferring: nil)?.id == "new")
+        // A hand-off id is the most precise signal when there is one…
+        #expect(snNextSharePayload([old, new], preferring: "old")?.id == "old")
+        // …and one that is no longer staged falls back to the newest.
+        #expect(snNextSharePayload([old, new], preferring: "gone")?.id == "new")
+        #expect(snNextSharePayload([], preferring: "new") == nil)
+    }
+
+    /// The foreground that follows a share also fires `didBecomeActive`, and a
+    /// picker for an older payload may already be up (restored after a
+    /// relaunch). The newer share takes it over; an older one never does, so
+    /// repeated foreground scans cannot flap between payloads.
+    @Test
+    func aNewerShareTakesOverAPickerShowingAnOlderOne() {
+        let old = payload("old", at: 100)
+        let new = payload("new", at: 200)
+        #expect(snShouldReplaceOfferedShare(current: old, with: new, preferring: nil))
+        #expect(!snShouldReplaceOfferedShare(current: new, with: old, preferring: nil))
+        #expect(!snShouldReplaceOfferedShare(current: new, with: new, preferring: nil))
+        // The payload a hand-off names wins even if it is not the newest.
+        #expect(snShouldReplaceOfferedShare(current: new, with: old, preferring: "old"))
+    }
+
+    @Test
+    func theHandOffURLNamesItsPayload() throws {
+        let id = UUID().uuidString
+        #expect(snSharePayloadID(from: try #require(URL(string: "sonar://share?id=\(id)"))) == id)
+        #expect(snSharePayloadID(from: try #require(URL(string: "sonar://share"))) == nil)
+        #expect(snSharePayloadID(from: try #require(URL(string: "sonar://share?id="))) == nil)
+    }
+
+    // MARK: - File or body, never both
+
+    /// QA finding on #559 (QA-084): an app exporting a text document from
+    /// memory — the bytes registered as `public.plain-text`, plus a
+    /// `suggestedName` — was delivered as the file AND as a text message
+    /// holding the whole document. `loadItem(forTypeIdentifier:
+    /// "public.plain-text")` on that provider returns the bytes, and the body
+    /// reader looked at every provider. Exactly the provider the QA host built.
+    @Test
+    func anInAppTextExportIsStagedAndNeverReadAsTheMessageBody() {
+        let document = Data("Sonar share QA notes.\nThis is a document, not a message.\n".utf8)
+        let export = NSItemProvider(item: document as NSData, typeIdentifier: UTType.plainText.identifier)
+        export.suggestedName = "export.txt"
+        let split = snPartitionShareProviders([export])
+        #expect(split.files == [export])
+        #expect(split.body.isEmpty)
+    }
+
+    /// The same invariant for file-backed providers, which answer a
+    /// plain-text load with the file's bytes in-process.
+    @Test
+    func aSharedDocumentIsStagedAndNeverReadAsTheMessageBody() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-partition-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        for name in ["notes.txt", "report.csv", "script.py", "data.json", "archive.zip", "README"] {
+            let url = dir.appendingPathComponent(name)
+            try Data("a,b\n1,2\n".utf8).write(to: url)
+            let provider = try #require(NSItemProvider(contentsOf: url))
+            let split = snPartitionShareProviders([provider])
+            #expect(split.files.count == 1, "\(name) must be staged as a file")
+            #expect(split.body.isEmpty, "\(name) must not also be read as the message body")
+        }
+    }
+
+    @Test
+    func plainTextAndWebLinksStayTheBody() throws {
+        let text = NSItemProvider(object: "hello from Notes" as NSString)
+        let link = NSItemProvider(object: try #require(URL(string: "https://example.com/a")) as NSURL)
+        let split = snPartitionShareProviders([text, link])
+        #expect(split.files.isEmpty)
+        #expect(split.body.count == 2)
+    }
+
+    @Test
+    func aCaptionedFileSplitsIntoOneFileAndOneBody() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("share-partition-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("report.csv")
+        try Data("a,b\n".utf8).write(to: url)
+
+        let file = try #require(NSItemProvider(contentsOf: url))
+        let caption = NSItemProvider(object: "Q3 numbers" as NSString)
+        let split = snPartitionShareProviders([caption, file])
+        #expect(split.files == [file])
+        #expect(split.body == [caption])
+    }
+
+    /// The second half of "the path is broken": the app sends each staged file
+    /// under `url.lastPathComponent`, so the old `"\(index)-\(name)"` layout put
+    /// the index INTO the delivered filename — the recipient saw `0-report.csv`.
+    @Test
+    func stagedPathKeepsTheIndexOutOfTheFilename() {
+        let path = snStagedRelativePath(index: 0, filename: "report.csv")
+        #expect(path == "0/report.csv")
+        #expect((path as NSString).lastPathComponent == "report.csv")
+
+        // Still collision-proof: two identically named attachments stay apart.
+        #expect(snStagedRelativePath(index: 1, filename: "IMG_0001.jpg")
+            != snStagedRelativePath(index: 2, filename: "IMG_0001.jpg"))
     }
 }

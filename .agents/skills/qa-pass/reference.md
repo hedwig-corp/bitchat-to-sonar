@@ -9,6 +9,7 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 |---|---|
 | `scripts/qa/android-setup.sh` | boots the QA AVD by serial, `installDebug` in place, logcat → `$QA_HOME` |
 | `scripts/qa/ios-setup.sh` | creates/boots a named QA simulator, signed Debug build, install, log stream (`chat.bitchat` + `sh.hedwig.sonar` subsystems) |
+| `scripts/qa/ios-share-smoke.sh` | iOS share sheet end to end (Files, Photos, a stand-in third-party app) → picker → peer; asserts name/MIME/sha256 on the recipient. Traps: scripts/qa/README.md |
 | `scripts/qa/android-ui.sh` | adb/uiautomator driver: `dump`, `tapx`/`tapt`, `wait`, `ime`, `shot` |
 | `scripts/qa/peers.sh` | fresh `sonar-cli` peers: `new`, `send`, `send-image`, `listen`, `expect` |
 | `scripts/qa/android-smoke.sh` | scripted registry scenarios on Android; exit status = failures |
