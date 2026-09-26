@@ -2614,16 +2614,26 @@ impl SonarClient {
     /// attacker-chosen on the join-request path. One event per relay is enough,
     /// because the globally newest event is by definition the newest on whatever
     /// relay carries it.
+    ///
+    /// A peer whose newest package is still MDK 0.8 has not updated: MDK 0.9
+    /// can never admit that package, so it reads as not found. Hosts map that
+    /// to "Waiting for them to update Sonar" — handing it to MLS instead
+    /// failed the resume with an opaque capability error (#613 QA A2).
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
         let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
-        events
+        let newest = events
             .into_iter()
             .max_by_key(|e| e.created_at)
-            .ok_or(Error::KeyPackageNotFound(author))
+            .ok_or(Error::KeyPackageNotFound(author))?;
+        if is_legacy_mdk08_key_package(&newest) {
+            tracing::info!("peer's newest KeyPackage is MDK 0.8; waiting for them to update");
+            return Err(Error::KeyPackageNotFound(author));
+        }
+        Ok(newest)
     }
 
     /// Fetch the exact KeyPackage advertised by a join request.
@@ -9071,15 +9081,29 @@ pub(crate) fn index_preview(message: &ChatMessage) -> String {
     }
 }
 
+fn decode_group_id_hex(hex_id: &str) -> Option<GroupId> {
+    hex::decode(hex_id).ok().map(GroupId::new)
+}
+
+/// A KeyPackage published by an MDK 0.8 install: it advertises the legacy
+/// `NostrGroupData` extension `0xf2ee` in `mls_extensions` (0.9 packages carry
+/// `app_components` instead). MDK 0.9 cannot admit it.
+pub(crate) fn is_legacy_mdk08_key_package(event: &Event) -> bool {
+    event.tags.iter().any(|tag| {
+        let values = tag.as_slice();
+        values.first().is_some_and(|name| name == "mls_extensions")
+            && values
+                .iter()
+                .skip(1)
+                .any(|value| value.eq_ignore_ascii_case("0xf2ee"))
+    })
+}
+
 /// True when the content is a serialized JSON object/array — the shape bot
 /// and interop control messages arrive in. A leading-brace fast path keeps
 /// ordinary chat text allocation-free; only brace-prefixed text pays the
 /// parse check. The transcript bubble still renders the full raw text; this
 /// only guards the preview/banner copy.
-fn decode_group_id_hex(hex_id: &str) -> Option<GroupId> {
-    hex::decode(hex_id).ok().map(GroupId::new)
-}
-
 fn looks_like_json_payload(content: &str) -> bool {
     let trimmed = content.trim_start();
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {

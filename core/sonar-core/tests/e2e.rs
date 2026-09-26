@@ -1295,6 +1295,75 @@ async fn recovered_08_chat_resumes_on_a_new_09_group_through_a_relay() {
     assert!(after_reopen.iter().any(|m| m.content == "second resume"));
 }
 
+/// A peer still on 0.8 DOES publish a KeyPackage — the 0.8 one (kind 30443,
+/// `mls_extensions` 0xf2ee, `client` MDK/0.8.0). The test above only models
+/// "no package at all". With a real 0.8 package on the relay the resume
+/// handed it to MDK 0.9 and failed with an opaque capability error, so hosts
+/// showed "Couldn't send" instead of "Waiting for them to update Sonar"
+/// (#613 QA A2, Android). The tags below are copied from a live 0.8 package.
+#[tokio::test]
+async fn recovered_08_resume_with_a_peer_still_on_08_waits_for_their_update() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let (historical, _old_event) =
+        write_mdk08_alice_bob_store(&db_path, bob_identity.public_key(), "keep this chat");
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        MDK08_DB_KEY,
+    )
+    .await
+    .expect("alice migrates the 0.8 store");
+
+    let mdk08_key_package = EventBuilder::new(
+        Kind::Custom(KEY_PACKAGE_KIND),
+        "AAEAAkDwAAEAAQAABkAA0ZxHs3h8OdW0fXTdbV3sEWUfd9uP0bX3+JqZ8HjP0w==",
+    )
+    .tags([
+        Tag::identifier("11882635c8f007d981dd81e6ef623f81873cab01d79cee53d9ba9c64b8dd133b"),
+        Tag::parse(["mls_protocol_version", "1.0"]).unwrap(),
+        Tag::parse(["mls_ciphersuite", "0x0001"]).unwrap(),
+        Tag::parse(["mls_extensions", "0x000a", "0xf2ee"]).unwrap(),
+        Tag::parse(["mls_proposals", "0x000a"]).unwrap(),
+        Tag::parse(["client", "MDK/0.8.0"]).unwrap(),
+        Tag::parse(["encoding", "base64"]).unwrap(),
+    ])
+    .build(bob_identity.public_key())
+    .sign_with_keys(bob_identity.keys())
+    .expect("sign 0.8-shaped key package");
+    let bob_08 = NostrClient::new(bob_identity.keys().clone());
+    bob_08.add_relay(relay_url).await.expect("add mock relay");
+    bob_08.connect().await;
+    let published = bob_08
+        .send_event(&mdk08_key_package)
+        .await
+        .expect("publish 0.8 key package");
+    assert!(
+        !published.success.is_empty(),
+        "relay must accept the 0.8 package, else this test proves nothing: {:?}",
+        published.failed
+    );
+
+    let err = alice
+        .send_text(&historical, "are you there?")
+        .await
+        .expect_err("a 0.8 package cannot resume a 0.9 chat");
+    assert!(
+        err.to_string().contains("no key package"),
+        "hosts map only this to 'Waiting for them to update Sonar', got: {err}"
+    );
+    assert_eq!(
+        alice.groups().expect("live groups").len(),
+        0,
+        "a failed resume must not mint an empty 0.9 group"
+    );
+}
+
 /// Two first-resume sends (text+media, double-tap) must share one 0.9 group.
 /// Without `resume_mint_lock` both pass the unbound check, each mint, and
 /// `record_resume_fold` steals history onto the second.
