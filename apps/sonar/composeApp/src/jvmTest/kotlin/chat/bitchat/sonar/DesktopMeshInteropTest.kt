@@ -184,6 +184,26 @@ class DesktopMeshInteropTest {
     }
 
     /**
+     * A DM of a couple of hundred characters pads past one GATT value. Android
+     * sends it as 0x20 fragments, which MeshLink dropped (every long DM from a
+     * phone vanished), and MeshLink sent its own as one oversized write, which a
+     * radio refuses (modelled here by [MAX_WRITE_BYTES]).
+     */
+    @Test
+    fun aLongDmCrossesInBothDirections() {
+        val pixel = radio.phone("pixel")
+        radio.linkOut(pixel)
+        radio.run(3_000)
+        assertTrue(linked(pixel))
+        val long = "long message ".repeat(60).trim()
+        assertTrue(MeshLink.sendDm(pixel.fp, "d-long", long))
+        pixel.send(desktopFp, "p-long", long.uppercase())
+        radio.run(2_000)
+        assertEquals(listOf(long), pixel.texts, "the phone never got the desktop's long DM")
+        assertEquals(listOf(long.uppercase()), MeshLink.drainDms().map { it.text }, "the desktop never got the phone's long DM")
+    }
+
+    /**
      * The bridge's RX shape, byte for byte as `sonar-ble`'s `rx_items_name_their_link`
      * pins it. Parsed by hand on this side, so the two tests are the contract.
      */
@@ -256,6 +276,8 @@ class DesktopMeshInteropTest {
 
         private fun toPeer(link: Long, bytes: ByteArray) {
             if (dropToPhone?.invoke(bytes) == true) return
+            // One GATT value per write, bounded by the ATT MTU (517 - 3).
+            if (bytes.size > MAX_WRITE_BYTES) return
             val peer = centralLinks[link] ?: return
             later(HOP_MS) { if (centralLinks[link] === peer) peer.onServerRx(link, bytes) }
         }
@@ -321,6 +343,7 @@ class DesktopMeshInteropTest {
 
             /** Our GATT server notified the subscribed phone (the server path). */
             fun fromDesktopNotify(bytes: ByteArray) {
+                if (bytes.size > MAX_WRITE_BYTES) return
                 later(HOP_MS) { handle(engine.onClientRx(clientConn, 0, bytes, now)) }
             }
 
@@ -416,6 +439,7 @@ class DesktopMeshInteropTest {
     }
 
     private companion object {
+        const val MAX_WRITE_BYTES = 514
         const val STEP_MS = 10L
         const val HOP_MS = 20L
         val defaultWire: MeshWire = MeshLink.wire
