@@ -297,6 +297,44 @@ func snShouldStageAsFile(
     return isData
 }
 
+/// `snShouldStageAsFile`, asked of a real provider.
+func snStagesAsFile(_ provider: NSItemProvider) -> Bool {
+    let conforms = { (type: UTType) in provider.hasItemConformingToTypeIdentifier(type.identifier) }
+    let isFileURL = conforms(.fileURL)
+    return snShouldStageAsFile(
+        isConcreteFileType: [UTType.image, .movie, .audio, .pdf, .fileURL].contains(where: conforms),
+        isText: conforms(.plainText) || conforms(.text),
+        isNonFileURL: conforms(.url) && !isFileURL,
+        isData: conforms(.data),
+        hasSuggestedName: provider.suggestedName?.isEmpty == false
+    )
+}
+
+/// Split a share's attachments into the files to stage and the providers the
+/// text/link body may be read from. Disjoint on purpose.
+///
+/// A text document that stages as a file — an app's in-memory export (the
+/// bytes registered as `public.plain-text` with a `suggestedName`), or a
+/// file-backed provider in-process — answers `loadItem(forTypeIdentifier:
+/// "public.plain-text")` with the document's *bytes*. Reading the body from
+/// every provider therefore sent the whole document a second time, as a text
+/// message next to the staged file, and put it in the picker preview (QA-084).
+/// A provider is a file or the body, never both.
+func snPartitionShareProviders(
+    _ providers: [NSItemProvider]
+) -> (files: [NSItemProvider], body: [NSItemProvider]) {
+    var files: [NSItemProvider] = []
+    var body: [NSItemProvider] = []
+    for provider in providers {
+        if snStagesAsFile(provider) {
+            files.append(provider)
+        } else {
+            body.append(provider)
+        }
+    }
+    return (files, body)
+}
+
 /// True for `public.url` and `public.file-url` — the identifiers whose "data" is
 /// the link itself rather than the bytes it points at.
 func snIsURLTypeIdentifier(_ identifier: String) -> Bool {

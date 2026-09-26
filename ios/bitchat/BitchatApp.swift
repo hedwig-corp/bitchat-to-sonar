@@ -247,7 +247,7 @@ struct BitchatApp: App {
         // The share extension opens `sonar://share` right after staging;
         // `bitchat://share` stays accepted for older staged payloads.
         if (url.scheme == "sonar" || url.scheme == "bitchat") && url.host == "share" {
-            checkForSharedContent()
+            checkForSharedContent(preferring: snSharePayloadID(from: url))
         } else if let token = InviteShare.token(from: url) {
             // Covers both sonar://invite/sinvite1… and https://<host>/join#sinvite1…
             sonarStore.submitInviteLink(token)
@@ -260,9 +260,12 @@ struct BitchatApp: App {
     /// with no private chat selected broadcasts to the **public mesh** — a
     /// shared link went out to everyone in range instead of the person the
     /// user meant. The app now always asks who it goes to.
-    private func checkForSharedContent() {
+    ///
+    /// `preferredID` is the payload a `sonar://share?id=` hand-off names, so the
+    /// file the user just shared is offered before any older staged one.
+    private func checkForSharedContent(preferring preferredID: String? = nil) {
         Task { @MainActor in
-            sonarStore.ingestPendingShares()
+            sonarStore.ingestPendingShares(preferring: preferredID)
         }
     }
 }

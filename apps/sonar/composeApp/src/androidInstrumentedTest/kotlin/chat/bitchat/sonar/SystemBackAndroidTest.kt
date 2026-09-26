@@ -41,7 +41,7 @@ class SystemBackAndroidTest {
                     enabled = true,
                     isAtRoot = state.isHome,
                     isCallScreen = state.screen is Screen.Call,
-                    onNavigate = state::back,
+                    onNavigate = state::navigateBack,
                 )
             }
 
@@ -88,7 +88,7 @@ class SystemBackAndroidTest {
                     enabled = true,
                     isAtRoot = state.isHome,
                     isCallScreen = state.screen is Screen.Call,
-                    onNavigate = state::back,
+                    onNavigate = state::navigateBack,
                 )
             }
 

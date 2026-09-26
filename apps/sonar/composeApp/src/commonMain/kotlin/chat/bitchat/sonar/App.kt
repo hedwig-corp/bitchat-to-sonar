@@ -313,7 +313,7 @@ fun App(
             state.homeMessagesHydrated,
         isAtRoot = state.isHome,
         isCallScreen = state.screen is Screen.Call,
-        onNavigate = state::back,
+        onNavigate = state::navigateBack,
     )
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
