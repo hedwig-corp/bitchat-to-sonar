@@ -93,14 +93,13 @@ struct SonarProfileScreen: View {
                                 Text(verbatim: displayNick)
                                     .font(SonarTheme.uiFont(size: 24, weight: .heavy))
                                     .foregroundColor(SonarTheme.text)
-                                SNIconButton(size: 30, action: {
+                                SNIconButton(Text(verbatim: "Edit name"), size: 30, action: {
                                     draft = store.nick
                                     editing = true
                                     draftFocused = true
                                 }) {
                                     SNIcon(name: .pencil, size: 15, weight: 2)
                                 }
-                                .accessibilityLabel("Edit name")
                             }
                         }
                         Text(verbatim: store.profileCardSubtitle)

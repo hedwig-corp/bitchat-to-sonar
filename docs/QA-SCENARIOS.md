@@ -407,17 +407,25 @@ nothing by design.
 ## Accessibility
 
 ### QA-040 — Icon controls are labelled
-- **Platforms:** Android automated (`uiautomator dump` content-desc); iOS manual
-  (VoiceOver / Accessibility Inspector)
+- **Platforms:** Android automated (`uiautomator dump` content-desc); iOS
+  `ios-drive.sh … tree:<name>` or Accessibility Inspector
 - **Expect:** send, attach, emoji, voice, back, call, settings, start-chat, the
   nickname, search and composer fields all have spoken labels (`android-ui.sh
-  dump` shows an unlabelled field as `E!` — uiautomator's NAF flag).
+  dump` shows an unlabelled field as `E!` — uiautomator's NAF flag; an iOS tree
+  shows it as a `Button`/`TextField` row with no `label:`).
 - **How:** `android-smoke.sh` QA-040 checks the chat screen (attach, emoji,
   send/record, back, composer field), home (settings, start-chat, nearby) and
   the search field. Manual: the nickname field (onboarding only, use
   `android-setup.sh --fresh`) and call buttons (call-capable peers only).
-  Channel controls: QA-042. Guard: `IconButtonAccessibilityUiTest`
-- **Origin:** A9/A5/A21 (#616)
+  Channel controls: QA-042. Guard: `IconButtonAccessibilityUiTest`. iOS: dump
+  the tree of a chat (Back, Add to your message, Emoji and stickers, Record
+  voice message → Send while typing) and home; `SNIconButton` takes its label
+  as a required argument, so a new header icon without one does not compile.
+  The recording mic is one element with a VoiceOver activate action (start /
+  send), since its press-and-hold gesture cannot be performed by VoiceOver.
+- **Origin:** A9/A5/A21 (#616); iOS: every `SNIconButton` (back, call, video,
+  settings, nearby, bookmark, edit-name, close) and the composer's plus, emoji,
+  mic and send were read as "button" (QA follow-up to #616)
 
 ### QA-041 — Profile QR is a real, scannable code
 - **Platforms:** both (Android automated on macOS; iOS manual)
@@ -429,13 +437,19 @@ nothing by design.
   under "Let someone scan this to add you"; nothing could scan it.
 
 ### QA-043 — Accessibility sweep: no unlabelled controls
-- **Platforms:** Android automated (`android-ui.sh naf` per screen); iOS manual
-  (Accessibility Inspector audit)
+- **Platforms:** Android automated (`android-ui.sh naf` per screen); iOS
+  `ios-drive.sh` tree dump per screen, or an Accessibility Inspector audit
 - **Expect:** zero NAF nodes on home, search, start-chat, nearby, settings, a
   chat and its contact profile (extend the sweep when a screen is added).
-- **How:** `android-smoke.sh` QA-043
+- **How:** `android-smoke.sh` QA-043. iOS: `ios-drive.sh <name>
+  "launch;<navigate>;tree:t"` for the same screens plus the Mesh channel, the
+  emoji tray and a chat with reaction chips, then grep each dump for
+  `Button`/`TextField` rows without `label:` — none expected.
 - **Origin:** A28 (#616) — contact-profile action circles were NAF and their
   captions were dead taps; the 2026-09-24 sweep of every main screen is clean.
+  iOS had the same two gaps (the Message/Call/Pay/Verify circles and the
+  placeholder-only search field); the 2026-09-27 sweep of all of the above,
+  reaction chips included, is clean.
 - **Also:** every settings toggle is a switch that reports its state
   (uiautomator `checkable="true"` and `checked` match the switch; VoiceOver
   reads "On"/"Off"). `android-smoke.sh` QA-043 checks "Share local time" is a

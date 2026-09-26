@@ -328,10 +328,10 @@ struct SonarDMScreenContent: View {
                 // Calls are Sonar-only: shown when the peer advertised calls and
                 // BLE or White Noise can signal.
                 if store.canCall(peerId) {
-                    SNIconButton(action: { store.placeCall(peerId, video: false) }) {
+                    SNIconButton(Text("Voice call"), action: { store.placeCall(peerId, video: false) }) {
                         SNIcon(name: .phone, size: 20)
                     }
-                    SNIconButton(action: { store.placeCall(peerId, video: true) }) {
+                    SNIconButton(Text("Video call"), action: { store.placeCall(peerId, video: true) }) {
                         SNIcon(name: .videocam, size: 21)
                     }
                 }

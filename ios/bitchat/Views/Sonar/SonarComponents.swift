@@ -102,14 +102,24 @@ struct SNIconButtonStyle: ButtonStyle {
     }
 }
 
+/// A round icon-only button. The spoken label is required: an icon has no
+/// text, so without one VoiceOver announces just "button" (the chat's Back,
+/// call and several header buttons were exactly that).
 struct SNIconButton: View {
     var size: CGFloat = 38
     let action: () -> Void
+    private let accessibilityLabel: Text
     private let label: AnyView
 
-    init<Content: View>(size: CGFloat = 38, action: @escaping () -> Void, @ViewBuilder content: () -> Content) {
+    init<Content: View>(
+        _ accessibilityLabel: Text,
+        size: CGFloat = 38,
+        action: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) {
         self.size = size
         self.action = action
+        self.accessibilityLabel = accessibilityLabel
         self.label = AnyView(content())
     }
 
@@ -121,6 +131,7 @@ struct SNIconButton: View {
                 .contentShape(Circle())
         }
         .buttonStyle(SNIconButtonStyle())
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -368,7 +379,7 @@ struct SNNavHeader<Content: View, Trailing: View>: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            SNIconButton(action: onBack) {
+            SNIconButton(Text("Back"), action: onBack) {
                 SNIcon(name: .back, size: 21, weight: 2.1)
             }
             HStack(spacing: 10) {
@@ -5015,6 +5026,7 @@ struct SNComposer: View {
                     )
             }
             .buttonStyle(SNScaleStyle(scale: 0.92))
+            .accessibilityLabel(Text("Add to your message"))
 
             HStack {
                 SNMessageComposerField(
@@ -5051,6 +5063,7 @@ struct SNComposer: View {
                         .foregroundColor(showEmojiTray ? SonarTheme.accent : SonarTheme.text3)
                 }
                 .buttonStyle(SNScaleStyle(scale: 0.94))
+                .accessibilityLabel(Text("Emoji and stickers"))
                 .accessibilityIdentifier("sonar-emoji-tray-toggle")
             }
             .padding(.vertical, 7)
@@ -5072,6 +5085,7 @@ struct SNComposer: View {
                 .padding(.bottom, 1)
         }
         .buttonStyle(SNScaleStyle(scale: 0.92))
+        .accessibilityLabel(Text("Send"))
         .accessibilityIdentifier("sonar-message-send")
         .disabled(!hasText)
     }
@@ -5102,6 +5116,19 @@ struct SNComposer: View {
                         endVoiceRecording(send: true)
                     }
             )
+            // A shape with a drag gesture is not a control to VoiceOver, so
+            // voice notes were unreachable. Hold-to-talk becomes two
+            // activations: the first starts recording, the second sends.
+            .accessibilityElement()
+            .accessibilityLabel(recording ? Text("Send") : Text("Record voice message"))
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction {
+                if recording {
+                    endVoiceRecording(send: true)
+                } else {
+                    beginVoiceRecording()
+                }
+            }
     }
 
     private func beginVoiceRecording() {
@@ -5154,6 +5181,7 @@ struct SNComposer: View {
             Button { endVoiceRecording(send: false) } label: {
                 SNIcon(name: .trash, size: 19, weight: 2).foregroundColor(SonarTheme.danger)
             }
+            .accessibilityLabel(Text("Cancel"))
             HStack(spacing: 9) {
                 Circle().fill(SonarTheme.danger).frame(width: 9, height: 9)
                 Text(verbatim: snFmtDur(voice.elapsed))

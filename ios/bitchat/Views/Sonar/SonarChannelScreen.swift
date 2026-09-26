@@ -59,7 +59,7 @@ struct SonarChannelScreen: View {
                     // (geohash channels only — Mesh is always present).
                     if let gh = geohash {
                         let saved = GeohashBookmarksStore.shared.isBookmarked(gh)
-                        SNIconButton(action: {
+                        SNIconButton(Text(verbatim: saved ? "Unsave channel" : "Save channel"), action: {
                             GeohashBookmarksStore.shared.toggle(gh)
                             showToast(GeohashBookmarksStore.shared.isBookmarked(gh) ? "Channel saved" : "Removed from saved channels")
                         }) {
@@ -67,12 +67,10 @@ struct SonarChannelScreen: View {
                                 .font(.system(size: 18, weight: .semibold))
                                 .foregroundColor(saved ? SonarTheme.accent : SonarTheme.text2)
                         }
-                        .accessibilityLabel(saved ? "Unsave channel" : "Save channel")
                     }
-                    SNIconButton(action: { store.push(.nearby) }) {
+                    SNIconButton(Text(verbatim: "People nearby"), action: { store.push(.nearby) }) {
                         SNIcon(name: .rings, size: 20)
                     }
-                    .accessibilityLabel("People nearby")
                 }
             }
 
