@@ -99,7 +99,7 @@ struct SonarPaymentStatusScreen: View {
                     // .rs-x — closes the screen only. Unlike the labelled
                     // Cancel action below, it never aborts the payment: ✕ is
                     // "I am done looking", Cancel is "do not send this".
-                    SNIconButton(action: { store.pop() }) {
+                    SNIconButton(Text("Close"), action: { store.pop() }) {
                         SNIcon(name: .x, size: 14, weight: 2.4)
                             .foregroundColor(SonarTheme.text2)
                     }

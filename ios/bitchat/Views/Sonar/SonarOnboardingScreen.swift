@@ -53,7 +53,7 @@ struct SonarOnboardingScreen: View {
             // bc-obtop
             HStack {
                 if step > 0 || restoring {
-                    SNIconButton(action: {
+                    SNIconButton(Text("Back"), action: {
                         if restoring { restoring = false; restoreError = nil }
                         else { advance(to: step - 1) }
                     }) {

@@ -561,9 +561,12 @@ struct SonarContactProfileScreen: View {
         }
     }
 
+    /// Icon circle + caption as ONE button: the circle alone was an unlabelled
+    /// control ("button") and the caption a detached, untappable text (the
+    /// iOS side of Android's A28).
     private func profileAction(icon: SNIconName, label: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
-        VStack(spacing: 5) {
-            Button(action: action) {
+        Button(action: action) {
+            VStack(spacing: 5) {
                 Circle()
                     .fill(enabled ? SonarTheme.accentSoft : SonarTheme.surface2)
                     .frame(width: 52, height: 52)
@@ -571,13 +574,14 @@ struct SonarContactProfileScreen: View {
                         SNIcon(name: icon, size: 22, weight: 2.1)
                             .foregroundColor(enabled ? SonarTheme.accentDeep : SonarTheme.text3)
                     )
+                Text(verbatim: label)
+                    .font(SonarTheme.uiFont(size: 11, weight: .medium))
+                    .foregroundColor(SonarTheme.text2)
             }
-            .buttonStyle(SNScaleStyle(scale: 0.94))
-            .disabled(!enabled)
-            Text(verbatim: label)
-                .font(SonarTheme.uiFont(size: 11, weight: .medium))
-                .foregroundColor(SonarTheme.text2)
         }
+        .buttonStyle(SNScaleStyle(scale: 0.94))
+        .disabled(!enabled)
+        .accessibilityLabel(Text(verbatim: label))
     }
 
     @ViewBuilder

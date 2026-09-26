@@ -188,10 +188,9 @@ struct SonarHomeScreen: View {
     // bc-header: settings avatar · "sonar" title · radar button
     private var header: some View {
         HStack(spacing: 6) {
-            SNIconButton(action: { store.push(.settings) }) {
+            SNIconButton(Text("Settings"), action: { store.push(.settings) }) {
                 SonarAvatar(name: store.nick.isEmpty ? "you" : store.nick, size: 32)
             }
-            .accessibilityLabel("Settings")
             Text("sonar")
                 .font(SonarTheme.uiFont(size: 27, weight: .heavy))
                 .kerning(-27 * 0.02)
@@ -199,10 +198,9 @@ struct SonarHomeScreen: View {
                 .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())
                 .onTapGesture { titleTap() }
-            SNIconButton(action: { store.push(.nearby) }) {
+            SNIconButton(Text(verbatim: "People nearby"), action: { store.push(.nearby) }) {
                 SNIcon(name: .rings, size: 22)
             }
-            .accessibilityLabel("People nearby")
         }
         .padding(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
         .background(SonarTheme.bg)
@@ -916,6 +914,7 @@ struct SNSearchSheetContent: View {
             .textFieldStyle(.plain)
             .font(SonarTheme.uiFont(size: 16))
             .foregroundColor(SonarTheme.text)
+            .accessibilityLabel(Text("Search"))
             .focused($focused)
             #if os(iOS)
             .textInputAutocapitalization(.never)
