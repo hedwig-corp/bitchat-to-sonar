@@ -93,6 +93,7 @@ def png(w, h, rgb):
 write("photo.png", png(32, 32, (40, 120, 200)))
 write("old-draft.csv", "abandoned,share\n1,2\n")
 write("fresh.csv", "the,share,just,made\n")
+write("cold.csv", "shared,while,sonar,was,closed\n")
 write("Folder QA/one.txt", "inside a shared folder\n")
 write("Folder QA/two.txt", "also inside\n")
 big = os.path.join(fix, "big.bin")
@@ -112,6 +113,7 @@ IT_LINK="$(items link '[{"kind":"url","value":"https://sonar.hedwig.sh/qa-share-
 IT_NOEXT="$(items noext "[{\"kind\":\"file\",\"path\":\"$FIX/README\"}]")"
 IT_BIG="$(items big "[{\"kind\":\"file\",\"path\":\"$FIX/big.bin\"}]")"
 IT_EXPORT="$(items export "[{\"kind\":\"export\",\"path\":\"$FIX/notes.txt\",\"type\":\"public.plain-text\",\"name\":\"export.txt\"}]")"
+IT_COLD="$(items cold "[{\"kind\":\"file\",\"path\":\"$FIX/cold.csv\"}]")"
 IT_OLD="$(items old "[{\"kind\":\"file\",\"path\":\"$FIX/old-draft.csv\"}]")"
 IT_FRESH="$(items fresh "[{\"kind\":\"file\",\"path\":\"$FIX/fresh.csv\"}]")"
 
@@ -415,7 +417,10 @@ launch_sonar "$RUN/bootstrap-launch" ||
 # on the relays the peer cannot open the chat.
 sent=0
 for _ in $(seq 1 12); do
-  if "$PEERS" send "$PEER" "$APP_NPUB" "$HELLO" >/dev/null 2>&1; then sent=1; break; fi
+  # A unique group name: every sonar-cli chat is otherwise titled "Sonar agent
+  # DM", and the picker row is found by its title.
+  if "$CLI" --home "$PEER_HOME" send --to "$APP_NPUB" --text "$HELLO" \
+      --group-name "Share QA $PEER" 2>/dev/null | grep -q '"type"'; then sent=1; break; fi
   sleep 10
 done
 (( sent )) || { echo "bootstrap failed: the app's KeyPackage never reached the relays" >&2; exit 1; }
@@ -522,6 +527,31 @@ if want QA-089; then
     "$PRE;expect:old-draft.csv@40;hostshare:$IT_FRESH;sheet:Sonar;handoff:$INBOX#2;expect:fresh.csv@40;absent:old-draft.csv;$(pick)" || rc=$?; }
   (( rc == 0 )) && { verify "$RUN/QA-089" 150 "file:fresh.csv=$FIX/fresh.csv=application/octet-stream" notext || rc=$?; }
   record QA-089 "$rc" "An abandoned share does not replace the one just made"
+fi
+
+# The most common real flow: Sonar is NOT running when the user shares. They
+# switch to it — a cold launch — and pick the chat straight away, while the
+# store and relays are still coming up. The launch and the tap share one driver
+# run (the race is the point), so the identity check runs afterwards and the
+# scenario is retried once if the launch lost SONAR_BENCH_NSEC.
+if want QA-092; then
+  echo ">> QA-092 Sharing while Sonar is not running (cold launch, immediate pick)" >&2
+  rc=1
+  for attempt in 1 2; do
+    rc=0; reset_inbox
+    xcrun simctl terminate "$UDID" sh.hedwig.sonar >/dev/null 2>&1 || true
+    drive "$RUN/QA-092/share-$attempt" "hostshare:$IT_COLD;sheet:Sonar;staged:$INBOX#1" || rc=$?
+    (( rc == 0 )) && { drive "$RUN/QA-092" \
+      "launch@sonar;expect:Send to…@40;expect:cold.csv;shot:picker;tapc:$CHAT_ROW;wait:4;shot:sent" || rc=$?; }
+    pid="$(sonar_pid)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && ! launched_with_identity "$pid" && (( attempt == 1 )); then
+      echo "   (harness: cold launch lost SONAR_BENCH_NSEC — retrying the scenario)" >&2
+      continue
+    fi
+    break
+  done
+  (( rc == 0 )) && { verify "$RUN/QA-092" 150 "file:cold.csv=$FIX/cold.csv=application/octet-stream" notext || rc=$?; }
+  record QA-092 "$rc" "Sharing while Sonar is not running (cold launch, immediate pick)"
 fi
 
 scenario QA-091 "A text document from Files arrives as the file only" \

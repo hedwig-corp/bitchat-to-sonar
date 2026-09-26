@@ -25,7 +25,7 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 | `android-ui.sh` | uiautomator driver: `dump`, `tapx`/`tapt`/`tapedit`, `wait`/`gone`, `ime`, `shot`. |
 | `peers.sh` | Fresh `sonar-cli` counterparties: `new`, `send`, `send-image`, `listen`, `expect`. |
 | `android-smoke.sh` | Automated registry scenarios (`qaNNN` = `QA-NNN`). |
-| `ios-share-smoke.sh` | iOS share-sheet scenarios QA-080…090: shares real files into Sonar through the system share sheet (Files, Photos, and `ios-share/QAShareHost`, a stand-in third-party app), picks the chat with a fresh peer, and asserts on what the **peer** received (name, MIME, sha256). XCUITest driver in `ios-share/`, generated into `$QA_HOME/share/driver` — the app project is untouched. Pass scenario ids to run a subset. |
+| `ios-share-smoke.sh` | iOS share-sheet scenarios QA-080…092: shares real files into Sonar through the system share sheet (Files, Photos, and `ios-share/QAShareHost`, a stand-in third-party app), picks the chat with a fresh peer, and asserts on what the **peer** received (name, MIME, sha256). XCUITest driver in `ios-share/`, generated into `$QA_HOME/share/driver` — the app project is untouched. Pass scenario ids to run a subset. |
 | `idle-cpu.sh` | Average app CPU over a window on Android or an iOS simulator. |
 | `qr-decode.swift` | Print QR payloads found in a screenshot (macOS CoreImage). |
 
