@@ -122,8 +122,12 @@ Shared behaviour, pinned by tests on both platforms:
   exists for this account", with no dependence on a Breez key.
 - The descriptor, BIP-353 handle and Unify use the Cashu offer and republish
   when it changes. Difference: while an account has no offer yet, Apple skips
-  publishing, while Compose publishes the descriptor with no offer, so a
-  restored device stops advertising an offer only the old device can mint.
+  publishing, while Compose publishes the call descriptor alone. Neither
+  withdraws an offer already on the relays: `descriptor_events`
+  (`core/sonar-core/src/sonar_descriptor.rs`) emits the `sonar.meta.v1`
+  event, which carries the offer, only when there is an offer, because
+  republishing it empty would replace a good offer with nothing. That is
+  deliberate; do not "fix" it to clear the offer.
 - A send that returns Pending is recorded as pending and settled exactly once,
   by the outcome event or by a lookup after reconnecting. A chat ⚡PAY sends
   neither its `PAY` nor its `PAYDONE|2|id|preimage` line until it settles, so
