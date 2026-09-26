@@ -189,7 +189,18 @@ class EventDrivenRefreshTest {
         snapshot: Int = 3,
         npub: String = "me",
         hold: Int = 0,
-    ) = VisibleChatsKey(chatsIdentity, folded, pendingChats, pendingGroups, social, snapshot, npub, hold)
+        conversationIndex: Int = 0,
+    ) = VisibleChatsKey(
+        chatsIdentity,
+        folded,
+        pendingChats,
+        pendingGroups,
+        social,
+        snapshot,
+        npub,
+        hold,
+        conversationIndex,
+    )
 
     @Test
     fun identicalKeysAreEqual() {
@@ -234,5 +245,10 @@ class EventDrivenRefreshTest {
     @Test
     fun ownNpubChangeInvalidates() {
         assertFalse(key(npub = "me") == key(npub = "someoneElse"))
+    }
+
+    @Test
+    fun conversationIndexVersionChangeInvalidates() {
+        assertFalse(key(conversationIndex = 0) == key(conversationIndex = 1))
     }
 }

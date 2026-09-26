@@ -190,8 +190,19 @@ actual object SonarCore {
         )
 
     actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
-        val n = node ?: return@withContext emptyList()
-        n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
+        requireNode().groups().map {
+            SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs, isDirect = it.isDirect)
+        }
+    }
+
+    actual fun liveFoldTarget(groupId: String): String? {
+        val n = node ?: return null
+        return n.liveFoldTarget(groupId)
+    }
+
+    actual fun foldAliases(groupId: String): List<String> {
+        val n = node ?: return listOf(groupId)
+        return n.foldAliases(groupId)
     }
 
     actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {
@@ -203,8 +214,7 @@ actual object SonarCore {
     }
 
     actual suspend fun pendingGroupInvites(): List<SonarGroupInvite> = withContext(Dispatchers.IO) {
-        val n = node ?: return@withContext emptyList()
-        n.pendingGroupInvites().map {
+        requireNode().pendingGroupInvites().map {
             SonarGroupInvite(
                 id = it.idHex,
                 groupId = it.groupIdHex,
@@ -456,8 +466,7 @@ actual object SonarCore {
     }
 
     actual suspend fun messages(chatId: String): List<SonarMsg> = withContext(Dispatchers.IO) {
-        val n = node ?: return@withContext emptyList()
-        n.messages(chatId).map { it.toCommon() }
+        requireNode().messages(chatId).map { it.toCommon() }
     }
 
     actual suspend fun messagesPage(chatId: String, limit: Int, offset: Int): List<SonarMsg> =
@@ -475,8 +484,8 @@ actual object SonarCore {
         withContext(Dispatchers.IO) {
             require(groupLimit >= 0) { "recentMessagePages groupLimit must be non-negative" }
             require(pageLimit >= 0) { "recentMessagePages pageLimit must be non-negative" }
-            val n = node ?: return@withContext emptyList()
-            n.recentMessagePages(groupLimit.toUInt(), pageLimit.toUInt()).map {
+            // Same as messagesPage: a closed node must not look like "no chats".
+            requireNode().recentMessagePages(groupLimit.toUInt(), pageLimit.toUInt()).map {
                 SonarRecentTranscriptPage(
                     chatId = it.groupIdHex,
                     latestTsSecs = it.latestCreatedAtSecs.toLong(),
@@ -486,8 +495,7 @@ actual object SonarCore {
         }
 
     actual suspend fun conversationSummaries(): List<SonarConversationSummary> = withContext(Dispatchers.IO) {
-        val n = node ?: return@withContext emptyList()
-        n.conversationSummaries().map {
+        requireNode().conversationSummaries().map {
             SonarConversationSummary(
                 groupIdHex = it.groupIdHex,
                 name = it.name,

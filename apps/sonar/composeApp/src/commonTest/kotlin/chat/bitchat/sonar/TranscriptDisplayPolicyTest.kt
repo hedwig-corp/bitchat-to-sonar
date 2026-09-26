@@ -793,6 +793,54 @@ class TranscriptDisplayPolicyTest {
         assertEquals(null, reopenTranscriptPaint(null, unreadAtOpen = 0))
     }
 
+    /** #613 QA A1: a 45-message chat reopened at its tail paged once (the
+     *  cursor page brought 1..15 into the window), then load-older stopped at
+     *  16 forever. The family-cache heuristic still counted 45 held rows > a
+     *  30-row page as "older exists", so the source demanded an expansion no
+     *  fetch could satisfy and the held rows were never prepended. */
+    @Test
+    fun exhaustedSourceDoesNotDemandAnotherExpansion() {
+        val rows = (1..45).map { message("g$it", it.toLong()) }
+        val oldestVisible = rows[15]
+        val familyCacheSaysOlder = {
+            hasOlderForFoldFamily("g", emptyMap(), emptyMap(), cachedCount = 45, pageSize = 30)
+        }
+        assertTrue(familyCacheSaysOlder(), "the cache heuristic alone still claims older rows")
+        assertEquals(
+            setOf("g"),
+            transcriptSourceIdsNeedingExpansion(listOf(TranscriptSourceWindow("g", rows, true)), oldestVisible),
+            "old gate: 15 held rows < a page, and the source never stops claiming more",
+        )
+
+        val drained = cursorPageExhaustsSource(rawPageCount = 15, pageSize = 30, admittedNewRows = true)
+        assertTrue(drained, "a short page that admitted rows is the bottom of the source")
+        val gate = transcriptSourceHasOlder(drained, windowHasMore = false, familyHasOlder = familyCacheSaysOlder)
+        assertFalse(gate)
+        assertTrue(
+            transcriptSourceIdsNeedingExpansion(listOf(TranscriptSourceWindow("g", rows, gate)), oldestVisible).isEmpty(),
+            "an exhausted source must let load-older prepend the rows it holds",
+        )
+
+        // Not proof: an empty page that admitted nothing (0.8 remainder can
+        // still be pending), or a full page (more rows beyond it).
+        assertFalse(cursorPageExhaustsSource(rawPageCount = 0, pageSize = 30, admittedNewRows = false))
+        assertFalse(cursorPageExhaustsSource(rawPageCount = 31, pageSize = 30, admittedNewRows = true))
+        assertTrue(transcriptSourceHasOlder(false, windowHasMore = false, familyHasOlder = familyCacheSaysOlder))
+    }
+
+    /** R-049 through #613's remounted-snapshot first paint: the Marmot
+     *  `openChat` early-paint gate refuses any unread open, whether the paint
+     *  would come from the (fold-family) leave frame or the home snapshot. */
+    @Test
+    fun earlyOpenPaintRefusesAnUnreadOpen() {
+        val leaveFrame = listOf(message("read", 1))
+        assertFalse(firstOpenPaintsBeforePage(leaveFrame, emptyList(), unreadAtOpen = 2))
+        assertFalse(firstOpenPaintsBeforePage(emptyList(), leaveFrame, unreadAtOpen = 1))
+        assertTrue(firstOpenPaintsBeforePage(leaveFrame, emptyList(), unreadAtOpen = 0))
+        assertTrue(firstOpenPaintsBeforePage(emptyList(), leaveFrame, unreadAtOpen = 0))
+        assertFalse(firstOpenPaintsBeforePage(emptyList(), emptyList(), unreadAtOpen = 0))
+    }
+
     @Test
     fun firstUnreadIndexSkipsNonMessageRows() {
         // Call records merge into the transcript feed but never consume

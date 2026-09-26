@@ -6,7 +6,35 @@ use crate::marmot::MarmotEngine;
 use crate::timezone::CachedPeerTimezone;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
+
+/// Private per-sender timezone metadata received over encrypted conversations
+/// (timezone shares). Keyed by the sender's Nostr pubkey hex — a person has one
+/// system timezone regardless of how many conversations we share, and the
+/// sender only ever asserts their OWN zone.
+const PEER_TIMEZONE_DDL: &str = "CREATE TABLE IF NOT EXISTS peer_timezone (
+    sender_pubkey_hex TEXT PRIMARY KEY,
+    iana_tz           TEXT NOT NULL,
+    updated_at_secs   INTEGER NOT NULL DEFAULT 0
+);";
+
+/// The zone this device last shared into each MLS group and the epoch it was
+/// encrypted at.
+const TIMEZONE_SHARE_SENT_DDL: &str = "CREATE TABLE IF NOT EXISTS timezone_share_sent (
+    group_id_hex TEXT PRIMARY KEY,
+    iana_tz      TEXT NOT NULL,
+    epoch        INTEGER NOT NULL
+);";
+
+/// Durable hist→live binds. The JSON fold sidecar can vanish while this
+/// SQLCipher file stays put. Restore only recorded pairs — do not infer a bind
+/// from members/name (R-050).
+const HISTORICAL_FOLD_DDL: &str = "CREATE TABLE IF NOT EXISTS historical_fold (
+    historical_hex TEXT PRIMARY KEY,
+    live_hex TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_historical_fold_live
+    ON historical_fold(live_hex);";
 
 pub struct ConversationIndex {
     db: Connection,
@@ -198,36 +226,35 @@ impl ConversationIndex {
         }
 
         if current < 3 {
-            // Private per-sender timezone metadata received over encrypted
-            // conversations (kind-449 timezone shares). Keyed by the sender's
-            // Nostr pubkey hex — a person has one system timezone regardless of
-            // how many conversations we share, and the sender only ever asserts
-            // their OWN zone. `CREATE TABLE IF NOT EXISTS` keeps the step
-            // idempotent under a non-atomic partial migration.
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS peer_timezone (
-                    sender_pubkey_hex TEXT PRIMARY KEY,
-                    iana_tz           TEXT NOT NULL,
-                    updated_at_secs   INTEGER NOT NULL DEFAULT 0
-                );",
-            )
-            .map_err(|e| crate::Error::Storage(format!("index create peer_timezone: {e}")))?;
+            // `CREATE TABLE IF NOT EXISTS` keeps the step idempotent under a
+            // non-atomic partial migration.
+            tx.execute_batch(PEER_TIMEZONE_DDL)
+                .map_err(|e| crate::Error::Storage(format!("index create peer_timezone: {e}")))?;
         }
 
         if current < 4 {
-            // The zone this device last shared into each MLS group and the
-            // epoch it was encrypted at. Without it every process start (and
-            // every iOS store reopen) re-encrypted a kind-449 into every
-            // allowed group. Its own step, not folded into v3: builds of the
-            // timezone branch already wrote v3 databases.
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS timezone_share_sent (
-                    group_id_hex TEXT PRIMARY KEY,
-                    iana_tz      TEXT NOT NULL,
-                    epoch        INTEGER NOT NULL
-                );",
-            )
-            .map_err(|e| crate::Error::Storage(format!("index create timezone_share_sent: {e}")))?;
+            // Without it every process start (and every iOS store reopen)
+            // re-encrypted a timezone share into every allowed group. Its own
+            // step, not folded into v3: builds of the timezone branch already
+            // wrote v3 databases.
+            tx.execute_batch(TIMEZONE_SHARE_SENT_DDL).map_err(|e| {
+                crate::Error::Storage(format!("index create timezone_share_sent: {e}"))
+            })?;
+        }
+
+        if current < 5 {
+            // #613 builds numbered `historical_fold` v3 before #607 took v3/v4
+            // for the timezone tables, so a v3 database may hold the fold table
+            // and neither timezone table. Every statement is IF NOT EXISTS:
+            // re-running the timezone DDL heals that lineage and is a no-op on
+            // a v4 database from main.
+            tx.execute_batch(PEER_TIMEZONE_DDL)
+                .map_err(|e| crate::Error::Storage(format!("index create peer_timezone: {e}")))?;
+            tx.execute_batch(TIMEZONE_SHARE_SENT_DDL).map_err(|e| {
+                crate::Error::Storage(format!("index create timezone_share_sent: {e}"))
+            })?;
+            tx.execute_batch(HISTORICAL_FOLD_DDL)
+                .map_err(|e| crate::Error::Storage(format!("index create historical_fold: {e}")))?;
         }
 
         tx.execute(
@@ -250,7 +277,8 @@ impl ConversationIndex {
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(|e| crate::Error::Storage(format!("index table_info query: {e}")))?;
         for name in names {
-            let name = name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
+            let name =
+                name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
             if name == column {
                 return Ok(true);
             }
@@ -303,6 +331,67 @@ impl ConversationIndex {
         Ok(())
     }
 
+    /// Copy a recovered-chat summary onto its live 0.9 sibling without
+    /// incrementing message counts. Unread is **added** onto the live row
+    /// (an incoming 0.9 DM can already have a badge) and then zeroed on
+    /// the historical id so a second copy cannot double-count.
+    pub fn copy_summary(&self, from_hex: &str, to_hex: &str) -> Result<()> {
+        if from_hex == to_hex {
+            return Ok(());
+        }
+        let Some(src) = self.summary(from_hex)? else {
+            return Ok(());
+        };
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Storage(format!("index copy_summary begin: {e}")))?;
+        tx.execute(
+            "INSERT INTO conversation_summary
+                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs,
+                     latest_mine, message_count, unread_count, version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(group_id_hex) DO UPDATE SET
+                    name = CASE WHEN excluded.name != '' THEN excluded.name ELSE name END,
+                    latest_content = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_content ELSE latest_content END,
+                    latest_sender = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_sender ELSE latest_sender END,
+                    latest_at_secs = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_at_secs ELSE latest_at_secs END,
+                    latest_mine = CASE
+                        WHEN excluded.latest_at_secs >= latest_at_secs
+                        THEN excluded.latest_mine ELSE latest_mine END,
+                    unread_count = unread_count + excluded.unread_count,
+                    version = version + 1",
+            params![
+                to_hex,
+                src.name,
+                src.latest_content,
+                src.latest_sender,
+                src.latest_at_secs as i64,
+                src.latest_mine as i32,
+                src.message_count as i64,
+                src.unread_count as i64,
+                src.version as i64,
+            ],
+        )
+        .map_err(|e| crate::Error::Storage(format!("index copy_summary: {e}")))?;
+        tx.execute(
+            "UPDATE conversation_summary
+                    SET unread_count = 0, version = version + 1
+                    WHERE group_id_hex = ?1 AND unread_count != 0",
+            params![from_hex],
+        )
+        .map_err(|e| crate::Error::Storage(format!("index copy_summary zero hist: {e}")))?;
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index copy_summary commit: {e}")))?;
+        Ok(())
+    }
+
     pub fn ensure_group(&self, group_id_hex: &str, name: &str) -> Result<()> {
         self.db
             .execute(
@@ -348,6 +437,57 @@ impl ConversationIndex {
                 params![group_id_hex],
             )
             .map_err(|e| crate::Error::Storage(format!("index remove: {e}")))?;
+        self.forget_folds_for(group_id_hex)
+    }
+
+    /// Persist a hist→live resume bind that `record_historical_fold` already
+    /// accepted. Lost JSON sidecars rebuild from this table; they must not
+    /// invent a pair from overlapping members.
+    pub fn record_fold(&self, historical_hex: &str, live_hex: &str) -> Result<()> {
+        if historical_hex == live_hex || historical_hex.is_empty() || live_hex.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .execute(
+                "INSERT INTO historical_fold (historical_hex, live_hex)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(historical_hex) DO UPDATE SET live_hex = excluded.live_hex",
+                params![historical_hex, live_hex],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index record_fold: {e}")))?;
+        Ok(())
+    }
+
+    pub fn list_folds(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT historical_hex, live_hex FROM historical_fold")
+            .map_err(|e| crate::Error::Storage(format!("index list_folds prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| crate::Error::Storage(format!("index list_folds query: {e}")))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index list_folds row: {e}")))
+    }
+
+    pub fn forget_folds_for(&self, group_id_hex: &str) -> Result<()> {
+        self.db
+            .execute(
+                "DELETE FROM historical_fold
+                 WHERE historical_hex = ?1 OR live_hex = ?1",
+                params![group_id_hex],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index forget_folds: {e}")))?;
+        Ok(())
+    }
+
+    /// Drop every recorded bind. Tests pair this with
+    /// [`crate::marmot::MarmotEngine::clear_historical_folds`] to isolate the
+    /// topic-match heal from index restore. Production hosts must not call it.
+    pub fn clear_folds(&self) -> Result<()> {
+        self.db
+            .execute("DELETE FROM historical_fold", [])
+            .map_err(|e| crate::Error::Storage(format!("index clear_folds: {e}")))?;
         Ok(())
     }
 
@@ -513,31 +653,61 @@ impl ConversationIndex {
     pub fn materialize_from(&self, engine: &MarmotEngine) -> Result<()> {
         let groups = engine.groups()?;
         for group in &groups {
-            let group_id_hex = hex::encode(group.mls_group_id.as_slice());
-            let page = engine.messages_page(&group.mls_group_id, 1, 0)?;
-            if let Some(msg) = page.first() {
-                let sender = msg.sender.to_string();
-                self.upsert_summary(
-                    &group_id_hex,
-                    &group.name,
-                    &crate::client::index_preview(msg),
-                    &sender,
-                    msg.created_at.as_secs(),
-                    msg.mine,
-                    // Rebuild from storage resets unread below anyway.
-                    msg.classification.is_transcript_visible(),
-                )?;
-                self.db
-                    .execute(
-                        "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
-                        params![group_id_hex],
-                    )
-                    .map_err(|e| {
-                        crate::Error::Storage(format!("index materialize unread reset: {e}"))
-                    })?;
-            } else {
-                self.ensure_group(&group_id_hex, &group.name)?;
+            self.materialize_one(engine, &group.id, &group.name)?;
+        }
+        // Recovered 0.8 history lives on the transcript sidecar, not in the
+        // 0.9 MLS group list. Seed those rows so chat-list first paint keeps
+        // the old conversations after a protocol port.
+        self.seed_missing_recovered(engine)
+    }
+
+    /// Add recovered 0.8 rows that the existing index never stored. Safe on a
+    /// non-empty index: existing summaries (and their unread counts) stay put.
+    pub fn seed_missing_recovered(&self, engine: &MarmotEngine) -> Result<()> {
+        for group_id in engine.recovered_group_ids() {
+            if engine.is_dropped(&group_id) {
+                continue;
             }
+            let hex = hex::encode(group_id.as_slice());
+            if self.summary(&hex)?.is_some() {
+                continue;
+            }
+            let name = engine.historical_group_name(&group_id).unwrap_or_default();
+            self.materialize_one(engine, &group_id, &name)?;
+        }
+        Ok(())
+    }
+
+    fn materialize_one(
+        &self,
+        engine: &MarmotEngine,
+        group_id: &crate::GroupId,
+        name: &str,
+    ) -> Result<()> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let page = engine.messages_page(group_id, 1, 0)?;
+        if let Some(msg) = page.first() {
+            let sender = msg.sender.to_string();
+            self.upsert_summary(
+                &group_id_hex,
+                name,
+                &crate::client::index_preview(msg),
+                &sender,
+                msg.created_at.as_secs(),
+                msg.mine,
+                // Rebuild from storage resets unread below anyway.
+                msg.classification.is_transcript_visible(),
+            )?;
+            self.db
+                .execute(
+                    "UPDATE conversation_summary SET unread_count = 0 WHERE group_id_hex = ?1",
+                    params![group_id_hex],
+                )
+                .map_err(|e| {
+                    crate::Error::Storage(format!("index materialize unread reset: {e}"))
+                })?;
+        } else {
+            self.ensure_group(&group_id_hex, name)?;
         }
         Ok(())
     }
@@ -551,8 +721,26 @@ mod tests {
     fn repair_json_previews_rewrites_legacy_rows_once() {
         let idx = ConversationIndex::open_in_memory().unwrap();
         // Simulate a row written before the guard landed.
-        idx.upsert_summary("g1", "agent", "{\"alert\":\"cpu\",\"host\":\"ocean\"}", "npub1x", 10, false, true).unwrap();
-        idx.upsert_summary("g2", "human", "{ not json, just a brace", "npub1y", 20, false, true).unwrap();
+        idx.upsert_summary(
+            "g1",
+            "agent",
+            "{\"alert\":\"cpu\",\"host\":\"ocean\"}",
+            "npub1x",
+            10,
+            false,
+            true,
+        )
+        .unwrap();
+        idx.upsert_summary(
+            "g2",
+            "human",
+            "{ not json, just a brace",
+            "npub1y",
+            20,
+            false,
+            true,
+        )
+        .unwrap();
         idx.repair_json_previews().unwrap();
         let summaries = idx.summaries_ordered().unwrap();
         let g1 = summaries.iter().find(|s| s.group_id_hex == "g1").unwrap();
@@ -561,7 +749,15 @@ mod tests {
         assert_eq!(g2.latest_content, "{ not json, just a brace");
         // Second repair is a no-op (row no longer brace-prefixed JSON).
         idx.repair_json_previews().unwrap();
-        assert_eq!(idx.summaries_ordered().unwrap().iter().find(|s| s.group_id_hex == "g1").unwrap().latest_content, crate::client::JSON_PAYLOAD_PREVIEW_LABEL);
+        assert_eq!(
+            idx.summaries_ordered()
+                .unwrap()
+                .iter()
+                .find(|s| s.group_id_hex == "g1")
+                .unwrap()
+                .latest_content,
+            crate::client::JSON_PAYLOAD_PREVIEW_LABEL
+        );
     }
 
     #[test]
@@ -651,6 +847,58 @@ mod tests {
         idx.remove_group("g1").unwrap();
         assert!(idx.is_empty());
         assert!(idx.summary("g1").unwrap().is_none());
+    }
+
+    #[test]
+    fn copy_summary_promotes_recovered_row_onto_live_id() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary(
+            "hist",
+            "alice & bob",
+            "keep this chat",
+            "bob",
+            100,
+            false,
+            true,
+        )
+        .unwrap();
+        idx.copy_summary("hist", "live").unwrap();
+
+        let live = idx.summary("live").unwrap().unwrap();
+        assert_eq!(live.name, "alice & bob");
+        assert_eq!(live.latest_content, "keep this chat");
+        assert_eq!(live.unread_count, 1);
+        assert_eq!(
+            idx.summary("hist").unwrap().unwrap().latest_content,
+            "keep this chat"
+        );
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 0);
+    }
+
+    #[test]
+    fn copy_summary_adds_historical_unread_onto_live_that_already_has_unread() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("hist", "alice", "old 1", "bob", 100, false, true)
+            .unwrap();
+        idx.upsert_summary("hist", "alice", "old 2", "bob", 110, false, true)
+            .unwrap();
+        idx.upsert_summary("hist", "alice", "old 3", "bob", 120, false, true)
+            .unwrap();
+        idx.upsert_summary("live", "alice", "new 0.9", "bob", 200, false, true)
+            .unwrap();
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 3);
+        assert_eq!(idx.summary("live").unwrap().unwrap().unread_count, 1);
+
+        idx.copy_summary("hist", "live").unwrap();
+        assert_eq!(idx.summary("live").unwrap().unwrap().unread_count, 4);
+        assert_eq!(idx.summary("hist").unwrap().unwrap().unread_count, 0);
+
+        idx.copy_summary("hist", "live").unwrap();
+        assert_eq!(
+            idx.summary("live").unwrap().unwrap().unread_count,
+            4,
+            "second copy must not double-count after historical unread is zeroed"
+        );
     }
 
     #[test]
@@ -782,7 +1030,7 @@ mod tests {
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
 
-        // Reopen: schema_version is now 2, migration is a no-op.
+        // Reopen: schema_version is now SCHEMA_VERSION, migration is a no-op.
         drop(idx);
         let idx = ConversationIndex::open(&path, key).expect("reopen must not fail");
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
@@ -946,6 +1194,144 @@ mod tests {
         assert_eq!(
             idx.peer_timezone("peer").unwrap().unwrap().zone,
             "Pacific/Chatham"
+        );
+    }
+
+    #[test]
+    fn record_fold_roundtrips_and_remove_group_forgets_bind() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
+
+        idx.record_fold("hist", "live2").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live2".into())],
+            "same historical id must replace the live sibling"
+        );
+
+        idx.remove_group("live2").unwrap();
+        assert!(
+            idx.list_folds().unwrap().is_empty(),
+            "leave/delete of either id must drop the recorded bind"
+        );
+    }
+
+    #[test]
+    fn clear_folds_drops_recorded_binds_only() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("hist", "room", "hi", "bob", 100, false, true)
+            .unwrap();
+        idx.record_fold("hist", "live").unwrap();
+        idx.clear_folds().unwrap();
+        assert!(idx.list_folds().unwrap().is_empty());
+        assert!(
+            idx.summary("hist").unwrap().is_some(),
+            "clear_folds must not wipe conversation summaries"
+        );
+    }
+
+    #[test]
+    fn migrates_v2_schema_adding_historical_fold_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x33u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex    TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL DEFAULT '',
+                    latest_content  TEXT NOT NULL DEFAULT '',
+                    latest_sender   TEXT NOT NULL DEFAULT '',
+                    latest_at_secs  INTEGER NOT NULL DEFAULT 0,
+                    latest_mine     INTEGER NOT NULL DEFAULT 0,
+                    message_count   INTEGER NOT NULL DEFAULT 0,
+                    unread_count    INTEGER NOT NULL DEFAULT 0,
+                    version         INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO schema_version(version) VALUES (2);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("v2 must migrate");
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
+    }
+
+    /// A #613 build wrote `historical_fold` as v3, with neither timezone
+    /// table. v5 must create them, or every timezone share fails to cache.
+    #[test]
+    fn migrates_613_v3_schema_adding_timezone_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x77u8; 32];
+        {
+            let idx = ConversationIndex::open(&path, key).unwrap();
+            idx.record_fold("hist", "live").unwrap();
+            idx.db
+                .execute_batch(
+                    "DROP TABLE peer_timezone;
+                     DROP TABLE timezone_share_sent;
+                     DELETE FROM schema_version;
+                     INSERT INTO schema_version(version) VALUES (3);",
+                )
+                .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("#613 v3 must migrate");
+        assert!(idx
+            .upsert_peer_timezone("peer", "Asia/Kolkata", 9)
+            .unwrap());
+        idx.record_timezone_share_sent("g", "Asia/Kolkata", 1)
+            .unwrap();
+        assert_eq!(idx.timezone_shares_sent().unwrap().len(), 1);
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())],
+            "the recorded bind must survive the migration"
+        );
+    }
+
+    /// A main build (#607) wrote v4 with both timezone tables and no
+    /// `historical_fold`. v5 adds it and keeps the cached zones.
+    #[test]
+    fn migrates_607_v4_schema_adding_historical_fold_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x88u8; 32];
+        {
+            let idx = ConversationIndex::open(&path, key).unwrap();
+            idx.upsert_peer_timezone("peer", "Europe/Zurich", 5).unwrap();
+            idx.db
+                .execute_batch(
+                    "DROP TABLE historical_fold;
+                     DELETE FROM schema_version;
+                     INSERT INTO schema_version(version) VALUES (4);",
+                )
+                .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).expect("#607 v4 must migrate");
+        idx.record_fold("hist", "live").unwrap();
+        assert_eq!(
+            idx.list_folds().unwrap(),
+            vec![("hist".into(), "live".into())]
+        );
+        assert_eq!(
+            idx.peer_timezone("peer").unwrap().unwrap().zone,
+            "Europe/Zurich"
         );
     }
 }

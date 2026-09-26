@@ -367,7 +367,8 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
                         val chat = homeRow.chat
                         val row = state.marmotRow(chat.id)
                         DmRow(
-                            selected = (state.screen as? Screen.Chat)?.id == chat.id,
+                            selected = (state.screen as? Screen.Chat)?.id == chat.id
+                                || state.isConversationOpen(chat.id),
                             name = row.title, preview = row.sub, mesh = false,
                             verified = row.verified,
                             onRowActions = if (row.pending) null else {

@@ -11,10 +11,17 @@ members = ["sonar-core", "sonar-ffi", "sonar-cli", "sonar-stickers", "sonar-stat
 #    interface. MUST stay an island: breez-sdk-liquid ships a forked
 #    libsqlite3-sys 0.36 (`links = "sqlite3"`, plain bundled SQLite) that
 #    cannot coexist in one cargo graph with the workspace's SQLCipher
-#    libsqlite3-sys 0.35 (via mdk-sqlite-storage) — and linking both into one
-#    binary would recreate the SQLCipher symbol-shadowing bug that once broke
-#    iOS Marmot encryption.
-exclude = ["vendor/iroh-roq", "sonar-ble", "sonar-wallet-breez"]
+#    libsqlite3-sys (via storage-sqlite / rusqlite 0.40) — and linking both into
+#    one binary would recreate the SQLCipher symbol-shadowing bug that once
+#    broke iOS Marmot encryption.
+#  - vendor/breez-sdk: sdk-common/sdk-macros, vendored because upstream deleted
+#    github.com/breez/breez-sdk (see vendor/breez-sdk/VENDORED.md). Belongs to
+#    the Breez island for the same reason as above — sdk-common's workspace
+#    pins rusqlite with `bundled` (plain SQLite), so letting this workspace
+#    absorb it would reintroduce the SQLCipher shadowing risk. It has its own
+#    [workspace] root; without this exclude, cargo resolves these crates
+#    against THIS manifest and fails to inherit their workspace deps.
+exclude = ["vendor/iroh-roq", "sonar-ble", "sonar-wallet-breez", "vendor/breez-sdk"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,18 +38,20 @@ lto = "thin"
 codegen-units = 1
 
 [workspace.dependencies]
-# Pinned to the SAME MDK git rev White Noise (whitenoise-rs) uses, so the MLS
-# group/welcome/message wire format matches byte-for-byte and White Noise <->
-# Sonar interop works in BOTH directions. The published crates.io 0.8.0 is
-# behind this rev (which adds the v3 Nostr-group-data extension / disappearing
-# messages); our old 0.8.0 could not read White Noise's newer messages. Keep
-# this rev in lockstep with whitenoise-rs's Cargo.toml.
-# `mip04` enables the Encrypted Media module (EncryptedMediaManager) — the
-# Marmot media spec White Noise uses; required for image/file/voice sharing.
-mdk-core = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1", features = ["mip04"] }
-mdk-storage-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
-mdk-memory-storage = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
-mdk-sqlite-storage = { git = "https://github.com/marmot-protocol/mdk", rev = "e8cd584878be908cb95aad260bb7bca65e017de1" }
+# MDK v0.10.4 (commit fcc85edd, tag v0.10.4, 2026-09-20): the release White
+# Noise iOS ships (MarmotKit v0.10.4). v0.9.21+ rejects invitee KeyPackages
+# that list default MLS capabilities, which every 0.9.14 package did, so an
+# older pin cannot be invited by current White Noise. Upstream deleted the
+# 0.8 crates (`mdk-core` / `mdk-sqlite-storage` / `mdk-memory-storage` /
+# `mdk-storage-traits`) and split the workspace into `cgka-engine` /
+# `cgka-session` / `storage-sqlite` / `transport-nostr-peeler`. Wire format is
+# Marmot `0xf2f1` — NOT byte-compatible with the 0.8 `e8cd584` / `0xf2ee` pin.
+# crates.io still only publishes 0.8.0.
+cgka-traits = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
+cgka-engine = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
+cgka-session = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
+storage-sqlite = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
+transport-nostr-peeler = { git = "https://github.com/marmot-protocol/mdk", rev = "fcc85edd8dbd07c8293c899ee52230f72c54c897" }
 nostr = { version = "0.44", features = ["std", "nip44", "nip59"] }
 nostr-sdk = "0.44"
 nostr-relay-builder = "0.44"
@@ -58,5 +67,7 @@ tempfile = "3.20"
 
 # Accept HTTP 201 Created from Blossom servers (e.g. nostr.download) until upstream
 # nostr-blossom includes the same status handling.
+# hax-lib-macros: copied from MDK so the OpenMLS/libcrux path builds.
 [patch.crates-io]
 nostr-blossom = { path = "vendor/nostr-blossom" }
+hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }

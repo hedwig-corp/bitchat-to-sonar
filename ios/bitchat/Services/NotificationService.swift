@@ -120,9 +120,17 @@ final class NotificationService {
         // kinds (message/payment/trill/BLE) without sprinkling checks at
         // call sites. Rows and unread badges still accrue upstream.
         if let userInfo,
-           let conversationId = SonarNotificationHandoff.conversationId(from: userInfo),
-           SonarChatMuteStore.shared.isMuted(conversationId) {
-            return
+           let conversationId = SonarNotificationHandoff.conversationId(from: userInfo) {
+            let folds = SonarNSEDecoratePolicy.decodeHistoricalFolds(
+                UserDefaults(suiteName: SonarChatMuteStore.appGroupId)
+            )
+            let keys = snMutedFoldKeys(
+                groupIdHex: snBareMarmotGroupId(conversationId),
+                historicalFolds: folds
+            ) + [conversationId]
+            if SonarChatMuteStore.shared.isMuted(anyOf: keys) {
+                return
+            }
         }
         let content = UNMutableNotificationContent()
         content.title = title

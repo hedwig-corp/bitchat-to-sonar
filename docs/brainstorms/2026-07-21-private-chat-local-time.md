@@ -1,3 +1,9 @@
+> **Update (#613, MDK v0.10.4):** the share is no longer kind 449. The MDK 0.10
+> profile reserves 449 for MIP-05 push-token removal, so White Noise members
+> parsed every share as one. It is now a kind-30078 (NIP-78) Marmot app event
+> with a `d` tag of `sonar/local-time`; see `core/sonar-core/src/timezone.rs`.
+> The payload and the rest of this design are unchanged.
+
 ## Clarified Problem Statement
 
 **Goal:** When the user enables Share local time, automatically read the phone's current system timezone and share that IANA identifier inside encrypted private conversations, allowing contacts to see that user's current local time without exposing it on Nostr relays.

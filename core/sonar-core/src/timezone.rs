@@ -5,33 +5,41 @@
 //! contact's live local time can be shown privately — without publishing any
 //! location, geohash, or coordinates.
 //!
-//! Transport mirrors Marmot kind-7 reactions ([`crate::reaction`]): the zone
-//! is an **unsigned kind-449 application rumor inside MLS (kind 445)**. Relays
-//! only ever see the same opaque group ciphertext they already store for chat.
-//! This makes the payload:
+//! The zone travels as a **Marmot app event inside MLS (kind 445)**: kind
+//! 30078 (NIP-78 application data) with a `d` tag of `sonar/local-time`.
+//! Relays only ever see the same opaque group ciphertext they already store
+//! for chat. This makes the payload:
 //!
 //! - **Private**: only current MLS group members can decrypt it. It never
 //!   touches a public kind-0 profile, Sonar descriptor, BLE announce, geohash
 //!   channel, or a pairwise NIP-44 gift wrap that would leak a new event kind
 //!   onto relays.
-//! - **Non-transcript**: `process_group_message` classifies kind 449 as
-//!   `Incoming::TimezoneShare`, so it can never become a transcript row,
+//! - **Non-transcript**: the engine classifies it as `Incoming::TimezoneShare`
+//!   and queues it for the host, so it can never become a transcript row,
 //!   unread count, notification, or chat preview.
-//! - **Backward compatible**: older clients persist the application rumor in
-//!   MDK but filter non-kind-9 rows out of the transcript. The `v` envelope
-//!   field lets newer clients ignore future payload revisions.
+//! - **Not a Marmot protocol event**: kinds MDK assigns meaning to are reserved
+//!   (MDK v0.10.4 `RESERVED_APP_EVENT_KINDS`: 5, 7, 9, 447–449, 1009,
+//!   1200–1202, 1210, 1984, 1985, 4891). The first version used 449, which
+//!   MIP-05 now defines as a push-token removal, so White Noise members parsed
+//!   every share as one. 30078 is a custom kind MDK passes through, and White
+//!   Noise does not render unknown kinds. The `d` tag keeps it apart from
+//!   other apps' kind-30078 data, and the `v` envelope field lets newer
+//!   clients ignore future payload revisions.
 //!
 //! Only the *zone identifier* travels on the wire; the current UTC offset is
 //! recomputed locally by each host from its own tz database, so DST and offset
 //! changes always display correctly without any re-send.
 
+use nostr::{EventBuilder, Kind, PublicKey, Tag, UnsignedEvent};
 use serde::{Deserialize, Serialize};
 
-/// MLS application rumor kind carrying a timezone share. Sits next to the
-/// push-token share (447) and notification request (446) control kinds; 448
-/// is intentionally skipped to avoid any ambiguity. The rumor is encrypted
-/// into a signed kind-445, never published as a public Nostr event.
-pub(crate) const KIND_TIMEZONE_SHARE: u16 = 449;
+/// Marmot app-event kind carrying a timezone share: NIP-78 application data,
+/// namespaced by [`TIMEZONE_SHARE_D_TAG`]. The event is encrypted into a
+/// signed kind-445, never published as a public Nostr event.
+pub(crate) const KIND_TIMEZONE_SHARE: u16 = 30078;
+
+/// `d` tag value that marks a kind-30078 app event as a Sonar timezone share.
+pub(crate) const TIMEZONE_SHARE_D_TAG: &str = "sonar/local-time";
 
 /// Current wire version of [`TimezoneSharePayload`]. Bump only for an
 /// incompatible payload change; older clients ignore versions they do not know.
@@ -42,7 +50,7 @@ pub(crate) const TIMEZONE_SHARE_VERSION: u32 = 1;
 /// while still rejecting obviously abusive input.
 const MAX_ZONE_LEN: usize = 64;
 
-/// JSON payload sent inside the kind-449 rumor.
+/// JSON payload sent inside a timezone share.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TimezoneSharePayload {
     /// Wire version. See [`TIMEZONE_SHARE_VERSION`].
@@ -61,7 +69,24 @@ pub struct CachedPeerTimezone {
     pub updated_at_secs: u64,
 }
 
-/// Encode the local timezone into the JSON body of a kind-449 rumor. Returns an
+/// The unsigned app event carrying `payload` (from
+/// [`encode_timezone_share_payload`]).
+pub(crate) fn timezone_share_rumor(payload: &str, author: PublicKey) -> UnsignedEvent {
+    EventBuilder::new(Kind::Custom(KIND_TIMEZONE_SHARE), payload)
+        .tag(Tag::identifier(TIMEZONE_SHARE_D_TAG))
+        .build(author)
+}
+
+/// Whether a decrypted Marmot app event is a Sonar timezone share: our kind
+/// AND our `d` tag. Another app's kind-30078 data is not.
+pub(crate) fn is_timezone_share(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == u64::from(KIND_TIMEZONE_SHARE)
+        && tags.iter().any(|tag| {
+            tag.len() >= 2 && tag[0] == "d" && tag[1] == TIMEZONE_SHARE_D_TAG
+        })
+}
+
+/// Encode the local timezone into the JSON body of a timezone share. Returns an
 /// error for a syntactically invalid zone so we never advertise garbage.
 pub(crate) fn encode_timezone_share_payload(zone: &str) -> crate::Result<String> {
     let zone = normalize_zone(zone);
@@ -77,7 +102,7 @@ pub(crate) fn encode_timezone_share_payload(zone: &str) -> crate::Result<String>
     serde_json::to_string(&payload).map_err(crate::Error::from)
 }
 
-/// Parse an incoming kind-449 rumor body into a validated zone identifier.
+/// Parse an incoming timezone share body into a validated zone identifier.
 ///
 /// Returns `None` (rather than erroring) for anything we cannot safely use — a
 /// malformed body, an unknown version, or an invalid zone — so a bad control
@@ -145,6 +170,35 @@ fn is_valid_zone_segment(seg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MDK v0.10.4 `RESERVED_APP_EVENT_KINDS` (marmot-app
+    /// `messages/intents.rs`): kinds other clients act on under MDK's
+    /// meaning. 449 is MIP-05's push-token removal.
+    const MARMOT_RESERVED_APP_EVENT_KINDS: [u64; 14] = [
+        5, 7, 9, 447, 448, 449, 1009, 1200, 1201, 1202, 1210, 1984, 1985, 4891,
+    ];
+
+    #[test]
+    fn timezone_share_kind_is_not_a_marmot_protocol_kind() {
+        assert!(
+            !MARMOT_RESERVED_APP_EVENT_KINDS.contains(&u64::from(KIND_TIMEZONE_SHARE)),
+            "White Noise members would act on kind {KIND_TIMEZONE_SHARE} under MDK's meaning"
+        );
+    }
+
+    #[test]
+    fn a_timezone_share_needs_our_kind_and_our_d_tag() {
+        let author = nostr::Keys::generate().public_key();
+        let payload = encode_timezone_share_payload("Europe/Zurich").unwrap();
+        let rumor = timezone_share_rumor(&payload, author);
+        let tags: Vec<Vec<String>> = rumor.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        assert!(is_timezone_share(u64::from(rumor.kind.as_u16()), &tags));
+
+        let other_app = vec![vec!["d".to_string(), "some-other-app".to_string()]];
+        assert!(!is_timezone_share(30078, &other_app), "another app's NIP-78 data");
+        assert!(!is_timezone_share(30078, &[]), "no d tag");
+        assert!(!is_timezone_share(449, &tags), "White Noise's push-token removal");
+    }
 
     #[test]
     fn accepts_real_iana_identifiers() {

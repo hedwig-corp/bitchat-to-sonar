@@ -136,20 +136,41 @@ struct SonarMacRootView: View {
                 SonarCallScreen(peerId: call.convId, video: call.video)
             }
         }
-        .onChange(of: selection) { _ in
+        .onChange(of: selection) { newSelection in
+            let nextId: String?
+            if case .dm(let id) = newSelection { nextId = id } else { nextId = nil }
+            guard store.macSelectionChangeShouldClearPath(nextConversationId: nextId) else { return }
             store.path.removeAll()
         }
         .onChange(of: store.path) { newPath in
             syncSelection(with: newPath.last)
         }
         .onChange(of: store.pendingMarmotRouteReplacement) { replacement in
-            guard let replacement, selection == .dm(replacement.pendingId) else { return }
-            selection = .dm(replacement.realId)
+            guard let replacement, case .dm(let id) = selection else { return }
+            let next = snMacSelectionAfterFoldRemount(
+                selectionId: id,
+                openId: replacement.pendingId,
+                realId: replacement.realId
+            )
+            guard next != id else { return }
+            selection = .dm(next)
         }
         .onChange(of: store.pendingMarmotRouteFailure) { failure in
             guard let failure, selection == .dm(failure.pendingId) else { return }
             selection = .radar
             store.path.removeAll()
+        }
+        .onChange(of: store.deletedOpenConversationTick) { _ in
+            let isDM: Bool
+            let isChannel: Bool
+            switch selection {
+            case .dm: isDM = true; isChannel = false
+            case .channel: isDM = false; isChannel = true
+            default: return
+            }
+            if snMacSelectionShouldHopAfterOpenSessionCleared(isDM: isDM, isChannel: isChannel) {
+                selection = .radar
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .sonarMacOpenSearch)) { _ in
             searchOpen = true
@@ -316,6 +337,7 @@ private struct SonarMacSidebar: View {
                             MacDMRow(
                                 row: row,
                                 selected: selection == .dm(row.id)
+                                    || store.isConversationOpen(row.id)
                             ) {
                                 store.openDM(row.id, marmotGroupId: row.marmotGroupId) {
                                     selection = .dm(row.id)
@@ -340,8 +362,9 @@ private struct SonarMacSidebar: View {
             presenting: pendingDelete
         ) { row in
             Button(store.isMultiMemberMarmotGroupId(row.id) ? "Leave \(row.title)" : "Delete \(row.title)", role: .destructive) {
+                let leaveOpen = selection == .dm(row.id) || store.isConversationOpen(row.id)
                 store.deleteChat(row.id)
-                if selection == .dm(row.id) { selection = .radar }
+                if leaveOpen { selection = .radar }
             }
             Button("Cancel", role: .cancel) {}
         } message: { row in
@@ -481,7 +504,9 @@ private struct SonarMacMainPane: View {
             // reuses the pane instance, .onDisappear never fires for A, and
             // store.closedDM(A) is skipped — leaking A's ConversationViewState
             // (it would keep rebuilding on every store invalidation forever).
-            .id(id)
+            // Remount hops selection hist→live; keep hist identity so the
+            // pane is not remade (scroll / unread / composer).
+            .id(store.macConversationPaneIdentity(forSelectionId: id))
         case .profile:
             MacProfilePane()
         }
@@ -820,6 +845,12 @@ private struct MacConversationPane: View {
     @ViewBuilder private var banner: some View {
         if isChannel {
             SNBanner(icon: .people, tone: .publicRoom, bold: "Public channel", rest: " - anyone nearby can read")
+        } else if store.recoveredChatWaitingForPeerUpdate(id) {
+            SNBanner(
+                icon: .globe, tone: .net,
+                bold: "Waiting for them to update Sonar",
+                rest: " - this chat's history is here; internet send needs their new version"
+            )
         } else if verified {
             SNBanner(icon: .shieldCheck, tone: .enc, bold: "Verified", rest: " - you confirmed \(peer.name)'s safety number")
         } else if isMultiMemberMarmot {
@@ -3899,8 +3930,11 @@ private struct MacDMTranscript: View {
                 onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
-                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
-                expectedNewestDate: store.expectedNewestMessageDate(peerId)
+                unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
+                expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                familyHasOlder: store.canLoadOlderDM(peerId),
+                jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
+                onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) }
             )
         }
     }
@@ -3970,9 +4004,10 @@ private struct MacCollectionHostDM<Composer: View>: View {
                 onJumpQuote: { store.jumpToQuotedMessage(chatId: peerId, parentId: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
-                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                unreadCountAtOpen: store.unreadCountAtOpen(for: peerId),
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
-                jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
+                familyHasOlder: store.canLoadOlderDM(peerId),
+                jumpMessageId: store.jumpMessageIdAtOpen(for: peerId),
                 onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
                 composer: composer
             )
@@ -4040,7 +4075,7 @@ private struct MacSpikeADMHost<Composer: View>: View {
                 onRetry: { store.retryDm(peerId, message: $0) },
                 loadOlder: { await convo.loadOlder() },
                 loadNewest: { await convo.loadNewestIfNeeded() },
-                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId] ?? 0,
+                unreadCountAtOpen: store.unreadCountAtOpen(for: peerId) ?? 0,
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
                 composer: composer
             )

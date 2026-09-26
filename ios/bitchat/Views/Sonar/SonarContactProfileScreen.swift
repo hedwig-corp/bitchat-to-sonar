@@ -34,10 +34,16 @@ struct SonarContactProfileScreen: View {
     @State private var nip05Verified: [String: Bool] = [:]
     @State private var nip05Checks: Set<String> = []
     @State private var paymentCopied = false
+    /// FFI hist→live for this peer's 1:1s. The open remount pair may be a
+    /// group, so persist+remount alone can still pick recovered hist.
+    @State private var ffiDirectFolds: [String: String] = [:]
 
     private var effectiveChatId: String {
         guard peerId.hasPrefix("npub1") else { return peerId }
-        if let group = store.marmotGroup(forNpub: peerId) {
+        if let group = store.contactDirectMarmotGroup(
+            forNpub: peerId,
+            ffiHistoricalFolds: ffiDirectFolds
+        ) {
             return SonarAppStore.marmotIDPrefix + group.id
         }
         if let peerKey = store.sonarPeerKey(forNpub: peerId) {
@@ -476,6 +482,14 @@ struct SonarContactProfileScreen: View {
                 store.marmot.ensureProfile(npub)
             }
             verifyHandleIfNeeded()
+        }
+        .task(id: resolvedNpub) {
+            let npub = resolvedNpub
+            guard !npub.isEmpty else {
+                ffiDirectFolds = [:]
+                return
+            }
+            ffiDirectFolds = await store.ffiFoldsForDirectNpub(npub)
         }
         .onChange(of: nip05Address) { _ in
             // The kind-0 profile may arrive after first paint.

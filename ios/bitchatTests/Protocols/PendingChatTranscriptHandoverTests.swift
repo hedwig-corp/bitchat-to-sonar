@@ -34,11 +34,15 @@ struct PendingChatTranscriptHandoverTests {
         #expect(pendingState.isActive)
 
         let groupId = "5e1ec7ed"
+        // FFI `GroupInfo.is_direct` marks the DM that `startDm` created; the
+        // in-memory default is not-direct so a recovered room never folds onto
+        // a 1:1 (R-050), and only a direct group resolves a pending npub.
         store.marmot.groups = [
             MarmotService.MarmotGroup(
                 id: groupId,
                 name: "",
-                memberNpubs: [SNMarmotProfileCache.canonicalKey(Self.peer)]
+                memberNpubs: [SNMarmotProfileCache.canonicalKey(Self.peer)],
+                isDirect: true
             )
         ]
         let realId = SonarAppStore.marmotIDPrefix + groupId

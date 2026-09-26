@@ -13,10 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::media_crypto::EncryptedMediaUpload;
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
-use mdk_core::encrypted_media::EncryptedMediaUpload;
-use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification, RelayStatus};
@@ -35,8 +34,9 @@ use crate::conversation_index::{
 use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
-    ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
-    MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    gift_wrap_with_current_timestamp_async, ChatMessage, DeliveryState, GroupCreation, GroupInvite,
+    GroupMembershipUpdate, HistoricalGroup, Incoming, MarmotEngine, RecentMessagePage,
+    KEY_PACKAGE_KIND, SONAR_DIRECT_DM_DESCRIPTION, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
@@ -53,7 +53,7 @@ use crate::sticker_cache::{
     STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
 };
 use crate::timezone::CachedPeerTimezone;
-use crate::{Error, Result};
+use crate::{Error, GroupId, Result};
 
 /// Blossom user-server-list event kind (BUD-03): the user's preferred blob
 /// servers, newest first.
@@ -135,7 +135,6 @@ const STICKER_REF_PREFETCH_BATCH_LIMIT: usize = 16;
 const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 /// How often a receive-prefetch await re-checks for an identity wipe.
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
-const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
@@ -256,6 +255,8 @@ fn upload_to_sealed(upload: &EncryptedMediaUpload, url: &str) -> SealedMediaItem
         thumbhash: upload.thumbhash.clone(),
         duration_ms: upload.duration_ms,
         waveform: upload.waveform.clone(),
+        scheme_version: upload.scheme_version.clone(),
+        source_epoch: upload.source_epoch,
     }
 }
 
@@ -287,6 +288,8 @@ fn sealed_item_to_upload(sealed: SealedMediaItem) -> Result<EncryptedMediaUpload
         duration_ms: sealed.duration_ms,
         waveform: sealed.waveform,
         nonce,
+        scheme_version: sealed.scheme_version,
+        source_epoch: sealed.source_epoch,
     })
 }
 
@@ -897,6 +900,41 @@ fn retryable_media_http_error(error: &Error) -> bool {
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// MDK's MIP-03 quiescence window is ~1.1s; wake the drain after it.
+const CONVERGENCE_WAKE_DELAY: Duration = Duration::from_millis(1_500);
+/// Convergence passes a refused media send waits through before retrying.
+const MEDIA_EPOCH_SETTLE_PASSES: usize = 3;
+/// Per-relay bound for [`SonarClient::fetch_key_package`]: enough to see past
+/// a newer MDK 0.8 package from the same account's not-yet-updated install.
+const NEWEST_KEY_PACKAGE_FETCH_LIMIT: usize = 4;
+
+/// NIP-17 inbox relays: where this account reads gift-wrapped welcomes.
+pub const INBOX_RELAYS_KIND: u16 = 10050;
+/// MIP-00 KeyPackage relays: where this account publishes its KeyPackages.
+pub const KEY_PACKAGE_RELAYS_KIND: u16 = 10051;
+
+/// The kind-10050 and kind-10051 relay lists naming `relays`, signed by
+/// `identity`. White Noise (marmot-app) sends a welcome only to the invitee's
+/// kind-10050 list and has no fallback, so without it a White Noise user's
+/// invite to a Sonar user is never delivered. Empty when there are no relays:
+/// an empty list would tell peers this account reads nowhere.
+pub(crate) fn relay_list_events(identity: &Identity, relays: &[RelayUrl]) -> Result<Vec<Event>> {
+    if relays.is_empty() {
+        return Ok(Vec::new());
+    }
+    [INBOX_RELAYS_KIND, KEY_PACKAGE_RELAYS_KIND]
+        .into_iter()
+        .map(|kind| {
+            let tags = relays
+                .iter()
+                .map(|relay| Tag::custom(TagKind::custom("relay"), [relay.to_string()]));
+            Ok(EventBuilder::new(Kind::Custom(kind), "")
+                .tags(tags)
+                .build(identity.public_key())
+                .sign_with_keys(identity.keys())?)
+        })
+        .collect()
+}
 
 /// Relay-side cap when pulling ALL of an author's KeyPackages. `author` can be
 /// attacker-chosen, and this query is unbounded otherwise. Note it bounds the
@@ -1777,7 +1815,7 @@ struct TimezoneShareDedupe {
 }
 
 /// Hydrate the sent-share dedupe from the encrypted index so a process start
-/// (or an iOS store reopen) does not re-encrypt a kind-449 into every group.
+/// (or an iOS store reopen) does not re-encrypt a timezone share into every group.
 fn load_timezone_shares_sent(
     index: &Option<Arc<Mutex<ConversationIndex>>>,
 ) -> HashMap<String, TimezoneShareDedupe> {
@@ -1854,6 +1892,13 @@ pub struct SonarClient {
     /// relay publish. (Incoming membership commits from OTHERS are inherently
     /// racy with sends across the network and are not gated.)
     membership_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Serializes first-resume mint (`resolve_send_group` creating a new 0.9
+    /// group for a recovered 0.8 row). Two concurrent sends (text+media,
+    /// double-tap) used to each mint a group; `record_resume_fold` then
+    /// stole history onto the second and left an extra empty chat.
+    /// Client-wide: first-resume mint is rare and the window includes the
+    /// KeyPackage fetch. Already-folded sends do not take this lock.
+    resume_mint_lock: Arc<tokio::sync::Mutex<()>>,
     /// How many times the live pending buffer dropped its oldest half.
     buffer_drops_total: Arc<AtomicUsize>,
     /// True after the real-session Marmot live tail is opened. Local group
@@ -1942,6 +1987,9 @@ pub struct SonarClient {
     sticker_ref_prefetch_inflight: StickerRefPrefetchInflight,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// How many times a new live join/create asked to share our push token.
+    /// Tests pin first-resume mint / Accept without waiting on relays.
+    push_token_share_after_join: Arc<AtomicU64>,
     /// Incoming-message notifications produced by the forced-sync gap-recovery
     /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
     /// `drain_pending_marmot()`; the recovered messages are stored by the sync
@@ -2025,6 +2073,14 @@ impl SonarClient {
         client.handle_state_path = Some(handle_path);
         client.marmot_db_path = Some(db_path.to_path_buf());
         client.materialize_index_if_empty();
+        // JSON folds → index (existing installs). Index folds → JSON
+        // (lost sidecar). Do this at connect so first paint does not wait
+        // on ensure_subscriptions. If both sidecars are gone, re-discover
+        // by members so fold_aliases / first-open messages_page / nsec
+        // restore remount do not wait on home-list `groups()`.
+        client.persist_engine_folds_into_index();
+        client.restore_recorded_folds_from_index();
+        client.rediscover_unbound_historical_folds();
         Ok(client)
     }
 
@@ -2452,6 +2508,7 @@ impl SonarClient {
             marmot_notify,
             send_inflight,
             membership_gate,
+            resume_mint_lock: Arc::new(tokio::sync::Mutex::new(())),
             buffer_drops_total,
             live_marmot_enabled,
             marmot_group_subscriptions,
@@ -2485,6 +2542,7 @@ impl SonarClient {
             )),
             sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
+            push_token_share_after_join: Arc::new(AtomicU64::new(0)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
@@ -2522,12 +2580,16 @@ impl SonarClient {
         &self.engine
     }
 
-    /// Publish our kind-30443 KeyPackage so others can start groups with us.
+    /// Publish our kind-30443 KeyPackage so others can start groups with us,
+    /// with the kind-10050/10051 relay lists White Noise routes welcomes by.
     /// Waits for the relay OK acks — callers that need durability (a peer is
     /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = self.engine.key_package_event(self.relays.clone()).await?;
         self.nostr.send_event(&event).await?;
+        for list in relay_list_events(self.identity(), &self.relays)? {
+            self.nostr.send_event(&list).await?;
+        }
         Ok(())
     }
 
@@ -2541,11 +2603,17 @@ impl SonarClient {
     /// logged, not returned. Event creation (MLS key material persistence) still
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = self.engine.key_package_event(self.relays.clone()).await?;
+        let lists = relay_list_events(self.identity(), &self.relays)?;
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
             if let Err(err) = nostr.send_event(&event).await {
                 tracing::warn!(%err, "background KeyPackage publish failed");
+            }
+            for list in lists {
+                if let Err(err) = nostr.send_event(&list).await {
+                    tracing::warn!(%err, kind = list.kind.as_u16(), "background relay list publish failed");
+                }
             }
         });
         Ok(())
@@ -2586,13 +2654,41 @@ impl SonarClient {
         key_package: Event,
         name: &str,
     ) -> Result<GroupId> {
-        let creation = self.engine.create_group_with_description(
-            name,
-            SONAR_DIRECT_DM_DESCRIPTION,
-            vec![key_package],
-            self.relays.clone(),
-        )?;
+        let creation = self
+            .engine
+            .create_group_with_description(
+                name,
+                SONAR_DIRECT_DM_DESCRIPTION,
+                vec![key_package],
+                self.relays.clone(),
+                Vec::new(),
+            )
+            .await?;
         self.publish_group_creation(creation).await
+    }
+
+    /// Best-effort KeyPackages for a recovered 0.8 resume. Missing packages
+    /// (peer still on 0.8 / unpublished) are skipped. Relay/fetch failures
+    /// still fail the send — a down relay is not "they have not updated".
+    async fn fetch_resume_key_packages(&self, members: &[PublicKey]) -> Result<Vec<Event>> {
+        let mut packages = Vec::new();
+        let mut relay_err = None;
+        for member in members {
+            if *member == self.identity().public_key() {
+                continue;
+            }
+            match self.fetch_key_package(*member).await {
+                Ok(event) => packages.push(event),
+                Err(Error::KeyPackageNotFound(_)) => {}
+                Err(err) => relay_err = Some(err),
+            }
+        }
+        if packages.is_empty() {
+            if let Some(err) = relay_err {
+                return Err(err);
+            }
+        }
+        Ok(packages)
     }
 
     async fn fetch_key_packages_for_members(&self, members: Vec<PublicKey>) -> Result<Vec<Event>> {
@@ -2629,19 +2725,41 @@ impl SonarClient {
     /// not silently change meaning if that ordering ever does.
     ///
     /// The `limit` is a relay-side bound and must stay: `author` is
-    /// attacker-chosen on the join-request path. One event per relay is enough,
-    /// because the globally newest event is by definition the newest on whatever
-    /// relay carries it.
+    /// attacker-chosen on the join-request path. A few events per relay, not
+    /// one: during the MDK 0.8 → 0.9 transition an account can run both an
+    /// updated and a not-yet-updated install, each republishing its own slot,
+    /// and a newer 0.8 package must not hide the 0.9 one.
+    ///
+    /// A peer with only MDK 0.8 packages has not updated: MDK 0.9 can never
+    /// admit one, so it reads as not found. Hosts map that to "Waiting for them
+    /// to update Sonar" — handing it to MLS instead failed the resume with an
+    /// opaque capability error (#613 QA A2).
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
-            .limit(1);
+            .limit(NEWEST_KEY_PACKAGE_FETCH_LIMIT);
         let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
-        events
+        let mut saw_legacy = false;
+        let newest = events
             .into_iter()
-            .max_by_key(|e| e.created_at)
-            .ok_or(Error::KeyPackageNotFound(author))
+            .filter(|event| {
+                let legacy = is_legacy_mdk08_key_package(event);
+                saw_legacy |= legacy;
+                !legacy
+            })
+            .max_by_key(|e| e.created_at);
+        match newest {
+            Some(event) => Ok(event),
+            None => {
+                if saw_legacy {
+                    tracing::info!(
+                        "peer only publishes MDK 0.8 KeyPackages; waiting for them to update"
+                    );
+                }
+                Err(Error::KeyPackageNotFound(author))
+            }
+        }
     }
 
     /// Fetch the exact KeyPackage advertised by a join request.
@@ -3095,7 +3213,8 @@ impl SonarClient {
         let key_packages = self.fetch_key_packages_for_members(members).await?;
         let creation = self
             .engine
-            .create_group(name, key_packages, self.relays.clone())?;
+            .create_group(name, key_packages, self.relays.clone())
+            .await?;
         self.publish_group_creation(creation).await
     }
 
@@ -3114,12 +3233,16 @@ impl SonarClient {
             return Ok(existing);
         }
         let key_packages = self.fetch_key_packages_for_members(vec![peer]).await?;
-        let creation = self.engine.create_group_with_description(
-            name,
-            SONAR_DIRECT_DM_DESCRIPTION,
-            key_packages,
-            self.relays.clone(),
-        )?;
+        let creation = self
+            .engine
+            .create_group_with_description(
+                name,
+                SONAR_DIRECT_DM_DESCRIPTION,
+                key_packages,
+                self.relays.clone(),
+                Vec::new(),
+            )
+            .await?;
         self.publish_group_creation(creation).await
     }
 
@@ -3128,47 +3251,26 @@ impl SonarClient {
         let groups = self.engine.groups()?;
         let me = self.identity().public_key();
         for group in groups {
-            let members = self.engine.members(&group.mls_group_id)?;
-            if Self::is_reusable_dm_group(&group, &members, &me, peer) {
-                return Ok(Some(group.mls_group_id));
+            let members = self.engine.members(&group.id)?;
+            if members.len() != 2 || !members.contains(peer) || !members.contains(&me) {
+                continue;
+            }
+            // `group_is_direct` keeps a remounted empty-topic room off this
+            // path (R-050). Do not reuse session name/desc alone.
+            if self.group_is_direct(&group.id) {
+                return Ok(Some(group.id));
             }
         }
         Ok(None)
     }
 
-    fn is_reusable_dm_group(
-        group: &group_types::Group,
-        members: &[PublicKey],
-        me: &PublicKey,
-        peer: &PublicKey,
-    ) -> bool {
-        if members.len() != 2 || !members.contains(peer) || !members.contains(me) {
-            return false;
-        }
-
-        group.description == SONAR_DIRECT_DM_DESCRIPTION
-            || (group.description.is_empty() && group.name.is_empty())
-    }
-
     async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
-        let group_id = creation.group.mls_group_id;
-        let mut wrapped_welcomes = Vec::with_capacity(creation.welcomes.len());
-
-        for (member, rumor) in creation.welcomes {
-            match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
-                Err(err) => {
-                    self.discard_unpublished_group_creation(&group_id);
-                    return Err(err);
-                }
-            }
-        }
-
+        let group_id = creation.group.id;
         let mut published_welcomes = 0usize;
-        for wrapped in wrapped_welcomes {
+        for (_member, wrapped) in creation.welcomes {
             if let Err(err) = self.publish_marmot_event(&wrapped, "group welcome").await {
                 if published_welcomes == 0 {
-                    self.discard_unpublished_group_creation(&group_id);
+                    self.discard_unpublished_group_creation(&group_id).await;
                 } else {
                     tracing::debug!(
                         %err,
@@ -3182,18 +3284,19 @@ impl SonarClient {
             published_welcomes += 1;
         }
 
-        self.engine.merge_pending_commit(&group_id)?;
+        self.engine.merge_pending_commit(&group_id).await?;
         let name = self
             .engine
             .groups()
             .ok()
-            .and_then(|gs| {
-                gs.into_iter()
-                    .find(|g| g.mls_group_id == group_id)
-                    .map(|g| g.name)
-            })
+            .and_then(|gs| gs.into_iter().find(|g| g.id == group_id).map(|g| g.name))
             .unwrap_or_default();
         self.ensure_index_for_group(&group_id, &name);
+        self.maybe_fold_new_group(&group_id);
+        // First-resume mint and start_dm create a live group peers will
+        // send into. Share our token now so a killed-app gap before the
+        // next sync does not leave them without a Transponder wake.
+        self.schedule_share_push_token_with_groups();
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
@@ -3203,39 +3306,25 @@ impl SonarClient {
         Ok(group_id)
     }
 
-    fn discard_unpublished_group_creation(&self, group_id: &GroupId) {
-        let _ = self.engine.clear_pending_commit(group_id);
-        let _ = self.engine.delete_group(group_id);
+    async fn discard_unpublished_group_creation(&self, group_id: &GroupId) {
+        let _ = self.engine.clear_pending_commit(group_id).await;
+        let _ = self.engine.delete_group(group_id).await;
     }
 
     async fn publish_membership_update(&self, update: GroupMembershipUpdate) -> Result<()> {
         let group_id = update.group_id.clone();
         let requires_commit_merge = update.requires_commit_merge;
-        let mut wrapped_welcomes = Vec::with_capacity(update.welcomes.len());
-
-        for (member, rumor) in update.welcomes {
-            match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
-                Err(err) => {
-                    if requires_commit_merge {
-                        let _ = self.engine.clear_pending_commit(&group_id);
-                    }
-                    return Err(err);
-                }
-            }
-        }
-
         if let Err(err) = self
             .publish_marmot_event(&update.evolution_event, "membership update")
             .await
         {
             if requires_commit_merge {
-                let _ = self.engine.clear_pending_commit(&group_id);
+                let _ = self.engine.clear_pending_commit(&group_id).await;
             }
             return Err(err.into());
         }
 
-        for wrapped in wrapped_welcomes {
+        for (_member, wrapped) in update.welcomes {
             if let Err(err) = self
                 .publish_marmot_event(&wrapped, "membership welcome")
                 .await
@@ -3250,7 +3339,7 @@ impl SonarClient {
         }
 
         if requires_commit_merge {
-            self.engine.merge_pending_commit(&group_id)?;
+            self.engine.merge_pending_commit(&group_id).await?;
         }
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after membership update");
@@ -3273,13 +3362,17 @@ impl SonarClient {
     }
 
     /// Add members to an existing group.
+    ///
+    /// A recovered 0.8 id is routed onto the live 0.9 sibling first —
+    /// `engine.add_members` cannot commit on a historical group.
     pub async fn add_group_members(
         &self,
         group_id: &GroupId,
         members: Vec<PublicKey>,
     ) -> Result<()> {
+        let group_id = self.resolve_send_group(group_id).await?;
         let key_packages = self.fetch_key_packages_for_members(members).await?;
-        self.commit_add_members(group_id, key_packages).await
+        self.commit_add_members(&group_id, key_packages).await
     }
 
     /// Commit already-resolved KeyPackages into `group_id`.
@@ -3289,11 +3382,14 @@ impl SonarClient {
     /// [`Self::add_group_members`] on lock discipline.
     async fn commit_add_members(&self, group_id: &GroupId, key_packages: Vec<Event>) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
-        let update = self.engine.add_members(group_id, key_packages)?;
+        let update = self.engine.add_members(group_id, key_packages).await?;
         self.publish_membership_update(update).await
     }
 
     /// Remove members from an existing group.
+    ///
+    /// Same fold routing as [`Self::add_group_members`]: admin on a recovered
+    /// 0.8 id must commit on the live sibling.
     pub async fn remove_group_members(
         &self,
         group_id: &GroupId,
@@ -3304,12 +3400,13 @@ impl SonarClient {
                 "remove_group_members requires at least one member".into(),
             ));
         }
+        let group_id = self.resolve_send_group(group_id).await?;
         // Write-hold the gate from commit creation through publish+merge so no
         // send can encrypt at the pre-removal epoch while the commit is on the
         // wire — the removed member must not be able to read anything sent
         // after the removal was initiated.
         let _epoch = self.membership_gate.write().await;
-        let update = self.engine.remove_members(group_id, &members)?;
+        let update = self.engine.remove_members(&group_id, &members).await?;
         self.publish_membership_update(update).await
     }
 
@@ -3322,32 +3419,70 @@ impl SonarClient {
     /// create the leave proposal (MIP-03).
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
-        let leave_update = match self.engine.leave_group(group_id) {
-            Ok(update) => update,
-            Err(err) if err.to_string().contains("self-demote") => {
-                let demote = self.engine.self_demote(group_id)?;
+        // Persist-folds can remount while the JSON sidecar is gone. Restore
+        // the recorded index bind — or re-discover by members when that
+        // bind is gone too — before capturing `fold_aliases`. Leave of the
+        // live id would otherwise leave hist on disk and the next
+        // `groups()` paints the deleted room again.
+        self.restore_or_rediscover_touching(group_id);
+        let leave_id = self
+            .engine
+            .live_fold_target(group_id)
+            .filter(|live| self.engine.is_live_group(live).unwrap_or(false))
+            .unwrap_or_else(|| group_id.clone());
+        let mut queued_leave_event = None;
+        let leave_update = match self.engine.leave_group(&leave_id).await {
+            Ok(update) => Some(update),
+            // MDK queued the SelfRemove behind unresolved convergence input.
+            // Converge now so the proposal goes out before the chat is dropped.
+            Err(Error::LeaveQueued) => {
+                queued_leave_event = self
+                    .engine
+                    .regenerate_queued_leave(&leave_id)
+                    .await
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(%err, "queued leave did not regenerate");
+                        None
+                    });
+                if queued_leave_event.is_none() {
+                    tracing::warn!(
+                        "queued leave not regenerated in time; dropping the chat locally"
+                    );
+                }
+                None
+            }
+            Err(err) if is_admin_self_remove_blocked(&err) => {
+                let demote = self.engine.self_demote(&leave_id).await?;
                 self.best_effort_membership_publish(demote, "self-demote before leave")
                     .await;
-                self.engine.leave_group(group_id)?
+                Some(self.engine.leave_group(&leave_id).await?)
             }
+            Err(_) if !self.engine.is_live_group(&leave_id).unwrap_or(false) => None,
             Err(err) => return Err(err),
         };
         // Always purge locally first — Leave is a user intent to drop this chat.
         // Leave updates are proposals (`requires_commit_merge == false`), so the
         // evolution event can be published after MDK group state is gone.
-        let group_id_hex = hex::encode(group_id.as_slice());
-        self.engine.delete_group(group_id)?;
-        self.outbox_state
-            .lock()
-            .unwrap()
-            .remove_group_entries(&group_id_hex)?;
-        self.remove_index_for_group(group_id);
-        self.notify_conversation_changed(&group_id_hex);
+        // Purge the recovered 0.8 sibling too so a later start_dm cannot
+        // re-fold deleted history onto a new live group.
+        let family = self.engine.fold_aliases(&leave_id);
+        self.engine.delete_group(&leave_id).await?;
+        self.purge_conversation_ids(&family);
         if let Some(ref db_path) = self.marmot_db_path {
             crate::account_backup::mark_backup_dirty(db_path);
         }
         self.schedule_resubscribe_marmot_groups_if_live();
-        self.schedule_best_effort_leave_publish(leave_update);
+        if let Some(leave_update) = leave_update {
+            self.schedule_best_effort_leave_publish(leave_update);
+        }
+        if let Some(event) = queued_leave_event {
+            self.schedule_best_effort_leave_publish(GroupMembershipUpdate {
+                group_id: leave_id.clone(),
+                evolution_event: event,
+                welcomes: Vec::new(),
+                requires_commit_merge: false,
+            });
+        }
         Ok(())
     }
 
@@ -3356,8 +3491,11 @@ impl SonarClient {
         update: GroupMembershipUpdate,
         context: &'static str,
     ) {
-        match tokio::time::timeout(MEMBERSHIP_PUBLISH_TIMEOUT, self.publish_membership_update(update))
-            .await
+        match tokio::time::timeout(
+            MEMBERSHIP_PUBLISH_TIMEOUT,
+            self.publish_membership_update(update),
+        )
+        .await
         {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
@@ -3409,27 +3547,44 @@ impl SonarClient {
     // ── Invite links ──────────────────────────────────────────────────
 
     pub fn create_invite_link(&self, group_id: &GroupId, group_name: &str) -> Result<String> {
+        let mint_id = self.invite_mint_group(group_id)?;
         let relay_strings: Vec<String> = self.relays.iter().map(|r| r.to_string()).collect();
-        self.invite_links
-            .create_link(group_id, group_name, self.engine.identity(), relay_strings)
+        let token = self.invite_links.create_link(
+            &mint_id,
+            group_name,
+            self.engine.identity(),
+            relay_strings,
+        )?;
+        // Minting a shareable secret is local-only and must not wait for the
+        // next outbound send to enter the opportunistic backup window.
+        if let Some(ref db_path) = self.marmot_db_path {
+            crate::account_backup::mark_backup_dirty(db_path);
+        }
+        Ok(token)
     }
 
     pub fn revoke_invite_link(&self, group_id: &GroupId, secret_hash: &[u8; 32]) -> Result<()> {
-        self.invite_links.revoke_link(group_id, secret_hash)
+        self.invite_links
+            .revoke_link_for(&self.invite_family(group_id), secret_hash)?;
+        if let Some(ref db_path) = self.marmot_db_path {
+            crate::account_backup::mark_backup_dirty(db_path);
+        }
+        Ok(())
     }
 
     pub fn active_invite_links(
         &self,
         group_id: &GroupId,
     ) -> Vec<crate::invite_link::InviteLinkMeta> {
-        self.invite_links.active_links(group_id)
+        self.invite_links
+            .active_links_for(&self.invite_family(group_id))
     }
 
     pub async fn request_join_via_link(&self, token_str: &str) -> Result<()> {
         let token = crate::invite_link::decode_invite_token(token_str)?;
         let admin = PublicKey::from_slice(&token.admin_npub)
             .map_err(|e| Error::InvalidInput(e.to_string()))?;
-        let group_id = GroupId::from_slice(&token.group_id);
+        let group_id = GroupId::new(token.group_id.clone());
         let invite_relays: Vec<RelayUrl> = token
             .relays
             .iter()
@@ -3445,7 +3600,10 @@ impl SonarClient {
         };
 
         self.ensure_relays_connected(&publish_relays).await?;
-        let kp_event = self.engine.key_package_event(publish_relays.clone())?;
+        let kp_event = self
+            .engine
+            .key_package_event(publish_relays.clone())
+            .await?;
         let output = self
             .nostr
             .send_event_to(publish_relays.clone(), &kp_event)
@@ -3468,7 +3626,8 @@ impl SonarClient {
         &self,
         group_id: &GroupId,
     ) -> Vec<crate::invite_link::JoinRequest> {
-        self.invite_links.pending_join_requests(group_id)
+        self.invite_links
+            .pending_join_requests_for(&self.invite_family(group_id))
     }
 
     pub async fn approve_join_request(
@@ -3484,30 +3643,40 @@ impl SonarClient {
                 "cannot approve your own join request".into(),
             ));
         }
+        let family = self.invite_family(group_id);
         let request = self
             .invite_links
-            .pending_join_requests(group_id)
+            .pending_join_requests_for(&family)
             .into_iter()
             .find(|request| request.requester == *requester)
             .ok_or_else(|| Error::InvalidInput("no pending join request".into()))?;
+        let live = self.resolve_send_group(group_id).await?;
         let key_package = self.key_package_for_join_request(&request).await?;
-        self.commit_add_members(group_id, vec![key_package]).await?;
-        self.invite_links.remove_join_request(group_id, requester)?;
+        self.commit_add_members(&live, vec![key_package]).await?;
+        self.invite_links
+            .remove_join_request_for(&family, requester)?;
         Ok(())
     }
 
     pub fn decline_join_request(&self, group_id: &GroupId, requester: &PublicKey) -> Result<()> {
-        self.invite_links.remove_join_request(group_id, requester)
+        self.invite_links
+            .remove_join_request_for(&self.invite_family(group_id), requester)
     }
 
     pub fn store_join_request(&self, request: crate::invite_link::JoinRequest) -> Result<bool> {
+        let family = self.invite_family(&request.group_id);
         if !self
             .invite_links
-            .validate_secret(&request.group_id, &request.secret_hash)
+            .validate_secret_for(&family, &request.secret_hash)
         {
             return Ok(false);
         }
         self.invite_links.add_join_request(request)?;
+        // Pre-migration requests key hist. Host group-info sits on live.
+        // Wake every family id so a lost JSON sidecar still remounts.
+        for id in family {
+            self.notify_conversation_changed(&hex::encode(id.as_slice()));
+        }
         Ok(true)
     }
 
@@ -3519,15 +3688,13 @@ impl SonarClient {
     /// Accept a pending group invite by welcome event id, then backfill its
     /// existing group history and widen the live subscription.
     pub async fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
-        let group_id = self.engine.accept_group_invite(welcome_id)?;
-        if let Some(group) = self
-            .engine
-            .groups()?
-            .into_iter()
-            .find(|g| g.mls_group_id == group_id)
-        {
+        let group_id = self.engine.accept_group_invite(welcome_id).await?;
+        if let Some(group) = self.engine.groups()?.into_iter().find(|g| g.id == group_id) {
             self.ensure_index_for_group(&group_id, &group.name);
-            let nostr_group_id = hex::encode(group.nostr_group_id);
+            let nostr_group_id = self
+                .engine
+                .nostr_h_tag_hex(&group_id)?
+                .unwrap_or_else(|| hex::encode(group.id.as_slice()));
             if let Err(err) = self.backfill_group(&nostr_group_id).await {
                 tracing::debug!(
                     %err,
@@ -3536,6 +3703,17 @@ impl SonarClient {
                 );
             }
         }
+        // Auto-accept is Incoming::GroupUpdated (below). Parked 2-member
+        // welcomes land here when the user taps Accept. Either path must
+        // fold a recovered 0.8 DM onto this live id so history is not a
+        // second row and a later send on the 0.8 id cannot mint a third.
+        self.maybe_fold_new_group(&group_id);
+        // Immediate `backfill_group` above can fail (timeout, no quorum).
+        // After the one-shot empty-transcript scan, idle short-circuit
+        // sync never re-lists this room — enqueue the same empty-live
+        // retry auto-joined DMs use. Folded hist does not count.
+        self.enqueue_empty_live_transcript_backfill(&group_id);
+        self.schedule_share_push_token_with_groups();
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
@@ -3544,8 +3722,8 @@ impl SonarClient {
     }
 
     /// Decline a pending group invite by welcome event id.
-    pub fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
-        self.engine.decline_group_invite(welcome_id)
+    pub async fn decline_group_invite(&self, welcome_id: &EventId) -> Result<()> {
+        self.engine.decline_group_invite(welcome_id).await
     }
 
     /// Encrypt and durably record a text message locally before relay publish.
@@ -3564,6 +3742,8 @@ impl SonarClient {
         text: &str,
         reply: Option<&crate::reply::ReplyTo>,
     ) -> Result<()> {
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
         let local_started = Instant::now();
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
@@ -3571,7 +3751,8 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_text_message_with_reply(group_id, text, reply)?
+                .create_and_process_text_message_with_reply(group_id, text, reply)
+                .await?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -3592,6 +3773,7 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        self.notify_fold_aliases(group_id);
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
@@ -3755,10 +3937,13 @@ impl SonarClient {
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
     pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_sticker_message(group_id, sticker_ref)?
+                .create_and_process_sticker_message(group_id, sticker_ref)
+                .await?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -4669,11 +4854,7 @@ impl SonarClient {
                 let attempts = outbox_state
                     .lock()
                     .unwrap()
-                    .mark_failed_by_message_id(
-                        &message_id_hex,
-                        reason,
-                        Timestamp::now().as_secs(),
-                    )
+                    .mark_failed_by_message_id(&message_id_hex, reason, Timestamp::now().as_secs())
                     .ok()
                     .flatten();
                 // Surface the first failure to the host immediately (Failed +
@@ -4705,10 +4886,10 @@ impl SonarClient {
                 if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
                     break;
                 }
-                let prepared = outbox_state.lock().unwrap().prepare_auto_retry(
-                    &message_id_hex,
-                    Timestamp::now().as_secs(),
-                );
+                let prepared = outbox_state
+                    .lock()
+                    .unwrap()
+                    .prepare_auto_retry(&message_id_hex, Timestamp::now().as_secs());
                 match prepared {
                     Ok(Some((next_group_id_hex, next_event))) => {
                         group_id_hex = next_group_id_hex;
@@ -4748,10 +4929,29 @@ impl SonarClient {
 
     /// Retry one failed outgoing message using the exact encrypted event stored
     /// in the durable outbox. This never creates a second local transcript row
-    /// or advances MLS state; it only republishes the original wrapper event.
+    /// or advances MLS state; it only republishes the original wrapper event
+    /// when that event is still live 0.9 ciphertext.
     pub async fn retry_message(&self, message_id_hex: &str) -> Result<String> {
         if self.relays.is_empty() {
             return Err(Error::NoRelayConnected);
+        }
+        let group_id_hex = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .group_id_hex_for_message(message_id_hex)
+            .ok_or_else(|| Error::InvalidInput("message is no longer available to retry".into()))?;
+        let Some(group_id) = decode_group_id_hex(&group_id_hex) else {
+            return Err(Error::InvalidInput(
+                "message is no longer available to retry".into(),
+            ));
+        };
+        self.restore_recorded_folds_from_index();
+        // 0.8 ciphertext cannot be decrypted by a 0.9 peer. Refuse before
+        // flipping the row back to Pending, or a tap would republish the
+        // dead wrapper and a successful relay ACK would paint Sent.
+        if !self.engine.is_live_group(&group_id).unwrap_or(false) {
+            return Err(Error::HistoricalProtocolRetry);
         }
         let (group_id_hex, event) = self
             .outbox_state
@@ -4767,31 +4967,89 @@ impl SonarClient {
         if self.relays.is_empty() {
             return;
         }
-        let active_group_ids = match self.engine.groups() {
-            Ok(groups) => groups
-                .into_iter()
-                .map(|group| hex::encode(group.mls_group_id.as_slice()))
-                .collect::<HashSet<_>>(),
-            Err(err) => {
-                tracing::debug!(%err, "failed to load active Marmot groups for outbox retry");
-                return;
-            }
-        };
-        let retryable = {
+        // `retryable_events` deletes rows whose group is not in `active`.
+        // Live MLS ids alone drop recovered 0.8 pending sends on the first
+        // 0.9 connect; hosts then paint those mine rows as Sent.
+        self.restore_recorded_folds_from_index();
+        let active_group_ids = self.outbox_active_group_ids();
+        if active_group_ids.is_empty() {
+            return;
+        }
+        let publishable_group_ids = self.outbox_publishable_group_ids();
+        let (retryable, newly_failed) = {
             let mut outbox = self.outbox_state.lock().unwrap();
-            match outbox.retryable_events(Timestamp::now().as_secs(), &active_group_ids) {
-                Ok(events) => events,
+            match outbox.retryable_events(
+                Timestamp::now().as_secs(),
+                &active_group_ids,
+                &publishable_group_ids,
+            ) {
+                Ok(result) => result,
                 Err(err) => {
                     tracing::debug!(%err, "failed to load retryable outbox events");
                     return;
                 }
             }
         };
+        for group_id_hex in newly_failed {
+            self.notify_conversation_changed(&group_id_hex);
+        }
         for (message_id_hex, group_id_hex, event) in retryable {
             // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
+    }
+
+    /// Live 0.9 MLS ids only. Fold aliases of a live group include the
+    /// recovered 0.8 sibling; that sibling's stored wrapper is still 0.8
+    /// ciphertext and must not be republished.
+    fn outbox_publishable_group_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        match self.engine.groups() {
+            Ok(groups) => {
+                for group in groups {
+                    if self.engine.is_live_group(&group.id).unwrap_or(false) {
+                        ids.insert(hex::encode(group.id.as_slice()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(%err, "failed to load live groups for outbox publish");
+            }
+        }
+        ids
+    }
+
+    /// Groups whose outbox rows must survive idle retry. Live 0.9 ids plus
+    /// recovered 0.8 siblings (and their fold aliases) so an upgrade connect
+    /// cannot purge a pending send and lie that it was delivered.
+    fn outbox_active_group_ids(&self) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        match self.engine.groups() {
+            Ok(groups) => {
+                for group in groups {
+                    for alias in self.engine.fold_aliases(&group.id) {
+                        ids.insert(hex::encode(alias.as_slice()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(%err, "failed to load live groups for outbox retry");
+            }
+        }
+        match self.engine.historical_groups() {
+            Ok(historical) => {
+                for group in historical {
+                    for alias in self.engine.fold_aliases(&group.id) {
+                        ids.insert(hex::encode(alias.as_slice()));
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::debug!(%err, "failed to load recovered groups for outbox retry");
+            }
+        }
+        ids
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {
@@ -4873,19 +5131,11 @@ impl SonarClient {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
-        // Direct send is intentional — clear any prior stopPolling / wipe latch
-        // so a new upload is not immediately cancelled (Android can race a
-        // concurrent send between stopPolling and the next resume pass).
-        self.clear_media_upload_cancel();
-        tracing::info!(
-            items = items.len(),
-            client_pending_id,
-            "media send_media_multi_with_progress enter"
-        );
         // Receivers hard-cap downloads at MAX_MEDIA_PLAINTEXT_BYTES, so an
         // over-limit upload would publish a message NO client can ever fetch.
-        // Reject before any encrypt/upload work. The aggregate cap bounds the
-        // whole album's resident plaintext (every item is in memory at once).
+        // Reject before resume-group creation or any encrypt/upload work. The
+        // aggregate cap bounds the whole album's resident plaintext (every
+        // item is in memory at once).
         let mut total_bytes: u64 = 0;
         for item in &items {
             if item.data.len() > MAX_MEDIA_PLAINTEXT_BYTES {
@@ -4902,6 +5152,17 @@ impl SonarClient {
                 max: MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64,
             });
         }
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
+        // Direct send is intentional — clear any prior stopPolling / wipe latch
+        // so a new upload is not immediately cancelled (Android can race a
+        // concurrent send between stopPolling and the next resume pass).
+        self.clear_media_upload_cancel();
+        tracing::info!(
+            items = items.len(),
+            client_pending_id,
+            "media send_media_multi_with_progress enter"
+        );
 
         let entry_id = if client_pending_id.is_empty() {
             new_media_staging_id()?
@@ -4951,7 +5212,7 @@ impl SonarClient {
         }
 
         match self
-            .complete_staged_media_upload(&entry_id, group_id, observer)
+            .complete_staged_media_upload_settling(&entry_id, group_id, observer)
             .await
         {
             Ok(()) => Ok(()),
@@ -5028,7 +5289,7 @@ impl SonarClient {
                     continue;
                 }
             };
-            // GroupId::from_slice panics on wrong length — refuse corrupt rows.
+            // Staged media rows store a 32-byte MLS group id as hex.
             if group_bytes.len() != 32 {
                 let _ = self.media_staging.lock().unwrap().mark_failed(
                     &id,
@@ -5040,7 +5301,7 @@ impl SonarClient {
                 );
                 continue;
             }
-            let group_id = GroupId::from_slice(&group_bytes);
+            let group_id = GroupId::new(group_bytes);
             let _ = self
                 .media_staging
                 .lock()
@@ -5057,7 +5318,7 @@ impl SonarClient {
                 obs.on_progress(&progress_id, 0, total);
             }
             match self
-                .complete_staged_media_upload(&id, &group_id, observer)
+                .complete_staged_media_upload_settling(&id, &group_id, observer)
                 .await
             {
                 Ok(()) => {}
@@ -5112,8 +5373,8 @@ impl SonarClient {
             else {
                 let staging = self.media_staging.clone();
                 let id = id.clone();
-                let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&id))
-                    .await;
+                let _ =
+                    tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&id)).await;
                 continue;
             };
             let event = match Event::from_json(&event_json) {
@@ -5149,10 +5410,8 @@ impl SonarClient {
             }
             let staging = self.media_staging.clone();
             let remove_id = id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                staging.lock().unwrap().remove(&remove_id)
-            })
-            .await;
+            let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&remove_id))
+                .await;
             let _ = self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
             self.notify_conversation_changed(&group_id_hex);
         }
@@ -5162,7 +5421,8 @@ impl SonarClient {
     async fn staging_remove(&self, entry_id: &str) {
         let staging = self.media_staging.clone();
         let entry_id = entry_id.to_string();
-        let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&entry_id)).await;
+        let _ =
+            tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&entry_id)).await;
     }
 
     async fn staging_mark_failed(&self, entry_id: &str, error: String) {
@@ -5210,11 +5470,61 @@ impl SonarClient {
             return Ok(false);
         }
         const CRASH_RECOVERY_URL_SCAN: usize = 64;
-        let messages = self.engine.messages_page(group_id, CRASH_RECOVERY_URL_SCAN, 0)?;
+        let messages = self
+            .engine
+            .messages_page(group_id, CRASH_RECOVERY_URL_SCAN, 0)?;
         Ok(messages.iter().any(|message| {
             urls.iter()
                 .all(|url| message.media.iter().any(|m| m.url == *url))
         }))
+    }
+
+    /// Media messages are pinned to the epoch their attachments were sealed
+    /// in. When MDK refuses one (the group was converging, or moved on while
+    /// the upload ran), let the group settle and try once more: reuse the
+    /// upload if the epoch is still the sealed one, otherwise forget it so the
+    /// retry re-encrypts and re-uploads for the current epoch.
+    async fn complete_staged_media_upload_settling(
+        &self,
+        entry_id: &str,
+        group_id: &GroupId,
+        observer: Option<&dyn MediaUploadObserver>,
+    ) -> Result<()> {
+        match self
+            .complete_staged_media_upload(entry_id, group_id, observer)
+            .await
+        {
+            Err(Error::MediaEpochMoved) => {}
+            other => return other,
+        }
+        let send_group = self.resolve_send_group(group_id).await?;
+        for _ in 0..MEDIA_EPOCH_SETTLE_PASSES {
+            self.engine.request_convergence(&send_group);
+            tokio::time::sleep(CONVERGENCE_WAKE_DELAY).await;
+            let (changed, retry) = self.apply_convergence_and_publish("media epoch").await;
+            self.notify_conversations_changed(&changed);
+            if retry.is_none() {
+                break;
+            }
+        }
+        let sealed_epoch = self
+            .media_staging
+            .lock()
+            .unwrap()
+            .get(entry_id)
+            .and_then(|entry| entry.sealed_items.as_ref())
+            .and_then(|items| items.first())
+            .and_then(|item| item.source_epoch);
+        if sealed_epoch.is_none() || sealed_epoch != self.engine.group_epoch(&send_group) {
+            let staging = self.media_staging.clone();
+            let id = entry_id.to_string();
+            let now = Timestamp::now().as_secs();
+            tokio::task::spawn_blocking(move || staging.lock().unwrap().clear_sealed(&id, now))
+                .await
+                .map_err(|e| Error::Storage(format!("media unseal join: {e}")))??;
+        }
+        self.complete_staged_media_upload(entry_id, group_id, observer)
+            .await
     }
 
     async fn complete_staged_media_upload(
@@ -5223,6 +5533,12 @@ impl SonarClient {
         group_id: &GroupId,
         observer: Option<&dyn MediaUploadObserver>,
     ) -> Result<()> {
+        // Staging can still name a recovered 0.8 id (upgrade mid-upload, or a
+        // host that staged from the open conversation). Encrypting against
+        // that id fails — there is no live MLS exporter. Resume onto the
+        // live sibling the same way `send_media_multi` does.
+        let send_group = self.resolve_send_group(group_id).await?;
+        let group_id = &send_group;
         if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
             return Err(Error::MediaUploadCancelled);
         }
@@ -5275,12 +5591,8 @@ impl SonarClient {
             }
             (encrypted, urls)
         } else {
-            let plaintext_lens: Arc<Vec<u64>> = Arc::new(
-                plaintext_items
-                    .iter()
-                    .map(|d| d.len() as u64)
-                    .collect(),
-            );
+            let plaintext_lens: Arc<Vec<u64>> =
+                Arc::new(plaintext_items.iter().map(|d| d.len() as u64).collect());
             let item_sent: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
                 (0..item_count)
                     .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -5317,20 +5629,12 @@ impl SonarClient {
                         tokio::runtime::RuntimeFlavor::MultiThread
                     ) {
                         tokio::task::block_in_place(|| {
-                            self.engine.encrypt_media(
-                                &group_id,
-                                &data,
-                                &meta.mime,
-                                &meta.filename,
-                            )
+                            self.engine
+                                .encrypt_media(&group_id, &data, &meta.mime, &meta.filename)
                         })?
                     } else {
-                        self.engine.encrypt_media(
-                            &group_id,
-                            &data,
-                            &meta.mime,
-                            &meta.filename,
-                        )?
+                        self.engine
+                            .encrypt_media(&group_id, &data, &meta.mime, &meta.filename)?
                     };
                     let cipher_len = upload.encrypted_data.len() as u64;
                     item_totals[index].store(cipher_len, Ordering::Relaxed);
@@ -5347,7 +5651,8 @@ impl SonarClient {
                                 move |sent: u64, _total: u64| {
                                     item_sent[index].store(sent, Ordering::Relaxed);
                                 }
-                            }) as Box<dyn FnMut(u64, u64) + Send>),
+                            })
+                                as Box<dyn FnMut(u64, u64) + Send>),
                         )
                         .await?;
                     Ok::<_, Error>((index, upload, url))
@@ -5383,11 +5688,7 @@ impl SonarClient {
                         let mut album_total = 0u64;
                         for (i, total) in item_totals.iter().enumerate() {
                             let known = total.load(Ordering::Relaxed);
-                            album_total += if known > 0 {
-                                known
-                            } else {
-                                plaintext_lens[i]
-                            };
+                            album_total += if known > 0 { known } else { plaintext_lens[i] };
                         }
                         let aggregate = aggregate.min(album_total.max(1));
                         let _ = media_staging.lock().unwrap().update_progress(
@@ -5477,7 +5778,8 @@ impl SonarClient {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_media_event_multi(group_id, &refs, &caption)?
+                .create_and_process_media_event_multi(group_id, &refs, &caption)
+                .await?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -5502,8 +5804,7 @@ impl SonarClient {
         .await?;
         self.mark_outbox_pending(group_id, &message, &event)?;
         self.staging_remove(entry_id).await;
-        let publish_ack =
-            self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
+        let publish_ack = self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);
@@ -5524,6 +5825,16 @@ impl SonarClient {
     /// Download the encrypted blob at `url` and decrypt it with the group media
     /// key (resolved from the message's imeta tag). Returns plaintext bytes.
     pub async fn fetch_media(&self, group_id: &GroupId, url: &str) -> Result<Vec<u8>> {
+        // Lost JSON sidecar: restore the index bind so a hist-id fetch of a
+        // 0.9 blob can use `live_fold_target` / the live exporter. Lost
+        // index bind too: re-discover before the fetch. 0.8 attachments
+        // are found by blossom URL either way.
+        self.restore_or_rediscover_touching(group_id);
+        if self.engine.recovered_08_media_unavailable(group_id, url) {
+            return Err(Error::Media(
+                crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
+            ));
+        }
         let ciphertext = http_get_with_retries(url, None).await?;
         self.engine.decrypt_media_by_url(group_id, url, &ciphertext)
     }
@@ -5539,6 +5850,12 @@ impl SonarClient {
         destination: &Path,
         observer: &dyn MediaDownloadObserver,
     ) -> Result<u64> {
+        self.restore_or_rediscover_touching(group_id);
+        if self.engine.recovered_08_media_unavailable(group_id, url) {
+            return Err(Error::Media(
+                crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE.to_owned(),
+            ));
+        }
         let ciphertext = http_get_with_retries(url, Some(observer)).await?;
         if observer.is_cancelled() {
             return Err(Error::MediaDownloadCancelled);
@@ -5618,8 +5935,7 @@ impl SonarClient {
         }
         // Reuse the process-wide upload client so sequential/concurrent PUTs
         // share keep-alive + TLS session cache (same shape as download HTTP_CLIENT).
-        let client =
-            BlossomClient::with_client(base, BLOSSOM_UPLOAD_HTTP_CLIENT.clone());
+        let client = BlossomClient::with_client(base, BLOSSOM_UPLOAD_HTTP_CLIENT.clone());
         let keys = self.identity().keys();
         let mime = Some(ENCRYPTED_BLOB_MIME_TYPE.to_string());
         let upload = async {
@@ -5719,9 +6035,17 @@ impl SonarClient {
         tracing::info!(is_live, since_secs, force, "sync() called");
         if is_live && since_secs > 0 && !force {
             tracing::info!("sync() short-circuited — live subscriptions active");
+            // Live drain can join an empty 0.9 sibling after the one-shot
+            // populate. Idle hosts never re-enter the full sync path, so
+            // drain the empty-transcript queue here too.
+            process_report.absorb(self.run_empty_transcript_backfills().await);
             self.save_or_rewind_without_advancing_watermark(process_report)?;
             self.retry_outbox().await;
+            self.reconcile_historical_resume_members().await;
             self.share_push_token_with_groups().await;
+            if let Err(err) = self.engine.ensure_mdk08_remainder() {
+                tracing::warn!(%err, "mdk08 remainder extract failed");
+            }
             return Ok(());
         }
 
@@ -5769,34 +6093,13 @@ impl SonarClient {
                     process_report.record_retryable(Timestamp::now().as_secs());
                 }
             }
+            self.schedule_share_push_token_with_groups();
         }
         // Existing installs can have group/MLS rows locally while the chat
         // transcript page is empty. Full-backfill those groups once. The scan
         // is deferred from client construction to the first sync so it does not
         // delay local-only first paint.
-        self.populate_empty_transcript_backfills_once();
-        let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
-        if !empty_transcript_group_ids.is_empty() {
-            // Cap per-sync to avoid stacking timeouts when many groups need repair.
-            let (batch, overflow): (Vec<_>, Vec<_>) = empty_transcript_group_ids
-                .into_iter()
-                .enumerate()
-                .partition(|(i, _)| *i < MAX_BACKFILLS_PER_SYNC);
-            for (_, id) in &overflow {
-                self.requeue_initial_empty_transcript_backfill(id);
-            }
-            let batch_ids: Vec<String> = batch.into_iter().map(|(_, id)| id).collect();
-            match self.backfill_groups(&batch_ids).await {
-                Ok(report) => process_report.absorb(report),
-                Err(err) => {
-                    tracing::debug!(%err, "batched empty transcript backfill failed");
-                    for id in &batch_ids {
-                        self.requeue_initial_empty_transcript_backfill(id);
-                    }
-                    process_report.record_retryable(Timestamp::now().as_secs());
-                }
-            }
-        }
+        process_report.absorb(self.run_empty_transcript_backfills().await);
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed during sync");
         }
@@ -5849,7 +6152,11 @@ impl SonarClient {
             self.save_sync_state()?;
         }
         self.retry_outbox().await;
+        self.reconcile_historical_resume_members().await;
         self.share_push_token_with_groups().await;
+        if let Err(err) = self.engine.ensure_mdk08_remainder() {
+            tracing::warn!(%err, "mdk08 remainder extract failed");
+        }
         Ok(())
     }
 
@@ -5972,27 +6279,33 @@ impl SonarClient {
         Ok(())
     }
 
+    /// Kind-445 `#h` tags for every live group (32-byte Nostr routing ids).
+    /// Host conversation ids stay MLS [`GroupId`] hex; do not mix the two.
     fn current_group_ids(&self) -> Result<HashSet<String>> {
-        Ok(self
-            .engine
-            .groups()?
-            .into_iter()
-            .map(|g| hex::encode(g.nostr_group_id))
-            .collect())
+        let mut tags = HashSet::new();
+        for group in self.engine.groups()? {
+            if let Some(h) = self.engine.nostr_h_tag_hex(&group.id)? {
+                tags.insert(h);
+            }
+        }
+        Ok(tags)
     }
 
     fn empty_transcript_group_ids(engine: &MarmotEngine) -> HashSet<String> {
         let Ok(groups) = engine.groups() else {
             return HashSet::new();
         };
+        // Live MLS rows only. `messages_page` unions folded hist, which
+        // would hide a new 0.9 sibling that still needs a full backfill.
         groups
             .into_iter()
-            .filter_map(
-                |group| match engine.messages_page(&group.mls_group_id, 1, 0) {
-                    Ok(page) if page.is_empty() => Some(hex::encode(group.nostr_group_id)),
-                    _ => None,
-                },
-            )
+            .filter_map(|group| {
+                if engine.live_chat_page_empty(&group.id) {
+                    engine.nostr_h_tag_hex(&group.id).ok().flatten()
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -6000,8 +6313,53 @@ impl SonarClient {
         if self.initial_backfill_scanned.swap(true, Ordering::Relaxed) {
             return;
         }
+        self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         let mut set = self.initial_empty_transcript_backfills.lock().unwrap();
         *set = Self::empty_transcript_group_ids(&self.engine);
+    }
+
+    /// Queue a newly joined live group that still has no 0.9 chat rows.
+    /// Folded hist does not count — that sibling needs a full `#h` backfill.
+    fn enqueue_empty_live_transcript_backfill(&self, group_id: &GroupId) {
+        if !self.engine.live_chat_page_empty(group_id) {
+            return;
+        }
+        let Some(h) = self.engine.nostr_h_tag_hex(group_id).ok().flatten() else {
+            return;
+        };
+        self.requeue_initial_empty_transcript_backfill(&h);
+    }
+
+    async fn run_empty_transcript_backfills(&self) -> MarmotProcessReport {
+        let mut report = MarmotProcessReport::default();
+        if self.relays.is_empty() {
+            return report;
+        }
+        self.populate_empty_transcript_backfills_once();
+        let empty_transcript_group_ids = self.take_initial_empty_transcript_backfills();
+        if empty_transcript_group_ids.is_empty() {
+            return report;
+        }
+        let (batch, overflow): (Vec<_>, Vec<_>) = empty_transcript_group_ids
+            .into_iter()
+            .enumerate()
+            .partition(|(i, _)| *i < MAX_BACKFILLS_PER_SYNC);
+        for (_, id) in &overflow {
+            self.requeue_initial_empty_transcript_backfill(id);
+        }
+        let batch_ids: Vec<String> = batch.into_iter().map(|(_, id)| id).collect();
+        match self.backfill_groups(&batch_ids).await {
+            Ok(backfill) => report.absorb(backfill),
+            Err(err) => {
+                tracing::debug!(%err, "batched empty transcript backfill failed");
+                for id in &batch_ids {
+                    self.requeue_initial_empty_transcript_backfill(id);
+                }
+                report.record_retryable(Timestamp::now().as_secs());
+            }
+        }
+        report
     }
 
     fn take_initial_empty_transcript_backfills(&self) -> Vec<String> {
@@ -6026,17 +6384,16 @@ impl SonarClient {
         groups
             .into_iter()
             .filter_map(|group| {
-                let has_local_chat = engine
-                    .messages_page(&group.mls_group_id, 1, 0)
-                    .map(|page| !page.is_empty())
-                    .unwrap_or(false);
-                if !has_local_chat {
+                // Live 0.9 rows only. Folded hist must not mark the group
+                // "already paged" or raise `since` past unread 0.9 traffic.
+                if engine.live_chat_page_empty(&group.id) {
                     return None;
                 }
                 let floor = engine
-                    .latest_remote_chat_message_secs(&group.mls_group_id)
+                    .latest_remote_chat_message_secs(&group.id)
                     .unwrap_or(0);
-                Some((hex::encode(group.nostr_group_id), floor))
+                let h = engine.nostr_h_tag_hex(&group.id).ok().flatten()?;
+                Some((h, floor))
             })
             .collect()
     }
@@ -6048,6 +6405,8 @@ impl SonarClient {
         {
             return;
         }
+        self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         let mut queue = self.initial_group_message_catchups.lock().unwrap();
         *queue =
             Self::group_message_catchup_queue(Self::group_message_catchup_floors(&self.engine));
@@ -6256,11 +6615,30 @@ impl SonarClient {
         });
     }
 
+    /// Map a recovered 0.8 MLS id onto the live sibling before `groups()`
+    /// lookup. Restores a recorded index bind when the JSON sidecar is gone,
+    /// or re-discovers by members when the index bind is gone too.
+    fn resolve_catchup_mls_hex(&self, clean: &str) -> String {
+        let Some(group_id) = decode_group_id_hex(clean) else {
+            return clean.to_string();
+        };
+        self.restore_or_rediscover_touching(&group_id);
+        match self.engine.live_fold_target(&group_id) {
+            Some(live) if live != group_id => hex::encode(live.as_slice()),
+            _ => clean.to_string(),
+        }
+    }
+
     /// Prefer catch-up for the open chat.
     ///
     /// Hosts pass the MLS group id hex (same id used by send_text / messages).
     /// We map it to the public nostr group id used by the catch-up queue (#h tag).
     /// Unknown/empty clears the preference.
+    ///
+    /// A recovered 0.8 id is remapped onto its live sibling first. Opening the
+    /// hist row (snapshot still lists it, or remount has not swapped nav)
+    /// used to miss `engine.groups()` and clear the preference, so 0.9
+    /// traffic sat behind every other chat's catch-up.
     pub fn prefer_catchup_group(&self, mls_group_id_hex: Option<String>) {
         let preferred = match mls_group_id_hex {
             None => None,
@@ -6268,19 +6646,28 @@ impl SonarClient {
                 let clean = raw.trim().to_ascii_lowercase();
                 if clean.is_empty() {
                     None
-                } else if let Ok(groups) = self.engine.groups() {
-                    groups.into_iter().find_map(|g| {
-                        let mls = hex::encode(g.mls_group_id.as_slice());
-                        if mls == clean {
-                            Some(hex::encode(g.nostr_group_id))
-                        } else {
-                            None
-                        }
-                    })
                 } else {
-                    // Fall back to treating the input as already-nostr hex so
-                    // tests/tools can still target the queue key directly.
-                    Some(clean)
+                    let lookup = self.resolve_catchup_mls_hex(&clean);
+                    if let Ok(groups) = self.engine.groups() {
+                        groups.into_iter().find_map(|g| {
+                            let mls = hex::encode(g.id.as_slice());
+                            let h = self.engine.nostr_h_tag_hex(&g.id).ok().flatten();
+                            if mls == lookup {
+                                h
+                            } else if h.as_deref() == Some(lookup.as_str())
+                                || h.as_deref() == Some(clean.as_str())
+                            {
+                                Some(lookup.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        // Fall back to treating the (possibly remapped) hex as
+                        // already-nostr so tests/tools can still target the
+                        // queue key directly.
+                        Some(lookup)
+                    }
                 }
             }
         };
@@ -6323,12 +6710,20 @@ impl SonarClient {
             Ok(report) => self.save_or_rewind_without_advancing_watermark(report)?,
             Err(err) => tracing::debug!(%err, "initial Marmot per-group catch-up failed"),
         }
+        // Hosts idle here, not on `sync()`. A live welcome after the one-shot
+        // populate must still full-backfill an empty 0.9 sibling.
+        let empty_report = self.run_empty_transcript_backfills().await;
+        self.save_or_rewind_without_advancing_watermark(empty_report)?;
         // The apps use this lightweight idle path instead of `sync()`. Retry
         // the durable outbox here too so a transient outage self-heals after
         // relay reconnection even when the user does not tap the retry button.
         // (Publish failures also schedule a core-owned backoff retry; this path
         // covers Pending rows stranded while relays were briefly unavailable.)
         self.retry_outbox().await;
+        self.reconcile_historical_resume_members().await;
+        if let Err(err) = self.engine.ensure_mdk08_remainder() {
+            tracing::warn!(%err, "mdk08 remainder extract failed");
+        }
         Ok(())
     }
 
@@ -6535,7 +6930,11 @@ impl SonarClient {
         // actually reconnect. Reconnection itself is owned by the pool and the
         // host attach paths, never by hammering fetches.
         if self.connected_relay_count().await == 0 {
-            tracing::debug!(context, total_relays, "relay fetch skipped: no relay connected");
+            tracing::debug!(
+                context,
+                total_relays,
+                "relay fetch skipped: no relay connected"
+            );
             return Ok(RelayFetchOutcome {
                 events: Vec::new(),
                 completed_relays: 0,
@@ -6698,6 +7097,65 @@ impl SonarClient {
         })
     }
 
+    /// Run the due convergence passes and publish the commits they staged
+    /// (a SelfRemove auto-commit). Returns the groups that changed and when
+    /// the next pass is due.
+    async fn apply_convergence_and_publish(
+        &self,
+        context: &'static str,
+    ) -> (HashSet<String>, Option<Duration>) {
+        let mut changed = HashSet::new();
+        let pass = match self.engine.apply_pending_convergence().await {
+            Ok(pass) => pass,
+            Err(err) => {
+                tracing::debug!(%err, context, "pending MIP-03 convergence apply failed");
+                return (changed, None);
+            }
+        };
+        for update in pass.updates {
+            let group_hex = hex::encode(update.group_id.as_slice());
+            // Same exclusion as any membership change: no sends while the
+            // commit is staged.
+            let _epoch = self.membership_gate.write().await;
+            match self.publish_membership_update(update).await {
+                Ok(()) => {
+                    changed.insert(group_hex);
+                }
+                Err(err) => tracing::debug!(
+                    %err,
+                    context,
+                    "convergence auto-commit publish failed; MDK restores it on the next pass"
+                ),
+            }
+        }
+        // A pass can decrypt app messages MDK had deferred, shares included.
+        changed.extend(self.drain_timezone_shares());
+        (changed, pass.retry_after)
+    }
+
+    /// Cache every timezone share the engine decrypted since the last drain
+    /// (ingest or a convergence pass). Returns the groups whose member zones
+    /// changed, for UI invalidation. A failed cache write is not retried from
+    /// here: MDK already consumed the ciphertext and dedups a redelivery, so
+    /// the zone comes back with the sender's next share (new zone or epoch).
+    fn drain_timezone_shares(&self) -> HashSet<String> {
+        let mut changed = HashSet::new();
+        let now = Timestamp::now().as_secs();
+        for share in self.engine.take_timezone_shares() {
+            let received_at = bounded_timezone_share_timestamp(share.created_at.as_secs(), now);
+            match self.handle_timezone_share(
+                &share.sender,
+                &share.content,
+                received_at,
+                &share.group_id,
+            ) {
+                Ok(groups) => changed.extend(groups),
+                Err(err) => tracing::debug!(%err, "timezone share cache write failed"),
+            }
+        }
+        changed
+    }
+
     async fn process_marmot_events(
         &self,
         events: impl IntoIterator<Item = Event>,
@@ -6707,12 +7165,23 @@ impl SonarClient {
         let mut notifications: Vec<DrainNotification> = Vec::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
         let mut sticker_refs: Vec<StickerRef> = Vec::new();
+        // Replay MIP-03 buffered commits and due SelfRemove auto-commits from
+        // an earlier ingest. Ingest itself returns immediately (Buffered →
+        // GroupUpdated); applying here keeps the quiescence wait off the
+        // receive path.
+        let convergence_before = self.engine.pending_convergence_ids();
+        let (convergence_changed, convergence_retry) =
+            self.apply_convergence_and_publish(context).await;
+        changed_groups.extend(convergence_changed);
         let group_names: HashMap<Vec<u8>, String> = self
             .engine
             .groups()
             .unwrap_or_default()
             .into_iter()
-            .map(|g| (g.mls_group_id.as_slice().to_vec(), g.name))
+            .map(|g| {
+                let name = self.engine.display_name(&g.id, &g.name);
+                (g.id.as_slice().to_vec(), name)
+            })
             .collect();
         for event in sort_marmot_events(events) {
             if self.is_sync_event_processed(&event.id) {
@@ -6835,41 +7304,34 @@ impl SonarClient {
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
-                Ok(Incoming::TimezoneShare {
-                    group_id,
-                    sender,
-                    content,
-                    created_at,
-                }) => {
-                    let now = Timestamp::now().as_secs();
-                    let received_at = bounded_timezone_share_timestamp(created_at.as_secs(), now);
-                    match self.handle_timezone_share(&sender, &content, received_at, &group_id) {
-                        Ok(changed) => {
-                            changed_groups.extend(changed);
-                            self.mark_sync_event_processed(&event.id);
-                            report.record_processed();
-                        }
-                        Err(err) => {
-                            tracing::debug!(
-                                %err,
-                                event_id = %event.id,
-                                event_created_at = event.created_at.as_secs(),
-                                context,
-                                "timezone share cache write needs retry"
-                            );
-                            report.record_retryable(event.created_at.as_secs());
-                        }
-                    }
+                Ok(Incoming::TimezoneShare { .. }) => {
+                    // The engine queued the share; `drain_timezone_shares`
+                    // below caches it with any a convergence pass decrypted.
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
                 }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
+                    if self.engine.is_dropped(&message.group_id) {
+                        // Persist already skips dropped ids; keep the event
+                        // marked processed so relay replay cannot toast or
+                        // reindex a chat the user already left.
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                        continue;
+                    }
                     self.record_delivery_for_incoming(incoming);
                     if let Some(sticker_ref) = &message.sticker_ref {
                         sticker_refs.push(sticker_ref.clone());
                     }
-                    let cached_name = group_names
+                    let painted = group_names
                         .get(message.group_id.as_slice())
-                        .map(|s| s.as_str());
-                    self.upsert_index_for_message(message, cached_name);
+                        .cloned()
+                        .unwrap_or_else(|| self.engine.display_name(&message.group_id, ""));
+                    let cached_name = painted.as_str();
+                    self.upsert_index_for_message(
+                        message,
+                        Some(cached_name).filter(|s| !s.is_empty()),
+                    );
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     if !message.mine {
                         // Same preview as conversation index (media/sticker
@@ -6880,7 +7342,7 @@ impl SonarClient {
                             message_id_hex: message.id.to_hex(),
                             sender_pubkey: message.sender.to_string(),
                             group_id_hex: hex::encode(message.group_id.as_slice()),
-                            group_name: cached_name.unwrap_or("").to_string(),
+                            group_name: painted,
                             content_preview: preview,
                         });
                     }
@@ -6899,7 +7361,23 @@ impl SonarClient {
                     if let Incoming::GroupUpdated(group_id)
                     | Incoming::GroupInvitePending(group_id) = &incoming
                     {
-                        changed_groups.insert(hex::encode(group_id.as_slice()));
+                        if !self.engine.is_dropped(group_id) {
+                            if matches!(incoming, Incoming::GroupUpdated(_)) {
+                                // Auto-joined welcomes fold a recovered 0.8
+                                // sibling onto this live id before hosts paint
+                                // chats(). Already-folded hist is skipped so a
+                                // second matching welcome cannot steal history.
+                                // Rooms still must not fold onto a 1:1 (R-050).
+                                self.maybe_fold_new_group(group_id);
+                                // Auto-joined welcomes land here, not
+                                // `accept_group_invite`. Folded 0.8 hist must
+                                // not count as a live page — enqueue a full
+                                // 0.9 backfill or idle sync never fetches
+                                // traffic older than the live tail.
+                                self.enqueue_empty_live_transcript_backfill(group_id);
+                            }
+                            changed_groups.insert(hex::encode(group_id.as_slice()));
+                        }
                     }
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
@@ -6927,6 +7405,7 @@ impl SonarClient {
             }
         }
         let membership_may_have_changed = !changed_groups.is_empty();
+        changed_groups.extend(self.drain_timezone_shares());
         self.notify_conversations_changed(&changed_groups);
         if membership_may_have_changed {
             // Recipient dedupe makes this a no-op for ordinary message-only
@@ -6941,6 +7420,24 @@ impl SonarClient {
             sticker_refs,
             STICKER_REF_PREFETCH_BATCH_LIMIT,
         ));
+        // A proposal or buffered commit noted during this batch converges after
+        // MDK's quiescence window, and a pass MDK asked to repeat is due after
+        // its cutoff. Wake the host's drain loop for it. The engine stops
+        // asking after a bounded number of unsettled passes, so an input that
+        // never settles cannot keep the device awake.
+        let newly_noted = self
+            .engine
+            .pending_convergence_ids()
+            .iter()
+            .any(|id| !convergence_before.contains(id));
+        let wake_after = convergence_retry.or(newly_noted.then_some(CONVERGENCE_WAKE_DELAY));
+        if let Some(delay) = wake_after {
+            let notify = self.marmot_notify.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                notify.notify_one();
+            });
+        }
         (report, notifications)
     }
 
@@ -7038,7 +7535,9 @@ impl SonarClient {
         let mut events: Vec<Event> = {
             let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
             let mut groups = self.pending_marmot_groups.lock().unwrap();
-            if giftwraps.is_empty() && groups.is_empty() {
+            // Nothing buffered still drains when a convergence pass is due
+            // (a member's leave waits on it to be committed).
+            if giftwraps.is_empty() && groups.is_empty() && !self.engine.has_pending_convergence() {
                 return Ok(notifications);
             }
             let mut out = std::mem::take(&mut *giftwraps);
@@ -7067,6 +7566,7 @@ impl SonarClient {
                 }
             }
             let _ = self.resubscribe_marmot_groups_if_live().await;
+            self.schedule_share_push_token_with_groups();
         }
         if let Some(secs) = process_report.oldest_retryable_secs {
             self.rewind_sync_watermark_for_retry(secs)?;
@@ -7084,11 +7584,644 @@ impl SonarClient {
         Ok(notifications)
     }
 
-    pub fn groups(&self) -> Result<Vec<group_types::Group>> {
+    pub fn groups(&self) -> Result<Vec<cgka_traits::group::Group>> {
+        // Hosts paint `chats()` / FFI `groups()` before summaries. A lost
+        // JSON sidecar must not re-list a recovered 0.8 row as a second
+        // home conversation — restore recorded binds first. If the index
+        // bind is gone too, re-discover by members so first paint does
+        // not wait on idle reconcile or a send.
+        self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         self.engine.groups()
     }
 
+    pub fn historical_groups(&self) -> Result<Vec<HistoricalGroup>> {
+        self.engine.historical_groups()
+    }
+
+    /// Hosts fold 1:1s by the single other npub. A recovered or live room
+    /// that currently lists only one reachable peer must not ride that path.
+    pub fn group_is_direct(&self, group_id: &GroupId) -> bool {
+        // Persist-folds remounts a 2-person live sibling before leftover
+        // members join 0.9. Restore the recorded bind so an empty-topic
+        // room is not painted as a DM (R-050) after the JSON sidecar is lost.
+        self.restore_recorded_folds_touching(group_id);
+        if self.engine.is_historical_group(group_id).unwrap_or(false) {
+            return self.engine.historical_resume_is_direct(group_id);
+        }
+        // Live id of a recovered room: hosts fold 1:1s by `is_direct`.
+        // Partial resume copies empty name+desc onto a 2-person MLS
+        // group, which would otherwise match the live DM rule.
+        for alias in self.engine.fold_aliases(group_id) {
+            if alias == *group_id {
+                continue;
+            }
+            if self.engine.is_historical_group(&alias).unwrap_or(false)
+                && !self.engine.historical_resume_is_direct(&alias)
+            {
+                return false;
+            }
+        }
+        let Ok(groups) = self.engine.groups() else {
+            return false;
+        };
+        let Some(group) = groups.into_iter().find(|g| g.id == *group_id) else {
+            return false;
+        };
+        let Ok(members) = self.engine.members(group_id) else {
+            return false;
+        };
+        members.len() == 2
+            && (group.description == SONAR_DIRECT_DM_DESCRIPTION
+                || (group.description.is_empty() && group.name.is_empty()))
+    }
+
+    /// Route a send aimed at a recovered 0.8 group onto a live 0.9 group.
+    ///
+    /// Creates a new DM/group with the same peers when no fold exists yet.
+    /// The old transcript stays; MLS membership is not imported.
+    async fn resolve_send_group(&self, group_id: &GroupId) -> Result<GroupId> {
+        if self.engine.is_dropped(group_id) {
+            return Err(Error::InvalidInput("this chat was deleted".into()));
+        }
+        // Host persist-folds and leftover-member sends may still name the
+        // recovered 0.8 id. A lost JSON sidecar made `live_fold_target`
+        // miss, so this minted a second 0.9 group and
+        // `record_resume_fold` stole hist off the first live sibling.
+        self.restore_recorded_folds_touching(group_id);
+        if self.engine.is_live_group(group_id)? {
+            // Persist-folds can remount onto this live id after the core
+            // sidecar was lost. Restore a recorded index bind first
+            // (empty-desc rooms cannot use topic-match). Then rebuild
+            // leftover-member invite so `missing_resume_peers` sees hist.
+            self.maybe_fold_new_group(group_id);
+            self.maybe_add_late_resume_members(group_id).await;
+            return Ok(group_id.clone());
+        }
+        if let Some(live) = self.rebound_resume_live(group_id) {
+            self.maybe_add_late_resume_members(&live).await;
+            return Ok(live);
+        }
+        if !self.engine.is_historical_group(group_id)? {
+            // Unknown / not-yet-created ids keep the existing send error
+            // (group missing, media cap, …). Only recovered 0.8 rows resume.
+            return Ok(group_id.clone());
+        }
+        // Two first-resume sends (text+media, double-tap) used to both pass
+        // the unbound check, each mint a 0.9 group, and steal hist onto the
+        // second. Hold the mint lock through KeyPackage fetch + create so
+        // the waiter re-discovers the winner instead of minting again.
+        let _mint = self.resume_mint_lock.lock().await;
+        if let Some(live) = self.rebound_resume_live(group_id) {
+            self.maybe_add_late_resume_members(&live).await;
+            return Ok(live);
+        }
+        let peers = self.engine.historical_resume_peers(group_id);
+        let name = self
+            .engine
+            .historical_group_name(group_id)
+            .unwrap_or_default();
+        if peers.is_empty() {
+            return Err(Error::InvalidInput(
+                "this recovered chat cannot send until the other members update Sonar".into(),
+            ));
+        }
+        let packages = self.fetch_resume_key_packages(&peers).await?;
+        if packages.is_empty() {
+            return Err(Error::KeyPackageNotFound(peers[0]));
+        }
+        // A welcome can fold hist onto a peer-created live group while we
+        // waited for KeyPackages. Minting after that would steal history.
+        if let Some(live) = self.rebound_resume_live(group_id) {
+            self.maybe_add_late_resume_members(&live).await;
+            return Ok(live);
+        }
+        // A recovered room with only some peers on 0.9 must stay a group, even
+        // when one reachable member would look like a DM. Reusing start_dm
+        // would fold the room onto an existing 1:1 with that peer.
+        let live = if self.engine.historical_resume_is_direct(group_id) {
+            self.start_dm_with_key_package(packages.into_iter().next().expect("nonempty"), &name)
+                .await?
+        } else {
+            // Keep the 0.8 room topic. Never copy the DM marker onto a room —
+            // that would make hosts treat a recovered group as a 1:1 (R-050).
+            let description = self
+                .engine
+                .historical_group_description(group_id)
+                .filter(|desc| desc != SONAR_DIRECT_DM_DESCRIPTION)
+                .unwrap_or_default();
+            let creation = self
+                .engine
+                .create_group_with_description(
+                    &name,
+                    &description,
+                    packages,
+                    self.relays.clone(),
+                    Vec::new(),
+                )
+                .await?;
+            self.publish_group_creation(creation).await?
+        };
+        // Do not steal hist if a welcome bound it during create/publish.
+        // The leftover empty mint is the same residual as two incoming
+        // matching welcomes; history stays on the first live sibling.
+        if let Some(existing) = self.engine.live_fold_target(group_id) {
+            if existing != live {
+                return Ok(existing);
+            }
+        }
+        self.record_resume_fold(group_id, &live);
+        Ok(live)
+    }
+
+    /// Restore a recorded bind, or re-discover unbound hist onto an
+    /// already-joined live sibling. Used by first-resume send so a lost
+    /// sidecar does not mint a second 0.9 group.
+    fn rebound_resume_live(&self, group_id: &GroupId) -> Option<GroupId> {
+        self.restore_recorded_folds_touching(group_id);
+        if let Some(live) = self.engine.live_fold_target(group_id) {
+            return Some(live);
+        }
+        if self.engine.is_historical_group(group_id).unwrap_or(false) {
+            self.maybe_fold_live_groups();
+            return self.engine.live_fold_target(group_id);
+        }
+        None
+    }
+
+    /// Background reconcile: leftover 0.8 room members who later publish a
+    /// 0.9 KeyPackage are invited without waiting for a local send.
+    /// Hosts hit this from `ensure_subscriptions`; tests may also hit it
+    /// from `sync()`.
+    async fn reconcile_historical_resume_members(&self) {
+        // Host persist-folds remounts hist onto live before (or after)
+        // core `fold_aliases` exist. Rebuild matching binds first so
+        // leftover 0.8 members are invited without a send on the hidden
+        // hist id. Prefer previously recorded index binds (empty-desc
+        // rooms included). Topic-match is the fallback when the index
+        // never stored the pair. `maybe_fold_new_group` still refuses
+        // R-050 (room onto a 1:1 / incoming named pair).
+        self.restore_recorded_folds_from_index();
+        self.maybe_fold_live_groups();
+        for live in self.engine.live_resume_targets() {
+            self.maybe_add_late_resume_members(&live).await;
+        }
+    }
+
+    fn maybe_fold_live_groups(&self) {
+        let Ok(groups) = self.engine.groups() else {
+            return;
+        };
+        for group in groups {
+            self.maybe_fold_new_group(&group.id);
+        }
+    }
+
+    /// After a mixed 0.8/0.9 room resume, invite leftover members the next
+    /// time they publish a 0.9 KeyPackage. Failure must not block the send
+    /// to people already in the live group.
+    async fn maybe_add_late_resume_members(&self, live: &GroupId) {
+        let missing = self.missing_resume_peers(live);
+        if missing.is_empty() {
+            return;
+        }
+        let Ok(packages) = self.fetch_resume_key_packages(&missing).await else {
+            return;
+        };
+        if packages.is_empty() {
+            return;
+        }
+        if let Err(err) = self.commit_add_members(live, packages).await {
+            tracing::warn!(%err, "late resume add_members failed");
+        }
+    }
+
+    fn missing_resume_peers(&self, live: &GroupId) -> Vec<PublicKey> {
+        let aliases = self.engine.fold_aliases(live);
+        let has_historical = aliases
+            .iter()
+            .any(|id| self.engine.is_historical_group(id).unwrap_or(false));
+        if !has_historical {
+            return Vec::new();
+        }
+        let live_members = self.engine.members(live).unwrap_or_default();
+        let me = self.identity().public_key();
+        let mut wanted = Vec::new();
+        for alias in aliases {
+            wanted.extend(self.engine.historical_resume_peers(&alias));
+        }
+        wanted.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        wanted.dedup();
+        wanted
+            .into_iter()
+            .filter(|pk| *pk != me && !live_members.contains(pk))
+            .collect()
+    }
+
+    fn maybe_fold_new_group(&self, live_id: &GroupId) {
+        // Incoming GroupUpdated / local create can land before summaries.
+        // Restore recorded binds so `is_folded_historical_group` still
+        // skips hist after a lost JSON sidecar — otherwise a second 0.9
+        // DM with the same peer steals history onto the new MLS id.
+        self.restore_recorded_folds_from_index();
+        let Ok(live_members) = self.engine.members(live_id) else {
+            return;
+        };
+        let me = self.identity().public_key();
+        let mut live_others: Vec<PublicKey> =
+            live_members.into_iter().filter(|pk| *pk != me).collect();
+        live_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+        if live_others.is_empty() {
+            return;
+        }
+        let Ok(historical) = self.engine.historical_groups() else {
+            return;
+        };
+        let live_direct = self.group_is_direct(live_id);
+        let live_count = live_others.len() as u32 + 1;
+        let (live_name, live_desc) = self
+            .engine
+            .groups()
+            .ok()
+            .and_then(|groups| groups.into_iter().find(|g| g.id == *live_id))
+            .map(|g| (g.name, g.description))
+            .unwrap_or_default();
+        let mut room_candidates: Vec<(GroupId, String, Vec<PublicKey>)> = Vec::new();
+        for group in historical {
+            // Already bound to a live sibling. A later matching welcome
+            // (peer also created a 0.9 group) must not steal history onto
+            // that second MLS id — `record_historical_fold` overwrites.
+            if self.is_folded_historical_group(&group.id) {
+                continue;
+            }
+            let mut hist_others: Vec<PublicKey> =
+                group.members.into_iter().filter(|pk| *pk != me).collect();
+            hist_others.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+            if self.engine.historical_resume_is_direct(&group.id) {
+                // R-003: recovered DM onto the new 2-person group with that
+                // peer. Live may carry a display name (`create_group("alice
+                // & bob")`); do not require `group_is_direct` here.
+                if hist_others == live_others {
+                    self.record_resume_fold(&group.id, live_id);
+                }
+                continue;
+            }
+            // Rooms: never absorb into a 1:1 / welcomer DM (R-050). Local
+            // `resolve_send_group` already folds a mixed resume (whoever
+            // published a 0.9 KeyPackage). Incoming accept must do the same
+            // when the live others are a unique subset of one recovered room.
+            let hist_count = self.engine.historical_declared_member_count(&group.id);
+            if !live_direct
+                && live_count == 2
+                && hist_count == 2
+                && hist_others == live_others
+                && !live_name.is_empty()
+                && group.name == live_name
+            {
+                // Named 2-person room / White Noise DM without the Sonar
+                // marker: fold only on exact name + member match.
+                room_candidates.push((group.id, group.name, hist_others));
+                continue;
+            }
+            // Mixed resume after a lost core sidecar: `resolve_send_group`
+            // copied the 0.8 name *and* topic onto the 2-person live room.
+            // Require that non-empty topic match so an incoming 2-person
+            // "standup" (empty desc, `create_group`) cannot absorb a
+            // recovered 3-person standup (R-050).
+            let hist_desc = self
+                .engine
+                .historical_group_description(&group.id)
+                .unwrap_or_default();
+            if !live_direct
+                && live_count == 2
+                && hist_count >= 3
+                && live_others.iter().all(|pk| hist_others.contains(pk))
+                && !live_name.is_empty()
+                && group.name == live_name
+                && !live_desc.is_empty()
+                && live_desc != SONAR_DIRECT_DM_DESCRIPTION
+                && hist_desc == live_desc
+            {
+                room_candidates.push((group.id, group.name, hist_others));
+                continue;
+            }
+            if live_direct || live_count < 3 {
+                continue;
+            }
+            if hist_count < 3 {
+                continue;
+            }
+            if !live_others.iter().all(|pk| hist_others.contains(pk)) {
+                continue;
+            }
+            room_candidates.push((group.id, group.name, hist_others));
+        }
+        if let Some(historical) =
+            Self::unique_recovered_room_fold(&room_candidates, &live_others, &live_name)
+        {
+            self.record_resume_fold(&historical, live_id);
+        }
+    }
+
+    /// Pick at most one recovered room for an incoming 0.9 group.
+    /// Prefer an exact member match; otherwise a single subset; otherwise a
+    /// unique name match. Two overlapping rooms with no unique name stay
+    /// unfolder — guessing would merge distinct conversations.
+    fn unique_recovered_room_fold(
+        candidates: &[(GroupId, String, Vec<PublicKey>)],
+        live_others: &[PublicKey],
+        live_name: &str,
+    ) -> Option<GroupId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let exact: Vec<&GroupId> = candidates
+            .iter()
+            .filter(|(_, _, hist)| hist.as_slice() == live_others)
+            .map(|(id, _, _)| id)
+            .collect();
+        if exact.len() == 1 {
+            return Some(exact[0].clone());
+        }
+        if candidates.len() == 1 {
+            return Some(candidates[0].0.clone());
+        }
+        if live_name.is_empty() {
+            return None;
+        }
+        let named: Vec<&GroupId> = candidates
+            .iter()
+            .filter(|(_, name, _)| name == live_name)
+            .map(|(id, _, _)| id)
+            .collect();
+        (named.len() == 1).then(|| named[0].clone())
+    }
+
+    fn invite_family(&self, group_id: &GroupId) -> Vec<GroupId> {
+        // Host group-info queries the listed live id. Pre-migration
+        // `sinvite1` tokens and join requests still key the recovered 0.8
+        // id. Restore a recorded index bind — or re-discover by members
+        // when that bind is gone too — so a lost sidecar does not hide
+        // those rows until housekeeping.
+        self.restore_or_rediscover_touching(group_id);
+        self.engine.fold_aliases(group_id)
+    }
+
+    /// Group id a newly minted invite token should name.
+    ///
+    /// After resume the host may still pass the recovered 0.8 id. New tokens
+    /// must embed the live sibling so a joiner requests the 0.9 group. Do not
+    /// call `resolve_send_group`: minting must not create a group. Pre-fold
+    /// tokens stay on the 0.8 id; family union still lists and approves them.
+    /// An unresumed recovered room has no live sibling — minting would embed
+    /// a dead 0.8 MLS id that a 0.9 joiner cannot request.
+    fn invite_mint_group(&self, group_id: &GroupId) -> Result<GroupId> {
+        self.restore_recorded_folds_touching(group_id);
+        if self.engine.is_dropped(group_id) {
+            return Err(Error::InvalidInput("this chat was deleted".into()));
+        }
+        if let Some(live) = self.engine.live_fold_target(group_id) {
+            if self.engine.is_dropped(&live) {
+                return Err(Error::InvalidInput("this chat was deleted".into()));
+            }
+            return Ok(live);
+        }
+        // Same lost-bind window as `resolve_send_group`: a live sibling
+        // may already exist. Re-discover before refusing to mint.
+        if self.engine.is_historical_group(group_id)? {
+            self.maybe_fold_live_groups();
+            if let Some(live) = self.engine.live_fold_target(group_id) {
+                if self.engine.is_dropped(&live) {
+                    return Err(Error::InvalidInput("this chat was deleted".into()));
+                }
+                return Ok(live);
+            }
+            return Err(Error::InvalidInput(
+                "this recovered chat cannot invite until it is resumed".into(),
+            ));
+        }
+        Ok(group_id.clone())
+    }
+
+    fn record_resume_fold(&self, historical: &GroupId, live: &GroupId) {
+        self.engine.record_historical_fold(historical, live);
+        self.promote_index_fold(historical, live);
+        self.notify_fold_aliases(historical);
+    }
+
+    fn promote_index_fold(&self, historical: &GroupId, live: &GroupId) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        if let Err(e) = idx.lock().unwrap().copy_summary(&hist_hex, &live_hex) {
+            tracing::warn!(%e, "index fold promote failed");
+            let name = self
+                .engine
+                .historical_group_name(historical)
+                .unwrap_or_default();
+            if let Err(e) = idx.lock().unwrap().ensure_group(&live_hex, &name) {
+                tracing::warn!(%e, "index fold ensure_group failed");
+            }
+        }
+        if let Err(e) = idx.lock().unwrap().record_fold(&hist_hex, &live_hex) {
+            tracing::warn!(%e, "index fold record failed");
+        }
+    }
+
+    fn persist_engine_folds_into_index(&self) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let idx = idx.lock().unwrap();
+        for (historical, live) in self.engine.historical_fold_pairs() {
+            let hist_hex = hex::encode(historical.as_slice());
+            let live_hex = hex::encode(live.as_slice());
+            if let Err(e) = idx.record_fold(&hist_hex, &live_hex) {
+                tracing::warn!(%e, "index fold backfill failed");
+            }
+        }
+    }
+
+    /// Host persist-folds can remount and page live before idle
+    /// `ensure_subscriptions`. If the JSON sidecar is gone, restore the
+    /// recorded index bind so `messages_page(live)` unions hist instead of
+    /// waiting on housekeeping. No-op when this id already has aliases.
+    ///
+    /// Must not rediscover: [`Self::group_is_direct`] sits inside
+    /// [`Self::maybe_fold_new_group`], and that would recurse. Host
+    /// remount / first-open / leave use
+    /// [`Self::restore_or_rediscover_touching`] instead.
+    fn restore_recorded_folds_touching(&self, group_id: &GroupId) {
+        if self.engine.fold_aliases(group_id).len() > 1 {
+            return;
+        }
+        self.restore_recorded_folds_from_index();
+    }
+
+    /// Restore a recorded index bind, then re-discover by members when
+    /// both sidecars are gone. Host remount (`fold_aliases` after nsec
+    /// restore), first-open `messages_page`, mark-read, and leave/delete
+    /// can run before home-list `groups()`. No-op when this id already
+    /// has aliases.
+    fn restore_or_rediscover_touching(&self, group_id: &GroupId) {
+        if self.engine.fold_aliases(group_id).len() > 1 {
+            return;
+        }
+        self.restore_recorded_folds_from_index();
+        if self.engine.fold_aliases(group_id).len() > 1 {
+            return;
+        }
+        self.rediscover_unbound_historical_folds();
+    }
+
+    /// Re-bind recovered 0.8 rows onto an already-joined 0.9 sibling when
+    /// both fold sidecars are gone. No-op when there is no live group or
+    /// every hist row is already folded — first paint after upgrade (live
+    /// empty) and the steady folded path stay cheap. Must not be called
+    /// from [`Self::restore_recorded_folds_from_index`]:
+    /// [`Self::maybe_fold_new_group`] already restores, and that would
+    /// recurse.
+    fn rediscover_unbound_historical_folds(&self) {
+        let Ok(live) = self.engine.groups() else {
+            return;
+        };
+        if live.is_empty() {
+            return;
+        }
+        let Ok(historical) = self.engine.historical_groups() else {
+            return;
+        };
+        if historical
+            .iter()
+            .all(|group| self.is_folded_historical_group(&group.id))
+        {
+            return;
+        }
+        self.maybe_fold_live_groups();
+    }
+
+    fn restore_recorded_folds_from_index(&self) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let Ok(pairs) = idx.lock().unwrap().list_folds() else {
+            return;
+        };
+        let mut stale = Vec::new();
+        for (hist_hex, live_hex) in pairs {
+            let Some(historical) = decode_group_id_hex(&hist_hex) else {
+                stale.push(hist_hex);
+                continue;
+            };
+            let Some(live) = decode_group_id_hex(&live_hex) else {
+                stale.push(hist_hex);
+                continue;
+            };
+            if self.engine.is_dropped(&historical) || self.engine.is_dropped(&live) {
+                stale.push(hist_hex);
+                continue;
+            }
+            if !self.engine.is_live_group(&live).unwrap_or(false) {
+                continue;
+            }
+            if self.engine.live_fold_target(&historical).is_some() {
+                continue;
+            }
+            self.engine.record_historical_fold(&historical, &live);
+            self.notify_fold_aliases(&historical);
+        }
+        if !stale.is_empty() {
+            let idx = idx.lock().unwrap();
+            for hist_hex in stale {
+                if let Err(e) = idx.forget_folds_for(&hist_hex) {
+                    tracing::warn!(%e, "index stale fold forget failed");
+                }
+            }
+        }
+    }
+
+    /// Drop index-recorded hist→live binds. Tests pair this with
+    /// [`MarmotEngine::clear_historical_folds`] so `maybe_fold_new_group`
+    /// topic-match stays the only heal. Production hosts must not call it.
+    pub fn clear_index_historical_folds(&self) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        if let Err(e) = idx.lock().unwrap().clear_folds() {
+            tracing::warn!(%e, "index fold clear failed");
+        }
+    }
+
+    fn is_folded_historical_summary(&self, group_id_hex: &str) -> bool {
+        let Ok(bytes) = hex::decode(group_id_hex) else {
+            return false;
+        };
+        self.is_folded_historical_group(&GroupId::new(bytes))
+    }
+
+    fn is_dropped_summary(&self, group_id_hex: &str) -> bool {
+        let Ok(bytes) = hex::decode(group_id_hex) else {
+            return false;
+        };
+        self.engine.is_dropped(&GroupId::new(bytes))
+    }
+
+    /// True when `group_id` is a recovered 0.8 row that already has a live
+    /// 0.9 fold sibling. Hosts must not paint that id as a second chat.
+    pub fn is_folded_historical_group(&self, group_id: &GroupId) -> bool {
+        matches!(self.engine.live_fold_target(group_id), Some(live) if live != *group_id)
+    }
+
+    /// Hex of the live 0.9 group that replaced `group_id_hex` after resume.
+    ///
+    /// `None` when the id is not folded. Hosts remount an open transcript
+    /// onto this id after `groups()` hides the recovered row.
+    pub fn live_fold_target_hex(&self, group_id_hex: &str) -> Option<String> {
+        let bytes = hex::decode(group_id_hex).ok()?;
+        let group_id = GroupId::new(bytes);
+        // Persist-folds remount from FFI aliases before summaries / page.
+        // Restore a recorded index bind — or re-discover by members when
+        // that bind is gone too — so the first alias query is not
+        // hist-blind after nsec restore wipes the host fold blob.
+        self.restore_or_rediscover_touching(&group_id);
+        let live = self.engine.live_fold_target(&group_id)?;
+        Some(hex::encode(live.as_slice()))
+    }
+
+    /// Recovered and live ids that share one conversation after resume.
+    /// Includes `group_id_hex` itself. Hosts use this to discover hidden 0.8
+    /// siblings from a listed live id (`live_fold_target(live)` is just live).
+    pub fn fold_aliases_hex(&self, group_id_hex: &str) -> Vec<String> {
+        if let Ok(bytes) = hex::decode(group_id_hex) {
+            self.restore_or_rediscover_touching(&GroupId::new(bytes));
+        }
+        self.fold_index_ids(group_id_hex)
+    }
+
+    fn fold_index_ids(&self, group_id_hex: &str) -> Vec<String> {
+        let Ok(bytes) = hex::decode(group_id_hex) else {
+            return vec![group_id_hex.to_string()];
+        };
+        self.engine
+            .fold_aliases(&GroupId::new(bytes))
+            .into_iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect()
+    }
+
+    fn notify_fold_aliases(&self, group_id: &GroupId) {
+        for alias in self.engine.fold_aliases(group_id) {
+            if alias == *group_id {
+                continue;
+            }
+            self.notify_conversation_changed(&hex::encode(alias.as_slice()));
+        }
+    }
+
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
+        self.restore_or_rediscover_touching(group_id);
         self.engine.messages(group_id).map(|msgs| {
             msgs.into_iter()
                 .map(|m| self.with_delivery_state(m))
@@ -7102,6 +8235,7 @@ impl SonarClient {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<ChatMessage>> {
+        self.restore_or_rediscover_touching(group_id);
         self.engine
             .messages_page(group_id, limit, offset)
             .map(|msgs| {
@@ -7116,6 +8250,8 @@ impl SonarClient {
         group_limit: usize,
         page_limit: usize,
     ) -> Result<Vec<RecentMessagePage>> {
+        self.restore_recorded_folds_from_index();
+        self.rediscover_unbound_historical_folds();
         self.engine
             .recent_message_pages(group_limit, page_limit)
             .map(|pages| {
@@ -7153,6 +8289,22 @@ impl SonarClient {
         self.engine.members(group_id)
     }
 
+    /// FFI / host paint only. See [`MarmotEngine::display_members`].
+    pub fn display_members(&self, group_id: &GroupId) -> Result<Vec<PublicKey>> {
+        // Restore only. Rediscover would bind hist onto live and paint
+        // leftover 0.8 members before idle invite (`ensure_subscriptions`).
+        // FFI `groups()` already rediscovers; leftover roster stays a
+        // post-fold display.
+        self.restore_recorded_folds_touching(group_id);
+        self.engine.display_members(group_id)
+    }
+
+    /// FFI / host paint only. See [`MarmotEngine::display_name`].
+    pub fn display_name(&self, group_id: &GroupId, live_name: &str) -> String {
+        self.restore_or_rediscover_touching(group_id);
+        self.engine.display_name(group_id, live_name)
+    }
+
     /// Delete a single Marmot chat's local state (see
     /// [`MarmotEngine::delete_group`]) and narrow the live 445 subscription so we
     /// stop receiving its messages. Local-only; the peer is not notified.
@@ -7160,19 +8312,26 @@ impl SonarClient {
     /// Returns after durable local purge. Live-subscription narrowing runs in
     /// the background so delete never waits on relay round-trips.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
-        let group_id_hex = hex::encode(group_id.as_slice());
-        self.engine.delete_group(group_id)?;
-        self.outbox_state
-            .lock()
-            .unwrap()
-            .remove_group_entries(&group_id_hex)?;
-        self.remove_index_for_group(group_id);
+        self.restore_or_rediscover_touching(group_id);
+        let family = self.engine.fold_aliases(group_id);
+        self.engine.delete_group(group_id).await?;
+        self.purge_conversation_ids(&family);
         if let Some(ref db_path) = self.marmot_db_path {
             crate::account_backup::mark_backup_dirty(db_path);
         }
-        self.notify_conversation_changed(&group_id_hex);
         self.schedule_resubscribe_marmot_groups_if_live();
         Ok(())
+    }
+
+    fn purge_conversation_ids(&self, ids: &[GroupId]) {
+        for id in ids {
+            let hex = hex::encode(id.as_slice());
+            if let Err(e) = self.outbox_state.lock().unwrap().remove_group_entries(&hex) {
+                tracing::warn!(%e, "outbox family purge failed");
+            }
+            self.remove_index_for_group(id);
+            self.notify_conversation_changed(&hex);
+        }
     }
 
     // ── Conversation index (Signal-style summary table) ──────────────────
@@ -7185,29 +8344,164 @@ impl SonarClient {
     }
 
     pub fn conversation_summaries(&self) -> Vec<ConversationSummary> {
+        // Lost JSON sidecar: hist summaries reappear until a page restores
+        // the bind. Home list must not split a person into two rows.
+        self.restore_recorded_folds_from_index();
+        // Lost index bind too: restore is a no-op. Re-discover before
+        // hide/remount so NSE / wake / home do not publish hist + live.
+        self.rediscover_unbound_historical_folds();
         let Some(ref idx) = self.conversation_index else {
             return Vec::new();
         };
-        idx.lock().unwrap().summaries_ordered().unwrap_or_default()
+        let mut summaries = idx.lock().unwrap().summaries_ordered().unwrap_or_default();
+        let mut stale = Vec::new();
+        summaries.retain(|s| {
+            if self.is_folded_historical_summary(&s.group_id_hex) {
+                return false;
+            }
+            if self.is_dropped_summary(&s.group_id_hex) {
+                stale.push(s.group_id_hex.clone());
+                return false;
+            }
+            true
+        });
+        if !stale.is_empty() {
+            let idx = idx.lock().unwrap();
+            for hex in stale {
+                if let Err(e) = idx.remove_group(&hex) {
+                    tracing::warn!(%e, "index heal dropped group failed");
+                }
+            }
+        }
+        // Hide must not invent 0 on the live row. Restore records the bind
+        // only — `copy_summary` stays on `maybe_fold` so a second copy cannot
+        // double-count. Hist remains in the table; first-process hosts and
+        // NSE have no previous cache, so remount unread / latest_at /
+        // message_count onto the published live id here.
+        self.remount_hidden_hist_onto_published_summaries(&mut summaries);
+        // FFI `groups()` paints via `display_name` (sidecar / fold-family).
+        // Wake, NSE, and host-delta titles read `summary.name`. A blank
+        // live MLS topic plus an empty index row would otherwise banner
+        // the sender only for a named recovered room.
+        self.paint_summary_display_names(&mut summaries);
+        summaries
+    }
+
+    fn remount_hidden_hist_onto_published_summaries(
+        &self,
+        summaries: &mut Vec<ConversationSummary>,
+    ) {
+        let Some(ref idx) = self.conversation_index else {
+            return;
+        };
+        let pairs = self.engine.historical_fold_pairs();
+        if pairs.is_empty() {
+            return;
+        }
+        let idx = idx.lock().unwrap();
+        let mut remounted = false;
+        for (historical, live) in pairs {
+            if live == historical {
+                continue;
+            }
+            let hist_hex = hex::encode(historical.as_slice());
+            let live_hex = hex::encode(live.as_slice());
+            let Ok(Some(hist)) = idx.summary(&hist_hex) else {
+                continue;
+            };
+            if hist.unread_count == 0 && hist.latest_at_secs == 0 && hist.message_count == 0 {
+                continue;
+            }
+            if let Some(live_summary) = summaries.iter_mut().find(|s| s.group_id_hex == live_hex) {
+                Self::remount_hist_fields_onto_live(live_summary, &hist);
+                remounted = true;
+                continue;
+            }
+            if self.engine.is_dropped(&live) || !self.engine.is_live_group(&live).unwrap_or(false) {
+                continue;
+            }
+            let mut published = hist.clone();
+            published.group_id_hex = live_hex;
+            summaries.push(published);
+            remounted = true;
+        }
+        // SQL order used live latest_at 0. Remounting hist newest onto that
+        // existing row must re-sort or NSE / first-tip fallback keep a
+        // newer unrelated chat in front.
+        if remounted {
+            summaries.sort_by(|a, b| {
+                b.latest_at_secs
+                    .cmp(&a.latest_at_secs)
+                    .then_with(|| a.group_id_hex.cmp(&b.group_id_hex))
+            });
+        }
+    }
+
+    fn paint_summary_display_names(&self, summaries: &mut [ConversationSummary]) {
+        for summary in summaries.iter_mut() {
+            if !summary.name.trim().is_empty() {
+                continue;
+            }
+            let Some(id) = decode_group_id_hex(&summary.group_id_hex) else {
+                continue;
+            };
+            let painted = self.engine.display_name(&id, "");
+            if !painted.is_empty() {
+                summary.name = painted;
+            }
+        }
+    }
+
+    fn remount_hist_fields_onto_live(live: &mut ConversationSummary, hist: &ConversationSummary) {
+        live.unread_count = live.unread_count.saturating_add(hist.unread_count);
+        if hist.latest_at_secs > live.latest_at_secs {
+            live.latest_content = hist.latest_content.clone();
+            live.latest_sender = hist.latest_sender.clone();
+            live.latest_at_secs = hist.latest_at_secs;
+            live.latest_mine = hist.latest_mine;
+        }
+        if hist.message_count > live.message_count {
+            live.message_count = hist.message_count;
+        }
+        if live.name.is_empty() && !hist.name.is_empty() {
+            live.name = hist.name.clone();
+        }
     }
 
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
+        if self.is_dropped_summary(group_id_hex) {
+            return None;
+        }
         let idx = self.conversation_index.as_ref()?;
         idx.lock().unwrap().summary(group_id_hex).ok().flatten()
     }
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
+        if let Some(group_id) = decode_group_id_hex(group_id_hex) {
+            self.restore_or_rediscover_touching(&group_id);
+        }
+        let ids = self.fold_index_ids(group_id_hex);
         if let Some(ref idx) = self.conversation_index {
-            // Notify only when the unread count actually moved. Hosts re-mark
+            // Notify only when an unread count actually moved. Hosts re-mark
             // the OPEN chat read on every change notification for it, so an
             // unconditional notify here closed a loop — mark → notify →
             // reload page → mark → … — that spun at ~20 Hz (DB write + page
             // read + summaries read each turn) for as long as a chat was open.
-            let result = idx.lock().unwrap().mark_read(group_id_hex);
-            match result {
-                Ok(true) => self.notify_conversation_changed(group_id_hex),
-                Ok(false) => {}
-                Err(e) => tracing::warn!(%e, "index mark_read failed"),
+            // A fold family (hidden 0.8 hist + live 0.9) clears together: when
+            // any member moved, notify every member so the live home row drops
+            // a badge only the hidden sibling carried.
+            let mut changed = false;
+            for id in &ids {
+                match idx.lock().unwrap().mark_read(id) {
+                    Ok(true) => changed = true,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(%e, "index mark_read failed"),
+                }
+            }
+            if changed {
+                for id in &ids {
+                    self.notify_conversation_changed(id);
+                }
             }
         }
     }
@@ -7301,7 +8595,7 @@ impl SonarClient {
         }
     }
 
-    /// Encrypt at most one kind-449 rumor per active MLS group and publish
+    /// Encrypt at most one timezone share per active MLS group and publish
     /// through the chat outbox. Per-group dedupe suppresses ordinary
     /// sync/message triggers; failed creates stay eligible for retry.
     async fn share_local_timezone_with_groups(&self) {
@@ -7328,7 +8622,7 @@ impl SonarClient {
         }
         let mut groups: Vec<_> = groups
             .into_iter()
-            .filter(|group| allow.contains(&hex::encode(group.mls_group_id.as_slice())))
+            .filter(|group| allow.contains(&hex::encode(group.id.as_slice())))
             .collect();
         if groups.len() > MAX_TIMEZONE_SHARE_GROUPS {
             tracing::warn!(
@@ -7340,11 +8634,11 @@ impl SonarClient {
         }
 
         for group in groups {
-            let group_id = group.mls_group_id;
+            let group_id = group.id;
             let group_id_hex = hex::encode(group_id.as_slice());
             let wanted = TimezoneShareDedupe {
                 zone: zone.clone(),
-                epoch: group.epoch,
+                epoch: group.epoch.0,
             };
             {
                 let mut shared = self.timezone_shared_with.lock().unwrap();
@@ -7369,6 +8663,7 @@ impl SonarClient {
                 match self
                     .engine
                     .create_and_process_timezone_share(&group_id, &payload)
+                    .await
                 {
                     Ok(created) => created,
                     Err(err) => {
@@ -7384,7 +8679,7 @@ impl SonarClient {
                     self.remove_failed_timezone_share(&group_id_hex, &zone);
                     tracing::debug!(
                         ?other,
-                        "created timezone share did not persist as a kind-449 rumor"
+                        "created timezone share was not echoed as a timezone share"
                     );
                     continue;
                 }
@@ -7425,6 +8720,7 @@ impl SonarClient {
         before_id: Option<&nostr::EventId>,
         limit: usize,
     ) -> Result<Vec<ChatMessage>> {
+        self.restore_or_rediscover_touching(group_id);
         self.engine
             .messages_cursor_page(group_id, before_secs, before_id, limit)
             .map(|msgs| {
@@ -7435,6 +8731,9 @@ impl SonarClient {
     }
 
     fn upsert_index_for_message(&self, message: &ChatMessage, group_name: Option<&str>) {
+        if self.engine.is_dropped(&message.group_id) {
+            return;
+        }
         if let Some(ref idx) = self.conversation_index {
             let group_id_hex = hex::encode(message.group_id.as_slice());
             let name = group_name.unwrap_or("");
@@ -7476,6 +8775,9 @@ impl SonarClient {
     }
 
     fn ensure_index_for_group(&self, group_id: &GroupId, name: &str) {
+        if self.engine.is_dropped(group_id) {
+            return;
+        }
         let Some(ref idx) = self.conversation_index else {
             return;
         };
@@ -7486,11 +8788,14 @@ impl SonarClient {
     }
 
     fn resolve_group_name(&self, group_id: &GroupId) -> Option<String> {
-        self.engine.groups().ok().and_then(|gs| {
-            gs.into_iter()
-                .find(|g| g.mls_group_id == *group_id)
-                .map(|g| g.name)
-        })
+        let live = self
+            .engine
+            .groups()
+            .ok()
+            .and_then(|gs| gs.into_iter().find(|g| g.id == *group_id).map(|g| g.name))
+            .unwrap_or_default();
+        let painted = self.engine.display_name(group_id, &live);
+        (!painted.is_empty()).then_some(painted)
     }
 
     fn remove_index_for_group(&self, group_id: &GroupId) {
@@ -7524,10 +8829,14 @@ impl SonarClient {
             return;
         };
         let idx_guard = idx.lock().unwrap();
-        if !idx_guard.is_empty() {
-            return;
-        }
-        if let Err(e) = idx_guard.materialize_from(&self.engine) {
+        let result = if idx_guard.is_empty() {
+            idx_guard.materialize_from(&self.engine)
+        } else {
+            // An upgraded 0.8 install already has index rows. Still seed any
+            // recovered transcript / admin-member chats the old index missed.
+            idx_guard.seed_missing_recovered(&self.engine)
+        };
+        if let Err(e) = result {
             tracing::warn!(%e, "index materialize failed");
         }
     }
@@ -7952,6 +9261,66 @@ impl SonarClient {
         Ok(())
     }
 
+    /// After a new live group is minted or joined, share our token without
+    /// waiting for the next sync. First-resume send and Accept are the
+    /// common killed-app gap: peers on the new 0.9 group otherwise cannot
+    /// Transponder-wake this install. No-ops without a cached registration.
+    /// Relays and gift-wraps run off the send/accept path.
+    fn schedule_share_push_token_with_groups(&self) {
+        let Some(reg) = self.own_push_registration.lock().unwrap().clone() else {
+            return;
+        };
+        self.push_token_share_after_join
+            .fetch_add(1, Ordering::Relaxed);
+        let my_pubkey = self.engine.identity().public_key();
+        let identity_keys = self.engine.identity().keys().clone();
+        let nostr = self.nostr.clone();
+        let mut recipients = HashSet::new();
+        for group_id in self.membership_group_ids() {
+            let Ok(members) = self.engine.members(&group_id) else {
+                continue;
+            };
+            for member in members {
+                if member != my_pubkey {
+                    recipients.insert(member);
+                }
+            }
+        }
+        if recipients.is_empty() {
+            return;
+        }
+        let payload = crate::push::PushTokenSharePayload {
+            encrypted_token: reg.encrypted_token_b64.clone(),
+            server_pubkey: reg.server_pubkey.to_hex(),
+        };
+        let Ok(payload_json) = serde_json::to_string(&payload) else {
+            return;
+        };
+        tokio::spawn(async move {
+            for recipient in recipients {
+                let rumor = EventBuilder::new(
+                    Kind::Custom(crate::push::KIND_PUSH_TOKEN_SHARE),
+                    payload_json.clone(),
+                )
+                .tags([Tag::public_key(recipient)])
+                .build(my_pubkey);
+                let Ok(wrapped) =
+                    gift_wrap_with_current_timestamp_async(&identity_keys, &recipient, rumor).await
+                else {
+                    continue;
+                };
+                if let Err(err) = nostr.send_event(&wrapped).await {
+                    tracing::debug!(%err, "push token share after join failed");
+                }
+            }
+        });
+    }
+
+    #[cfg(test)]
+    fn push_token_share_after_join_count(&self) -> u64 {
+        self.push_token_share_after_join.load(Ordering::Relaxed)
+    }
+
     /// Send our encrypted push token to every member of every joined group
     /// via a NIP-44 encrypted DM (kind 447). Group members cache this to send
     /// sender-side notifications to us.
@@ -7984,13 +9353,7 @@ impl SonarClient {
         let own_reg = self.own_push_registration.lock().unwrap().clone();
         let Some(reg) = own_reg else { return };
 
-        let groups = match self.engine.groups() {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(%e, "push token share: failed to list groups");
-                return;
-            }
-        };
+        let group_ids = self.membership_group_ids();
 
         let my_pubkey = self.engine.identity().public_key();
         let payload = crate::push::PushTokenSharePayload {
@@ -8005,16 +9368,20 @@ impl SonarClient {
             }
         };
 
-        for group in &groups {
-            let members = match self.engine.members(&group.mls_group_id) {
+        let mut seen = HashSet::new();
+        for group_id in &group_ids {
+            let members = match self.engine.members(group_id) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            for member in &members {
-                if member == &my_pubkey {
+            for member in members {
+                if member == my_pubkey {
                     continue;
                 }
-                if let Err(e) = self.send_push_token_dm(member, &payload_json).await {
+                if !seen.insert(member.to_hex()) {
+                    continue;
+                }
+                if let Err(e) = self.send_push_token_dm(&member, &payload_json).await {
                     tracing::debug!(
                         recipient = %member,
                         %e,
@@ -8102,18 +9469,32 @@ impl SonarClient {
     /// protocol-critical decision, and a transient engine read failure must not
     /// crash or drop the sync batch.
     fn is_known_group_member(&self, sender: &PublicKey) -> bool {
-        let groups = match self.engine.groups() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        for group in &groups {
-            if let Ok(members) = self.engine.members(&group.mls_group_id) {
+        for group_id in self.membership_group_ids() {
+            if let Ok(members) = self.engine.members(&group_id) {
                 if members.contains(sender) {
                     return true;
                 }
             }
         }
         false
+    }
+
+    /// Live 0.9 MLS ids plus recovered 0.8 conversations that are still
+    /// readable. Kind-447 push-token shares can arrive from a recovered peer
+    /// before either side resumes; walking `groups()` alone rejects them.
+    fn membership_group_ids(&self) -> Vec<GroupId> {
+        let mut ids = Vec::new();
+        match self.engine.groups() {
+            Ok(groups) => ids.extend(groups.into_iter().map(|group| group.id)),
+            Err(e) => tracing::warn!(%e, "membership walk: failed to list live groups"),
+        }
+        match self.engine.historical_groups() {
+            Ok(historical) => ids.extend(historical.into_iter().map(|group| group.id)),
+            Err(e) => tracing::warn!(%e, "membership walk: failed to list recovered groups"),
+        }
+        ids.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        ids.dedup();
+        ids
     }
 }
 
@@ -8143,11 +9524,13 @@ fn sync_state_tmp_path(path: &Path) -> PathBuf {
 fn is_terminal_marmot_processing_error(err: &Error) -> bool {
     matches!(
         err,
-        Error::Nip59(_)
-            | Error::Nip44(_)
-            | Error::NostrEvent(_)
-            | Error::Mdk(mdk_core::Error::WelcomePreviouslyFailed(_))
+        Error::Nip59(_) | Error::Nip44(_) | Error::NostrEvent(_)
     )
+}
+
+fn is_admin_self_remove_blocked(err: &Error) -> bool {
+    let s = err.to_string();
+    s.contains("admin cannot self-remove") || s.contains("self-demote")
 }
 
 /// Deadline for one Blossom upload, scaled to the payload so a large video on
@@ -8201,6 +9584,24 @@ pub(crate) fn index_preview(message: &ChatMessage) -> String {
     } else {
         first.filename.clone()
     }
+}
+
+fn decode_group_id_hex(hex_id: &str) -> Option<GroupId> {
+    hex::decode(hex_id).ok().map(GroupId::new)
+}
+
+/// A KeyPackage published by an MDK 0.8 install: it advertises the legacy
+/// `NostrGroupData` extension `0xf2ee` in `mls_extensions` (0.9 packages carry
+/// `app_components` instead). MDK 0.9 cannot admit it.
+pub(crate) fn is_legacy_mdk08_key_package(event: &Event) -> bool {
+    event.tags.iter().any(|tag| {
+        let values = tag.as_slice();
+        values.first().is_some_and(|name| name == "mls_extensions")
+            && values
+                .iter()
+                .skip(1)
+                .any(|value| value.eq_ignore_ascii_case("0xf2ee"))
+    })
 }
 
 /// True when the content is a serialized JSON object/array — the shape bot
@@ -8340,12 +9741,10 @@ mod tests {
             .await
             .expect("mock relay starts");
         let url = relay.url().await;
-        let client = SonarClient::connect_in_memory(
-            crate::identity::Identity::generate(),
-            vec![url],
-        )
-        .await
-        .expect("client connects");
+        let client =
+            SonarClient::connect_in_memory(crate::identity::Identity::generate(), vec![url])
+                .await
+                .expect("client connects");
 
         // Disconnect from the CLIENT side, not by killing the relay: a dead
         // socket is only noticed on the next read/ping, so `relay.shutdown()`
@@ -8725,7 +10124,7 @@ mod tests {
             ConversationIndex::open_in_memory().expect("index opens"),
         )));
 
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let group_hex = hex::encode(group_id.as_slice());
         let peer = Keys::generate().public_key();
         let incoming = |seed: u8, secs: u64, content: &str| ChatMessage {
@@ -8743,7 +10142,8 @@ mod tests {
         };
 
         client.upsert_index_for_message(&incoming(1, 100, "hey"), Some("Chat"));
-        client.upsert_index_for_message(&incoming(2, 200, "☎CALL|1|END|c3a1|declined"), Some("Chat"));
+        client
+            .upsert_index_for_message(&incoming(2, 200, "☎CALL|1|END|c3a1|declined"), Some("Chat"));
         client.upsert_index_for_message(&incoming(3, 300, "⚡PAYDONE|1|abc-123"), Some("Chat"));
 
         let summary = client
@@ -8785,7 +10185,7 @@ mod tests {
         });
         client.set_conversation_change_listener(Some(listener.clone()));
 
-        let group_id = GroupId::from_slice(&[9u8; 32]);
+        let group_id = GroupId::new(vec![9u8; 32]);
         let group_hex = hex::encode(group_id.as_slice());
         let incoming = ChatMessage {
             id: test_event_id(1),
@@ -8826,6 +10226,639 @@ mod tests {
         );
     }
 
+    /// Leave/delete marks the fold family dropped and removes the index row.
+    /// A crash between those two steps (or a host that only purged core) must
+    /// not keep the recovered chat in `conversation_summaries` unread/home
+    /// probes. Heal the leftover index row on the next read.
+    #[tokio::test]
+    async fn conversation_summaries_omit_and_heal_dropped_groups() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let group_id = GroupId::new([0x11u8; 16]);
+        let group_hex = hex::encode(group_id.as_slice());
+        let peer = Keys::generate().public_key();
+        client.upsert_index_for_message(
+            &ChatMessage {
+                id: test_event_id(1),
+                group_id: group_id.clone(),
+                sender: peer,
+                content: "old hello".into(),
+                created_at: Timestamp::from_secs(100),
+                mine: false,
+                delivery_state: crate::marmot::DeliveryState::Received,
+                media: vec![],
+                sticker_ref: None,
+                classification: crate::marmot::MessageClassification::of("old hello"),
+                reply: None,
+            },
+            Some("standup"),
+        );
+        assert!(client.conversation_summary(&group_hex).is_some());
+        client.engine.purge_fold_family(&group_id);
+
+        assert!(
+            client.conversation_summary(&group_hex).is_none(),
+            "dropped recovered chat must not stay readable as a summary"
+        );
+        assert!(
+            client
+                .conversation_summaries()
+                .iter()
+                .all(|s| s.group_id_hex != group_hex),
+            "home-list unread probe must omit a chat the user already left"
+        );
+        let leftover = client
+            .conversation_index
+            .as_ref()
+            .expect("index")
+            .lock()
+            .unwrap()
+            .summary(&group_hex)
+            .expect("lookup");
+        assert!(
+            leftover.is_none(),
+            "listing must heal the leftover index row so the next cold start stays clean"
+        );
+
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(2),
+            group_id: group_id.clone(),
+            sender: peer,
+            content: "replayed after leave".into(),
+            created_at: Timestamp::from_secs(200),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("replayed after leave"),
+            reply: None,
+        });
+        client.upsert_index_for_message(
+            &ChatMessage {
+                id: test_event_id(2),
+                group_id: group_id.clone(),
+                sender: peer,
+                content: "replayed after leave".into(),
+                created_at: Timestamp::from_secs(200),
+                mine: false,
+                delivery_state: crate::marmot::DeliveryState::Received,
+                media: vec![],
+                sticker_ref: None,
+                classification: crate::marmot::MessageClassification::of("replayed after leave"),
+                reply: None,
+            },
+            Some("standup"),
+        );
+        assert!(
+            client
+                .engine
+                .messages(&group_id)
+                .expect("transcript")
+                .is_empty(),
+            "store_chat after Leave must not rewrite a deleted recovered chat"
+        );
+        assert!(
+            client.conversation_summary(&group_hex).is_none(),
+            "index upsert after Leave must not recreate the home-list row"
+        );
+    }
+
+    /// Restore records the hist→live bind without `copy_summary`. Hide must
+    /// still publish hist unread / latest_at / message_count on the live row
+    /// so first-process hosts and NSE do not invent 0. A later `copy_summary`
+    /// zeros hist unread, so a second remount cannot double-count.
+    #[tokio::test]
+    async fn conversation_summaries_remount_hidden_hist_without_copy_summary() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "old 1", "alice", 80, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "old 2", "alice", 90, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live_hex, "", "", "", 0, true, false)
+                .unwrap();
+            assert_eq!(idx.summary(&hist_hex).unwrap().unwrap().unread_count, 3);
+            assert_eq!(idx.summary(&live_hex).unwrap().unwrap().unread_count, 0);
+        }
+        client.engine.record_historical_fold(&historical, &live);
+
+        let summaries = client.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "folded hist must stay hidden: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, live_hex);
+        assert_eq!(
+            summaries[0].unread_count, 3,
+            "first-process hide must remount hist unread onto live"
+        );
+        assert_eq!(summaries[0].latest_at_secs, 100);
+        assert_eq!(summaries[0].latest_content, "keep this chat");
+        assert_eq!(
+            summaries[0].message_count, 3,
+            "blank-recovery count must remount when live count is still 0"
+        );
+        assert_eq!(
+            client
+                .conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            3,
+            "display remount must not write copy_summary"
+        );
+
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&live_hex, "alice", "new 0.9", "alice", 200, false, true)
+                .unwrap();
+        }
+        let with_live_unread = client.conversation_summaries();
+        assert_eq!(
+            with_live_unread[0].unread_count, 4,
+            "incoming 0.9 unread must add hist, matching copy_summary"
+        );
+        assert_eq!(with_live_unread[0].latest_at_secs, 200);
+        assert_eq!(with_live_unread[0].latest_content, "new 0.9");
+
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.copy_summary(&hist_hex, &live_hex).unwrap();
+            assert_eq!(idx.summary(&hist_hex).unwrap().unwrap().unread_count, 0);
+            assert_eq!(idx.summary(&live_hex).unwrap().unwrap().unread_count, 4);
+        }
+        let after_copy = client.conversation_summaries();
+        assert_eq!(
+            after_copy[0].unread_count, 4,
+            "after copy_summary hist unread is 0; remount must not double-count"
+        );
+        assert_eq!(after_copy[0].latest_at_secs, 200);
+        assert!(
+            after_copy[0].message_count >= 3,
+            "hist count must still remount after copy_summary leaves live count stale"
+        );
+    }
+
+    /// Live MLS topic and index name can both stay blank after hide.
+    /// FFI `groups()` still paints via `display_name` / sidecar. Wake and
+    /// NSE read `summary.name` and would banner the sender only.
+    #[tokio::test]
+    async fn conversation_summaries_paint_sidecar_name_when_index_name_blank() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live_hex, "", "", "", 0, true, false)
+                .unwrap();
+        }
+        client
+            .engine
+            .seed_historical_metadata(historical.clone(), "standup", vec![], 3);
+        client.engine.record_historical_fold(&historical, &live);
+
+        let summaries = client.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "folded hist must stay hidden: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, live_hex);
+        assert_eq!(
+            summaries[0].name, "standup",
+            "sidecar title must paint onto published live summary"
+        );
+        assert_eq!(summaries[0].latest_content, "keep this chat");
+    }
+
+    /// `summaries_ordered` ranks live `latest_at=0` below an unrelated chat.
+    /// Remounting hist newest onto that existing live row must re-sort so
+    /// first-tip / NSE fallback do not keep the unrelated chat in front.
+    #[tokio::test]
+    async fn conversation_summaries_reorder_after_hidden_hist_latest_remount() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let idx = ConversationIndex::open_in_memory().expect("index opens");
+        client.conversation_index = Some(Arc::new(Mutex::new(idx)));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let other = GroupId::new([0x0au8; 16]);
+        let hist_hex = hex::encode(historical.as_slice());
+        let live_hex = hex::encode(live.as_slice());
+        let other_hex = hex::encode(other.as_slice());
+        {
+            let idx = client
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "alice", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            idx.upsert_summary(&live_hex, "", "", "", 0, true, false)
+                .unwrap();
+            idx.upsert_summary(&other_hex, "bob", "newer other", "bob", 50, false, true)
+                .unwrap();
+        }
+        client.engine.record_historical_fold(&historical, &live);
+
+        let summaries = client.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            2,
+            "folded hist stays hidden: {summaries:?}"
+        );
+        assert_eq!(
+            summaries[0].group_id_hex, live_hex,
+            "remounted hist latest_at must lead SQL order: {summaries:?}"
+        );
+        assert_eq!(summaries[0].latest_at_secs, 100);
+        assert_eq!(summaries[1].group_id_hex, other_hex);
+        assert_eq!(summaries[1].latest_at_secs, 50);
+    }
+
+    /// A stale send aimed at a chat the user already left must fail closed
+    /// instead of hitting MLS on a dead id or creating a new resume group.
+    #[tokio::test]
+    async fn send_text_rejects_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x11u8; 16]);
+        client.engine.purge_fold_family(&group_id);
+        let err = client
+            .send_text(&group_id, "hi")
+            .await
+            .expect_err("send after Leave must fail");
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "deleted chat must not resume as a new group: {err:?}"
+        );
+    }
+
+    /// Add/remove on a chat the user already left must fail closed the same
+    /// way as send — not fetch KeyPackages or resume a new group.
+    #[tokio::test]
+    async fn add_and_remove_members_reject_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x12u8; 16]);
+        client.engine.purge_fold_family(&group_id);
+        let peer = Keys::generate().public_key();
+        let add_err = client
+            .add_group_members(&group_id, vec![peer])
+            .await
+            .expect_err("add after Leave must fail");
+        assert!(
+            matches!(add_err, Error::InvalidInput(_)),
+            "deleted chat must not resume as a new group: {add_err:?}"
+        );
+        let remove_err = client
+            .remove_group_members(&group_id, vec![peer])
+            .await
+            .expect_err("remove after Leave must fail");
+        assert!(
+            matches!(remove_err, Error::InvalidInput(_)),
+            "deleted chat must not resume as a new group: {remove_err:?}"
+        );
+    }
+
+    /// A pre-migration invite token still names the 0.8 MLS id. After resume
+    /// the admin UI queries the live sibling — the sidecar must union the
+    /// fold family so the request is visible and decline/revoke still work.
+    #[tokio::test]
+    async fn pending_join_requests_see_folded_historical_sidecar() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        let token = client
+            .create_invite_link(&historical, "standup")
+            .expect("create 0.8 invite");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        let requester = Keys::generate().public_key();
+        let stored = client
+            .store_join_request(crate::invite_link::JoinRequest {
+                requester,
+                group_id: historical.clone(),
+                secret_hash: crate::invite_link::sha256(&decoded.invite_secret),
+                key_package_event_id: None,
+                key_package_d_tag: None,
+                received_at: 1,
+            })
+            .expect("store");
+        assert!(stored, "0.8 token must still validate after mint");
+        client.engine.record_historical_fold(&historical, &live);
+        assert_eq!(
+            client.pending_join_requests(&live).len(),
+            1,
+            "live group-info must list requests stored on the recovered id"
+        );
+        assert_eq!(
+            client.active_invite_links(&live).len(),
+            1,
+            "live group-info must list links minted on the recovered id"
+        );
+        client
+            .decline_join_request(&live, &requester)
+            .expect("decline via live id");
+        assert!(client.pending_join_requests(&live).is_empty());
+        assert!(client.pending_join_requests(&historical).is_empty());
+        client
+            .revoke_invite_link(&live, &crate::invite_link::sha256(&decoded.invite_secret))
+            .expect("revoke via live id");
+        assert!(client.active_invite_links(&live).is_empty());
+        assert!(client.active_invite_links(&historical).is_empty());
+    }
+
+    /// After resume the host may still pass the recovered 0.8 id. A newly
+    /// minted token must name the live sibling so a joiner requests the 0.9
+    /// group rather than a dead MLS id.
+    #[tokio::test]
+    async fn create_invite_link_after_fold_mints_on_live_sibling() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x08u8; 16]);
+        let live = GroupId::new([0x09u8; 16]);
+        client.engine.record_historical_fold(&historical, &live);
+        let token = client
+            .create_invite_link(&historical, "standup")
+            .expect("mint after fold");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        assert_eq!(
+            decoded.group_id,
+            live.as_slice(),
+            "post-resume invite must embed the live 0.9 group id"
+        );
+        assert_eq!(client.active_invite_links(&historical).len(), 1);
+        assert_eq!(client.active_invite_links(&live).len(), 1);
+    }
+
+    /// A recovered 0.8 room has no live MLS group until resume. Minting a
+    /// token that names that id would hand a 0.9 joiner a dead group.
+    #[tokio::test]
+    async fn create_invite_link_rejects_unresumed_historical_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x17u8; 16]);
+        let peer = Keys::generate().public_key();
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(3),
+            group_id: historical.clone(),
+            sender: peer,
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(1),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        assert!(
+            client.engine.is_historical_group(&historical).unwrap(),
+            "transcript-only id must be a recovered room"
+        );
+        let err = client
+            .create_invite_link(&historical, "standup")
+            .expect_err("unresumed recovered room must not mint a dead 0.8 token");
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "unresumed recovered room must fail closed: {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("cannot invite until it is resumed"),
+            "host toast maps this string: {err}"
+        );
+        let live = GroupId::new([0x19u8; 16]);
+        client.engine.record_historical_fold(&historical, &live);
+        let token = client
+            .create_invite_link(&historical, "standup")
+            .expect("mint after resume");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        assert_eq!(decoded.group_id, live.as_slice());
+    }
+
+    #[tokio::test]
+    async fn create_invite_link_rejects_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x13u8; 16]);
+        client.engine.purge_fold_family(&group_id);
+        let err = client
+            .create_invite_link(&group_id, "standup")
+            .expect_err("invite after Leave must fail");
+        assert!(
+            matches!(err, Error::InvalidInput(_)),
+            "deleted chat must not mint a new invite: {err:?}"
+        );
+    }
+
+    /// Minting a shareable `sinvite1` secret is local-only. Opportunistic
+    /// backup must not wait for the next outbound send — otherwise nsec
+    /// restore drops unused invite tokens.
+    #[tokio::test]
+    async fn create_invite_link_marks_account_backup_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        client.marmot_db_path = Some(db_path.clone());
+        crate::account_backup::save_backup_policy(
+            &db_path,
+            &crate::account_backup::BackupPolicy::default(),
+        )
+        .expect("seed policy");
+        assert!(!crate::account_backup::load_backup_policy(&db_path).dirty);
+
+        client
+            .create_invite_link(&GroupId::new([0x14u8; 16]), "standup")
+            .expect("mint");
+        assert!(
+            crate::account_backup::load_backup_policy(&db_path).dirty,
+            "invite mint must enter the opportunistic backup window"
+        );
+    }
+
+    /// Inbound join requests are replayable from the relay. Marking dirty here
+    /// would keep any account with a shared invite permanently urgent — the
+    /// same class of bug as dirty-on-receive.
+    #[tokio::test]
+    async fn inbound_join_request_does_not_mark_account_backup_dirty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        client.marmot_db_path = Some(db_path.clone());
+        crate::account_backup::save_backup_policy(
+            &db_path,
+            &crate::account_backup::BackupPolicy::default(),
+        )
+        .expect("seed policy");
+        let group_id = GroupId::new([0x15u8; 16]);
+        let token = client
+            .create_invite_link(&group_id, "standup")
+            .expect("mint");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        let mut policy = crate::account_backup::load_backup_policy(&db_path);
+        policy.dirty = false;
+        crate::account_backup::save_backup_policy(&db_path, &policy).expect("clear dirty");
+        assert!(!crate::account_backup::load_backup_policy(&db_path).dirty);
+
+        let stored = client
+            .store_join_request(crate::invite_link::JoinRequest {
+                requester: Keys::generate().public_key(),
+                group_id,
+                secret_hash: crate::invite_link::sha256(&decoded.invite_secret),
+                key_package_event_id: None,
+                key_package_d_tag: None,
+                received_at: 1,
+            })
+            .expect("store");
+        assert!(stored, "valid inbound request must persist");
+        assert!(
+            !crate::account_backup::load_backup_policy(&db_path).dirty,
+            "inbound join request must not make the account backup urgent"
+        );
+    }
+
+    fn stage_tiny_jpeg(client: &SonarClient, id: &str, group_id: &GroupId) {
+        client
+            .media_staging
+            .lock()
+            .unwrap()
+            .stage(
+                id.to_string(),
+                id.to_string(),
+                hex::encode(group_id.as_slice()),
+                String::new(),
+                String::new(),
+                vec![("a.jpg".into(), "image/jpeg".into(), vec![0xFF, 0xD8, 0xFF])],
+                1,
+            )
+            .expect("stage in-memory jpeg");
+    }
+
+    fn staged_last_error(client: &SonarClient, id: &str) -> String {
+        client
+            .media_staging
+            .lock()
+            .unwrap()
+            .get(id)
+            .and_then(|entry| entry.last_error.clone())
+            .expect("staged entry failed")
+    }
+
+    /// An in-flight upload left on a chat the user already left must not
+    /// resume as a new 0.9 group.
+    #[tokio::test]
+    async fn resume_staged_media_rejects_dropped_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let group_id = GroupId::new([0x16u8; 32]);
+        client.engine.purge_fold_family(&group_id);
+        stage_tiny_jpeg(&client, "resume08drop", &group_id);
+        client
+            .resume_pending_media_uploads(None)
+            .await
+            .expect("resume reports attempts");
+        let err = staged_last_error(&client, "resume08drop");
+        assert!(
+            err.contains("this chat was deleted"),
+            "deleted chat must not resume media: {err}"
+        );
+    }
+
+    /// Staging that still names the recovered 0.8 id must hit
+    /// `resolve_send_group` (no live MLS exporter on that id) instead of
+    /// failing as a generic missing-group encrypt.
+    #[tokio::test]
+    async fn resume_staged_media_on_recovered_chat_uses_resolve_send_group() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        let historical = GroupId::new([0x08u8; 32]);
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(1),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: "old hello".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: true,
+            delivery_state: crate::marmot::DeliveryState::Sent,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old hello"),
+            reply: None,
+        });
+        stage_tiny_jpeg(&client, "resume08hist", &historical);
+        client
+            .resume_pending_media_uploads(None)
+            .await
+            .expect("resume reports attempts");
+        let err = staged_last_error(&client, "resume08hist");
+        assert!(
+            err.contains("cannot send until the other members update"),
+            "recovered media resume must go through resolve_send_group: {err}"
+        );
+    }
+
     /// R: a received message must NOT make the account "urgent" for auto-backup.
     ///
     /// Marking dirty on inbound kept any account in one active group dirty
@@ -8854,7 +10887,7 @@ mod tests {
         )
         .expect("seed policy");
 
-        let group_id = GroupId::from_slice(&[9u8; 32]);
+        let group_id = GroupId::new([9u8; 32]);
         let peer = Keys::generate().public_key();
         let msg = |seed: u8, secs: u64, mine: bool| ChatMessage {
             id: test_event_id(seed),
@@ -8887,7 +10920,7 @@ mod tests {
     fn index_preview_labels_json_payloads_without_leaking_raw_json() {
         let msg = |content: &str| ChatMessage {
             id: test_event_id(9),
-            group_id: GroupId::from_slice(&[1u8; 32]),
+            group_id: GroupId::new([1u8; 32]),
             sender: Keys::generate().public_key(),
             content: content.to_owned(),
             created_at: Timestamp::from_secs(1),
@@ -8899,27 +10932,37 @@ mod tests {
             reply: None,
         };
         // Bot/agent JSON payloads preview as a label, never raw JSON.
-        assert_eq!(index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")), "JSON payload");
+        assert_eq!(
+            index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")),
+            "JSON payload"
+        );
         assert_eq!(index_preview(&msg("  {\"ok\":true}")), "JSON payload");
         assert_eq!(index_preview(&msg("[1,2,3]")), "JSON payload");
         // Brace-prefixed human text that is NOT valid JSON stays verbatim.
-        assert_eq!(index_preview(&msg("{ not json, just a brace")), "{ not json, just a brace");
+        assert_eq!(
+            index_preview(&msg("{ not json, just a brace")),
+            "{ not json, just a brace"
+        );
         assert_eq!(index_preview(&msg("hello {}")), "hello {}");
     }
 
     #[test]
     fn index_preview_labels_media_only_messages() {
         let media_ref = |mime: &str, filename: &str| crate::marmot::MediaRef {
+            scheme_version: None,
+            file_key: None,
             url: "https://blossom.test/x".to_owned(),
             mime_type: mime.to_owned(),
             filename: filename.to_owned(),
             width: None,
             height: None,
             duration_ms: None,
+            original_hash: None,
+            nonce: None,
         };
         let msg = |content: &str, media: Vec<crate::marmot::MediaRef>| ChatMessage {
             id: test_event_id(9),
-            group_id: GroupId::from_slice(&[1u8; 32]),
+            group_id: GroupId::new([1u8; 32]),
             sender: Keys::generate().public_key(),
             content: content.to_owned(),
             created_at: Timestamp::from_secs(1),
@@ -9027,6 +11070,82 @@ mod tests {
         );
     }
 
+    /// A recovered 0.8 peer can share kind-447 before either side resumes.
+    /// Walking live `groups()` alone would reject them and drop wake tokens
+    /// until the first send.
+    #[tokio::test]
+    async fn push_token_share_from_recovered_08_peer_is_cached() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("in-memory client");
+        let historical = GroupId::new([0x08u8; 16]);
+        let peer = Keys::generate().public_key();
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(1),
+            group_id: historical,
+            sender: peer,
+            content: "old hello".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old hello"),
+            reply: None,
+        });
+        let payload = serde_json::json!({
+            "encrypted_token": "dGVzdA==",
+            "server_pubkey": Keys::generate().public_key().to_hex(),
+        })
+        .to_string();
+        client
+            .handle_push_token_share(&peer, &payload)
+            .expect("recovered peer share accepted");
+        assert!(
+            client
+                .push_token_cache
+                .lock()
+                .unwrap()
+                .contains_key(&peer.to_hex()),
+            "recovered 0.8 peer must be able to share a wake token before resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_token_share_from_left_recovered_peer_is_rejected() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("in-memory client");
+        let historical = GroupId::new([0x08u8; 16]);
+        let peer = Keys::generate().public_key();
+        client.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(1),
+            group_id: historical.clone(),
+            sender: peer,
+            content: "old hello".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old hello"),
+            reply: None,
+        });
+        client.engine.purge_fold_family(&historical);
+        let payload = serde_json::json!({
+            "encrypted_token": "dGVzdA==",
+            "server_pubkey": Keys::generate().public_key().to_hex(),
+        })
+        .to_string();
+        client
+            .handle_push_token_share(&peer, &payload)
+            .expect("left-chat share ignored");
+        assert!(
+            client.push_token_cache.lock().unwrap().is_empty(),
+            "a peer from a chat the user already left must not pollute the cache"
+        );
+    }
+
     #[tokio::test]
     async fn share_push_token_with_groups_noops_when_no_relay_connected() {
         // Behavioral coverage for the Connected-status guard on
@@ -9124,7 +11243,7 @@ mod tests {
         let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await
             .expect("client without relays");
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let oversized = vec![0u8; MAX_MEDIA_PLAINTEXT_BYTES + 1];
         let err = client
             .send_media(&group_id, oversized, "big.mp4", "video/mp4", "", "")
@@ -9145,7 +11264,7 @@ mod tests {
         let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await
             .expect("client without relays");
-        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_id = GroupId::new([7u8; 32]);
         let per_item = MAX_MEDIA_PLAINTEXT_BYTES;
         let count = MAX_MEDIA_TOTAL_PLAINTEXT_BYTES / per_item + 1;
         let items: Vec<_> = (0..count)
@@ -9164,6 +11283,201 @@ mod tests {
                 if bytes == (count * per_item) as u64
                     && max == MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_media_rejects_recovered_08_attachments_before_http() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let url = "https://blossom.example/old.bin";
+        client.engine().push_transcript_message(ChatMessage {
+            id: EventId::from_slice(&[1u8; 32]).expect("event id"),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: true,
+            delivery_state: DeliveryState::Sent,
+            media: vec![crate::marmot::MediaRef {
+                scheme_version: None,
+                file_key: None,
+                url: url.to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                filename: "old.jpg".to_owned(),
+                width: Some(100),
+                height: Some(80),
+                duration_ms: None,
+                original_hash: Some([1u8; 32]),
+                nonce: Some([2u8; 12]),
+            }],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+            reply: None,
+        });
+        let err = client
+            .fetch_media(&historical, url)
+            .await
+            .expect_err("recovered 0.8 media must fail before HTTP");
+        assert!(
+            err.to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_media_with_stored_08_exporter_is_not_unavailable() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let url = "https://127.0.0.1:1/old.bin";
+        client.engine().push_transcript_message(ChatMessage {
+            id: EventId::from_slice(&[1u8; 32]).expect("event id"),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: true,
+            delivery_state: DeliveryState::Sent,
+            media: vec![crate::marmot::MediaRef {
+                scheme_version: None,
+                file_key: None,
+                url: url.to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                filename: "old.jpg".to_owned(),
+                width: Some(100),
+                height: Some(80),
+                duration_ms: None,
+                original_hash: Some([1u8; 32]),
+                nonce: Some([2u8; 12]),
+            }],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+            reply: None,
+        });
+        client
+            .engine()
+            .add_historical_media_secret(historical.clone(), vec![0xABu8; 32]);
+        let live = GroupId::new(vec![0x22; 16]);
+        client.engine().record_historical_fold(&historical, &live);
+        assert!(
+            !client
+                .engine()
+                .recovered_08_media_unavailable(&historical, url),
+            "a stored exporter must leave the host download path open"
+        );
+        assert!(
+            !client.engine().recovered_08_media_unavailable(&live, url),
+            "a remounted live id must still see the stored 0.8 exporter"
+        );
+        let err = client
+            .fetch_media(&historical, url)
+            .await
+            .expect_err("loopback download should fail after the unavailable gate");
+        assert!(
+            !err.to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "hosts must attempt download when the 0.8 exporter was copied: {err}"
+        );
+        let live_err = client
+            .fetch_media(&live, url)
+            .await
+            .expect_err("remounted live id must also pass the unavailable gate");
+        assert!(
+            !live_err
+                .to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "hosts remounted onto the live sibling must still download: {live_err}"
+        );
+        struct NoopDownload;
+        impl MediaDownloadObserver for NoopDownload {
+            fn on_progress(&self, _: u64, _: Option<u64>) {}
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+        let dest_dir = tempfile::tempdir().expect("media dest");
+        let dest = dest_dir.path().join("old.bin.partial");
+        let file_err = client
+            .fetch_media_to_file(&historical, url, &dest, &NoopDownload)
+            .await
+            .expect_err("iOS fetch_media_to_file must pass the same gate");
+        assert!(
+            !file_err
+                .to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "hosts writing to a file must also attempt download: {file_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_folds_live_id_fetch_media_uses_hist_exporter_without_core_fold() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        let url = "https://127.0.0.1:1/old.bin";
+        client.engine().push_transcript_message(ChatMessage {
+            id: EventId::from_slice(&[1u8; 32]).expect("event id"),
+            group_id: historical.clone(),
+            sender: client.identity().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(1_700_000_000),
+            mine: true,
+            delivery_state: DeliveryState::Sent,
+            media: vec![crate::marmot::MediaRef {
+                scheme_version: None,
+                file_key: None,
+                url: url.to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                filename: "old.jpg".to_owned(),
+                width: Some(100),
+                height: Some(80),
+                duration_ms: None,
+                original_hash: Some([1u8; 32]),
+                nonce: Some([2u8; 12]),
+            }],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+            reply: None,
+        });
+        client
+            .engine()
+            .add_historical_media_secret(historical.clone(), vec![0xABu8; 32]);
+        assert!(
+            client.engine().live_fold_target(&historical).is_none(),
+            "persist-folds window has no core fold"
+        );
+        let live_err = client
+            .fetch_media(&live, url)
+            .await
+            .expect_err("loopback download should fail after the unavailable gate");
+        assert!(
+            !live_err
+                .to_string()
+                .contains(crate::marmot::RECOVERED_08_MEDIA_UNAVAILABLE),
+            "live id must still attempt download when hist owns the URL: {live_err}"
+        );
+        assert!(client.engine().recovered_08_media_unavailable(&live, url) == false);
+    }
+
+    #[tokio::test]
+    async fn send_text_on_unknown_group_is_not_a_recovered_chat_error() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let err = client
+            .send_text(&GroupId::new([7u8; 32]), "hi")
+            .await
+            .expect_err("unknown group must fail");
+        assert!(
+            !err.to_string().contains("other members update Sonar"),
+            "resume-fold error is only for recovered 0.8 rows: {err}"
         );
     }
 
@@ -9356,13 +11670,17 @@ mod tests {
         let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
         let bob = MarmotEngine::in_memory(Identity::generate());
         let carol = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
-        let carol_kp = carol.key_package_event(relays.clone()).expect("carol kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol kp");
 
         let creation = alice
             .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
+        let group_id = creation.group.id.clone();
         for (member, engine) in [
             (bob.identity().public_key(), &bob),
             (carol.identity().public_key(), &carol),
@@ -9373,10 +11691,7 @@ mod tests {
                 .find(|(pubkey, _)| *pubkey == member)
                 .cloned()
                 .expect("welcome");
-            let wrapped = alice
-                .gift_wrap_welcome(&member, welcome)
-                .await
-                .expect("wrap welcome");
+            let wrapped = welcome;
             // A >2-member group welcome lands as a pending invite that the
             // member must accept explicitly (White Noise semantics).
             match engine
@@ -9389,6 +11704,7 @@ mod tests {
                     let invite = engine.pending_group_invites().expect("pending invites")[0].id;
                     engine
                         .accept_group_invite(&invite)
+                        .await
                         .expect("member accepts invite");
                 }
                 other => panic!("unexpected welcome result: {other:?}"),
@@ -9396,24 +11712,28 @@ mod tests {
         }
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges creation commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
-        let incoming_events: Vec<Event> = (0..10)
-            .map(|i| {
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
+        let mut incoming_events = Vec::new();
+        for i in 0..10 {
+            incoming_events.push(
                 bob.create_text_message(&bob_group_id, &format!("bob under load {i}"))
-                    .expect("bob creates message")
-            })
-            .collect();
+                    .await
+                    .expect("bob creates message"),
+            );
+        }
 
         // Phase 1: sends + incoming + reads all concurrent.
         let sender = {
             let alice = alice.clone();
             let group_id = group_id.clone();
-            tokio::task::spawn_blocking(move || {
+            tokio::spawn(async move {
                 for i in 0..20 {
                     alice
                         .create_and_process_text_message(&group_id, &format!("alice load {i}"))
+                        .await
                         .expect("alice sends under load");
                 }
             })
@@ -9455,11 +11775,14 @@ mod tests {
         // the post-removal message, carol must not.
         let removal = alice
             .remove_members(&group_id, &[carol.identity().public_key()])
+            .await
             .expect("alice removes carol");
         assert!(removal.requires_commit_merge);
-        let carol_group_id = carol.groups().expect("carol groups")[0]
-            .mls_group_id
-            .clone();
+        let carol_group_id = carol.groups().expect("carol groups")[0].id.clone();
+        alice
+            .merge_pending_commit(&group_id)
+            .await
+            .expect("alice merges removal");
         bob.process_incoming(&removal.evolution_event)
             .await
             .expect("bob processes removal commit");
@@ -9467,9 +11790,16 @@ mod tests {
             .process_incoming(&removal.evolution_event)
             .await
             .expect("carol processes removal commit");
-        alice
-            .merge_pending_commit(&group_id)
-            .expect("alice merges removal");
+        // MIP-03 collects commits for ~1s before applying. Ingest must not
+        // wait that window (a rival commit can still arrive).
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        bob.advance_group_convergence(&bob_group_id)
+            .await
+            .expect("bob applies removal after cutoff");
+        carol
+            .advance_group_convergence(&carol_group_id)
+            .await
+            .expect("carol applies removal after cutoff");
         assert!(
             !alice
                 .members(&group_id)
@@ -9480,13 +11810,16 @@ mod tests {
 
         let (post_removal_event, _) = alice
             .create_and_process_text_message(&group_id, "after carol removal")
+            .await
             .expect("alice sends post-removal");
-        assert!(matches!(
-            bob.process_incoming(&post_removal_event)
-                .await
-                .expect("bob still reads post-removal message"),
-            Incoming::Message(_)
-        ));
+        let bob_post = bob
+            .process_incoming(&post_removal_event)
+            .await
+            .expect("bob still reads post-removal message");
+        assert!(
+            matches!(bob_post, Incoming::Message(_)),
+            "bob must decrypt the post-removal message, got {bob_post:?}"
+        );
         let carol_result = carol.process_incoming(&post_removal_event).await;
         let carol_readable = matches!(carol_result, Ok(Incoming::Message(_)));
         assert!(
@@ -9512,21 +11845,19 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
 
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
-        let (bob_pubkey, bob_welcome) = creation
+        let group_id = creation.group.id.clone();
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
             .expect("bob welcome");
-        let bob_wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let bob_wrapped = bob_welcome;
         assert!(matches!(
             bob.process_incoming(&bob_wrapped)
                 .await
@@ -9535,23 +11866,27 @@ mod tests {
         ));
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges pending commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
-        let incoming_events: Vec<Event> = (0..10)
-            .map(|i| {
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
+        let mut incoming_events = Vec::new();
+        for i in 0..10 {
+            incoming_events.push(
                 bob.create_text_message(&bob_group_id, &format!("from bob {i}"))
-                    .expect("bob creates message")
-            })
-            .collect();
+                    .await
+                    .expect("bob creates message"),
+            );
+        }
 
         let sender = {
             let alice = alice.clone();
             let group_id = group_id.clone();
-            tokio::task::spawn_blocking(move || {
+            tokio::spawn(async move {
                 for i in 0..10 {
                     alice
                         .create_and_process_text_message(&group_id, &format!("from alice {i}"))
+                        .await
                         .expect("alice sends");
                 }
             })
@@ -9598,22 +11933,23 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = MarmotEngine::in_memory(Identity::generate());
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
 
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
-        let nostr_group_id_hex = hex::encode(creation.group.nostr_group_id);
-        let (bob_pubkey, bob_welcome) = creation
+        let group_id = creation.group.id.clone();
+        let nostr_group_id_hex = alice
+            .nostr_h_tag_hex(&group_id)
+            .expect("routing")
+            .expect("founding group has nostr routing");
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
             .expect("bob welcome");
-        let bob_wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let bob_wrapped = bob_welcome;
         assert!(matches!(
             bob.process_incoming(&bob_wrapped)
                 .await
@@ -9622,11 +11958,13 @@ mod tests {
         ));
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges pending commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
         let bob_event = bob
             .create_text_message(&bob_group_id, "remote first")
+            .await
             .expect("bob creates message");
         let bob_message_secs = bob_event.created_at.as_secs();
         assert!(matches!(
@@ -9640,6 +11978,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let alice_event = alice
             .create_text_message(&group_id, "local later")
+            .await
             .expect("alice creates local message");
         assert!(alice_event.created_at.as_secs() > bob_message_secs);
         assert!(matches!(
@@ -9651,9 +11990,321 @@ mod tests {
         ));
 
         let floors = SonarClient::group_message_catchup_floors(&alice);
+        assert_eq!(nostr_group_id_hex.len(), 64);
+        assert_ne!(nostr_group_id_hex, hex::encode(group_id.as_slice()));
         assert_eq!(
             floors.get(&nostr_group_id_hex).copied(),
             Some(bob_message_secs)
+        );
+    }
+
+    /// Folded 0.8 hist must not count as a live 0.9 page. Family union would
+    /// skip empty-transcript backfill and raise catch-up `since` past unread
+    /// 0.9 traffic from a peer who upgraded first.
+    #[tokio::test]
+    async fn catchup_and_empty_backfill_ignore_folded_hist_transcript() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x08u8; 16]);
+        const HIST_REMOTE_SECS: u64 = 9_000_000_000;
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(21),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(HIST_REMOTE_SECS),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live)
+        );
+        assert!(
+            !bob.engine
+                .messages_page(&live, 1, 0)
+                .expect("family page")
+                .is_empty(),
+            "sanity: messages_page(live) unions hist"
+        );
+        let h = bob
+            .engine
+            .nostr_h_tag_hex(&live)
+            .expect("routing")
+            .expect("founding group has nostr routing");
+
+        let empty = SonarClient::empty_transcript_group_ids(&bob.engine);
+        assert!(
+            empty.contains(&h),
+            "folded hist must not hide an empty live group from full backfill: {empty:?}"
+        );
+        let floors = SonarClient::group_message_catchup_floors(&bob.engine);
+        assert!(
+            !floors.contains_key(&h),
+            "empty live must not enter catch-up with a hist floor: {floors:?}"
+        );
+
+        alice
+            .merge_pending_commit(&creation.group.id)
+            .await
+            .expect("alice merges pending commit");
+        let alice_event = alice
+            .create_text_message(&creation.group.id, "0.9 after upgrade")
+            .await
+            .expect("alice creates 0.9 message");
+        let live_remote_secs = alice_event.created_at.as_secs();
+        assert!(live_remote_secs < HIST_REMOTE_SECS);
+        assert!(matches!(
+            bob.engine
+                .process_incoming(&alice_event)
+                .await
+                .expect("bob stores 0.9 message"),
+            Incoming::Message(_)
+        ));
+
+        let empty_after = SonarClient::empty_transcript_group_ids(&bob.engine);
+        assert!(
+            !empty_after.contains(&h),
+            "a live 0.9 row must leave empty-transcript repair"
+        );
+        let floors_after = SonarClient::group_message_catchup_floors(&bob.engine);
+        assert_eq!(
+            floors_after.get(&h).copied(),
+            Some(live_remote_secs),
+            "catch-up floor must be the live 0.9 remote, not folded hist {HIST_REMOTE_SECS}"
+        );
+    }
+
+    /// Auto-joined 0.9 DMs go through drain `GroupUpdated`, not
+    /// `accept_group_invite`. After the one-shot empty-transcript scan,
+    /// idle `ensure_subscriptions` would never full-backfill that sibling
+    /// unless the welcome re-queues it.
+    #[tokio::test]
+    async fn incoming_09_welcome_enqueues_empty_live_after_oneshot_scan() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(22),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        bob.populate_empty_transcript_backfills_once();
+        assert!(
+            bob.take_initial_empty_transcript_backfills().is_empty(),
+            "one-shot scan before the welcome must not see a live 0.9 group"
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        let h = bob
+            .engine
+            .nostr_h_tag_hex(&live)
+            .expect("routing")
+            .expect("founding group has nostr routing");
+        let queued = bob.take_initial_empty_transcript_backfills();
+        assert!(
+            queued.iter().any(|id| id == &h),
+            "drain welcome must re-queue the empty live group after the one-shot scan: {queued:?}"
+        );
+    }
+
+    /// Rooms stay `GroupInvitePending` until Accept. That must not enqueue
+    /// a backfill (not joined yet). After Accept, the same one-shot-scan
+    /// miss as auto-joined DMs applies — idle sync never full-backfills
+    /// unless Accept re-queues the empty live sibling.
+    #[tokio::test]
+    async fn accept_09_room_enqueues_empty_live_after_oneshot_scan() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        bob.populate_empty_transcript_backfills_once();
+        assert!(
+            bob.take_initial_empty_transcript_backfills().is_empty(),
+            "one-shot scan before the invite must not see a live 0.9 group"
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice creates room");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 room")
+            .await;
+        assert!(
+            bob.take_initial_empty_transcript_backfills().is_empty(),
+            "pending room invite must not enqueue a backfill before Accept"
+        );
+
+        let invite = bob
+            .pending_group_invites()
+            .expect("parked 3-member welcome")
+            .remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts the room");
+
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        let h = bob
+            .engine
+            .nostr_h_tag_hex(&live)
+            .expect("routing")
+            .expect("founding group has nostr routing");
+        let queued = bob.take_initial_empty_transcript_backfills();
+        assert!(
+            queued.iter().any(|id| id == &h),
+            "accept must re-queue the empty live room after the one-shot scan: {queued:?}"
+        );
+        assert_eq!(
+            bob.push_token_share_after_join_count(),
+            0,
+            "Accept must not schedule a token share before this device registered"
+        );
+    }
+
+    /// First-resume mint and Accept create a live group peers will send
+    /// into. If we wait for the next sync to share our kind-447 token,
+    /// a killed-app gap leaves them unable to Transponder-wake us.
+    #[tokio::test]
+    async fn accept_09_room_schedules_push_token_share_when_registered() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        *bob.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
+            encrypted_token_b64: "dGVzdA==".to_owned(),
+            server_pubkey: Keys::generate().public_key(),
+        });
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice creates room");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 room")
+            .await;
+        assert_eq!(bob.push_token_share_after_join_count(), 0);
+
+        let invite = bob
+            .pending_group_invites()
+            .expect("parked 3-member welcome")
+            .remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts the room");
+        assert_eq!(
+            bob.push_token_share_after_join_count(),
+            1,
+            "Accept must schedule a token share so peers can wake this install"
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_445_h_tag_is_nostr_routing_id_not_mls_group_id() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let mls_hex = hex::encode(creation.group.id.as_slice());
+        let h = alice
+            .nostr_h_tag_hex(&creation.group.id)
+            .expect("routing lookup")
+            .expect("founding group has nostr routing");
+        assert_eq!(h.len(), 64, "kind-445 #h is 32 bytes of lowercase hex");
+        assert_ne!(
+            h, mls_hex,
+            "MLS GroupId must not be used as the Nostr #h filter"
         );
     }
 
@@ -9667,20 +12318,18 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = MarmotEngine::in_memory(Identity::generate());
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let group_id = creation.group.mls_group_id.clone();
-        let (bob_pubkey, bob_welcome) = creation
+        let group_id = creation.group.id.clone();
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pk, _)| *pk == bob.identity().public_key())
             .expect("bob welcome");
-        let bob_wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let bob_wrapped = bob_welcome;
         assert!(matches!(
             bob.process_incoming(&bob_wrapped)
                 .await
@@ -9689,8 +12338,9 @@ mod tests {
         ));
         alice
             .merge_pending_commit(&group_id)
+            .await
             .expect("alice merges pending commit");
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
 
         // Alice sends a "voice note" -- arbitrary bytes stand in for AAC audio.
         let original = b"fake-aac-audio-bytes".to_vec();
@@ -9700,6 +12350,7 @@ mod tests {
             .expect("alice encrypts media");
         let event = alice
             .create_media_event(&group_id, &upload, url, "listen to this")
+            .await
             .expect("alice creates media event");
 
         // Both sides store the message; the imeta rides inside the encrypted rumor.
@@ -9891,6 +12542,27 @@ mod tests {
         );
         assert_eq!(map_mls_hex_to_nostr_hex("", &pairs), None);
         assert_eq!(map_mls_hex_to_nostr_hex("zz", &pairs), None);
+    }
+
+    #[tokio::test]
+    async fn prefer_catchup_maps_folded_hist_to_live_mls_hex() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client");
+        let historical = GroupId::new(vec![0x11; 16]);
+        let live = GroupId::new(vec![0x22; 16]);
+        client.engine().record_historical_fold(&historical, &live);
+        let hist_hex = hex::encode(historical.as_slice());
+        assert_eq!(
+            client.resolve_catchup_mls_hex(&hist_hex),
+            hex::encode(live.as_slice()),
+            "opening a recovered 0.8 id must catch-up the live sibling"
+        );
+        assert_eq!(
+            client.resolve_catchup_mls_hex(&hex::encode(live.as_slice())),
+            hex::encode(live.as_slice()),
+            "a live id must stay itself"
+        );
     }
 
     #[test]
@@ -10327,13 +12999,11 @@ mod tests {
             client.sync_watermark_secs() < before_wm,
             "in-memory rewind still applies during the wake"
         );
-        assert!(
-            client
-                .sync_state
-                .lock()
-                .unwrap()
-                .has_processed(&event_id.to_hex())
-        );
+        assert!(client
+            .sync_state
+            .lock()
+            .unwrap()
+            .has_processed(&event_id.to_hex()));
         assert_eq!(
             fs::read(&sync_path).expect("read sync state while frozen"),
             before_bytes,
@@ -10373,21 +13043,25 @@ mod tests {
             .expect("charlie starts without relays");
         let bob_kp = bob
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let charlie_kp = charlie
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("charlie key package");
         let creation = alice
-            .create_group("rollback retry", vec![bob_kp, charlie_kp], relays.clone())
+            .create_group_with_admins(
+                "rollback retry",
+                vec![bob_kp, charlie_kp],
+                relays.clone(),
+                vec![bob.identity().public_key()],
+            )
+            .await
             .expect("alice creates group");
-        let alice_group_id = creation.group.mls_group_id.clone();
 
         for (member, welcome) in creation.welcomes {
-            let wrapped = alice
-                .gift_wrap_welcome(&member, welcome)
-                .await
-                .expect("wrap welcome");
+            let wrapped = welcome;
             if member == bob.identity().public_key() {
                 assert!(matches!(
                     bob.process_incoming(&wrapped)
@@ -10397,6 +13071,7 @@ mod tests {
                 ));
                 let invite = bob.pending_group_invites().expect("bob invites").remove(0);
                 bob.accept_group_invite(&invite.id)
+                    .await
                     .expect("bob accepts invite");
             } else {
                 let (report, _) = charlie
@@ -10411,57 +13086,57 @@ mod tests {
                 charlie
                     .engine
                     .accept_group_invite(&invite.id)
+                    .await
                     .expect("charlie accepts invite");
             }
         }
         alice
-            .merge_pending_commit(&creation.group.mls_group_id)
+            .merge_pending_commit(&creation.group.id)
+            .await
             .expect("merge pending commit");
 
-        let bob_group_id = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        let bob_group_id = bob.groups().expect("bob groups")[0].id.clone();
         let charlie_group_id = charlie.engine.groups().expect("charlie groups")[0]
-            .mls_group_id
+            .id
             .clone();
         let dave = MarmotEngine::in_memory(Identity::generate());
-        let erin = MarmotEngine::in_memory(Identity::generate());
 
-        // Bob's earlier commit is the MIP-03 winner, but Charlie sees Alice's
-        // competing commit first and therefore cannot initially decrypt Bob's
-        // message from the winning epoch.
+        // MDK 0.9 does not apply kind-445 commits on ingest (they stay
+        // Buffered until `advance_group_convergence`). A message from the
+        // next epoch therefore arrives PeelDeferred/Failed until Charlie
+        // applies Bob's add-Dave commit. 0.8 used a competing-commit
+        // rollback here; 0.9 selects forks by committer/digest, not
+        // Nostr `created_at`, so a rival Alice commit is not a reliable
+        // way to force the initial decrypt miss.
         let bob_update = bob
             .add_members(
                 &bob_group_id,
                 vec![dave
-                    .key_package_event(relays.clone())
+                    .key_package_event(relays)
+                    .await
                     .expect("dave key package")],
             )
-            .expect("bob creates earlier commit");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let alice_update = alice
-            .add_members(
-                &alice_group_id,
-                vec![erin.key_package_event(relays).expect("erin key package")],
-            )
-            .expect("alice creates later commit");
-        assert!(
-            bob_update.evolution_event.created_at < alice_update.evolution_event.created_at,
-            "competing commits need deterministic MIP-03 order"
-        );
+            .await
+            .expect("bob adds dave");
         bob.merge_pending_commit(&bob_group_id)
-            .expect("bob merges winning commit");
+            .await
+            .expect("bob merges add-dave commit");
         let bob_message = bob
             .create_text_message(&bob_group_id, "message recovered after rollback")
-            .expect("bob creates message in winning epoch");
+            .await
+            .expect("bob creates message in the new epoch");
 
-        let (wrong_commit, _) = charlie
-            .process_marmot_events([alice_update.evolution_event], "test losing commit first")
-            .await;
-        assert_eq!(wrong_commit.processed, 1);
-
+        // 0.9 records a durable PeelDeferred/Failed row on first decrypt miss
+        // (0.8 returned Err / retryable). Count it handled, do not durable-dedup.
         let (first_failure, _) = charlie
             .process_marmot_events([bob_message.clone()], "test initial message failure")
             .await;
-        assert_eq!(first_failure.retryable_failures, 1);
+        assert_eq!(first_failure.retryable_failures, 0);
+        assert_eq!(first_failure.processed, 1);
+        assert!(
+            !charlie.is_sync_event_processed(&bob_message.id),
+            "first Failed delivery must stay eligible for rollback retry"
+        );
 
         // A duplicate relay delivery reaches MDK's Incoming::Failed branch.
         // Sonar used to add the event to its own durable processed-ID set here.
@@ -10471,26 +13146,46 @@ mod tests {
         assert_eq!(failed_redelivery.processed, 1);
         assert!(
             !charlie.is_sync_event_processed(&bob_message.id),
-            "Sonar dedup must not hide an MDK Failed event that a later MLS rollback can make Retryable"
+            "Sonar dedup must not hide an MDK Failed event that a later MLS commit can make decryptable"
         );
 
-        let (winning_commit, _) = charlie
-            .process_marmot_events([bob_update.evolution_event], "test winning commit rollback")
+        let (epoch_commit, _) = charlie
+            .process_marmot_events([bob_update.evolution_event], "test epoch commit")
             .await;
-        assert_eq!(winning_commit.processed, 1);
+        assert_eq!(epoch_commit.processed, 1);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        charlie
+            .engine
+            .advance_group_convergence(&charlie_group_id)
+            .await
+            .expect("charlie applies buffered add-dave commit");
 
         let (recovered, _) = charlie
-            .process_marmot_events([bob_message], "test retry after rollback")
+            .process_marmot_events([bob_message], "test retry after commit apply")
             .await;
         assert_eq!(recovered.processed, 1);
+        let members = charlie
+            .engine
+            .members(&charlie_group_id)
+            .expect("charlie members after commit");
         assert!(
-            charlie
-                .engine
-                .messages(&charlie_group_id)
-                .expect("charlie transcript")
+            members.contains(&dave.identity().public_key()),
+            "buffered add-dave commit must apply before the message can decrypt"
+        );
+        let transcript = charlie
+            .engine
+            .messages(&charlie_group_id)
+            .expect("charlie transcript");
+        assert!(
+            transcript
                 .iter()
                 .any(|message| message.content == "message recovered after rollback"),
-            "relay redelivery after rollback must restore the missing peer message"
+            "relay redelivery after the matching commit applies must restore the missing peer message; \
+             contents={:?}",
+            transcript
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -10567,31 +13262,1093 @@ mod tests {
         let bob_kp = bob
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .expect("alice creates group");
-        let (bob_pubkey, bob_welcome) = creation
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pk, _)| *pk == bob.identity().public_key())
             .expect("bob welcome");
-        let wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let wrapped = bob_welcome;
 
         let (report, _) = bob.process_marmot_events([wrapped], "test welcome").await;
         assert_eq!(report.processed, 1);
 
         let bob_groups = bob.engine.groups().expect("bob groups");
         assert_eq!(bob_groups.len(), 1);
-        let expected = hex::encode(bob_groups[0].mls_group_id.as_slice());
+        let expected = hex::encode(bob_groups[0].id.as_slice());
         let changed = listener.changed.lock().unwrap().clone();
         assert_eq!(
             changed,
             vec![expected],
             "welcome must notify the conversation listener exactly once for the new group"
+        );
+    }
+
+    /// Peer-initiated 0.9 DM: the welcome auto-joins as GroupUpdated and
+    /// must record a hist→live fold. Without that, FFI still lists the
+    /// recovered 0.8 row, hosts only merge 1:1 duplicates while both are
+    /// listed, and a send on the 0.8 id mints a *second* 0.9 group.
+    #[tokio::test]
+    async fn incoming_09_dm_welcome_folds_recovered_08_direct_chat() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        assert!(
+            bob.engine.historical_resume_is_direct(&historical),
+            "empty name+desc recovered row must classify as a DM"
+        );
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "old 1", "alice", 80, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "old 2", "alice", 90, false, true)
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+            assert_eq!(idx.summary(&hist_hex).unwrap().unwrap().unread_count, 3);
+        }
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+
+        let (report, _) = bob
+            .process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        assert_eq!(report.processed, 1);
+
+        let live_groups = bob.engine.groups().expect("bob live groups");
+        assert_eq!(live_groups.len(), 1);
+        let live = live_groups[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "auto-accepted 0.9 DM must fold the recovered 0.8 sibling"
+        );
+        assert!(
+            bob.is_folded_historical_group(&historical),
+            "FFI groups() hides folded historical via this flag"
+        );
+        let from_live = bob.messages(&live).expect("union transcript");
+        assert!(
+            from_live.iter().any(|m| m.content == "keep this chat"),
+            "messages(live) must include recovered 0.8 history after the incoming fold"
+        );
+
+        let summaries = bob.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "conversation_summaries must hide the folded 0.8 sibling: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+        assert_eq!(
+            summaries[0].unread_count, 3,
+            "recovered unread must land on the live row; hosts hide hist"
+        );
+        assert_eq!(
+            bob.conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            0,
+            "second copy_summary must not double-count"
+        );
+    }
+
+    /// Lost JSON + index binds must not mint a second 0.9 DM on send, and
+    /// must not refuse invite, when a live sibling with that peer already
+    /// exists. Idle `maybe_fold_live_groups` would heal; send / invite
+    /// must re-discover first.
+    #[tokio::test]
+    async fn send_on_recovered_dm_rebinds_existing_live_after_lost_fold() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live)
+        );
+
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "test setup: both binds must be gone"
+        );
+        assert_eq!(bob.engine.groups().expect("still one live").len(), 1);
+
+        bob.send_text(&historical, "hello again")
+            .await
+            .expect("send must reuse the existing live group, not KeyPackageNotFound");
+        let live_groups = bob.engine.groups().expect("bob live groups");
+        assert_eq!(
+            live_groups.len(),
+            1,
+            "lost-bind send must not mint a second 0.9 DM: {live_groups:?}"
+        );
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "send must re-record the hist→live bind"
+        );
+        let sent = bob.messages(&live).expect("union transcript");
+        assert!(
+            sent.iter().any(|m| m.content == "hello again"),
+            "the send must land on the existing live sibling: {sent:?}"
+        );
+
+        let token = bob
+            .create_invite_link(&historical, "alice & bob")
+            .expect("invite must remint on the live sibling");
+        let decoded = crate::invite_link::decode_invite_token(&token).expect("decode");
+        assert_eq!(
+            decoded.group_id,
+            live.as_slice(),
+            "invite token must name the rebound live id"
+        );
+    }
+
+    /// Lost JSON + index binds must not split the home list. Send/invite
+    /// rebind; first paint (`groups` / `conversation_summaries`) must too,
+    /// or the person is two rows until idle reconcile.
+    #[tokio::test]
+    async fn conversation_summaries_rebind_lost_fold_without_waiting_for_send() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+        }
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "test setup: both binds must be gone"
+        );
+
+        let summaries = bob.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "conversation_summaries must hide rebound hist without a send: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+        assert!(
+            bob.is_folded_historical_group(&historical),
+            "first summaries paint must re-record the bind"
+        );
+        assert_eq!(
+            bob.groups().expect("live listing").len(),
+            1,
+            "groups() must not mint or split after the rebound"
+        );
+    }
+
+    /// Lost JSON + index binds must not drop recovered history on first
+    /// open, nsec-restore remount, or mark-read. Those FFI paths run
+    /// before home-list `groups()` / `conversation_summaries()`.
+    #[tokio::test]
+    async fn open_transcript_rebinds_lost_fold_without_waiting_for_home_list() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x08u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(9),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "keep this chat".into(),
+            created_at: Timestamp::from_secs(100),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("keep this chat"),
+            reply: None,
+        });
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+        }
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice creates group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "incoming 0.9 dm")
+            .await;
+        let live = bob.engine.groups().expect("bob live groups")[0].id.clone();
+        let live_hex = hex::encode(live.as_slice());
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "test setup: both binds must be gone"
+        );
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(&hist_hex, "", "keep this chat", "alice", 100, false, true)
+                .unwrap();
+        }
+        assert_eq!(
+            bob.conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            1,
+            "test setup: hist still has unread before mark_read"
+        );
+
+        // mark_read first: rediscover's copy_summary also zeros hist, so
+        // unread must still be 1 when this FFI runs.
+        bob.mark_conversation_read(&live_hex);
+        assert_eq!(
+            bob.conversation_summary(&hist_hex)
+                .expect("hist row kept")
+                .unread_count,
+            0,
+            "mark_read(live) must clear remounted hist unread without groups()"
+        );
+
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        let aliases = bob.fold_aliases_hex(&live_hex);
+        assert!(
+            aliases.iter().any(|id| id == &hist_hex),
+            "fold_aliases after nsec restore must re-discover hist without groups(): {aliases:?}"
+        );
+        assert_eq!(
+            bob.live_fold_target_hex(&hist_hex).as_deref(),
+            Some(live_hex.as_str()),
+            "live_fold_target must remount the recovered row onto live"
+        );
+
+        bob.engine.clear_historical_folds();
+        bob.clear_index_historical_folds();
+        let from_live = bob.messages(&live).expect("union transcript");
+        assert!(
+            from_live.iter().any(|m| m.content == "keep this chat"),
+            "messages(live) must union recovered 0.8 history before home-list paint"
+        );
+    }
+
+    /// Peer recreated the same 3-person room on 0.9. Accept must fold the
+    /// recovered 0.8 room onto that live id so history is not a second row.
+    #[tokio::test]
+    async fn incoming_09_room_welcome_folds_recovered_08_room() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x18u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(11),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key(), carol.identity().public_key()],
+            3,
+        );
+        assert!(
+            !bob.engine.historical_resume_is_direct(&historical),
+            "named 3-member sidecar must stay a room"
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice recreates the room");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let (report, _) = bob
+            .process_marmot_events([bob_welcome], "incoming 0.9 room")
+            .await;
+        assert_eq!(report.processed, 1);
+        let invite = bob
+            .pending_group_invites()
+            .expect("parked 3-member welcome")
+            .remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts the recreated room");
+
+        let live_groups = bob.engine.groups().expect("bob live groups");
+        assert_eq!(live_groups.len(), 1);
+        let live = live_groups[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "accepting the matching 0.9 room must fold recovered 0.8 history"
+        );
+        assert!(bob.is_folded_historical_group(&historical));
+        assert!(
+            bob.messages(&live)
+                .expect("union")
+                .iter()
+                .any(|m| m.content == "old standup"),
+            "messages(live) must include the recovered room transcript"
+        );
+        assert_eq!(
+            bob.conversation_summaries().len(),
+            1,
+            "folded historical room must leave one home-list row"
+        );
+    }
+
+    /// Mixed resume: the peer's new 0.9 room has whoever already updated.
+    /// Local `resolve_send_group` already folds that; incoming accept must too.
+    #[tokio::test]
+    async fn incoming_09_room_welcome_folds_when_live_is_subset_of_recovered() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = Keys::generate().public_key();
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x38u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(13),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![
+                alice.identity().public_key(),
+                carol.identity().public_key(),
+                dave,
+            ],
+            4,
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("alice resumes with whoever is on 0.9");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "mixed room welcome")
+            .await;
+        let invite = bob.pending_group_invites().expect("parked").remove(0);
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("accept mixed room");
+
+        let live = bob.engine.groups().expect("live")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "incoming mixed room must fold like resolve_send_group"
+        );
+        assert!(bob
+            .messages(&live)
+            .expect("union")
+            .iter()
+            .any(|m| m.content == "old standup"));
+    }
+
+    /// Two recovered rooms that both contain the live others: do not guess.
+    #[tokio::test]
+    async fn incoming_09_room_welcome_skips_ambiguous_overlapping_rooms() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = Keys::generate().public_key();
+        let eve = Keys::generate().public_key();
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let standup = GroupId::new([0x48u8; 16]);
+        let lunch = GroupId::new([0x49u8; 16]);
+        for (id, seed, name, extra) in [
+            (standup.clone(), 14u8, "standup", dave),
+            (lunch.clone(), 15u8, "lunch", eve),
+        ] {
+            bob.engine.push_transcript_message(ChatMessage {
+                id: test_event_id(seed),
+                group_id: id.clone(),
+                sender: alice.identity().public_key(),
+                content: name.into(),
+                created_at: Timestamp::from_secs(50),
+                mine: false,
+                delivery_state: crate::marmot::DeliveryState::Received,
+                media: vec![],
+                sticker_ref: None,
+                classification: crate::marmot::MessageClassification::of(name),
+                reply: None,
+            });
+            bob.engine.seed_historical_metadata(
+                id,
+                name,
+                vec![
+                    alice.identity().public_key(),
+                    carol.identity().public_key(),
+                    extra,
+                ],
+                4,
+            );
+        }
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let carol_kp = carol
+            .key_package_event(relays.clone())
+            .await
+            .expect("carol key package");
+        let creation = alice
+            .create_group("project", vec![bob_kp, carol_kp], relays)
+            .await
+            .expect("ambiguous 3-person group");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "ambiguous room")
+            .await;
+        let invite = bob.pending_group_invites().expect("parked").remove(0);
+        bob.accept_group_invite(&invite.id).await.expect("accept");
+
+        assert!(
+            bob.engine.live_fold_target(&standup).is_none()
+                && bob.engine.live_fold_target(&lunch).is_none(),
+            "overlapping recovered rooms with no unique name must not merge"
+        );
+    }
+
+    /// A recovered 0.8 "standup" with just Alice+Bob is a named room, not a
+    /// DM (`historical_resume_is_direct` is false). Incoming 0.9
+    /// `create_group("standup", [bob])` auto-joins (member_count <= 2).
+    /// Folding only 3+ rooms left that history as a second row. Fold on
+    /// unique name + exact member match.
+    #[tokio::test]
+    async fn incoming_09_named_pair_welcome_folds_recovered_named_room() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let historical = GroupId::new([0x58u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(16),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "standup from 0.8".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("standup from 0.8"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key()],
+            2,
+        );
+        assert!(
+            !bob.engine.historical_resume_is_direct(&historical),
+            "a named 2-person room must stay a room, not a DM"
+        );
+        let hist_hex = hex::encode(historical.as_slice());
+        {
+            let idx = bob
+                .conversation_index
+                .as_ref()
+                .expect("index")
+                .lock()
+                .unwrap();
+            idx.upsert_summary(
+                &hist_hex,
+                "standup",
+                "standup from 0.8",
+                "alice",
+                50,
+                false,
+                true,
+            )
+            .unwrap();
+        }
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp], relays)
+            .await
+            .expect("alice recreates the named pair");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let (report, _) = bob
+            .process_marmot_events([bob_welcome], "incoming 0.9 named pair")
+            .await;
+        assert_eq!(report.processed, 1);
+
+        let live_groups = bob.engine.groups().expect("bob live groups");
+        assert_eq!(live_groups.len(), 1);
+        let live = live_groups[0].id.clone();
+        assert_eq!(live_groups[0].name, "standup");
+        assert!(
+            !bob.group_is_direct(&live),
+            "a named pair is a room, not a DM"
+        );
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&live),
+            "auto-accepted 0.9 named pair must fold recovered 0.8 history"
+        );
+        assert!(bob.is_folded_historical_group(&historical));
+        assert!(
+            bob.messages(&live)
+                .expect("union")
+                .iter()
+                .any(|m| m.content == "standup from 0.8"),
+            "messages(live) must include the recovered named-pair transcript"
+        );
+        let summaries = bob.conversation_summaries();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "folded historical named pair must leave one home-list row: {summaries:?}"
+        );
+        assert_eq!(summaries[0].group_id_hex, hex::encode(live.as_slice()));
+        assert_eq!(
+            summaries[0].unread_count, 1,
+            "recovered named-pair unread must land on the live row"
+        );
+    }
+
+    #[tokio::test]
+    async fn incoming_09_named_pair_welcome_skips_when_names_differ() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x59u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(17),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "standup from 0.8".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("standup from 0.8"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key()],
+            2,
+        );
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("lunch", vec![bob_kp], relays)
+            .await
+            .expect("alice creates a differently named pair");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "named pair name mismatch")
+            .await;
+
+        let live = bob.engine.groups().expect("live")[0].id.clone();
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "standup history must not fold onto a lunch named pair"
+        );
+        assert!(!bob.is_folded_historical_group(&historical));
+        assert!(
+            !bob.messages(&live)
+                .expect("live")
+                .iter()
+                .any(|m| m.content == "standup from 0.8"),
+            "standup history must not appear on the lunch transcript"
+        );
+    }
+
+    /// R-050: a recovered 3-person standup must not fold onto Alice's
+    /// 2-person 0.9 standup just because the names match.
+    #[tokio::test]
+    async fn incoming_09_named_pair_welcome_does_not_fold_three_member_room() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x5au8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(18),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "standup from 0.8".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("standup from 0.8"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key(), carol.identity().public_key()],
+            3,
+        );
+        assert!(!bob.engine.historical_resume_is_direct(&historical));
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("standup", vec![bob_kp], relays)
+            .await
+            .expect("alice creates a 2-person 0.9 standup");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        bob.process_marmot_events([bob_welcome], "named pair vs 3-person room")
+            .await;
+
+        let live = bob.engine.groups().expect("live")[0].id.clone();
+        // Idle reconcile uses the same matcher as GroupUpdated. A lost-sidecar
+        // heal must not start absorbing 3-person rooms onto 2-person standups.
+        bob.ensure_subscriptions()
+            .await
+            .expect("idle reconcile after incoming named pair");
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "3-person recovered standup must not fold onto a 2-person live standup"
+        );
+        assert!(!bob.is_folded_historical_group(&historical));
+        assert!(
+            !bob.messages(&live)
+                .expect("live")
+                .iter()
+                .any(|m| m.content == "standup from 0.8"),
+            "3-person standup history must not appear on the 2-person transcript"
+        );
+        assert!(
+            bob.historical_groups()
+                .expect("room stays listed")
+                .iter()
+                .any(|g| g.id == historical),
+            "recovered 3-person standup must remain a separate conversation"
+        );
+    }
+
+    /// Concurrent resume: the first matching 0.9 standup already owns the
+    /// recovered history. A second same-name welcome from the same peer
+    /// must not overwrite `historical_folds` and move 0.8 messages onto
+    /// the empty new MLS group.
+    #[tokio::test]
+    async fn incoming_09_named_pair_second_welcome_does_not_steal_fold() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x5bu8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(19),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "standup from 0.8".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("standup from 0.8"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key()],
+            2,
+        );
+
+        let first_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob first key package");
+        let first = alice
+            .create_group("standup", vec![first_kp], relays.clone())
+            .await
+            .expect("alice first standup");
+        let (_pk, first_welcome) = first
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("first welcome");
+        bob.process_marmot_events([first_welcome], "first named pair")
+            .await;
+
+        let first_live = bob.engine.groups().expect("first live")[0].id.clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&first_live)
+        );
+
+        let second_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob second key package");
+        let second = alice
+            .create_group("standup", vec![second_kp], relays)
+            .await
+            .expect("alice second standup");
+        let (_pk, second_welcome) = second
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("second welcome");
+        bob.process_marmot_events([second_welcome], "second named pair")
+            .await;
+
+        let live_ids: Vec<_> = bob
+            .engine
+            .groups()
+            .expect("two live standups")
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(
+            live_ids.len(),
+            2,
+            "concurrent resume still mints a second MLS group"
+        );
+        let second_live = live_ids
+            .iter()
+            .find(|id| *id != &first_live)
+            .expect("second live id")
+            .clone();
+        assert_eq!(
+            bob.engine.live_fold_target(&historical).as_ref(),
+            Some(&first_live),
+            "second matching welcome must not steal the hist→live fold"
+        );
+        assert!(
+            bob.messages(&first_live)
+                .expect("first")
+                .iter()
+                .any(|m| m.content == "standup from 0.8"),
+            "0.8 history must stay on the first resumed standup"
+        );
+        assert!(
+            !bob.messages(&second_live)
+                .expect("second")
+                .iter()
+                .any(|m| m.content == "standup from 0.8"),
+            "the empty second standup must not inherit recovered history"
+        );
+    }
+
+    /// R-050 at the incoming-welcome call site: a recovered room that only
+    /// knows the welcomer must not fold onto that peer's new 0.9 DM.
+    #[tokio::test]
+    async fn incoming_09_dm_welcome_does_not_fold_recovered_room() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+
+        let historical = GroupId::new([0x28u8; 16]);
+        bob.engine.push_transcript_message(ChatMessage {
+            id: test_event_id(12),
+            group_id: historical.clone(),
+            sender: alice.identity().public_key(),
+            content: "old standup".into(),
+            created_at: Timestamp::from_secs(50),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("old standup"),
+            reply: None,
+        });
+        bob.engine.seed_historical_metadata(
+            historical.clone(),
+            "standup",
+            vec![alice.identity().public_key()],
+            3,
+        );
+        assert!(!bob.engine.historical_resume_is_direct(&historical));
+
+        let bob_kp = bob
+            .engine
+            .key_package_event(relays.clone())
+            .await
+            .expect("bob key package");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .await
+            .expect("alice starts a DM");
+        let (_bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pk, _)| *pk == bob.identity().public_key())
+            .expect("bob welcome");
+        let (report, _) = bob
+            .process_marmot_events([bob_welcome], "incoming dm beside room")
+            .await;
+        assert_eq!(report.processed, 1);
+        assert!(
+            bob.engine.live_fold_target(&historical).is_none(),
+            "maybe_fold must not absorb a 3-member recovered room into the welcomer DM"
+        );
+        assert!(!bob.is_folded_historical_group(&historical));
+        assert_eq!(bob.engine.groups().expect("live dm").len(), 1);
+        assert!(
+            bob.historical_groups()
+                .expect("room stays listed")
+                .iter()
+                .any(|g| g.id == historical),
+            "recovered room must remain a separate conversation"
         );
     }
 
@@ -10602,24 +14359,25 @@ mod tests {
         let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await
             .expect("bob starts");
-        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let bob_kp = bob.engine.key_package_event(relays.clone()).await.unwrap();
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .unwrap();
-        let group_id = creation.group.mls_group_id;
-        let (bob_pubkey, welcome) = creation
+        let group_id = creation.group.id;
+        let (_bob_pubkey, welcome) = creation
             .welcomes
             .into_iter()
             .find(|(member, _)| *member == bob.identity().public_key())
             .unwrap();
-        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
         bob.process_marmot_events([welcome], "timezone test welcome")
             .await;
-        alice.merge_pending_commit(&group_id).unwrap();
+        alice.merge_pending_commit(&group_id).await.unwrap();
 
         let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
         let (event, incoming) = alice
             .create_and_process_timezone_share(&group_id, &payload)
+            .await
             .unwrap();
         assert_eq!(event.kind, Kind::MlsGroupMessage);
         assert!(matches!(incoming, Incoming::TimezoneShare { .. }));
@@ -10652,17 +14410,17 @@ mod tests {
             .await
             .expect("bob starts");
         let outsider = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let bob_kp = bob.engine.key_package_event(relays.clone()).await.unwrap();
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .unwrap();
-        let group_id = creation.group.mls_group_id;
-        let (bob_pubkey, welcome) = creation
+        let group_id = creation.group.id;
+        let (_bob_pubkey, welcome) = creation
             .welcomes
             .into_iter()
             .find(|(member, _)| *member == bob.identity().public_key())
             .unwrap();
-        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
         bob.process_marmot_events([welcome], "timezone test welcome")
             .await;
 
@@ -10716,12 +14474,13 @@ mod tests {
             .await
             .expect("alice starts");
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).unwrap();
+        let bob_kp = bob.key_package_event(relays.clone()).await.unwrap();
         let creation = alice
             .engine
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .unwrap();
-        let group_id_hex = hex::encode(creation.group.mls_group_id.as_slice());
+        let group_id_hex = hex::encode(creation.group.id.as_slice());
 
         alice.update_local_timezone("Europe/Zurich").await.unwrap();
         assert!(
@@ -10744,7 +14503,7 @@ mod tests {
         assert_eq!(
             alice.outbox_state.lock().unwrap().recorded_count(),
             1,
-            "kind-449 must be in the durable outbox before publish so offline retries can find it"
+            "the share must be in the durable outbox before publish so offline retries can find it"
         );
 
         alice
@@ -10784,7 +14543,7 @@ mod tests {
     #[tokio::test]
     async fn timezone_share_is_not_repeated_after_restart() {
         // A1/i2 (#607 QA): the dedupe lived only in process memory, so every
-        // cold start (and every iOS store reopen) re-encrypted a kind-449 into
+        // cold start (and every iOS store reopen) re-encrypted a timezone share into
         // every allowed group — 37 publishes per launch on the QA account.
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("marmot.sqlite");
@@ -10796,16 +14555,18 @@ mod tests {
             let alice = SonarClient::connect(identity.clone(), vec![], &db, key)
                 .await
                 .expect("alice");
-            let bob_kp = bob.key_package_event(relays.clone()).unwrap();
+            let bob_kp = bob.key_package_event(relays.clone()).await.unwrap();
             let creation = alice
                 .engine
                 .create_group("alice & bob", vec![bob_kp], relays)
+                .await
                 .unwrap();
             alice
                 .engine
-                .merge_pending_commit(&creation.group.mls_group_id)
+                .merge_pending_commit(&creation.group.id)
+                .await
                 .unwrap();
-            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            let group_hex = hex::encode(creation.group.id.as_slice());
             alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
             alice.update_local_timezone("Europe/Zurich").await.unwrap();
             assert_eq!(alice.timezone_shared_with.lock().unwrap().len(), 1);
@@ -10851,15 +14612,16 @@ mod tests {
             .create_group(
                 "trio",
                 vec![
-                    bob.key_package_event(relays.clone()).unwrap(),
-                    carol.key_package_event(relays.clone()).unwrap(),
+                    bob.key_package_event(relays.clone()).await.unwrap(),
+                    carol.key_package_event(relays.clone()).await.unwrap(),
                 ],
                 relays.clone(),
             )
+            .await
             .unwrap();
-        let group_id = creation.group.mls_group_id;
+        let group_id = creation.group.id;
         let group_hex = hex::encode(group_id.as_slice());
-        alice.engine.merge_pending_commit(&group_id).unwrap();
+        alice.engine.merge_pending_commit(&group_id).await.unwrap();
 
         alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
         alice.update_local_timezone("Europe/Zurich").await.unwrap();
@@ -10869,13 +14631,15 @@ mod tests {
         alice
             .engine
             .remove_members(&group_id, &[carol.identity().public_key()])
+            .await
             .unwrap();
-        alice.engine.merge_pending_commit(&group_id).unwrap();
+        alice.engine.merge_pending_commit(&group_id).await.unwrap();
         alice
             .engine
-            .add_members(&group_id, vec![dave.key_package_event(relays).unwrap()])
+            .add_members(&group_id, vec![dave.key_package_event(relays).await.unwrap()])
+            .await
             .unwrap();
-        alice.engine.merge_pending_commit(&group_id).unwrap();
+        alice.engine.merge_pending_commit(&group_id).await.unwrap();
         assert_eq!(alice.engine.members(&group_id).unwrap().len(), members_before);
 
         alice.set_timezone_share_groups(vec![group_hex]).await;
@@ -10893,12 +14657,13 @@ mod tests {
             .await
             .expect("alice starts");
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).unwrap();
+        let bob_kp = bob.key_package_event(relays.clone()).await.unwrap();
         let creation = alice
             .engine
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .unwrap();
-        let group_id_hex = hex::encode(creation.group.mls_group_id.as_slice());
+        let group_id_hex = hex::encode(creation.group.id.as_slice());
 
         alice.update_local_timezone("Europe/Zurich").await.unwrap();
         alice
@@ -10921,18 +14686,18 @@ mod tests {
             changed: Mutex::new(Vec::new()),
         });
         bob.set_conversation_change_listener(Some(listener.clone()));
-        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let bob_kp = bob.engine.key_package_event(relays.clone()).await.unwrap();
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
+            .await
             .unwrap();
-        let group_id = creation.group.mls_group_id;
+        let group_id = creation.group.id;
         let group_id_hex = hex::encode(group_id.as_slice());
-        let (bob_pubkey, welcome) = creation
+        let (_bob_pubkey, welcome) = creation
             .welcomes
             .into_iter()
             .find(|(member, _)| *member == bob.identity().public_key())
             .unwrap();
-        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
         bob.process_marmot_events([welcome], "timezone listener welcome")
             .await;
         listener.changed.lock().unwrap().clear();
@@ -10940,6 +14705,7 @@ mod tests {
         let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
         let (event, _) = alice
             .create_and_process_timezone_share(&group_id, &payload)
+            .await
             .unwrap();
         let (report, notifications) = bob
             .process_marmot_events([event], "timezone listener")
@@ -10981,22 +14747,22 @@ mod tests {
         let bob_kp = bob
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let carol_kp = carol
             .key_package_event(relays.clone())
+            .await
             .expect("carol key package");
         let creation = alice
             .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)
+            .await
             .expect("alice creates 3-member group");
-        let (bob_pubkey, bob_welcome) = creation
+        let (_bob_pubkey, bob_welcome) = creation
             .welcomes
             .into_iter()
             .find(|(pk, _)| *pk == bob.identity().public_key())
             .expect("bob welcome");
-        let wrapped = alice
-            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-            .await
-            .expect("wrap bob welcome");
+        let wrapped = bob_welcome;
 
         let (report, _) = bob
             .process_marmot_events([wrapped], "test pending invite")
@@ -11035,7 +14801,13 @@ mod profile_merge_tests {
 
     #[test]
     fn fresh_key_publishes_supplied_fields() {
-        let m = SonarClient::merge_profile_metadata(None, "alice", Some("hi"), Some("https://x/p.png"), None);
+        let m = SonarClient::merge_profile_metadata(
+            None,
+            "alice",
+            Some("hi"),
+            Some("https://x/p.png"),
+            None,
+        );
         assert_eq!(m.name.as_deref(), Some("alice"));
         assert_eq!(m.display_name.as_deref(), Some("alice"));
         assert_eq!(m.about.as_deref(), Some("hi"));
@@ -11059,14 +14831,26 @@ mod profile_merge_tests {
     #[test]
     fn claimed_handle_replaces_nip05() {
         let r = rich_remote();
-        let m = SonarClient::merge_profile_metadata(Some(&r), "n", None, None, Some("n@sonarprivacy.xyz".into()));
+        let m = SonarClient::merge_profile_metadata(
+            Some(&r),
+            "n",
+            None,
+            None,
+            Some("n@sonarprivacy.xyz".into()),
+        );
         assert_eq!(m.nip05.as_deref(), Some("n@sonarprivacy.xyz"));
     }
 
     #[test]
     fn explicit_about_and_picture_override_remote() {
         let r = rich_remote();
-        let m = SonarClient::merge_profile_metadata(Some(&r), "n", Some("new bio"), Some("https://x/new.png"), None);
+        let m = SonarClient::merge_profile_metadata(
+            Some(&r),
+            "n",
+            Some("new bio"),
+            Some("https://x/new.png"),
+            None,
+        );
         assert_eq!(m.about.as_deref(), Some("new bio"));
         assert_eq!(m.picture.unwrap().as_str(), "https://x/new.png");
         assert_eq!(m.website, r.website);
@@ -11075,7 +14859,8 @@ mod profile_merge_tests {
     #[test]
     fn empty_args_never_wipe_remote_fields() {
         let r = rich_remote();
-        let m = SonarClient::merge_profile_metadata(Some(&r), "n", Some(""), Some("not a url"), None);
+        let m =
+            SonarClient::merge_profile_metadata(Some(&r), "n", Some(""), Some("not a url"), None);
         assert_eq!(m.about.as_deref(), Some("bitcoin dev"));
         assert_eq!(m.picture, r.picture);
     }

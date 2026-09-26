@@ -88,13 +88,26 @@ enum Command {
     Groups,
     /// Print messages for all groups or one group.
     Messages(MessagesArgs),
-    /// Share this agent's local time privately (kind-449 inside MLS), or print
-    /// the zones peers have shared with it.
+    /// Share this agent's local time privately (inside MLS), or print the
+    /// zones peers have shared with it.
     Timezone(TimezoneArgs),
     /// List pending multi-member group invites (1:1 welcomes auto-join).
     Invites,
     /// Accept pending group invites: every one, or one by welcome id.
     Accept(AcceptArgs),
+    /// Create a group with the given members and deliver their welcomes.
+    GroupCreate(GroupCreateArgs),
+    /// Send a text message to an existing group.
+    GroupSend(GroupSendArgs),
+    /// Leave a group (MIP-03 SelfRemove) and drop it locally.
+    Leave(LeaveArgs),
+}
+
+#[derive(Args, Debug)]
+struct LeaveArgs {
+    /// Group id hex, as printed by `groups`.
+    #[arg(long)]
+    group: String,
 }
 
 #[derive(Args, Debug)]
@@ -102,6 +115,26 @@ struct AcceptArgs {
     /// Kind-444 welcome event id (hex) from `invites`. Omit to accept all.
     #[arg(long)]
     id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct GroupCreateArgs {
+    /// Group display name.
+    #[arg(long)]
+    name: String,
+    /// Member npub1... or 64-char hex public key. Repeat for each member.
+    #[arg(long = "member", required = true)]
+    members: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct GroupSendArgs {
+    /// Group id hex, as printed by `groups`.
+    #[arg(long)]
+    group: String,
+    /// Plaintext message body.
+    #[arg(long)]
+    text: String,
 }
 
 #[derive(Args, Debug)]
@@ -373,6 +406,17 @@ enum Output {
         id: String,
         group_id: String,
     },
+    GroupCreated {
+        group_id: String,
+        name: String,
+        members: Vec<String>,
+    },
+    GroupSent {
+        group_id: String,
+    },
+    Left {
+        group_id: String,
+    },
     PeerTimezone {
         sender: String,
         zone: String,
@@ -423,7 +467,10 @@ async fn main() {
             "debug" => tracing::Level::DEBUG,
             "info" => tracing::Level::INFO,
             "error" => tracing::Level::ERROR,
-            _ if filter.contains("info") || filter.contains("debug") || filter.contains("trace") => {
+            _ if filter.contains("info")
+                || filter.contains("debug")
+                || filter.contains("trace") =>
+            {
                 if filter.contains("trace") {
                     tracing::Level::TRACE
                 } else if filter.contains("debug") {
@@ -719,6 +766,63 @@ async fn run(cli: Cli) -> Result<()> {
             tokio::time::sleep(Duration::from_secs(3)).await;
             Ok(())
         }
+        Command::GroupCreate(args) => {
+            let members = args
+                .members
+                .iter()
+                .map(|m| {
+                    PublicKey::parse(m).map_err(|e| CliError::Message(format!("member {m}: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = client.start_group(members.clone(), &args.name).await?;
+            print_json(&Output::GroupCreated {
+                group_id: hex::encode(group_id.as_slice()),
+                name: args.name,
+                members: members
+                    .iter()
+                    .map(|pk| pk.to_bech32().expect("valid public key encodes as npub"))
+                    .collect(),
+            })?;
+            Ok(())
+        }
+        Command::GroupSend(args) => {
+            let group_id = parse_group_id_hex(&args.group)?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            // Publishing finishes after send_text returns; exiting first would
+            // leave the message in the local outbox (same wait as `send`).
+            let message_ids_before = outbound_message_ids(&client, &group_id)?;
+            client.send_text(&group_id, &args.text).await?;
+            wait_for_new_outbound_ack(
+                &client,
+                &group_id,
+                &message_ids_before,
+                Duration::from_secs(15),
+            )
+            .await?;
+            print_json(&Output::GroupSent {
+                group_id: args.group,
+            })?;
+            Ok(())
+        }
+        Command::Leave(args) => {
+            let group_id = parse_group_id_hex(&args.group)?;
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            client.leave_group(&group_id).await?;
+            // The SelfRemove proposal is published by a spawned task; keep the
+            // runtime alive long enough for it to reach the relays.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            print_json(&Output::Left {
+                group_id: args.group,
+            })?;
+            Ok(())
+        }
     }
 }
 
@@ -776,7 +880,7 @@ async fn timezone(loaded: LoadedConfig, action: TimezoneAction) -> Result<()> {
                 let me = client.identity().public_key();
                 let mut members = BTreeSet::new();
                 for group in client.groups()? {
-                    members.extend(client.members(&group.mls_group_id)?);
+                    members.extend(client.members(&group.id)?);
                 }
                 members.remove(&me);
                 if let Some(from) = from {
@@ -1063,12 +1167,12 @@ async fn listen(loaded: LoadedConfig, args: ListenArgs) -> Result<()> {
 fn print_groups(client: &SonarClient) -> Result<()> {
     for group in client.groups()? {
         let members = client
-            .members(&group.mls_group_id)?
+            .members(&group.id)?
             .into_iter()
             .map(|pk| pk.to_bech32().expect("valid public key encodes as npub"))
             .collect();
         print_json(&Output::Group {
-            id: hex::encode(group.mls_group_id.as_slice()),
+            id: hex::encode(group.id.as_slice()),
             name: group.name,
             members,
         })?;
@@ -1081,14 +1185,11 @@ fn print_messages(client: &SonarClient, group_filter: Option<&str>) -> Result<()
     let mut matched = false;
     let groups = client.groups()?;
     for group in groups {
-        if wanted
-            .as_ref()
-            .is_some_and(|want| want != &group.mls_group_id)
-        {
+        if wanted.as_ref().is_some_and(|want| want != &group.id) {
             continue;
         }
         matched = true;
-        for msg in client.messages(&group.mls_group_id)? {
+        for msg in client.messages(&group.id)? {
             print_json(&message_output(&msg))?;
         }
     }
@@ -1105,7 +1206,7 @@ fn emit_unseen_messages(
 ) -> Result<()> {
     let mut changed = false;
     for group in client.groups()? {
-        let mut messages = client.messages(&group.mls_group_id)?;
+        let mut messages = client.messages(&group.id)?;
         messages.sort_by_key(|m| m.created_at);
         for msg in messages {
             let id = msg.id.to_hex();
@@ -1155,10 +1256,9 @@ fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
 fn find_dm_group(client: &SonarClient, peer: PublicKey) -> Result<Option<GroupId>> {
     let me = client.identity().public_key();
     for group in client.groups()? {
-        let members: BTreeSet<PublicKey> =
-            client.members(&group.mls_group_id)?.into_iter().collect();
+        let members: BTreeSet<PublicKey> = client.members(&group.id)?.into_iter().collect();
         if members.len() == 2 && members.contains(&me) && members.contains(&peer) {
-            return Ok(Some(group.mls_group_id));
+            return Ok(Some(group.id));
         }
     }
     Ok(None)
@@ -1466,7 +1566,7 @@ fn parse_group_id_hex(hex_id: &str) -> Result<GroupId> {
     if bytes.is_empty() {
         return Err(CliError::Message("group id cannot be empty".to_owned()));
     }
-    Ok(GroupId::from_slice(&bytes))
+    Ok(GroupId::new(bytes))
 }
 
 fn init_secret(args: &InitArgs) -> Result<Option<String>> {

@@ -1627,6 +1627,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws  -> StickerPackInfo
 
     /**
+     * Recovered and live ids that share one conversation after resume.
+     * Local read; includes `group_id_hex` itself.
+     */
+    func foldAliases(groupIdHex: String)  -> [String]
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -1643,7 +1649,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func geohashPresenceCount(geohash: String) throws  -> UInt32
 
     /**
-     * All groups this identity belongs to.
+     * All groups this identity belongs to, including recovered 0.8 history
+     * that is not a live 0.9 MLS group. Hosts fold those rows by npub.
      */
     func groups() throws  -> [GroupInfo]
 
@@ -1670,6 +1677,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Leave a group and delete its local state after the leave proposal is sent.
      */
     func leaveGroup(groupIdHex: String) throws
+
+    /**
+     * Live 0.9 group that replaced a recovered 0.8 row after resume-send.
+     * Local read; `None` when the id is not folded.
+     */
+    func liveFoldTarget(groupIdHex: String)  -> String?
 
     func markConversationRead(groupIdHex: String)
 
@@ -1801,8 +1814,10 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
 
     /**
      * Retry one failed outgoing message from the durable local outbox. The
-     * original encrypted event is republished, so retry cannot duplicate the
-     * plaintext transcript row or mutate MLS state a second time.
+     * original encrypted event is republished when it is still live 0.9
+     * ciphertext, so retry cannot duplicate the plaintext transcript row
+     * or mutate MLS state a second time. Recovered 0.8 rows refuse with
+     * `HistoricalProtocolRetry` and stay Failed.
      */
     func retryMessage(messageIdHex: String) throws  -> String
 
@@ -1937,7 +1952,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Report this host's current system IANA timezone. The host must only
      * call this after the user enables Share local time. Pass an empty
      * string to stop sharing. The core validates a non-empty id, remembers
-     * it for the node lifetime, and encrypts kind-449 rumors into MLS group
+     * it for the node lifetime, and encrypts timezone shares into MLS group
      * messages (kind 445) without blocking transcript reads.
      */
     func updateLocalTimezone(ianaTimezone: String) throws
@@ -2494,6 +2509,19 @@ open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrl
 }
 
     /**
+     * Recovered and live ids that share one conversation after resume.
+     * Local read; includes `group_id_hex` itself.
+     */
+open func foldAliases(groupIdHex: String) -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_fold_aliases(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+})
+}
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
 open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
@@ -2533,7 +2561,8 @@ open func geohashPresenceCount(geohash: String)throws  -> UInt32  {
 }
 
     /**
-     * All groups this identity belongs to.
+     * All groups this identity belongs to, including recovered 0.8 history
+     * that is not a live 0.9 MLS group. Hosts fold those rows by npub.
      */
 open func groups()throws  -> [GroupInfo]  {
     return try  FfiConverterSequenceTypeGroupInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -2582,6 +2611,19 @@ open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConve
         FfiConverterString.lower(groupIdHex),$0
     )
 }
+}
+
+    /**
+     * Live 0.9 group that replaced a recovered 0.8 row after resume-send.
+     * Local read; `None` when the id is not folded.
+     */
+open func liveFoldTarget(groupIdHex: String) -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_live_fold_target(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+})
 }
 
 open func markConversationRead(groupIdHex: String)  {try! rustCall() {
@@ -2861,8 +2903,10 @@ open func resumePendingMediaUploadsQuiet()throws  -> UInt32  {
 
     /**
      * Retry one failed outgoing message from the durable local outbox. The
-     * original encrypted event is republished, so retry cannot duplicate the
-     * plaintext transcript row or mutate MLS state a second time.
+     * original encrypted event is republished when it is still live 0.9
+     * ciphertext, so retry cannot duplicate the plaintext transcript row
+     * or mutate MLS state a second time. Recovered 0.8 rows refuse with
+     * `HistoricalProtocolRetry` and stay Failed.
      */
 open func retryMessage(messageIdHex: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -3168,7 +3212,7 @@ open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithErro
      * Report this host's current system IANA timezone. The host must only
      * call this after the user enables Share local time. Pass an empty
      * string to stop sharing. The core validates a non-empty id, remembers
-     * it for the node lifetime, and encrypts kind-449 rumors into MLS group
+     * it for the node lifetime, and encrypts timezone shares into MLS group
      * messages (kind 445) without blocking transcript reads.
      */
 open func updateLocalTimezone(ianaTimezone: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -4352,16 +4396,26 @@ public struct GroupInfo: Equatable, Hashable {
     public var idHex: String
     public var name: String
     public var memberNpubs: [String]
+    /**
+     * False for recovered/live rooms, even when only one other member is listed.
+     * Hosts must not fold those onto a 1:1 by npub.
+     */
+    public var isDirect: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
          * Hex of the MLS group id (stable; use it for `send_text`/`messages`).
-         */idHex: String, name: String, memberNpubs: [String]) {
+         */idHex: String, name: String, memberNpubs: [String],
+        /**
+         * False for recovered/live rooms, even when only one other member is listed.
+         * Hosts must not fold those onto a 1:1 by npub.
+         */isDirect: Bool) {
         self.idHex = idHex
         self.name = name
         self.memberNpubs = memberNpubs
+        self.isDirect = isDirect
     }
 
 
@@ -4382,7 +4436,8 @@ public struct FfiConverterTypeGroupInfo: FfiConverterRustBuffer {
             try GroupInfo(
                 idHex: FfiConverterString.read(from: &buf),
                 name: FfiConverterString.read(from: &buf),
-                memberNpubs: FfiConverterSequenceString.read(from: &buf)
+                memberNpubs: FfiConverterSequenceString.read(from: &buf),
+                isDirect: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -4390,6 +4445,7 @@ public struct FfiConverterTypeGroupInfo: FfiConverterRustBuffer {
         FfiConverterString.write(value.idHex, into: &buf)
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterSequenceString.write(value.memberNpubs, into: &buf)
+        FfiConverterBool.write(value.isDirect, into: &buf)
     }
 }
 
@@ -9500,6 +9556,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_pack() != 19095) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fold_aliases() != 36383) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9509,7 +9568,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geohash_presence_count() != 20097) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_groups() != 48990) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_groups() != 3660) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {
@@ -9519,6 +9578,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_live_fold_target() != 18271) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_mark_conversation_read() != 18250) {
@@ -9584,7 +9646,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_resume_pending_media_uploads_quiet() != 56734) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 65232) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 21048) {
@@ -9650,7 +9712,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_uninstall_sticker_pack() != 43475) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_update_local_timezone() != 29748) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_update_local_timezone() != 26069) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_verify_nip05() != 52785) {

@@ -20,35 +20,35 @@ async fn multi_member_welcomes_wait_for_accept_or_decline() {
     let bob = MarmotEngine::in_memory(Identity::generate());
     let charlie = MarmotEngine::in_memory(Identity::generate());
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let charlie_kp = charlie
         .key_package_event(relays.clone())
+        .await
         .expect("charlie kp");
 
     let creation = alice
         .create_group("field team", vec![bob_kp, charlie_kp], relays)
+        .await
         .expect("alice creates group");
     alice
-        .merge_pending_commit(&creation.group.mls_group_id)
+        .merge_pending_commit(&creation.group.id)
+        .await
         .expect("creator merge after welcome delivery");
     assert_eq!(alice.groups().expect("alice groups").len(), 1);
 
-    let (bob_pubkey, bob_welcome) = creation
+    let (_bob_pubkey, bob_welcome) = creation
         .welcomes
         .iter()
         .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
         .cloned()
         .expect("bob welcome");
-    let bob_wrapped = alice
-        .gift_wrap_welcome(&bob_pubkey, bob_welcome)
-        .await
-        .expect("wrap bob welcome");
+    let bob_wrapped = bob_welcome;
     match bob
         .process_incoming(&bob_wrapped)
         .await
         .expect("bob processes welcome")
     {
-        Incoming::GroupInvitePending(group_id) => assert_eq!(group_id, creation.group.mls_group_id),
+        Incoming::GroupInvitePending(_) => {}
         other => panic!("expected pending group invite, got {other:?}"),
     }
     assert_eq!(bob.groups().expect("bob active groups").len(), 0);
@@ -56,30 +56,32 @@ async fn multi_member_welcomes_wait_for_accept_or_decline() {
     assert_eq!(bob_invites.len(), 1);
     assert_eq!(bob_invites[0].group_name, "field team");
     assert_eq!(bob_invites[0].member_count, 3);
+    assert!(
+        !bob_invites[0].wrapper_json.is_empty(),
+        "parked invite must retain the kind-1059 wrapper"
+    );
 
     let accepted_group = bob
         .accept_group_invite(&bob_invites[0].id)
+        .await
         .expect("bob accepts invite");
-    assert_eq!(accepted_group, creation.group.mls_group_id);
+    assert_eq!(accepted_group, creation.group.id);
     assert_eq!(bob.groups().expect("bob active groups").len(), 1);
     assert!(bob.pending_group_invites().expect("bob invites").is_empty());
 
-    let (charlie_pubkey, charlie_welcome) = creation
+    let (_charlie_pubkey, charlie_welcome) = creation
         .welcomes
         .iter()
         .find(|(pubkey, _)| *pubkey == charlie.identity().public_key())
         .cloned()
         .expect("charlie welcome");
-    let charlie_wrapped = alice
-        .gift_wrap_welcome(&charlie_pubkey, charlie_welcome)
-        .await
-        .expect("wrap charlie welcome");
+    let charlie_wrapped = charlie_welcome;
     match charlie
         .process_incoming(&charlie_wrapped)
         .await
         .expect("charlie processes welcome")
     {
-        Incoming::GroupInvitePending(group_id) => assert_eq!(group_id, creation.group.mls_group_id),
+        Incoming::GroupInvitePending(_) => {}
         other => panic!("expected pending group invite, got {other:?}"),
     }
     let charlie_invites = charlie
@@ -88,6 +90,7 @@ async fn multi_member_welcomes_wait_for_accept_or_decline() {
     assert_eq!(charlie_invites.len(), 1);
     charlie
         .decline_group_invite(&charlie_invites[0].id)
+        .await
         .expect("charlie declines");
     assert_eq!(charlie.groups().expect("charlie active groups").len(), 0);
     assert!(charlie
@@ -105,15 +108,17 @@ async fn unpublished_group_creation_can_be_discarded() {
     let bob = MarmotEngine::in_memory(Identity::generate());
     let charlie = MarmotEngine::in_memory(Identity::generate());
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let charlie_kp = charlie
         .key_package_event(relays.clone())
+        .await
         .expect("charlie kp");
 
     let creation = alice
         .create_group("field team", vec![bob_kp, charlie_kp], relays)
+        .await
         .expect("alice creates group");
-    let group_id = creation.group.mls_group_id;
+    let group_id = creation.group.id;
     assert_eq!(
         alice.groups().expect("alice groups").len(),
         1,
@@ -122,8 +127,12 @@ async fn unpublished_group_creation_can_be_discarded() {
 
     alice
         .clear_pending_commit(&group_id)
+        .await
         .expect("clear pending creation commit");
-    alice.delete_group(&group_id).expect("discard staged group");
+    alice
+        .delete_group(&group_id)
+        .await
+        .expect("discard staged group");
 
     assert!(
         alice
@@ -144,30 +153,41 @@ async fn staged_add_member_commit_can_be_rolled_back() {
     let charlie = MarmotEngine::in_memory(Identity::generate());
     let charlie_pubkey = charlie.identity().public_key();
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let creation = alice
         .create_group("alice and bob", vec![bob_kp], relays.clone())
+        .await
         .expect("alice creates group");
-    let group_id = creation.group.mls_group_id;
+    let group_id = creation.group.id;
     alice
         .merge_pending_commit(&group_id)
+        .await
         .expect("merge initial group");
 
-    let charlie_kp = charlie.key_package_event(relays).expect("charlie kp");
+    let charlie_kp = charlie.key_package_event(relays).await.expect("charlie kp");
     let update = alice
         .add_members(&group_id, vec![charlie_kp])
+        .await
         .expect("stage add charlie");
     assert_eq!(update.welcomes.len(), 1);
     assert!(
-        !alice
+        update.requires_commit_merge,
+        "invite is GroupEvolution: host must confirm_published or publish_failed"
+    );
+    // MDK 0.9 projects the invitee into members() during PendingPublish
+    // (cgka-engine publish_lifecycle). Rollback, not "absent until merge",
+    // is the host invariant.
+    assert!(
+        alice
             .members(&group_id)
-            .expect("members before merge")
+            .expect("members while pending")
             .contains(&charlie_pubkey),
-        "staged add-member state stays pending until commit merge"
+        "0.9 projects staged invitees into members() before confirm"
     );
 
     alice
         .clear_pending_commit(&group_id)
+        .await
         .expect("clear staged add-member commit");
 
     assert!(
@@ -188,15 +208,17 @@ async fn partially_published_group_creation_can_still_be_merged() {
     let bob = MarmotEngine::in_memory(Identity::generate());
     let charlie = MarmotEngine::in_memory(Identity::generate());
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let charlie_kp = charlie
         .key_package_event(relays.clone())
+        .await
         .expect("charlie kp");
 
     let creation = alice
         .create_group("field team", vec![bob_kp, charlie_kp], relays)
+        .await
         .expect("alice creates group");
-    let group_id = creation.group.mls_group_id;
+    let group_id = creation.group.id;
 
     assert_eq!(
         creation.welcomes.len(),
@@ -206,6 +228,7 @@ async fn partially_published_group_creation_can_still_be_merged() {
 
     alice
         .merge_pending_commit(&group_id)
+        .await
         .expect("partial welcome publish keeps creator pending commit mergeable");
 
     let members = alice.members(&group_id).expect("members after merge");
@@ -223,30 +246,38 @@ async fn published_add_member_commit_remains_mergeable_after_welcome_failure() {
     let charlie = MarmotEngine::in_memory(Identity::generate());
     let charlie_pubkey = charlie.identity().public_key();
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let creation = alice
         .create_group("alice and bob", vec![bob_kp], relays.clone())
+        .await
         .expect("alice creates group");
-    let group_id = creation.group.mls_group_id;
+    let group_id = creation.group.id;
     alice
         .merge_pending_commit(&group_id)
+        .await
         .expect("merge initial group");
 
-    let charlie_kp = charlie.key_package_event(relays).expect("charlie kp");
+    let charlie_kp = charlie.key_package_event(relays).await.expect("charlie kp");
     let update = alice
         .add_members(&group_id, vec![charlie_kp])
+        .await
         .expect("stage add charlie");
     assert_eq!(update.welcomes.len(), 1);
     assert!(
-        !alice
+        update.requires_commit_merge,
+        "invite is GroupEvolution: host must confirm_published or publish_failed"
+    );
+    assert!(
+        alice
             .members(&group_id)
-            .expect("members before merge")
+            .expect("members while pending")
             .contains(&charlie_pubkey),
-        "staged add-member state stays pending until commit merge"
+        "0.9 projects staged invitees into members() before confirm"
     );
 
     alice
         .merge_pending_commit(&group_id)
+        .await
         .expect("published add-member commit remains mergeable after welcome retry");
 
     assert!(
@@ -276,12 +307,16 @@ async fn join_request_naming_a_third_party_is_rejected() {
     // id the engine actually holds rather than a synthetic one.
     let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
     let member = MarmotEngine::in_memory(Identity::generate());
-    let member_kp = member.key_package_event(relays.clone()).expect("member kp");
+    let member_kp = member
+        .key_package_event(relays.clone())
+        .await
+        .expect("member kp");
     let group_id = admin
         .create_group("crew", vec![member_kp], relays)
+        .await
         .expect("admin creates group")
         .group
-        .mls_group_id;
+        .id;
 
     // Mallory seals honestly (rumor.pubkey == seal author, so the envelope
     // itself is valid) but writes the victim's npub into the request body.
@@ -326,12 +361,16 @@ async fn join_request_naming_itself_is_accepted_with_seal_identity() {
     // id the engine actually holds rather than a synthetic one.
     let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
     let member = MarmotEngine::in_memory(Identity::generate());
-    let member_kp = member.key_package_event(relays.clone()).expect("member kp");
+    let member_kp = member
+        .key_package_event(relays.clone())
+        .await
+        .expect("member kp");
     let group_id = admin
         .create_group("crew", vec![member_kp], relays)
+        .await
         .expect("admin creates group")
         .group
-        .mls_group_id;
+        .id;
 
     let rumor = build_join_request_rumor(&group_id, secret, &joiner_pubkey, None, None);
     let wrapped = joiner
@@ -475,15 +514,14 @@ async fn stranger_dm_welcome(receiver: &MarmotEngine) -> (MarmotEngine, nostr::E
     let stranger = MarmotEngine::in_memory(Identity::generate());
     let kp = receiver
         .key_package_event(vec![relay.clone()])
+        .await
         .expect("receiver key package");
     let creation = stranger
         .create_group("dm", vec![kp], vec![relay])
-        .expect("stranger creates 2-member group");
-    let (pk, welcome) = creation.welcomes[0].clone();
-    let wrapped = stranger
-        .gift_wrap_welcome(&pk, welcome)
         .await
-        .expect("wrap welcome");
+        .expect("stranger creates 2-member group");
+    let (_pk, welcome) = creation.welcomes[0].clone();
+    let wrapped = welcome;
     (stranger, wrapped)
 }
 
@@ -504,12 +542,15 @@ async fn unknown_sender_dm_welcomes_rate_limit_to_pending() {
             other => panic!("welcome {i} should auto-accept, got {other:?}"),
         }
     }
-    assert_eq!(bob.groups().expect("groups").len(), UNKNOWN_DM_AUTOACCEPT_MAX);
+    assert_eq!(
+        bob.groups().expect("groups").len(),
+        UNKNOWN_DM_AUTOACCEPT_MAX
+    );
 
     // The next one inside the window routes to the pending accept/decline UI —
     // visible, bounded, and still acceptable by the user.
     let (_stranger, wrapped) = stranger_dm_welcome(&bob).await;
-    let pending_group = match bob.process_incoming(&wrapped).await.expect("process") {
+    let _pending_group = match bob.process_incoming(&wrapped).await.expect("process") {
         Incoming::GroupInvitePending(group_id) => group_id,
         other => panic!("welcome past the limit must be pending, got {other:?}"),
     };
@@ -522,11 +563,18 @@ async fn unknown_sender_dm_welcomes_rate_limit_to_pending() {
     assert_eq!(invites.len(), 1);
     let accepted = bob
         .accept_group_invite(&invites[0].id)
+        .await
         .expect("user can still accept a rate-limited welcome");
-    assert_eq!(accepted, pending_group);
     assert_eq!(
         bob.groups().expect("groups").len(),
         UNKNOWN_DM_AUTOACCEPT_MAX + 1
+    );
+    assert!(
+        bob.groups()
+            .expect("groups")
+            .iter()
+            .any(|g| g.id == accepted),
+        "accept must join the MLS group, got {accepted:?}"
     );
 }
 
@@ -543,12 +591,14 @@ async fn known_sender_dm_welcome_auto_accepts_past_the_limit() {
     // Bob a shared active group with her.
     let kp = bob
         .key_package_event(vec![relay.clone()])
+        .await
         .expect("bob key package");
     let creation = alice
         .create_group("dm", vec![kp], vec![relay.clone()])
+        .await
         .expect("alice creates dm");
-    let (pk, welcome) = creation.welcomes[0].clone();
-    let wrapped = alice.gift_wrap_welcome(&pk, welcome).await.expect("wrap");
+    let (_pk, welcome) = creation.welcomes[0].clone();
+    let wrapped = welcome;
     match bob.process_incoming(&wrapped).await.expect("process") {
         Incoming::GroupUpdated(_) => {}
         other => panic!("first contact should auto-accept, got {other:?}"),
@@ -569,12 +619,14 @@ async fn known_sender_dm_welcome_auto_accepts_past_the_limit() {
     // Alice again (new group, e.g. after a reset): known peer, still instant.
     let kp = bob
         .key_package_event(vec![relay.clone()])
+        .await
         .expect("bob key package 2");
     let creation = alice
         .create_group("dm again", vec![kp], vec![relay])
+        .await
         .expect("alice creates dm again");
-    let (pk, welcome) = creation.welcomes[0].clone();
-    let wrapped = alice.gift_wrap_welcome(&pk, welcome).await.expect("wrap");
+    let (_pk, welcome) = creation.welcomes[0].clone();
+    let wrapped = welcome;
     match bob.process_incoming(&wrapped).await.expect("process") {
         Incoming::GroupUpdated(_) => {}
         other => panic!("known-sender welcome must bypass the limit, got {other:?}"),
@@ -596,17 +648,22 @@ async fn welcome_sealed_by_a_third_party_is_rejected() {
 
     let kp = bob
         .key_package_event(vec![relay.clone()])
+        .await
         .expect("bob key package");
     let creation = alice
         .create_group("dm", vec![kp], vec![relay])
-        .expect("alice creates dm");
-    let (_pk, welcome_rumor) = creation.welcomes[0].clone();
-
-    // Mallory re-seals Alice's welcome rumor under her own key.
-    let wrapped = mallory
-        .gift_wrap_rumor(&bob.identity().public_key(), welcome_rumor)
         .await
-        .expect("mallory wraps alice's welcome");
+        .expect("alice creates dm");
+    let (_pk, _alice_welcome) = creation.welcomes[0].clone();
+
+    // MDK 0.9 already gift-wraps welcomes. Rebuild a kind-444 rumor claiming
+    // Alice as author and have Mallory seal it — the peeler must reject a
+    // third-party seal.
+    let fake_rumor = EventBuilder::new(Kind::Custom(444), "").build(alice.identity().public_key());
+    let wrapped = mallory
+        .gift_wrap_rumor(&bob.identity().public_key(), fake_rumor)
+        .await
+        .expect("mallory wraps a fake welcome rumor");
     assert!(
         bob.process_incoming(&wrapped).await.is_err(),
         "a third-party-sealed welcome must be rejected at unwrap"
@@ -622,7 +679,6 @@ async fn welcome_sealed_by_a_third_party_is_rejected() {
         "and nothing is parked as pending either"
     );
 }
-
 
 /// #419: past the parked-invite ceiling the welcome is DROPPED (declined),
 /// not parked — otherwise the flood just moves from silent groups into an
@@ -726,8 +782,7 @@ async fn unpersistable_budget_parks_instead_of_auto_accepting() {
     std::fs::create_dir(dir.path().join("marmot.sqlite.dm-autoaccepts.json"))
         .expect("block the sidecar path");
 
-    let bob = MarmotEngine::persistent(Identity::generate(), &db_path, [0x42u8; 32])
-        .expect("open");
+    let bob = MarmotEngine::persistent(Identity::generate(), &db_path, [0x42u8; 32]).expect("open");
     let (_s, wrapped) = stranger_dm_welcome(&bob).await;
     match bob.process_incoming(&wrapped).await.expect("process") {
         Incoming::GroupInvitePending(_) => {}
@@ -756,23 +811,25 @@ async fn multi_member_invite_flood_is_capped_too() {
         // A 3-member group: bob + the stranger + one filler member.
         let stranger = MarmotEngine::in_memory(Identity::generate());
         let filler = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(vec![relay.clone()]).expect("bob kp");
+        let bob_kp = bob
+            .key_package_event(vec![relay.clone()])
+            .await
+            .expect("bob kp");
         let filler_kp = filler
             .key_package_event(vec![relay.clone()])
+            .await
             .expect("filler kp");
         let creation = stranger
             .create_group("spam", vec![bob_kp, filler_kp], vec![relay.clone()])
+            .await
             .expect("create 3-member group");
-        let (pk, welcome) = creation
+        let (_pk, welcome) = creation
             .welcomes
             .iter()
             .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
             .cloned()
             .expect("bob welcome");
-        let wrapped = stranger
-            .gift_wrap_welcome(&pk, welcome)
-            .await
-            .expect("wrap welcome");
+        let wrapped = welcome;
         match bob.process_incoming(&wrapped).await.expect("process") {
             Incoming::GroupInvitePending(_) => pending += 1,
             Incoming::None => dropped += 1,
@@ -780,7 +837,10 @@ async fn multi_member_invite_flood_is_capped_too() {
         }
     }
 
-    assert_eq!(pending, PENDING_INVITE_CAP, "parked invites stop at the cap");
+    assert_eq!(
+        pending, PENDING_INVITE_CAP,
+        "parked invites stop at the cap"
+    );
     assert!(dropped > 0, "past the cap, welcomes are dropped");
     assert_eq!(
         bob.pending_group_invites().expect("invites").len(),
@@ -788,16 +848,13 @@ async fn multi_member_invite_flood_is_capped_too() {
         "the invite list must not grow past the ceiling for ANY group size"
     );
 
-    // #419 is a STORAGE denial of service, so bounding the invite list is only
-    // half of it. `process_welcome` persists the welcome and a group row before
-    // we get to decide, and `decline_welcome` only marks them Declined/Inactive
-    // — so a ceiling that stops at declining still lets an attacker grow the
-    // SQLCipher database ~5KB per event forever. Every dropped welcome must
-    // leave NO row behind.
+    // #419 is a STORAGE denial of service. MDK 0.9 auto-joins on ingest, so
+    // park/drop happen *before* ingest: parked invites keep the wrapper in a
+    // sidecar and dropped welcomes never create an MLS group row.
     assert_eq!(
         bob.stored_group_count().expect("stored groups"),
-        PENDING_INVITE_CAP,
-        "dropped welcomes must not leave stored group rows behind — the \
+        0,
+        "parked and dropped welcomes must not leave stored group rows behind — the \
          database, not just the invite list, is what #419 bounds"
     );
 }
@@ -819,15 +876,16 @@ async fn a_known_sender_cannot_park_unlimited_invites() {
     let mut accepted = 0usize;
     let mut dropped = 0usize;
     for _ in 0..(KNOWN_SENDER_PENDING_INVITE_CAP + UNKNOWN_DM_AUTOACCEPT_MAX + 10) {
-        let bob_kp = bob.key_package_event(vec![relay.clone()]).expect("bob kp");
+        let bob_kp = bob
+            .key_package_event(vec![relay.clone()])
+            .await
+            .expect("bob kp");
         let creation = stranger
             .create_group("spam", vec![bob_kp], vec![relay.clone()])
-            .expect("stranger creates 2-member group");
-        let (pk, welcome) = creation.welcomes[0].clone();
-        let wrapped = stranger
-            .gift_wrap_welcome(&pk, welcome)
             .await
-            .expect("wrap welcome");
+            .expect("stranger creates 2-member group");
+        let (_pk, welcome) = creation.welcomes[0].clone();
+        let wrapped = welcome;
         match bob.process_incoming(&wrapped).await.expect("process") {
             Incoming::None => dropped += 1,
             Incoming::GroupUpdated(_) => accepted += 1,

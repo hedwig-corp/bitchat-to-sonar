@@ -81,7 +81,7 @@ fn invalid<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> SonarFfiError 
 
 fn parse_group_id(hex_id: &str) -> FfiResult<GroupId> {
     let bytes = hex::decode(hex_id).map_err(invalid("group id"))?;
-    Ok(GroupId::from_slice(&bytes))
+    Ok(GroupId::new(bytes))
 }
 
 fn parse_event_id(hex_id: &str) -> FfiResult<EventId> {
@@ -442,10 +442,12 @@ pub fn abort_account_restore(db_path: String) -> FfiResult<()> {
 /// leftover staging was committed under `db_key_hex`.
 #[uniffi::export]
 pub fn reconcile_account_restore(db_path: String, db_key_hex: String) -> FfiResult<bool> {
-    Ok(sonar_core::account_backup::reconcile_staged_account_restore(
-        Path::new(&db_path),
-        &db_key_hex,
-    )?)
+    Ok(
+        sonar_core::account_backup::reconcile_staged_account_restore(
+            Path::new(&db_path),
+            &db_key_hex,
+        )?,
+    )
 }
 
 /// True when `*.sonar-restore-staging` still exists (DB not yet promoted).
@@ -540,6 +542,9 @@ pub struct GroupInfo {
     pub id_hex: String,
     pub name: String,
     pub member_npubs: Vec<String>,
+    /// False for recovered/live rooms, even when only one other member is listed.
+    /// Hosts must not fold those onto a 1:1 by npub.
+    pub is_direct: bool,
 }
 
 /// A peer's locally cached, privately shared IANA timezone.
@@ -1371,7 +1376,8 @@ impl SonarNode {
     /// Decline a pending group invite by welcome event id.
     pub fn decline_group_invite(&self, invite_id_hex: String) -> FfiResult<()> {
         let invite_id = parse_event_id(&invite_id_hex)?;
-        self.client.decline_group_invite(&invite_id)?;
+        self.runtime
+            .block_on(self.client.decline_group_invite(&invite_id))?;
         Ok(())
     }
 
@@ -1449,14 +1455,12 @@ impl SonarNode {
         let group_id = parse_group_id(&group_id_hex)?;
         let parent_id = nostr::EventId::from_hex(&reply_to_hex)
             .map_err(|e| SonarFfiError::InvalidInput(format!("reply_to: {e}")))?;
-        let parent_pk = PublicKey::parse(&reply_to_npub)
-            .map_err(invalid("reply_to npub"))?;
+        let parent_pk = PublicKey::parse(&reply_to_npub).map_err(invalid("reply_to npub"))?;
         let reply = sonar_core::reply::ReplyTo::new(parent_id, parent_pk, preview);
-        self.runtime.block_on(self.client.send_text_with_reply(
-            &group_id,
-            &text,
-            Some(&reply),
-        ))?;
+        self.runtime.block_on(
+            self.client
+                .send_text_with_reply(&group_id, &text, Some(&reply)),
+        )?;
         Ok(())
     }
 
@@ -1637,8 +1641,10 @@ impl SonarNode {
     }
 
     /// Retry one failed outgoing message from the durable local outbox. The
-    /// original encrypted event is republished, so retry cannot duplicate the
-    /// plaintext transcript row or mutate MLS state a second time.
+    /// original encrypted event is republished when it is still live 0.9
+    /// ciphertext, so retry cannot duplicate the plaintext transcript row
+    /// or mutate MLS state a second time. Recovered 0.8 rows refuse with
+    /// `HistoricalProtocolRetry` and stay Failed.
     pub fn retry_message(&self, message_id_hex: String) -> FfiResult<String> {
         Ok(self
             .runtime
@@ -1685,31 +1691,68 @@ impl SonarNode {
             .collect())
     }
 
-    /// All groups this identity belongs to.
+    /// All groups this identity belongs to, including recovered 0.8 history
+    /// that is not a live 0.9 MLS group. Hosts fold those rows by npub.
     pub fn groups(&self) -> FfiResult<Vec<GroupInfo>> {
-        let groups = self.client.groups()?;
-        groups
-            .into_iter()
-            .map(|g| {
-                let members = self
-                    .client
-                    .members(&g.mls_group_id)?
-                    .into_iter()
-                    .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
-                    .collect();
-                Ok(GroupInfo {
-                    id_hex: hex::encode(g.mls_group_id.as_slice()),
-                    name: g.name,
-                    member_npubs: members,
-                })
-            })
-            .collect()
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for g in self.client.groups()? {
+            let id_hex = hex::encode(g.id.as_slice());
+            seen.insert(id_hex.clone());
+            let members = self
+                .client
+                .display_members(&g.id)?
+                .into_iter()
+                .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
+                .collect();
+            let is_direct = self.client.group_is_direct(&g.id);
+            out.push(GroupInfo {
+                id_hex,
+                name: self.client.display_name(&g.id, &g.name),
+                member_npubs: members,
+                is_direct,
+            });
+        }
+        for hist in self.client.historical_groups()? {
+            if self.client.is_folded_historical_group(&hist.id) {
+                continue;
+            }
+            let id_hex = hex::encode(hist.id.as_slice());
+            if !seen.insert(id_hex.clone()) {
+                continue;
+            }
+            let is_direct = self.client.group_is_direct(&hist.id);
+            let member_npubs = hist
+                .members
+                .into_iter()
+                .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
+                .collect();
+            out.push(GroupInfo {
+                id_hex,
+                name: hist.name,
+                member_npubs,
+                is_direct,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Live 0.9 group that replaced a recovered 0.8 row after resume-send.
+    /// Local read; `None` when the id is not folded.
+    pub fn live_fold_target(&self, group_id_hex: String) -> Option<String> {
+        self.client.live_fold_target_hex(&group_id_hex)
+    }
+
+    /// Recovered and live ids that share one conversation after resume.
+    /// Local read; includes `group_id_hex` itself.
+    pub fn fold_aliases(&self, group_id_hex: String) -> Vec<String> {
+        self.client.fold_aliases_hex(&group_id_hex)
     }
 
     /// Report this host's current system IANA timezone. The host must only
     /// call this after the user enables Share local time. Pass an empty
     /// string to stop sharing. The core validates a non-empty id, remembers
-    /// it for the node lifetime, and encrypts kind-449 rumors into MLS group
+    /// it for the node lifetime, and encrypts timezone shares into MLS group
     /// messages (kind 445) without blocking transcript reads.
     pub fn update_local_timezone(&self, iana_timezone: String) -> FfiResult<()> {
         self.runtime
@@ -2131,10 +2174,7 @@ impl SonarNode {
             &recipient_peer_id_hex,
             &message_id,
             &text,
-            reply_to
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty()),
+            reply_to.as_deref().map(str::trim).filter(|s| !s.is_empty()),
         ))?;
         Ok(())
     }
@@ -3422,9 +3462,7 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
             .into_iter()
             .map(|c| match c {
                 mesh_engine::Command::Dial { conn } => MeshEngineCommand::Dial { conn },
-                mesh_engine::Command::Disconnect { conn } => {
-                    MeshEngineCommand::Disconnect { conn }
-                }
+                mesh_engine::Command::Disconnect { conn } => MeshEngineCommand::Disconnect { conn },
                 mesh_engine::Command::CancelServer { conn } => {
                     MeshEngineCommand::CancelServer { conn }
                 }
@@ -3560,9 +3598,9 @@ impl MeshLinkEngine {
     ) -> FfiResult<Arc<Self>> {
         let sk = hex::decode(&noise_private_hex).map_err(invalid("noise private key"))?;
         let seed = hex::decode(&ed25519_seed_hex).map_err(invalid("mesh seed"))?;
-        let sk: [u8; 32] = sk
-            .try_into()
-            .map_err(|_| SonarFfiError::InvalidInput("noise private key must be 32 bytes".into()))?;
+        let sk: [u8; 32] = sk.try_into().map_err(|_| {
+            SonarFfiError::InvalidInput("noise private key must be 32 bytes".into())
+        })?;
         let seed: [u8; 32] = seed
             .try_into()
             .map_err(|_| SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()))?;
@@ -3619,7 +3657,10 @@ impl MeshLinkEngine {
         instances: Vec<i32>,
         now_ms: i64,
     ) -> MeshEngineOutput {
-        engine_output(self.lock().on_instances_discovered(&conn, &instances, ms(now_ms)))
+        engine_output(
+            self.lock()
+                .on_instances_discovered(&conn, &instances, ms(now_ms)),
+        )
     }
 
     pub fn on_subscribe_result(
@@ -3642,7 +3683,10 @@ impl MeshLinkEngine {
         bytes: Vec<u8>,
         now_ms: i64,
     ) -> MeshEngineOutput {
-        engine_output(self.lock().on_client_rx(&conn, instance, &bytes, ms(now_ms)))
+        engine_output(
+            self.lock()
+                .on_client_rx(&conn, instance, &bytes, ms(now_ms)),
+        )
     }
 
     pub fn on_server_connected(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
@@ -3694,10 +3738,7 @@ impl MeshLinkEngine {
         reply_to: Option<String>,
         now_ms: i64,
     ) -> Option<MeshEngineOutput> {
-        let reply = reply_to
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
+        let reply = reply_to.as_deref().map(str::trim).filter(|s| !s.is_empty());
         self.lock()
             .send_text_with_reply(&fingerprint, &message_id, &text, reply, ms(now_ms))
             .map(engine_output)
@@ -3758,11 +3799,7 @@ impl MeshLinkEngine {
         engine_output(self.lock().set_nickname(&nickname, ms(now_ms)))
     }
 
-    pub fn set_sonar_payload(
-        &self,
-        payload: Option<Vec<u8>>,
-        now_ms: i64,
-    ) -> MeshEngineOutput {
+    pub fn set_sonar_payload(&self, payload: Option<Vec<u8>>, now_ms: i64) -> MeshEngineOutput {
         engine_output(self.lock().set_sonar_payload(payload, ms(now_ms)))
     }
 
@@ -4067,7 +4104,7 @@ mod tests {
 
     #[test]
     fn group_id_hex_roundtrips() {
-        let gid = GroupId::from_slice(&[7u8; 32]);
+        let gid = GroupId::new([7u8; 32]);
         let hex_id = hex::encode(gid.as_slice());
         assert_eq!(parse_group_id(&hex_id).unwrap(), gid);
         assert!(parse_group_id("zz").is_err());
@@ -4104,7 +4141,13 @@ mod tests {
         ));
         // empty db path
         assert!(matches!(
-            SonarNode::connect(id, vec!["wss://relay.example".into()], String::new(), key, None),
+            SonarNode::connect(
+                id,
+                vec!["wss://relay.example".into()],
+                String::new(),
+                key,
+                None
+            ),
             Err(SonarFfiError::InvalidInput(_))
         ));
     }

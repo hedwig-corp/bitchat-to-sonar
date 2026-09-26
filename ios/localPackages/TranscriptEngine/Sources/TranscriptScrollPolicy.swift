@@ -128,12 +128,39 @@ public enum TranscriptScrollPolicy {
         jumpMessageId: String?,
         lastJumpMessageId: String?,
         expectedNewestDate: Date?,
-        lastExpectedNewestDate: Date?
+        lastExpectedNewestDate: Date?,
+        familyHasOlder: Bool = false,
+        lastFamilyHasOlder: Bool = false
     ) -> Bool {
         guard let contentVersion, contentVersion == lastContentVersion else { return false }
         return unreadCountAtOpen == lastUnreadCountAtOpen
             && jumpMessageId == lastJumpMessageId
             && expectedNewestDate == lastExpectedNewestDate
+            && familyHasOlder == lastFamilyHasOlder
+    }
+
+    /// Do not abandon an unread divider while older fold-family / bak rows
+    /// may still hold incoming unread. Compose `shouldRetireOpenChatUnread`.
+    public static func shouldRetireOpenUnread(
+        unreadAtOpen: UInt64,
+        anchorFound: Bool,
+        feedNewest: Date?,
+        expectedNewest: Date?,
+        familyHasOlder: Bool
+    ) -> Bool {
+        if unreadAtOpen == 0 || anchorFound { return false }
+        if familyHasOlder { return false }
+        if let expected = expectedNewest {
+            let feed = feedNewest ?? .distantPast
+            if feed < expected { return false }
+        }
+        return true
+    }
+
+    /// Keep a Jump target until the parent is in the painted entries.
+    /// Soft-fail must not settle: remainder / family reveal can still admit it.
+    public static func shouldSettleJump(parentVisible: Bool) -> Bool {
+        parentVisible
     }
 
     public static func insetFollowDecision(
