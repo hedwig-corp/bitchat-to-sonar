@@ -1250,11 +1250,32 @@ impl MarmotEngine {
                 consume_budget: false,
             };
         }
+        if self.shares_recovered_chat_with(welcomer) {
+            return DmWelcomeDecision::AutoAccept {
+                consume_budget: false,
+            };
+        }
         tracing::info!(
             "unknown-sender DM welcome from {} not auto-accepted (budget exhausted)",
             welcomer
         );
         self.park_or_drop_welcome(welcomer)
+    }
+
+    /// A peer from a recovered (unfolded, not deleted) 0.8 conversation is
+    /// not a stranger. Right after the 0.8 → 0.9 upgrade no live 0.9 group
+    /// exists yet, so [`Self::shared_active_groups_with`] is 0 for every
+    /// contact: the first peers to resume burned the unknown-sender budget
+    /// and the rest parked as an anonymous "Group chat · invite" instead of
+    /// auto-joining and folding onto their recovered row (#613 QA i3).
+    fn shares_recovered_chat_with(&self, welcomer: &PublicKey) -> bool {
+        let Ok(recovered) = self.historical_groups() else {
+            return false;
+        };
+        recovered
+            .iter()
+            .take(SHARED_GROUP_SCAN_CAP)
+            .any(|group| group.members.contains(welcomer))
     }
 
     fn shared_active_groups_with(&self, welcomer: &PublicKey, limit: usize) -> usize {
@@ -1276,7 +1297,8 @@ impl MarmotEngine {
     }
 
     fn park_or_drop_welcome(&self, welcomer: &PublicKey) -> DmWelcomeDecision {
-        let known_sender = self.shared_active_groups_with(welcomer, 1) > 0;
+        let known_sender = self.shared_active_groups_with(welcomer, 1) > 0
+            || self.shares_recovered_chat_with(welcomer);
         let cap = if known_sender {
             KNOWN_SENDER_PENDING_INVITE_CAP
         } else {

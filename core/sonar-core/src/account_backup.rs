@@ -589,6 +589,7 @@ fn count_transcript_sidecar_messages(db_path: &Path) -> Option<u64> {
     count_transcript_bytes_remounted(&bytes, &folds, &dropped_group_hexes_on_disk(db_path))
 }
 
+#[cfg(test)]
 fn count_transcript_bytes(bytes: &[u8]) -> Option<u64> {
     count_transcript_bytes_remounted(bytes, &[], &HashSet::new())
 }
@@ -1080,7 +1081,18 @@ fn remove_backup_sidecars(db_path: &Path) {
     }
 }
 
-fn promote_staged_sidecars_best_effort(db_path: &Path) {
+/// Move staged restore sidecars onto the live account.
+///
+/// `drop_omitted` also deletes a live sidecar the restored package did not
+/// carry, so a v1 blob cannot keep the outgoing install's recovered transcript.
+/// Only the first-pass commit (staged DB just promoted) may pass `true`: it is
+/// the one moment "no staged twin" provably means "omitted by the package".
+/// On a retry (staged DB already gone) a missing twin may just as well mean
+/// "already promoted", and on a plain boot — hosts reconcile before EVERY store
+/// open — there is no restore at all, so deleting there wiped the live
+/// recovered transcript, the `*.mdk08.bak`, the outbox and the sync watermark
+/// on every launch (#613 QA i2).
+fn promote_staged_sidecars_best_effort(db_path: &Path, drop_omitted: bool) {
     let staged = staging_db_path(db_path);
     for suffix in backup_sidecar_suffixes() {
         let from = sidecar_named(&staged, suffix);
@@ -1093,10 +1105,7 @@ fn promote_staged_sidecars_best_effort(db_path: &Path) {
                     "account restore: sidecar rename failed; main DB committed, staged sidecar kept"
                 );
             }
-        } else if to.is_file() {
-            // Restored package omitted this file — drop leftover history from
-            // the outgoing account so a v1 blob cannot keep the previous
-            // install's recovered transcript.
+        } else if drop_omitted && to.is_file() {
             let _ = fs::remove_file(&to);
         }
     }
@@ -1319,7 +1328,11 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     if !staged.is_file() {
         // Already promoted (or never staged). Finish any leftover staged index.
         promote_staged_index_best_effort(db_path);
-        promote_staged_sidecars_best_effort(db_path);
+        // Sidecars only while a restore is in flight, and never deleting: a
+        // missing staged twin here is "already promoted", not "omitted".
+        if restore_intent_path(db_path).is_file() {
+            promote_staged_sidecars_best_effort(db_path, false);
+        }
         // Staging gone AND intent still set means a previous call renamed but
         // died before finishing cleanup, so the slot below may still be the
         // OUTGOING install's. Finish it here, gated on the intent marker: called
@@ -1359,7 +1372,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     // which is the narrower form of the bug this cleanup exists to prevent.
     drop_outgoing_key_package_slot(db_path);
     promote_staged_index_best_effort(db_path);
-    promote_staged_sidecars_best_effort(db_path);
+    promote_staged_sidecars_best_effort(db_path, true);
     promote_staged_backup_policy_best_effort(db_path);
     // Drop leftover staging DB sidecars (index may remain if rename failed).
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -1557,13 +1570,16 @@ pub fn reconcile_staged_account_restore(db_path: &Path, db_key_hex: &str) -> Res
     let staged = staging_db_path(db_path);
     if !staged.is_file() {
         // Crash after DB rename / before index rename — finish the index only.
+        // This is also every plain boot: hosts reconcile before EVERY store
+        // open, so without a restore in flight the live sidecars (recovered
+        // transcript, `*.mdk08.bak`, outbox, sync watermark) must stay put.
         promote_staged_index_best_effort(db_path);
-        promote_staged_sidecars_best_effort(db_path);
         // And the stats, under the same intent gate commit uses: the promotion
         // is the last thing commit does, so this window is exactly where a
         // restored install would otherwise keep reporting "Never" forever and
         // leave the staged sidecar in the account dir for storage to count.
         if restore_intent_path(db_path).is_file() {
+            promote_staged_sidecars_best_effort(db_path, false);
             promote_staged_backup_policy_best_effort(db_path);
         }
         clear_restore_intent(db_path);

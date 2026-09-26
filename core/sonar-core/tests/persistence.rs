@@ -982,6 +982,197 @@ async fn mdk08_store_decrypts_and_moves_plaintext_without_wiping() {
     assert!(bak.exists(), "quarantine must survive a later 0.9 reopen");
 }
 
+/// Minimal MDK 0.8 store: one direct chat with one plaintext row from `peer`.
+fn write_mdk08_dm_fixture(
+    db_path: &std::path::Path,
+    peer: &Identity,
+    group_id: &[u8],
+    event_id: nostr::EventId,
+    body: &str,
+) {
+    let conn = rusqlite::Connection::open(db_path).expect("open 0.8 file");
+    let hex_key = DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+        .expect("0.8 raw key");
+    conn.execute_batch(
+        "CREATE TABLE groups (
+            mls_group_id BLOB PRIMARY KEY,
+            nostr_group_id BLOB NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL
+        );
+        CREATE TABLE messages (
+            mls_group_id BLOB NOT NULL,
+            id BLOB NOT NULL,
+            pubkey BLOB NOT NULL,
+            kind INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL,
+            event TEXT NOT NULL,
+            wrapper_event_id BLOB NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY (mls_group_id, id)
+        );",
+    )
+    .expect("0.8 schema");
+    conn.execute(
+        "INSERT INTO groups (mls_group_id, nostr_group_id, name, description)
+         VALUES (?1, ?2, 'Sonar agent DM', 'sonar.direct-dm.v1')",
+        rusqlite::params![group_id.to_vec(), vec![0x22u8; 32]],
+    )
+    .expect("group row");
+    conn.execute(
+        "INSERT INTO messages
+            (mls_group_id, id, pubkey, kind, created_at, content, tags, event,
+             wrapper_event_id, state)
+         VALUES (?1, ?2, ?3, 9, 1_700_000_000, ?4, '[]', '{}', ?2, 'processed')",
+        rusqlite::params![
+            group_id.to_vec(),
+            event_id.as_bytes().to_vec(),
+            peer.public_key().to_bytes().to_vec(),
+            body,
+        ],
+    )
+    .expect("chat row");
+}
+
+/// Hosts call `reconcile_account_restore` before EVERY store open (iOS
+/// `MarmotService.databaseConfig`, Compose `SonarCore.{android,jvm}`). A plain
+/// boot has no restore in flight, so reconcile must leave every live sidecar
+/// alone. #613 QA i2: it deleted each one without a staged twin, so the
+/// first connect after the 0.8 → 0.9 upgrade migrated, and the next connect
+/// (relay attach) wiped the recovered transcript, the `*.mdk08.bak`, the
+/// outbox and the sync watermark — every recovered chat vanished from Home.
+#[tokio::test]
+async fn boot_reconcile_keeps_recovered_08_history_and_live_sidecars() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice = Identity::generate();
+    let bob = Identity::generate();
+    let group_id = vec![0x33u8; 16];
+    let event_id = nostr::EventId::from_slice(&[0xCDu8; 32]).expect("event id");
+    write_mdk08_dm_fixture(&db_path, &bob, &group_id, event_id, "keep me after reconnect");
+    let key_hex = DB_KEY
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let boot = |label: &str| {
+        let committed =
+            sonar_core::account_backup::reconcile_staged_account_restore(&db_path, &key_hex)
+                .unwrap_or_else(|e| panic!("{label}: reconcile: {e}"));
+        assert!(!committed, "{label}: no restore was staged");
+    };
+
+    // First launch of the upgraded build: reconcile, then open (migrates).
+    boot("upgrade launch");
+    drop(MarmotEngine::persistent(alice.clone(), &db_path, DB_KEY).expect("0.8 migrates"));
+    let sidecar = |suffix: &str| db_path.with_file_name(format!("marmot.sqlite{suffix}"));
+    // Host-owned state that exists on any install, upgraded or not.
+    for suffix in [".sonar-sync.json", ".sonar-outbox.json"] {
+        std::fs::write(sidecar(suffix), b"{}").expect("seed live sidecar");
+    }
+
+    // Relay attach / next launch: reconcile again, then reopen.
+    boot("reconnect");
+    for suffix in [
+        ".mdk08.bak",
+        ".sonar-transcript.json",
+        ".sonar-sync.json",
+        ".sonar-outbox.json",
+    ] {
+        assert!(
+            sidecar(suffix).is_file(),
+            "a boot with no restore in flight deleted marmot.sqlite{suffix}"
+        );
+    }
+    let reopened = MarmotEngine::persistent(alice, &db_path, DB_KEY).expect("0.9 reopen");
+    let recovered = reopened
+        .messages(&sonar_core::GroupId::new(group_id.clone()))
+        .expect("recovered transcript");
+    assert_eq!(recovered.len(), 1, "recovered chat must survive the reconnect");
+    assert_eq!(recovered[0].content, "keep me after reconnect");
+    assert_eq!(
+        reopened.historical_groups().expect("recovered rows").len(),
+        1,
+        "Home must still list the recovered chat"
+    );
+}
+
+/// Right after the upgrade no live 0.9 group exists, so the #419 known-sender
+/// exemption saw every returning contact as a stranger: once the unknown-DM
+/// budget was spent, a recovered contact's resume welcome parked as an
+/// anonymous invite instead of auto-joining and folding onto their recovered
+/// row (#613 QA i3). A peer from a recovered 0.8 chat is known; a stranger
+/// still parks.
+#[tokio::test]
+async fn recovered_08_contact_resume_welcome_bypasses_the_stranger_budget() {
+    let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let bob = Identity::generate();
+    let alice = Identity::generate();
+    write_mdk08_dm_fixture(
+        &db_path,
+        &alice,
+        &[0x44u8; 16],
+        nostr::EventId::from_slice(&[0xEFu8; 32]).expect("event id"),
+        "from before the upgrade",
+    );
+    let bob_engine = MarmotEngine::persistent(bob, &db_path, DB_KEY).expect("0.8 migrates");
+    assert_eq!(bob_engine.groups().expect("live groups").len(), 0);
+
+    // Strangers spend the whole unknown-sender budget.
+    let mut strangers = Vec::new();
+    for _ in 0..sonar_core::marmot::UNKNOWN_DM_AUTOACCEPT_MAX {
+        let stranger = MarmotEngine::in_memory(Identity::generate());
+        let kp = bob_engine
+            .key_package_event(vec![relay.clone()])
+            .await
+            .expect("bob kp");
+        let creation = stranger
+            .create_group("dm", vec![kp], vec![relay.clone()])
+            .await
+            .expect("stranger dm");
+        bob_engine
+            .process_incoming(&creation.welcomes[0].1)
+            .await
+            .expect("process stranger welcome");
+        strangers.push(stranger);
+    }
+
+    let resume_from = |who: Identity| {
+        let bob_engine = &bob_engine;
+        let relay = relay.clone();
+        async move {
+            let peer = MarmotEngine::in_memory(who);
+            let kp = bob_engine
+                .key_package_event(vec![relay.clone()])
+                .await
+                .expect("bob kp");
+            let creation = peer
+                .create_group("dm", vec![kp], vec![relay])
+                .await
+                .expect("peer creates 0.9 dm");
+            bob_engine
+                .process_incoming(&creation.welcomes[0].1)
+                .await
+                .expect("process welcome")
+        }
+    };
+    match resume_from(alice).await {
+        Incoming::GroupUpdated(_) => {}
+        other => panic!("a recovered contact's resume must auto-join, got {other:?}"),
+    }
+    match resume_from(Identity::generate()).await {
+        Incoming::GroupInvitePending(_) => {}
+        other => panic!("a stranger past the budget must still park, got {other:?}"),
+    }
+}
+
 /// A backup taken after the 0.8 → 0.9 migrate must carry recovered-chat
 /// sidecars. Restore onto a fresh path must still paint the transcript.
 #[tokio::test]
