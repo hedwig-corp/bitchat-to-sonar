@@ -1474,7 +1474,45 @@ final class SonarAppStore: ObservableObject {
     /// the durable record). Distinct from `bip353`, which may also hold an
     /// external payment address from another wallet: only a core-claimed
     /// address gets the claim checkmark and kind-0 `nip05`.
-    @Published private(set) var coreClaimedHandle: String?
+    @Published private(set) var coreClaimedHandle: String? {
+        didSet {
+            // A handle that just became known may need registering (or the
+            // "still pays your old wallet" notice): decide off this path.
+            if coreClaimedHandle != oldValue { scheduleHandleOfferRefresh() }
+        }
+    }
+    /// Which wallet the claimed handle's BIP-353 record pays, for this
+    /// account (nil = not known yet: a handle claimed before Cashu). See
+    /// `SonarHandleOfferPolicy`.
+    @Published private(set) var handleAddressWallet: SonarHandleAddressWallet?
+    /// An automatic re-registration of the handle failed; retried with backoff.
+    @Published private(set) var handleAddressUpdateFailing = false
+    /// The user-confirmed move of the handle, in flight or failed.
+    enum HandleMoveState: Equatable {
+        case idle
+        case moving
+        case failed(String)
+    }
+    @Published private(set) var handleMoveState: HandleMoveState = .idle
+    /// The offer last registered with the handle (persisted with the wallet).
+    private var handleRegisteredOffer: String?
+    /// The account (npub) the handle record belongs to; nil until known.
+    private var handleAddressAccount: String?
+    /// Tail of the registrar writes, so an automatic re-claim never races a
+    /// move (each waits for the previous one).
+    private var handleRegistrationTail: Task<Void, Never>?
+    private var handleReclaimRetryTask: Task<Void, Never>?
+    private var handleReclaimRetryAttempt = 0
+    /// The Cashu offer the last restore reclaim was handed (recorded once the
+    /// core reports the sidecar seeded).
+    private var restoreReclaimCashuOffer: String?
+    /// The registrar claim. Tests replace it; everything else goes through
+    /// the core.
+    var registerHandleAtRegistrar: ((_ handle: String, _ offer: String?) async throws -> String)?
+    #if DEBUG
+    /// Tests pin the legacy presence (the real one opens Breez).
+    var legacyPresenceOverrideForTesting: SonarLegacyPresence?
+    #endif
     /// Mirrors wallet.state for the UI (balance row and PaySheet).
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
@@ -2302,6 +2340,21 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.ensureLegacyWebhookIfNeeded() }
             .store(in: &cancellables)
+        // The handle decision reads the legacy presence: re-run it (and the
+        // notice) whenever that changes — attached, restore check settled,
+        // deleted, or established absent.
+        Publishers.CombineLatest3(
+            self.legacyWallets.$wallet.map { $0 != nil },
+            self.legacyWallets.$restoreCheckInProgress,
+            self.legacyWallets.$resolvedPresence
+        )
+        .dropFirst()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.objectWillChange.send()
+            self?.scheduleHandleOfferRefresh()
+        }
+        .store(in: &cancellables)
 
         // `dmRows` is an expensive folded projection. Drive its revision from
         // the narrow conversation inputs instead of recomputing a 278-group
@@ -2364,11 +2417,9 @@ final class SonarAppStore: ObservableObject {
         marmot.shareLocalTimeIfEnabled = { [weak self] in self?.reconcileTimezoneShare() }
         marmot.localBip353Provider = { [weak self] in self?.bip353 ?? "" }
         marmot.handleDomainProvider = { Self.handleDomain }
-        marmot.handleOfferProvider = { [weak self] in
+        marmot.handleOfferProvider = { [weak self] handle in
             guard let self else { return nil }
-            if let cached = self.wallet.cachedReceiveOffer { return cached }
-            guard case .ready = self.walletState else { return nil }
-            return try? await self.wallet.createOffer()
+            return await self.restoreReclaimOffer(forHandle: handle)
         }
         // Adopt own kind-0 into local Profile state before the connect-path
         // republish (nsec restore clears the device-bound nick/handle).
@@ -2386,6 +2437,9 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
                 guard let self else { return }
+                // Which wallet this account's handle pays, before anything
+                // can re-claim it.
+                self.loadHandleAddressRecord(forAccount: npub)
                 self.wireSonarProfileProvider(npub)
                 self.runPostLocalMarmotStartupIfReady()
             }
@@ -2462,9 +2516,9 @@ final class SonarAppStore: ObservableObject {
                 guard let self else { return }
                 UserDefaults.standard.set(offer != nil, forKey: Keys.walletConfigured)
                 self.updateReceiverAdvertising()
-                // A changed offer republishes the descriptor and re-claims the
-                // handle (refreshHandleOfferIfNeeded) — force past the
-                // unchanged-offer skip.
+                // A changed offer republishes the descriptor (and re-runs the
+                // handle decision, refreshHandleOfferIfNeeded) — force past
+                // the unchanged-offer skip.
                 if offer != nil, offer != self.publishedBolt12Offer {
                     self.publishPaymentMetadataIfNeeded(force: true)
                 }
@@ -3559,6 +3613,13 @@ final class SonarAppStore: ObservableObject {
     private func noteOwnHandleSidecarSeeded(_ address: String) {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // The reclaim registered the Cashu offer only where the handle may
+        // pay it silently (restoreReclaimOffer); record that before the
+        // handle becomes known, so the decision it triggers sees it.
+        if let offer = restoreReclaimCashuOffer, let account = handleAddressAccount {
+            recordHandleAddress(.cashu, offer: offer, account: account)
+        }
+        restoreReclaimCashuOffer = nil
         coreClaimedHandle = trimmed
         if bip353.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             setBip353(trimmed)
@@ -4269,20 +4330,27 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             // Offer fetch is tolerated to fail: no offer yet = chat-only claim
-            // (re-claimed with the offer once it exists).
+            // (re-claimed with the offer once it exists). An explicit claim is
+            // the user choosing this wallet for the address (the claim field
+            // says where payments go).
             var offer: String? = self.wallet.cachedReceiveOffer
             if offer == nil, case .ready = self.walletState {
                 offer = try? await self.wallet.createOffer()
             }
-            do {
-                let address = try await self.marmot.claimHandle(handle: name, offer: offer)
-                self.coreClaimedHandle = address
-                if let offer { self.lastClaimedOffer = offer }
-                self.setBip353(address)
-                self.marmot.publishProfile(name: self.chatViewModel.nickname)
-                self.handleClaimState = .claimed(address)
-            } catch {
-                self.handleClaimState = .failed(Self.describeHandleClaimError(error))
+            let account = self.handleAddressAccount
+            await self.serializeHandleRegistration {
+                do {
+                    let address = try await self.registerHandle(name, offer: offer)
+                    if let account, account == self.handleAddressAccount {
+                        self.recordHandleAddress(.cashu, offer: offer, account: account)
+                    }
+                    self.coreClaimedHandle = address
+                    self.setBip353(address)
+                    self.marmot.publishProfile(name: self.chatViewModel.nickname)
+                    self.handleClaimState = .claimed(address)
+                } catch {
+                    self.handleClaimState = .failed(Self.describeHandleClaimError(error))
+                }
             }
         }
     }
@@ -4308,21 +4376,258 @@ final class SonarAppStore: ObservableObject {
         return detail
     }
 
-    /// The BOLT12 offer last registered with the handle this session.
-    private var lastClaimedOffer: String?
+    // MARK: Handle payment address
+    //
+    // The handle's BIP-353 record is a public address. Before Cashu it paid
+    // the Breez wallet's offer; it moves to the Cashu offer (custody at the
+    // mint) only when the user confirms, or where there is no old wallet to
+    // move away from (docs/WALLET-INTEGRATION.md "The handle's payment
+    // address"). Compose mirror: SonarAppState "Which wallet the handle pays".
 
-    /// Upgrade a chat-only claim once a wallet offer exists: a claim made
-    /// before the wallet was ready has no BIP-353 DNS record, so the handle
-    /// looks payable but isn't until re-registered. Re-claims from the same
-    /// key are idempotent; once per offer per session keeps this quiet.
+    private func registerHandle(_ name: String, offer: String?) async throws -> String {
+        if let registerHandleAtRegistrar {
+            return try await registerHandleAtRegistrar(name, offer)
+        }
+        return try await marmot.claimHandle(handle: name, offer: offer)
+    }
+
+    /// Run `work` after every earlier registrar write finished: a move and an
+    /// automatic re-claim never interleave.
+    private func serializeHandleRegistration(_ work: @escaping @MainActor () async -> Void) async {
+        let previous = handleRegistrationTail
+        let task = Task { @MainActor in
+            await previous?.value
+            await work()
+        }
+        handleRegistrationTail = task
+        await task.value
+    }
+
+    private static func handleName(_ address: String) -> String {
+        String(address.split(separator: "@").first ?? "")
+    }
+
+    private func loadHandleAddressRecord(forAccount npub: String?) {
+        let account = npub?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard account != handleAddressAccount || account == nil else { return }
+        handleReclaimRetryTask?.cancel()
+        handleReclaimRetryTask = nil
+        handleReclaimRetryAttempt = 0
+        handleAddressUpdateFailing = false
+        handleMoveState = .idle
+        restoreReclaimCashuOffer = nil
+        guard let account, !account.isEmpty else {
+            handleAddressAccount = nil
+            handleAddressWallet = nil
+            handleRegisteredOffer = nil
+            return
+        }
+        let record = SonarHandleAddressRecord.load(defaults: defaults, account: account)
+        handleAddressAccount = account
+        handleAddressWallet = record.wallet
+        handleRegisteredOffer = record.registeredOffer
+        scheduleHandleOfferRefresh()
+    }
+
+    private func recordHandleAddress(_ wallet: SonarHandleAddressWallet, offer: String?, account: String) {
+        SonarHandleAddressRecord(wallet: wallet, registeredOffer: offer).save(defaults: defaults, account: account)
+        handleAddressWallet = wallet
+        handleRegisteredOffer = offer
+        handleAddressUpdateFailing = false
+        handleReclaimRetryTask?.cancel()
+        handleReclaimRetryTask = nil
+        handleReclaimRetryAttempt = 0
+    }
+
+    /// Present / absent / unknown, as far as the legacy coordinator has
+    /// established it. Only `.absent` lets the handle move silently.
+    var legacyWalletPresence: SonarLegacyPresence {
+        #if DEBUG
+        if let pinned = legacyPresenceOverrideForTesting { return pinned }
+        #endif
+        return legacyWallets.presenceForHandle
+    }
+
+    private func handleOfferDecision(claimedHandle: String?, cashuOffer: String?) -> SonarHandleOfferAction {
+        guard handleAddressAccount != nil else { return .none }
+        return SonarHandleOfferPolicy.action(
+            claimedHandle: claimedHandle,
+            legacyPresence: legacyWalletPresence,
+            addressWallet: handleAddressWallet,
+            cashuOffer: cashuOffer,
+            lastRegisteredOffer: handleRegisteredOffer
+        )
+    }
+
+    /// The notice next to the address (Profile, Settings, Wallet).
+    var handleAddressNotice: SonarHandleAddressNotice {
+        guard let claimed = coreClaimedHandle?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !claimed.isEmpty, handleAddressAccount != nil
+        else { return .none }
+        if handleOfferDecision(claimedHandle: claimed, cashuOffer: wallet.cachedReceiveOffer) == .askToMove {
+            return .paysOldWallet(address: claimed)
+        }
+        return handleAddressUpdateFailing ? .updateFailing(address: claimed) : .none
+    }
+
+    /// "Move back to your old wallet": the handle pays Cashu and the old
+    /// wallet is here.
+    var canMoveHandleBackToOldWallet: Bool {
+        handleAddressAccount != nil && SonarHandleOfferPolicy.canMoveBack(
+            claimedHandle: coreClaimedHandle,
+            legacyPresence: legacyWalletPresence,
+            addressWallet: handleAddressWallet
+        )
+    }
+
+    /// Re-run the handle decision off the caller's path (descriptor publish,
+    /// presence change, handle adopted, retry).
+    private func scheduleHandleOfferRefresh(_ offer: String? = nil) {
+        guard let offer = offer ?? wallet.cachedReceiveOffer else { return }
+        Task { [weak self] in await self?.refreshHandleOfferIfNeeded(offer) }
+    }
+
+    /// Re-register the handle with the Cashu offer where
+    /// `SonarHandleOfferPolicy` allows it (the handle already pays Cashu, or
+    /// no old wallet exists): a chat-only claim made before the wallet had an
+    /// offer, or a rotated offer. Never while the handle pays a legacy wallet
+    /// that is still here. A failure is surfaced (`handleAddressUpdateFailing`)
+    /// and retried with backoff; the persisted offer keeps this to once per
+    /// offer, not once per launch.
     private func refreshHandleOfferIfNeeded(_ offer: String) async {
-        guard let claimed = coreClaimedHandle, offer != lastClaimedOffer else { return }
-        let name = String(claimed.split(separator: "@").first ?? "")
-        guard !name.isEmpty else { return }
-        if (try? await marmot.claimHandle(handle: name, offer: offer)) != nil {
-            lastClaimedOffer = offer
+        guard handleOfferDecision(claimedHandle: coreClaimedHandle, cashuOffer: offer) == .reclaimWithCashu else { return }
+        await serializeHandleRegistration { [weak self] in
+            guard let self else { return }
+            // A failure is retried on its backoff, not by every trigger that
+            // queued behind it (offer, presence, handle adopted).
+            guard self.handleReclaimRetryTask == nil else { return }
+            // Decide again in order: a move may have just landed.
+            guard let claimed = self.coreClaimedHandle, let account = self.handleAddressAccount,
+                  self.handleOfferDecision(claimedHandle: claimed, cashuOffer: offer) == .reclaimWithCashu
+            else { return }
+            let name = Self.handleName(claimed)
+            guard !name.isEmpty else { return }
+            do {
+                _ = try await self.registerHandle(name, offer: offer)
+                guard account == self.handleAddressAccount else { return }
+                self.recordHandleAddress(.cashu, offer: offer, account: account)
+            } catch {
+                SecureLogger.error("Handle re-registration with the wallet offer failed: \(error)", category: .session)
+                guard account == self.handleAddressAccount else { return }
+                self.handleAddressUpdateFailing = true
+                self.scheduleHandleReclaimRetry()
+            }
         }
     }
+
+    private func scheduleHandleReclaimRetry() {
+        handleReclaimRetryTask?.cancel()
+        let delaySecs = Self.paymentMetadataRetryDelaySecs(attempt: handleReclaimRetryAttempt)
+        handleReclaimRetryAttempt += 1
+        handleReclaimRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delaySecs) * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.handleReclaimRetryTask = nil
+            self.scheduleHandleOfferRefresh()
+        }
+    }
+
+    /// The confirmed "Move": register the handle with the Cashu offer. On
+    /// failure the handle keeps paying the old wallet and the notice stays.
+    func moveHandleToNewWallet() {
+        guard let claimed = coreClaimedHandle, let account = handleAddressAccount,
+              handleMoveState != .moving
+        else { return }
+        let name = Self.handleName(claimed)
+        guard !name.isEmpty else { return }
+        handleMoveState = .moving
+        Task { [weak self] in
+            guard let self else { return }
+            var offer = self.wallet.cachedReceiveOffer
+            if offer == nil, case .ready = self.walletState {
+                offer = try? await self.wallet.createOffer()
+            }
+            guard let offer else {
+                self.handleMoveState = .failed(String(localized: "Your new wallet isn't ready yet. Try again in a moment."))
+                return
+            }
+            await self.serializeHandleRegistration {
+                do {
+                    _ = try await self.registerHandle(name, offer: offer)
+                    if account == self.handleAddressAccount {
+                        self.recordHandleAddress(.cashu, offer: offer, account: account)
+                    }
+                    self.handleMoveState = .idle
+                    self.showToast(String(localized: "Your address now pays your new wallet"))
+                } catch {
+                    self.handleMoveState = .failed(Self.describeHandleClaimError(error))
+                }
+            }
+        }
+    }
+
+    /// The confirmed path back: register the handle with the legacy wallet's
+    /// OWN offer while that wallet is here.
+    func moveHandleToOldWallet() {
+        guard let claimed = coreClaimedHandle, let account = handleAddressAccount,
+              handleMoveState != .moving
+        else { return }
+        let name = Self.handleName(claimed)
+        guard !name.isEmpty else { return }
+        handleMoveState = .moving
+        Task { [weak self] in
+            guard let self else { return }
+            guard let legacy = self.legacyWallet, case .ready = legacy.state,
+                  let offer = try? await legacy.createOffer()
+            else {
+                self.handleMoveState = .failed(String(localized: "Your old wallet isn't connected. Try again in a moment."))
+                return
+            }
+            await self.serializeHandleRegistration {
+                do {
+                    _ = try await self.registerHandle(name, offer: offer)
+                    if account == self.handleAddressAccount {
+                        self.recordHandleAddress(.legacy, offer: offer, account: account)
+                    }
+                    self.handleMoveState = .idle
+                    self.showToast(String(localized: "Your address pays your old wallet again"))
+                } catch {
+                    self.handleMoveState = .failed(Self.describeHandleClaimError(error))
+                }
+            }
+        }
+    }
+
+    /// Clear a failed move's message (its dialog was dismissed).
+    func resetHandleMoveState() {
+        if case .failed = handleMoveState { handleMoveState = .idle }
+    }
+
+    /// The offer a restore reclaim of `handle` may register: the Cashu offer
+    /// only where `SonarHandleOfferPolicy` allows a silent re-claim;
+    /// otherwise none, and the registrar keeps the record it has (a claim
+    /// without an offer never changes the DNS record).
+    private func restoreReclaimOffer(forHandle handle: String) async -> String? {
+        var offer = wallet.cachedReceiveOffer
+        if offer == nil, case .ready = walletState {
+            offer = try? await wallet.createOffer()
+        }
+        let decided = offer.flatMap {
+            handleOfferDecision(claimedHandle: handle, cashuOffer: $0) == .reclaimWithCashu ? $0 : nil
+        }
+        restoreReclaimCashuOffer = decided
+        return decided
+    }
+
+    #if DEBUG
+    /// Tests seed the core-claimed handle (the core has no node there).
+    func seedClaimedHandleForTesting(_ address: String) {
+        coreClaimedHandle = address
+    }
+
+    /// The account the handle record was loaded for.
+    var handleAddressAccountForTesting: String? { handleAddressAccount }
+    #endif
 
     /// If lightweight prefs lost the BIP-353 address but the core still holds
     /// a claimed handle, adopt it back (core persistence is the durable copy).
@@ -4940,8 +5245,12 @@ final class SonarAppStore: ObservableObject {
                 guard self.publishedBolt12Offer == nil else { return }
                 offer = nil
             }
+            // The public handle is decided separately and never gates this
+            // publish: the descriptor is in-app ⚡PAY and always carries the
+            // Cashu offer; the handle's BIP-353 record moves to it only where
+            // SonarHandleOfferPolicy allows.
             if let offer {
-                await self.refreshHandleOfferIfNeeded(offer)
+                self.scheduleHandleOfferRefresh(offer)
             }
             // Offline relay: the reconnect path republishes, no retry needed.
             guard self.marmot.npub != nil, self.marmot.relayConnected else { return }
@@ -11316,6 +11625,9 @@ final class SonarAppStore: ObservableObject {
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
+        // Which wallet each account's handle pays (the npub sink drops the
+        // in-memory copy).
+        SonarHandleAddressRecord.removeAll(defaults: defaults)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).
         if let ble = chatViewModel.meshService as? BLEService {

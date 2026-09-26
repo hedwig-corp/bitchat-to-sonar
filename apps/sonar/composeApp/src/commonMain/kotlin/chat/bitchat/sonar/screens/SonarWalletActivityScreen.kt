@@ -591,6 +591,12 @@ private fun LegacyWalletCard(state: SonarAppState) {
                 null -> Unit
             }
         }
+        // Which wallet the public address pays: the old one until the user
+        // moves it (and back, while the old wallet is here).
+        if (handleAddressNoticeVisible(state)) {
+            Spacer(Modifier.height(12.dp))
+            HandleAddressNotice(state)
+        }
     }
 }
 

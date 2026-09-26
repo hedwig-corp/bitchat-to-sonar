@@ -79,7 +79,8 @@ Every call blocks. Call it from a background executor.
   crash interrupted, then the 5 s watcher. Idempotent, `Busy` while another
   connect runs. Bounded: a hung mint yields `Timeout`, never a stuck call.
 - `receive_offer()`: **the** receive address hosts publish (descriptor,
-  BIP-353, BLE, Unify). One reusable amountless BOLT12 quote; stable across
+  BLE, Unify, and the BIP-353 handle once it pays this wallet: see "The
+  handle's payment address"). One reusable amountless BOLT12 quote; stable across
   calls and launches; answered from disk with no network once created.
   Rotates only when the quote expires (the old quote keeps minting). A mint
   that forgets the quote is indistinguishable from an outage and does not
@@ -120,14 +121,16 @@ Shared behaviour, pinned by tests on both platforms:
   foreground and disconnects on background, never under a send in flight.
 - "Payments enabled" and the BLE payments capability mean "a Cashu offer
   exists for this account", with no dependence on a Breez key.
-- The descriptor, BIP-353 handle and Unify use the Cashu offer and republish
-  when it changes. Difference: while an account has no offer yet, Apple skips
+- The descriptor and Unify use the Cashu offer and republish when it
+  changes. Difference: while an account has no offer yet, Apple skips
   publishing, while Compose publishes the call descriptor alone. Neither
   withdraws an offer already on the relays: `descriptor_events`
   (`core/sonar-core/src/sonar_descriptor.rs`) emits the `sonar.meta.v1`
   event, which carries the offer, only when there is an offer, because
   republishing it empty would replace a good offer with nothing. That is
-  deliberate; do not "fix" it to clear the offer.
+  deliberate; do not "fix" it to clear the offer. The public BIP-353 handle
+  follows the Cashu offer only under the rules in "The handle's payment
+  address"; its registration never gates the descriptor publish.
 - A send that returns Pending is recorded as pending and settled exactly once,
   by the outcome event or by a lookup after reconnecting. A chat ⚡PAY sends
   neither its `PAY` nor its `PAYDONE|2|id|preimage` line until it settles, so
@@ -156,6 +159,58 @@ Shared behaviour, pinned by tests on both platforms:
   Pending/Refundable payments. Anything unknown means not safe.
 - Balances under ~1,000 sats cannot leave over Lightning (the Boltz submarine
   swap minimum), so they stay visible and undeletable until spendable.
+
+## The handle's payment address
+
+The handle (`name@sonarprivacy.xyz`) is a public address: it can be printed
+or shared outside the app, and the registrar
+(`services/handle-registrar/src/registry.ts`) points its BIP-353 DNS TXT at
+whatever offer the last claim carried. Before Cashu that was the Breez
+wallet's offer. Retargeting it at the Cashu offer moves future payments into
+custody at `mint.hedwig.sh`, so the app never does that on an update. (The
+in-app descriptor is a different surface: it always carries the Cashu offer.)
+
+Per account the app records which wallet the handle pays (`legacy` |
+`cashu`, absent = not known yet) and the offer last registered with it
+(iOS: `UserDefaults` `sonar.handle.addressWallet.<npub>` /
+`sonar.handle.registeredOffer.<npub>`; Compose: `CoreWalletPrefs`
+`wallet.handle.pays.<accountId>` / `wallet.handle.registeredOffer.<accountId>`).
+The decision is one pure function on each platform
+(`SonarHandleOfferPolicy.action` / `handleOfferAction`):
+
+| Recorded | Legacy wallet on this device | Result |
+| --- | --- | --- |
+| `cashu` | any | re-register when the Cashu offer differs from the one registered |
+| `legacy` or absent | present | **ask**: "Your address … still pays your old wallet." + Move |
+| `legacy` or absent | not established yet | nothing, until it is |
+| `legacy` or absent | absent (new install, or the old wallet deleted) | re-register with the Cashu offer |
+
+- **Legacy presence** is "absent" only once established: the presence check
+  ran and no post-restore check that could still keep a Breez wallet is
+  pending (in a build with a Breez key). A Keychain that cannot answer, an
+  archive that failed to come back, or a restore check in progress are all
+  "unknown", which never moves the handle.
+- **Move** asks first: payments to the address will go to the new wallet,
+  held as ecash at mint.hedwig.sh; the old wallet stays spendable; deleting
+  the new wallet does not move the address back. Confirm → claim with the
+  Cashu offer; success records `cashu`; failure shows the error and leaves
+  the notice (the address still pays the old wallet).
+- **Move back**: while the handle pays Cashu and the old wallet is here,
+  "Move back to your old wallet" (confirmed) claims with the legacy wallet's
+  OWN offer and records `legacy`. It needs the old wallet connected.
+- **An explicit claim** (typing a name and claiming) registers the Cashu
+  offer and records `cashu`; the claim field says where payments go.
+- **A restore reclaim** (the sidecar is empty after an nsec restore) carries
+  the Cashu offer only where the table says re-register; otherwise it is a
+  chat-only claim, which seeds the sidecar and leaves the registrar's record
+  as it is (a claim without an offer never changes the DNS TXT).
+- **A failed automatic re-registration** shows "Couldn't update your address
+  … Retrying." and retries with backoff (30 s doubling to 15 min).
+- Registrar writes are serialized, so an automatic re-claim never races a
+  Move.
+- The notice is shown with the username (Profile; the Mac panes), in
+  Settings under the wallet, and in the old wallet's card on the Wallet
+  screen.
 
 ## Wipe and account replacement
 
@@ -265,3 +320,13 @@ message is the notification):
 - Offer backups need the account's relays: if none answers when a reinstalled
   wallet first connects, no offer is created until one does (retried every
   30 s), rather than publishing a new offer over the backed-up one.
+- The handle's payment record is local to the device. After a restore onto
+  a device that keeps a Breez wallet, the app does not know which offer the
+  registrar holds, so it says "still pays your old wallet" even if the old
+  device had already moved it (Move then re-registers the same Cashu offer).
+  A handle that was a chat-only claim with a Breez wallet present also reads
+  "still pays your old wallet" although it pays nothing. Reading the live
+  BIP-353 record (a DNS TXT lookup of
+  `<name>.user._bitcoin-payment.<domain>`) would settle both; the apps do
+  not do that lookup today. Follow-up: compare the live record with the two
+  wallets' offers before showing the notice.

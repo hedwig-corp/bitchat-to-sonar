@@ -214,6 +214,17 @@ fun SonarSettingsScreen(state: SonarAppState) {
             // = false, iOS `SonarWallet.displayMode()` = "bitcoin"); the note
             // used to claim the opposite (QA-A23).
             StNote("On by default — amounts show in sats, with Lightning and ecash. Turn off to see your currency instead.")
+            // Which wallet the public address pays (only while there is
+            // something to say: it still pays the old wallet, an update is
+            // failing, or it can move back).
+            if (handleAddressNoticeVisible(state)) {
+                HandleAddressNotice(
+                    state,
+                    Modifier.padding(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 8.dp)
+                        .clip(RoundedCornerShape(18.dp)).background(s.surface)
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                )
+            }
 
             SNSectionLabel("Privacy & safety")
             SNSettingsCard {

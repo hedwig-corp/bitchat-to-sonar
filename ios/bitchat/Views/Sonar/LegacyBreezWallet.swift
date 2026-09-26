@@ -781,6 +781,20 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
     /// True while the one-time post-restore check has not decided yet. The
     /// store keeps the Breez webhook off until the wallet is known to stay.
     @Published private(set) var restoreCheckInProgress = false
+    /// What the last presence check established for this account: nil until
+    /// one ran. `.absent` only when no store exists AND no restore check
+    /// could still bring one back; anything in doubt is `.unknown`. The
+    /// handle decision (`SonarHandleOfferPolicy`) moves the public address
+    /// only on `.absent`.
+    @Published private(set) var resolvedPresence: SonarLegacyPresence?
+
+    /// Present when a wallet is attached; unknown while the restore check may
+    /// still delete it; otherwise what the last presence check found.
+    var presenceForHandle: SonarLegacyPresence {
+        if restoreCheckInProgress { return .unknown }
+        if wallet != nil { return .present }
+        return resolvedPresence ?? .unknown
+    }
 
     private let storage: SonarLegacyWalletStorage
     private let presence: () -> SonarLegacyPresence
@@ -823,9 +837,13 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
         case .present:
             attach(factory(.openExisting))
         case .unknown:
+            resolvedPresence = .unknown
             return
         case .absent:
-            guard let nsec = nsecProvider() else { return }
+            guard let nsec = nsecProvider() else {
+                resolvedPresence = .unknown
+                return
+            }
             let accountId = SonarCashuStorage.accountId(nsec: nsec)
             if storage.hasArchive(accountId: accountId) {
                 // This account's archived legacy store comes back with it.
@@ -834,18 +852,25 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
                     try storage.writeDerivedSeed(nsec: nsec)
                     attach(factory(.openExisting))
                 } catch {
+                    // An archive that may hold funds is still there.
+                    resolvedPresence = .unknown
                     SecureLogger.error("Legacy wallet archive restore failed: \(error)", category: .session)
                 }
                 return
             }
             if storage.restoreCheckPending(accountId), hasAPIKey() {
                 attach(factory(.restoreCheck))
+                return
             }
+            // A pending check in a build without a Breez key never runs: no
+            // legacy wallet can exist in this build.
+            resolvedPresence = .absent
         }
     }
 
     private func attach(_ legacy: LegacyBreezWallet) {
         wallet = legacy
+        resolvedPresence = .present
         watchRestoreCheck(legacy)
     }
 
@@ -894,6 +919,7 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
             do {
                 try await legacy.deleteIfSafe(unregisterWebhook: unregisterWebhook)
                 wallet = nil
+                resolvedPresence = .absent
             } catch {
                 // Not provably empty after all: keep it as legacy.
                 SecureLogger.warning("Legacy restore check: kept wallet (\(error))", category: .session)
@@ -914,12 +940,15 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
         guard let legacy = wallet else { return }
         try await legacy.deleteIfSafe(unregisterWebhook: unregisterWebhook)
         wallet = nil
+        resolvedPresence = .absent
     }
 
     /// Account replacement. Must run BEFORE the new key is committed.
     func prepareForIdentityReplacement() async throws {
         restoreCheckCancellable = nil
         restoreCheckInProgress = false
+        // The next account's presence is established by its own refresh().
+        resolvedPresence = nil
         guard let oldNsec = nsecProvider() else {
             // No current account: nothing on this device belongs to one.
             if let legacy = wallet { try await legacy.releaseForReplacement(oldAccountId: "unknown") }
@@ -948,6 +977,7 @@ final class SonarLegacyWalletCoordinator: ObservableObject {
     func wipeForEmergency() async -> Bool {
         restoreCheckCancellable = nil
         restoreCheckInProgress = false
+        resolvedPresence = nil
         if let legacy = wallet {
             let ok = await legacy.wipeForEmergency()
             wallet = nil

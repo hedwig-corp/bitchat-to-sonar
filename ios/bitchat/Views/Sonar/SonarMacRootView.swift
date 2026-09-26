@@ -2741,7 +2741,7 @@ private struct MacProfilePane: View {
             if let custody = store.walletCustodyLine {
                 macCustodyNote(custody)
             }
-            SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true })
+            SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true }, showsAddressNotice: false)
         }
     }
 
@@ -3060,7 +3060,7 @@ private struct MacSettingsModal: View {
             if let custody = store.walletCustodyLine {
                 macCustodyNote(custody)
             }
-            SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true })
+            SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true }, showsAddressNotice: false)
         }
     }
 

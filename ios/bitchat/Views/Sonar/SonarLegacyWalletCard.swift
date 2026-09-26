@@ -22,11 +22,22 @@ struct SNLegacyWalletSection: View {
     /// root (`snSheet` is an overlay, so it must not live inside a scroll
     /// view section).
     let onDelete: () -> Void
+    /// Show which wallet the public address pays here. Off where the host
+    /// already shows the username card (the Mac panes), so the notice
+    /// appears once per screen.
+    var showsAddressNotice: Bool = true
 
     var body: some View {
         if let legacy = store.legacyWallet {
             VStack(spacing: 0) {
                 SNSectionLabel(String(localized: "Old Lightning wallet"))
+                if showsAddressNotice, SNHandleAddressNotice.isVisible(store) {
+                    SNSettingsCard {
+                        SNHandleAddressNotice(store: store)
+                            .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                    }
+                    .padding(.bottom, 8)
+                }
                 SNSettingsCard {
                     SNSettingsRow(
                         icon: .bolt, tone: .gold,

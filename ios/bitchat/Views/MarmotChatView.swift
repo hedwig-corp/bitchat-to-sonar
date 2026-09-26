@@ -407,8 +407,10 @@ final class MarmotChatModel: ObservableObject {
     var localBip353Provider: (() -> String)?
     /// Default Sonar handle domain (registrar). Set by SonarAppStore.
     var handleDomainProvider: (() -> String)?
-    /// Best-effort BOLT12 offer for restore reclaim. Set by SonarAppStore.
-    var handleOfferProvider: (() async -> String?)?
+    /// The BOLT12 offer a restore reclaim of this handle may register, or nil
+    /// for a chat-only claim (the registrar then keeps its payment record).
+    /// Set by SonarAppStore, which decides which wallet the handle pays.
+    var handleOfferProvider: ((String) async -> String?)?
     /// Share local time privacy pref. Set by SonarAppStore. Default off.
     var shareLocalTimeIfEnabled: () -> Void = {}
     /// Called on the main actor after our own kind-0 is fetched on relay
@@ -3276,7 +3278,7 @@ final class MarmotChatModel: ObservableObject {
         )
         var handleSeeded = plan.handleLocalToClaim == nil
         if let local = plan.handleLocalToClaim, !local.isEmpty {
-            let offer = await handleOfferProvider?()
+            let offer = await handleOfferProvider?(local)
             if let address = try? await service.claimHandle(handle: local, offer: offer) {
                 handleSeeded = true
                 await MainActor.run { onOwnHandleSidecarSeeded?(address) }

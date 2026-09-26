@@ -49,6 +49,9 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.HandleClaimState
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.payments_to_this_address_go_to_your
+import org.jetbrains.compose.resources.stringResource
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -257,6 +260,11 @@ private fun UsernameCard(
                     }
                 )
             }
+            // Which wallet the address pays, and the confirmed move.
+            if (isCoreClaimed && handleAddressNoticeVisible(state)) {
+                Spacer(Modifier.height(10.dp))
+                HandleAddressNotice(state)
+            }
         } else {
             val draft = payDraft.trim()
             val isExternal = '@' in draft && !draft.lowercase().endsWith("@${state.handleDomain}")
@@ -303,6 +311,14 @@ private fun UsernameCard(
                 isExternal -> Text(
                     "External address — saved as your payment address only.",
                     color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp
+                )
+            }
+            if (!isExternal) {
+                // A claim registers the address with the ecash wallet's offer.
+                Text(
+                    stringResource(Res.string.payments_to_this_address_go_to_your),
+                    color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp,
+                    modifier = Modifier.padding(top = 4.dp),
                 )
             }
             Spacer(Modifier.height(10.dp))

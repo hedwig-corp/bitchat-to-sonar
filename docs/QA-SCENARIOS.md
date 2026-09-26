@@ -579,6 +579,32 @@ real mint and need the maintainer's approval of the amounts.
   connection waiting forever for an answer nobody reads. The build before
   the review fixes behaves the same.
 
+### QA-094 — An address on the old wallet moves only when the user says so
+- **Platforms:** both (manual: needs an account whose handle was claimed on a
+  pre-Cashu build and still has its Breez wallet, i.e. a build with a Breez
+  key; the registrar's DNS TXT is readable with
+  `dig TXT <name>.user._bitcoin-payment.sonarprivacy.xyz`)
+- **Steps:** update such an install to this build, open it and wait for the
+  wallet to come online; read the TXT record. Open Profile (and Settings,
+  and the Wallet screen's old-wallet card). Tap Move to new wallet, read the
+  confirmation, confirm. Read the TXT record again. Then Move back to your
+  old wallet, confirm, read it once more.
+- **Expect:** after the update the TXT record still carries the Breez offer
+  and every surface says "Your address … still pays your old wallet." The
+  confirmation says payments will go to the new wallet held as ecash at
+  mint.hedwig.sh, that the old wallet stays spendable, and that deleting the
+  new wallet does not move the address back. After confirming, the record
+  carries the Cashu offer and the notice is gone; after moving back it
+  carries the Breez offer again. A relaunch neither asks again nor
+  re-registers. With the registrar unreachable the move shows its error and
+  the notice stays.
+- **Guard:** `WalletAppStateTest.anAddressOnTheOldWalletMovesOnlyOnAConfirmedMove`,
+  `SonarHandleAddressTests.testAnAddressOnTheOldWalletMovesOnlyOnAConfirmedMove`,
+  `HandleAddressTest`, `SonarHandleAddressTests.testHandleOfferActionMatrix`
+- **Origin:** #614 review (H3) — once a Cashu offer existed, the descriptor
+  publish re-claimed the public handle with it, retargeting its DNS record at
+  the mint with no confirmation, and nothing ever wrote the Breez offer back.
+
 ## Open questions (need a product decision, not a fix)
 
 - **Data usage (A24):** "Wi-Fi only" is stored but nothing reads it on either

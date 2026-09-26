@@ -8,6 +8,11 @@ import chat.bitchat.sonar.wallet.CashuWalletEngine
 import chat.bitchat.sonar.wallet.CashuWalletException
 import chat.bitchat.sonar.wallet.CoreWalletPrefs
 import chat.bitchat.sonar.wallet.FakeCashuNative
+import chat.bitchat.sonar.wallet.HandleAddressNotice
+import chat.bitchat.sonar.wallet.HandleAddressRecord
+import chat.bitchat.sonar.wallet.HandleAddressWallet
+import chat.bitchat.sonar.wallet.HandleMoveState
+import chat.bitchat.sonar.wallet.LegacyWalletPresence
 import chat.bitchat.sonar.wallet.LegacyBreezStore
 import chat.bitchat.sonar.wallet.LegacyBreezWallet
 import chat.bitchat.sonar.wallet.MapWalletPrefs
@@ -327,6 +332,116 @@ class WalletAppStateTest {
         assertEquals(SonarAnnounce.CAP_PAY, announce.capabilities and SonarAnnounce.CAP_PAY, "still payable")
         val packets = sonarAnnouncePackets(announce.encode())
         assertTrue(packets.isNotEmpty() && packets.all { it.size <= 512 }, "sizes ${packets.map { it.size }}")
+    }
+
+    /** The registrar as the app state reaches it, captured. */
+    private class Registrar {
+        val claims = CopyOnWriteArrayList<Pair<String, String?>>()
+        @Volatile var fail = false
+    }
+
+    /**
+     * A state whose account claimed `alice@…` (the core sidecar), with the
+     * registrar captured and the legacy presence pinned (the real presence
+     * opens Breez when this build carries a key).
+     */
+    private fun handleState(presence: LegacyWalletPresence, registrar: Registrar): SonarAppState {
+        val s = state()
+        s.handleClaimer = { name, offer ->
+            registrar.claims += name to offer
+            if (registrar.fail) throw IllegalStateException("registrar down")
+            "$name@sonarprivacy.xyz"
+        }
+        s.legacyPresenceForTest = presence
+        s.seedClaimedHandleForTest("alice@sonarprivacy.xyz")
+        return s
+    }
+
+    /**
+     * The reported scenario (PR #614 review, H3): an address claimed on the
+     * Breez wallet, which is still here. Publishing the Cashu offer — on
+     * setup, and again when the offer rotates — must NOT re-register the
+     * handle; the notice says where it pays; the confirmed Move registers
+     * the Cashu offer and records it for this account.
+     */
+    @Test
+    fun anAddressOnTheOldWalletMovesOnlyOnAConfirmedMove() = runBlocking {
+        val registrar = Registrar()
+        val s = handleState(LegacyWalletPresence.Present, registrar)
+        s.setupWallet()
+        waitUntil("offer published") { s.cashuOffer == "lno1fakeoffer" }
+        native.offer = "lno1rotatedoffer"
+        engine.onForeground() // re-reads the offer: the descriptor publish runs again
+        waitUntil("rotated offer published") { s.cashuOffer == "lno1rotatedoffer" }
+        delay(600)
+        assertEquals(
+            emptyList<Pair<String, String?>>(), registrar.claims.toList(),
+            "the handle must not be re-registered with the Cashu offer without consent",
+        )
+        assertEquals(HandleAddressNotice.PaysOldWallet("alice@sonarprivacy.xyz"), s.handleAddressNotice)
+        assertNull(s.handleAddressWallet)
+        assertFalse(s.canMoveHandleBackToOldWallet)
+
+        s.moveHandleToNewWallet()
+        waitUntil("the move registered") { s.handleAddressWallet == HandleAddressWallet.Cashu }
+        assertEquals(listOf<Pair<String, String?>>("alice" to "lno1rotatedoffer"), registrar.claims.toList())
+        assertEquals(HandleMoveState.Idle, s.handleMoveState)
+        assertEquals(HandleAddressNotice.None, s.handleAddressNotice)
+        assertTrue(s.canMoveHandleBackToOldWallet, "the old wallet is still here: offer the way back")
+        assertEquals(
+            HandleAddressRecord(HandleAddressWallet.Cashu, "lno1rotatedoffer"),
+            HandleAddressRecord.load(CoreWalletPrefs, cashuAccountId(nsec)),
+            "persisted per account, so the next launch neither asks again nor re-registers",
+        )
+
+        // From now on the handle follows the Cashu offer, once per offer.
+        native.offer = "lno1thirdoffer"
+        engine.onForeground()
+        waitUntil("the rotated offer registered") { registrar.claims.size == 2 }
+        assertEquals("alice" to "lno1thirdoffer", registrar.claims.last())
+    }
+
+    /**
+     * Positive control for the test above: with no old wallet here, the same
+     * descriptor publish DOES register the Cashu offer (nothing to move away
+     * from), so that test's silence is the decision, not a dead path.
+     */
+    @Test
+    fun withNoOldWalletTheDescriptorPublishRegistersTheCashuOffer() = runBlocking {
+        val registrar = Registrar()
+        val s = handleState(LegacyWalletPresence.Absent, registrar)
+        s.setupWallet()
+        waitUntil("re-registered") { s.handleAddressWallet == HandleAddressWallet.Cashu }
+        assertEquals(listOf<Pair<String, String?>>("alice" to "lno1fakeoffer"), registrar.claims.toList())
+        assertEquals(HandleAddressNotice.None, s.handleAddressNotice)
+    }
+
+    /** A failed Move leaves the address where it was, and says so. */
+    @Test
+    fun aFailedMoveLeavesTheAddressOnTheOldWallet() = runBlocking {
+        val registrar = Registrar().apply { fail = true }
+        val s = handleState(LegacyWalletPresence.Present, registrar)
+        s.setupWallet()
+        waitUntil("offer published") { s.cashuOffer == "lno1fakeoffer" }
+        s.moveHandleToNewWallet()
+        waitUntil("the move failed") { s.handleMoveState is HandleMoveState.Failed }
+        assertEquals(1, registrar.claims.size)
+        assertNull(s.handleAddressWallet)
+        assertEquals(HandleAddressNotice.PaysOldWallet("alice@sonarprivacy.xyz"), s.handleAddressNotice)
+    }
+
+    /** A failed automatic re-registration is surfaced and backed off, not retried silently. */
+    @Test
+    fun aFailedAutomaticUpdateIsSurfaced() = runBlocking {
+        val registrar = Registrar().apply { fail = true }
+        val s = handleState(LegacyWalletPresence.Absent, registrar)
+        s.setupWallet()
+        waitUntil("the failure is shown") {
+            s.handleAddressNotice == HandleAddressNotice.UpdateFailing("alice@sonarprivacy.xyz")
+        }
+        delay(300)
+        assertEquals(1, registrar.claims.size, "retried with backoff, not in a tight loop")
+        assertNull(s.handleAddressWallet)
     }
 
     @Test

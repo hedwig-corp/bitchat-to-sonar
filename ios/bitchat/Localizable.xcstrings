@@ -1,6 +1,54 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Your address %@ still pays your old wallet." : {
+
+    },
+    "Move to new wallet" : {
+
+    },
+    "Move your address to your new wallet?" : {
+
+    },
+    "Payments to %@ will go to your new wallet, held as ecash at mint.hedwig.sh. Your old wallet stays spendable. Deleting the new wallet does not move the address back." : {
+
+    },
+    "Move address" : {
+
+    },
+    "Moving…" : {
+
+    },
+    "Move back to your old wallet" : {
+
+    },
+    "Move your address back to your old wallet?" : {
+
+    },
+    "Payments to %@ will go to your old Lightning wallet again. Your ecash wallet keeps what it holds." : {
+
+    },
+    "Move back" : {
+
+    },
+    "Couldn't update your address %@. Retrying." : {
+
+    },
+    "Your new wallet isn't ready yet. Try again in a moment." : {
+
+    },
+    "Your old wallet isn't connected. Try again in a moment." : {
+
+    },
+    "Your address now pays your new wallet" : {
+
+    },
+    "Your address pays your old wallet again" : {
+
+    },
+    "Payments to this address go to your wallet at mint.hedwig.sh." : {
+
+    },
     "Unread" : {
 
     },

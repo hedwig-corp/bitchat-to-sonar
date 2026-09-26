@@ -139,9 +139,19 @@ struct SonarSettingsScreen: View {
                     if let custody = store.walletCustodyLine {
                         settingsNote(custody)
                     }
+                    // Which wallet the public address pays (only while there
+                    // is something to say: it still pays the old wallet, an
+                    // update is failing, or it can move back).
+                    if SNHandleAddressNotice.isVisible(store) {
+                        SNSettingsCard {
+                            SNHandleAddressNotice(store: store)
+                                .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                        }
+                        .padding(.bottom, 8)
+                    }
 
                     // Only while the legacy Breez wallet exists on this device.
-                    SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true })
+                    SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true }, showsAddressNotice: false)
 
                     SNSectionLabel("Privacy & safety")
                     SNSettingsCard {
