@@ -592,6 +592,22 @@ share a zone with the app and report the zone the app shared with it.
   notification (no transcript rebuild loop).
 - **Guard:** `client.rs::marking_an_already_read_conversation_does_not_notify` (#615)
 
+### QA-053 — Idle with other Sonar devices advertising nearby
+- **Platforms:** Android (iOS already scans on its own `bleQueue`)
+- **Steps:** boot a second emulator of your own with Sonar onboarded and
+  Bluetooth on (every emulator on a Mac shares one virtual BLE radio); leave
+  the app under test idle on Home with Bluetooth on for 60 s.
+- **Expect:** no "Sonar isn't responding"; main-thread CPU stays near idle
+  (`/proc/<pid>/task/<pid>/stat` utime+stime); the two devices still link
+  ("Mesh · 1 here now", logcat `Noise link ESTABLISHED`).
+- **Guard:** `MeshScanThrottleTest` (the throttle); the move off the main
+  looper is checked here, by hand.
+- **Origin:** #603 QA — `MeshRadio.onScanResult` ran UniFFI calls
+  (`isLinkedAddr`, `shouldDial`, `connect` under `txLock`) on the main looper
+  for every advertisement. With other agents' Sonar emulators around: repeated
+  ANRs and 23–26 % idle CPU on Home, the same on a `main` build. With one
+  advertiser, main-thread time went 68 → 32 ticks/60 s after the fix.
+
 ## Open questions (need a product decision, not a fix)
 
 - **Data usage (A24):** "Wi-Fi only" is stored but nothing reads it on either

@@ -54,6 +54,19 @@ actual object MeshRadio {
     // are spaced ≥ WATCHDOG_GAP_MS apart to stay under Android's "5 scan starts /
     // 30 s" throttle (which would otherwise silently stop the scan for 30 s).
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    // Scan results arrive on the MAIN looper (the platform gives startScan no
+    // executor). The work they drive crosses into the Rust mesh engine through
+    // UniFFI (dial election, link lookup, dial) and can wait on MeshGatt's
+    // txLock, so with many advertisers around it saturated the UI thread: ANRs
+    // and 23-26 % idle CPU on Home. The callback now only records the sighting
+    // and hands at most one pass per address per MESH_RESIGHT_MIN_INTERVAL_MS
+    // to this thread.
+    private val scanWorker: android.os.Handler by lazy {
+        val thread = android.os.HandlerThread("mesh-scan").apply { start() }
+        android.os.Handler(thread.looper)
+    }
+    /** Last full pass per address, touched only by the scan callback. */
+    private val lastScanWorkMs = ConcurrentHashMap<String, Long>()
     // Track callbacks separately from NEW (distinct-address) discoveries:
     // the Pixel 10 Pro's scanner goes "tunnel-blind" after a dial — it keeps
     // re-reporting the ONE address it locked onto while missing every other
@@ -239,6 +252,8 @@ actual object MeshRadio {
     actual fun stop() {
         scanning = false
         handler.removeCallbacks(scanWatchdog)
+        scanWorker.removeCallbacksAndMessages(null)
+        lastScanWorkMs.clear()
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
@@ -373,7 +388,9 @@ actual object MeshRadio {
         // shown. BLE MAC rotation turns one device into a stream of addresses;
         // exposing those produced "zombie" peers. Only VERIFIED announce peers
         // (stable bitchat peerID + signed nickname) are real users, like iOS.
-        for ((id, t) in lastSeen) if (now - t > STALE_MS) { seen.remove(id); lastSeen.remove(id) }
+        for ((id, t) in lastSeen) {
+            if (now - t > STALE_MS) { seen.remove(id); lastSeen.remove(id); lastScanWorkMs.remove(id) }
+        }
         // Keep a peer while it has a live Noise link (definitely present), or
         // within the grace window after we last heard from it.
         for ((id, t) in announcedSeen) {
@@ -460,55 +477,67 @@ actual object MeshRadio {
     actual fun connectedMeshPeerCount(): Int = MeshGatt.connectedPeerCount()
 
     private val scanCallback = object : ScanCallback() {
+        // Main thread: bookkeeping only. No FFI, no locks (see scanWorker).
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             scanResultCount++
-            lastScanCallbackMs = SystemClock.elapsedRealtime()
+            val nowElapsed = SystemClock.elapsedRealtime()
+            lastScanCallbackMs = nowElapsed
             val id = result.device.address
             if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) return
-            val name = runCatching { result.scanRecord?.deviceName }.getOrNull()
-                ?: ("mesh·" + id.takeLast(5).replace(":", ""))
-            val isNew = !seen.containsKey(id)
-            seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
-            lastSeen[id] = System.currentTimeMillis()
-            val peerNodeId = runCatching {
-                result.scanRecord?.getManufacturerSpecificData(NODE_ID_COMPANY)
-            }.getOrNull()
-            if (isNew) {
-                lastNewDiscoveryMs = SystemClock.elapsedRealtime()
-                // SOFT dialer election. Two Sonar-Android phones dialing each
-                // other at once race the controller (status 19), so the SMALLER
-                // node id dials immediately and the larger holds back — BUT only
-                // as a head start, not a veto: the larger ALSO dials after a short
-                // fallback delay. A strict "larger never dials" deadlocks whenever
-                // the smaller node's scanner is the weak one (e.g. Pixel 10 Pro,
-                // whose mesh scan goes tunnel-blind after a dial) — it never
-                // re-discovers the peer to dial it, and nobody else does either.
-                // The larger node's healthy scanner then carries the link; the
-                // peer's GATT server accepts inbound dials regardless of its own
-                // scanner. connect()'s dedup + cap + backoff bound the churn, and
-                // status 19 is cleaned up + retried like 133. A peer with NO node
-                // id (iOS / stock bitchat) is dialed immediately (iPhone compat).
-                val dialNow = peerNodeId == null || MeshGatt.shouldDial(peerNodeId)
-                android.util.Log.i(TAG, "discovered $id rssi=${result.rssi} nodeId=${peerNodeId != null} dialNow=$dialNow")
-                if (dialNow) {
-                    runCatching { MeshGatt.connect(result.device) }
-                } else {
-                    handler.postDelayed({ runCatching { MeshGatt.connect(result.device) } }, FALLBACK_DIAL_MS)
-                }
-            } else if (!MeshGatt.isLinkedAddr(id)) {
-                // RE-DIAL a known peer we have NO live link to. The first dial can
-                // fail (rotated RPA, status 133, iOS not yet ready), and on the
-                // Pixel 10 the scanner never re-fires `isNew` for that address —
-                // so without this branch a failed dial is never retried and the
-                // mesh link with iOS / a peer never recovers. connect()'s 30s
-                // backoff (recentDials) + MAX_CLIENTS cap throttle this; we just
-                // un-gate the *attempt* so re-sightings can drive recovery.
-                runCatching { MeshGatt.connect(result.device) }
-            }
+            if (seen.containsKey(id)) lastSeen[id] = System.currentTimeMillis()
+            if (!shouldProcessMeshSighting(lastScanWorkMs[id], nowElapsed)) return
+            lastScanWorkMs[id] = nowElapsed
+            scanWorker.post { processScanResult(result) }
         }
 
         override fun onScanFailed(errorCode: Int) {
             android.util.Log.e(TAG, "scan failed: $errorCode")
+        }
+    }
+
+    /** A full pass over one sighting, on [scanWorker]. */
+    private fun processScanResult(result: ScanResult) {
+        if (!scanning) return
+        val id = result.device.address
+        val name = runCatching { result.scanRecord?.deviceName }.getOrNull()
+            ?: ("mesh·" + id.takeLast(5).replace(":", ""))
+        val isNew = !seen.containsKey(id)
+        seen[id] = MeshPeer(id = id, name = name, rssi = result.rssi)
+        lastSeen[id] = System.currentTimeMillis()
+        val peerNodeId = runCatching {
+            result.scanRecord?.getManufacturerSpecificData(NODE_ID_COMPANY)
+        }.getOrNull()
+        if (isNew) {
+            lastNewDiscoveryMs = SystemClock.elapsedRealtime()
+            // SOFT dialer election. Two Sonar-Android phones dialing each
+            // other at once race the controller (status 19), so the SMALLER
+            // node id dials immediately and the larger holds back — BUT only
+            // as a head start, not a veto: the larger ALSO dials after a short
+            // fallback delay. A strict "larger never dials" deadlocks whenever
+            // the smaller node's scanner is the weak one (e.g. Pixel 10 Pro,
+            // whose mesh scan goes tunnel-blind after a dial) — it never
+            // re-discovers the peer to dial it, and nobody else does either.
+            // The larger node's healthy scanner then carries the link; the
+            // peer's GATT server accepts inbound dials regardless of its own
+            // scanner. connect()'s dedup + cap + backoff bound the churn, and
+            // status 19 is cleaned up + retried like 133. A peer with NO node
+            // id (iOS / stock bitchat) is dialed immediately (iPhone compat).
+            val dialNow = peerNodeId == null || MeshGatt.shouldDial(peerNodeId)
+            android.util.Log.i(TAG, "discovered $id rssi=${result.rssi} nodeId=${peerNodeId != null} dialNow=$dialNow")
+            if (dialNow) {
+                runCatching { MeshGatt.connect(result.device) }
+            } else {
+                scanWorker.postDelayed({ runCatching { MeshGatt.connect(result.device) } }, FALLBACK_DIAL_MS)
+            }
+        } else if (!MeshGatt.isLinkedAddr(id)) {
+            // RE-DIAL a known peer we have NO live link to. The first dial can
+            // fail (rotated RPA, status 133, iOS not yet ready), and on the
+            // Pixel 10 the scanner never re-fires `isNew` for that address —
+            // so without this branch a failed dial is never retried and the
+            // mesh link with iOS / a peer never recovers. connect()'s 30s
+            // backoff (recentDials) + MAX_CLIENTS cap throttle this; we just
+            // un-gate the *attempt* so re-sightings can drive recovery.
+            runCatching { MeshGatt.connect(result.device) }
         }
     }
 
