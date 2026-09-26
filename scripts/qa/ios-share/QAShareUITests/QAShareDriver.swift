@@ -18,6 +18,8 @@ import XCTest
 ///   sheet:<target>          tap <target> ("Sonar") in the open share sheet
 ///   handoff:<inbox>#<n>     wait for n committed payloads, then open Sonar as
 ///                           a user would (the extension cannot open it)
+///   staged:<inbox>#<n>      wait for n committed payloads, open nothing
+///   terminate[@app]
 ///   tap:<label> | tapc:<substring> | tapid:<id> | longpress:<substring>
 ///   tapif:<label>           tap only if it shows up within 5 s (e.g. tapif@sb:Allow)
 ///   expect:<substring>[@secs] | absent:<substring>[@secs] | count:<substring>[=n]
@@ -94,6 +96,22 @@ final class QAShareDriver: XCTestCase {
             current = appName
         case "handoff":
             try handOff(arg)
+        case "staged":
+            // staged:<inbox>#<n> — wait for n committed payloads, touch nothing
+            // (Sonar is not running; the next step launches it cold).
+            let parts = arg.split(separator: "#").map(String.init)
+            let want = parts.count > 1 ? Int(parts[1]) ?? 1 : 1
+            let deadline = Date().addingTimeInterval(60)
+            while committedPayloads(in: URL(fileURLWithPath: parts[0])) < want {
+                guard Date() < deadline else {
+                    return try fail("staged: no committed payload after 60 s", app)
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            Thread.sleep(forTimeInterval: 3) // let the extension finish and dismiss
+            log.append("staged: \(want) payload(s) committed")
+        case "terminate":
+            app.terminate()
         case "waitfg":
             // Wait for the app to come forward ON ITS OWN — after a share, the
             // extension opens Sonar. Activating it from here instead raced the
@@ -293,7 +311,10 @@ final class QAShareDriver: XCTestCase {
         _ = tapIfPresent(photos.buttons["Continue"], timeout: 4)
         let grid = photos.images.matching(identifier: "PXGGridLayout-Info")
         guard grid.firstMatch.waitForExistence(timeout: 15) else { return try fail("no photo", photos) }
-        grid.element(boundBy: grid.count - 1).tap()
+        // Tap by coordinate: Photos' grid images report "not hittable" now and
+        // then even when on screen (occlusion is judged from a11y frames).
+        grid.element(boundBy: grid.count - 1)
+            .coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         try element(in: photos, label: "Share", contains: false).tap()
     }
 

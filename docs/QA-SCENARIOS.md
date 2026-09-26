@@ -135,7 +135,7 @@ share extensions, so the extension says "Open Sonar to send" and the user
 switches to Sonar, whose "Send to…" picker sends it. Android receives
 `ACTION_SEND` directly.
 
-`scripts/qa/ios-share-smoke.sh` drives all of it on the iOS simulator: the real
+`scripts/qa/ios-share-smoke.sh` (QA-080…092) drives all of it on the iOS simulator: the real
 system share sheet, from the Files app and from a stand-in third-party app
 (`scripts/qa/ios-share/QAShareHost`, a `UIActivityViewController` over file
 URLs), picks the chat with a fresh `sonar-cli` peer and asserts on **what the
@@ -251,6 +251,18 @@ CSV arriving as `application/octet-stream` named `report.csv` is correct.
 - **Steps:** Files → `notes.txt` → Share → Sonar → chat.
 - **Expect:** `notes.txt`, `text/plain`, bytes identical, no text message.
 - **How:** `ios-share-smoke.sh` QA-091
+
+### QA-092 — Sharing while Sonar is not running
+- **Platforms:** iOS (automated); Android receives `ACTION_SEND` by launching
+  the activity, so the equivalent is covered by any Android share
+- **Steps:** Sonar terminated; host shares `cold.csv` → Sonar (extension says
+  "Open Sonar to send") → launch Sonar → tap the chat as soon as the picker
+  shows (the store and relays are still starting).
+- **Expect:** the picker comes up from the staged payload on the cold launch;
+  the peer receives `cold.csv`, bytes identical.
+- **How:** `ios-share-smoke.sh` QA-092
+- **Origin:** QA pass on #559 — the most common real flow (the app is rarely
+  running when a share starts); every other scenario had Sonar running.
 
 ## Notifications and lifecycle
 
