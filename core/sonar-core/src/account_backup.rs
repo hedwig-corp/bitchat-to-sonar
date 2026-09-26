@@ -939,6 +939,7 @@ pub fn write_account_backup_package(db_path: &Path, package: &AccountBackupPacka
     }
     // Remove prior sidecars so a partial restore cannot mix WAL from another key.
     remove_db_tree(db_path);
+    crate::reaction::remove_reaction_store_files(db_path);
     fs::write(db_path, &package.db_bytes).map_err(|e| Error::Storage(format!("write db: {e}")))?;
     if let Some(index) = &package.index_bytes {
         let index_path = index_db_path_for_db(db_path);
@@ -993,6 +994,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
         // clear below makes every later call take the no-intent path.
         if restore_intent_path(db_path).is_file() {
             drop_outgoing_key_package_slot(db_path);
+            crate::reaction::remove_reaction_store_files(db_path);
             // Under the same gate: without a restore in flight, a leftover
             // staged policy is debris, and adopting it would tell a healthy
             // install it holds a backup that never replaced it.
@@ -1022,6 +1024,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     // while the relays still carry the first: one install, two coordinates,
     // which is the narrower form of the bug this cleanup exists to prevent.
     drop_outgoing_key_package_slot(db_path);
+    crate::reaction::remove_reaction_store_files(db_path);
     promote_staged_index_best_effort(db_path);
     promote_staged_backup_policy_best_effort(db_path);
     // Drop leftover staging DB sidecars (index may remain if rename failed).
