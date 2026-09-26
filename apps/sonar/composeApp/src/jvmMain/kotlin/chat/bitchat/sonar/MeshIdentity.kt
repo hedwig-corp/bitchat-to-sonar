@@ -68,6 +68,17 @@ object MeshIdentity {
         peerIdCache = null
     }
 
+    /**
+     * Run as [keypair]/[seedHex] without touching any keystore. For protocol
+     * tests that need an identity, not its storage: on a runner with no OS
+     * keyring the mint path rightly refuses (see [requireTrustworthyAbsence]).
+     */
+    internal fun useIdentityForTest(keypair: NoiseKeypairHex, seedHex: String) {
+        keypairCache = keypair
+        seedCache = seedHex
+        peerIdCache = null
+    }
+
     private val keypair: NoiseKeypairHex
         get() = keypairCache ?: loadOrCreateKeypair().also { keypairCache = it }
 
