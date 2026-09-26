@@ -127,6 +127,90 @@ is the build under test on a dedicated QA emulator/simulator.
   Compose `VideoPrivacyTest`, `VideoPrivacyFixtureTest`
 - **Origin:** #615 (iOS) and its review (Compose parity, fail-closed)
 
+## MDK 0.8 → 0.9.14 upgrade (#613)
+
+Build history on an MDK 0.8 install, then replace it **in place** with the
+0.9.14 build — never uninstall. Needs two apps and two CLIs: build `main`
+(pre-#613, 0.8) from a second checkout (`git worktree add --detach <dir>
+<pre-613 commit>`) for both the app and `sonar-cli`, and this branch for the
+0.9 ones. `scripts/qa/mdk-upgrade.sh` drives the peers (`peer <name> 08|09`,
+`seed`, `upgrade-peer`, `send`/`expect`, `store`). iOS runs headless
+(`SIMCTL_CHILD_SONAR_BENCH_NSEC`, same nsec before and after — the bench path
+derives the DB key from it); Android through `android-ui.sh`. Seed at least one
+chat above 80 messages (the first-paint extract window) and one image.
+
+### QA-070 — In-place upgrade keeps every chat
+- **Platforms:** iOS (headless), Android (UI)
+- **Steps:** 0.8 app with ≥ 3 DMs from 0.8 peers (one > 80 msgs, one image) and
+  a 3+ member room; install the 0.9.14 build in place; launch; wait 30 s.
+- **Expect:** first paint shows the same rows, previews and unread dots
+  (`SONAR_BENCH t1_local_paint groups=N`), and they are still there after relay
+  attach (`t4_first_drain`, `home_rows … rows=N`); `mdk-upgrade.sh store` lists
+  `*.mdk08.bak`, `.sonar-transcript.json` and the historical sidecars; sync
+  resumes from its watermark (`sync() called … since_secs=` ≠ 0); no
+  "Group chat · invite" row appears.
+- **Guard:** `persistence.rs::boot_reconcile_keeps_recovered_08_history_and_live_sidecars`
+- **Origin:** i2 (#613) — boot reconcile deleted every live sidecar on each
+  store open: all recovered chats vanished ~1 s after launch, the bak and the
+  transcript were gone, sync restarted from 0 and re-parked old 0.8 welcomes.
+
+### QA-071 — Older recovered history pages in
+- **Platforms:** Android (UI), iOS (sidecar check: `.sonar-transcript.json`
+  holds every row after an idle minute)
+- **Steps:** open the > 80-message recovered chat; scroll to the top.
+- **Expect:** reaches message 1, including the rows only in the bak.
+- **Guard:** `TranscriptDisplayPolicyTest.exhaustedSourceDoesNotDemandAnotherExpansion`
+- **Origin:** A1 (#613) — every Compose chat stopped after one older page.
+  Also stops after the second page **and on main** (tracked separately, see
+  Open questions) — run it on a chat that fits in two pages until that lands.
+
+### QA-072 — Send in a recovered chat once the peer updated
+- **Platforms:** Android (UI); iOS covered by core e2e (no headless send)
+- **Steps:** `mdk-upgrade.sh upgrade-peer <peer>`; send from the recovered row.
+- **Expect:** "Sent · internet"; the peer's 0.9 CLI receives it; one row on
+  Home; the new message sits under the recovered history.
+- **Guard:** `e2e.rs::recovered_08_chat_resumes_on_a_new_09_group_through_a_relay`
+
+### QA-073 — Peer still on 0.8
+- **Platforms:** Android (UI)
+- **Steps:** send in the recovered chat of a peer who has not upgraded.
+- **Expect:** "Waiting for them to update Sonar" banner; no second row; no
+  wipe. (The peer's own 0.8 sends never arrive — flag-day by design.)
+- **Guard:** `e2e.rs::recovered_08_resume_with_a_peer_still_on_08_waits_for_their_update`
+- **Origin:** A2 (#613) — the peer's 0.8 KeyPackage reached MDK 0.9 and the
+  send failed with an opaque error and "Couldn't send".
+
+### QA-074 — Upgraded peer messages first
+- **Platforms:** iOS (headless), Android
+- **Steps:** `upgrade-peer <peer>`; the peer sends to the app.
+- **Expect:** the 0.9 DM auto-joins and folds onto the recovered row — still
+  one row, now previewing the new message; `.sonar-historical-folds.json` maps
+  hist → live; unchanged after a cold restart. Several contacts resuming within
+  10 minutes all fold (the unknown-sender budget does not apply to them).
+- **Guard:** `persistence.rs::recovered_08_contact_resume_welcome_bypasses_the_stranger_budget`
+- **Origin:** i3 (#613) — recovered contacts counted as strangers.
+
+### QA-075 — A recovered room stays a room
+- **Platforms:** Android (UI)
+- **Steps:** send in a recovered 3+ member room with one member upgraded.
+- **Expect:** title and "only group members" banner kept; the upgraded member
+  receives it in a group with the same name; no fold onto a 1:1.
+- **Guard:** `e2e.rs::recovered_08_pending_room_send_creates_named_group_not_dm` (R-050)
+
+### QA-076 — Chat history is sealed at rest
+- **Platforms:** both (file check on the simulator App Group / `run-as`)
+- **Steps:** after QA-070/074, `grep` a message body in the store directory.
+- **Expect:** no match in `.sonar-transcript.json` / `.sonar-transcript.log`.
+- **Guard:** `marmot.rs::transcript_rows_are_sealed_at_rest_and_survive_reopen`
+- **Origin:** P1 (#613) — the 0.9 transcript was plaintext JSON and rewritten
+  whole per message (17 ms at 10k rows).
+
+### QA-077 — The checked-in Swift binding matches the core
+- **Platforms:** iOS (CI: *Checked-in SonarFFI.swift matches the core*)
+- **Expect:** `core/build-ios.sh` leaves `git status` clean.
+- **Origin:** i1 (#613) — edited `///` doc comments moved two UniFFI checksums;
+  a build from the committed binding would fatalError at launch.
+
 ## Notifications and lifecycle
 
 ### QA-020 — Background receive
@@ -235,6 +319,17 @@ is the build under test on a dedicated QA emulator/simulator.
 - **Expect:** re-marking an already-read conversation emits no change
   notification (no transcript rebuild loop).
 - **Guard:** `client.rs::marking_an_already_read_conversation_does_not_notify` (#615)
+
+## Known gaps found by passes (tracked, not fixed here)
+
+- **Compose load-older stops early (main too):** a chat opened at its unread
+  anchor never loads older rows, and a read chat stops after the second older
+  page (`firstVisibleItemIndex <= 2` never re-arms after a prepend). Seen on the
+  `main` build in the #613 pass; not caused by #613.
+- **Mesh realtime loop saturates the UI thread (main too):** with other BLE
+  mesh peers in range (other agents' emulators) `startMeshRealtimeLoop` ran on
+  the main dispatcher long enough to ANR the app. Turn Bluetooth off on a QA
+  emulator that shares a host with other emulators.
 
 ## Open questions (need a product decision, not a fix)
 
