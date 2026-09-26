@@ -52,11 +52,24 @@ use crate::sticker_cache::{
     wipe_sticker_cache_for_db, StickerCache, MAX_STICKER_CACHE_BYTES,
     STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
 };
+use crate::timezone::CachedPeerTimezone;
 use crate::{Error, Result};
 
 /// Blossom user-server-list event kind (BUD-03): the user's preferred blob
 /// servers, newest first.
 const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
+
+/// A single timezone-change pass is intentionally bounded. Current Marmot
+/// group counts are far below this, but the defensive cap keeps corrupt local
+/// membership state from creating an unbounded MLS fan-out.
+const MAX_TIMEZONE_SHARE_GROUPS: usize = 256;
+/// Accept modest clock skew, but never let a peer pin its cached timezone with
+/// an arbitrarily far-future rumor timestamp.
+const TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
+
+fn bounded_timezone_share_timestamp(reported_at: u64, now: u64) -> u64 {
+    reported_at.min(now.saturating_add(TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS))
+}
 
 /// Fallback Blossom server when the user has published no kind-10063 list.
 /// Hedwig Blossom (`push.sonar.hedwig.sh`) accepts Marmot ciphertext as
@@ -1753,6 +1766,36 @@ impl Drop for FrozenWakeGuard<'_> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimezoneShareDedupe {
+    zone: String,
+    /// MLS epoch the share was encrypted at. Any commit (add, remove, swap)
+    /// moves it, and members who joined after it cannot decrypt the rumor, so
+    /// a new epoch means the group needs the zone again. A member count missed
+    /// a swap: one leaves, one joins, same count, and the newcomer never got it.
+    epoch: u64,
+}
+
+/// Hydrate the sent-share dedupe from the encrypted index so a process start
+/// (or an iOS store reopen) does not re-encrypt a kind-449 into every group.
+fn load_timezone_shares_sent(
+    index: &Option<Arc<Mutex<ConversationIndex>>>,
+) -> HashMap<String, TimezoneShareDedupe> {
+    let Some(index) = index else {
+        return HashMap::new();
+    };
+    match index.lock().unwrap().timezone_shares_sent() {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(group, zone, epoch)| (group, TimezoneShareDedupe { zone, epoch }))
+            .collect(),
+        Err(err) => {
+            tracing::warn!(%err, "timezone sent-share dedupe unreadable; next pass reshares");
+            HashMap::new()
+        }
+    }
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
@@ -1846,6 +1889,22 @@ pub struct SonarClient {
     allow_geo_relays: bool,
     /// Persistent conversation-summary index (None for in-memory sessions).
     conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
+    /// The host-reported current system IANA timezone. It is process-local
+    /// and only set while Share local time is enabled; hosts report the
+    /// phone's IANA id and clear this on disable so membership changes
+    /// cannot keep publishing.
+    local_timezone: Arc<Mutex<Option<String>>>,
+    /// Per-group record of the zone we last shared and its MLS epoch, written
+    /// through to the conversation index so it survives restarts. Entries are
+    /// installed before an MLS share and removed on failure so the next
+    /// trigger retries. v1 sends no revoke, so an entry is what that group's
+    /// members still hold for us: it is kept when the group leaves the
+    /// allowlist or sharing is turned off, and only a new zone or a new epoch
+    /// shares again.
+    timezone_shared_with: Arc<Mutex<HashMap<String, TimezoneShareDedupe>>>,
+    /// MLS group ids the host currently wants to receive our timezone.
+    /// Empty means share with nobody, even if `local_timezone` is set.
+    timezone_share_group_ids: Arc<Mutex<HashSet<String>>>,
     /// Host-registered callback fired when a conversation summary changes.
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
     /// In-memory store for invite link secrets and pending join requests.
@@ -1973,6 +2032,7 @@ impl SonarClient {
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
+        let index = Arc::new(Mutex::new(ConversationIndex::open_in_memory()?));
         Self::with_engine(
             identity,
             relays,
@@ -1984,7 +2044,7 @@ impl SonarClient {
             None,
             None,
             StickerCache::disabled(),
-            None,
+            Some(index),
         )
         .await
     }
@@ -2368,6 +2428,8 @@ impl SonarClient {
         )));
         let media_upload_inflight = Arc::new(Mutex::new(HashSet::new()));
         let media_upload_cancel_all = Arc::new(AtomicBool::new(false));
+        let timezone_shared_with =
+            Arc::new(Mutex::new(load_timezone_shares_sent(&conversation_index)));
         let client = Self {
             engine,
             nostr,
@@ -2402,6 +2464,9 @@ impl SonarClient {
             last_ensure_subscriptions_at,
             allow_geo_relays,
             conversation_index,
+            local_timezone: Arc::new(Mutex::new(None)),
+            timezone_shared_with,
+            timezone_share_group_ids: Arc::new(Mutex::new(HashSet::new())),
             change_listener: Arc::new(Mutex::new(None)),
             invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
                 invite_link_state_path,
@@ -3134,6 +3199,7 @@ impl SonarClient {
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
         }
+        self.share_local_timezone_with_groups().await;
         Ok(group_id)
     }
 
@@ -3189,6 +3255,7 @@ impl SonarClient {
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after membership update");
         }
+        self.share_local_timezone_with_groups().await;
         Ok(())
     }
 
@@ -3472,6 +3539,7 @@ impl SonarClient {
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
+        self.share_local_timezone_with_groups().await;
         Ok(group_id)
     }
 
@@ -6767,6 +6835,32 @@ impl SonarClient {
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
+                Ok(Incoming::TimezoneShare {
+                    group_id,
+                    sender,
+                    content,
+                    created_at,
+                }) => {
+                    let now = Timestamp::now().as_secs();
+                    let received_at = bounded_timezone_share_timestamp(created_at.as_secs(), now);
+                    match self.handle_timezone_share(&sender, &content, received_at, &group_id) {
+                        Ok(changed) => {
+                            changed_groups.extend(changed);
+                            self.mark_sync_event_processed(&event.id);
+                            report.record_processed();
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                %err,
+                                event_id = %event.id,
+                                event_created_at = event.created_at.as_secs(),
+                                context,
+                                "timezone share cache write needs retry"
+                            );
+                            report.record_retryable(event.created_at.as_secs());
+                        }
+                    }
+                }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(incoming);
                     if let Some(sticker_ref) = &message.sticker_ref {
@@ -6832,7 +6926,13 @@ impl SonarClient {
                 }
             }
         }
+        let membership_may_have_changed = !changed_groups.is_empty();
         self.notify_conversations_changed(&changed_groups);
+        if membership_may_have_changed {
+            // Recipient dedupe makes this a no-op for ordinary message-only
+            // changes, while a received welcome/commit shares with new peers.
+            self.share_local_timezone_with_groups().await;
+        }
         // Signal-style receive-time warming: sticker attachments referenced by
         // freshly processed messages download in the background now, so opening
         // the chat later paints them from the local disk cache instead of doing
@@ -7108,6 +7208,212 @@ impl SonarClient {
                 Ok(true) => self.notify_conversation_changed(group_id_hex),
                 Ok(false) => {}
                 Err(e) => tracing::warn!(%e, "index mark_read failed"),
+            }
+        }
+    }
+
+    /// Update this device's current system IANA timezone and schedule a
+    /// private MLS share to every active Marmot group. The host calls this
+    /// only after the user enables Share local time, and again on OS
+    /// timezone-change notifications. An empty `zone` clears the process
+    /// cache so later membership changes cannot keep publishing; the
+    /// sent-share record stays, because peers keep the zone they last got.
+    /// Publication uses the same kind-445 outbox as chat and never blocks
+    /// chat paint.
+    pub async fn update_local_timezone(&self, zone: &str) -> Result<()> {
+        if zone.trim().is_empty() {
+            *self.local_timezone.lock().unwrap() = None;
+            return Ok(());
+        }
+        let payload = crate::timezone::encode_timezone_share_payload(zone)?;
+        let normalized = crate::timezone::parse_timezone_share_payload(&payload)
+            .expect("freshly encoded timezone payload must parse");
+        *self.local_timezone.lock().unwrap() = Some(normalized);
+        self.share_local_timezone_with_groups().await;
+        Ok(())
+    }
+
+    /// Replace the set of MLS groups that may receive this device's timezone.
+    /// An empty list shares with nobody. Dropping a group keeps its sent-share
+    /// record: hosts pass a transient empty list before their chat list loads,
+    /// and a re-enable in the same zone and epoch has nothing new to send.
+    pub async fn set_timezone_share_groups(&self, group_id_hexes: Vec<String>) {
+        let next: HashSet<String> = group_id_hexes
+            .into_iter()
+            .map(|id| id.trim().to_ascii_lowercase())
+            .filter(|id| !id.is_empty())
+            .collect();
+        *self.timezone_share_group_ids.lock().unwrap() = next;
+        self.share_local_timezone_with_groups().await;
+    }
+
+    /// Batch local-only cache lookup for visible DM/group members.
+    pub fn peer_timezones(&self, peers: &[PublicKey]) -> Vec<(PublicKey, CachedPeerTimezone)> {
+        let Some(ref idx) = self.conversation_index else {
+            return Vec::new();
+        };
+        let idx = idx.lock().unwrap();
+        peers
+            .iter()
+            .filter_map(|peer| {
+                idx.peer_timezone(&peer.to_hex())
+                    .ok()
+                    .flatten()
+                    .map(|cached| (*peer, cached))
+            })
+            .collect()
+    }
+
+    /// Cache a validated peer-authored timezone only when the sender currently
+    /// belongs to the MLS group this rumor arrived on. Returns the affected
+    /// MLS group id for local UI invalidation.
+    fn handle_timezone_share(
+        &self,
+        sender: &PublicKey,
+        content: &str,
+        updated_at_secs: u64,
+        group_id: &GroupId,
+    ) -> Result<Vec<String>> {
+        let Some(zone) = crate::timezone::parse_timezone_share_payload(content) else {
+            tracing::debug!("ignoring malformed or unsupported timezone share");
+            return Ok(Vec::new());
+        };
+
+        let members = self.engine.members(group_id)?;
+        if !members.contains(sender) {
+            tracing::debug!("ignoring timezone share from non-member");
+            return Ok(Vec::new());
+        }
+        let group_id_hex = hex::encode(group_id.as_slice());
+
+        let Some(ref idx) = self.conversation_index else {
+            return Ok(Vec::new());
+        };
+        let changed =
+            idx.lock()
+                .unwrap()
+                .upsert_peer_timezone(&sender.to_hex(), &zone, updated_at_secs)?;
+        if changed {
+            tracing::info!("cached private timezone from group member");
+            Ok(vec![group_id_hex])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Encrypt at most one kind-449 rumor per active MLS group and publish
+    /// through the chat outbox. Per-group dedupe suppresses ordinary
+    /// sync/message triggers; failed creates stay eligible for retry.
+    async fn share_local_timezone_with_groups(&self) {
+        let Some(zone) = self.local_timezone.lock().unwrap().clone() else {
+            return;
+        };
+        let payload = match crate::timezone::encode_timezone_share_payload(&zone) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::debug!(%err, "local timezone became invalid before share");
+                return;
+            }
+        };
+        let groups = match self.engine.groups() {
+            Ok(groups) => groups,
+            Err(err) => {
+                tracing::debug!(%err, "timezone share group list failed");
+                return;
+            }
+        };
+        let allow = self.timezone_share_group_ids.lock().unwrap().clone();
+        if allow.is_empty() {
+            return;
+        }
+        let mut groups: Vec<_> = groups
+            .into_iter()
+            .filter(|group| allow.contains(&hex::encode(group.mls_group_id.as_slice())))
+            .collect();
+        if groups.len() > MAX_TIMEZONE_SHARE_GROUPS {
+            tracing::warn!(
+                groups = groups.len(),
+                cap = MAX_TIMEZONE_SHARE_GROUPS,
+                "timezone share group cap reached"
+            );
+            groups.truncate(MAX_TIMEZONE_SHARE_GROUPS);
+        }
+
+        for group in groups {
+            let group_id = group.mls_group_id;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            let wanted = TimezoneShareDedupe {
+                zone: zone.clone(),
+                epoch: group.epoch,
+            };
+            {
+                let mut shared = self.timezone_shared_with.lock().unwrap();
+                if shared.get(&group_id_hex) == Some(&wanted) {
+                    continue;
+                }
+                shared.insert(group_id_hex.clone(), wanted.clone());
+            }
+            if let Some(ref idx) = self.conversation_index {
+                if let Err(err) = idx.lock().unwrap().record_timezone_share_sent(
+                    &group_id_hex,
+                    &wanted.zone,
+                    wanted.epoch,
+                ) {
+                    // Not fatal: the in-memory record still dedupes this
+                    // process; the next start reshares once.
+                    tracing::debug!(%err, "timezone sent-share record not persisted");
+                }
+            }
+            let (event, incoming) = {
+                let _epoch = self.membership_gate.read().await;
+                match self
+                    .engine
+                    .create_and_process_timezone_share(&group_id, &payload)
+                {
+                    Ok(created) => created,
+                    Err(err) => {
+                        self.remove_failed_timezone_share(&group_id_hex, &zone);
+                        tracing::debug!(%err, "timezone MLS share failed");
+                        continue;
+                    }
+                }
+            };
+            match incoming {
+                Incoming::TimezoneShare { .. } => {}
+                other => {
+                    self.remove_failed_timezone_share(&group_id_hex, &zone);
+                    tracing::debug!(
+                        ?other,
+                        "created timezone share did not persist as a kind-449 rumor"
+                    );
+                    continue;
+                }
+            }
+            // Durable before publish: if every relay is down, reconnect
+            // retry_outbox can still send this control event. Skipping this
+            // leaves timezone_shared_with claiming success and suppresses
+            // later attempts until the zone or membership changes.
+            if let Err(err) = self.outbox_state.lock().unwrap().mark_pending(
+                group_id_hex.clone(),
+                event.id.to_hex(),
+                event.id.to_hex(),
+                event.as_json(),
+                Timestamp::now().as_secs(),
+            ) {
+                self.remove_failed_timezone_share(&group_id_hex, &zone);
+                tracing::debug!(%err, "timezone share outbox persist failed");
+                continue;
+            }
+            let _publish_ack = self.spawn_outbox_publish(event.id.to_hex(), group_id_hex, event);
+        }
+    }
+
+    fn remove_failed_timezone_share(&self, group_id_hex: &str, zone: &str) {
+        let mut shared = self.timezone_shared_with.lock().unwrap();
+        if shared.get(group_id_hex).map(|r| r.zone.as_str()) == Some(zone) {
+            shared.remove(group_id_hex);
+            if let Some(ref idx) = self.conversation_index {
+                let _ = idx.lock().unwrap().forget_timezone_share_sent(group_id_hex);
             }
         }
     }
@@ -10287,6 +10593,371 @@ mod tests {
             vec![expected],
             "welcome must notify the conversation listener exactly once for the new group"
         );
+    }
+
+    #[tokio::test]
+    async fn timezone_control_share_is_cached_and_never_enters_transcript() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let (bob_pubkey, welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(member, _)| *member == bob.identity().public_key())
+            .unwrap();
+        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+        bob.process_marmot_events([welcome], "timezone test welcome")
+            .await;
+        alice.merge_pending_commit(&group_id).unwrap();
+
+        let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
+        let (event, incoming) = alice
+            .create_and_process_timezone_share(&group_id, &payload)
+            .unwrap();
+        assert_eq!(event.kind, Kind::MlsGroupMessage);
+        assert!(matches!(incoming, Incoming::TimezoneShare { .. }));
+        let (report, notifications) = bob.process_marmot_events([event], "timezone control").await;
+
+        assert_eq!(report.processed, 1);
+        assert!(notifications.is_empty());
+        assert!(bob.messages(&group_id).unwrap().is_empty());
+        let cached = bob.peer_timezones(&[alice.identity().public_key()]);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].1.zone, "Europe/Zurich");
+        assert!(cached[0].1.updated_at_secs > 0);
+    }
+
+    #[tokio::test]
+    async fn timezone_share_future_timestamp_is_capped() {
+        let now = 1_000;
+        assert_eq!(bounded_timezone_share_timestamp(900, now), 900);
+        assert_eq!(
+            bounded_timezone_share_timestamp(u64::MAX, now),
+            now + TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_from_non_member_is_ignored() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let outsider = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let (bob_pubkey, welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(member, _)| *member == bob.identity().public_key())
+            .unwrap();
+        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+        bob.process_marmot_events([welcome], "timezone test welcome")
+            .await;
+
+        let payload = crate::timezone::encode_timezone_share_payload("Asia/Kolkata").unwrap();
+        let changed = bob
+            .handle_timezone_share(
+                &outsider.identity().public_key(),
+                &payload,
+                1_000,
+                &group_id,
+            )
+            .unwrap();
+        assert!(changed.is_empty());
+        assert!(bob
+            .peer_timezones(&[outsider.identity().public_key()])
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_timezone_update_validates_and_replaces_process_cache() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts");
+
+        client
+            .update_local_timezone("America/New_York")
+            .await
+            .unwrap();
+        assert_eq!(
+            client.local_timezone.lock().unwrap().as_deref(),
+            Some("America/New_York")
+        );
+        assert!(client
+            .update_local_timezone("not a timezone")
+            .await
+            .is_err());
+        assert_eq!(
+            client.local_timezone.lock().unwrap().as_deref(),
+            Some("America/New_York")
+        );
+
+        client.update_local_timezone("").await.unwrap();
+        assert!(client.local_timezone.lock().unwrap().is_none());
+        assert!(client.timezone_shared_with.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn timezone_share_only_publishes_to_allowlisted_groups() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .engine
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id_hex = hex::encode(creation.group.mls_group_id.as_slice());
+
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert!(
+            alice.timezone_shared_with.lock().unwrap().is_empty(),
+            "no allowlist means no MLS timezone fan-out"
+        );
+
+        alice
+            .set_timezone_share_groups(vec![group_id_hex.clone()])
+            .await;
+        assert_eq!(
+            alice
+                .timezone_shared_with
+                .lock()
+                .unwrap()
+                .get(&group_id_hex)
+                .map(|r| r.zone.as_str()),
+            Some("Europe/Zurich")
+        );
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            1,
+            "kind-449 must be in the durable outbox before publish so offline retries can find it"
+        );
+
+        alice
+            .set_timezone_share_groups(vec![group_id_hex.clone()])
+            .await;
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            1,
+            "same zone and membership must not encrypt a second rumor"
+        );
+
+        alice
+            .timezone_shared_with
+            .lock()
+            .unwrap()
+            .get_mut(&group_id_hex)
+            .unwrap()
+            .epoch += 1;
+        alice
+            .set_timezone_share_groups(vec![group_id_hex.clone()])
+            .await;
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            2,
+            "an epoch change must resend so a new member can decrypt"
+        );
+
+        // Leaving the allowlist keeps the record: the group still holds this
+        // zone (no revoke in v1), so coming back in the same zone sends nothing.
+        alice.set_timezone_share_groups(Vec::new()).await;
+        alice
+            .set_timezone_share_groups(vec![group_id_hex.clone()])
+            .await;
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn timezone_share_is_not_repeated_after_restart() {
+        // A1/i2 (#607 QA): the dedupe lived only in process memory, so every
+        // cold start (and every iOS store reopen) re-encrypted a kind-449 into
+        // every allowed group — 37 publishes per launch on the QA account.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let key = [9u8; 32];
+        let identity = Identity::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let group_hex = {
+            let alice = SonarClient::connect(identity.clone(), vec![], &db, key)
+                .await
+                .expect("alice");
+            let bob_kp = bob.key_package_event(relays.clone()).unwrap();
+            let creation = alice
+                .engine
+                .create_group("alice & bob", vec![bob_kp], relays)
+                .unwrap();
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .unwrap();
+            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
+            alice.update_local_timezone("Europe/Zurich").await.unwrap();
+            assert_eq!(alice.timezone_shared_with.lock().unwrap().len(), 1);
+            group_hex
+        };
+
+        let alice = SonarClient::connect(identity, vec![], &db, key)
+            .await
+            .expect("alice restarts");
+        let before = alice.outbox_state.lock().unwrap().recorded_count();
+        // What a host does on launch: a transient empty allowlist before its
+        // chat list loads, then the real one, then the zone.
+        alice.set_timezone_share_groups(Vec::new()).await;
+        alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            before,
+            "a restart with the same zone and epoch must not re-encrypt the share"
+        );
+
+        alice.update_local_timezone("Asia/Tokyo").await.unwrap();
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            before + 1,
+            "a new zone still shares"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_resends_when_a_member_is_swapped() {
+        // One member leaves and another joins: the member count is unchanged,
+        // but the newcomer cannot decrypt the earlier epoch's rumor.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "trio",
+                vec![
+                    bob.key_package_event(relays.clone()).unwrap(),
+                    carol.key_package_event(relays.clone()).unwrap(),
+                ],
+                relays.clone(),
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let group_hex = hex::encode(group_id.as_slice());
+        alice.engine.merge_pending_commit(&group_id).unwrap();
+
+        alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 1);
+        let members_before = alice.engine.members(&group_id).unwrap().len();
+
+        alice
+            .engine
+            .remove_members(&group_id, &[carol.identity().public_key()])
+            .unwrap();
+        alice.engine.merge_pending_commit(&group_id).unwrap();
+        alice
+            .engine
+            .add_members(&group_id, vec![dave.key_package_event(relays).unwrap()])
+            .unwrap();
+        alice.engine.merge_pending_commit(&group_id).unwrap();
+        assert_eq!(alice.engine.members(&group_id).unwrap().len(), members_before);
+
+        alice.set_timezone_share_groups(vec![group_hex]).await;
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            2,
+            "the swapped-in member must receive the zone"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_allowlist_ignores_marmot_prefixed_chat_ids() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let bob_kp = bob.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .engine
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id_hex = hex::encode(creation.group.mls_group_id.as_slice());
+
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        alice
+            .set_timezone_share_groups(vec![format!("marmot:{group_id_hex}")])
+            .await;
+        assert!(
+            alice.timezone_shared_with.lock().unwrap().is_empty(),
+            "hosts must pass MLS group hex, not marmot: chat ids"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_notifies_conversation_listener_without_unread() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        bob.set_conversation_change_listener(Some(listener.clone()));
+        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let (bob_pubkey, welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(member, _)| *member == bob.identity().public_key())
+            .unwrap();
+        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+        bob.process_marmot_events([welcome], "timezone listener welcome")
+            .await;
+        listener.changed.lock().unwrap().clear();
+
+        let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
+        let (event, _) = alice
+            .create_and_process_timezone_share(&group_id, &payload)
+            .unwrap();
+        let (report, notifications) = bob
+            .process_marmot_events([event], "timezone listener")
+            .await;
+
+        assert_eq!(report.processed, 1);
+        assert!(notifications.is_empty());
+        assert_eq!(
+            listener.changed.lock().unwrap().as_slice(),
+            [group_id_hex.as_str()]
+        );
+        assert_eq!(
+            bob.conversation_summary(&group_id_hex)
+                .map(|s| s.unread_count)
+                .unwrap_or(0),
+            0
+        );
+        assert!(bob.messages(&group_id).unwrap().is_empty());
     }
 
     #[tokio::test]

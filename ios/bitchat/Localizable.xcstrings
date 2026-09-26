@@ -28,6 +28,27 @@
     "Record voice message" : {
 
     },
+    "%@ ahead" : {
+
+    },
+    "%@ behind" : {
+
+    },
+    "%@ hours" : {
+
+    },
+    "%@ minutes" : {
+
+    },
+    "1 hour" : {
+
+    },
+    "1 minute" : {
+
+    },
+    "Local time: %@" : {
+
+    },
     "Restoring..." : {
 
     },

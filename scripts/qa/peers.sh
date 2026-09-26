@@ -14,6 +14,16 @@
 #   peers.sh expect <name> <substring> [secs] print the first inbound message JSON
 #                                             containing <substring> and exit 0 the
 #                                             moment it arrives; exit 1 on timeout
+#   peers.sh share-tz <name> <to-npub> <zone> share an IANA zone privately (kind-449
+#                                             in MLS) with the existing 1:1 chat
+#   peers.sh expect-tz <name> <from-npub> [zone] [secs]
+#                                             exit 0 once <from> has shared a zone
+#                                             (== <zone> when given); prints it
+#   peers.sh tz <name>                        print every zone peers shared (JSON)
+#   peers.sh share-tz-group <name> <group-hex> <zone>
+#                                             share a zone with a multi-member group
+#   peers.sh accept <name>                    accept every pending group invite
+#   peers.sh groups <name>                    print the peer's groups + members
 #
 # Env: QA_HOME (default $TMPDIR/sonar-qa-<worktree>), SONAR_CLI (default core/target/release/sonar-cli).
 #
@@ -104,6 +114,24 @@ print(f"expect TIMEOUT: '{needle}' never reached {name} ({secs}s)", file=sys.std
 sys.exit(1)
 EXPECT_PY
     ;;
+  share-tz)
+    name="${1:?share-tz <name> <to> <zone>}"; to="${2:?to npub}"; zone="${3:?IANA zone}"
+    cli --home "$(home "$name")" timezone share --to "$to" --zone "$zone" | grep '"type"' ;;
+  expect-tz)
+    name="${1:?expect-tz <name> <from> [zone] [secs]}"; from="${2:?from npub}"
+    zone="${3:-}"; secs="${4:-60}"
+    args=(timezone show --from "$from" --wait-secs "$secs")
+    [[ -n "$zone" ]] && args+=(--zone "$zone")
+    cli --home "$(home "$name")" "${args[@]}" | grep '"type"' ;;
+  tz)
+    cli --home "$(home "${1:?tz <name>}")" timezone show | grep '"type"' || true ;;
+  share-tz-group)
+    name="${1:?share-tz-group <name> <group-hex> <zone>}"; group="${2:?group hex}"; zone="${3:?IANA zone}"
+    cli --home "$(home "$name")" timezone share --group "$group" --zone "$zone" | grep '"type"' ;;
+  accept)
+    cli --home "$(home "${1:?accept <name>}")" accept | grep '"type"' ;;
+  groups)
+    cli --home "$(home "${1:?groups <name>}")" groups | grep '"type"' ;;
   *)
-    sed -n '2,25p' "$0"; exit 2 ;;
+    sed -n '2,36p' "$0"; exit 2 ;;
 esac

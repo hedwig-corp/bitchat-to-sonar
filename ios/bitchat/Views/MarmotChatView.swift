@@ -409,6 +409,8 @@ final class MarmotChatModel: ObservableObject {
     var handleDomainProvider: (() -> String)?
     /// Best-effort BOLT12 offer for restore reclaim. Set by SonarAppStore.
     var handleOfferProvider: (() async -> String?)?
+    /// Share local time privacy pref. Set by SonarAppStore. Default off.
+    var shareLocalTimeIfEnabled: () -> Void = {}
     /// Called on the main actor after our own kind-0 is fetched on relay
     /// connect, so the host can adopt name / NIP-05 into local profile state
     /// before any republish. Set by SonarAppStore.
@@ -421,6 +423,9 @@ final class MarmotChatModel: ObservableObject {
     /// still re-enter so reclaim can retry.
     private var didFetchOwnProfileThisSession = false
     @Published var groups: [MarmotService.MarmotGroup] = []
+    /// Core-owned private timezone cache, hydrated from the local encrypted
+    /// index with group metadata. No relay/profile lookup is involved.
+    @Published private(set) var peerTimezonesByNpub: [String: MarmotService.PeerTimezone] = [:]
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
     private var directChatSetupTasks: [String: (token: UUID, task: Task<String?, Never>)] = [:]
@@ -1085,6 +1090,7 @@ final class MarmotChatModel: ObservableObject {
             SecureLogger.info("SONAR_BENCH t1_local_paint groups=\(groups.count)", category: .session)
             #endif
             self.errorText = nil
+            shareLocalTimeIfEnabled()
             scheduleRelayConnect(delaySeconds: 0.25)
             // Auto-backup executor: after local paint + relay kickoff, not on the
             // critical path. Skip when reconnecting after a seal (backupAccount)
@@ -2604,6 +2610,7 @@ final class MarmotChatModel: ObservableObject {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let summaries = await service.conversationSummaries()
+            await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             self.conversationSummariesByGroup = Dictionary(
                 uniqueKeysWithValues: summaries
@@ -2777,6 +2784,7 @@ final class MarmotChatModel: ObservableObject {
                 pageLimit: Self.localSummaryPageLimit
             )
             let summaries = await service.conversationSummaries()
+            await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             self.conversationSummariesByGroup = Dictionary(
                 uniqueKeysWithValues: summaries
@@ -2850,6 +2858,47 @@ final class MarmotChatModel: ObservableObject {
         } catch {
             self.errorText = Self.describe(error)
             return false
+        }
+    }
+
+    private func refreshPeerTimezones(for groups: [MarmotService.MarmotGroup]) async {
+        let members = groups.flatMap(\.memberNpubs).filter { $0 != npub }
+        let cached = await service.peerTimezones(memberNpubs: members)
+        self.peerTimezonesByNpub = Dictionary(
+            cached.map { (SNMarmotProfileCache.canonicalKey($0.senderNpub), $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+    }
+
+    /// Accepts npub or 64-hex: group members arrive as npub, but the
+    /// Noise↔Nostr link of a folded mesh chat can hold either form.
+    func peerTimezone(for npub: String) -> MarmotService.PeerTimezone? {
+        peerTimezonesByNpub[SNMarmotProfileCache.canonicalKey(npub)]
+    }
+
+    /// Called for NSSystemTimeZoneDidChange and foreground reconciliation
+    /// only while Share local time is enabled. Sharing is bounded in core;
+    /// visible clocks refresh locally from the cached IANA id.
+    func systemTimezoneDidChange() {
+        shareLocalTimeIfEnabled()
+    }
+
+    /// Clear the process-local timezone so membership changes cannot keep
+    /// publishing after the user turns Share local time off.
+    func stopSharingLocalTimezone() {
+        Task { await service.clearLocalTimezone() }
+    }
+
+    func setTimezoneShareGroups(_ groupIdHexes: [String]) async {
+        await service.setTimezoneShareGroups(groupIdHexes)
+    }
+
+    func applyLocalTimezoneShare(groupIds: [String]) async {
+        await service.setTimezoneShareGroups(groupIds)
+        if groupIds.isEmpty {
+            await service.clearLocalTimezone()
+        } else {
+            await service.updateLocalTimezone()
         }
     }
 
@@ -5139,6 +5188,7 @@ final class MarmotChatModel: ObservableObject {
         relayConnected = false
         npub = nil
         groups = []
+        peerTimezonesByNpub = [:]
         pendingGroupInvites = []
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]

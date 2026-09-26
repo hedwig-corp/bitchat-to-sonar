@@ -28,6 +28,7 @@ pub mod reply;
 pub mod sonar_descriptor;
 pub mod sqlcipher_runtime;
 pub mod sticker_cache;
+pub mod timezone;
 
 pub use error::Error;
 

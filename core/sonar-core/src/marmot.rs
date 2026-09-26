@@ -292,6 +292,14 @@ pub enum Incoming {
     Failed,
     /// A join request was received for a group we administer.
     JoinRequest(crate::invite_link::JoinRequest),
+    /// A kind-449 timezone share decrypted from MLS. Not a transcript row —
+    /// hosts must cache it locally and must not upsert unread, notify, or push.
+    TimezoneShare {
+        group_id: GroupId,
+        sender: PublicKey,
+        content: String,
+        created_at: Timestamp,
+    },
     /// The event was valid but produced nothing actionable (duplicates,
     /// ignored proposals, non-Marmot gift wraps, ...).
     None,
@@ -1243,6 +1251,22 @@ impl MarmotEngine {
         Ok((event, incoming))
     }
 
+    /// Encrypt a kind-449 timezone share into a signed kind-445 and process it
+    /// locally under one MLS write guard (same shape as text / reactions).
+    pub fn create_and_process_timezone_share(
+        &self,
+        group_id: &GroupId,
+        payload: &str,
+    ) -> Result<(Event, Incoming)> {
+        let _mls = self.mls_write();
+        let rumor = EventBuilder::new(Kind::Custom(crate::timezone::KIND_TIMEZONE_SHARE), payload)
+            .build(self.identity.public_key());
+        let event = dispatch!(&self.storage, |mdk| mdk
+            .create_message(group_id, rumor, None))?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
     /// Encrypt a sticker message into a signed kind-445 event for `group_id`.
     /// The rumor carries the sticker ref tag so the receiver can resolve the
     /// sticker image from the pack's Blossom URL.
@@ -1627,6 +1651,14 @@ impl MarmotEngine {
                 // index them, count them as unread and ring a notification for
                 // a row no host can ever render. MDK has already persisted the
                 // rumor, so future features can still read it from storage.
+                if msg.kind.as_u16() == crate::timezone::KIND_TIMEZONE_SHARE {
+                    return Ok(Incoming::TimezoneShare {
+                        group_id: msg.mls_group_id,
+                        sender: msg.pubkey,
+                        content: msg.content,
+                        created_at: msg.created_at,
+                    });
+                }
                 if msg.kind.as_u16() != CHAT_RUMOR_KIND {
                     return Ok(Incoming::None);
                 }

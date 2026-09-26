@@ -23,7 +23,7 @@ function bcNow() {
 
 function bcFreshState() {
   return {
-    v: 4,
+    v: 5,
     onboarded: false,
     nick: '',
     network: 'online',
@@ -34,7 +34,8 @@ function bcFreshState() {
     read: {},
     stack: [{ s: 'home' }],
     nav: '',
-    prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'default', requests: 1, btcMode: false, currency: 'EUR' },
+    prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'default', requests: 1, btcMode: false, currency: 'EUR', shareLocalTime: false },
+    tzShare: { sofia: true, tomas: false, lake: true },
     chMsgs: { centro: BC_DATA.chMsgs.slice(), city: [] },
     dmMsgs: { maya: BC_DATA.dmMsgs.slice(), sofia: BC_DATA.dmMsgsSofia.slice() },
     groupMsgs: { lake: BC_DATA.groupMsgs.lake.slice(), trip: BC_DATA.groupMsgs.trip.slice() },
@@ -44,9 +45,9 @@ function bcFreshState() {
 function bcLoadState() {
   try {
     const s = JSON.parse(localStorage.getItem('sn_proto_v1'));
-    if (s && s.v === 4) {
+    if (s && s.v === 5) {
       const d = bcFreshState();
-      return { ...d, ...s, nav: '', prefs: { ...d.prefs, ...(s.prefs || {}) }, chMsgs: { ...d.chMsgs, ...(s.chMsgs || {}) }, dmMsgs: { ...d.dmMsgs, ...(s.dmMsgs || {}) }, groupMsgs: { ...d.groupMsgs, ...(s.groupMsgs || {}) }, txns: s.txns || d.txns };
+      return { ...d, ...s, nav: '', prefs: { ...d.prefs, ...(s.prefs || {}) }, tzShare: { ...d.tzShare, ...(s.tzShare || {}) }, chMsgs: { ...d.chMsgs, ...(s.chMsgs || {}) }, dmMsgs: { ...d.dmMsgs, ...(s.dmMsgs || {}) }, groupMsgs: { ...d.groupMsgs, ...(s.groupMsgs || {}) }, txns: s.txns || d.txns };
     }
   } catch (e) { /* fall through */ }
   return bcFreshState();
@@ -82,6 +83,8 @@ function SonarApp() {
   const toggleNetwork = () => setApp((a) => ({ ...a, network: a.network === 'online' ? 'offline' : 'online' }));
   const wipe = () => setApp(bcFreshState());
   const setPref = (k, v) => setApp((a) => ({ ...a, prefs: { ...(a.prefs || {}), [k]: v } }));
+  // per-conversation override of the Share local time default (control message, never in the transcript)
+  const setTzShare = (id, v) => setApp((a) => ({ ...a, tzShare: { ...(a.tzShare || {}), [id]: v } }));
   const muteConv = (id, dur) => setApp((a) => ({ ...a, muted: { ...a.muted, [id]: dur || 'forever' } }));
   const unmuteConv = (id) => setApp((a) => { const m = { ...a.muted }; delete m[id]; return { ...a, muted: m }; });
 
@@ -315,7 +318,7 @@ function SonarApp() {
   } else if (top.s === 'group') {
     screen = <GroupScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onSend={sendGroup} onReact={reactMsg('group')} onNudge={sendNudgeGroup} onCommand={onCommand} onMedia={sendMediaGroup} onVoice={sendVoiceGroup} />;
   } else if (top.s === 'groupinfo') {
-    screen = <GroupInfoScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onLeave={leaveGroup} />;
+    screen = <GroupInfoScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onLeave={leaveGroup} onTzShare={setTzShare} />;
   } else if (top.s === 'newgroup') {
     screen = <NewGroupScreen key={screenKey} app={app} nav={app.nav} pop={pop} onCreate={createGroup} />;
   } else if (top.s === 'call') {
@@ -336,7 +339,7 @@ function SonarApp() {
   } else if (top.s === 'paystatus') {
     screen = <PayStatusScreen key={screenKey} app={app} nav={app.nav} pop={pop} target={top.target} sats={top.sats} />;
   } else if (top.s === 'peer') {
-    screen = <PeerProfileScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} />;
+    screen = <PeerProfileScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onTzShare={setTzShare} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} />;
   }
 
   const fontStack = BC_FONTS[t.typeface] || BC_FONTS.Figtree;

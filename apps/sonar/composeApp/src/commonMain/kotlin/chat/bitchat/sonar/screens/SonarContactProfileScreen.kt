@@ -46,6 +46,7 @@ import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.canonicalProfileKey
 import chat.bitchat.sonar.crypto.Bech32
+import chat.bitchat.sonar.shareLocalTimeNote
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -372,6 +373,32 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     trail = SNTrail.None,
                     divider = false
                 ) {}
+            }
+
+            if (state.canShareLocalTimeInChat(effectiveChatId)) {
+                val sharing = state.prefsVersion >= 0 && state.sharesLocalTimeWith(effectiveChatId)
+                SNSectionLabel("Privacy")
+                SNSettingsCard {
+                    SNSettingsRow(
+                        icon = SNIconName.Globe,
+                        label = "Share local time",
+                        sub = "This chat can show your current time. Uses this phone's timezone.",
+                        toggle = sharing,
+                        divider = false,
+                    ) { state.toggleShareLocalTimeForChat(effectiveChatId) }
+                }
+                Text(
+                    shareLocalTimeNote(
+                        sharing = sharing,
+                        overridden = state.hasShareLocalTimeOverride(effectiveChatId),
+                        zone = state.systemTimeZoneId,
+                        peerName = screen.name,
+                    ),
+                    color = s.text3,
+                    fontSize = 13.sp,
+                    lineHeight = 19.5.sp,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 0.dp),
+                )
             }
 
             // ── Shared groups ──

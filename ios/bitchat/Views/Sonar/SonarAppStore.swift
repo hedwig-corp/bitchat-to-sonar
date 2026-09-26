@@ -1287,6 +1287,8 @@ final class SonarAppStore: ObservableObject {
         static let notificationShowNames = SonarNotificationPreferenceStore.showNamesKey
         static let notificationShowPreview = SonarNotificationPreferenceStore.showPreviewKey
         static let discoverNewPeople = "sonar.ble.discoverNewPeople"
+        static let shareLocalTime = "sonar.privacy.shareLocalTime"
+        static let shareLocalTimeByChat = "sonar.privacy.shareLocalTimeByChat"
         static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
         static let marmotNsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
     }
@@ -2207,6 +2209,13 @@ final class SonarAppStore: ObservableObject {
                 self?.storeInvalidations.invalidate()
             }
             .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.shareLocalTimeIfEnabled()
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
         #if os(iOS)
         NotificationCenter.default.publisher(for: UIDevice.proximityStateDidChangeNotification)
             .receive(on: DispatchQueue.main)
@@ -2228,6 +2237,7 @@ final class SonarAppStore: ObservableObject {
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
         marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
+        marmot.shareLocalTimeIfEnabled = { [weak self] in self?.reconcileTimezoneShare() }
         marmot.localBip353Provider = { [weak self] in self?.bip353 ?? "" }
         marmot.handleDomainProvider = { Self.handleDomain }
         marmot.handleOfferProvider = { [weak self] in
@@ -2286,6 +2296,7 @@ final class SonarAppStore: ObservableObject {
                 self.refreshBleKnownContactSnapshot()
                 self.applyBLEDiscoveryPolicy()
                 self.objectWillChange.send()
+                self.reconcileTimezoneShare()
                 DispatchQueue.main.async { [weak self] in
                     self?.flushPendingMarmotSends()
                 }
@@ -2774,6 +2785,98 @@ final class SonarAppStore: ObservableObject {
 
     var notificationShowPreview: Bool {
         defaults.object(forKey: Keys.notificationShowPreview) as? Bool ?? false
+    }
+
+    var shareLocalTime: Bool {
+        defaults.object(forKey: Keys.shareLocalTime) as? Bool ?? false
+    }
+
+    func sharesLocalTime(withChatId id: String) -> Bool {
+        if let override = shareLocalTimeOverride(for: id) { return override }
+        return shareLocalTime
+    }
+
+    func toggleShareLocalTime() {
+        let enabled = !shareLocalTime
+        defaults.set(enabled, forKey: Keys.shareLocalTime)
+        objectWillChange.send()
+        reconcileTimezoneShare()
+    }
+
+    func toggleShareLocalTime(forChatId id: String) {
+        let next = !sharesLocalTime(withChatId: id)
+        var overrides = shareLocalTimeByChat
+        let keys = timezoneShareKeys(forChatId: id)
+        if next == shareLocalTime {
+            keys.forEach { overrides.removeValue(forKey: $0) }
+        } else {
+            keys.forEach { overrides[$0] = next }
+        }
+        persistShareLocalTimeByChat(overrides)
+        objectWillChange.send()
+        reconcileTimezoneShare()
+    }
+
+    func shareLocalTimeIfEnabled() {
+        reconcileTimezoneShare()
+    }
+
+    /// True when this chat has its own on/off, not the Settings default.
+    func hasShareLocalTimeOverride(forChatId id: String) -> Bool {
+        shareLocalTimeOverride(for: id) != nil
+    }
+
+    private var shareLocalTimeByChat: [String: Bool] {
+        guard let raw = defaults.dictionary(forKey: Keys.shareLocalTimeByChat) else {
+            return [:]
+        }
+        return raw.reduce(into: [:]) { result, item in
+            if let flag = item.value as? Bool {
+                result[item.key] = flag
+            } else if let number = item.value as? NSNumber {
+                result[item.key] = number.boolValue
+            }
+        }
+    }
+
+    private func persistShareLocalTimeByChat(_ overrides: [String: Bool]) {
+        defaults.set(overrides, forKey: Keys.shareLocalTimeByChat)
+    }
+
+    private func shareLocalTimeOverride(for id: String) -> Bool? {
+        let stored = shareLocalTimeByChat
+        if let override = stored[id] { return override }
+        return timezoneShareKeys(forChatId: id).compactMap { stored[$0] }.first
+    }
+
+    private func timezoneShareKeys(forChatId id: String) -> [String] {
+        var keys = Set(muteKeys(forChatId: id))
+        if let groupId = marmotGroupId(id) {
+            keys.insert(groupId)
+            keys.insert(Self.marmotIDPrefix + groupId)
+        }
+        return Array(keys)
+    }
+
+    private func timezoneShareGroupIds() -> [String] {
+        var ids = Set<String>()
+        for group in marmot.groups {
+            let chatId = Self.marmotIDPrefix + group.id
+            if sharesLocalTime(withChatId: chatId) || sharesLocalTime(withChatId: group.id) {
+                ids.insert(group.id)
+            }
+        }
+        for id in marmotGroupIdsByConversationId.values where sharesLocalTime(withChatId: id) {
+            ids.insert(id)
+        }
+        return Array(ids)
+    }
+
+    private func reconcileTimezoneShare() {
+        let groupIds = timezoneShareGroupIds()
+        Task { [weak self] in
+            await self?.marmot.applyLocalTimezoneShare(groupIds: groupIds)
+        }
     }
 
     func toggleNotificationsEnabled() {
@@ -3376,6 +3479,9 @@ final class SonarAppStore: ObservableObject {
         }
         updateReceiverAdvertising()
         if cameToForeground {
+            // Reconcile timezone even if Darwin coalesced the change
+            // notification while this process was suspended.
+            shareLocalTimeIfEnabled()
             refreshKnownContactDescriptors()
             publishedCallDescriptor = false
             publishedBolt12Offer = nil
@@ -5304,6 +5410,12 @@ final class SonarAppStore: ObservableObject {
     func marmotGroup(forConversationId id: String) -> MarmotService.MarmotGroup? {
         guard let groupId = marmotGroupId(id) else { return nil }
         return marmotGroup(byId: groupId)
+    }
+
+    /// Account identity linked to a folded/plain mesh conversation. Local-only:
+    /// verified Sonar announces/persisted favorites provide the mapping.
+    func linkedNpubForConversation(_ id: String) -> String? {
+        linkedNpub(forPeerKey: canonicalPeerKey(PeerID(str: id)))
     }
 
     func isMultiMemberMarmotGroupId(_ id: String) -> Bool {
@@ -10640,6 +10752,7 @@ final class SonarAppStore: ObservableObject {
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()
         SNDecodedMediaCache.shared.clear()
+        defaults.removeObject(forKey: Keys.shareLocalTimeByChat)
         objectWillChange.send()
     }
 
@@ -10769,6 +10882,8 @@ final class SonarAppStore: ObservableObject {
         resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
+        defaults.removeObject(forKey: Keys.shareLocalTime)
+        defaults.removeObject(forKey: Keys.shareLocalTimeByChat)
         // Panic wipe must not leave auto-backup disclosure / BG tasks armed for
         // the next account (or race a due seal against wipeDatabase).
         defaults.removeObject(forKey: Self.autoBackupDisclosedKey)
