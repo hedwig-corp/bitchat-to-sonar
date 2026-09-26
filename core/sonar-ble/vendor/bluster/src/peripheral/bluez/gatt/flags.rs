@@ -24,7 +24,17 @@ impl Flags for CharacteristicProperties {
                     characteristic::Secure::Secure(_) => {
                         &["secure-write", "encrypt-authenticated-write"]
                     }
-                    characteristic::Secure::Insecure(_) => &["write"],
+                    // PATCH (Sonar): advertise write-without-response alongside
+                    // write. bluster models Write as either/or, so an insecure
+                    // WithResponse characteristic advertised only "write" and a
+                    // central that writes without a response got NOTSUPPORTED.
+                    // Both phone platforms use both types on this characteristic
+                    // (iOS [.write, .writeWithoutResponse], Android
+                    // PROPERTY_WRITE | PROPERTY_WRITE_NO_RESPONSE), and the
+                    // CoreBluetooth backend already carries the mirror of this
+                    // patch in characteristic_flags.rs. BlueZ routes both to the
+                    // same WriteValue handler, so one WriteRequest arm serves them.
+                    characteristic::Secure::Insecure(_) => &["write", "write-without-response"],
                 },
                 characteristic::Write::WithoutResponse(_) => &["write-without-response"],
             };
