@@ -2,11 +2,13 @@ package chat.bitchat.sonar
 
 import chat.bitchat.sonar.BleBridge.MeshRx
 import chat.bitchat.sonar.BleBridge.SERVER_LINK
+import uniffi.sonar_ffi.MeshReassembler
 import uniffi.sonar_ffi.SonarNoise
 import uniffi.sonar_ffi.meshDecodePacket
 import uniffi.sonar_ffi.meshDecodePrivateMessage
 import uniffi.sonar_ffi.meshEncodePrivateMessage
 import uniffi.sonar_ffi.meshEncodePrivateMessageWithReply
+import uniffi.sonar_ffi.meshFragment
 import uniffi.sonar_ffi.meshParseAnnounce
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -58,6 +60,7 @@ object MeshLink {
     private const val TYPE_ANNOUNCE = 0x01
     private const val TYPE_NOISE_HANDSHAKE = 0x10
     private const val TYPE_NOISE_ENCRYPTED = 0x11
+    private const val TYPE_FRAGMENT = 0x20
     private const val TYPE_SONAR = 0x53
     private const val PEER_TTL_MS = 90_000L
 
@@ -74,6 +77,19 @@ object MeshLink {
      * while a session exists, nothing ever retried.
      */
     internal const val HANDSHAKE_TIMEOUT_MS = 8_000L
+
+    /**
+     * One GATT value per packet up to this size; anything larger goes out as
+     * 0x20 fragments of [FRAGMENT_CHUNK_BYTES]. Both are the Android engine's
+     * (`MAX_SINGLE_GATT_PACKET_BYTES`, `FRAGMENT_CHUNK_SIZE` in mesh_engine.rs),
+     * sized so every write fits an ATT MTU and iOS's reliable 256-byte block.
+     * A DM of a couple of hundred characters pads to 512 bytes and did not fit.
+     */
+    internal const val MAX_SINGLE_PACKET_BYTES = 480
+    private const val FRAGMENT_CHUNK_BYTES = 205u
+
+    /** Phones fragment the same way, so their long DMs arrive as 0x20 pieces. */
+    private val reassembler = MeshReassembler()
 
     private class Session(val noise: SonarNoise, val initiator: Boolean, val startedAtMs: Long) {
         @Volatile var established = false
@@ -137,50 +153,61 @@ object MeshLink {
     private fun pump() {
         for (rx in wire.drain()) {
             val pkt = rx.bytes
-            if (pkt == null) {
-                onLinkDown(rx.link)
-                continue
+            if (pkt == null) onLinkDown(rx.link) else handlePacket(pkt, rx.link, reassembled = false)
+        }
+        afterPump()
+    }
+
+    private fun handlePacket(pkt: ByteArray, link: Long, reassembled: Boolean) {
+        val info = runCatching { meshDecodePacket(pkt) }.getOrNull() ?: return
+        val sender = info.senderIdHex
+        when (info.packetType.toInt()) {
+            TYPE_FRAGMENT -> {
+                // A long DM from a phone. The whole packet goes through the
+                // same rules as one that fit, on the link its pieces came in.
+                if (reassembled) return
+                val whole = runCatching { reassembler.add(sender, info.payload) }.getOrNull() ?: return
+                handlePacket(whole, link, reassembled = true)
             }
-            val info = runCatching { meshDecodePacket(pkt) }.getOrNull() ?: continue
-            val sender = info.senderIdHex
-            when (info.packetType.toInt()) {
-                TYPE_ANNOUNCE -> {
-                    val ann = runCatching { meshParseAnnounce(pkt) }.getOrNull() ?: continue
-                    val fp = MeshIdentity.fingerprintOf(ann.noisePublicKeyHex)
-                    if (fp.isNotEmpty()) {
-                        val now = clock()
-                        val wasVisible = now - (seenByFp[fp] ?: 0L) < PEER_TTL_MS
-                        fpByPeerId[sender] = fp; peerIdByFp[fp] = sender
-                        val previousName = nameByFp.put(fp, ann.nickname)
-                        seenByFp[fp] = now
-                        if (!wasVisible || previousName != ann.nickname) notifyPeerUpdate()
-                        // Only a direct announce binds the peer to this link; a
-                        // relayed one says nothing about where the peer is.
-                        if (info.ttl.toInt() == DIRECT_TTL) {
-                            linkByFp[fp] = rx.link
-                            // On a link WE dialed, start the handshake: the phone
-                            // will not (Android's server side waits for our 0x10,
-                            // iOS only initiates when it has something to send),
-                            // and without a session hasLink() stays false, which
-                            // the UI reads as "out of range". Never on the GATT
-                            // server path, where the phone dialed and initiates:
-                            // an m1 from us there resets its own in-flight one.
-                            if (rx.link != SERVER_LINK) beginHandshake(fp, sender)
-                        }
+            TYPE_ANNOUNCE -> {
+                val ann = runCatching { meshParseAnnounce(pkt) }.getOrNull() ?: return
+                val fp = MeshIdentity.fingerprintOf(ann.noisePublicKeyHex)
+                if (fp.isNotEmpty()) {
+                    val now = clock()
+                    val wasVisible = now - (seenByFp[fp] ?: 0L) < PEER_TTL_MS
+                    fpByPeerId[sender] = fp; peerIdByFp[fp] = sender
+                    val previousName = nameByFp.put(fp, ann.nickname)
+                    seenByFp[fp] = now
+                    if (!wasVisible || previousName != ann.nickname) notifyPeerUpdate()
+                    // Only a direct announce binds the peer to this link; a
+                    // relayed one says nothing about where the peer is.
+                    if (info.ttl.toInt() == DIRECT_TTL) {
+                        linkByFp[fp] = link
+                        // On a link WE dialed, start the handshake: the phone
+                        // will not (Android's server side waits for our 0x10,
+                        // iOS only initiates when it has something to send),
+                        // and without a session hasLink() stays false, which
+                        // the UI reads as "out of range". Never on the GATT
+                        // server path, where the phone dialed and initiates:
+                        // an m1 from us there resets its own in-flight one.
+                        if (link != SERVER_LINK) beginHandshake(fp, sender)
                     }
                 }
-                TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload, rx.link)
-                TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload, rx.link)
-                TYPE_SONAR -> {
-                    sonarSeenAt[sender] = clock()
-                    val previous = sonarByPeerId.put(sender, info.payload)
-                    if (previous == null) {
-                        sonarLog("MeshLink", "RX 0x53 Sonar announce from ${nameByFp[fpByPeerId[sender]] ?: sender} → peer is a full Sonar user (npub for WN fallback)")
-                    }
-                    if (previous == null || !previous.contentEquals(info.payload)) notifyPeerUpdate()
+            }
+            TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload, link)
+            TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload, link)
+            TYPE_SONAR -> {
+                sonarSeenAt[sender] = clock()
+                val previous = sonarByPeerId.put(sender, info.payload)
+                if (previous == null) {
+                    sonarLog("MeshLink", "RX 0x53 Sonar announce from ${nameByFp[fpByPeerId[sender]] ?: sender} → peer is a full Sonar user (npub for WN fallback)")
                 }
+                if (previous == null || !previous.contentEquals(info.payload)) notifyPeerUpdate()
             }
         }
+    }
+
+    private fun afterPump() {
         val now = clock()
         expireStalledHandshakes(now)
         val peersExpired = seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
@@ -213,13 +240,27 @@ object MeshLink {
      * too was not harmless: Android answers a 0x10 whatever its recipient id
      * says, so an m1 meant for one phone reset every other phone's responder.
      */
-    private fun sendTo(fp: String, packet: ByteArray): Boolean {
+    private fun sendTo(fp: String, recipientPeerId: String, type: Int, payload: ByteArray): Boolean {
         val link = linkByFp[fp]
-        if (link == null || link == SERVER_LINK) {
-            wire.broadcast(packet)
-            return true
+        return packetsFor(recipientPeerId, type, payload).all { packet ->
+            if (link == null || link == SERVER_LINK) {
+                wire.broadcast(packet)
+                true
+            } else {
+                wire.sendTo(link, packet)
+            }
         }
-        return wire.sendTo(link, packet)
+    }
+
+    /** The packet, or its 0x20 fragments when it would not fit one GATT value. */
+    private fun packetsFor(recipientPeerId: String, type: Int, payload: ByteArray): List<ByteArray> {
+        val packet = MeshIdentity.buildPacket(type.toUByte(), recipientPeerId, payload)
+        if (packet.size <= MAX_SINGLE_PACKET_BYTES) return listOf(packet)
+        // A wire id: the CSPRNG seam, per the Randomness Rule.
+        val id = secureRandomHex(8)
+        return meshFragment(packet, id, type.toUByte(), FRAGMENT_CHUNK_BYTES).map { piece ->
+            MeshIdentity.buildPacket(TYPE_FRAGMENT.toUByte(), recipientPeerId, piece)
+        }
     }
 
     /**
@@ -311,7 +352,7 @@ object MeshLink {
         synchronized(s) {
             runCatching {
                 val m1 = s.noise.writeMessage()
-                check(sendTo(fp, MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), peerId, m1))) { "link gone" }
+                check(sendTo(fp, peerId, TYPE_NOISE_HANDSHAKE, m1)) { "link gone" }
                 sonarLog("MeshLink", "Noise handshake started with ${nameByFp[fp] ?: fp.take(8)}")
             }.onFailure { sessions.remove(fp, s) }
         }
@@ -326,7 +367,7 @@ object MeshLink {
                 sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
             } else {
                 val next = s.noise.writeMessage()
-                sendTo(fp, MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, next))
+                sendTo(fp, senderPeerId, TYPE_NOISE_HANDSHAKE, next)
                 // The responder finishes after READING m3; the initiator finishes
                 // after WRITING it. Without this check the initiator sends m3 and
                 // then waits forever for a fourth message that never comes.
@@ -380,7 +421,7 @@ object MeshLink {
             runCatching {
                 val plain = byteArrayOf(MeshNoisePayload.DELIVERED.toByte()) + messageId.encodeToByteArray()
                 val ct = s.noise.encrypt(plain)
-                sendTo(fp, MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct))
+                sendTo(fp, peerId, TYPE_NOISE_ENCRYPTED, ct)
             }.getOrDefault(false)
         }
     }
@@ -402,7 +443,7 @@ object MeshLink {
                     meshEncodePrivateMessageWithReply(messageId, text, parent)
                 }
                 val ct = s.noise.encrypt(plain)
-                val sent = sendTo(fp, MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct))
+                val sent = sendTo(fp, peerId, TYPE_NOISE_ENCRYPTED, ct)
                 if (sent) sonarLog("MeshLink", "TX DM to ${nameByFp[fp] ?: fp.take(8)} (${text.length} chars)")
                 sent
             }.getOrDefault(false)
