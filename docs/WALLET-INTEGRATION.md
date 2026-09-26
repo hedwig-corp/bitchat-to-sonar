@@ -95,10 +95,27 @@ Every call blocks. Call it from a background executor.
   **`Pending` is not a failure**: past its deadline, or with a mint still
   routing, the payment is reported Pending and its outcome arrives as an
   event with the same `id`. Never retry a Pending send with a new quote; that
-  can pay twice. A confirm error is only Pending when the mint's own quote
-  state says so: a quote the mint reports Unpaid or Failed (including a melt
-  saga recovery rolled back) is Failed, and `lookup_payment` answers from the
-  mint's melt quote when history no longer shows the send.
+  can pay twice. A send is Failed only when nothing of it can still be paid:
+  - the mint answered the melt request itself with a failure or a refusal
+    ("request already paid", a spent input, …): Failed at once;
+  - the request got no answer (a reset, a timeout, a proxy error): CDK then
+    asks the mint and, on Unpaid, puts the inputs back and reports
+    `PaymentFailed` like a real failure. The mint connector records which
+    melt requests got no answer, so such a send is **Pending**. Unpaid is
+    also what a mint reports before it has started on a request still on its
+    way, so the watcher believes it only after a 60 s grace window, then
+    reports Failed; if the mint pays it meanwhile, it reports Complete, drops
+    the spent inputs from the balance and marks the history row Completed.
+    These sends are kept in a per-mint journal (`cashu.unsettled.<tag>`), so
+    a relaunch changes nothing;
+  - a melt whose saga is still open locally is Pending, whatever the stored
+    quote says (it was written before the confirm and reads Unpaid);
+    `lookup_payment` resumes that one saga before answering;
+  - the watcher finalizes open melts saga by saga and skips a melt whose
+    confirm a send is still awaiting (CDK's `finalize_pending_melts` would
+    compensate it while the mint had not started on it yet).
+  Hosts also accept a Complete for a payment they already marked Failed and
+  move the row to paid (both apps), as a last line of defence.
 - Every payment to the offer is its own payment: `{quote_id}:{tx_id}`.
 - History carries the preimage (chat `⚡PAYDONE|2` needs it after a restart).
 - Errors: `WalletFfiError` is non-flat; branch on `InsufficientFunds`,
@@ -150,8 +167,13 @@ Shared behaviour, pinned by tests on both platforms:
 
 - Opened only when its store already exists on the device. A restored account
   gets ONE background check (builds with a Breez API key only): if the derived
-  Breez wallet has funds or history it is kept as legacy, otherwise what the
-  check created is deleted.
+  Breez wallet has funds or history it is kept as legacy. It is deleted only
+  when a second pass, 15 s later and after the SDK reported a completed sync,
+  finds it empty too: on a fresh device a sync can return before the history
+  lands, and a discarded wallet is never opened again. A pass that fails, or
+  that saw no completed sync, decides nothing and the check runs again.
+- Deleting it re-reads the facts after the webhook is removed and stops if
+  anything moved since the gate passed (a swap settling in between).
 - Its NDS webhook / `invoice_request` push path stays alive only while it
   exists, against its own offer (never the published Cashu offer).
 - **Delete gate**, all of: connected with a completed sync; confirmed,
@@ -284,6 +306,18 @@ message is the notification):
   24 h and not our own, so a transcript replayed after a restart never
   silences a new outside payment.
 
+## Mint connection
+
+The CDK HTTP client (bitreq 0.3) keeps one cached connection per host, and a
+request whose future is dropped after it was written, but before its answer
+was read, leaves that connection waiting for the answer forever: every later
+request on it times out. The wallet's own deadlines drop futures that way.
+The mint connector (`core/sonar-wallet-cdk/src/connector.rs`) therefore
+rebuilds CDK's HTTP client, with a fresh connection pool and the same rate
+limiter, before the next call after any call abandoned mid-flight. A mint
+call that ran out of time after the mint had issued is completed by CDK's
+next status check of that quote, and the watcher announces it as a receive.
+
 ## Known gaps
 
 - No push notification for a Cashu receive while the app is killed. Funds
@@ -317,6 +351,15 @@ message is the notification):
   twice; and two chat payments minted in one wallet poll arrive as one receive
   that neither receipt matches. An exact link needs the receipt to name the
   payment, which the mint does not expose per payment today.
+- The 60 s grace window for a send whose melt request got no answer is a
+  bound, not a proof: a request that reaches the mint more than 60 s after
+  its connection dropped would be paid over a Failed row (and its inputs,
+  already put back, would fail their next spend). HTTP stacks give up long
+  before that. Proof would need the inputs spent elsewhere (a self-swap)
+  before calling it Failed. Also, the change of a melt the mint paid after
+  CDK had compensated it is not recovered at once (the saga that held the
+  change outputs is gone); it is derived from the seed, so a NUT-13 restore
+  finds it.
 - Offer backups need the account's relays: if none answers when a reinstalled
   wallet first connects, no offer is created until one does (retried every
   30 s), rather than publishing a new offer over the backed-up one.
