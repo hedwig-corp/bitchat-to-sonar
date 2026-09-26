@@ -128,6 +128,32 @@ class TranscriptDisplayPolicyTest {
             ),
         )
         assertFalse(sameTranscriptPaint(withMedia, sameUrlNewMime))
+        val withReply = listOf(
+            message("a", 1).copy(reply = SonarReplyRef("parent", "npub1x", "You", "hi")),
+        )
+        assertFalse(sameTranscriptPaint(listOf(message("a", 1)), withReply))
+        val withReaction = listOf(
+            message("a", 1).copy(reactions = listOf(SonarReactionTally("👍", 1, mine = true))),
+        )
+        assertFalse(
+            sameTranscriptPaint(listOf(message("a", 1)), withReaction),
+            "kind-7 tally changes must republish or chips never appear on an open chat",
+        )
+    }
+
+    @Test
+    fun overlayReactionTalliesPatchesRetainedRows() {
+        val existing = listOf(
+            message("old", 1),
+            message("new", 2).copy(reactions = listOf(SonarReactionTally("👍", 1, mine = false))),
+        )
+        val overlaid = overlayReactionTallies(
+            existing,
+            mapOf("old" to listOf(SonarReactionTally("🔥", 1, mine = true))),
+        )
+        assertEquals("🔥", overlaid[0].reactions.single().emoji)
+        assertTrue(overlaid[0].reactions.single().mine)
+        assertEquals("👍", overlaid[1].reactions.single().emoji)
     }
 
     @Test
