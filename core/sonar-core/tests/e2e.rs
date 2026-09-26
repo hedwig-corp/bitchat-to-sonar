@@ -1048,7 +1048,7 @@ async fn timezone_share_does_not_notify_or_increment_unread() {
                 .expect("drain timezone share"),
         );
         let _ = bob.sync().await;
-        cached = bob.peer_timezones(&[bob_hex.clone()]);
+        cached = bob.peer_timezones(std::slice::from_ref(&bob_hex));
         if cached.iter().any(|(_, _, zone)| zone.zone == "Europe/Zurich") {
             break;
         }
@@ -1106,7 +1106,7 @@ async fn timezone_revoke_reaches_the_peer_over_the_relay() {
     for _ in 0..50 {
         let _ = bob.drain_pending_marmot().await;
         let _ = bob.sync().await;
-        if !bob.peer_timezones(&[bob_hex.clone()]).is_empty() {
+        if !bob.peer_timezones(std::slice::from_ref(&bob_hex)).is_empty() {
             seen = true;
             break;
         }
@@ -1120,7 +1120,7 @@ async fn timezone_revoke_reaches_the_peer_over_the_relay() {
     for _ in 0..50 {
         notes.extend(bob.drain_pending_marmot().await.expect("drain revoke"));
         let _ = bob.sync().await;
-        if bob.peer_timezones(&[bob_hex.clone()]).is_empty() {
+        if bob.peer_timezones(std::slice::from_ref(&bob_hex)).is_empty() {
             gone = true;
             break;
         }

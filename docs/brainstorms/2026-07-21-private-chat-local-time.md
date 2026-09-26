@@ -25,7 +25,7 @@
 - Showing timezone beside every message.
 - Putting multiple clocks in the group chat header.
 - Inferring whether someone is currently awake or available.
-- A retraction rumor that wipes peer caches on disable (v1 just stops sending; peers keep the last cached zone until a newer share arrives).
+- ~~A retraction rumor that wipes peer caches on disable~~ — shipped after #607: a kind-449 with an empty zone withdraws the sender's zone from that group; peer zones are cached per (sender, group) with revoke tombstones.
 
 **Success criteria:**
 - With the pref off, the host never calls `update_local_timezone` with a zone id, and core has no process-local zone to fan out.
@@ -72,4 +72,4 @@ Use **Approach A: MLS application rumor**. It is the only approach that satisfie
 - Should a timezone change be sent immediately to every existing conversation, or lazily on next send/open plus a bounded background queue? Recommendation: bounded background queue with retry, because changes are rare and should propagate without requiring chat activity. Cap fan-out at 256 groups.
 - For groups, should all members proactively publish after joining, or should the new member's client request a refresh? Recommendation: each member sends their own timezone after observing a membership change; never allow one member to assert another member's timezone.
 - Exact copy and formatting need localization decisions, including 12/24-hour preference and whether to show only `4:10 PM` or also `6 hours behind`. Recommendation: respect the viewer's clock-format preference and include the relative offset in DMs when it is non-zero.
-- Should disable send a tombstone so peers drop the cached zone? Deferred: v1 clears only the sender's process cache and stops publishing.
+- Should disable send a tombstone so peers drop the cached zone? Resolved in the #607 follow-up: yes. An explicit toggle-off sends an empty-zone kind-449 into each group that had the zone.

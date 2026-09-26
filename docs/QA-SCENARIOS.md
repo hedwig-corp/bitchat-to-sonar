@@ -200,6 +200,11 @@ is the build under test on a dedicated QA emulator/simulator.
 - **How:** `android-smoke.sh` QA-043
 - **Origin:** A28 (#616) — contact-profile action circles were NAF and their
   captions were dead taps; the 2026-09-24 sweep of every main screen is clean.
+- **Also:** every settings toggle is a switch that reports its state
+  (uiautomator `checkable="true"` and `checked` match the switch; VoiceOver
+  reads "On"/"Off"). Guard: `SettingsToggleSemanticsUiTest`,
+  `SNPeerLocalTimeFormatterTests.toggleRowsSpeakTheirState`. Origin: #607 QA
+  (no toggle exposed its state on Compose; iOS read it as a plain button).
 
 ### QA-042 — Channel screen controls are labelled
 - **Platforms:** Android (manual: open any location channel, `android-ui.sh dump`)
@@ -293,6 +298,21 @@ share a zone with the app and report the zone the app shared with it.
 - **Guard:** `client.rs::timezone_share_is_not_repeated_after_restart`
 - **Origin:** A1/i2 (#607 QA — every launch, and every iOS store reopen,
   re-encrypted a kind-449 into every allowed group: 37 per launch)
+
+### QA-090 — Turning sharing off withdraws your time
+- **Platforms:** both (manual; Android can script it with peers.sh)
+- **Steps:** sharing on and delivered to peer A (`peers.sh expect-tz`); turn
+  the chat's own toggle off (or the Settings default, for chats following it).
+- **Expect:** within 60 s the peer no longer has your zone
+  (`peers.sh expect-no-tz <peer> <app-npub>`); a group you still share with
+  keeps it. The reverse: when a peer runs `peers.sh revoke-tz`, the app's DM
+  header drops the clock and shows the encryption line again, with no bubble,
+  unread or notification.
+- **Guard:** `client.rs::timezone_revoke_hides_the_zone_only_in_its_own_group`,
+  `client.rs::timezone_revoke_is_sent_only_where_a_share_was_sent`,
+  `e2e.rs::timezone_revoke_reaches_the_peer_over_the_relay`,
+  `conversation_index.rs::revoke_tombstone_is_per_group_and_blocks_older_replays`
+- **Origin:** #607 known gap — a stale clock stayed after sharing was off.
 
 ## Settings
 

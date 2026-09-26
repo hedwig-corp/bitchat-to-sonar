@@ -2797,13 +2797,15 @@ final class SonarAppStore: ObservableObject {
     }
 
     func toggleShareLocalTime() {
+        let before = timezoneShareGroupIds()
         let enabled = !shareLocalTime
         defaults.set(enabled, forKey: Keys.shareLocalTime)
         objectWillChange.send()
-        reconcileTimezoneShare()
+        applyTimezoneShareChange(before: before)
     }
 
     func toggleShareLocalTime(forChatId id: String) {
+        let before = timezoneShareGroupIds()
         let next = !sharesLocalTime(withChatId: id)
         var overrides = shareLocalTimeByChat
         let keys = timezoneShareKeys(forChatId: id)
@@ -2814,7 +2816,22 @@ final class SonarAppStore: ObservableObject {
         }
         persistShareLocalTimeByChat(overrides)
         objectWillChange.send()
-        reconcileTimezoneShare()
+        applyTimezoneShareChange(before: before)
+    }
+
+    /// After an explicit toggle: withdraw the zone from every group that just
+    /// stopped sharing, then share with the new set. Only toggles revoke; the
+    /// reconcile passes on refresh/startup never do.
+    private func applyTimezoneShareChange(before: [String]) {
+        let after = timezoneShareGroupIds()
+        let revoked = snRevokedTimezoneGroups(before: before, after: after)
+        Task { [weak self] in
+            guard let self else { return }
+            if !revoked.isEmpty {
+                await self.marmot.revokeLocalTimezoneShare(groupIds: revoked)
+            }
+            await self.marmot.applyLocalTimezoneShare(groupIds: after)
+        }
     }
 
     func shareLocalTimeIfEnabled() {

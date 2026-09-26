@@ -85,6 +85,13 @@ enum SNPeerLocalTimeFormatter {
     }
 }
 
+/// Groups to send a revoke to after an explicit toggle: shared before, not after.
+func snRevokedTimezoneGroups(before: [String], after: [String]) -> [String] {
+    let keep = Set(after)
+    var seen = Set<String>()
+    return before.filter { !keep.contains($0) && seen.insert($0).inserted }
+}
+
 /// Contact-profile note under *Share local time*. "Off" has two causes and
 /// they read differently: this chat's own override, or the Settings default.
 func snShareLocalTimeNote(sharing: Bool, overridden: Bool, zone: String, peerName: String) -> String {
@@ -196,12 +203,13 @@ struct SonarDMScreenContent: View {
         if let group = store.marmotGroup(forConversationId: peerId),
            let ownNpub = store.marmot.npub,
            let other = group.memberNpubs.first(where: { $0 != ownNpub }) {
-            return store.marmot.peerTimezone(for: other)?.ianaIdentifier
+            return store.marmot.peerTimezone(for: other, inGroup: group.id)?.ianaIdentifier
         }
         // Folded/plain BLE conversations resolve through the same persisted
-        // Noise↔Nostr account link used by the home-row identity fold.
+        // Noise↔Nostr account link used by the home-row identity fold, then to
+        // the 1:1 Marmot group with that account.
         if let npub = store.linkedNpubForConversation(peerId) {
-            return store.marmot.peerTimezone(for: npub)?.ianaIdentifier
+            return store.marmot.peerTimezone(forDirectPeer: npub)?.ianaIdentifier
         }
         return nil
     }
