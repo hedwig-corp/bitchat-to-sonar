@@ -67,6 +67,16 @@ const MAX_TIMEZONE_SHARE_GROUPS: usize = 256;
 /// an arbitrarily far-future rumor timestamp.
 const TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
 
+/// Idle self-heal cadence for re-sending the long-lived Marmot subscriptions.
+/// It was 20 s: every idle host re-sent every REQ to every relay about three
+/// times a minute, re-collecting the same `auth-required` rejections each
+/// time, although the relay pool already resubscribes on reconnect.
+const IDLE_RESUBSCRIBE_INTERVAL: Duration = Duration::from_secs(300);
+
+fn idle_resubscribe_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|prev| now.duration_since(prev) >= IDLE_RESUBSCRIBE_INTERVAL)
+}
+
 fn bounded_timezone_share_timestamp(reported_at: u64, now: u64) -> u64 {
     reported_at.min(now.saturating_add(TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS))
 }
@@ -6308,19 +6318,20 @@ impl SonarClient {
         if !*self.live_marmot_enabled.lock().unwrap() {
             return Ok(());
         }
-        // P2: hosts call this every 25-60s. Avoid thrashing welcome/group REQs
-        // when nothing changed and we recently ensured.
-        const MIN_ENSURE_INTERVAL: Duration = Duration::from_secs(20);
+        // Hosts call this every 25-60 s while idle. The welcome/group
+        // subscriptions are long-lived: nostr-relay-pool re-sends them itself
+        // on every reconnect and re-auth, and group changes resubscribe at
+        // once (`resubscribe_marmot_groups_if_live`). Re-sending them here is
+        // only a self-heal for a relay that drops a subscription without
+        // closing the socket, so it runs on `IDLE_RESUBSCRIBE_INTERVAL`.
         let now = Instant::now();
         let should_resub = {
             let mut last = self.last_ensure_subscriptions_at.lock().unwrap();
-            match *last {
-                Some(prev) if now.duration_since(prev) < MIN_ENSURE_INTERVAL => false,
-                _ => {
-                    *last = Some(now);
-                    true
-                }
+            let due = idle_resubscribe_due(*last, now);
+            if due {
+                *last = Some(now);
             }
+            due
         };
         if should_resub {
             self.subscribe_marmot().await?;
@@ -10716,6 +10727,17 @@ mod tests {
         assert_eq!(cached[0].0, alice.identity().public_key());
         assert_eq!(cached[0].2.zone, "Europe/Zurich");
         assert!(cached[0].2.updated_at_secs > 0);
+    }
+
+    #[test]
+    fn idle_ensure_resubscribes_only_on_the_self_heal_interval() {
+        // #607 follow-up (idle churn): hosts poll ensure_subscriptions every
+        // 25-60 s, and the 20 s throttle re-sent every REQ on every poll.
+        let t0 = Instant::now();
+        assert!(idle_resubscribe_due(None, t0), "first ensure subscribes");
+        assert!(!idle_resubscribe_due(Some(t0), t0 + Duration::from_secs(25)));
+        assert!(!idle_resubscribe_due(Some(t0), t0 + Duration::from_secs(60)));
+        assert!(idle_resubscribe_due(Some(t0), t0 + IDLE_RESUBSCRIBE_INTERVAL));
     }
 
     #[tokio::test]
