@@ -11,6 +11,9 @@
 //  - `pending` is in flight, never failed. The row keeps `pending` and
 //    records the wallet payment id; nothing is ever re-sent.
 //  - A later update with the same wallet id finishes the row.
+//  - `paid` is final. `failed` is final too, except that a later update
+//    saying the same wallet payment COMPLETED moves it to paid: the money
+//    left, and the row must not keep saying "you were not charged".
 //  - Idempotent: the send's own result and the event for the same outcome
 //    can arrive in either order; the second one is a no-op.
 //  - A chat ⚡PAY receipt is due exactly once, after the payment completes
@@ -20,6 +23,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import Foundation
 
 @MainActor
@@ -62,7 +66,11 @@ enum SonarWalletPaymentReconciler {
             ledger.markHandedToWallet(activityId, walletPaymentId: payment.id, sats: adopted)
             return .pending(activityId: activityId)
         case .failed:
-            ledger.markFailed(activityId, message: String(localized: "Payment failed — you were not charged."))
+            ledger.markFailed(
+                activityId,
+                message: String(localized: "Payment failed — you were not charged."),
+                walletPaymentId: payment.id
+            )
             return .failed(activityId: activityId)
         }
     }
@@ -85,7 +93,15 @@ enum SonarWalletPaymentReconciler {
             let due = receiptDue(activityId, ledger: ledger, hasReceipt: hasReceipt)
             return due ? .paid(activityId: activityId, receiptDue: true) : .none
         case .failed:
-            return .none
+            // Reported failed, then paid (an ambiguous send the mint went on
+            // to pay). A later failure changes nothing.
+            guard update.status == .complete else { return .none }
+            SecureLogger.warning(
+                "wallet payment \(update.id) was reported failed, then paid: settling it as paid",
+                category: .session
+            )
+            ledger.markPaid(activityId, payment: update)
+            return .paid(activityId: activityId, receiptDue: receiptDue(activityId, ledger: ledger, hasReceipt: hasReceipt))
         case .pending:
             break
         }

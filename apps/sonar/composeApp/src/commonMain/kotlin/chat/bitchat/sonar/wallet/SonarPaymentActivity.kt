@@ -138,6 +138,19 @@ class SonarPaymentActivityLedger(blob: String = "") {
     }
 
     /**
+     * [markPaidIfPending], and also a row that FAILED under this same wallet
+     * payment: the wallet later reported it paid, so the money left and the
+     * row must stop saying "you were not charged". A Paid row never moves.
+     */
+    fun markPaidIfUnsettled(id: String, walletPaymentId: String?, feesSats: Long?, settledAtSecs: Long): Boolean {
+        val e = entries[id] ?: return false
+        val paidAfterFailing = e.status == SonarPaymentActivity.Status.Failed &&
+            walletPaymentId != null && e.walletPaymentId == walletPaymentId
+        if (e.status != SonarPaymentActivity.Status.Pending && !paidAfterFailing) return false
+        return markPaid(id, walletPaymentId, feesSats, settledAtSecs)
+    }
+
+    /**
      * A send the wallet reported as in flight: remember which wallet payment
      * settles this row. Only a still-Pending row is linked; the status is left
      * alone (it is NOT a failure and must never be re-sent).
@@ -430,6 +443,25 @@ object PaymentActivityStore {
     ): Boolean {
         val changed = lock.withLock {
             if (!ledger().markPaidIfPending(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
+    }
+
+    /**
+     * [markPaidIfPending] that also moves a row that failed under the same
+     * wallet payment to Paid (a late Complete for an ambiguous send). Same
+     * single-winner guarantee: only the transition returns `true`.
+     */
+    fun markPaidIfUnsettled(
+        id: String,
+        walletPaymentId: String?,
+        feesSats: Long?,
+        settledAtSecs: Long = SonarClock.nowSecs(),
+    ): Boolean {
+        val changed = lock.withLock {
+            if (!ledger().markPaidIfUnsettled(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
             persist(); true
         }
         if (changed) version++

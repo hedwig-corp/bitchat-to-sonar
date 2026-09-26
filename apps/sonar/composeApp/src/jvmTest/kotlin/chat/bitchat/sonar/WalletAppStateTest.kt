@@ -399,6 +399,41 @@ class WalletAppStateTest {
         assertEquals(1, native.count("send"))
     }
 
+    /**
+     * A send the wallet reported Failed, whose melt the mint then paid (an
+     * ambiguous confirm): the later Complete for the same wallet payment
+     * must settle the row as paid, not leave "you were not charged" on a
+     * payment that went through. A later Failed never un-pays it.
+     */
+    @Test
+    fun aSendReportedFailedIsPaidWhenTheWalletLaterCompletesIt() = runBlocking {
+        native.confirmedSats = 10_000
+        native.sendStatus = CashuPaymentStatus.Failed
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+        val id = assertNotNull(s.beginDestinationPayment("lno1destination", 600, "Dest"))
+        waitUntil("failed") { PaymentActivityStore.get(id)?.status == SonarPaymentActivity.Status.Failed }
+        val walletId = assertNotNull(PaymentActivityStore.get(id)!!.walletPaymentId, "linked before the send")
+
+        native.emit(
+            CashuEvent.PaymentSent(
+                CashuPayment(walletId, false, 600, 1, 1_700_000_600, CashuPaymentStatus.Complete, "pre", null),
+            ),
+        )
+        waitUntil("paid after failing") { PaymentActivityStore.get(id)?.status == SonarPaymentActivity.Status.Paid }
+        assertNull(PaymentActivityStore.get(id)!!.failure)
+
+        native.emit(
+            CashuEvent.PaymentFailed(
+                CashuPayment(walletId, false, 600, 0, 1_700_000_601, CashuPaymentStatus.Failed, null, null),
+            ),
+        )
+        delay(200)
+        assertEquals(SonarPaymentActivity.Status.Paid, PaymentActivityStore.get(id)!!.status, "paid is final")
+        assertEquals(1, native.count("send"), "nothing is ever re-sent")
+    }
+
     @Test
     fun aPendingChatPayIsReceiptedOnlyOnceItSettles() = runBlocking {
         native.confirmedSats = 10_000

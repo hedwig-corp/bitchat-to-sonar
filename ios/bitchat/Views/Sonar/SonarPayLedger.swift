@@ -391,11 +391,16 @@ final class SonarPaymentActivityLedger: ObservableObject {
         entries.values.compactMap { $0.status == .pending ? $0.walletPaymentId : nil }
     }
 
+    /// `walletPaymentId`: the wallet payment that failed, so a later update
+    /// saying that same payment completed can still find this row.
     @discardableResult
-    func markFailed(_ id: String, message: String) -> Bool {
+    func markFailed(_ id: String, message: String, walletPaymentId: String? = nil) -> Bool {
         guard var entry = entries[id] else { return false }
         entry.status = .failed
         entry.failure = message
+        if let walletPaymentId, !walletPaymentId.isEmpty, entry.walletPaymentId == nil {
+            entry.walletPaymentId = walletPaymentId
+        }
         entry.settledAt = Date()
         entries[id] = entry
         sortedCache = nil

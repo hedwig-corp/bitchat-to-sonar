@@ -3132,11 +3132,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (ev.status != CashuPaymentStatus.Complete && ev.status != CashuPaymentStatus.Failed) return
-        val row = PaymentActivityStore.sorted().firstOrNull {
-            it.status == SonarPaymentActivity.Status.Pending &&
-                it.direction == SonarPaymentActivity.Direction.Outgoing &&
-                it.walletPaymentId == ev.paymentId
-        } ?: return
+        val rows = PaymentActivityStore.sorted().filter {
+            it.direction == SonarPaymentActivity.Direction.Outgoing && it.walletPaymentId == ev.paymentId
+        }
+        // A Complete also settles a row that already FAILED under this wallet
+        // payment: a send reported failed whose melt the mint then paid. The
+        // money left; the row must not keep saying "you were not charged".
+        val row = rows.firstOrNull { it.status == SonarPaymentActivity.Status.Pending }
+            ?: rows.firstOrNull {
+                it.status == SonarPaymentActivity.Status.Failed && ev.status == CashuPaymentStatus.Complete
+            }
+            ?: return
         scope.launch {
             settlePendingWalletSend(
                 activityId = row.id,
@@ -3190,7 +3196,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val row = PaymentActivityStore.get(activityId) ?: return
         val watching = (screen as? Screen.PaymentStatus)?.activityId == activityId
         if (complete) {
-            if (!PaymentActivityStore.markPaidIfPending(activityId, row.walletPaymentId, feesSats, settledAtSecs)) return
+            if (!PaymentActivityStore.markPaidIfUnsettled(activityId, row.walletPaymentId, feesSats, settledAtSecs)) return
+            if (row.status == SonarPaymentActivity.Status.Failed) {
+                sonarLog("SonarApp", "wallet payment ${row.walletPaymentId} reported failed, then paid: settled as paid")
+            }
             if (livePayments.containsKey(activityId)) {
                 livePayments = livePayments - activityId
                 stopPaymentClockIfIdle()

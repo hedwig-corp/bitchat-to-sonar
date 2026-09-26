@@ -195,6 +195,49 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.releaseQuietly()
     }
 
+    /// A send the wallet reported failed, whose melt the mint then paid (an
+    /// ambiguous confirm): the later Complete for the same wallet payment
+    /// settles the row as paid and owes the chat receipt; the row must not
+    /// keep saying "you were not charged". A later failure never un-pays it.
+    func testASendReportedFailedIsPaidByALaterCompleteForItsWalletPayment() {
+        let (ledger, ledgerSuite) = freshLedger()
+        defer { UserDefaults(suiteName: ledgerSuite)?.removePersistentDomain(forName: ledgerSuite) }
+        var receipts = Set<String>()
+        ledger.recordPending(chatActivity(id: "act-f", sats: 900))
+        func payment(_ id: String, _ status: SonarWalletPayment.Status) -> SonarWalletPayment {
+            SonarWalletPayment(
+                id: id, amountSats: 900, isIncoming: false, timestamp: Date(), note: nil,
+                feesSats: 1, preimage: status == .complete ? String(repeating: "cd", count: 32) : nil,
+                status: status
+            )
+        }
+
+        let first = SonarWalletPaymentReconciler.applySendResult(
+            payment("quote-f", .failed), activityId: "act-f", ledger: ledger, hasReceipt: { receipts.contains($0) }
+        )
+        XCTAssertEqual(first, .failed(activityId: "act-f"))
+        XCTAssertEqual(ledger.entries["act-f"]?.walletPaymentId, "quote-f", "the failed payment stays findable")
+
+        XCTAssertEqual(
+            SonarWalletPaymentReconciler.applyUpdate(payment("quote-other", .complete), ledger: ledger, hasReceipt: { receipts.contains($0) }),
+            .none,
+            "another payment's outcome"
+        )
+        let late = SonarWalletPaymentReconciler.applyUpdate(
+            payment("quote-f", .complete), ledger: ledger, hasReceipt: { receipts.contains($0) }
+        )
+        XCTAssertEqual(late, .paid(activityId: "act-f", receiptDue: true), "PAY + PAYDONE are owed now")
+        XCTAssertEqual(ledger.entries["act-f"]?.status, .paid)
+        XCTAssertNil(ledger.entries["act-f"]?.failure)
+
+        receipts.insert("act-f")
+        XCTAssertEqual(
+            SonarWalletPaymentReconciler.applyUpdate(payment("quote-f", .failed), ledger: ledger, hasReceipt: { receipts.contains($0) }),
+            .none
+        )
+        XCTAssertEqual(ledger.entries["act-f"]?.status, .paid, "paid is final")
+    }
+
     /// The outcome event can land BEFORE the send's own Pending result is
     /// handled; the wallet must report the terminal state for that id, never
     /// downgrade it back to Pending.
