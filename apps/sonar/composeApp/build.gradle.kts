@@ -131,6 +131,11 @@ val buildAndroidRustCore = tasks.register<Exec>("buildAndroidRustCore") {
     inputs.file(repoRootDir.resolve("core/Cargo.lock"))
     inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
     inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
+    // sonar-ffi's wallet crates: a change there must rebuild the .so, or an
+    // UP-TO-DATE task ships the previous wallet (and its bindings).
+    inputs.dir(repoRootDir.resolve("core/sonar-wallet/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-wallet-cdk/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-stickers/src"))
     inputs.dir(repoRootDir.resolve("core/vendor/nostr-blossom/src"))
     inputs.property(
         "sonarAbis",
@@ -158,6 +163,9 @@ val buildDesktopRustCore = tasks.register<Exec>("buildDesktopRustCore") {
     inputs.file(repoRootDir.resolve("core/sonar-ble/Cargo.toml"))
     inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
     inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-wallet/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-wallet-cdk/src"))
+    inputs.dir(repoRootDir.resolve("core/sonar-stickers/src"))
     inputs.dir(repoRootDir.resolve("core/sonar-ble/src"))
     inputs.file(rootProject.file("gradle/libs.versions.toml"))
     outputs.file(desktopBindingsFile)

@@ -324,7 +324,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
 
     private func handleFCMToken(_ fcmToken: String, source: String) {
         Self.pushLog.info("FCM token available from \(source, privacy: .public)")
-        let wallet = (sonarStore?.wallet as? BridgedWallet)?.walletService
+        // The Breez NDS webhook exists only for the LEGACY wallet, and only
+        // while it exists; the primary (Cashu) wallet needs no push webhook.
+        let wallet = sonarStore?.legacyWallet?.walletService
         SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
     }
 
@@ -337,7 +339,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
             SonarPushProcessor.process(
                 userInfo: userInfo,
                 marmot: sonarStore?.marmot,
-                wallet: sonarStore?.wallet,
+                legacyWallet: sonarStore?.legacyWallet,
                 fetchCompletionHandler: completionHandler
             )
         }

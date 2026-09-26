@@ -227,8 +227,12 @@ fun SonarRadarScreen(state: SonarAppState) {
             balanceSats = state.walletBalanceSats(),
             mesh = false,
             fiatOf = { state.fiatOrNull(it) },
-            onSend = { state.sendSatsToUnify(p.id, it); paySheet = null },
+            // No feeQuote: the Unify peer's offer is read over BLE only
+            // after Send, so this sheet shows no fee and the ceiling is null.
+            onSend = { sats, _ -> state.sendSatsToUnify(p.id, sats); paySheet = null },
             onClose = { paySheet = null },
+            maxSats = state.maxSendableSats(),
+            onSendMax = { sats, _ -> state.sendSatsToUnify(p.id, sats, feeFromAmount = true); paySheet = null },
         )
     }
 }

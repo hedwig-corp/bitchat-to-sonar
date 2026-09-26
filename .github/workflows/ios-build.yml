@@ -6,7 +6,8 @@ name: iOS build
 # (missing `import BitLogger`) and another where an FFI signature change broke
 # the Apple build; both were found by hand, days apart.
 #
-# This job only proves the app COMPILES. It cannot catch runtime bugs — the
+# This job proves the app COMPILES, and runs the wallet XCTest classes (money
+# code) on a simulator. It cannot catch other runtime bugs — the
 # launch-surface hang in #368 compiled perfectly. Catching that class needs a
 # smoke launch (boot a simulator, install, assert the launch surface goes away),
 # which wants a UI test target and is deliberately left as a follow-up.
@@ -58,6 +59,14 @@ jobs:
       - name: Build the Rust core for iOS
         run: ./core/build-ios.sh
 
+      # Regenerating alone is not enough: the app then compiles against the
+      # FRESH binding while the committed one can be stale. That hid a
+      # missing symbol and an outdated checksum on #586 — a stale xcframework
+      # paired with that file crashes at launch with apiChecksumMismatch.
+      # A diff here means: run core/build-ios.sh and commit SonarFFI.swift.
+      - name: Committed Swift bindings are current
+        run: git diff --exit-code -- ios/localPackages/SonarCore/Sources/SonarFFI.swift
+
       # `CODE_SIGNING_ALLOWED=NO` keeps this credential-free — a compile check
       # must not need the signing identity or any gitignored secret. The app
       # builds without `Local.xcconfig` / `GoogleService-Info.plist`; both are
@@ -70,6 +79,64 @@ jobs:
             -scheme 'bitchat (iOS)' \
             -configuration Debug \
             -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO
+
+      # Money code gets a runtime floor: ONLY the wallet XCTest classes run
+      # here (the full bitchatTests_iOS suite has known parallel-clone flakes;
+      # see docs/REGRESSIONS.md "iOS tests do not run in CI"). They drive the
+      # Cashu wallet service, the pending-payment reconciler, the legacy
+      # Breez delete gate / presence check and the money-display prefs
+      # against fakes — no network, no keychain entitlement needed.
+      # Shares the build step's derived data so only the test bundle compiles.
+      - name: Wallet XCTests (iOS Simulator)
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          for runtime in sorted(devices, reverse=True):
+              if "iOS" not in runtime:
+                  continue
+              for d in devices[runtime]:
+                  if d.get("isAvailable") and "iPhone" in d.get("deviceTypeIdentifier", ""):
+                      print(d["udid"]); sys.exit(0)
+          ')
+          if [ -z "$UDID" ]; then
+            echo "no available iPhone simulator" >&2
+            xcrun simctl list devices available
+            exit 1
+          fi
+          echo "Using simulator $UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          xcodebuild test \
+            -project ios/bitchat.xcodeproj \
+            -scheme 'bitchat (iOS)' \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/ios-derived" \
+            -parallel-testing-enabled NO \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -only-testing:bitchatTests_iOS/CashuWalletServiceTests \
+            -only-testing:bitchatTests_iOS/CashuWalletLifecycleTests \
+            -only-testing:bitchatTests_iOS/CashuWalletUXTests \
+            -only-testing:bitchatTests_iOS/SonarLegacyWalletTests \
+            -only-testing:bitchatTests_iOS/SonarMoneyDisplayTests \
+            -only-testing:bitchatTests_iOS/CashuOfferBackupTests \
+            -only-testing:bitchatTests_iOS/WalletReceiveNotificationTests \
+            -only-testing:bitchatTests_iOS/SonarHandleAddressTests \
+            -only-testing:bitchatTests_iOS/SonarPaymentStatusTests \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee "$RUNNER_TEMP/wallet-tests.log"
+          # A selector that matches nothing still "succeeds": prove the
+          # classes actually ran.
+          for suite in CashuWalletServiceTests CashuWalletLifecycleTests CashuWalletUXTests SonarLegacyWalletTests SonarMoneyDisplayTests CashuOfferBackupTests WalletReceiveNotificationTests SonarHandleAddressTests SonarPaymentStatusTests; do
+            grep -q "Test Suite '$suite' passed" "$RUNNER_TEMP/wallet-tests.log" \
+              || { echo "wallet test suite $suite did not run/pass" >&2; exit 1; }
+          done

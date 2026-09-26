@@ -121,10 +121,8 @@ struct SonarPaymentStatusScreen: View {
             .padding(.top, 14)
             .animation(.easeInOut(duration: 0.7), value: status.phase)
 
-            // .rs-hint
-            Text(verbatim: SNPayStatusCopy.hint(
-                status.phase, payee: status.payeeName, sats: status.sats
-            ))
+            // .rs-hint (states a risen fee — see `SNPayStatusCopy.hint(for:)`)
+            Text(verbatim: SNPayStatusCopy.hint(for: status))
             .font(SonarTheme.uiFont(size: 12.5))
             .lineSpacing(12.5 * 0.5)
             .foregroundColor(SonarTheme.text2)

@@ -65,7 +65,7 @@ import chat.bitchat.sonar.resources.no_signup_your_identity_is_a_private
 import chat.bitchat.sonar.resources.nsec1
 import chat.bitchat.sonar.resources.out_of_range_still_reachable
 import chat.bitchat.sonar.resources.paste_key
-import chat.bitchat.sonar.resources.paste_your_nsec_private_key_to_bring
+import chat.bitchat.sonar.resources.paste_your_nsec_private_key_this
 import chat.bitchat.sonar.resources.pick_a_nickname
 import chat.bitchat.sonar.resources.private_by_design
 import chat.bitchat.sonar.resources.restore_account
@@ -340,7 +340,7 @@ private fun StepRestore(
         Text(stringResource(Res.string.restore_account), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
         Text(
-            stringResource(Res.string.paste_your_nsec_private_key_to_bring),
+            stringResource(Res.string.paste_your_nsec_private_key_this),
             color = s.text2, fontSize = 16.sp, lineHeight = 21.sp,
         )
         Spacer(Modifier.height(22.dp))

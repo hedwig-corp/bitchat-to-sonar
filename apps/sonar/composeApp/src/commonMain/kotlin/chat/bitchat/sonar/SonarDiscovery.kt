@@ -55,6 +55,15 @@ data class SonarAnnounce(
         return out.toByteArray()
     }
 
+    /** This announce as it may go on the mesh. The signed 0x53 packet must fit
+     *  ONE BLE attribute value: Android 13+ throws (and the app crashes) on a
+     *  larger notify or write. Only the offer can push it over — a mint's
+     *  BOLT12 offer is ~400 chars — so drop it and keep [CAP_PAY]: the payer
+     *  reads the offer from the Nostr descriptor, as it does for every iOS peer
+     *  (iOS never puts the offer in its announce). */
+    fun forMesh(): SonarAnnounce =
+        if (bolt12Offer == null || encode().size <= MAX_MESH_PAYLOAD_BYTES) this else copy(bolt12Offer = null)
+
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is SonarAnnounce) return false
@@ -72,6 +81,11 @@ data class SonarAnnounce(
         const val CAP_MARMOT = 0x01
         const val CAP_PAY = 0x02
         const val CAP_CALLS = 0x04   // bit2: speaks Sonar voice/video calls
+
+        /** Largest 0x53 payload whose signed packet fits one 512-byte BLE
+         *  attribute: 512 − 14 (v1 header) − 8 (sender id) − 64 (signature).
+         *  Padding never grows a packet this size past 512 (`mesh.rs` `pad`). */
+        const val MAX_MESH_PAYLOAD_BYTES = 426
 
         /** Decode a TLV payload. Returns null if malformed or no npub present.
          *  Type 0x05 (BOLT12 offer) uses a 2-byte length; all others 1 byte. */

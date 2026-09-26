@@ -328,6 +328,314 @@ share a zone with the app and report the zone the app shared with it.
   notification (no transcript rebuild loop).
 - **Guard:** `client.rs::marking_an_already_read_conversation_does_not_notify` (#615)
 
+## Wallet (Cashu)
+
+Money scenarios never need real sats: point a DEBUG iOS build at a local
+`cdk-mintd` with `ln_backend = "fakewallet"` (the `sonar.debug.cashuMintURL`
+override; recipe in `SonarCashuStorage`), and use a second fakewallet mint for
+"foreign" invoices. The DEBUG override is also read from the launch arguments
+(`simctl launch <udid> sh.hedwig.sonar -sonar.debug.cashuMintURL <url>`). To
+reproduce what a real network does to a payment, put
+`scripts/qa/mint-proxy.py` between the app and the mint and arm one fault at
+a time (a lost melt answer, a melt request that arrives late or never, a mint
+answer past the wallet's deadline); `sonar-cashu-cli --mint <proxy>` drives
+the same core headlessly. Steps that only read from the mint (offer, invoice, fee
+quote) are safe against `mint.hedwig.sh`. The Compose build has no mint
+override, so on Android the money-moving scenarios stay manual against the
+real mint and need the maintainer's approval of the amounts.
+
+### QA-078 — Receive shows a real, reusable offer
+- **Platforms:** both (Android automated; iOS manual)
+- **Steps:** Settings → Balance → **Receive**.
+- **Expect:** the Wallet screen does not stay on "Mint offline — retrying"
+  (the offer is cached, so a QR alone passes over a broken store); the QR
+  decodes to a BOLT12 offer (`lno1…`); Copy puts the full
+  offer on the clipboard ("Copied" for ~1.7 s); caption "Anyone can pay this
+  address — any amount, as often as they like."; with no mint yet, "Your
+  wallet is still connecting to the mint." instead of a QR.
+- **How:** `android-smoke.sh` QA-078 · Guard: `receive_offer_is_stable_across_calls_reconnects_and_offline`
+- **Origin:** #614 (the wallet had no way to be funded from outside).
+
+### QA-079 — One-time invoice for an amount, retired once paid
+- **Platforms:** both (manual, fake mint)
+- **Steps:** Receive → *Request an amount* 210 → *Create invoice* → pay it.
+- **Expect:** the QR swaps to an `lnbc…` invoice, caption "One-time invoice
+  for …"; when **that** payment lands, "Received …" shows and the sheet goes
+  back to the reusable address. A same-sized payment to the offer does not
+  retire the invoice.
+- **Guard:** `a_bolt11_invoice_is_paid_under_the_id_it_was_issued_with` (core),
+  `a_paid_invoice_arrives_under_its_payment_id` (FFI),
+  `CashuWalletUXTests.testOnlyTheShownInvoicesPaymentRetiresIt`,
+  `PayFooterTest.onlyTheShownInvoicesPaymentRetiresIt`
+- **Origin:** #614 (a paid one-time invoice stayed on screen as payable).
+
+### QA-080 — The fee is shown before confirming, in sats
+- **Platforms:** both (manual)
+- **Steps:** with fiat display on, Send → paste an invoice or offer → open the
+  confirm sheet; change the amount.
+- **Expect:** "Checking the fee…" then "Network fee: up to N **sats**" (never
+  "CHF 0.00"), re-quoted after the amount settles; Send waits only while
+  "Checking the fee…" shows (a failed quote hides the line and does not block
+  — see QA-095). The footer reads "Pays this Lightning invoice." / "Pays this
+  Bolt12 offer.", never "Pays lnbc…'s wallet".
+- **Guard:** `CashuWalletUXTests.testPaySheetFeeLineIsAlwaysInSats`,
+  `testFeeLineShowsTheQuotedFee`, `testPaySheetFooterNamesInvoicesAndOffersNotPeople`,
+  `PayFooterTest.theFeeLineIsAlwaysInSats`, `aRawLightningInvoiceIsNotAName`
+- **Origin:** #614 (fee hidden until after consent; a 1-sat reserve shown as
+  "CHF 0.00"; raw invoices named as people).
+
+### QA-081 — A pasted invoice shows its exact amount
+- **Platforms:** both (manual; exhaustive by unit test)
+- **Steps:** paste a `lnbc2100n…` invoice (210 sats) into Send.
+- **Expect:** the sheet says **210** sats (not 211); after paying, the
+  activity row is −210.
+- **Guard:** `Bolt11AmountTest.wholeSatAmountsAreExactNeverRoundedUp`,
+  `CashuWalletUXTests.testBolt11WholeSatAmountsAreExact`
+- **Origin:** #614 (floating-point parse read 210.00000000000003 and rounded up).
+
+### QA-082 — A send the mint refuses settles as Failed
+- **Platforms:** both (manual, fake mint: pay an invoice the mint has already
+  paid itself)
+- **Steps:** send; relaunch the app if a row from an older build is still
+  "Taking longer than usual · still in flight".
+- **Expect:** the row reads "Failed", the amount is struck through, the
+  balance is unchanged; a stuck row settles to Failed on the next connect.
+- **Guard:** `a_melt_the_mint_refuses_is_failed_not_in_flight`,
+  `a_refused_melt_is_failed_in_history_and_lookup`,
+  `a_pending_melt_the_mint_later_fails_is_reported_and_refunded`
+- **Origin:** #614 (a refused send stayed "still in flight" forever).
+
+### QA-083 — Restore brings the ecash back
+- **Platforms:** both (manual)
+- **Steps:** Settings → Restore account with an nsec whose wallet holds ecash.
+- **Expect:** after the wallet connects, the balance matches the old wallet's
+  (NUT-13 restore); the previous account's `sonar-cashu/<id>/` stays on disk;
+  the sheet says "Your wallet is rebuilt…", not "Lightning wallet".
+- **Guard:** `connect_restores_again_after_proof_db_is_deleted`,
+  `surviving_restore_marker_does_not_skip_nut13_when_proof_db_is_gone` (R-050)
+- **Origin:** #614.
+
+### QA-084 — Chat ⚡PAY to a contact
+- **Platforms:** both (manual; the payee can be headless: a `sonar-cli` peer
+  whose descriptor carries a second wallet's offer on the same mint)
+- **Steps:** open the chat → + → *Send money* → amount → Send.
+- **Expect:** the fee line prices the contact's cached offer; the bubble reads
+  "Paid"; the peer receives `⚡PAY` then `⚡PAYDONE`; the payee's wallet
+  mints the amount. Same-mint payments settle internally and carry no
+  preimage (known gap, `docs/WALLET-INTEGRATION.md`), so the receipt says
+  "They received N sats." and never claims a "cryptographic proof".
+- **Guard:** `PaymentStatusTest.aSettledPaymentNeverClaimsAProofItMayNotHave`,
+  `SonarPaymentStatusTests.testASettledPaymentNeverClaimsAProofItMayNotHave`
+- **Origin:** #614 (QA pass: the receipt promised a proof an internal
+  settlement does not have).
+
+### QA-085 — Two Sonars in Bluetooth range, both with a wallet
+- **Platforms:** Android (two emulators share the virtual Bluetooth medium,
+  so any second running Sonar emulator is a mesh peer); iOS sends no offer in
+  its announce
+- **Steps:** onboard, let the wallet publish its offer, keep the app open
+  with another Sonar in range for 2 min.
+- **Expect:** the peer shows up ("1 here now") and the app never crashes;
+  logcat has no `max length of an attribute value`.
+- **Guard:** `WalletAppStateTest.theMeshAnnounceCarryingTheCashuOfferFitsOneBleAttribute`
+  (real `SonarAppState` → real mesh engine framing; red without the fix)
+- **Origin:** #614 QA pass — every install now has a ~400-char mint offer; the
+  0x53 announce carried it, a > 512-byte GATT notify/write threw on Android
+  13+, and the app crash-looped whenever another Sonar was near.
+
+### QA-086 — The wallet store survives background/foreground churn
+- **Platforms:** Android first (no redb file lock there), then iOS
+- **Steps:** with the wallet connected, press HOME and relaunch 40 times at
+  random 0.3–3 s intervals (throttle the emulator network,
+  `adb emu network speed gsm`, to keep syncs in flight); then open the wallet.
+- **Expect:** logcat never shows `DB corrupted` or `Database already open`;
+  the wallet reconnects and shows its balance, not "Mint offline — retrying".
+- **Guard:** `a_reconnect_while_the_old_wallet_is_still_in_use_shares_its_store`
+  (core; fails with "Database already open" without the fix)
+- **Origin:** #614 QA pass — the Android store came back "All roots are
+  corrupted" after a session of crashes and lifecycle churn: a reconnect
+  opened a second redb writer while an in-flight call held the old wallet,
+  and Rust's std has no file lock on Android to refuse it.
+
+### QA-087 — A damaged wallet store is rebuilt from the key
+- **Platforms:** both (Android automated; iOS manual on the fake-mint simulator)
+- **Steps:** with the app stopped, damage `sonar-cashu/<id>/mainnet/cashu.redb`
+  (Android: `run-as` + `dd` over the header; iOS: the app container), relaunch,
+  open the wallet.
+- **Expect:** the wallet comes online (never stuck on "Mint offline —
+  retrying"), the balance comes back through the NUT-13 restore, and the
+  damaged file is kept as `cashu.redb.corrupt-<secs>`.
+- **How:** `android-smoke.sh` QA-087 · Guard:
+  `a_corrupted_store_is_set_aside_and_rebuilt_from_the_seed`,
+  `a_store_that_panics_redb_on_open_is_rebuilt_too`
+- **Origin:** #614 QA pass — a corrupted store failed every connect forever;
+  some damage made redb panic inside connect.
+
+### QA-088 — A payment from outside Sonar raises a banner
+- **Platforms:** both (manual; iOS on the fake mint, whose invoices pay
+  themselves)
+- **Steps:** Receive → request an amount → create the invoice (or have an
+  outside wallet pay the offer) with the app open.
+- **Expect:** one "Payment received" notification ("N sats received."), not
+  repeated when the payment is replayed, and none for our own sends. It
+  comes about 30 s after the payment: the wallet first waits for a chat ⚡PAY
+  line that would announce it (QA-090).
+- **Guard:** `WalletReceiveNotificationTests.testAnOutsidePaymentIsAnnouncedOnceWhenItSettles`,
+  `WalletAppStateTest.anOutsidePaymentIsAnnouncedOnceWhenItSettles`
+- **Origin:** #614 — an outside payment has no chat line, so nothing
+  announced it; the money just appeared.
+
+### QA-090 — A chat ⚡PAY is announced once
+- **Platforms:** both (manual; iOS on the fake mint: a `sonar-cli` peer sends
+  the `⚡PAY|1|<hex>|<sats>` line and `sonar-cashu-cli` pays the app's offer
+  from a funded fake-mint wallet)
+- **Steps:** with the app open, (a) the peer sends ⚡PAY for N sats, then the
+  offer is paid N; (b) the offer is paid M, then within 30 s the peer sends
+  ⚡PAY for M; (c) the offer is paid K with no ⚡PAY.
+- **Expect:** no "Payment received" banner for (a) or (b), whose chat line
+  announces them; one banner for (c) after about 30 s. Check the system log
+  for `sonar-payment-wallet-<quote id>` requests.
+- **Guard:** `WalletReceiveNotificationTests.testAChatPaymentIsAnnouncedByItsChatLineOnly`,
+  `WalletAppStateTest.aChatPaymentIsAnnouncedByItsChatLineOnly`,
+  `ReceiveAnnouncerTest`
+- **Origin:** #614 — every chat payment raised the chat notification and a
+  second "Payment received" banner from the wallet.
+
+### QA-089 — A reinstall keeps the same receive offer
+- **Platforms:** both (Android automated, destructive: `QA_ALLOW_WIPE=1` on a
+  throwaway emulator; iOS manual: delete and reinstall on a throwaway
+  simulator. The simulator keeps the key in the Keychain, so the account
+  comes back without a restore; on the fake mint write the DEBUG mint
+  override before the first launch, or the wallet merges against the real
+  mint first)
+- **Steps:** restore a throwaway key, read the Receive QR, wait for the offer
+  to be backed up, clear the app (or reinstall), restore the same key, read
+  the QR again.
+- **Expect:** the same `lno1…` offer both times; a payment made to it after
+  the reinstall is minted by the new install.
+- **How:** `android-smoke.sh` QA-089 · Guard:
+  `an_offer_backup_brings_the_offer_and_its_payments_back_after_a_reinstall`,
+  `wallet_offer_backups_are_sealed_to_the_account_and_survive_a_reinstall`,
+  `CashuWalletEngineTest.aReinstalledWalletPublishesItsBackedUpOfferNotANewOne`,
+  `CashuOfferBackupTests.testAReinstalledWalletPublishesItsBackedUpOfferNotANewOne`
+- **Origin:** #614 — the offer's quote id lived only on the device, so a
+  reinstall published a new offer and payments to the old one stayed at the
+  mint, unclaimed.
+
+### QA-091 — A send whose melt request is lost is never reported Failed
+- **Platforms:** both (one Rust core; iOS on the fake mint through
+  `scripts/qa/mint-proxy.py`; headless with `sonar-cashu-cli --mint <proxy>`)
+- **Steps:** fund the wallet, get a foreign invoice from the second fake mint,
+  `mint-proxy.py arm drop-melt` (the melt POST is cut off before the mint
+  sees it and held), pay the invoice. Then either `mint-proxy.py deliver`
+  (the request reaches the mint late and is paid) or `mint-proxy.py discard`
+  (it never arrives). Repeat once with an app relaunch before `deliver`.
+- **Expect:** while the request is out the payment reads "Taking longer than
+  usual … Still in flight — held, not lost", never "Payment failed — you
+  were not charged". After `deliver`: "Paid … They received N sats" within a
+  watcher pass, balance down by the amount and fee, the mint's melt quote
+  PAID. After `discard`: "Couldn't send … not charged" once 60 s have passed,
+  balance unchanged. A relaunch in between changes nothing.
+- **Guard:** `a_compensated_melt_the_mint_pays_late_is_pending_then_paid`,
+  `a_compensated_melt_still_unpaid_after_the_grace_window_is_failed`,
+  `an_ambiguous_melt_is_still_tracked_after_a_relaunch`,
+  `a_lost_melt_answer_is_pending_in_lookups_until_the_mint_answers`;
+  app side `aSendReportedFailedIsPaidWhenTheWalletLaterCompletesIt`,
+  `testASendReportedFailedIsPaidByALaterCompleteForItsWalletPayment`
+- **Origin:** #614 review (High). CDK compensates a melt whose POST got no
+  answer when the mint then reads Unpaid, and returns `PaymentFailed`, the
+  same error as a real failure. With the proxy, the build before the fix said
+  Failed, the mint then paid 210 sats, and the wallet kept counting them.
+- **Known limit:** a request that reaches the mint more than 60 s after its
+  connection dropped is paid over a Failed row. HTTP stacks time requests
+  out long before that; `discard` exists so a pass never delivers one late.
+
+### QA-092 — A melt still on its way to the mint is left to its send
+- **Platforms:** both (headless or iOS through the proxy)
+- **Steps:** `mint-proxy.py arm delay-melt 12`, pay a foreign invoice.
+- **Expect:** in flight for about 12 s, then paid; never Failed; the balance
+  is exact afterwards.
+- **Guard:** `a_pass_during_a_confirm_in_flight_leaves_that_melt_alone`
+- **Origin:** #614 review. The watcher's `finalize_pending_melts` resumed
+  every open melt, including one whose confirm a send was still awaiting;
+  the mint read Unpaid and CDK compensated a payment it then made. End to
+  end the race does not show through CDK's own HTTP client, which queued the
+  watcher's status check behind the melt POST in this pass; the unit test
+  against the in-process fake mint is the guard.
+
+### QA-093 — A mint that answers after the wallet's deadline does not cut it off
+- **Platforms:** both (one Rust core; iOS on the fake mint through the proxy)
+- **Steps:** `mint-proxy.py arm delay-mint-answer 20` (the mint issues at once,
+  its answer arrives after the wallet's 15 s deadline), then Receive → request
+  an amount; the fake mint pays the invoice.
+- **Expect:** "Received N sats" shows within about 20 s; the log has one
+  "a mint call was abandoned mid-flight: opening a fresh connection" and no
+  stream of "mint-quote poll failed … timed out" afterwards. Sends and
+  receives keep working without a relaunch.
+- **Guard:** `connector::tests::a_call_abandoned_mid_flight_rebuilds_the_client_once`,
+  `a_mint_call_that_timed_out_is_recovered_on_the_next_pass`
+- **Origin:** #614 QA pass (round 4). After one timed-out mint call every later
+  request to the mint timed out, every watcher pass, until the app was
+  relaunched: the HTTP client under CDK (bitreq 0.3) keeps a cached
+  connection waiting forever for an answer nobody reads. The build before
+  the review fixes behaves the same.
+
+### QA-094 — An address on the old wallet moves only when the user says so
+- **Platforms:** both (manual: needs an account whose handle was claimed on a
+  pre-Cashu build and still has its Breez wallet, i.e. a build with a Breez
+  key; the registrar's DNS TXT is readable with
+  `dig TXT <name>.user._bitcoin-payment.sonarprivacy.xyz`)
+- **Steps:** update such an install to this build, open it and wait for the
+  wallet to come online; read the TXT record. Open Profile (and Settings,
+  and the Wallet screen's old-wallet card). Tap Move to new wallet, read the
+  confirmation, confirm. Read the TXT record again. Then Move back to your
+  old wallet, confirm, read it once more.
+- **Expect:** after the update the TXT record still carries the Breez offer
+  and every surface says "Your address … still pays your old wallet." The
+  confirmation says payments will go to the new wallet held as ecash at
+  mint.hedwig.sh, that the old wallet stays spendable, and that deleting the
+  new wallet does not move the address back. After confirming, the record
+  carries the Cashu offer and the notice is gone; after moving back it
+  carries the Breez offer again. A relaunch neither asks again nor
+  re-registers. With the registrar unreachable the move shows its error and
+  the notice stays.
+- **Guard:** `WalletAppStateTest.anAddressOnTheOldWalletMovesOnlyOnAConfirmedMove`,
+  `SonarHandleAddressTests.testAnAddressOnTheOldWalletMovesOnlyOnAConfirmedMove`,
+  `HandleAddressTest`, `SonarHandleAddressTests.testHandleOfferActionMatrix`
+- **Origin:** #614 review (H3) — once a Cashu offer existed, the descriptor
+  publish re-claimed the public handle with it, retargeting its DNS record at
+  the mint with no confirmation, and nothing ever wrote the Breez offer back.
+
+### QA-095 — The fee paid never exceeds the fee shown
+- **Platforms:** both (manual, fake mint: raise the fee reserve between the
+  sheet's quote and Send with `mint-proxy.py arm inflate-melt-fee 40`, which
+  rewrites the next melt quote's answer; unit tests drive it with a scripted
+  reserve). Passed on the iOS simulator in #614 QA round 4: "up to 3 sats"
+  on the sheet, refused at 40, Try again paid with a 3-sat fee.
+- **Steps:** Send → paste an offer → type an amount, wait for "Network fee:
+  up to N sats" → raise the reserve → Send. On the status screen tap **Try
+  again**. Repeat from a chat ⚡PAY sheet; and once with the mint stopped
+  while the sheet quotes (no fee line), then started before Send.
+- **Expect:** nothing is sent; the payment fails with "The network fee is now
+  up to M sats. Nothing was sent — try again to pay it." — on the status
+  screen in place of "No route…", as a toast for a chat pay. **Try again**
+  pays with M as the new ceiling (a further rise is refused again). With no
+  fee on screen, any non-zero fee is refused the same way. The Send button
+  is disabled while "Checking the fee…" shows.
+- **Guard:** `CashuWalletEngineTest.aFeeAboveTheConsentedCeilingIsRefusedWithTheNewFeeAndNothingIsSent`,
+  `WalletAppStateTest.aDestinationPaymentAboveTheConsentedFeeFailsWithTheNewFeeAndTryAgainPaysIt`,
+  `WalletAppStateTest.aChatPayAboveTheConsentedFeeIsRefusedWithTheNewFee`,
+  `PaySheetFeeConsentTest`,
+  `CashuWalletServiceTests.testAFeeAboveTheConsentedCeilingIsRefusedWithTheNewFeeAndNothingIsSent`,
+  `CashuWalletServiceTests.testADestinationPaymentAboveTheConsentedFeeFailsAndTryAgainPaysTheNewFee`,
+  `CashuWalletUXTests.testTheConsentedCeilingIsTheFeeOnScreen`,
+  `SonarPaymentStatusTests.testAFeeChangeIsStatedOnlyOnAFailedPayment`
+- **Not covered:** the Unify nearby sheet shows no fee (its offer is read over
+  BLE after Send), so a Unify send has no ceiling on either platform.
+- **Origin:** #614 maintainer review — the sheet's "up to N" came from a
+  discarded quote and Send re-prepared and paid whatever the new reserve was,
+  checked only against the balance.
+
 ## Open questions (need a product decision, not a fix)
 
 - **Data usage (A24):** "Wi-Fi only" is stored but nothing reads it on either
@@ -335,8 +643,14 @@ share a zone with the app and report the zone the app shared with it.
   (gate media auto-download on metered links) or remove it.
 - **Bitcoin mode default (A23):** both apps default to sats; the old copy
   claimed fiat. Which one is intended?
+  Note (#614): on iOS the SDK fallback is sats, but the app picks fiat in the
+  locale currency on first run (`applyFirstRunMoneyDefaults` before #614,
+  `SonarMoneyDisplay` after), so a fresh iOS install shows fiat.
 
 - **Fingerprint card (A3/A6):** iOS shows the Noise (mesh) key fingerprint,
   Android the nsec pubkey fingerprint — people comparing in person across
   platforms never match. Android also shows "Generating…" on the onboarding
   done step because the nsec is created on *Start chatting*.
+- **Exact "send all" (#618):** Max leaves the mint's unused fee reserve as
+  change (5 sats in the #614 live test). A mint-side zero reserve for same-mint
+  payments is under discussion (cashubtc/cdk#2606).

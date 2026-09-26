@@ -80,4 +80,12 @@ object SpendableBalance {
      */
     fun insufficientMessage(amountSats: Long, feeSats: Long, balanceSats: Long): String =
         "Amount plus fee ($amountSats + $feeSats sats) exceeds your balance of $balanceSats sats."
+
+    /**
+     * Same refusal when the wallet reports insufficient funds before a fee is
+     * known (the Cashu mint's typed `InsufficientFunds`). Never shows a
+     * made-up fee.
+     */
+    fun insufficientBalanceMessage(balanceSats: Long): String =
+        "Amount plus fee exceeds your balance of $balanceSats sats."
 }

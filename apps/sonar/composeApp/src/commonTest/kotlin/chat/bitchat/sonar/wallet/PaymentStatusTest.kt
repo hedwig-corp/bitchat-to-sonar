@@ -109,6 +109,36 @@ class PaymentStatusTest {
         )
     }
 
+    /**
+     * A send refused because the fee rose carries the new fee, so the screen
+     * can state it before `Try again` pays it — but only while the row is a
+     * concluded failure: a row that settled or is still in flight never
+     * reads as "the fee changed".
+     */
+    @Test
+    fun aFeeChangeIsStatedOnlyOnAFailedPayment() {
+        val failed = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Failed, settledAtSecs = 1_010),
+            live = null, nowSecs = 2_000, canRetry = true, feeChangedSats = 40,
+        )
+        assertEquals(PayPhase.FailedSafe, failed.phase)
+        assertEquals(40L, failed.feeChangedSats)
+        assertEquals(PayAction.Effect.Retry, PayStatusCopy.actions(failed).first().effect)
+
+        val paid = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Paid, settledAtSecs = 1_004),
+            live = null, nowSecs = 2_000, canRetry = true, feeChangedSats = 40,
+        )
+        assertNull(paid.feeChangedSats)
+        val inFlight = paymentStatusOf(
+            activity(SonarPaymentActivity.Status.Pending), live(), nowSecs = 1_001, canRetry = true, feeChangedSats = 40,
+        )
+        assertNull(inFlight.feeChangedSats)
+        assertNull(
+            paymentStatusOf(activity(SonarPaymentActivity.Status.Failed), null, 2_000, canRetry = true).feeChangedSats
+        )
+    }
+
     @Test
     fun aPendingRowWithNoLiveSendIsUnknownNotFailed() {
         // The process died mid-send. We genuinely cannot say the payment
@@ -128,7 +158,7 @@ class PaymentStatusTest {
             PayPhase.Resolving to "Nothing sent yet — your sats are still yours",
             PayPhase.Paying to "2,100 sats in flight — not yet settled",
             PayPhase.Slow to "Still in flight — held, not lost",
-            PayPhase.Sent to "2,100 sats delivered · proof received",
+            PayPhase.Sent to "2,100 sats delivered",
             PayPhase.FailedSafe to "Nothing left your wallet — balance unchanged",
             PayPhase.Refunded to "2,100 sats returned to your balance",
             PayPhase.Unknown to "Sats reserved — we’ll confirm or refund automatically",
@@ -136,6 +166,18 @@ class PaymentStatusTest {
         for ((phase, text) in expected) {
             assertEquals(text, PayStatusCopy.money(phase, 2_100).second, "money line for $phase")
         }
+    }
+
+    @Test
+    fun aSettledPaymentNeverClaimsAProofItMayNotHave() {
+        // A payment inside one mint settles internally, with no preimage.
+        val lines = listOf(
+            PayStatusCopy.hint(PayPhase.Sent, "Ana", 2_100),
+            PayStatusCopy.money(PayPhase.Sent, 2_100).second,
+            PayStatusCopy.walletRow(PayPhase.Sent, 0),
+            PayStatusCopy.homeStrip(PayPhase.Sent, "Ana", 2_100).second,
+        )
+        for (line in lines) assertFalse("proof" in line, line)
     }
 
     @Test

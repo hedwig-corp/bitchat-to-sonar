@@ -1077,3 +1077,70 @@ async fn timezone_share_does_not_notify_or_increment_unread() {
         "kind-449 must not increment unread"
     );
 }
+
+/// A wallet's receive-offer pointer (its mint quote id) exists only on the
+/// device, so a reinstall lost it. Its backups go to the account's relays,
+/// sealed to the account's own key, one event per backup: a reinstall with
+/// the same key reads every one back, a newer backup never replaces an older
+/// one, and nobody else can read them.
+#[tokio::test]
+async fn wallet_offer_backups_are_sealed_to_the_account_and_survive_a_reinstall() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let account = Identity::generate();
+    let older = r#"{"v":1,"quote_id":"q-old","offer":"lno1old","index":0}"#;
+    let newer = r#"{"v":1,"quote_id":"q-new","offer":"lno1new","index":1}"#;
+
+    let phone = SonarClient::connect_in_memory(account.clone(), vec![relay_url.clone()])
+        .await
+        .expect("phone connects");
+    phone
+        .publish_wallet_offer_backup(older)
+        .await
+        .expect("backup older");
+    phone
+        .publish_wallet_offer_backup(newer)
+        .await
+        .expect("backup newer");
+    phone
+        .publish_wallet_offer_backup(newer)
+        .await
+        .expect("the same backup again");
+
+    let reinstalled = SonarClient::connect_in_memory(account.clone(), vec![relay_url.clone()])
+        .await
+        .expect("reinstall connects");
+    let mut restored = reinstalled
+        .fetch_wallet_offer_backups()
+        .await
+        .expect("fetch ok");
+    restored.sort();
+    assert_eq!(restored, vec![newer.to_string(), older.to_string()]);
+
+    // Only ciphertext reaches the relay.
+    let observer = NostrClient::default();
+    observer.add_relay(relay_url.clone()).await.unwrap();
+    observer.connect().await;
+    let raw = observer
+        .fetch_events(
+            Filter::new()
+                .author(account.public_key())
+                .kind(Kind::Custom(30078)),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("raw fetch");
+    assert!(!raw.is_empty(), "premise: the backups are on the relay");
+    assert!(raw
+        .iter()
+        .all(|e| !e.content.contains("q-old") && !e.content.contains("q-new")));
+
+    let stranger = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
+        .await
+        .expect("stranger connects");
+    assert!(stranger
+        .fetch_wallet_offer_backups()
+        .await
+        .expect("fetch ok")
+        .is_empty());
+}

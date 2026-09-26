@@ -448,6 +448,8 @@ internal fun SonarScreenHost(state: SonarAppState) {
             is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
             is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
             is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
+            is Screen.SendPaymentFromLegacy ->
+                chat.bitchat.sonar.screens.SonarSendPaymentScreen(state, fromLegacy = true)
             is Screen.PaymentStatus ->
                 chat.bitchat.sonar.screens.SonarPaymentStatusScreen(state, sc.activityId)
             is Screen.Backup -> chat.bitchat.sonar.screens.SonarBackupScreen(state)
@@ -2391,8 +2393,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // The receipt follows the chat route; the actual payment settles over Lightning.
         mesh = screen.id.startsWith("mesh:"),
         fiatOf = { state.fiatOrNull(it) },
-        onSend = { sats -> scope.launch { state.sendPay(screen.id, sats)?.let { state.toast = it } } },
-        onClose = { paySheet = false }
+        onSend = { sats, maxFee -> scope.launch { state.sendPay(screen.id, sats, maxFee)?.let { state.toast = it } } },
+        onClose = { paySheet = false },
+        maxSats = state.maxSendableSats(),
+        onSendMax = { sats, maxFee ->
+            scope.launch { state.sendPay(screen.id, sats, maxFee, feeFromAmount = true)?.let { state.toast = it } }
+        },
+        feeQuote = { sats -> state.quoteChatPayFee(screen.id, sats) },
     )
     if (verifySheet) VerifySheet(
         peerName = peerName,

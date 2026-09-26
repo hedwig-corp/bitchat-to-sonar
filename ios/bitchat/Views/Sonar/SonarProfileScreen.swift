@@ -309,6 +309,34 @@ struct SNKeyShareCard: View {
     }
 
     private func keyShareButtonLabel(icon: SNIconName, iconWeight: CGFloat, text: String, fg: Color, bg: Color) -> some View {
+        SNPairButtonLabel(icon: icon, iconWeight: iconWeight, text: text, fg: fg, bg: bg)
+    }
+}
+
+// MARK: - Equal-width button pair label (keyshare-btns)
+
+/// One half of the equal-width button pair under the key QR ("Copy key" on
+/// the accent fill, "Share" on the neutral fill). Shared with the wallet's
+/// Receive / Send pair and the Receive sheet's Copy / Share, so every pair
+/// has the same height, radius, font and icon size.
+struct SNPairButtonLabel: View {
+    let icon: SNIconName
+    var iconWeight: CGFloat = 2
+    let text: String
+    let fg: Color
+    let bg: Color
+
+    /// Accent-filled half ("Copy key", "Receive").
+    static func accent(icon: SNIconName, iconWeight: CGFloat = 2.2, text: String) -> SNPairButtonLabel {
+        SNPairButtonLabel(icon: icon, iconWeight: iconWeight, text: text, fg: SonarTheme.onAccent, bg: SonarTheme.accentFill)
+    }
+
+    /// Neutral half ("Share", "Send").
+    static func neutral(icon: SNIconName, iconWeight: CGFloat = 2, text: String) -> SNPairButtonLabel {
+        SNPairButtonLabel(icon: icon, iconWeight: iconWeight, text: text, fg: SonarTheme.text, bg: SonarTheme.surface2)
+    }
+
+    var body: some View {
         HStack(spacing: 7) {
             SNIcon(name: icon, size: 17, weight: iconWeight)
             Text(verbatim: text)

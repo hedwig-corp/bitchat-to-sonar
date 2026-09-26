@@ -249,7 +249,10 @@ struct SonarPaymentActivity: Codable, Equatable, Identifiable {
     let peerKey: String
     let peerName: String
     let direction: Direction
-    let sats: Int64
+    /// What this payment moves. Starts as the amount the user asked for; a
+    /// Cashu `Max` send (fee taken from the amount) replaces it with the
+    /// amount the mint actually quoted once the wallet has it.
+    var sats: Int64
     let via: String
     let createdAt: Date
     let destinationHash: String?
@@ -364,11 +367,40 @@ final class SonarPaymentActivityLedger: ObservableObject {
         return true
     }
 
+    /// The wallet accepted the payment and it is in flight (a Cashu
+    /// `Pending`): remember the wallet's payment id so its later outcome can
+    /// finish this row. The row stays `pending` — in flight is not failed.
     @discardableResult
-    func markFailed(_ id: String, message: String) -> Bool {
+    func markHandedToWallet(_ id: String, walletPaymentId: String, sats: Int64? = nil) -> Bool {
+        guard var entry = entries[id], entry.status == .pending else { return false }
+        entry.walletPaymentId = walletPaymentId
+        if let sats, sats > 0 { entry.sats = sats }
+        entries[id] = entry
+        sortedCache = nil
+        persist()
+        return true
+    }
+
+    /// The activity row a wallet payment id belongs to, if any.
+    func activityId(forWalletPayment walletPaymentId: String) -> String? {
+        entries.values.first { $0.walletPaymentId == walletPaymentId }?.id
+    }
+
+    /// Wallet payment ids of rows still waiting for an outcome.
+    var pendingWalletPaymentIds: [String] {
+        entries.values.compactMap { $0.status == .pending ? $0.walletPaymentId : nil }
+    }
+
+    /// `walletPaymentId`: the wallet payment that failed, so a later update
+    /// saying that same payment completed can still find this row.
+    @discardableResult
+    func markFailed(_ id: String, message: String, walletPaymentId: String? = nil) -> Bool {
         guard var entry = entries[id] else { return false }
         entry.status = .failed
         entry.failure = message
+        if let walletPaymentId, !walletPaymentId.isEmpty, entry.walletPaymentId == nil {
+            entry.walletPaymentId = walletPaymentId
+        }
         entry.settledAt = Date()
         entries[id] = entry
         sortedCache = nil

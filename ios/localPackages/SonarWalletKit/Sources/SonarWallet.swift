@@ -86,15 +86,19 @@ public final class SonarWallet {
         }
     }
 
-    public struct SupportedCurrency: Sendable, Equatable {
-        public let code: String
-        public let symbol: String
-        public let decimals: Int
-    }
-
-    public struct ExchangeRate: Sendable, Equatable {
-        public let currencyCode: String
-        public let rate: Double
+    /// What the legacy delete gate and the restore check need to know,
+    /// read right after a `sync()` on a connected node.
+    public struct LegacyInspection: Sendable, Equatable {
+        public let balanceSat: UInt64
+        public let pendingSendSat: UInt64
+        public let pendingReceiveSat: UInt64
+        /// Swaps whose funds must be refunded on-chain (`listRefundables`).
+        public let refundableSwaps: Int
+        /// Payments not in a terminal state (anything other than complete,
+        /// failed or timed out — pending, refundable, refund pending, ...).
+        public let unsettledPayments: Int
+        /// Whether the wallet has ANY payment history.
+        public let hasHistory: Bool
     }
 
     // MARK: - State
@@ -105,11 +109,11 @@ public final class SonarWallet {
     private var apiKey: String = ""
     private var mainnet = true
     private var workingDir = ""
-    private var ratesCache: [ExchangeRate] = []
 
-    private static let seedKey = "seed.v1"
-    private static let modeKey = "display.mode"
-    private static let currencyKey = "display.currency"
+    /// Keychain account of the Breez seed inside `KeychainWalletStorage.service`.
+    /// The legacy-wallet presence check and deletion target exactly this item.
+    public static let seedAccount = "seed.v1"
+    private static let seedKey = seedAccount
 
     public private(set) var isConfigured = false
 
@@ -271,20 +275,6 @@ public final class SonarWallet {
         return entropyHex
     }
 
-    /// Generate + persist a random 32-byte seed (standalone path).
-    @discardableResult
-    public func createWallet() async throws -> String {
-        try ensureConfigured()
-        var seed = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, seed.count, &seed) == errSecSuccess else {
-            throw WalletError.core("failed to generate wallet seed")
-        }
-        guard storage.putData(Self.seedKey, Data(seed)) else {
-            throw WalletError.core("failed to persist wallet seed")
-        }
-        return Self.hex(seed)
-    }
-
     public func loadWallet() async throws -> String? {
         try ensureConfigured()
         return storage.getData(Self.seedKey).map { Self.hex([UInt8]($0)) }
@@ -413,68 +403,34 @@ public final class SonarWallet {
         }
     }
 
-    // MARK: - Money display (plain Swift; sats or fiat via the cached rate)
+    // MARK: - Legacy inspection (delete gate / restore check)
 
-    public func supportedCurrencies() -> [SupportedCurrency] {
-        [
-            SupportedCurrency(code: "USD", symbol: "$", decimals: 2),
-            SupportedCurrency(code: "EUR", symbol: "€", decimals: 2),
-            SupportedCurrency(code: "GBP", symbol: "£", decimals: 2),
-            SupportedCurrency(code: "CHF", symbol: "₣", decimals: 2),
-        ]
-    }
-
-    public func fetchExchangeRates() async -> [ExchangeRate] {
-        guard let node = sdk else { return ratesCache }
-        let rates: [ExchangeRate] = (try? await run {
-            try node.fetchFiatRates().map { ExchangeRate(currencyCode: $0.coin.uppercased(), rate: $0.value) }
-        }) ?? ratesCache
-        ratesCache = rates.isEmpty ? ratesCache : rates
-        return ratesCache
-    }
-
-    public func cachedExchangeRates() -> [ExchangeRate] { ratesCache }
-
-    public func displayMode() -> String { storage.getString(Self.modeKey) ?? "bitcoin" }
-
-    @discardableResult
-    public func setDisplayMode(_ mode: String) async -> String {
-        storage.putString(Self.modeKey, mode); return mode
-    }
-
-    public func displayCurrency() -> String { storage.getString(Self.currencyKey) ?? "USD" }
-
-    @discardableResult
-    public func setDisplayCurrency(_ code: String) async -> String {
-        storage.putString(Self.currencyKey, code); return code
-    }
-
-    /// SDK-free formatting: fiat when the mode is "fiat" AND a live rate exists,
-    /// else sats. Callers gate the fiat path on their own `hasLiveRate`.
-    public func formatAmount(sats: Int64) -> String {
-        if displayMode() == "fiat", let rate = rate(for: displayCurrency()) {
-            let fiat = Double(sats) / 100_000_000.0 * rate
-            let cur = supportedCurrencies().first { $0.code == displayCurrency() }
-            return "\(cur?.symbol ?? "")\(String(format: "%.2f", fiat))"
+    /// Sync with the Breez backend, then read balance, pending amounts,
+    /// refundable swaps and unsettled payments. Throws when the node is not
+    /// running or any read fails — callers treat that as "unknown", which the
+    /// delete gate never accepts as safe.
+    public func syncAndInspect() async throws -> LegacyInspection {
+        guard let node = sdk else { throw WalletError.notConfigured }
+        return try await run {
+            try node.sync()
+            let info = try node.getInfo().walletInfo
+            let refundables = try node.listRefundables()
+            let unsettled = try node.listPayments(req: ListPaymentsRequest(
+                states: [.created, .pending, .refundable, .refundPending, .waitingFeeAcceptance]
+            ))
+            let anyPayment = try node.listPayments(req: ListPaymentsRequest(limit: 1))
+            return LegacyInspection(
+                balanceSat: info.balanceSat,
+                pendingSendSat: info.pendingSendSat,
+                pendingReceiveSat: info.pendingReceiveSat,
+                refundableSwaps: refundables.count,
+                unsettledPayments: unsettled.count,
+                hasHistory: !anyPayment.isEmpty
+            )
         }
-        return "\(sats) sats"
-    }
-
-    /// Convert typed fiat (or sats) text to sats using the cached rate. 0 if unparseable.
-    public func parseFiatInput(_ text: String, currencyCode: String) -> Int64 {
-        let cleaned = text.filter { $0.isNumber || $0 == "." }
-        guard let value = Double(cleaned) else { return 0 }
-        if displayMode() == "fiat", let rate = rate(for: currencyCode), rate > 0 {
-            return Int64((value / rate) * 100_000_000.0)
-        }
-        return Int64(value)
     }
 
     // MARK: - Helpers
-
-    private func rate(for currency: String) -> Double? {
-        ratesCache.first { $0.currencyCode == currency.uppercased() }?.rate
-    }
 
     public func registerWebhook(url: String) async throws {
         try ensureConfigured()

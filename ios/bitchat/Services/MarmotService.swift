@@ -847,6 +847,16 @@ final class MarmotService: @unchecked Sendable {
 
     /// Fetch a peer's public Sonar descriptor. nil means not confirmed Sonar,
     /// not necessarily White Noise-only.
+    /// Back up the wallet's offer pointer to our relays, sealed to our own key.
+    func publishWalletOfferBackup(_ backup: String) async throws {
+        try await run { try $0.requireNode().publishWalletOfferBackup(backup: backup) }
+    }
+
+    /// Every wallet offer backup we published; throws when no relay answered.
+    func fetchWalletOfferBackups() async throws -> [String] {
+        try await run { try $0.requireNode().fetchWalletOfferBackups() }
+    }
+
     func fetchSonarDescriptor(npub: String) async throws -> SonarDescriptor? {
         try await run {
             try $0.requireNode().fetchSonarDescriptor(npub: npub).map {

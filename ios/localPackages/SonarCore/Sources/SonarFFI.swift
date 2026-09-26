@@ -505,6 +505,22 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -1241,6 +1257,455 @@ public func FfiConverterTypeMeshReassembler_lower(_ value: MeshReassembler) -> U
 
 
 /**
+ * Sonar's Cashu wallet for one account at one mint.
+ *
+ * `working_dir` MUST be per account (the store refuses another account's
+ * seed): hosts use `<root>/sonar-cashu/<sha256(nsec)[:16] hex>/mainnet`.
+ */
+public protocol SonarCashuWalletProtocol: AnyObject, Sendable {
+
+    /**
+     * Local store read (no network). Requires `connect`.
+     */
+    func balance() throws  -> WalletBalance
+
+    func clearListener()
+
+    /**
+     * Open the store and reach the mint: loads mint info, runs a NUT-13
+     * restore when one is owed (new device, wipe, lost store), recovers
+     * payments a crash interrupted, and starts the payment watcher.
+     * Idempotent; `Busy` while another connect is in flight. Bounded — a
+     * hung mint yields `Timeout`, never a stuck call.
+     */
+    func connect() throws
+
+    /**
+     * Stop the watcher and release the store. Infallible in practice. Do
+     * not call while a `send` is in flight on another thread.
+     */
+    func disconnect() throws
+
+    func isConnected()  -> Bool
+
+    /**
+     * Most recent payments, newest first. Local store read.
+     */
+    func listPayments(limit: UInt32) throws  -> [WalletPayment]
+
+    /**
+     * The payment with this id: from history (the most recent 500), else —
+     * for an outgoing payment history does not show, such as a send the mint
+     * refused and the wallet rolled back — what the mint reports for its
+     * melt quote. `None` when the wallet knows nothing about the id.
+     */
+    func lookupPayment(id: String) throws  -> WalletPayment?
+
+    /**
+     * The published offer's pointer, for the host to back up off the device
+     * (`SonarNode::publish_wallet_offer_backup` seals it to the account key).
+     * Without it a reinstall publishes a new offer and payments to the old
+     * one stay at the mint. `None` until an offer exists. Local, no network.
+     */
+    func offerBackup()  -> String?
+
+    /**
+     * Classify what the user typed or scanned. Offline.
+     */
+    func parseDestination(input: String) throws  -> WalletDestination
+
+    /**
+     * Price a payment without paying: the mint quotes amount and fee
+     * reserve. `amount_sats` is required for amountless destinations and
+     * must agree with an amount the destination fixes.
+     */
+    func prepareSend(destination: String, amountSats: UInt64?) throws  -> WalletPreparedSend
+
+    /**
+     * A one-off BOLT11 invoice for `amount_sats`, with the id its payment
+     * will carry.
+     */
+    func receiveInvoice(amountSats: UInt64, description: String?) throws  -> WalletInvoice
+
+    /**
+     * THE wallet's receive offer (BOLT12, amountless, reusable) — the one
+     * hosts publish. Stable across calls and launches; answered from disk
+     * with no network once created. The first call needs `connect`.
+     */
+    func receiveOffer() throws  -> String
+
+    /**
+     * Bring backed-up offers back after a reinstall: the newest becomes the
+     * published offer when this store has none, and every backed-up quote the
+     * store lacks is re-adopted so its payments are still minted. Needs
+     * `connect`; returns how many quotes were adopted.
+     */
+    func restoreOfferBackups(backups: [String]) throws  -> UInt32
+
+    /**
+     * Pay a prepared send — the one spending call. A result with
+     * `status: Pending` is NOT a failure: the payment may be routing, and
+     * its outcome arrives as an event with the same `id`. Never retry a
+     * Pending send with a new quote; that can pay twice.
+     */
+    func send(prepared: WalletPreparedSend, note: String) throws  -> WalletPayment
+
+    /**
+     * Replace the event listener (one per wallet).
+     */
+    func setListener(listener: CashuWalletListener)
+
+    /**
+     * Reconcile now: mint paid receives, settle pending sends. An error
+     * means reconciliation did not complete — retry later.
+     */
+    func sync() throws
+
+    /**
+     * Delete this wallet's local store. Refused while connected. Proofs
+     * the mint has signed stay restorable from the nsec (NUT-13); sats paid
+     * to a quote but not yet minted do not — only a panic wipe should call
+     * this.
+     */
+    func wipeLocalStorage() throws
+
+}
+/**
+ * Sonar's Cashu wallet for one account at one mint.
+ *
+ * `working_dir` MUST be per account (the store refuses another account's
+ * seed): hosts use `<root>/sonar-cashu/<sha256(nsec)[:16] hex>/mainnet`.
+ */
+open class SonarCashuWallet: SonarCashuWalletProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_sonarcashuwallet(self.handle, $0) }
+    }
+    /**
+     * Local only: derives the seed and binds the object to its store. No
+     * network and no store I/O happen until `connect`.
+     */
+public convenience init(nsec: String, mintUrl: String, workingDir: String)throws  {
+    let handle =
+        try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_constructor_sonarcashuwallet_new(
+        FfiConverterString.lower(nsec),
+        FfiConverterString.lower(mintUrl),
+        FfiConverterString.lower(workingDir),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_sonarcashuwallet(handle, $0) }
+    }
+
+
+
+
+    /**
+     * Local store read (no network). Requires `connect`.
+     */
+open func balance()throws  -> WalletBalance  {
+    return try  FfiConverterTypeWalletBalance_lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_balance(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+open func clearListener()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_clear_listener(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
+     * Open the store and reach the mint: loads mint info, runs a NUT-13
+     * restore when one is owed (new device, wipe, lost store), recovers
+     * payments a crash interrupted, and starts the payment watcher.
+     * Idempotent; `Busy` while another connect is in flight. Bounded — a
+     * hung mint yields `Timeout`, never a stuck call.
+     */
+open func connect()throws   {try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_connect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
+     * Stop the watcher and release the store. Infallible in practice. Do
+     * not call while a `send` is in flight on another thread.
+     */
+open func disconnect()throws   {try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_disconnect(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+open func isConnected() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_is_connected(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * Most recent payments, newest first. Local store read.
+     */
+open func listPayments(limit: UInt32)throws  -> [WalletPayment]  {
+    return try  FfiConverterSequenceTypeWalletPayment.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_list_payments(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+
+    /**
+     * The payment with this id: from history (the most recent 500), else —
+     * for an outgoing payment history does not show, such as a send the mint
+     * refused and the wallet rolled back — what the mint reports for its
+     * melt quote. `None` when the wallet knows nothing about the id.
+     */
+open func lookupPayment(id: String)throws  -> WalletPayment?  {
+    return try  FfiConverterOptionTypeWalletPayment.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_lookup_payment(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),$0
+    )
+})
+}
+
+    /**
+     * The published offer's pointer, for the host to back up off the device
+     * (`SonarNode::publish_wallet_offer_backup` seals it to the account key).
+     * Without it a reinstall publishes a new offer and payments to the old
+     * one stay at the mint. `None` until an offer exists. Local, no network.
+     */
+open func offerBackup() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_offer_backup(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * Classify what the user typed or scanned. Offline.
+     */
+open func parseDestination(input: String)throws  -> WalletDestination  {
+    return try  FfiConverterTypeWalletDestination_lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_parse_destination(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(input),$0
+    )
+})
+}
+
+    /**
+     * Price a payment without paying: the mint quotes amount and fee
+     * reserve. `amount_sats` is required for amountless destinations and
+     * must agree with an amount the destination fixes.
+     */
+open func prepareSend(destination: String, amountSats: UInt64?)throws  -> WalletPreparedSend  {
+    return try  FfiConverterTypeWalletPreparedSend_lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_prepare_send(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(destination),
+        FfiConverterOptionUInt64.lower(amountSats),$0
+    )
+})
+}
+
+    /**
+     * A one-off BOLT11 invoice for `amount_sats`, with the id its payment
+     * will carry.
+     */
+open func receiveInvoice(amountSats: UInt64, description: String?)throws  -> WalletInvoice  {
+    return try  FfiConverterTypeWalletInvoice_lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_receive_invoice(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(amountSats),
+        FfiConverterOptionString.lower(description),$0
+    )
+})
+}
+
+    /**
+     * THE wallet's receive offer (BOLT12, amountless, reusable) — the one
+     * hosts publish. Stable across calls and launches; answered from disk
+     * with no network once created. The first call needs `connect`.
+     */
+open func receiveOffer()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_receive_offer(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * Bring backed-up offers back after a reinstall: the newest becomes the
+     * published offer when this store has none, and every backed-up quote the
+     * store lacks is re-adopted so its payments are still minted. Needs
+     * `connect`; returns how many quotes were adopted.
+     */
+open func restoreOfferBackups(backups: [String])throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_restore_offer_backups(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(backups),$0
+    )
+})
+}
+
+    /**
+     * Pay a prepared send — the one spending call. A result with
+     * `status: Pending` is NOT a failure: the payment may be routing, and
+     * its outcome arrives as an event with the same `id`. Never retry a
+     * Pending send with a new quote; that can pay twice.
+     */
+open func send(prepared: WalletPreparedSend, note: String)throws  -> WalletPayment  {
+    return try  FfiConverterTypeWalletPayment_lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_send(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeWalletPreparedSend_lower(prepared),
+        FfiConverterString.lower(note),$0
+    )
+})
+}
+
+    /**
+     * Replace the event listener (one per wallet).
+     */
+open func setListener(listener: CashuWalletListener)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_set_listener(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceCashuWalletListener_lower(listener),$0
+    )
+}
+}
+
+    /**
+     * Reconcile now: mint paid receives, settle pending sends. An error
+     * means reconciliation did not complete — retry later.
+     */
+open func sync()throws   {try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_sync(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
+     * Delete this wallet's local store. Refused while connected. Proofs
+     * the mint has signed stay restorable from the nsec (NUT-13); sats paid
+     * to a quote but not yet minted do not — only a panic wipe should call
+     * this.
+     */
+open func wipeLocalStorage()throws   {try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarcashuwallet_wipe_local_storage(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarCashuWallet: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = SonarCashuWallet
+
+    public static func lift(_ handle: UInt64) throws -> SonarCashuWallet {
+        return SonarCashuWallet(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: SonarCashuWallet) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarCashuWallet {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SonarCashuWallet, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarCashuWallet_lift(_ handle: UInt64) throws -> SonarCashuWallet {
+    return try FfiConverterTypeSonarCashuWallet.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarCashuWallet_lower(_ value: SonarCashuWallet) -> UInt64 {
+    return FfiConverterTypeSonarCashuWallet.lower(value)
+}
+
+
+
+
+
+
+/**
  * A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
  */
 public protocol SonarIdentityProtocol: AnyObject, Sendable {
@@ -1627,6 +2092,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws  -> StickerPackInfo
 
     /**
+     * Every wallet offer backup this account published, decrypted (empty
+     * when there are none). An error means the relays did not answer.
+     */
+    func fetchWalletOfferBackups() throws  -> [String]
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -1755,6 +2226,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * ⇒ an aborted publish self-heals on the next capability change or connect.
      */
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
+
+    /**
+     * Back up the wallet's receive-offer pointer (`SonarCashuWallet::offer_backup`)
+     * to our relays, NIP-44 sealed to our own key, one event per backup.
+     */
+    func publishWalletOfferBackup(backup: String) throws
 
     /**
      * Bounded local transcript windows for the most recent groups, newest
@@ -2494,6 +2971,18 @@ open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrl
 }
 
     /**
+     * Every wallet offer backup this account published, decrypted (empty
+     * when there are none). An error means the relays did not answer.
+     */
+open func fetchWalletOfferBackups()throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_fetch_wallet_offer_backups(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
 open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
@@ -2763,6 +3252,18 @@ open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12
         FfiConverterBool.lower(callsEnabled),
         FfiConverterSequenceString.lower(signaling),
         FfiConverterOptionString.lower(bolt12Offer),$0
+    )
+}
+}
+
+    /**
+     * Back up the wallet's receive-offer pointer (`SonarCashuWallet::offer_backup`)
+     * to our relays, NIP-44 sealed to our own key, one event per backup.
+     */
+open func publishWalletOfferBackup(backup: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_wallet_offer_backup(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(backup),$0
     )
 }
 }
@@ -4262,6 +4763,69 @@ public func FfiConverterTypeDrainNotificationInfo_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeDrainNotificationInfo_lower(_ value: DrainNotificationInfo) -> RustBuffer {
     return FfiConverterTypeDrainNotificationInfo.lower(value)
+}
+
+
+/**
+ * A fiat exchange rate: fiat units per whole BTC.
+ */
+public struct FiatRate: Equatable, Hashable {
+    /**
+     * ISO 4217, upper case.
+     */
+    public var currency: String
+    public var perBtc: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * ISO 4217, upper case.
+         */currency: String, perBtc: Double) {
+        self.currency = currency
+        self.perBtc = perBtc
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FiatRate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFiatRate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FiatRate {
+        return
+            try FiatRate(
+                currency: FfiConverterString.read(from: &buf),
+                perBtc: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FiatRate, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.currency, into: &buf)
+        FfiConverterDouble.write(value.perBtc, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFiatRate_lift(_ buf: RustBuffer) throws -> FiatRate {
+    return try FfiConverterTypeFiatRate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFiatRate_lower(_ value: FiatRate) -> RustBuffer {
+    return FfiConverterTypeFiatRate.lower(value)
 }
 
 
@@ -6119,6 +6683,376 @@ public func FfiConverterTypeStickerRefInfo_lower(_ value: StickerRefInfo) -> Rus
     return FfiConverterTypeStickerRefInfo.lower(value)
 }
 
+
+/**
+ * Balance snapshot, sats.
+ */
+public struct WalletBalance: Equatable, Hashable {
+    /**
+     * Spendable now.
+     */
+    public var confirmedSats: UInt64
+    /**
+     * Paid to us at the mint, not yet minted into proofs.
+     */
+    public var pendingReceiveSats: UInt64
+    /**
+     * On its way out: inputs of an in-flight or prepared payment.
+     */
+    public var pendingSendSats: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Spendable now.
+         */confirmedSats: UInt64,
+        /**
+         * Paid to us at the mint, not yet minted into proofs.
+         */pendingReceiveSats: UInt64,
+        /**
+         * On its way out: inputs of an in-flight or prepared payment.
+         */pendingSendSats: UInt64) {
+        self.confirmedSats = confirmedSats
+        self.pendingReceiveSats = pendingReceiveSats
+        self.pendingSendSats = pendingSendSats
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletBalance: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletBalance: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletBalance {
+        return
+            try WalletBalance(
+                confirmedSats: FfiConverterUInt64.read(from: &buf),
+                pendingReceiveSats: FfiConverterUInt64.read(from: &buf),
+                pendingSendSats: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletBalance, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.confirmedSats, into: &buf)
+        FfiConverterUInt64.write(value.pendingReceiveSats, into: &buf)
+        FfiConverterUInt64.write(value.pendingSendSats, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletBalance_lift(_ buf: RustBuffer) throws -> WalletBalance {
+    return try FfiConverterTypeWalletBalance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletBalance_lower(_ value: WalletBalance) -> RustBuffer {
+    return FfiConverterTypeWalletBalance.lower(value)
+}
+
+
+/**
+ * A destination classified offline (no mint round-trip).
+ */
+public struct WalletDestination: Equatable, Hashable {
+    public var raw: String
+    public var kind: WalletDestinationKind
+    /**
+     * Present when the destination fixes its own amount.
+     */
+    public var amountSats: UInt64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(raw: String, kind: WalletDestinationKind,
+        /**
+         * Present when the destination fixes its own amount.
+         */amountSats: UInt64?) {
+        self.raw = raw
+        self.kind = kind
+        self.amountSats = amountSats
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletDestination: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletDestination: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletDestination {
+        return
+            try WalletDestination(
+                raw: FfiConverterString.read(from: &buf),
+                kind: FfiConverterTypeWalletDestinationKind.read(from: &buf),
+                amountSats: FfiConverterOptionUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletDestination, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.raw, into: &buf)
+        FfiConverterTypeWalletDestinationKind.write(value.kind, into: &buf)
+        FfiConverterOptionUInt64.write(value.amountSats, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletDestination_lift(_ buf: RustBuffer) throws -> WalletDestination {
+    return try FfiConverterTypeWalletDestination.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletDestination_lower(_ value: WalletDestination) -> RustBuffer {
+    return FfiConverterTypeWalletDestination.lower(value)
+}
+
+
+/**
+ * A one-time BOLT11 invoice from `receive_invoice`. Its payment arrives as
+ * an incoming `WalletPayment` whose `id` equals `payment_id`, so a host can
+ * tell this invoice was paid (and stop showing it as payable).
+ */
+public struct WalletInvoice: Equatable, Hashable {
+    public var invoice: String
+    public var paymentId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(invoice: String, paymentId: String) {
+        self.invoice = invoice
+        self.paymentId = paymentId
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletInvoice: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletInvoice: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletInvoice {
+        return
+            try WalletInvoice(
+                invoice: FfiConverterString.read(from: &buf),
+                paymentId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletInvoice, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.invoice, into: &buf)
+        FfiConverterString.write(value.paymentId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletInvoice_lift(_ buf: RustBuffer) throws -> WalletInvoice {
+    return try FfiConverterTypeWalletInvoice.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletInvoice_lower(_ value: WalletInvoice) -> RustBuffer {
+    return FfiConverterTypeWalletInvoice.lower(value)
+}
+
+
+/**
+ * One payment, incoming or outgoing. `id` is stable: a live result, its
+ * later events, and history rows for the same payment share it.
+ */
+public struct WalletPayment: Equatable, Hashable {
+    public var id: String
+    public var incoming: Bool
+    /**
+     * Excluding fees.
+     */
+    public var amountSats: UInt64
+    public var feesSats: UInt64?
+    public var timestampSecs: UInt64
+    public var status: WalletPaymentStatus
+    /**
+     * Lightning preimage of an outgoing payment: the proof of payment.
+     */
+    public var preimage: String?
+    public var note: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, incoming: Bool,
+        /**
+         * Excluding fees.
+         */amountSats: UInt64, feesSats: UInt64?, timestampSecs: UInt64, status: WalletPaymentStatus,
+        /**
+         * Lightning preimage of an outgoing payment: the proof of payment.
+         */preimage: String?, note: String?) {
+        self.id = id
+        self.incoming = incoming
+        self.amountSats = amountSats
+        self.feesSats = feesSats
+        self.timestampSecs = timestampSecs
+        self.status = status
+        self.preimage = preimage
+        self.note = note
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletPayment: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletPayment: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletPayment {
+        return
+            try WalletPayment(
+                id: FfiConverterString.read(from: &buf),
+                incoming: FfiConverterBool.read(from: &buf),
+                amountSats: FfiConverterUInt64.read(from: &buf),
+                feesSats: FfiConverterOptionUInt64.read(from: &buf),
+                timestampSecs: FfiConverterUInt64.read(from: &buf),
+                status: FfiConverterTypeWalletPaymentStatus.read(from: &buf),
+                preimage: FfiConverterOptionString.read(from: &buf),
+                note: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletPayment, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterBool.write(value.incoming, into: &buf)
+        FfiConverterUInt64.write(value.amountSats, into: &buf)
+        FfiConverterOptionUInt64.write(value.feesSats, into: &buf)
+        FfiConverterUInt64.write(value.timestampSecs, into: &buf)
+        FfiConverterTypeWalletPaymentStatus.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.preimage, into: &buf)
+        FfiConverterOptionString.write(value.note, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletPayment_lift(_ buf: RustBuffer) throws -> WalletPayment {
+    return try FfiConverterTypeWalletPayment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletPayment_lower(_ value: WalletPayment) -> RustBuffer {
+    return FfiConverterTypeWalletPayment.lower(value)
+}
+
+
+/**
+ * A priced send, from `prepare_send`: what the user is agreeing to. Pass it
+ * back unchanged to `send`. `fees_sats` is the mint's fee RESERVE — the most
+ * the payment can cost on top of `amount_sats`; unused reserve returns.
+ */
+public struct WalletPreparedSend: Equatable, Hashable {
+    public var quoteId: String
+    public var destination: String
+    public var kind: WalletDestinationKind
+    public var amountSats: UInt64
+    public var feesSats: UInt64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(quoteId: String, destination: String, kind: WalletDestinationKind, amountSats: UInt64, feesSats: UInt64?) {
+        self.quoteId = quoteId
+        self.destination = destination
+        self.kind = kind
+        self.amountSats = amountSats
+        self.feesSats = feesSats
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletPreparedSend: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletPreparedSend: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletPreparedSend {
+        return
+            try WalletPreparedSend(
+                quoteId: FfiConverterString.read(from: &buf),
+                destination: FfiConverterString.read(from: &buf),
+                kind: FfiConverterTypeWalletDestinationKind.read(from: &buf),
+                amountSats: FfiConverterUInt64.read(from: &buf),
+                feesSats: FfiConverterOptionUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: WalletPreparedSend, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.quoteId, into: &buf)
+        FfiConverterString.write(value.destination, into: &buf)
+        FfiConverterTypeWalletDestinationKind.write(value.kind, into: &buf)
+        FfiConverterUInt64.write(value.amountSats, into: &buf)
+        FfiConverterOptionUInt64.write(value.feesSats, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletPreparedSend_lift(_ buf: RustBuffer) throws -> WalletPreparedSend {
+    return try FfiConverterTypeWalletPreparedSend.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletPreparedSend_lower(_ value: WalletPreparedSend) -> RustBuffer {
+    return FfiConverterTypeWalletPreparedSend.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
@@ -6408,6 +7342,118 @@ public func FfiConverterTypeCallStateInfo_lift(_ buf: RustBuffer) throws -> Call
 #endif
 public func FfiConverterTypeCallStateInfo_lower(_ value: CallStateInfo) -> RustBuffer {
     return FfiConverterTypeCallStateInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum CashuWalletEvent: Equatable, Hashable {
+
+    case connected
+    case disconnected
+    /**
+     * State changed without a payment the host tracks (e.g. a pending
+     * melt settled, or the offer rotated): re-read balance and offer.
+     */
+    case synced
+    case paymentReceived(payment: WalletPayment
+    )
+    /**
+     * Also emitted with `status: Pending` while a send is in flight; a later
+     * event with the same `id` carries the outcome.
+     */
+    case paymentSent(payment: WalletPayment
+    )
+    case paymentFailed(payment: WalletPayment
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension CashuWalletEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCashuWalletEvent: FfiConverterRustBuffer {
+    typealias SwiftType = CashuWalletEvent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CashuWalletEvent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .connected
+
+        case 2: return .disconnected
+
+        case 3: return .synced
+
+        case 4: return .paymentReceived(payment: try FfiConverterTypeWalletPayment.read(from: &buf)
+        )
+
+        case 5: return .paymentSent(payment: try FfiConverterTypeWalletPayment.read(from: &buf)
+        )
+
+        case 6: return .paymentFailed(payment: try FfiConverterTypeWalletPayment.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CashuWalletEvent, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .connected:
+            writeInt(&buf, Int32(1))
+
+
+        case .disconnected:
+            writeInt(&buf, Int32(2))
+
+
+        case .synced:
+            writeInt(&buf, Int32(3))
+
+
+        case let .paymentReceived(payment):
+            writeInt(&buf, Int32(4))
+            FfiConverterTypeWalletPayment.write(payment, into: &buf)
+
+
+        case let .paymentSent(payment):
+            writeInt(&buf, Int32(5))
+            FfiConverterTypeWalletPayment.write(payment, into: &buf)
+
+
+        case let .paymentFailed(payment):
+            writeInt(&buf, Int32(6))
+            FfiConverterTypeWalletPayment.write(payment, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCashuWalletEvent_lift(_ buf: RustBuffer) throws -> CashuWalletEvent {
+    return try FfiConverterTypeCashuWalletEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCashuWalletEvent_lower(_ value: CashuWalletEvent) -> RustBuffer {
+    return FfiConverterTypeCashuWalletEvent.lower(value)
 }
 
 
@@ -7012,6 +8058,459 @@ public func FfiConverterTypeSonarNotificationKindInfo_lower(_ value: SonarNotifi
     return FfiConverterTypeSonarNotificationKindInfo.lower(value)
 }
 
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum WalletDestinationKind: Equatable, Hashable {
+
+    case bolt11
+    case bolt12Offer
+    case lightningAddress
+    case lnurlPay
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletDestinationKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletDestinationKind: FfiConverterRustBuffer {
+    typealias SwiftType = WalletDestinationKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletDestinationKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .bolt11
+
+        case 2: return .bolt12Offer
+
+        case 3: return .lightningAddress
+
+        case 4: return .lnurlPay
+
+        case 5: return .unknown
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WalletDestinationKind, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .bolt11:
+            writeInt(&buf, Int32(1))
+
+
+        case .bolt12Offer:
+            writeInt(&buf, Int32(2))
+
+
+        case .lightningAddress:
+            writeInt(&buf, Int32(3))
+
+
+        case .lnurlPay:
+            writeInt(&buf, Int32(4))
+
+
+        case .unknown:
+            writeInt(&buf, Int32(5))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletDestinationKind_lift(_ buf: RustBuffer) throws -> WalletDestinationKind {
+    return try FfiConverterTypeWalletDestinationKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletDestinationKind_lower(_ value: WalletDestinationKind) -> RustBuffer {
+    return FfiConverterTypeWalletDestinationKind.lower(value)
+}
+
+
+
+/**
+ * Why a wallet call failed. Non-flat, with typed variants the hosts branch
+ * on: `InsufficientFunds` sizes a send down, `NotConnected`/`Timeout`/
+ * `Network` drive the reconnect UI. Fields are named `reason`, never
+ * `message` — that name collides with `Throwable.message` in Kotlin.
+ */
+public enum WalletFfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+
+
+    case NotConnected
+    case Busy(reason: String
+    )
+    case Unsupported(reason: String
+    )
+    case InvalidDestination(reason: String
+    )
+    case InsufficientFunds
+    case InvalidInput(reason: String
+    )
+    case Network(reason: String
+    )
+    case Timeout
+    case Backend(reason: String
+    )
+
+
+
+
+
+
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+
+}
+
+#if compiler(>=6)
+extension WalletFfiError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletFfiError: FfiConverterRustBuffer {
+    typealias SwiftType = WalletFfiError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletFfiError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+
+
+
+        case 1: return .NotConnected
+        case 2: return .Busy(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .Unsupported(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+        case 4: return .InvalidDestination(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+        case 5: return .InsufficientFunds
+        case 6: return .InvalidInput(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+        case 7: return .Network(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+        case 8: return .Timeout
+        case 9: return .Backend(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WalletFfiError, into buf: inout [UInt8]) {
+        switch value {
+
+
+
+
+
+        case .NotConnected:
+            writeInt(&buf, Int32(1))
+
+
+        case let .Busy(reason):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(reason, into: &buf)
+
+
+        case let .Unsupported(reason):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(reason, into: &buf)
+
+
+        case let .InvalidDestination(reason):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(reason, into: &buf)
+
+
+        case .InsufficientFunds:
+            writeInt(&buf, Int32(5))
+
+
+        case let .InvalidInput(reason):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(reason, into: &buf)
+
+
+        case let .Network(reason):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(reason, into: &buf)
+
+
+        case .Timeout:
+            writeInt(&buf, Int32(8))
+
+
+        case let .Backend(reason):
+            writeInt(&buf, Int32(9))
+            FfiConverterString.write(reason, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletFfiError_lift(_ buf: RustBuffer) throws -> WalletFfiError {
+    return try FfiConverterTypeWalletFfiError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletFfiError_lower(_ value: WalletFfiError) -> RustBuffer {
+    return FfiConverterTypeWalletFfiError.lower(value)
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum WalletPaymentStatus: Equatable, Hashable {
+
+    case pending
+    case complete
+    case failed
+    case refundable
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension WalletPaymentStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeWalletPaymentStatus: FfiConverterRustBuffer {
+    typealias SwiftType = WalletPaymentStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> WalletPaymentStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .pending
+
+        case 2: return .complete
+
+        case 3: return .failed
+
+        case 4: return .refundable
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: WalletPaymentStatus, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .pending:
+            writeInt(&buf, Int32(1))
+
+
+        case .complete:
+            writeInt(&buf, Int32(2))
+
+
+        case .failed:
+            writeInt(&buf, Int32(3))
+
+
+        case .refundable:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletPaymentStatus_lift(_ buf: RustBuffer) throws -> WalletPaymentStatus {
+    return try FfiConverterTypeWalletPaymentStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeWalletPaymentStatus_lower(_ value: WalletPaymentStatus) -> RustBuffer {
+    return FfiConverterTypeWalletPaymentStatus.lower(value)
+}
+
+
+
+
+
+/**
+ * Host observer for wallet events. Called on the wallet's own event
+ * thread, never the caller's; hop to the UI thread before touching UI.
+ * May call back into the wallet.
+ */
+public protocol CashuWalletListener: AnyObject, Sendable {
+
+    func onEvent(event: CashuWalletEvent)
+
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceCashuWalletListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceCashuWalletListener = UniffiVTableCallbackInterfaceCashuWalletListener(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceCashuWalletListener.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface CashuWalletListener: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceCashuWalletListener.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface CashuWalletListener: handle missing in uniffiClone")
+            }
+        },
+        onEvent: { (
+            uniffiHandle: UInt64,
+            event: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceCashuWalletListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onEvent(
+                     event: try FfiConverterTypeCashuWalletEvent_lift(event)
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceCashuWalletListener> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceCashuWalletListener>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitCashuWalletListener() {
+    uniffi_sonar_ffi_fn_init_callback_vtable_cashuwalletlistener(UniffiCallbackInterfaceCashuWalletListener.vtablePtr)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceCashuWalletListener {
+    fileprivate static let handleMap = UniffiHandleMap<CashuWalletListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceCashuWalletListener : FfiConverter {
+    typealias SwiftType = CashuWalletListener
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceCashuWalletListener_lift(_ handle: UInt64) throws -> CashuWalletListener {
+    return try FfiConverterCallbackInterfaceCashuWalletListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceCashuWalletListener_lower(_ v: CashuWalletListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceCashuWalletListener.lower(v)
+}
 
 
 
@@ -7884,6 +9383,30 @@ fileprivate struct FfiConverterOptionTypeStickerRefInfo: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeWalletPayment: FfiConverterRustBuffer {
+    typealias SwiftType = WalletPayment?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeWalletPayment.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeWalletPayment.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCallControlInfo: FfiConverterRustBuffer {
     typealias SwiftType = CallControlInfo?
 
@@ -8123,6 +9646,31 @@ fileprivate struct FfiConverterSequenceTypeDrainNotificationInfo: FfiConverterRu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeDrainNotificationInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFiatRate: FfiConverterRustBuffer {
+    typealias SwiftType = [FiatRate]
+
+    public static func write(_ value: [FiatRate], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFiatRate.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FiatRate] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FiatRate]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFiatRate.read(from: &buf))
         }
         return seq
     }
@@ -8398,6 +9946,31 @@ fileprivate struct FfiConverterSequenceTypeStickerInfo: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeStickerInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeWalletPayment: FfiConverterRustBuffer {
+    typealias SwiftType = [WalletPayment]
+
+    public static func write(_ value: [WalletPayment], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeWalletPayment.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [WalletPayment] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [WalletPayment]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeWalletPayment.read(from: &buf))
         }
         return seq
     }
@@ -9115,6 +10688,17 @@ public func wipeMarmotDatabase(dbPath: String)throws   {try rustCallWithError(Ff
     )
 }
 }
+/**
+ * Fetch display rates from Yadio (`sonar_wallet::YADIO_BTC_RATES_URL`),
+ * about 145 currencies. Blocking, bounded at 10s; call off the UI thread.
+ * Independent of any wallet, so a legacy wallet's UI can use it too.
+ */
+public func fetchFiatRates()throws  -> [FiatRate]  {
+    return try  FfiConverterSequenceTypeFiatRate.lift(try rustCallWithError(FfiConverterTypeWalletFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_fetch_fiat_rates($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -9294,6 +10878,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 46581) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_fetch_fiat_rates() != 25596) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_broadcast() != 44669) {
@@ -9500,6 +11087,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_pack() != 19095) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_wallet_offer_backups() != 44833) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9561,6 +11151,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 27940) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_wallet_offer_backup() != 45188) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
@@ -9686,6 +11279,57 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarsuspendlatch_is_interrupted() != 22902) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_balance() != 38348) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_clear_listener() != 16105) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_connect() != 65052) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_disconnect() != 106) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_is_connected() != 18465) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_list_payments() != 25012) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_lookup_payment() != 38504) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_offer_backup() != 24936) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_parse_destination() != 33322) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_prepare_send() != 24537) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_invoice() != 19291) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_receive_offer() != 22586) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_restore_offer_backups() != 23246) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_send() != 43113) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_set_listener() != 39372) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_sync() != 33124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarcashuwallet_wipe_local_storage() != 58333) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_constructor_meshlinkengine_new() != 12347) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9710,6 +11354,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_constructor_sonarsuspendlatch_new() != 52224) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_constructor_sonarcashuwallet_new() != 1289) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_conversationchangelistener_on_conversation_changed() != 35719) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9725,7 +11372,11 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_mediauploadlistener_is_cancelled() != 640) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_cashuwalletlistener_on_event() != 63812) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
+    uniffiCallbackInitCashuWalletListener()
     uniffiCallbackInitConversationChangeListener()
     uniffiCallbackInitMediaDownloadListener()
     uniffiCallbackInitMediaUploadListener()

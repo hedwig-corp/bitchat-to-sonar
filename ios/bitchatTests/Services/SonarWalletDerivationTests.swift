@@ -86,12 +86,15 @@ final class SonarWalletDerivationTests: XCTestCase {
             try? fm.removeItem(at: root)
         }
 
-        try BridgedWallet.wipeWalletFilesAndDefaults(
+        let storage = SonarLegacyWalletStorage(
             fileManager: fm,
             appGroupContainer: group,
             applicationSupportDirectory: support,
-            sharedDefaults: defaults
+            sharedDefaults: defaults,
+            defaults: defaults
         )
+        try storage.deleteStoreFiles()
+        storage.clearSharedCredentials()
 
         XCTAssertFalse(fm.fileExists(atPath: group.appendingPathComponent("breez-sdk").path))
         XCTAssertFalse(fm.fileExists(atPath: legacyWallet.path))

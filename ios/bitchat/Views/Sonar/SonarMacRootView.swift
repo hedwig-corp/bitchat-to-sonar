@@ -124,8 +124,9 @@ struct SonarMacRootView: View {
                     balance: store.balanceSats ?? 0,
                     money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
-                    onConfirmAmount: { dest, sats in
-                        store.confirmUnifyAmount(pay.peerId, destination: dest, sats: sats)
+                    usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
+                    onConfirmAmount: { dest, sats, feeFromAmount in
+                        store.confirmUnifyAmount(pay.peerId, destination: dest, sats: sats, feeFromAmount: feeFromAmount)
                     },
                     onClose: { store.dismissUnifyPay() }
                 )
@@ -674,10 +675,21 @@ private struct MacConversationPane: View {
                 transport: transport,
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
+                usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
+                quoteFee: store.feeQuoter(forContact: id),
                 onClose: { paySheet = false },
-                onSend: { sats in
+                onSend: { sats, maxFee in
                     Task {
-                        if let message = await store.sendPay(id, sats: sats) {
+                        if let message = await store.sendPay(id, sats: sats, maxFeeSats: maxFee) {
+                            showToast(message)
+                        }
+                    }
+                },
+                onSendMax: { sats, maxFee in
+                    Task {
+                        if let message = await store.sendPay(
+                            id, sats: sats, maxFeeSats: maxFee, feeFromAmount: true
+                        ) {
                             showToast(message)
                         }
                     }
@@ -2490,6 +2502,7 @@ private struct MacProfilePane: View {
     @State private var walletSheet = false
     @State private var currencySheet = false
     @State private var exportKeySheet = false
+    @State private var legacyDeleteSheet = false
     @FocusState private var nameFocused: Bool
 
     var body: some View {
@@ -2521,6 +2534,9 @@ private struct MacProfilePane: View {
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
+        }
+        .snSheet(isPresented: $legacyDeleteSheet, title: String(localized: "Delete old wallet")) {
+            SNLegacyWalletDeleteSheetContent(onClose: { legacyDeleteSheet = false })
         }
         .snSheet(isPresented: $currencySheet, title: "Currency") {
             SNCurrencyPickerContent(
@@ -2724,6 +2740,10 @@ private struct MacProfilePane: View {
                     }
                 }
             }
+            if let custody = store.walletCustodyLine {
+                macCustodyNote(custody)
+            }
+            SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true }, showsAddressNotice: false)
         }
     }
 
@@ -2735,20 +2755,18 @@ private struct MacProfilePane: View {
     private var walletValue: String {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
-        case .settingUp: return "Setting up..."
-        case .notConfigured:
-            return SonarBreezBuildConfig.hasAPIKey ? "Not ready" : "Unavailable"
+        case .settingUp: return String(localized: "Setting up\u{2026}")
+        case .notConfigured: return String(localized: "Not ready")
         }
     }
 
     private var walletSubtitle: String {
+        if let status = store.walletStatusLine { return status }
         switch store.walletState {
         case .notConfigured:
-            return SonarBreezBuildConfig.hasAPIKey
-                ? "Wallet not ready yet — setup retries in the background"
-                : "This build has no Breez API key, so Lightning stays off. Chat and restore still work."
+            return String(localized: "Wallet not ready yet — it opens once your Sonar identity is ready")
         case .settingUp:
-            return "Syncing wallet…"
+            return String(localized: "Syncing wallet…")
         case .ready:
             return "Pays like you message - Bluetooth or Lightning"
         }
@@ -2777,6 +2795,7 @@ private struct MacSettingsModal: View {
     @State private var exportKeySheet = false
     @State private var restoreKeySheet = false
     @State private var diagnosticsSheet = false
+    @State private var legacyDeleteSheet = false
     @FocusState private var nameFocused: Bool
 
     var body: some View {
@@ -2838,6 +2857,9 @@ private struct MacSettingsModal: View {
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
+        }
+        .snSheet(isPresented: $legacyDeleteSheet, title: String(localized: "Delete old wallet")) {
+            SNLegacyWalletDeleteSheetContent(onClose: { legacyDeleteSheet = false })
         }
         .snSheet(isPresented: $currencySheet, title: "Currency") {
             SNCurrencyPickerContent(
@@ -3037,6 +3059,10 @@ private struct MacSettingsModal: View {
                     }
                 }
             }
+            if let custody = store.walletCustodyLine {
+                macCustodyNote(custody)
+            }
+            SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true }, showsAddressNotice: false)
         }
     }
 
@@ -3149,20 +3175,18 @@ private struct MacSettingsModal: View {
     private var walletValue: String {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
-        case .settingUp: return "Setting up..."
-        case .notConfigured:
-            return SonarBreezBuildConfig.hasAPIKey ? "Not ready" : "Unavailable"
+        case .settingUp: return String(localized: "Setting up\u{2026}")
+        case .notConfigured: return String(localized: "Not ready")
         }
     }
 
     private var walletSubtitle: String {
+        if let status = store.walletStatusLine { return status }
         switch store.walletState {
         case .notConfigured:
-            return SonarBreezBuildConfig.hasAPIKey
-                ? "Wallet not ready yet — setup retries in the background"
-                : "This build has no Breez API key, so Lightning stays off. Chat and restore still work."
+            return String(localized: "Wallet not ready yet — it opens once your Sonar identity is ready")
         case .settingUp:
-            return "Syncing wallet…"
+            return String(localized: "Syncing wallet…")
         case .ready:
             return "Pays like you message - Bluetooth or Lightning"
         }
@@ -4046,5 +4070,13 @@ private struct MacSpikeADMHost<Composer: View>: View {
             )
         }
     }
+}
+/// The one custody-disclosure line under the Mac wallet settings.
+private func macCustodyNote(_ text: String) -> some View {
+    Text(verbatim: text)
+        .font(SonarTheme.uiFont(size: 12))
+        .foregroundColor(SonarTheme.text3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(EdgeInsets(top: 0, leading: 24, bottom: 4, trailing: 24))
 }
 #endif

@@ -147,6 +147,25 @@ enum SonarLocalNotificationRouter {
         )
     }
 
+    /// A payment from outside Sonar (another wallet paying the receive offer
+    /// or a one-time invoice): no chat line announces it, so this is its only
+    /// signal. Same copy as Compose `SonarNotificationRouter.buildWalletReceive`.
+    static func walletReceive(
+        paymentId: String,
+        sats: Int64,
+        prefs: SonarLocalNotificationPrefs
+    ) -> SonarLocalNotification? {
+        guard prefs.enabled else { return nil }
+        return SonarLocalNotification(
+            title: "Payment received",
+            body: prefs.showPaymentAmount
+                ? "\(sonarFormatSats(sats)) received."
+                : "Open Sonar to view the payment.",
+            identifier: "sonar-payment-wallet-\(paymentId)",
+            userInfo: [:]
+        )
+    }
+
     private static func identifierSegment(_ kind: SonarNotificationKindInfo) -> String {
         switch kind {
         case .message: return "message"
@@ -1335,13 +1354,50 @@ final class SonarAppStore: ObservableObject {
     /// The extra Unify payer scan is useful only while Radar is visible. Keep
     /// this separate from the mesh radio, which remains available for chats.
     private var isNearbyVisible = false
-    /// Lightning wallet behind the payments UI; UnconfiguredWallet until the
-    /// real bridge (Services/WalletBridgeService) is injected.
+    /// THE wallet behind the payments UI: Cashu for everyone
+    /// (`makeWallet(keychain:)`). `UnconfiguredWallet` in tests.
     let wallet: SonarWalletProviding
+    /// Money display (mode, currency, Yadio rates) — wallet-independent, so
+    /// deleting the legacy wallet never resets the user's currency.
+    let moneyDisplay: SonarMoneyDisplay
+    /// Owns the LEGACY Breez wallet: present only while its store exists on
+    /// this device. See `LegacyBreezWallet`.
+    let legacyWallets: SonarLegacyWalletCoordinator
+    /// The legacy Breez wallet, when one exists on this device.
+    var legacyWallet: LegacyBreezWallet? { legacyWallets.wallet }
+    /// Which wallet the send-payment screen pays from (the old Lightning
+    /// wallet card sets `.legacy` before pushing it).
+    @Published var paymentSource: SNPaymentSource = .primary
     /// Local state of every ⚡PAY coin sent/received (docs/SONAR-PAYMENTS.md).
     let payLedger: SonarPayLedger
     /// Local wallet payment activity for direct BOLT12 / Unify sends.
     let paymentActivityLedger: SonarPaymentActivityLedger
+    /// Where store-built local notifications go (the system one is silent
+    /// under XCTest, so tests capture them here).
+    var postLocalNotification: (SonarLocalNotification) -> Void = { note in
+        NotificationService.shared.sendLocalNotification(
+            title: note.title,
+            body: note.body,
+            identifier: note.identifier,
+            userInfo: note.userInfo
+        )
+    }
+    /// How long a wallet receive waits for its chat ⚡PAY line; tests shorten it.
+    var walletReceiveGraceNanos = SonarReceiveAnnouncer.defaultGraceNanos
+    /// One notification per payment: a chat ⚡PAY's own line, or the wallet banner.
+    private lazy var receiveAnnouncer = SonarReceiveAnnouncer(
+        graceNanos: { [weak self] in self?.walletReceiveGraceNanos ?? SonarReceiveAnnouncer.defaultGraceNanos },
+        announce: { [weak self] paymentId, sats in
+            guard let self,
+                  let note = SonarLocalNotificationRouter.walletReceive(
+                      paymentId: paymentId,
+                      sats: sats,
+                      prefs: self.notificationPrefs
+                  )
+            else { return }
+            self.postLocalNotification(note)
+        }
+    )
     private let keychain: KeychainManagerProtocol
     private let locationManager = LocationChannelManager.shared
     private let relayManager = NostrRelayManager.shared
@@ -1367,6 +1423,19 @@ final class SonarAppStore: ObservableObject {
     private var paymentDestinations: [String: String] = [:]
     /// Activity ids whose `Cancel` was tapped before the wallet was called.
     private var cancelledPayments: Set<String> = []
+    /// Which wallet each live external payment was sent from (memory only).
+    private var paymentSources: [String: SNPaymentSource] = [:]
+    /// External payments sent as a fee-inclusive `Max` (so `Try again` keeps it).
+    private var paymentFeeFromAmount: Set<String> = []
+    /// The fee ceiling each external payment was sent with — what the send
+    /// sheet showed. Absent = no ceiling (legacy wallet). `Try again` reuses it.
+    private var paymentFeeCeilings: [String: Int64] = [:]
+    /// External payments the wallet refused because the fee rose above the
+    /// one the user agreed to, with the NEW fee. The status screen states it,
+    /// and `Try again` — tapped after reading it — sends with it as the ceiling.
+    private var paymentFeeChanged: [String: Int64] = [:]
+    /// The Unify send whose sheet is waiting on a pending outcome.
+    private var unifyPendingActivity: (peerId: String, activityId: String, sats: Int64)?
     /// Invalidates in-flight toast dismissals when a newer toast is shown.
     private var toastSession = SNToastSession()
     /// Replaced on each `showToast` so rapid toasts don't pile sleeping tasks.
@@ -1414,7 +1483,45 @@ final class SonarAppStore: ObservableObject {
     /// the durable record). Distinct from `bip353`, which may also hold an
     /// external payment address from another wallet: only a core-claimed
     /// address gets the claim checkmark and kind-0 `nip05`.
-    @Published private(set) var coreClaimedHandle: String?
+    @Published private(set) var coreClaimedHandle: String? {
+        didSet {
+            // A handle that just became known may need registering (or the
+            // "still pays your old wallet" notice): decide off this path.
+            if coreClaimedHandle != oldValue { scheduleHandleOfferRefresh() }
+        }
+    }
+    /// Which wallet the claimed handle's BIP-353 record pays, for this
+    /// account (nil = not known yet: a handle claimed before Cashu). See
+    /// `SonarHandleOfferPolicy`.
+    @Published private(set) var handleAddressWallet: SonarHandleAddressWallet?
+    /// An automatic re-registration of the handle failed; retried with backoff.
+    @Published private(set) var handleAddressUpdateFailing = false
+    /// The user-confirmed move of the handle, in flight or failed.
+    enum HandleMoveState: Equatable {
+        case idle
+        case moving
+        case failed(String)
+    }
+    @Published private(set) var handleMoveState: HandleMoveState = .idle
+    /// The offer last registered with the handle (persisted with the wallet).
+    private var handleRegisteredOffer: String?
+    /// The account (npub) the handle record belongs to; nil until known.
+    private var handleAddressAccount: String?
+    /// Tail of the registrar writes, so an automatic re-claim never races a
+    /// move (each waits for the previous one).
+    private var handleRegistrationTail: Task<Void, Never>?
+    private var handleReclaimRetryTask: Task<Void, Never>?
+    private var handleReclaimRetryAttempt = 0
+    /// The Cashu offer the last restore reclaim was handed (recorded once the
+    /// core reports the sidecar seeded).
+    private var restoreReclaimCashuOffer: String?
+    /// The registrar claim. Tests replace it; everything else goes through
+    /// the core.
+    var registerHandleAtRegistrar: ((_ handle: String, _ offer: String?) async throws -> String)?
+    #if DEBUG
+    /// Tests pin the legacy presence (the real one opens Breez).
+    var legacyPresenceOverrideForTesting: SonarLegacyPresence?
+    #endif
     /// Mirrors wallet.state for the UI (balance row and PaySheet).
     @Published private(set) var walletState: SonarWalletState
     /// Radar "Send sats" quick-pay: the DM screen opens with the PaySheet up.
@@ -2051,6 +2158,11 @@ final class SonarAppStore: ObservableObject {
     private var paymentMetadataRetryForce = false
     private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
+    private var legacyWalletCancellables = Set<AnyCancellable>()
+    /// Legacy offer the Breez NDS webhook was last pointed at this session.
+    private var legacyWebhookOffer: String?
+    private var legacyWebhookTask: Task<Void, Never>?
+    private var pendingPaymentReconcileTask: Task<Void, Never>?
 
     convenience init() {
         let keychain = KeychainManager()
@@ -2064,16 +2176,36 @@ final class SonarAppStore: ObservableObject {
             marmot: MarmotChatModel(keychain: keychain),
             keychain: keychain,
             idBridge: idBridge,
-            wallet: Self.makeWallet()
+            wallet: Self.makeWallet(keychain: keychain),
+            legacyWallets: Self.makeLegacyWalletCoordinator(keychain: keychain)
         )
     }
 
-    private static func makeWallet() -> SonarWalletProviding {
-        #if os(iOS) || os(macOS)
-        return BridgedWallet()
-        #else
-        return UnconfiguredWallet()
-        #endif
+    /// The primary wallet for everyone: Cashu. No Breez construction here —
+    /// the legacy wallet is only ever opened by `legacyWallets` when its
+    /// store already exists.
+    static func makeWallet(keychain: KeychainManagerProtocol) -> SonarWalletProviding {
+        CashuWallet(keychain: keychain)
+    }
+
+    static func makeLegacyWalletCoordinator(keychain: KeychainManagerProtocol) -> SonarLegacyWalletCoordinator {
+        SonarLegacyWalletCoordinator(
+            nsecProvider: { Self.readAccountNsec(keychain) },
+            unregisterWebhook: { service in
+                #if os(iOS)
+                await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: service)
+                #endif
+            },
+            factory: { mode in LegacyBreezWallet(mode: mode, keychain: keychain) }
+        )
+    }
+
+    /// The signed-in account's nsec, read-only; nil on any non-success read.
+    private static func readAccountNsec(_ keychain: KeychainManagerProtocol) -> String? {
+        guard case .success(let data) = keychain.getIdentityKeyWithResult(forKey: Keys.marmotNsecKeychainKey)
+        else { return nil }
+        let nsec = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return SonarWalletDerivation.secret(fromNsec: nsec) != nil ? nsec : nil
     }
 
     private static func recoverOnboardingState(
@@ -2104,6 +2236,8 @@ final class SonarAppStore: ObservableObject {
         keychain: KeychainManagerProtocol,
         idBridge: NostrIdentityBridge,
         wallet: SonarWalletProviding = UnconfiguredWallet(),
+        moneyDisplay: SonarMoneyDisplay? = nil,
+        legacyWallets: SonarLegacyWalletCoordinator? = nil,
         payLedger: SonarPayLedger = SonarPayLedger(),
         paymentActivityLedger: SonarPaymentActivityLedger = SonarPaymentActivityLedger(),
         unify: UnifyNearbyService = UnifyNearbyService(),
@@ -2114,6 +2248,13 @@ final class SonarAppStore: ObservableObject {
         self.keychain = keychain
         self.idBridge = idBridge
         self.wallet = wallet
+        self.moneyDisplay = moneyDisplay ?? SonarMoneyDisplay()
+        self.legacyWallets = legacyWallets ?? SonarLegacyWalletCoordinator(
+            presence: { .absent },
+            hasAPIKey: { false },
+            nsecProvider: { nil },
+            factory: { mode in LegacyBreezWallet(mode: mode, keychain: keychain) }
+        )
         self.payLedger = payLedger
         self.paymentActivityLedger = paymentActivityLedger
         self.unify = unify
@@ -2121,10 +2262,13 @@ final class SonarAppStore: ObservableObject {
         walletState = wallet.state
 
         // Unify receiver (mirror role): serve an AMOUNTLESS BOLT12 offer behind
-        // the user's nickname so a Unify user can pay us. The offer is fetched
-        // lazily when advertising starts; the wallet façade is the only source.
+        // the user's nickname so a Unify user can pay us. The offer is the
+        // primary (Cashu) wallet's published offer — never the legacy one.
         let walletRef = wallet
-        unifyReceiver.offerProvider = { try? await walletRef.createOffer() }
+        unifyReceiver.offerProvider = {
+            if let cached = walletRef.cachedReceiveOffer { return cached }
+            return try? await walletRef.createOffer()
+        }
         let chatRef = chatViewModel
         unifyReceiver.nameProvider = { [weak chatRef] in
             let nick = chatRef?.nickname.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -2177,7 +2321,49 @@ final class SonarAppStore: ObservableObject {
         republish(unify.objectWillChange)
         // Money display: re-render every amount when the mode/currency/rate
         // changes (fiat<->bitcoin toggle, currency picker, live-rate arrival).
-        republish(wallet.moneyDisplayChanged)
+        republish(self.moneyDisplay.changed)
+        // Balance breakdown / "mint offline" line on the wallet screens.
+        republish(wallet.detailChanged)
+        // The old Lightning wallet card: appears/disappears with the legacy
+        // store, and re-renders on its state and snapshot.
+        self.legacyWallets.$wallet
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] legacy in
+                guard let self else { return }
+                self.legacyWalletCancellables = []
+                self.objectWillChange.send()
+                guard let legacy else { return }
+                legacy.detailChanged
+                    .receive(on: DispatchQueue.main)
+                    .sink { [weak self] _ in
+                        self?.objectWillChange.send()
+                        self?.ensureLegacyWebhookIfNeeded()
+                    }
+                    .store(in: &self.legacyWalletCancellables)
+            }
+            .store(in: &cancellables)
+        // A legacy wallet the restore check decided to keep gets its webhook.
+        self.legacyWallets.$restoreCheckInProgress
+            .removeDuplicates()
+            .filter { !$0 }
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.ensureLegacyWebhookIfNeeded() }
+            .store(in: &cancellables)
+        // The handle decision reads the legacy presence: re-run it (and the
+        // notice) whenever that changes — attached, restore check settled,
+        // deleted, or established absent.
+        Publishers.CombineLatest3(
+            self.legacyWallets.$wallet.map { $0 != nil },
+            self.legacyWallets.$restoreCheckInProgress,
+            self.legacyWallets.$resolvedPresence
+        )
+        .dropFirst()
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.objectWillChange.send()
+            self?.scheduleHandleOfferRefresh()
+        }
+        .store(in: &cancellables)
 
         // `dmRows` is an expensive folded projection. Drive its revision from
         // the narrow conversation inputs instead of recomputing a 278-group
@@ -2240,9 +2426,9 @@ final class SonarAppStore: ObservableObject {
         marmot.shareLocalTimeIfEnabled = { [weak self] in self?.reconcileTimezoneShare() }
         marmot.localBip353Provider = { [weak self] in self?.bip353 ?? "" }
         marmot.handleDomainProvider = { Self.handleDomain }
-        marmot.handleOfferProvider = { [weak self] in
-            guard let self, case .ready = self.walletState else { return nil }
-            return try? await self.wallet.createOffer()
+        marmot.handleOfferProvider = { [weak self] handle in
+            guard let self else { return nil }
+            return await self.restoreReclaimOffer(forHandle: handle)
         }
         // Adopt own kind-0 into local Profile state before the connect-path
         // republish (nsec restore clears the device-bound nick/handle).
@@ -2260,6 +2446,9 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
                 guard let self else { return }
+                // Which wallet this account's handle pays, before anything
+                // can re-claim it.
+                self.loadHandleAddressRecord(forAccount: npub)
                 self.wireSonarProfileProvider(npub)
                 self.runPostLocalMarmotStartupIfReady()
             }
@@ -2303,6 +2492,9 @@ final class SonarAppStore: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // The wallet's offer is backed up to (and, after a reinstall, brought
+        // back from) this account's relays.
+        (wallet as? CashuWallet)?.service.offerBackups = MarmotOfferBackupRelay(marmot: marmot)
         // Payments: mirror the wallet state and watch both transcript
         // stores for incoming ⚡PAY receipt control lines.
         republish(payLedger.objectWillChange)
@@ -2314,32 +2506,47 @@ final class SonarAppStore: ObservableObject {
                 let wasReady: Bool
                 if case .ready = self.walletState { wasReady = true } else { wasReady = false }
                 self.walletState = state
-                // Gate the advertised ⚡PAY capability on a receive-capable wallet.
-                let configured: Bool
-                if case .ready = state { configured = true } else { configured = false }
-                UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
-                // Start/stop the Unify receiver as the wallet becomes (un)ready.
-                self.updateReceiverAdvertising()
                 // A balance change does not change the receive offer; only a
-                // readiness change does. Re-publishing on every balance tick
-                // asked Boltz for a fresh offer each time.
-                if !(wasReady && configured) {
+                // readiness change does, so republish only then.
+                let ready: Bool
+                if case .ready = state { ready = true } else { ready = false }
+                if !(wasReady && ready) {
                     self.publishPaymentMetadataIfNeeded()
                 }
-                self.updateWalletPaymentObservation()
-                #if os(iOS)
-                if configured, let bridged = self.wallet as? BridgedWallet {
-                    SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: bridged.walletService)
+            }
+            .store(in: &cancellables)
+        // "Payments enabled" (the BLE ⚡PAY capability, the descriptor offer,
+        // the handle's BIP-353 record, the Unify receiver) = a Cashu offer is
+        // known for this account. Not tied to any API key or backend
+        // readiness; Compose applies the same rule.
+        wallet.receiveOfferPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] offer in
+                guard let self else { return }
+                UserDefaults.standard.set(offer != nil, forKey: Keys.walletConfigured)
+                self.updateReceiverAdvertising()
+                // A changed offer republishes the descriptor (and re-runs the
+                // handle decision, refreshHandleOfferIfNeeded) — force past
+                // the unchanged-offer skip.
+                if offer != nil, offer != self.publishedBolt12Offer {
+                    self.publishPaymentMetadataIfNeeded(force: true)
                 }
-                #endif
+            }
+            .store(in: &cancellables)
+        // Reconcile in-flight sends whenever the wallet (re)connects, and let
+        // the descriptor publish once the first connect settles either way.
+        wallet.detailChanged
+            .receive(on: DispatchQueue.main)
+            .map { [weak wallet] _ in wallet?.connectivity ?? .unavailable }
+            .removeDuplicates()
+            .sink { [weak self] connectivity in
+                guard let self else { return }
+                if connectivity == .online { self.reconcilePendingWalletPayments() }
+                if connectivity != .connecting { self.publishPaymentMetadataIfNeeded() }
             }
             .store(in: &cancellables)
         // Seed the flag from the current state so the first announce is correct.
-        if case .ready = wallet.state {
-            UserDefaults.standard.set(true, forKey: Keys.walletConfigured)
-        } else {
-            UserDefaults.standard.set(false, forKey: Keys.walletConfigured)
-        }
+        UserDefaults.standard.set(wallet.cachedReceiveOffer != nil, forKey: Keys.walletConfigured)
         // Seed receiver advertising from the current state (foreground at launch).
         updateReceiverAdvertising()
         publishPaymentMetadataIfNeeded()
@@ -2489,10 +2696,14 @@ final class SonarAppStore: ObservableObject {
     /// the coherent Home boundary so it cannot contend with first-paint reads.
     private func runPostLocalMarmotStartupIfReady() {
         guard marmot.initialLocalHomeReady, marmot.npub != nil else { return }
-        // The wallet derives from the same identity; retry its deferred setup.
-        #if os(iOS) || os(macOS)
-        (wallet as? BridgedWallet)?.retrySetup()
-        #endif
+        // The wallet derives from the same identity. Local-only open after
+        // first paint; the mint connect runs in the background.
+        wallet.start()
+        moneyDisplay.startRefreshing()
+        // Presence check for the legacy Breez wallet: constructs nothing when
+        // no legacy store exists on this device.
+        legacyWallets.refresh()
+        legacyWallet?.retrySetup()
         // Local sidecar read — recover a claimed handle into prefs without
         // waiting for a relay (Compose parity; the relay-connect sink stays
         // as the online refresh).
@@ -2983,9 +3194,15 @@ final class SonarAppStore: ObservableObject {
 
     /// Restore an existing account from a pasted `nsec1…` backup (onboarding
     /// "Restore account" or Settings → Restore account): import the identity,
-    /// try Blossom chat restore, wipe any prior wallet on this device, rebuild
-    /// the Lightning wallet from the restored nsec, then finish onboarding.
-    /// Throws on an invalid key.
+    /// try Blossom chat restore, release the previous account's wallets
+    /// WITHOUT destroying anything that may hold funds, open the Cashu wallet
+    /// for the restored nsec, then finish onboarding. Throws on an invalid key.
+    ///
+    /// Wallets on replacement: Cashu is per account, so the old account's
+    /// `sonar-cashu/<oldAccountId>/` simply stays on disk. The legacy Breez
+    /// store is shared (not per account): deleted only when its delete gate
+    /// passes, otherwise archived under the old account id (and brought back
+    /// if that account is restored again).
     func restoreAccount(nsec: String) async throws {
         let key = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
         // Validate before any destructive work. An invalid paste must leave the
@@ -3015,22 +3232,23 @@ final class SonarAppStore: ObservableObject {
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
         defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
 
-        #if os(iOS) || os(macOS)
-        let bridged = wallet as? BridgedWallet
         #if os(iOS)
-        await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: bridged?.walletService)
+        await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: legacyWallet?.walletService)
         #endif
         do {
-            if let bridged {
-                try await bridged.prepareForIdentityReplacement()
-            } else {
-                try BridgedWallet.beginWalletStorageMutation()
-                try BridgedWallet.wipeWalletStorage()
-            }
+            try await wallet.prepareForIdentityReplacement()
         } catch {
             throw SonarAccountRestoreError.walletCleanupFailed
         }
-        #endif
+        do {
+            try await legacyWallets.prepareForIdentityReplacement()
+        } catch {
+            // The Cashu wallet was only released (files kept); reopen it for
+            // the account that is still signed in.
+            wallet.start()
+            throw SonarAccountRestoreError.walletCleanupFailed
+        }
+        legacyWebhookOffer = nil
 
         // Clear host-owned local-first caches before committing the new nsec. A
         // crash after identity import must never paint the previous account's
@@ -3040,14 +3258,17 @@ final class SonarAppStore: ObservableObject {
         do {
             backupOutcome = try await marmot.restoreIdentity(nsec: key)
         } catch {
-            #if os(iOS) || os(macOS)
-            bridged?.retrySetup()
-            #endif
+            // Still the previous account: reopen its wallets.
+            wallet.start()
+            legacyWallets.refresh()
             throw SonarAccountRestoreError.accountReplacementFailed
         }
-        #if os(iOS) || os(macOS)
-        bridged?.retrySetup()
-        #endif
+        // The restored account gets ONE background check for a Breez wallet
+        // derived from its key (builds with a Breez API key only); an archive
+        // left by an earlier replacement of this account comes back first.
+        legacyWallets.armRestoreCheck()
+        wallet.start()
+        legacyWallets.refresh()
         onboarded = true
         defaults.set(true, forKey: Keys.onboarded)
         path = []
@@ -3332,8 +3553,9 @@ final class SonarAppStore: ObservableObject {
 
         unify.stop()
         unifyReceiver.stop()
-        incomingWalletTask?.cancel()
-        incomingWalletTask = nil
+        // Keep the wallet-update subscription: the wallet object outlives the
+        // account (it reopens for the next one), and a dropped subscription
+        // would strand every later pending send.
         publishedBolt12Offer = nil
         publishedCallDescriptor = false
         publishingPaymentMetadata = false
@@ -3400,6 +3622,13 @@ final class SonarAppStore: ObservableObject {
     private func noteOwnHandleSidecarSeeded(_ address: String) {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // The reclaim registered the Cashu offer only where the handle may
+        // pay it silently (restoreReclaimOffer); record that before the
+        // handle becomes known, so the decision it triggers sees it.
+        if let offer = restoreReclaimCashuOffer, let account = handleAddressAccount {
+            recordHandleAddress(.cashu, offer: offer, account: account)
+        }
+        restoreReclaimCashuOffer = nil
         coreClaimedHandle = trimmed
         if bip353.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             setBip353(trimmed)
@@ -3431,18 +3660,26 @@ final class SonarAppStore: ObservableObject {
         let cameToForeground = foreground && !isForeground
         let wentToBackground = !foreground && isForeground
         isForeground = foreground
+        // Cashu: connect + sync on foreground, disconnect on background (never
+        // under a send in flight). Idempotent, so it is driven on every signal.
+        wallet.setForeground(foreground)
+        if foreground {
+            moneyDisplay.startRefreshing()
+        } else {
+            moneyDisplay.stopRefreshing()
+        }
         #if canImport(UIKit)
-        // Tear the Breez node down before suspension so it never holds a SQLite
-        // lock while the process is suspended (the 0xdead10cc kill), and rebuild
-        // it on foreground. Offline receive is unaffected — it runs in the
-        // Notification Service Extension's own process.
+        // LEGACY Breez: tear the node down before suspension so it never holds a
+        // SQLite lock while the process is suspended (the 0xdead10cc kill), and
+        // rebuild it on foreground. Offline receive is unaffected — it runs in
+        // the Notification Service Extension's own process.
         //
         // Drive this on every foreground/background signal, even when our tracked
         // flag didn't change: a silent-push background launch leaves `isForeground`
         // at its `true` default, so the first real foreground would otherwise skip
         // the resume and the node (deferred at launch) would never come up.
         // suspend/resume are idempotent (guarded on node state / `suspendedForBackground`).
-        if let walletService = (wallet as? BridgedWallet)?.walletService {
+        if let walletService = legacyWallet?.walletService {
             if foreground {
                 walletService.resumeFromBackground()
             } else {
@@ -3490,12 +3727,11 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// Start advertising as a Unify receiver iff the wallet is ready AND the
-    /// app is foreground; stop otherwise. Idempotent — the receiver itself
+    /// Start advertising as a Unify receiver iff a receive offer is known AND
+    /// the app is foreground; stop otherwise. Idempotent — the receiver itself
     /// coalesces repeat starts and only advertises once an offer is fetched.
     private func updateReceiverAdvertising() {
-        let ready: Bool
-        if case .ready = walletState { ready = true } else { ready = false }
+        let ready = wallet.cachedReceiveOffer != nil
         if ready && isForeground && !isBLEDiscoveryRestricted {
             unifyReceiver.start()
         } else {
@@ -4102,20 +4338,28 @@ final class SonarAppStore: ObservableObject {
         handleClaimState = .claiming
         Task { [weak self] in
             guard let self else { return }
-            // Offer fetch is tolerated to fail: wallet not ready = chat-only claim.
-            var offer: String?
-            if case .ready = self.walletState {
+            // Offer fetch is tolerated to fail: no offer yet = chat-only claim
+            // (re-claimed with the offer once it exists). An explicit claim is
+            // the user choosing this wallet for the address (the claim field
+            // says where payments go).
+            var offer: String? = self.wallet.cachedReceiveOffer
+            if offer == nil, case .ready = self.walletState {
                 offer = try? await self.wallet.createOffer()
             }
-            do {
-                let address = try await self.marmot.claimHandle(handle: name, offer: offer)
-                self.coreClaimedHandle = address
-                if let offer { self.lastClaimedOffer = offer }
-                self.setBip353(address)
-                self.marmot.publishProfile(name: self.chatViewModel.nickname)
-                self.handleClaimState = .claimed(address)
-            } catch {
-                self.handleClaimState = .failed(Self.describeHandleClaimError(error))
+            let account = self.handleAddressAccount
+            await self.serializeHandleRegistration {
+                do {
+                    let address = try await self.registerHandle(name, offer: offer)
+                    if let account, account == self.handleAddressAccount {
+                        self.recordHandleAddress(.cashu, offer: offer, account: account)
+                    }
+                    self.coreClaimedHandle = address
+                    self.setBip353(address)
+                    self.marmot.publishProfile(name: self.chatViewModel.nickname)
+                    self.handleClaimState = .claimed(address)
+                } catch {
+                    self.handleClaimState = .failed(Self.describeHandleClaimError(error))
+                }
             }
         }
     }
@@ -4141,21 +4385,258 @@ final class SonarAppStore: ObservableObject {
         return detail
     }
 
-    /// The BOLT12 offer last registered with the handle this session.
-    private var lastClaimedOffer: String?
+    // MARK: Handle payment address
+    //
+    // The handle's BIP-353 record is a public address. Before Cashu it paid
+    // the Breez wallet's offer; it moves to the Cashu offer (custody at the
+    // mint) only when the user confirms, or where there is no old wallet to
+    // move away from (docs/WALLET-INTEGRATION.md "The handle's payment
+    // address"). Compose mirror: SonarAppState "Which wallet the handle pays".
 
-    /// Upgrade a chat-only claim once a wallet offer exists: a claim made
-    /// before the wallet was ready has no BIP-353 DNS record, so the handle
-    /// looks payable but isn't until re-registered. Re-claims from the same
-    /// key are idempotent; once per offer per session keeps this quiet.
+    private func registerHandle(_ name: String, offer: String?) async throws -> String {
+        if let registerHandleAtRegistrar {
+            return try await registerHandleAtRegistrar(name, offer)
+        }
+        return try await marmot.claimHandle(handle: name, offer: offer)
+    }
+
+    /// Run `work` after every earlier registrar write finished: a move and an
+    /// automatic re-claim never interleave.
+    private func serializeHandleRegistration(_ work: @escaping @MainActor () async -> Void) async {
+        let previous = handleRegistrationTail
+        let task = Task { @MainActor in
+            await previous?.value
+            await work()
+        }
+        handleRegistrationTail = task
+        await task.value
+    }
+
+    private static func handleName(_ address: String) -> String {
+        String(address.split(separator: "@").first ?? "")
+    }
+
+    private func loadHandleAddressRecord(forAccount npub: String?) {
+        let account = npub?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard account != handleAddressAccount || account == nil else { return }
+        handleReclaimRetryTask?.cancel()
+        handleReclaimRetryTask = nil
+        handleReclaimRetryAttempt = 0
+        handleAddressUpdateFailing = false
+        handleMoveState = .idle
+        restoreReclaimCashuOffer = nil
+        guard let account, !account.isEmpty else {
+            handleAddressAccount = nil
+            handleAddressWallet = nil
+            handleRegisteredOffer = nil
+            return
+        }
+        let record = SonarHandleAddressRecord.load(defaults: defaults, account: account)
+        handleAddressAccount = account
+        handleAddressWallet = record.wallet
+        handleRegisteredOffer = record.registeredOffer
+        scheduleHandleOfferRefresh()
+    }
+
+    private func recordHandleAddress(_ wallet: SonarHandleAddressWallet, offer: String?, account: String) {
+        SonarHandleAddressRecord(wallet: wallet, registeredOffer: offer).save(defaults: defaults, account: account)
+        handleAddressWallet = wallet
+        handleRegisteredOffer = offer
+        handleAddressUpdateFailing = false
+        handleReclaimRetryTask?.cancel()
+        handleReclaimRetryTask = nil
+        handleReclaimRetryAttempt = 0
+    }
+
+    /// Present / absent / unknown, as far as the legacy coordinator has
+    /// established it. Only `.absent` lets the handle move silently.
+    var legacyWalletPresence: SonarLegacyPresence {
+        #if DEBUG
+        if let pinned = legacyPresenceOverrideForTesting { return pinned }
+        #endif
+        return legacyWallets.presenceForHandle
+    }
+
+    private func handleOfferDecision(claimedHandle: String?, cashuOffer: String?) -> SonarHandleOfferAction {
+        guard handleAddressAccount != nil else { return .none }
+        return SonarHandleOfferPolicy.action(
+            claimedHandle: claimedHandle,
+            legacyPresence: legacyWalletPresence,
+            addressWallet: handleAddressWallet,
+            cashuOffer: cashuOffer,
+            lastRegisteredOffer: handleRegisteredOffer
+        )
+    }
+
+    /// The notice next to the address (Profile, Settings, Wallet).
+    var handleAddressNotice: SonarHandleAddressNotice {
+        guard let claimed = coreClaimedHandle?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !claimed.isEmpty, handleAddressAccount != nil
+        else { return .none }
+        if handleOfferDecision(claimedHandle: claimed, cashuOffer: wallet.cachedReceiveOffer) == .askToMove {
+            return .paysOldWallet(address: claimed)
+        }
+        return handleAddressUpdateFailing ? .updateFailing(address: claimed) : .none
+    }
+
+    /// "Move back to your old wallet": the handle pays Cashu and the old
+    /// wallet is here.
+    var canMoveHandleBackToOldWallet: Bool {
+        handleAddressAccount != nil && SonarHandleOfferPolicy.canMoveBack(
+            claimedHandle: coreClaimedHandle,
+            legacyPresence: legacyWalletPresence,
+            addressWallet: handleAddressWallet
+        )
+    }
+
+    /// Re-run the handle decision off the caller's path (descriptor publish,
+    /// presence change, handle adopted, retry).
+    private func scheduleHandleOfferRefresh(_ offer: String? = nil) {
+        guard let offer = offer ?? wallet.cachedReceiveOffer else { return }
+        Task { [weak self] in await self?.refreshHandleOfferIfNeeded(offer) }
+    }
+
+    /// Re-register the handle with the Cashu offer where
+    /// `SonarHandleOfferPolicy` allows it (the handle already pays Cashu, or
+    /// no old wallet exists): a chat-only claim made before the wallet had an
+    /// offer, or a rotated offer. Never while the handle pays a legacy wallet
+    /// that is still here. A failure is surfaced (`handleAddressUpdateFailing`)
+    /// and retried with backoff; the persisted offer keeps this to once per
+    /// offer, not once per launch.
     private func refreshHandleOfferIfNeeded(_ offer: String) async {
-        guard let claimed = coreClaimedHandle, offer != lastClaimedOffer else { return }
-        let name = String(claimed.split(separator: "@").first ?? "")
-        guard !name.isEmpty else { return }
-        if (try? await marmot.claimHandle(handle: name, offer: offer)) != nil {
-            lastClaimedOffer = offer
+        guard handleOfferDecision(claimedHandle: coreClaimedHandle, cashuOffer: offer) == .reclaimWithCashu else { return }
+        await serializeHandleRegistration { [weak self] in
+            guard let self else { return }
+            // A failure is retried on its backoff, not by every trigger that
+            // queued behind it (offer, presence, handle adopted).
+            guard self.handleReclaimRetryTask == nil else { return }
+            // Decide again in order: a move may have just landed.
+            guard let claimed = self.coreClaimedHandle, let account = self.handleAddressAccount,
+                  self.handleOfferDecision(claimedHandle: claimed, cashuOffer: offer) == .reclaimWithCashu
+            else { return }
+            let name = Self.handleName(claimed)
+            guard !name.isEmpty else { return }
+            do {
+                _ = try await self.registerHandle(name, offer: offer)
+                guard account == self.handleAddressAccount else { return }
+                self.recordHandleAddress(.cashu, offer: offer, account: account)
+            } catch {
+                SecureLogger.error("Handle re-registration with the wallet offer failed: \(error)", category: .session)
+                guard account == self.handleAddressAccount else { return }
+                self.handleAddressUpdateFailing = true
+                self.scheduleHandleReclaimRetry()
+            }
         }
     }
+
+    private func scheduleHandleReclaimRetry() {
+        handleReclaimRetryTask?.cancel()
+        let delaySecs = Self.paymentMetadataRetryDelaySecs(attempt: handleReclaimRetryAttempt)
+        handleReclaimRetryAttempt += 1
+        handleReclaimRetryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delaySecs) * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.handleReclaimRetryTask = nil
+            self.scheduleHandleOfferRefresh()
+        }
+    }
+
+    /// The confirmed "Move": register the handle with the Cashu offer. On
+    /// failure the handle keeps paying the old wallet and the notice stays.
+    func moveHandleToNewWallet() {
+        guard let claimed = coreClaimedHandle, let account = handleAddressAccount,
+              handleMoveState != .moving
+        else { return }
+        let name = Self.handleName(claimed)
+        guard !name.isEmpty else { return }
+        handleMoveState = .moving
+        Task { [weak self] in
+            guard let self else { return }
+            var offer = self.wallet.cachedReceiveOffer
+            if offer == nil, case .ready = self.walletState {
+                offer = try? await self.wallet.createOffer()
+            }
+            guard let offer else {
+                self.handleMoveState = .failed(String(localized: "Your new wallet isn't ready yet. Try again in a moment."))
+                return
+            }
+            await self.serializeHandleRegistration {
+                do {
+                    _ = try await self.registerHandle(name, offer: offer)
+                    if account == self.handleAddressAccount {
+                        self.recordHandleAddress(.cashu, offer: offer, account: account)
+                    }
+                    self.handleMoveState = .idle
+                    self.showToast(String(localized: "Your address now pays your new wallet"))
+                } catch {
+                    self.handleMoveState = .failed(Self.describeHandleClaimError(error))
+                }
+            }
+        }
+    }
+
+    /// The confirmed path back: register the handle with the legacy wallet's
+    /// OWN offer while that wallet is here.
+    func moveHandleToOldWallet() {
+        guard let claimed = coreClaimedHandle, let account = handleAddressAccount,
+              handleMoveState != .moving
+        else { return }
+        let name = Self.handleName(claimed)
+        guard !name.isEmpty else { return }
+        handleMoveState = .moving
+        Task { [weak self] in
+            guard let self else { return }
+            guard let legacy = self.legacyWallet, case .ready = legacy.state,
+                  let offer = try? await legacy.createOffer()
+            else {
+                self.handleMoveState = .failed(String(localized: "Your old wallet isn't connected. Try again in a moment."))
+                return
+            }
+            await self.serializeHandleRegistration {
+                do {
+                    _ = try await self.registerHandle(name, offer: offer)
+                    if account == self.handleAddressAccount {
+                        self.recordHandleAddress(.legacy, offer: offer, account: account)
+                    }
+                    self.handleMoveState = .idle
+                    self.showToast(String(localized: "Your address pays your old wallet again"))
+                } catch {
+                    self.handleMoveState = .failed(Self.describeHandleClaimError(error))
+                }
+            }
+        }
+    }
+
+    /// Clear a failed move's message (its dialog was dismissed).
+    func resetHandleMoveState() {
+        if case .failed = handleMoveState { handleMoveState = .idle }
+    }
+
+    /// The offer a restore reclaim of `handle` may register: the Cashu offer
+    /// only where `SonarHandleOfferPolicy` allows a silent re-claim;
+    /// otherwise none, and the registrar keeps the record it has (a claim
+    /// without an offer never changes the DNS record).
+    private func restoreReclaimOffer(forHandle handle: String) async -> String? {
+        var offer = wallet.cachedReceiveOffer
+        if offer == nil, case .ready = walletState {
+            offer = try? await wallet.createOffer()
+        }
+        let decided = offer.flatMap {
+            handleOfferDecision(claimedHandle: handle, cashuOffer: $0) == .reclaimWithCashu ? $0 : nil
+        }
+        restoreReclaimCashuOffer = decided
+        return decided
+    }
+
+    #if DEBUG
+    /// Tests seed the core-claimed handle (the core has no node there).
+    func seedClaimedHandleForTesting(_ address: String) {
+        coreClaimedHandle = address
+    }
+
+    /// The account the handle record was loaded for.
+    var handleAddressAccountForTesting: String? { handleAddressAccount }
+    #endif
 
     /// If lightweight prefs lost the BIP-353 address but the core still holds
     /// a claimed handle, adopt it back (core persistence is the durable copy).
@@ -4748,36 +5229,37 @@ final class SonarAppStore: ObservableObject {
                     self.publishPaymentMetadataIfNeeded(force: true)
                 }
             }
+            // The published offer is the primary (Cashu) wallet's. It is read
+            // from disk once it exists, so a mint outage does not unpublish it.
             let offer: String?
-            switch self.walletState {
-            case .ready:
+            if let cached = self.wallet.cachedReceiveOffer {
+                offer = cached
+            } else if case .ready = self.walletState {
                 do {
                     offer = try await self.wallet.createOffer()
-                    guard case .ready = self.walletState else { return }
                 } catch {
                     SecureLogger.error("Sonar descriptor payment metadata publish failed: \(error)", category: .session)
                     self.schedulePaymentMetadataRetry(force: force)
                     return
                 }
-            case .settingUp:
+            } else if case .settingUp = self.walletState, self.wallet.connectivity == .connecting {
+                // First connect in flight: the offer is about to be known — do
+                // not publish a descriptor without it in the meantime. (If the
+                // mint is unreachable, the connectivity change re-runs this and
+                // call signaling still gets published below.)
                 return
-            case .notConfigured:
-                // Keep call signaling discoverable for users without a ready
-                // wallet, but do not overwrite a known offer with nil.
+            } else {
+                // Keep call signaling discoverable for users without an offer
+                // yet, but do not overwrite a known offer with nil.
                 guard self.publishedBolt12Offer == nil else { return }
                 offer = nil
             }
-            // Re-subscribe the Breez NDS webhook as soon as the local receive
-            // offer is available. Descriptor publishing can be skipped when the
-            // offer is unchanged or the relay is offline, but Boltz webhook
-            // state still needs this per-launch unregister -> register self-heal.
-            #if os(iOS)
-            if let offer, let bridged = self.wallet as? BridgedWallet {
-                SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: bridged.walletService)
-            }
-            #endif
+            // The public handle is decided separately and never gates this
+            // publish: the descriptor is in-app ⚡PAY and always carries the
+            // Cashu offer; the handle's BIP-353 record moves to it only where
+            // SonarHandleOfferPolicy allows.
             if let offer {
-                await self.refreshHandleOfferIfNeeded(offer)
+                self.scheduleHandleOfferRefresh(offer)
             }
             // Offline relay: the reconnect path republishes, no retry needed.
             guard self.marmot.npub != nil, self.marmot.relayConnected else { return }
@@ -4787,9 +5269,6 @@ final class SonarAppStore: ObservableObject {
             }
             do {
                 try await self.marmot.publishSonarDescriptor(bolt12Offer: offer)
-                if offer != nil {
-                    guard case .ready = self.walletState else { return }
-                }
                 self.publishedCallDescriptor = true
                 self.publishedBolt12Offer = offer
                 self.resetPaymentMetadataRetry()
@@ -4842,26 +5321,140 @@ final class SonarAppStore: ObservableObject {
         min(30 << min(max(attempt, 0), 5), 15 * 60)
     }
 
+    /// Subscribe once to the primary wallet's payment updates: receives land
+    /// in the activity ledger; in-flight sends are finished by their outcome
+    /// (and a chat ⚡PAY receipt goes out when one is owed).
     private func updateWalletPaymentObservation() {
-        guard case .ready = walletState else {
-            incomingWalletTask?.cancel()
-            incomingWalletTask = nil
-            return
-        }
         guard incomingWalletTask == nil else { return }
-        let stream = wallet.incomingPayments()
+        let stream = wallet.paymentUpdates()
         incomingWalletTask = Task { [weak self] in
-            for await payment in stream {
+            for await update in stream {
                 guard !Task.isCancelled else { return }
-                self?.recordIncomingWalletPayment(payment)
+                self?.handleWalletPaymentUpdate(update)
             }
         }
+    }
+
+    private func handleWalletPaymentUpdate(_ update: SonarWalletPayment) {
+        if update.isIncoming {
+            // Cashu receives are final when they are reported complete.
+            if update.status == .complete { recordIncomingWalletPayment(update) }
+            return
+        }
+        let outcome = SonarWalletPaymentReconciler.applyUpdate(
+            update,
+            ledger: paymentActivityLedger,
+            hasReceipt: { [payLedger] in payLedger.entries[$0] != nil }
+        )
+        handlePaymentOutcome(outcome)
+    }
+
+    /// Act on a reconciled payment outcome: end the live send, deliver an
+    /// owed chat receipt, and say so when a payment the user walked away
+    /// from fails.
+    private func handlePaymentOutcome(_ outcome: SonarWalletPaymentReconciler.Outcome) {
+        switch outcome {
+        case .none, .pending:
+            return
+        case .failed(let activityId):
+            finishLivePayment(activityId)
+            if let pending = unifyPendingActivity, pending.activityId == activityId {
+                unifyPendingActivity = nil
+                if unifyPay?.peerId == pending.peerId {
+                    unifyPay = (pending.peerId, .failed(String(localized: "Payment failed — you were not charged.")))
+                }
+                return
+            }
+            if path.last != .paymentStatus(activityId) {
+                showToast(String(localized: "Payment failed — you were not charged."))
+            }
+        case .paid(let activityId, let receiptDue):
+            finishLivePayment(activityId)
+            if let pending = unifyPendingActivity, pending.activityId == activityId {
+                unifyPendingActivity = nil
+                if unifyPay?.peerId == pending.peerId {
+                    unifyPay = (pending.peerId, .sent(sats: pending.sats))
+                }
+            }
+            if receiptDue { deliverPaymentReceipt(activityId) }
+        }
+    }
+
+    private func finishLivePayment(_ activityId: String) {
+        guard livePayments[activityId] != nil else { return }
+        livePayments[activityId] = nil
+        stopPaymentClockIfIdle()
+    }
+
+    /// ⚡PAY + ⚡PAYDONE for a settled chat payment, exactly once: the pay
+    /// ledger row is recorded BEFORE the lines go out, and the reconciler
+    /// only reports a receipt as due while that row is missing.
+    private func deliverPaymentReceipt(_ activityId: String) {
+        guard let entry = paymentActivityLedger.entries[activityId],
+              payLedger.entries[activityId] == nil
+        else { return }
+        payLedger.record(SonarPayEntry(
+            id: activityId, peerKey: entry.peerKey, sats: entry.sats,
+            direction: .outgoing, state: .claimed, via: entry.via
+        ))
+        Task { [weak self] in
+            guard let self else { return }
+            let ok = await self.sendPaymentReceiptLines(
+                [
+                    SonarPayMessage.pay(id: activityId, sats: entry.sats).encoded(),
+                    SonarPayMessage.done(id: activityId, preimage: entry.preimage).encoded(),
+                ],
+                to: entry.peerKey
+            )
+            if !ok {
+                SecureLogger.error("Sonar direct payment receipt delivery failed", category: .session)
+            }
+        }
+    }
+
+    /// After a (re)connect: look up every send still marked in flight and
+    /// fold in whatever the wallet now knows. Never re-sends anything.
+    private func reconcilePendingWalletPayments() {
+        let ids = paymentActivityLedger.pendingWalletPaymentIds
+        guard !ids.isEmpty, pendingPaymentReconcileTask == nil else { return }
+        pendingPaymentReconcileTask = Task { [weak self] in
+            defer { self?.pendingPaymentReconcileTask = nil }
+            for id in ids {
+                guard let self else { return }
+                guard let update = await self.wallet.lookupPayment(id: id) else { continue }
+                self.handleWalletPaymentUpdate(update)
+            }
+        }
+    }
+
+    /// Point the Breez NDS webhook at the LEGACY wallet's own offer, only
+    /// while a legacy wallet exists and its node is up. Once per offer per
+    /// session (SonarPushRegistration dedups further).
+    private func ensureLegacyWebhookIfNeeded() {
+        #if os(iOS)
+        // Not while the one-time restore check may still delete the wallet.
+        guard let legacy = legacyWallet, case .ready = legacy.state,
+              !legacyWallets.restoreCheckInProgress,
+              legacyWebhookTask == nil
+        else { return }
+        legacyWebhookTask = Task { [weak self] in
+            defer { self?.legacyWebhookTask = nil }
+            guard let offer = try? await legacy.createOffer() else { return }
+            guard let self, self.legacyWallet === legacy else { return }
+            if self.legacyWebhookOffer != offer {
+                self.legacyWebhookOffer = offer
+                SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: legacy.walletService)
+            } else {
+                SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: legacy.walletService)
+            }
+        }
+        #endif
     }
 
     private func recordIncomingWalletPayment(_ payment: SonarWalletPayment) {
         guard payment.isIncoming else { return }
         let activityId = "wallet-\(payment.id)"
-        paymentActivityLedger.recordPending(SonarPaymentActivity(
+        let recorded = paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
             kind: .walletIncoming,
             peerKey: "wallet",
@@ -4876,6 +5469,11 @@ final class SonarAppStore: ObservableObject {
             feesSats: payment.feesSats,
             settledAt: payment.timestamp
         ))
+        // First time this receive is seen: announce it once, unless a chat
+        // ⚡PAY line already did.
+        if recorded {
+            receiveAnnouncer.walletReceive(paymentId: payment.id, sats: payment.amountSats)
+        }
     }
 
     // MARK: Connectivity (status chip + connection sheet)
@@ -8916,6 +9514,141 @@ final class SonarAppStore: ObservableObject {
         return nil
     }
 
+    /// The wallet a payment is sent from.
+    func sendingWallet(_ source: SNPaymentSource) -> SonarWalletProviding? {
+        switch source {
+        case .primary: return wallet
+        case .legacy: return legacyWallet
+        }
+    }
+
+    /// Spendable balance of `source`, when ready.
+    func balanceSats(for source: SNPaymentSource) -> Int64? {
+        guard let w = sendingWallet(source), case .ready(let balance) = w.state else { return nil }
+        return balance
+    }
+
+    /// Cashu `Max` takes the fee out of the amount at send time (prepare at
+    /// the full balance, subtract the quoted fee reserve, prepare again);
+    /// the legacy Breez wallet keeps the 0.5% reserve estimate.
+    func usesFeeInclusiveMax(_ source: SNPaymentSource) -> Bool { source == .primary }
+
+    /// The amount handed to the wallet for `destination`: 0 for a BOLT11
+    /// invoice (it speaks for its own amount), `sats` for everything else.
+    /// The send path and the fee quote share it, so the quote prices exactly
+    /// what `send` will prepare.
+    nonisolated static func walletAmount(forDestination destination: String, sats: Int64) -> Int64 {
+        SNPayDestinationKind(destination) == .bolt11 ? 0 : sats
+    }
+
+    /// The pay sheet's fee quote for paying `destination` from `wallet`. The
+    /// FFI call runs on the wallet's own queue (never the main thread).
+    static func feeQuoter(wallet: SonarWalletProviding, destination: String) -> SNFeeQuoter {
+        let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        return { [weak wallet] sats in
+            guard let wallet else { throw UnconfiguredWallet.WalletError.notConfigured }
+            return try await wallet.quoteFee(
+                destination: dest,
+                amountSats: walletAmount(forDestination: dest, sats: sats)
+            )
+        }
+    }
+
+    /// Fee quote for an external destination. Primary (Cashu) wallet only;
+    /// nil hides the fee line.
+    func feeQuoter(destination: String, source: SNPaymentSource = .primary) -> SNFeeQuoter? {
+        guard source == .primary else { return nil }
+        return Self.feeQuoter(wallet: wallet, destination: destination)
+    }
+
+    /// Fee quote for paying a contact: priced against the BOLT12 offer
+    /// `sendPay` will use. Cache-only — no descriptor fetch from a sheet
+    /// render. The offer is looked up when the sheet quotes (Compose
+    /// `quoteChatPayFee` parity); with none cached yet the quote throws and
+    /// the sheet shows no fee — which then consents to NO fee (`SNFeeQuote.
+    /// consentedCeiling`), so a paid route is asked about again rather than
+    /// paid unseen. Primary wallet only: nil for the legacy wallet (no quote).
+    func feeQuoter(forContact id: String, source: SNPaymentSource = .primary) -> SNFeeQuoter? {
+        guard source == .primary else { return nil }
+        return { [weak self] sats in
+            guard let self, let offer = self.cachedPaymentOffer(id) else {
+                throw UnconfiguredWallet.WalletError.notConfigured
+            }
+            return try await Self.feeQuoter(wallet: self.wallet, destination: offer)(sats)
+        }
+    }
+
+    /// A one-off BOLT11 invoice on the primary wallet, for the Receive sheet.
+    /// The wallet runs the FFI call off the main thread and throws its typed
+    /// errors (`SNReceiveSheetCopy.invoiceError` words them for a receive).
+    func receiveInvoice(sats: Int64) async throws -> SonarReceiveInvoice {
+        try await wallet.receiveInvoice(amountSats: sats, description: nil)
+    }
+
+    /// Settings / wallet screen line for the primary wallet: the live
+    /// balance, "Mint offline — retrying", or setup progress.
+    var walletStatusLine: String? {
+        switch wallet.connectivity {
+        case .offline: return String(localized: "Mint offline — retrying")
+        case .connecting: return balanceSats == nil ? String(localized: "Connecting to the mint…") : nil
+        case .online, .unavailable: return nil
+        }
+    }
+
+    /// One custody-disclosure line for Settings.
+    var walletCustodyLine: String? { wallet.custodyDescription }
+
+    /// Pending amounts of the primary wallet, for the wallet screen.
+    var walletBalanceDetail: SonarWalletBalanceDetail? { wallet.balanceDetail }
+
+    // MARK: Legacy (old Lightning) wallet
+
+    /// Why the old wallet cannot be deleted right now; nil = it can.
+    var legacyDeleteBlockerMessage: String? {
+        guard let legacy = legacyWallet else { return nil }
+        guard let blocker = legacy.deleteBlocker else { return nil }
+        return SonarLegacyDeleteGate.message(for: blocker, money: { [weak self] in
+            self?.money($0) ?? sonarFormatSats($0)
+        })
+    }
+
+    /// Delete the old Lightning wallet. Re-checks the gate on a fresh sync
+    /// first; returns the user-facing refusal/failure, or nil on success.
+    func deleteLegacyWallet() async -> String? {
+        guard legacyWallet != nil else { return nil }
+        do {
+            try await legacyWallets.deleteLegacy(unregisterWebhook: { service in
+                #if os(iOS)
+                await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: service)
+                #endif
+            })
+            legacyWebhookOffer = nil
+            if paymentSource == .legacy { paymentSource = .primary }
+            showToast(String(localized: "Old Lightning wallet removed"))
+            return nil
+        } catch LegacyBreezWallet.DeleteError.blocked(let blocker) {
+            return SonarLegacyDeleteGate.message(for: blocker, money: { [weak self] in
+                self?.money($0) ?? sonarFormatSats($0)
+            })
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// Re-take the old wallet's snapshot (card appear / pull to refresh).
+    func refreshLegacyWallet() {
+        guard let legacy = legacyWallet else { return }
+        legacy.retrySetup()
+        Task { await legacy.refreshSnapshot() }
+    }
+
+    /// Open the send-payment screen paying from the old wallet.
+    func sendFromLegacyWallet() {
+        guard legacyWallet != nil else { return }
+        paymentSource = .legacy
+        push(.sendPayment)
+    }
+
     /// Wallet payment activity, newest first. Includes direct Sonar BOLT12
     /// sends and Unify nearby sends.
     var paymentActivities: [SonarPaymentActivity] {
@@ -8927,36 +9660,36 @@ final class SonarAppStore: ObservableObject {
     /// The EFFECTIVE money string for an amount (fiat when the user picked fiat
     /// AND a live rate exists, otherwise grouped sats). The single rendering
     /// path for every amount in the UI.
-    func money(_ sats: Int64) -> String { wallet.format(sats: sats) }
+    func money(_ sats: Int64) -> String { moneyDisplay.format(sats: sats) }
 
     /// Secondary "≈ N sats" detail, shown only when the primary line is fiat
     /// (so the user can still see the bitcoin amount). nil otherwise.
     func moneySatsLine(_ sats: Int64) -> String? {
-        wallet.effectiveShowsFiat ? sonarFormatSats(sats) : nil
+        moneyDisplay.effectiveShowsFiat ? sonarFormatSats(sats) : nil
     }
 
     /// Live fiat line for an amount; nil unless fiat is effectively shown.
     /// (Kept for call sites that want an optional secondary fiat line.)
     func fiatText(_ sats: Int64) -> String? {
-        wallet.effectiveShowsFiat ? wallet.format(sats: sats) : nil
+        moneyDisplay.effectiveShowsFiat ? moneyDisplay.format(sats: sats) : nil
     }
 
-    var displayMode: String { wallet.displayMode }
-    var displayCurrency: String { wallet.displayCurrency }
-    var canEnterFiat: Bool { wallet.hasLiveRate }
-    func supportedCurrencies() -> [SonarCurrency] { wallet.supportedCurrencies() }
+    var displayMode: String { moneyDisplay.displayMode }
+    var displayCurrency: String { moneyDisplay.displayCurrency }
+    var canEnterFiat: Bool { moneyDisplay.hasLiveRate }
+    func supportedCurrencies() -> [SonarCurrency] { moneyDisplay.supportedCurrencies() }
 
     /// Symbol for the selected currency (falls back to the code).
     var currencySymbol: String {
         supportedCurrencies().first { $0.code == displayCurrency }?.symbol ?? displayCurrency
     }
 
-    func setDisplayMode(_ mode: String) { Task { await wallet.setDisplayMode(mode) } }
-    func setDisplayCurrency(_ code: String) { Task { await wallet.setDisplayCurrency(code) } }
+    func setDisplayMode(_ mode: String) { moneyDisplay.setDisplayMode(mode) }
+    func setDisplayCurrency(_ code: String) { moneyDisplay.setDisplayCurrency(code) }
 
     /// Typed fiat text → sats at the live rate (only call when canEnterFiat).
     func parseFiat(_ text: String) -> Int64 {
-        wallet.parseFiatInput(text, currencyCode: displayCurrency)
+        moneyDisplay.parseFiatInput(text, currencyCode: displayCurrency)
     }
 
     /// Payment-capable when the peer has a BOLT12 offer from their Nostr
@@ -9067,16 +9800,19 @@ final class SonarAppStore: ObservableObject {
         case refuse(String)
     }
 
-    private func destinationSendAmount(_ dest: String, sats: Int64) -> SNDestinationCheck {
-        guard case .ready = walletState else { return .refuse("Set up the wallet first.") }
+    private func destinationSendAmount(_ dest: String, sats: Int64, source: SNPaymentSource) -> SNDestinationCheck {
+        guard let sender = sendingWallet(source), case .ready = sender.state else {
+            return .refuse(String(localized: "Your wallet is still starting. Try again in a moment."))
+        }
         let lower = dest.lowercased()
-        let isBolt11 = lower.hasPrefix("lnbc") || lower.hasPrefix("lntb") || lower.hasPrefix("lnbcrt")
+        let isBolt11 = SNPayDestinationKind(dest) == .bolt11
         if isBolt11, SNScannedKind.bolt11AmountSats(lower) == nil {
             return .refuse(
                 "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
             )
         }
-        return .send(isBolt11 ? 0 : sats)
+        // Shared with the fee quote, so the quote prices what is sent.
+        return .send(Self.walletAmount(forDestination: dest, sats: sats))
     }
 
     /// Starts paying an arbitrary Lightning destination from the send-payment
@@ -9090,14 +9826,22 @@ final class SonarAppStore: ObservableObject {
     /// a toast). The send itself runs detached on the store's own task, so
     /// leaving the status screen — or the picker popping out from under it —
     /// cannot cancel a payment in flight.
+    ///
+    /// `maxFeeSats` is the fee the user agreed to on the sheet (nil = none
+    /// was shown — legacy wallet); see `SonarWalletProviding.send`.
     @discardableResult
     func beginDestinationPayment(
-        _ destination: String, sats: Int64, displayName: String
+        _ destination: String,
+        sats: Int64,
+        displayName: String,
+        maxFeeSats: Int64?,
+        source: SNPaymentSource = .primary,
+        feeFromAmount: Bool = false
     ) -> String? {
         let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
         guard sats > 0, !dest.isEmpty else { return nil }
         let amountForWallet: Int64
-        switch destinationSendAmount(dest, sats: sats) {
+        switch destinationSendAmount(dest, sats: sats, source: source) {
         case .send(let amount):
             amountForWallet = amount
         case .refuse(let message):
@@ -9125,6 +9869,9 @@ final class SonarAppStore: ObservableObject {
             status: .pending
         ))
         paymentDestinations[activityId] = dest
+        paymentSources[activityId] = source
+        if feeFromAmount { paymentFeeFromAmount.insert(activityId) }
+        if let maxFeeSats { paymentFeeCeilings[activityId] = maxFeeSats }
         livePayments[activityId] = SNLivePayment(
             id: activityId,
             payeeName: payeeName,
@@ -9151,21 +9898,47 @@ final class SonarAppStore: ObservableObject {
             // `await` here cannot leave a stale id behind.
             self.cancelledPayments.remove(activityId)
             self.livePayments[activityId]?.handedToWallet = true
+            guard let sender = self.sendingWallet(source) else {
+                self.paymentActivityLedger.markFailed(activityId, message: String(localized: "Payment failed — you were not charged."))
+                self.finishLivePayment(activityId)
+                return
+            }
             do {
-                let payment = try await self.wallet.send(
+                let payment = try await sender.send(
                     destination: dest,
                     amountSats: amountForWallet,
-                    note: "Sonar payment \(activityId)"
+                    note: "Sonar payment \(activityId)",
+                    feeFromAmount: feeFromAmount,
+                    maxFeeSats: maxFeeSats
                 )
-                self.paymentActivityLedger.markPaid(activityId, payment: payment)
+                let outcome = SonarWalletPaymentReconciler.applySendResult(
+                    payment,
+                    activityId: activityId,
+                    ledger: self.paymentActivityLedger,
+                    hasReceipt: { [payLedger = self.payLedger] in payLedger.entries[$0] != nil },
+                    adoptWalletAmount: feeFromAmount
+                )
+                if case .pending = outcome {
+                    // In flight, NOT failed: keep the live row ("Taking longer
+                    // than usual"); the wallet's update finishes it. Catch an
+                    // outcome that arrived before we recorded the id.
+                    self.catchUpEarlyUpdate(for: payment, from: sender)
+                    return
+                }
+                self.handlePaymentOutcome(outcome)
             } catch {
+                // Recorded BEFORE the ledger publishes the failure, so the
+                // status screen's re-render already states the new fee.
+                if case .feeChanged(let fee) = error as? CashuWalletError {
+                    self.paymentFeeChanged[activityId] = fee
+                }
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 SecureLogger.error("Sonar destination payment failed: \(error)", category: .session)
                 // The status screen states the failure in full, and the home
                 // strip clears on a terminal state — so without this a user who
                 // walked away from the screen would never learn it failed.
                 if self.path.last != .paymentStatus(activityId) {
-                    self.showToast("Payment failed: \(error.localizedDescription)")
+                    self.showToast(Self.sendFailureToast(error))
                 }
             }
             // Terminal: drop out of the live set so the home strip clears and
@@ -9180,14 +9953,46 @@ final class SonarAppStore: ObservableObject {
     /// destination as a fresh activity. Returns the new activity id, or nil
     /// when the destination is no longer known (a relaunch drops it — the
     /// ledger only ever stored its hash).
+    ///
+    /// The fee ceiling is the one the user last saw: the NEW fee when the
+    /// send was refused because the fee rose (the status screen states it,
+    /// and tapping `Try again` after reading it is the consent), else the fee
+    /// the sheet showed. A `Max` send stays a `Max` send.
     @discardableResult
     func retryDestinationPayment(_ activityId: String) -> String? {
         guard let destination = paymentDestinations[activityId],
-              let previous = paymentActivityLedger.entries[activityId]
+              let previous = paymentActivityLedger.entries[activityId],
+              // Only a payment that FAILED may be sent again. A pending one may
+              // still be routing — a second send could pay twice.
+              previous.status == .failed
         else { return nil }
         return beginDestinationPayment(
-            destination, sats: previous.sats, displayName: previous.peerName
+            destination,
+            sats: previous.sats,
+            displayName: previous.peerName,
+            maxFeeSats: paymentFeeChanged[activityId] ?? paymentFeeCeilings[activityId],
+            source: paymentSources[activityId] ?? .primary,
+            feeFromAmount: paymentFeeFromAmount.contains(activityId)
         )
+    }
+
+    /// The toast for a send that threw. A fee that rose is its own sentence
+    /// (it asks for a new consent, it is not a "payment failed").
+    static func sendFailureToast(_ error: Error) -> String {
+        if case .feeChanged = error as? CashuWalletError {
+            return error.localizedDescription
+        }
+        return "Payment failed: \(error.localizedDescription)"
+    }
+
+    /// A send returned `pending`: if its outcome already arrived (before the
+    /// ledger knew the wallet id), fold it in now.
+    private func catchUpEarlyUpdate(for payment: SonarWalletPayment, from sender: SonarWalletProviding) {
+        guard sender === wallet,
+              let early = wallet.latestPaymentUpdate(id: payment.id),
+              early.status != .pending
+        else { return }
+        handleWalletPaymentUpdate(early)
     }
 
     /// Aborts a payment that has not reached the wallet yet. No-op once it has
@@ -9210,7 +10015,8 @@ final class SonarAppStore: ObservableObject {
             activity: activity,
             live: livePayments[activityId],
             now: Date(),
-            canRetry: paymentDestinations[activityId] != nil
+            canRetry: paymentDestinations[activityId] != nil,
+            feeChangedSats: paymentFeeChanged[activityId]
         )
     }
 
@@ -9255,16 +10061,35 @@ final class SonarAppStore: ObservableObject {
         paymentClockTask = nil
         livePayments = [:]
         paymentDestinations = [:]
+        paymentSources = [:]
+        paymentFeeFromAmount = []
+        paymentFeeCeilings = [:]
+        paymentFeeChanged = [:]
         cancelledPayments = []
+        unifyPendingActivity = nil
     }
 
     /// Sends money directly to the receiver's BOLT12 offer from their
     /// `sonar.meta.v1` descriptor. Fetches the descriptor synchronously if
     /// missing; returns a user-facing message only when the offer is truly
     /// unavailable after the fetch.
+    ///
+    /// `maxFeeSats` is the fee the user agreed to on the sheet (nil = none
+    /// was shown — legacy wallet); see `SonarWalletProviding.send`. A higher
+    /// fee is refused and the returned message states the new one; the user
+    /// re-opens the sheet, which quotes again.
     @discardableResult
-    func sendPay(_ id: String, sats: Int64) async -> String? {
-        guard sats > 0, case .ready = walletState else { return nil }
+    func sendPay(
+        _ id: String,
+        sats: Int64,
+        maxFeeSats: Int64?,
+        source: SNPaymentSource = .primary,
+        feeFromAmount: Bool = false
+    ) async -> String? {
+        guard sats > 0 else { return nil }
+        guard let sender = sendingWallet(source), case .ready = sender.state else {
+            return String(localized: "Your wallet is still starting. Try again in a moment.")
+        }
         // Store-level block enforcement (Android parity): UI gating alone
         // would let stale UI state or future callers pay a blocked contact.
         if isContactBlocked(id, npub: callNpub(id) ?? "") {
@@ -9298,35 +10123,57 @@ final class SonarAppStore: ObservableObject {
         ))
         let payment: SonarWalletPayment
         do {
-            payment = try await wallet.send(
+            payment = try await sender.send(
                 destination: offer,
                 amountSats: sats,
-                note: "Sonar payment \(activityId)"
+                note: "Sonar payment \(activityId)",
+                feeFromAmount: feeFromAmount,
+                maxFeeSats: maxFeeSats
             )
         } catch {
             paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
             SecureLogger.error("Sonar direct payment failed: \(error)", category: .session)
-            return "Payment failed: \(error.localizedDescription)"
+            return Self.sendFailureToast(error)
         }
-        // Wallet settled — record locally before sending receipts so the
-        // ledger is consistent even if the chat send path ever fails.
-        paymentActivityLedger.markPaid(activityId, payment: payment)
-        payLedger.record(SonarPayEntry(
-            id: activityId, peerKey: id, sats: sats,
-            direction: .outgoing, state: .claimed, via: via.rawValue
-        ))
-        let receiptOk = await sendPaymentReceiptLines(
-            [
-                SonarPayMessage.pay(id: activityId, sats: sats).encoded(),
-                SonarPayMessage.done(id: activityId, preimage: payment.preimage).encoded()
-            ],
-            to: id
+        let outcome = SonarWalletPaymentReconciler.applySendResult(
+            payment,
+            activityId: activityId,
+            ledger: paymentActivityLedger,
+            hasReceipt: { [payLedger] in payLedger.entries[$0] != nil },
+            adoptWalletAmount: feeFromAmount
         )
-        if !receiptOk {
-            SecureLogger.error("Sonar direct payment receipt delivery failed", category: .session)
-            return "Payment sent but receipt delivery failed"
+        switch outcome {
+        case .none:
+            return nil
+        case .failed:
+            return String(localized: "Payment failed — you were not charged.")
+        case .pending:
+            // In flight (Cashu `Pending`): NOT failed and never re-sent. The
+            // ⚡PAY receipt + PAYDONE (with the preimage) go out when the
+            // wallet reports the same payment complete.
+            catchUpEarlyUpdate(for: payment, from: sender)
+            return String(localized: "Payment is on its way — it shows in the chat once it settles.")
+        case .paid(_, let receiptDue):
+            guard receiptDue, let entry = paymentActivityLedger.entries[activityId] else { return nil }
+            // Wallet settled — record locally before sending receipts so the
+            // ledger is consistent even if the chat send path ever fails.
+            payLedger.record(SonarPayEntry(
+                id: activityId, peerKey: id, sats: entry.sats,
+                direction: .outgoing, state: .claimed, via: via.rawValue
+            ))
+            let receiptOk = await sendPaymentReceiptLines(
+                [
+                    SonarPayMessage.pay(id: activityId, sats: entry.sats).encoded(),
+                    SonarPayMessage.done(id: activityId, preimage: entry.preimage ?? payment.preimage).encoded()
+                ],
+                to: id
+            )
+            if !receiptOk {
+                SecureLogger.error("Sonar direct payment receipt delivery failed", category: .session)
+                return "Payment sent but receipt delivery failed"
+            }
+            return nil
         }
-        return nil
     }
 
     /// Compose-style watermark gate for Marmot message side effects. Only
@@ -9436,7 +10283,7 @@ final class SonarAppStore: ObservableObject {
                             sound: via == .mesh ? .ble : .standard
                         )
                     }
-                    handlePayLine(line, convId: peerID.id, via: via)
+                    handlePayLine(line, convId: peerID.id, via: via, sentAt: m.timestamp)
                 }
             }
         }
@@ -9446,7 +10293,7 @@ final class SonarAppStore: ObservableObject {
                 guard !scannedPayMessageIDs.contains(m.id) else { continue }
                 scannedPayMessageIDs.insert(m.id)
                 if let line = SonarPayMessage.decode(m.content) {
-                    handlePayLine(line, convId: marmotConvId(forGroup: groupId), via: .internet)
+                    handlePayLine(line, convId: marmotConvId(forGroup: groupId), via: .internet, sentAt: m.createdAt)
                 }
             }
         }
@@ -9675,13 +10522,18 @@ final class SonarAppStore: ObservableObject {
         return Self.marmotIDPrefix + groupId
     }
 
-    private func handlePayLine(_ line: SonarPayMessage, convId: String, via: SNVia) {
+    private func handlePayLine(_ line: SonarPayMessage, convId: String, via: SNVia, sentAt: Date) {
         switch line {
         case .pay(let id, let sats):
-            payLedger.record(SonarPayEntry(
+            let firstSight = payLedger.record(SonarPayEntry(
                 id: id, peerKey: convId, sats: sats,
                 direction: .incoming, state: .sealed, via: via.rawValue
             ))
+            // First sight only: a replayed transcript must not silence a new
+            // outside payment (see SonarReceiveAnnouncer).
+            if firstSight {
+                receiveAnnouncer.chatReceipt(id: id, sats: sats, sentAt: sentAt)
+            }
 
         case .done(let id, let preimage):
             payLedger.markIncomingClaimedOrPending(id, preimage: preimage)
@@ -9767,7 +10619,7 @@ final class SonarAppStore: ObservableObject {
         guard let unifyId = unifyPeerId(id) else { return }
         // Honest gate: a Unify peer still shows, but paying needs a wallet.
         guard case .ready = walletState else {
-            unifyPay = (id, .failed("Set up your wallet first to send money."))
+            unifyPay = (id, .failed(String(localized: "Your wallet is still starting. Try again in a moment.")))
             return
         }
         unifyPay = (id, .fetching)
@@ -9791,15 +10643,16 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// User entered an amount on the Unify pay keypad.
-    func confirmUnifyAmount(_ id: String, destination: String, sats: Int64) {
+    /// User entered an amount on the Unify pay keypad. `feeFromAmount`: the
+    /// user chose `Max`, so the fee comes out of the amount.
+    func confirmUnifyAmount(_ id: String, destination: String, sats: Int64, feeFromAmount: Bool = false) {
         guard sats > 0 else { return }
-        payUnify(id, destination: destination, sats: sats)
+        payUnify(id, destination: destination, sats: sats, feeFromAmount: feeFromAmount)
     }
 
     /// Direct Lightning send to the Unify receiver's served offer/invoice. This
     /// is NOT the ⚡PAY sealed-coin chat path — Unify peers don't chat.
-    private func payUnify(_ id: String, destination: String, sats: Int64) {
+    private func payUnify(_ id: String, destination: String, sats: Int64, feeFromAmount: Bool = false) {
         let activityId = UUID().uuidString.lowercased()
         paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
@@ -9817,13 +10670,34 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
+                // No fee ceiling: the Unify sheet shows no fee line (the
+                // peer's request is read over BLE, and an amount-carrying one
+                // is paid with no sheet at all), so there is no quote the user
+                // saw to hold the send to. Tracked gap, same on Compose.
                 let payment = try await self.wallet.send(
                     destination: destination,
                     amountSats: sats,
-                    note: "Unify nearby payment \(activityId)"
+                    note: "Unify nearby payment \(activityId)",
+                    feeFromAmount: feeFromAmount,
+                    maxFeeSats: nil
                 )
-                self.paymentActivityLedger.markPaid(activityId, payment: payment)
-                self.unifyPay = (id, .sent(sats: sats))
+                let outcome = SonarWalletPaymentReconciler.applySendResult(
+                    payment,
+                    activityId: activityId,
+                    ledger: self.paymentActivityLedger,
+                    hasReceipt: { _ in true },
+                    adoptWalletAmount: feeFromAmount
+                )
+                switch outcome {
+                case .pending:
+                    // In flight: the sheet keeps "Sending…" until the outcome.
+                    self.unifyPendingActivity = (id, activityId, payment.amountSats > 0 ? payment.amountSats : sats)
+                    self.catchUpEarlyUpdate(for: payment, from: self.wallet)
+                case .failed:
+                    self.unifyPay = (id, .failed(String(localized: "Payment failed — you were not charged.")))
+                case .paid, .none:
+                    self.unifyPay = (id, .sent(sats: payment.amountSats > 0 ? payment.amountSats : sats))
+                }
             } catch {
                 self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
                 self.unifyPay = (id, .failed(error.localizedDescription))
@@ -10781,22 +11655,21 @@ final class SonarAppStore: ObservableObject {
         conversationViewStates.removeAll()
         retainedConversationOrder.removeAll()
         homeDMRowsCache = nil
-        // The Breez node must release its SQLite store before wallet files are
-        // deleted. Await this before revealing onboarding so a fast re-onboard
-        // cannot race a still-running destructive wallet task.
-        var walletWipeComplete = true
-        #if os(iOS) || os(macOS)
-        if let bridged = wallet as? BridgedWallet {
-            walletWipeComplete = await bridged.wipeForEmergency()
-        } else {
-            do {
-                try BridgedWallet.beginWalletStorageMutation()
-                try BridgedWallet.wipeWalletStorage()
-            } catch {
-                walletWipeComplete = false
-            }
-        }
+        // Every wallet releases its store before its files are deleted. Await
+        // this before revealing onboarding so a fast re-onboard cannot race a
+        // still-running destructive wallet task. Cashu disconnects first
+        // (queued behind any in-flight send), then EVERY `sonar-cashu/` root
+        // goes; the legacy Breez store, its archives, seed and credentials go
+        // too, open or not; then the money-display prefs.
+        #if os(iOS)
+        await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: legacyWallet?.walletService)
         #endif
+        let cashuWipeComplete = await wallet.wipeForEmergency()
+        let legacyWipeComplete = await legacyWallets.wipeForEmergency()
+        let walletWipeComplete = cashuWipeComplete && legacyWipeComplete
+        legacyWebhookOffer = nil
+        paymentSource = .primary
+        moneyDisplay.wipe()
         // Wipes Noise/Nostr keys, all keychain data (incl. marmot-nsec),
         // messages, favorites, verified fingerprints and the nickname.
         // panicClearAllData() also erases the on-disk MessageStore; call it
@@ -10814,6 +11687,9 @@ final class SonarAppStore: ObservableObject {
         marmotVerified = [:]
         defaults.removeObject(forKey: Keys.marmotVerified)
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
+        // Which wallet each account's handle pays (the npub sink drops the
+        // in-memory copy).
+        SonarHandleAddressRecord.removeAll(defaults: defaults)
         // Stop Sonar discovery announces and forget discovered profiles (live +
         // the persisted npub↔peer link).
         if let ble = chatViewModel.meshService as? BLEService {
@@ -10838,8 +11714,9 @@ final class SonarAppStore: ObservableObject {
         // Stop advertising as a Unify receiver (the served offer is derived
         // from the wallet seed being wiped below).
         unifyReceiver.stop()
-        incomingWalletTask?.cancel()
-        incomingWalletTask = nil
+        // Keep the wallet-update subscription: the wallet object outlives the
+        // account (it reopens for the next one), and a dropped subscription
+        // would strand every later pending send.
         publishedBolt12Offer = nil
         publishedCallDescriptor = false
         publishingPaymentMetadata = false

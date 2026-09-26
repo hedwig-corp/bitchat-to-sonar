@@ -7,7 +7,7 @@ import android.util.Log
 import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.SonarCore
-import chat.bitchat.sonar.wallet.WalletBridge
+import chat.bitchat.sonar.wallet.LegacyBreezWallet
 import chat.bitchat.sonar.wallet.WalletState
 import com.google.firebase.messaging.FirebaseMessaging
 import java.security.MessageDigest
@@ -21,7 +21,9 @@ import kotlinx.coroutines.withTimeout
 /**
  * Registers the device's FCM token with both notification servers:
  *   1. Transponder — MIP-05 encrypted token shares (chat/call wakeups)
- *   2. Breez NDS — webhook URL (wallet wakeups, silent only)
+ *   2. Breez NDS — webhook URL (wallet wakeups, silent only). LEGACY: only
+ *      while a legacy Breez wallet exists on this device, and always against
+ *      that wallet's OWN offer — never the published Cashu offer.
  */
 object SonarPushRegistration {
 
@@ -42,7 +44,7 @@ object SonarPushRegistration {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val webhookLock = Any()
 
-    // Same app-private "sonar" prefs used by WalletBridge.android.kt.
+    // Same app-private "sonar" prefs the wallet display prefs live in.
     private fun prefs() = AppContextHolder.ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
 
     private val transponderNpub: String get() = BuildConfig.TRANSPONDER_NPUB
@@ -170,7 +172,7 @@ object SonarPushRegistration {
 
     private fun registerBreezWebhook(fcmToken: String, offer: String) {
         if (ndsUrl.isBlank()) return
-        if (WalletBridge.state() !is WalletState.Ready) {
+        if (LegacyBreezWallet.state() !is WalletState.Ready) {
             Log.d(TAG, "Breez NDS: wallet not ready, will retry after wallet setup")
             return
         }
@@ -236,7 +238,7 @@ object SonarPushRegistration {
 
     fun unregister() {
         scope.launch {
-            try { WalletBridge.unregisterWebhook() } catch (_: Exception) {}
+            try { LegacyBreezWallet.unregisterWebhook() } catch (_: Exception) {}
         }
         cachedFcmToken = null
         cachedOffer = null
@@ -253,13 +255,20 @@ object SonarPushRegistration {
     }
 
     /**
+     * The legacy Breez wallet was deleted: forget its offer and markers so no
+     * later token refresh re-registers a webhook for a wallet that is gone.
+     * Same effect as [prepareForAccountReplacement].
+     */
+    suspend fun forgetLegacyWebhook() = prepareForAccountReplacement()
+
+    /**
      * Identity replacement keeps the device FCM token but must forget every
      * offer-scoped marker from the previous deterministic wallet. Best-effort
      * unregister while the old node is still connected; the new wallet always
      * force-registers its own offer after setup.
      */
     suspend fun prepareForAccountReplacement() {
-        try { WalletBridge.unregisterWebhook() } catch (_: Exception) {}
+        try { LegacyBreezWallet.unregisterWebhook() } catch (_: Exception) {}
         cachedOffer = null
         synchronized(webhookLock) {
             completedSessionWebhookMarker = null
@@ -322,8 +331,8 @@ object SonarPushRegistration {
         for (attempt in 1..MAX_RETRIES) {
             try {
                 withTimeout(WEBHOOK_REGISTRATION_TIMEOUT_MS) {
-                    try { WalletBridge.unregisterWebhook() } catch (_: Exception) {}
-                    WalletBridge.registerWebhook(webhookUrl)
+                    try { LegacyBreezWallet.unregisterWebhook() } catch (_: Exception) {}
+                    LegacyBreezWallet.registerWebhook(webhookUrl)
                 }
                 return
             } catch (e: Exception) {

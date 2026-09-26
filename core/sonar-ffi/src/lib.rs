@@ -35,6 +35,10 @@ mod android_jni;
 
 mod logging;
 
+/// Sonar's Cashu wallet.
+mod wallet;
+pub use wallet::*;
+
 /// Flat error: only the rendered message crosses the FFI boundary
 /// (`SonarFfiError.InvalidInput(message:)` / `.Core(message:)` in Swift).
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -1261,6 +1265,25 @@ impl SonarNode {
                 .publish_sonar_descriptor(calls_enabled, signaling, bolt12_offer),
         )?;
         Ok(())
+    }
+
+    /// Back up the wallet's receive-offer pointer (`SonarCashuWallet::offer_backup`)
+    /// to our relays, NIP-44 sealed to our own key, one event per backup.
+    pub fn publish_wallet_offer_backup(&self, backup: String) -> FfiResult<()> {
+        self.block_on_suspendable(
+            "publish_wallet_offer_backup",
+            self.client.publish_wallet_offer_backup(&backup),
+        )?;
+        Ok(())
+    }
+
+    /// Every wallet offer backup this account published, decrypted (empty
+    /// when there are none). An error means the relays did not answer.
+    pub fn fetch_wallet_offer_backups(&self) -> FfiResult<Vec<String>> {
+        self.block_on_suspendable(
+            "fetch_wallet_offer_backups",
+            self.client.fetch_wallet_offer_backups(),
+        )
     }
 
     /// Fetch a peer's Sonar descriptor (npub or hex pubkey). `None` means the

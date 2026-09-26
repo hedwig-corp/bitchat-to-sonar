@@ -22,21 +22,31 @@ mod destination;
 mod error;
 mod listeners;
 mod mock;
+mod rates;
 mod seed;
 mod traits;
 mod types;
+mod wipe;
 
 pub use destination::{classify_destination, resolve_send_amount};
 pub use error::{Result, WalletError};
 pub use listeners::ListenerRegistry;
 pub use mock::MockWallet;
-pub use seed::{entropy_hex, nsec_to_secret, wallet_entropy, SEED_INFO, SEED_SALT};
-pub use traits::{prepare_and_send, supports_receive, WalletBackend, WalletEventListener};
-pub use types::{
-    Balance, Destination, DestinationKind, ExchangeRate, Network, Payment, PaymentStatus,
-    PreparedSend, PreparedSendToken, ReceiveMethod, ReceiveRequest, WalletCapabilities,
-    WalletConfig, WalletEvent,
+pub use rates::{parse_yadio, YADIO_BTC_RATES_URL};
+pub use seed::{
+    cashu_offer_key, cashu_wallet_seed, entropy_hex, nsec_to_secret, wallet_entropy,
+    CASHU_OFFER_KEY_INFO, CASHU_SEED_INFO, SEED_INFO, SEED_SALT,
 };
+pub use traits::{
+    prepare_and_send, supports_receive, TrackedReceiveBackend, WalletBackend, WalletEventListener,
+};
+pub use types::{
+    Balance, Destination, DestinationKind, ExchangeRate, Network, Payment, PaymentLookup,
+    PaymentLookupStatus, PaymentStatus, PreparedSend, PreparedSendToken, ReceiveMethod,
+    ReceiveRequest, TrackedReceive, TrackedReceiveState, WalletCapabilities, WalletConfig,
+    WalletEvent,
+};
+pub use wipe::guard_wipe_path;
 /// Re-exported so backends can build a [`WalletConfig`] without taking their
 /// own `zeroize` dependency (and risking a different major version).
 pub use zeroize::Zeroizing;

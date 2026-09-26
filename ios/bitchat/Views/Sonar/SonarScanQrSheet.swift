@@ -338,21 +338,38 @@ struct SNScannedKind {
         var amountPart = String(prefix[digitsStart...])
         guard !amountPart.isEmpty else { return nil }
         let multiplier = amountPart.removeLast()
-        let scale: Double
+        // Integer millisatoshis, never `Double`: in floating point "lnbc2100n"
+        // (210 sats) came out as 210.00000000000003 and rounded UP to 211, so
+        // the send sheet showed and the ledger recorded a sat that was never
+        // paid. Millisatoshis per unit of the amount, by multiplier; nil = p
+        // (one pico-BTC is a tenth of a millisatoshi).
+        let msatPerUnit: Int64?
         switch multiplier {
-        case "m": scale = 1e-3
-        case "u": scale = 1e-6
-        case "n": scale = 1e-9
-        case "p": scale = 1e-12
-        default:
+        case "m": msatPerUnit = 100_000_000
+        case "u": msatPerUnit = 100_000
+        case "n": msatPerUnit = 100
+        case "p": msatPerUnit = nil
+        case "0"..."9":
             // No multiplier: the trailing character was part of the number.
             amountPart.append(multiplier)
-            scale = 1.0
+            msatPerUnit = 100_000_000_000
+        default:
+            return nil
         }
-        guard let value = Double(amountPart), value > 0 else { return nil }
-        // p-denominated invoices can encode sub-satoshi amounts; round up so we
-        // never underpay, and treat a zero result as "no amount".
-        let sats = Int64((value * scale * 100_000_000.0).rounded(.up))
+        guard !amountPart.isEmpty,
+              amountPart.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let value = Int64(amountPart), value > 0
+        else { return nil }
+        let msat: Int64
+        if let perUnit = msatPerUnit {
+            let (product, overflow) = value.multipliedReportingOverflow(by: perUnit)
+            guard !overflow else { return nil }
+            msat = product
+        } else {
+            msat = value / 10 + (value % 10 == 0 ? 0 : 1)
+        }
+        // A sub-satoshi remainder rounds up, so we never underpay.
+        let sats = msat / 1_000 + (msat % 1_000 == 0 ? 0 : 1)
         return sats > 0 ? sats : nil
     }
 }

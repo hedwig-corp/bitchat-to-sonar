@@ -43,6 +43,11 @@ struct SonarSendPaymentScreen: View {
     /// so it is snapshotted once per appearance and the search filters the
     /// snapshot.
     @State private var contacts: [SNPayableContact] = []
+    /// Which wallet pays: captured from the store when the screen opens (the
+    /// old Lightning wallet card opens this screen with `.legacy`).
+    @State private var source: SNPaymentSource = .primary
+
+    private var sourceBalance: Int64 { store.balanceSats(for: source) ?? 0 }
 
     private var trimmed: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var listed: [SNPayableContact] {
@@ -62,7 +67,9 @@ struct SonarSendPaymentScreen: View {
                     HStack(spacing: 7) {
                         SNIcon(name: .coin, size: 14, weight: 2)
                             .foregroundColor(SonarTheme.text3)
-                        Text(verbatim: "Your balance · \(store.money(store.balanceSats ?? 0))")
+                        Text(verbatim: source == .legacy
+                             ? String(localized: "Old Lightning wallet · \(store.money(sourceBalance))")
+                             : "Your balance · \(store.money(sourceBalance))")
                             .font(SonarTheme.uiFont(size: 13))
                             .foregroundColor(SonarTheme.text2)
                         Spacer(minLength: 0)
@@ -230,7 +237,14 @@ struct SonarSendPaymentScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
-        .task { contacts = store.payableContacts }
+        .task {
+            source = store.paymentSource
+            contacts = store.payableContacts
+        }
+        .onDisappear {
+            // The legacy source is for this visit only.
+            if store.paymentSource == .legacy { store.paymentSource = .primary }
+        }
         .snSheet(
             isPresented: Binding(
                 get: { contactTarget != nil },
@@ -241,24 +255,18 @@ struct SonarSendPaymentScreen: View {
             if let contact = contactTarget {
                 SNPaySheet(
                     peerName: contact.name,
-                    balance: store.balanceSats ?? 0,
+                    balance: sourceBalance,
                     transport: contact.nearby ? .mesh : .internet,
                     money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
+                    usesFeeInclusiveMax: store.usesFeeInclusiveMax(source),
+                    quoteFee: store.feeQuoter(forContact: contact.id, source: source),
                     onClose: { contactTarget = nil },
-                    onSend: { sats in
-                        // Route through the chat so the peer still gets the
-                        // in-chat ⚡PAY receipt, as paying from the chat does.
-                        // The screen pops immediately, so the outcome must go
-                        // to the app-level toast (rendered by SonarRootView).
-                        // A view-local toast here is written to a dismissed
-                        // view and never appears — the payment fails silently.
-                        Task {
-                            if let message = await store.sendPay(contact.id, sats: sats) {
-                                store.showToast(message)
-                            }
-                        }
-                        store.pop()
+                    onSend: { sats, maxFee in
+                        payContact(contact, sats: sats, maxFeeSats: maxFee, feeFromAmount: false)
+                    },
+                    onSendMax: { sats, maxFee in
+                        payContact(contact, sats: sats, maxFeeSats: maxFee, feeFromAmount: true)
                     }
                 )
             }
@@ -286,36 +294,66 @@ struct SonarSendPaymentScreen: View {
             if let destination = externalTarget {
                 SNPaySheet(
                     peerName: SNExternalDestination.displayName(destination),
-                    balance: store.balanceSats ?? 0,
+                    balance: sourceBalance,
                     transport: .internet,
                     money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
                     fixedSats: fixedSats,
+                    usesFeeInclusiveMax: store.usesFeeInclusiveMax(source),
+                    destination: destination,
+                    quoteFee: store.feeQuoter(destination: destination, source: source),
                     onClose: { externalTarget = nil; fixedSats = nil },
-                    onSend: { sats in
-                        // An external payment has no chat thread to report
-                        // into, so it gets its own status screen (design:
-                        // paystatus.jsx Direction D). The send runs on the
-                        // store, not here, so popping this picker cannot
-                        // cancel it. `replaceTop` keeps Back on home: the
-                        // picker's payment is already gone by then.
-                        let name = SNExternalDestination.displayName(destination)
-                        externalTarget = nil
-                        fixedSats = nil
-                        guard let activityId = store.beginDestinationPayment(
-                            destination, sats: sats, displayName: name
-                        ) else {
-                            // Refused before anything was sent; the store
-                            // toasted why, so stay on the picker to fix it.
-                            return
-                        }
-                        store.replaceTop(.paymentStatus(activityId))
+                    onSend: { sats, maxFee in
+                        payExternal(destination, sats: sats, maxFeeSats: maxFee, feeFromAmount: false)
+                    },
+                    onSendMax: { sats, maxFee in
+                        payExternal(destination, sats: sats, maxFeeSats: maxFee, feeFromAmount: true)
                     }
                 )
             }
         }
     }
 
+    /// Route through the chat so the peer still gets the in-chat ⚡PAY
+    /// receipt, as paying from the chat does. The screen pops immediately,
+    /// so the outcome must go to the app-level toast (rendered by
+    /// SonarRootView). A view-local toast here is written to a dismissed view
+    /// and never appears — the payment fails silently.
+    private func payContact(_ contact: SNPayableContact, sats: Int64, maxFeeSats: Int64?, feeFromAmount: Bool) {
+        let from = source
+        Task {
+            if let message = await store.sendPay(
+                contact.id, sats: sats, maxFeeSats: maxFeeSats, source: from, feeFromAmount: feeFromAmount
+            ) {
+                store.showToast(message)
+            }
+        }
+        store.pop()
+    }
+
+    /// An external payment has no chat thread to report into, so it gets its
+    /// own status screen (design: paystatus.jsx Direction D). The send runs
+    /// on the store, not here, so popping this picker cannot cancel it.
+    /// `replaceTop` keeps Back on home: the picker's payment is already gone
+    /// by then.
+    private func payExternal(_ destination: String, sats: Int64, maxFeeSats: Int64?, feeFromAmount: Bool) {
+        let name = SNExternalDestination.displayName(destination)
+        externalTarget = nil
+        fixedSats = nil
+        guard let activityId = store.beginDestinationPayment(
+            destination,
+            sats: sats,
+            displayName: name,
+            maxFeeSats: maxFeeSats,
+            source: source,
+            feeFromAmount: feeFromAmount
+        ) else {
+            // Refused before anything was sent; the store toasted why, so
+            // stay on the picker to fix it.
+            return
+        }
+        store.replaceTop(.paymentStatus(activityId))
+    }
 }
 
 /// How an external destination is labelled in the "Pay …" row.

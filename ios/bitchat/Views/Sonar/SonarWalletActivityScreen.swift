@@ -4,9 +4,10 @@
 //
 // Wallet — 1:1 with the design's `WalletScreen` + `WalletActivity`
 // (design/handoff/project/sonar/settings.jsx and pay.jsx): the balance block,
-// then the transaction log. It is a log only; there are no send/receive actions
-// here — paying starts from the new-chat sheet or inside a chat. Mirrors the
-// Compose Multiplatform SonarWalletActivityScreen.
+// the Receive / Send pair for the primary (Cashu) wallet, then the transaction
+// log. Receive opens `SNReceiveSheetContent` (reusable address QR + one-time
+// invoice), Send the existing send-payment screen. The legacy Breez card keeps
+// its own controls. Mirrors the Compose Multiplatform SonarWalletActivityScreen.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -16,9 +17,25 @@ import SwiftUI
 
 struct SonarWalletActivityScreen: View {
     @EnvironmentObject private var store: SonarAppStore
+    @State private var legacyDeleteSheet = false
+    @State private var receiveSheet = false
 
     private var balanceSats: Int64 { store.balanceSats ?? 0 }
     private var entries: [SonarPaymentActivity] { store.paymentActivities }
+
+    private var pendingLine: String? {
+        guard let detail = store.walletBalanceDetail else { return nil }
+        var parts: [String] = []
+        if detail.pendingReceiveSats > 0 {
+            let amount = store.money(detail.pendingReceiveSats)
+            parts.append(String(localized: "\(amount) arriving"))
+        }
+        if detail.pendingSendSats > 0 {
+            let amount = store.money(detail.pendingSendSats)
+            parts.append(String(localized: "\(amount) leaving"))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,10 +63,43 @@ struct SonarWalletActivityScreen: View {
                         Text("Balance · pays directly, no claim step")
                             .font(SonarTheme.uiFont(size: 12.5))
                             .foregroundColor(SonarTheme.text3)
+                        // Pending amounts, then "mint offline — retrying"
+                        // while the balance shown is the cached one.
+                        if let pending = pendingLine {
+                            Text(verbatim: pending)
+                                .font(SonarTheme.uiFont(size: 12.5))
+                                .foregroundColor(SonarTheme.text2)
+                        }
+                        if let status = store.walletStatusLine {
+                            Text(verbatim: status)
+                                .font(SonarTheme.uiFont(size: 12.5))
+                                .foregroundColor(SonarTheme.goldDeep)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.top, 14)
                     .padding(.bottom, 6)
+
+                    // Receive / Send for the PRIMARY wallet — the same
+                    // equal-width pair as the Profile key's Copy / Share.
+                    HStack(spacing: 10) {
+                        Button { receiveSheet = true } label: {
+                            SNPairButtonLabel.accent(icon: .download, text: String(localized: "Receive"))
+                        }
+                        .buttonStyle(SNScaleStyle(scale: 0.97))
+
+                        Button {
+                            store.paymentSource = .primary
+                            store.push(.sendPayment)
+                        } label: {
+                            SNPairButtonLabel.neutral(icon: .send, text: String(localized: "Send"))
+                        }
+                        .buttonStyle(SNScaleStyle(scale: 0.97))
+                    }
+                    .padding(EdgeInsets(top: 8, leading: 16, bottom: 4, trailing: 16))
+
+                    // Only while the legacy Breez wallet exists on this device.
+                    SNLegacyWalletSection(onDelete: { legacyDeleteSheet = true })
 
                     SNSectionLabel("Activity")
 
@@ -79,6 +129,12 @@ struct SonarWalletActivityScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .snSheet(isPresented: $legacyDeleteSheet, title: String(localized: "Delete old wallet")) {
+            SNLegacyWalletDeleteSheetContent(onClose: { legacyDeleteSheet = false })
+        }
+        .snSheet(isPresented: $receiveSheet, title: String(localized: "Receive")) {
+            SNReceiveSheetContent()
+        }
     }
 
     /// .wallet-txrow — icon bubble, "To/From <who>", "<status> · <rail> · <time>",

@@ -896,6 +896,8 @@ fn retryable_media_http_error(error: &Error) -> bool {
     true
 }
 
+/// `t` tag of the wallet receive-offer backups (see `publish_wallet_offer_backup`).
+pub const WALLET_OFFER_BACKUP_TAG: &str = "sonar.wallet.offer.v1";
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Relay-side cap when pulling ALL of an author's KeyPackages. `author` can be
@@ -3063,6 +3065,91 @@ impl SonarClient {
             self.nostr.send_event_builder(builder).await?;
         }
         Ok(())
+    }
+
+    /// Back up the wallet's receive-offer pointer (`CdkWallet::offer_backup`)
+    /// to our relays. Its mint quote id exists nowhere else, so without a copy
+    /// a reinstall publishes a new offer and payments to the old one stay at
+    /// the mint. Sealed with NIP-44 to our own key: the quote id would show
+    /// anyone how much the offer received. One addressable event per backup
+    /// (`d` = tag and content hash), all found through one `t` tag, so a
+    /// newer offer never replaces an older one's backup.
+    pub async fn publish_wallet_offer_backup(&self, backup: &str) -> Result<()> {
+        let keys = self.identity().keys();
+        let content = nip44::encrypt(
+            keys.secret_key(),
+            &keys.public_key(),
+            backup,
+            nip44::Version::default(),
+        )?;
+        let d_tag = format!(
+            "{WALLET_OFFER_BACKUP_TAG}:{}",
+            &sha256_hex(backup.as_bytes())[..16]
+        );
+        let builder = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content).tags([
+            Tag::identifier(d_tag),
+            Tag::hashtag(WALLET_OFFER_BACKUP_TAG),
+        ]);
+        self.nostr.send_event_builder(builder).await?;
+        Ok(())
+    }
+
+    /// Every wallet offer backup this account published, decrypted; one that
+    /// does not decrypt is skipped. An error when no relay answered: an empty
+    /// answer must mean "no backups", never "nobody replied", or the wallet
+    /// would create a new offer over a backed-up one. A relay counts as
+    /// answering when its fetch ends before the timeout (EOSE) and it is still
+    /// connected; relays keep different events, so every relay is asked.
+    pub async fn fetch_wallet_offer_backups(&self) -> Result<Vec<String>> {
+        if self.connected_relay_count().await == 0 {
+            return Err(Error::NoRelayConnected);
+        }
+        let keys = self.identity().keys().clone();
+        let me = keys.public_key();
+        let filter = Filter::new()
+            .kind(Kind::Custom(SONAR_DESCRIPTOR_KIND))
+            .author(me)
+            .hashtag(WALLET_OFFER_BACKUP_TAG)
+            .limit(64);
+        let mut tasks = tokio::task::JoinSet::new();
+        for relay in self.relays.clone() {
+            let nostr = self.nostr.clone();
+            let filter = filter.clone();
+            tasks.spawn(async move {
+                let started = Instant::now();
+                let result = nostr
+                    .fetch_events_from(vec![relay.clone()], filter, FETCH_TIMEOUT)
+                    .await;
+                // A dropped connection also ends the fetch early and empty.
+                let connected = nostr
+                    .relays()
+                    .await
+                    .get(&relay)
+                    .is_some_and(|handle| handle.status() == RelayStatus::Connected);
+                (connected && started.elapsed() < FETCH_TIMEOUT, result)
+            });
+        }
+        let mut answered = 0usize;
+        let mut backups: Vec<String> = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((in_time, Ok(events))) = joined else {
+                continue;
+            };
+            if in_time {
+                answered += 1;
+            }
+            for event in events.into_iter().filter(|e| e.pubkey == me) {
+                if let Ok(backup) = nip44::decrypt(keys.secret_key(), &me, &event.content) {
+                    if !backups.contains(&backup) {
+                        backups.push(backup);
+                    }
+                }
+            }
+        }
+        if answered == 0 && backups.is_empty() {
+            return Err(Error::NoRelayConnected);
+        }
+        Ok(backups)
     }
 
     /// Fetch a peer's freshest valid Sonar descriptor from our account relays.
@@ -8322,6 +8409,27 @@ fn require_relay_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "The relays did not answer" must not read as "no backups": the wallet
+    /// would then create a new offer over a backed-up one.
+    #[tokio::test]
+    async fn fetching_offer_backups_with_no_relay_connected_is_an_error() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let client = SonarClient::connect_in_memory(
+            crate::identity::Identity::generate(),
+            vec![relay.url().await],
+        )
+        .await
+        .expect("client connects");
+        relay.shutdown();
+        client.nostr.disconnect().await;
+        assert!(matches!(
+            client.fetch_wallet_offer_backups().await,
+            Err(Error::NoRelayConnected)
+        ));
+    }
 
     /// Field-measured on 2026-08-01 (iPhone 14 Pro Max): with zero relays
     /// connected the per-relay fetch fails at REQ-send time in microseconds,

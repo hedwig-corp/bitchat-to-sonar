@@ -7,7 +7,7 @@ import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 
 /** Desktop has no system share sheet — copy the link to the clipboard instead. */
-actual fun shareInviteText(text: String) {
+actual fun shareInviteText(text: String, chooserTitle: String) {
     runCatching {
         Toolkit.getDefaultToolkit().systemClipboard
             .setContents(StringSelection(text), null)

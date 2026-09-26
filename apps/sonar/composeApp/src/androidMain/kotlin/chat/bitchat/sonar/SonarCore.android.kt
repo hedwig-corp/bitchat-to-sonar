@@ -666,6 +666,16 @@ actual object SonarCore {
         Unit
     }
 
+    actual suspend fun publishWalletOfferBackup(backup: String): Boolean = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext false
+        runCatching { n.publishWalletOfferBackup(backup) }.isSuccess
+    }
+
+    actual suspend fun fetchWalletOfferBackups(): List<String>? = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext null
+        runCatching { n.fetchWalletOfferBackups() }.getOrNull()
+    }
+
     actual suspend fun fetchSonarDescriptor(npub: String): SonarDescriptor? = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext null
         runCatching {

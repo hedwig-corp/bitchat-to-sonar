@@ -50,8 +50,12 @@ fun inviteDeepLink(token: String): String = "sonar://invite/$token"
 fun inviteLinkPreview(token: String): String =
     "$JOIN_LINK_HOST/join#…${token.takeLast(6)}"
 
-/** Hand [text] to the platform share sheet (Android chooser; clipboard on desktop). */
-expect fun shareInviteText(text: String)
+/**
+ * Hand [text] to the platform share sheet (Android chooser titled
+ * [chooserTitle]; clipboard on desktop). Also shares the wallet's receive
+ * offer / invoice from the Receive sheet.
+ */
+expect fun shareInviteText(text: String, chooserTitle: String = "Share invite link")
 
 /**
  * Encode [data] as a QR module grid (`true` = dark). Returns null if encoding

@@ -119,6 +119,10 @@ actual object Notifier {
         chat.bitchat.sonar.push.SonarPushRegistration.ensureBreezWebhook(offer)
     }
 
+    actual suspend fun onLegacyWalletRemoved() {
+        chat.bitchat.sonar.push.SonarPushRegistration.forgetLegacyWebhook()
+    }
+
     actual suspend fun prepareForAccountReplacement() {
         chat.bitchat.sonar.push.SonarPushRegistration.prepareForAccountReplacement()
     }
