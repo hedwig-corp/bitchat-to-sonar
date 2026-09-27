@@ -25,7 +25,8 @@ private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: Mo
         keychain: keychain,
         idBridge: idBridge,
         identityManager: identityManager,
-        transport: transport
+        transport: transport,
+        messageStore: .isolatedForTest()
     )
 
     return (viewModel, transport)
@@ -143,16 +144,9 @@ struct ChatViewModelTimelineCapTests {
         let (viewModel, _) = makeTestableViewModel()
         let total = TransportConfig.meshTimelineCap + 5
 
-        // The mesh timeline is persisted and survives this view model, so a test
-        // that deliberately fills it to the cap hands the next test a saturated
-        // timeline in which a newly received message is immediately trimmed away.
-        // Put the store back the way we found it.
-        defer {
-            viewModel.messages.removeAll()
-            viewModel.timelineStore.clear(channel: .mesh)
-            MessageStore.shared.saveChannel(ChannelID.mesh.storeID, messages: [])
-        }
-
+        // The saturated mesh timeline this leaves behind is persisted, but only
+        // to this view model's own store (`makeTestableViewModel`), so no other
+        // test inherits it.
         for i in 0..<total {
             viewModel.sendMessage("cap-msg-\(i)")
         }

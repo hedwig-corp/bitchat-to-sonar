@@ -52,7 +52,7 @@ struct FragmentationTests {
         }
 
         // Wait for delegate callback with proper timeout
-        try await capture.waitForPublicMessages(count: 1, timeout: .seconds(2))
+        try await capture.waitForPublicMessages(count: 1, timeout: .seconds(10))
 
         #expect(capture.publicMessages.count == 1)
         #expect(capture.publicMessages.first?.content.count == 3_000)
@@ -86,7 +86,7 @@ struct FragmentationTests {
         }
 
         // Wait for delegate callback with proper timeout
-        try await capture.waitForPublicMessages(count: 1, timeout: .seconds(2))
+        try await capture.waitForPublicMessages(count: 1, timeout: .seconds(10))
 
         #expect(capture.publicMessages.count == 1)
         #expect(capture.publicMessages.first?.content.count == 2048)
@@ -134,7 +134,7 @@ struct FragmentationTests {
             }
         }
 
-        try await capture.waitForReceivedMessages(count: 1, timeout: .seconds(2))
+        try await capture.waitForReceivedMessages(count: 1, timeout: .seconds(10))
 
         let message = try #require(capture.receivedMessages.first, "Expected file transfer message")
         #expect(message.content.hasPrefix("[file]"))
@@ -249,8 +249,10 @@ extension FragmentationTests {
             }
         }
 
-        /// Waits for the specified number of public messages to be received
-        func waitForPublicMessages(count: Int, timeout: Duration = .seconds(2)) async throws {
+        /// Waits for the specified number of public messages to be received.
+        /// Delivery hops to the main actor, which the parallel suite can hold
+        /// for seconds (2 s timed out on main); the bound only stops a hang.
+        func waitForPublicMessages(count: Int, timeout: Duration = .seconds(10)) async throws {
             lock.lock()
             if _publicMessages.count >= count {
                 lock.unlock()
@@ -284,7 +286,7 @@ extension FragmentationTests {
         }
 
         /// Waits for the specified number of received messages
-        func waitForReceivedMessages(count: Int, timeout: Duration = .seconds(2)) async throws {
+        func waitForReceivedMessages(count: Int, timeout: Duration = .seconds(10)) async throws {
             lock.lock()
             if _receivedMessages.count >= count {
                 lock.unlock()

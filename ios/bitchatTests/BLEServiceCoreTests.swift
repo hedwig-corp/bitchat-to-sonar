@@ -35,7 +35,7 @@ struct BLEServiceCoreTests {
         ble._test_handlePacket(packet, fromPeerID: sender)
 
         _ = await TestHelpers.waitUntil({ delegate.publicMessagesSnapshot().count == 1 },
-                                        timeout: TestConstants.shortTimeout)
+                                        timeout: TestConstants.defaultTimeout)
 
         let messages = delegate.publicMessagesSnapshot()
         #expect(messages.count == 1)
@@ -164,7 +164,7 @@ struct BLEServiceCoreTests {
         ble._test_handlePacket(try signedAnnounce(at: now), fromPeerID: peerID, preseedPeer: false)
 
         let didConnect = await TestHelpers.waitUntil({ ble.isPeerConnected(peerID) },
-                                                     timeout: TestConstants.shortTimeout)
+                                                     timeout: TestConstants.defaultTimeout)
         #expect(didConnect)
 
         ble._test_handleCentralState(.poweredOff)
@@ -210,7 +210,7 @@ struct BLEServiceCoreTests {
         )))
         ble._test_handlePacket(signedAnnounce, fromPeerID: victimPeerID, preseedPeer: false)
         _ = await TestHelpers.waitUntil({ ble.isPeerConnected(victimPeerID) },
-                                        timeout: TestConstants.shortTimeout)
+                                        timeout: TestConstants.defaultTimeout)
 
         // The victim's own signed public message is accepted.
         let genuine = try #require(victim.signPacket(BitchatPacket(
@@ -225,7 +225,7 @@ struct BLEServiceCoreTests {
         ble._test_handlePacket(genuine, fromPeerID: victimPeerID, preseedPeer: false)
         let sawGenuine = await TestHelpers.waitUntil(
             { delegate.publicMessagesSnapshot().contains { $0.content == "from the real victim" } },
-            timeout: TestConstants.shortTimeout
+            timeout: TestConstants.defaultTimeout
         )
         #expect(sawGenuine, "a genuinely signed public message must still be delivered")
 
@@ -351,7 +351,7 @@ struct BLEServiceCoreTests {
         try await Task.sleep(nanoseconds: 50_000_000)
         ble._test_handlePacket(announcePacket, fromPeerID: peerID, preseedPeer: false)
 
-        let didReceive = await TestHelpers.waitUntil({ capture.profile != nil }, timeout: TestConstants.shortTimeout)
+        let didReceive = await TestHelpers.waitUntil({ capture.profile != nil }, timeout: TestConstants.defaultTimeout)
         #expect(didReceive)
         #expect(capture.profile?.npub == npub)
     }
@@ -449,7 +449,7 @@ struct BLEServiceCoreTests {
 
         let didAnnounceBack = await TestHelpers.waitUntil(
             { ble._test_lastAnnounceSentAt > before },
-            timeout: TestConstants.shortTimeout
+            timeout: TestConstants.defaultTimeout
         )
         #expect(didAnnounceBack)
     }
@@ -482,13 +482,12 @@ struct BLEServiceCoreTests {
         )), "Failed to sign Sonar packet")
 
         ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
+        ble._test_drainMessageQueue()
 
-        let didAnnounceBack = await TestHelpers.waitUntil(
-            { ble._test_lastAnnounceSentAt > Date.distantPast },
-            timeout: 0.6
-        )
-        #expect(!didAnnounceBack)
-        #expect(ble._test_lastAnnounceSentAt == Date.distantPast)
+        // Pin the decision, not the radio: the maintenance timer announces on
+        // its own 5 s after start, so "no announce within 0.6 s" failed whenever
+        // a busy suite resumed this test late.
+        #expect(ble._test_lastSonarAnnounceBackAt == Date.distantPast)
     }
 
     // A stream of 0x53s from unknown peers must not elicit one forced
@@ -523,26 +522,25 @@ struct BLEServiceCoreTests {
         let firstPeer = PeerID(publicKey: firstSigner.getStaticPublicKeyData())
 
         ble._test_handlePacket(firstPacket, fromPeerID: firstPeer, preseedPeer: false)
+        ble._test_drainMessageQueue()
+        let firstAnnounceBackAt = ble._test_lastSonarAnnounceBackAt
+        #expect(firstAnnounceBackAt > Date.distantPast)
         let didAnnounceBack = await TestHelpers.waitUntil(
             { ble._test_lastAnnounceSentAt > Date.distantPast },
-            timeout: TestConstants.shortTimeout
+            timeout: TestConstants.defaultTimeout
         )
         #expect(didAnnounceBack)
-        let firstAnnounceAt = ble._test_lastAnnounceSentAt
 
         // A second unknown sender inside the cooldown window must not elicit
-        // another forced announce.
+        // another forced announce. Checked on the cooldown stamp: the
+        // maintenance timer's own periodic announce moves the send time.
         let secondSigner = NoiseEncryptionService(keychain: MockKeychain())
         let secondPacket = try signedSonarPacket(secondSigner)
         let secondPeer = PeerID(publicKey: secondSigner.getStaticPublicKeyData())
 
         ble._test_handlePacket(secondPacket, fromPeerID: secondPeer, preseedPeer: false)
-        let didAnnounceAgain = await TestHelpers.waitUntil(
-            { ble._test_lastAnnounceSentAt > firstAnnounceAt },
-            timeout: 0.6
-        )
-        #expect(!didAnnounceAgain)
-        #expect(ble._test_lastAnnounceSentAt == firstAnnounceAt)
+        ble._test_drainMessageQueue()
+        #expect(ble._test_lastSonarAnnounceBackAt == firstAnnounceBackAt)
     }
 
     @Test
@@ -574,7 +572,7 @@ struct BLEServiceCoreTests {
 
         let didAdd = await TestHelpers.waitUntil({
             ble.currentPeerSnapshots().contains { $0.peerID == peerID }
-        }, timeout: TestConstants.shortTimeout)
+        }, timeout: TestConstants.defaultTimeout)
         #expect(didAdd)
 
         ble.knownPeerProvider = { _, _ in false }
@@ -582,7 +580,7 @@ struct BLEServiceCoreTests {
 
         let didPrune = await TestHelpers.waitUntil({
             !ble.currentPeerSnapshots().contains { $0.peerID == peerID }
-        }, timeout: TestConstants.shortTimeout)
+        }, timeout: TestConstants.defaultTimeout)
         #expect(didPrune)
     }
 }

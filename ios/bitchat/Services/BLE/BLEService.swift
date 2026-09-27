@@ -2609,6 +2609,22 @@ extension BLEService {
         defer { announceStateLock.unlock() }
         return lastAnnounceSent
     }
+
+    /// When `handleSonarAnnounce` last scheduled an announce-back (its
+    /// cooldown stamp). No other announce path moves it — unlike
+    /// `_test_lastAnnounceSentAt`, which the maintenance timer's periodic
+    /// announce also stamps — so a test can pin the announce-back decision.
+    var _test_lastSonarAnnounceBackAt: Date {
+        announceStateLock.lock()
+        defer { announceStateLock.unlock() }
+        return lastSonarAnnounceBackSent
+    }
+
+    /// Returns once every packet passed to `_test_handlePacket` so far has
+    /// been handled: a barrier on the concurrent message queue.
+    func _test_drainMessageQueue() {
+        messageQueue.sync(flags: .barrier) {}
+    }
 }
 #endif
 

@@ -25,7 +25,8 @@ struct ChatViewModelRefactoringTests {
             keychain: keychain,
             idBridge: idBridge,
             identityManager: identityManager,
-            transport: transport
+            transport: transport,
+            messageStore: .isolatedForTest()
         )
 
         return (viewModel, transport, identityManager)

@@ -20,7 +20,8 @@ func makeIsolatedSonarAppStore() -> (store: SonarAppStore, cleanup: () -> Void) 
         keychain: keychain,
         idBridge: idBridge,
         identityManager: MockIdentityManager(keychain),
-        transport: MockTransport()
+        transport: MockTransport(),
+        messageStore: .isolatedForTest()
     )
     let marmot = MarmotChatModel(
         service: MarmotService(relayUrls: []),
