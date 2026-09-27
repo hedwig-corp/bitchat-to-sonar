@@ -49,7 +49,9 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.HandleClaimState
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
-import chat.bitchat.sonar.wallet.WalletState
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.payments_to_this_address_go_to_your
+import org.jetbrains.compose.resources.stringResource
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -81,11 +83,11 @@ fun SonarProfileScreen(state: SonarAppState) {
     LaunchedEffect(paymentCopied) { if (paymentCopied) { delay(1700); paymentCopied = false } }
     val displayNick = state.nick.ifBlank { "you" }
     // Chat-only registrar claims fill bip353 before BIP-353 DNS exists — hide
-    // until the wallet is ready (re-claim attaches the offer). External
+    // until a Cashu offer exists (re-claim attaches it). External
     // name@other addresses always show.
     val paymentAddress = state.bip353.trim().takeIf { it.isNotEmpty() }?.takeIf { addr ->
         val claimed = state.coreClaimedHandle?.trim().orEmpty()
-        claimed.isEmpty() || addr != claimed || state.walletState is WalletState.Ready
+        claimed.isEmpty() || addr != claimed || state.cashuOffer != null
     }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
@@ -258,6 +260,11 @@ private fun UsernameCard(
                     }
                 )
             }
+            // Which wallet the address pays, and the confirmed move.
+            if (isCoreClaimed && handleAddressNoticeVisible(state)) {
+                Spacer(Modifier.height(10.dp))
+                HandleAddressNotice(state)
+            }
         } else {
             val draft = payDraft.trim()
             val isExternal = '@' in draft && !draft.lowercase().endsWith("@${state.handleDomain}")
@@ -304,6 +311,14 @@ private fun UsernameCard(
                 isExternal -> Text(
                     "External address — saved as your payment address only.",
                     color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp
+                )
+            }
+            if (!isExternal) {
+                // A claim registers the address with the ecash wallet's offer.
+                Text(
+                    stringResource(Res.string.payments_to_this_address_go_to_your),
+                    color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp,
+                    modifier = Modifier.padding(top = 4.dp),
                 )
             }
             Spacer(Modifier.height(10.dp))
@@ -448,9 +463,13 @@ private fun KeyShareCard(state: SonarAppState) {
     }
 }
 
-/** keyshare-btn: 13dp radius, 12dp padding, icon + 14.5/700 label. */
+/**
+ * keyshare-btn: 13dp radius, 12dp padding, icon + 14.5/700 label. Shared by
+ * the Wallet screen's Receive / Send pair and its Receive sheet's Copy /
+ * Share pair, so every such pair in the app is the same button.
+ */
 @Composable
-private fun KeyShareButton(
+internal fun KeyShareButton(
     label: String,
     bg: Color,
     fg: Color,

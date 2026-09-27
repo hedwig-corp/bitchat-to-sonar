@@ -158,6 +158,7 @@ fn main() -> Result<(), WalletError> {
                 "webhook": c.webhook,
                 "fiat_rates": c.fiat_rates,
                 "lnurl_send": c.lnurl_send,
+                "lightning_address_send": c.lightning_address_send,
                 "bolt11_send": c.bolt11_send,
                 "bolt12_send": c.bolt12_send,
                 "bolt12_receive": c.bolt12_receive,

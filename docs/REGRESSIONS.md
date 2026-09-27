@@ -2829,6 +2829,39 @@ because its feed is gated on `isTranscriptHydrated`, which open clears.
 - *Blame `ee44b140f` (mark-read no longer notifies on a no-op).* The same
   build with that commit reverted failed QA-005 identically.
 
+## R-050 — A lost Cashu proof db must re-run NUT-13 restore, even over a surviving marker
+
+**Invariant:** whether a NUT-13 restore scan is owed is decided BEFORE the
+proof store is opened, and a stale `cashu.restored.<mint>` marker is removed
+before the scan runs. A restore stays owed until a scan completes.
+
+**Breaks as:** delete (or lose) `cashu.redb` while its marker survives, and the
+wallet opens an empty store and shows 0 sats forever over ecash the nsec can
+recover. `cdk_redb::WalletRedbDatabase::new` CREATES the file, so asking "is the
+db missing?" after opening always answers no; and if the marker is left in
+place, one failed scan leaves marker + empty db, which also reads as restored.
+
+**Apple call site:** not applicable — the decision lives in the Rust core
+(`CdkWallet::build_wallet` / `connect`); hosts only call `connect()`.
+
+**Compose call site:** not applicable, same reason.
+
+**Guarded by:** `sonar-wallet-cdk/src/lib.rs::connect_restores_again_after_proof_db_is_deleted`
+(real `connect` against the in-process fake mint: funds 1,000 sats, deletes the
+proof db, fails one restore, and requires the next connect to scan again and
+bring the 1,000 back — fails if either the ordering or the marker clearing is
+reverted)
+
+**Not guarded:** a CORRUPT (rather than missing) proof db makes `connect` fail
+closed with an error; there is no automatic recovery path for it.
+
+**Rejected:**
+- *Judge freshness by the db file existing.* A first connect can create the file
+  and then fail transiently — keying on it skips restoration forever (the reason
+  the per-mint marker exists).
+- *Check `needs_nut13_restore` after opening the store.* Shipped once (33c5712f1,
+  reverting 6e63f6e3b on #586); the check can never see the db missing.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

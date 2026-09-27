@@ -48,7 +48,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.feeLineAmount
 import chat.bitchat.sonar.payFmt
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.the_network_fee_is_now_up_to_nothing
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -60,6 +63,7 @@ import chat.bitchat.sonar.wallet.PayMoneyTone
 import chat.bitchat.sonar.wallet.PayPhase
 import chat.bitchat.sonar.wallet.PayStatusCopy
 import chat.bitchat.sonar.wallet.PaymentStatus
+import org.jetbrains.compose.resources.stringResource
 
 /**
  * Payment status — 1:1 with Direction D ("resumable status") of the design's
@@ -211,9 +215,13 @@ private fun StatusCard(
             )
         }
 
-        // .rs-hint
+        // .rs-hint. Deviation from the design's copy table: a send refused
+        // because the network fee rose states the NEW fee instead of "No
+        // route" — `Try again` below pays it, so the user must read it first.
         Text(
-            PayStatusCopy.hint(status.phase, status.payeeName, status.sats),
+            status.feeChangedSats
+                ?.let { stringResource(Res.string.the_network_fee_is_now_up_to_nothing, feeLineAmount(it)) }
+                ?: PayStatusCopy.hint(status.phase, status.payeeName, status.sats),
             color = s.text2, fontSize = 12.5.sp, lineHeight = 19.sp,
             modifier = Modifier.padding(top = 12.dp),
         )

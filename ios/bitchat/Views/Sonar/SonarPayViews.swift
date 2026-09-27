@@ -173,6 +173,143 @@ private struct SNPayPop: ViewModifier {
     }
 }
 
+// MARK: - Destination kind + footer copy
+
+/// What a raw payment destination is, for copy and amount handling. Same
+/// prefix rules as `SNExternalDestination` / `SNScannedKind`, which hand the
+/// sheet an already-extracted rail (never a `lightning:`/`bitcoin:` URI).
+enum SNPayDestinationKind: Equatable {
+    /// BOLT11 invoice: carries its own amount.
+    case bolt11
+    /// BOLT12 offer.
+    case bolt12
+    /// A contact, username, Lightning address — anything with a name.
+    case named
+
+    init(_ destination: String?) {
+        let v = destination?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if v.hasPrefix("lno1") {
+            self = .bolt12
+        } else if v.hasPrefix("lnbc") || v.hasPrefix("lntb") || v.hasPrefix("lnbcrt") {
+            self = .bolt11
+        } else {
+            self = .named
+        }
+    }
+}
+
+/// The line under the pay sheet's Send button. A raw invoice or offer is not
+/// a person: "Pays lnbc5u1p4tg7…'s wallet directly" read as a name.
+enum SNPayFooterCopy {
+    /// `destination` is the raw rail for an external payment, nil when paying
+    /// a contact through their chat.
+    static func note(destination: String?, peerName: String, transport: SNVia) -> String {
+        switch SNPayDestinationKind(destination) {
+        case .bolt11:
+            return String(localized: "Pays this Lightning invoice.")
+        case .bolt12:
+            return String(localized: "Pays this Bolt12 offer.")
+        case .named:
+            if transport == .mesh {
+                return "Chat can stay on Bluetooth. The payment goes straight to \(peerName)\u{2019}s wallet."
+            }
+            return "Pays \(peerName)\u{2019}s wallet directly. No claim step."
+        }
+    }
+}
+
+// MARK: - Fee before confirm
+
+/// Quotes the most a send of `sats` can cost on top of the amount. Built by
+/// `SonarAppStore.feeQuoter(...)` for the primary wallet only.
+typealias SNFeeQuoter = @MainActor (_ sats: Int64) async throws -> Int64
+
+/// The pay sheet's fee line: "Checking the fee…" while a quote is pending,
+/// "Network fee: up to X" once known, nothing when there is no quote (legacy
+/// wallet, no amount) or the quote failed. The fee shown is a promise: it is
+/// the most the send may pay (`consentedCeiling`, enforced by the wallet at
+/// send time), and Send waits only while the quote is checking (`blocksSend`).
+enum SNFeeQuote {
+    enum State: Equatable {
+        case hidden
+        case checking
+        case quoted(Int64)
+    }
+
+    /// Typing on the keypad re-quotes only once the amount settles.
+    static let debounceNanos: UInt64 = 400_000_000
+
+    /// What to show the moment the amount changes, before the debounce.
+    static func initialState(sats: Int64, quote: SNFeeQuoter?) -> State {
+        (quote != nil && sats > 0) ? .checking : .hidden
+    }
+
+    /// Debounce, then quote. nil = superseded (the task was cancelled because
+    /// the amount changed again): keep whatever the newer quote shows, and
+    /// never hit the mint for an amount the user already typed past.
+    static func resolve(
+        sats: Int64,
+        quote: SNFeeQuoter?,
+        debounceNanos: UInt64 = SNFeeQuote.debounceNanos
+    ) async -> State? {
+        guard let quote, sats > 0 else { return .hidden }
+        do {
+            try await Task.sleep(nanoseconds: debounceNanos)
+        } catch {
+            return nil
+        }
+        let fee: Int64?
+        do {
+            fee = try await quote(sats)
+        } catch {
+            fee = nil
+        }
+        guard !Task.isCancelled else { return nil }
+        return fee.map { .quoted(max($0, 0)) } ?? .hidden
+    }
+
+    /// The line the pay sheet renders: always in sats, like the amount above
+    /// it. A fee reserve is a few sats, which the fiat formatter rounded to
+    /// "CHF 0.00" (QA, #614).
+    static func sheetLine(_ state: State) -> String? {
+        line(state, money: sonarFormatSats)
+    }
+
+    /// Send waits on the fee line only while a quote is in flight (the
+    /// debounce plus one `prepareSend`): tapping Send then would consent to a
+    /// fee the user has not seen yet. A hidden line (no quote, or the quote
+    /// failed) does not block — `consentedCeiling` makes that send ask again.
+    static func blocksSend(_ state: State, hasQuoter: Bool) -> Bool {
+        hasQuoter && state == .checking
+    }
+
+    /// The fee the user agrees to by tapping Send — the most the wallet may
+    /// spend on fees (`SonarWalletProviding.send` `maxFeeSats`). The fee on
+    /// screen when there is one; 0 when the sheet can quote but shows no fee
+    /// (quote failed or still pending), so any non-zero fee is refused and
+    /// asked about again; nil when the sheet has no quoter (legacy wallet),
+    /// i.e. no ceiling. Mirrors Compose `consentedFeeCeiling`.
+    static func consentedCeiling(_ state: State, hasQuoter: Bool) -> Int64? {
+        guard hasQuoter else { return nil }
+        switch state {
+        case .quoted(let fee): return fee
+        case .hidden, .checking: return 0
+        }
+    }
+
+    static func line(_ state: State, money: (Int64) -> String) -> String? {
+        switch state {
+        case .hidden:
+            return nil
+        case .checking:
+            return String(localized: "Checking the fee…")
+        case .quoted(let fee):
+            let amount = money(fee)
+            return String(localized: "Network fee: up to \(amount)")
+        }
+    }
+}
+
 // MARK: - Pay sheet (balance, big amount, quick chips, keypad, send)
 
 private let snPayKeys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0", "del"]
@@ -191,10 +328,29 @@ struct SNPaySheet: View {
     /// shown but the chips and keypad are hidden, because there is nothing to
     /// choose.
     var fixedSats: Int64?
+    /// Cashu `Max`: propose the FULL balance and let the wallet take the fee
+    /// out of it at send time (prepare at the full balance, subtract the
+    /// quoted fee reserve, prepare again). False = the legacy 0.5% reserve.
+    var usesFeeInclusiveMax: Bool = false
+    /// The raw rail for an external payment (invoice / offer / address); nil
+    /// when paying a contact. Picks the footer copy — see `SNPayFooterCopy`.
+    var destination: String? = nil
+    /// Primary wallet only: prices the send so the fee shows BEFORE the user
+    /// confirms. nil = no fee line (legacy wallet). With a quoter, the fee
+    /// shown is the most the send may pay — see `SNFeeQuote.consentedCeiling`.
+    var quoteFee: SNFeeQuoter? = nil
     let onClose: () -> Void
-    let onSend: (Int64) -> Void
+    /// Send `sats` with the fee the user agreed to: pass `maxFeeSats` to the
+    /// wallet send. nil means no fee was ever shown (no `quoteFee`).
+    let onSend: (_ sats: Int64, _ maxFeeSats: Int64?) -> Void
+    /// Called instead of `onSend` when the amount is an untouched fee-inclusive
+    /// `Max`. Falls back to `onSend` when nil.
+    var onSendMax: ((_ sats: Int64, _ maxFeeSats: Int64?) -> Void)? = nil
 
     @State private var v = ""
+    /// The amount came from a fee-inclusive `Max` tap and was not edited.
+    @State private var maxSelected = false
+    @State private var feeState: SNFeeQuote.State = .hidden
 
     private var sats: Int64 { fixedSats ?? (Int64(v) ?? 0) }
     /// Whether there is an amount to show. `v` is the *keypad* buffer, and a
@@ -208,16 +364,22 @@ struct SNPaySheet: View {
     // 99,600-sat invoice is payable but sat above the 99,500 estimate. A fixed
     // invoice cannot be lowered, so that user simply could not pay at all. Max
     // still proposes the reserve-adjusted amount, and the REAL prepared fee is
-    // enforced in `SonarWallet.send` before Breez is asked to pay.
+    // enforced by the sending wallet (Cashu: the mint quote's fee reserve;
+    // legacy Breez: `SonarWallet.send`) before anything is paid.
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
-    private var directNote: String {
-        if transport == .mesh {
-            return "Chat can stay on Bluetooth. The payment goes straight to \(peerName)\u{2019}s wallet."
-        }
-        return "Pays \(peerName)\u{2019}s wallet directly. No claim step."
+    /// Send is live: an affordable amount, and no fee quote still pending.
+    private var sendable: Bool {
+        can && !SNFeeQuote.blocksSend(feeState, hasQuoter: quoteFee != nil)
     }
+    /// Footer under the Send button (internal so tests pin THIS call site).
+    var directNote: String {
+        SNPayFooterCopy.note(destination: destination, peerName: peerName, transport: transport)
+    }
+    /// The amount to price: only a sendable one, and only with a quoter.
+    private var quoteSats: Int64 { (quoteFee != nil && can) ? sats : 0 }
     private func tap(_ k: String) {
+        maxSelected = false
         if k == "del" {
             v = String(v.dropLast())
             return
@@ -229,9 +391,22 @@ struct SNPaySheet: View {
     }
 
     private func send() {
-        guard can else { return }
-        onSend(sats)
+        guard sendable else { return }
+        // The fee on screen at the tap is the consent.
+        let maxFee = SNFeeQuote.consentedCeiling(feeState, hasQuoter: quoteFee != nil)
+        if maxSelected, fixedSats == nil, let onSendMax {
+            onSendMax(sats, maxFee)
+        } else {
+            onSend(sats, maxFee)
+        }
         onClose()
+    }
+
+    /// The amount `Max` proposes, or 0 to hide it.
+    private var maxAmount: Int64 {
+        usesFeeInclusiveMax
+            ? max(balance, 0)
+            : SonarSpendableBalance.maxSendable(balanceSats: Int64(balance))
     }
 
     var body: some View {
@@ -271,6 +446,7 @@ struct SNPaySheet: View {
                 ForEach(snPayChips, id: \.self) { c in
                     Button {
                         v = String(c)
+                        maxSelected = false
                     } label: {
                         Text(verbatim: snPayFmt(c))
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
@@ -281,13 +457,16 @@ struct SNPaySheet: View {
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }
-                // "Max" = everything that can actually settle: the balance
-                // minus a fee reserve (#141 — proposing the full balance made
-                // the send fail locally with a raw InsufficientFunds). A
-                // balance at or below the reserve offers no Max at all.
-                if SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)) > 0 {
+                // "Max" = everything that can actually settle. Legacy: the
+                // balance minus a fee reserve (#141 — proposing the full
+                // balance made the send fail locally with a raw
+                // InsufficientFunds). Cashu: the full balance, with the mint's
+                // quoted fee taken out of it at send time. No Max at all when
+                // nothing is sendable.
+                if maxAmount > 0 {
                     Button {
-                        v = String(SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)))
+                        v = String(maxAmount)
+                        maxSelected = usesFeeInclusiveMax
                     } label: {
                         Text(verbatim: "Max")
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
@@ -329,10 +508,20 @@ struct SNPaySheet: View {
 
             // .bc-sheetactions
             VStack(spacing: 6) {
+                // The mint's fee reserve, before the user confirms. Space is
+                // reserved while a quoter exists so the button never jumps;
+                // the button waits only while the quote is checking.
+                if quoteFee != nil {
+                    Text(verbatim: SNFeeQuote.sheetLine(feeState) ?? " ")
+                        .font(SonarTheme.uiFont(size: 12.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text2)
+                        .frame(maxWidth: .infinity, minHeight: 17)
+                        .accessibilityHidden(feeState == .hidden)
+                }
                 SNPrimaryButton(
                     label: "Send money",
                     net: true,
-                    disabled: !can,
+                    disabled: !sendable,
                     action: send
                 )
                 Text(verbatim: directNote)
@@ -343,6 +532,14 @@ struct SNPaySheet: View {
                     .padding(EdgeInsets(top: 2, leading: 14, bottom: 0, trailing: 14))
             }
             .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
+        }
+        // Re-quote whenever the sendable amount changes; SwiftUI cancels the
+        // previous task, which is what makes the debounce work.
+        .task(id: quoteSats) {
+            feeState = SNFeeQuote.initialState(sats: quoteSats, quote: quoteFee)
+            if let next = await SNFeeQuote.resolve(sats: quoteSats, quote: quoteFee) {
+                feeState = next
+            }
         }
     }
 }
@@ -536,7 +733,7 @@ struct SNWalletSetupSheetContent: View {
             return "Your wallet is being set up. Sats you receive will land here, and payments you send will settle from it — try again in a moment."
         }
         #if os(macOS)
-        return "Payments need the wallet to finish setup on this Mac. Check the Breez API key and wait for your Sonar identity to be ready."
+        return String(localized: "Payments need your wallet to finish opening on this Mac. It starts once your Sonar identity is ready.")
         #else
         return "Payments in Sonar need a wallet on this phone. Yours isn\u{2019}t set up yet — once it is, money you receive lands here and payments you send come from it."
         #endif
@@ -579,7 +776,10 @@ struct UnifyPaySheetView: View {
     /// Primary money string for the balance (fiat or sats, unit included).
     let money: (Int64) -> String
     let fiatText: (Int64) -> String?
-    let onConfirmAmount: (_ destination: String, _ sats: Int64) -> Void
+    /// See `SNPaySheet.usesFeeInclusiveMax`.
+    var usesFeeInclusiveMax: Bool = false
+    /// `feeFromAmount` is true for an untouched fee-inclusive `Max`.
+    let onConfirmAmount: (_ destination: String, _ sats: Int64, _ feeFromAmount: Bool) -> Void
     let onClose: () -> Void
 
     var body: some View {
@@ -595,7 +795,8 @@ struct UnifyPaySheetView: View {
                 balance: balance,
                 money: money,
                 fiatText: fiatText,
-                onSend: { sats in onConfirmAmount(destination, sats) }
+                usesFeeInclusiveMax: usesFeeInclusiveMax,
+                onSend: { sats, feeFromAmount in onConfirmAmount(destination, sats, feeFromAmount) }
             )
         case .paying(_, let sats):
             status(icon: .bolt, tint: SonarTheme.goldDeep,
@@ -654,16 +855,26 @@ private struct UnifyAmountKeypad: View {
     let balance: Int64
     let money: (Int64) -> String
     let fiatText: (Int64) -> String?
-    let onSend: (Int64) -> Void
+    var usesFeeInclusiveMax: Bool = false
+    /// `feeFromAmount` is true for an untouched fee-inclusive `Max`.
+    let onSend: (_ sats: Int64, _ feeFromAmount: Bool) -> Void
 
     @State private var v = ""
+    @State private var maxSelected = false
 
     private var sats: Int64 { Int64(v) ?? 0 }
     // See SNPaySheet.over (#141).
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
+    /// See `SNPaySheet.maxAmount`.
+    private var maxAmount: Int64 {
+        usesFeeInclusiveMax
+            ? max(balance, 0)
+            : SonarSpendableBalance.maxSendable(balanceSats: Int64(balance))
+    }
 
     private func tap(_ k: String) {
+        maxSelected = false
         if k == "del" { v = String(v.dropLast()); return }
         var nv = v + k
         while nv.count > 1 && nv.hasPrefix("0") { nv.removeFirst() }
@@ -703,7 +914,7 @@ private struct UnifyAmountKeypad: View {
 
             HStack(spacing: 8) {
                 ForEach(chips, id: \.self) { c in
-                    Button { v = String(c) } label: {
+                    Button { v = String(c); maxSelected = false } label: {
                         Text(verbatim: snPayFmt(c))
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
                             .foregroundColor(SonarTheme.goldDeep)
@@ -713,12 +924,12 @@ private struct UnifyAmountKeypad: View {
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }
-                // "Max" = everything that can actually settle: the balance
-                // minus a fee reserve (#141). Same policy as the main pay
-                // sheet — see SonarSpendableBalance.
-                if SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)) > 0 {
+                // "Max" = everything that can actually settle. Same policy as
+                // the main pay sheet — see SNPaySheet.maxAmount.
+                if maxAmount > 0 {
                     Button {
-                        v = String(SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)))
+                        v = String(maxAmount)
+                        maxSelected = usesFeeInclusiveMax
                     } label: {
                         Text(verbatim: "Max")
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
@@ -756,7 +967,7 @@ private struct UnifyAmountKeypad: View {
             VStack(spacing: 6) {
                 SNPrimaryButton(label: "Send over the internet", net: true, disabled: !can) {
                     guard can else { return }
-                    onSend(sats)
+                    onSend(sats, maxSelected)
                 }
                 Text(verbatim: "Instant over the internet, straight to \(peerName)\u{2019}s wallet.")
                     .font(SonarTheme.uiFont(size: 12))

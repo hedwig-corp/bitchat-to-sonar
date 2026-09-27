@@ -5,14 +5,14 @@ import com.google.zxing.EncodeHintType
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.google.zxing.qrcode.encoder.Encoder
 
-actual fun shareInviteText(text: String) {
+actual fun shareInviteText(text: String, chooserTitle: String) {
     val ctx = AppContextHolder.ctx
     val send = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
         putExtra(Intent.EXTRA_TEXT, text)
     }
     // Started from a non-Activity context, so a new task is required.
-    val chooser = Intent.createChooser(send, "Share invite link")
+    val chooser = Intent.createChooser(send, chooserTitle)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     runCatching { ctx.startActivity(chooser) }
 }

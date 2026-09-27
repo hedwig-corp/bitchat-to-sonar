@@ -25,21 +25,31 @@ fun bolt11AmountSats(invoice: String): Long? {
     var amountPart = prefix.substring(digitsStart)
     if (amountPart.isEmpty()) return null
     val multiplier = amountPart.last()
-    val scale: Double = when (multiplier) {
-        'm' -> 1e-3
-        'u' -> 1e-6
-        'n' -> 1e-9
-        'p' -> 1e-12
-        else -> 1.0
+    // Integer millisatoshis, never Double: in floating point "lnbc2100n"
+    // (210 sats) is 210.00000000000003, one rounding away from 211. Millisats
+    // per unit of the amount, by multiplier; null = p (a pico-BTC is a tenth
+    // of a millisatoshi). Same arithmetic as iOS `SNScannedKind`.
+    val msatPerUnit: Long? = when (multiplier) {
+        'm' -> 100_000_000L
+        'u' -> 100_000L
+        'n' -> 100L
+        'p' -> null
+        in '0'..'9' -> 100_000_000_000L
+        else -> return null
     }
     if (!multiplier.isDigit()) amountPart = amountPart.dropLast(1)
-    val value = amountPart.toDoubleOrNull() ?: return null
-    if (value <= 0.0) return null
-    val sats = value * scale * 100_000_000.0
-    // p-denominated invoices can encode sub-satoshi amounts; round up so we
-    // never underpay, and treat a zero result as "no amount".
-    val rounded = kotlin.math.ceil(sats - 1e-9).toLong()
-    return rounded.takeIf { it > 0 }
+    if (amountPart.isEmpty() || !amountPart.all { it in '0'..'9' }) return null
+    val value = amountPart.toLongOrNull() ?: return null
+    if (value <= 0L) return null
+    val msat = if (msatPerUnit == null) {
+        value / 10 + if (value % 10 == 0L) 0 else 1
+    } else {
+        if (value > Long.MAX_VALUE / msatPerUnit) return null
+        value * msatPerUnit
+    }
+    // A sub-satoshi remainder rounds up, so we never underpay.
+    val sats = msat / 1_000 + if (msat % 1_000 == 0L) 0 else 1
+    return sats.takeIf { it > 0 }
 }
 
 /** True for a BOLT11 invoice on any network. */

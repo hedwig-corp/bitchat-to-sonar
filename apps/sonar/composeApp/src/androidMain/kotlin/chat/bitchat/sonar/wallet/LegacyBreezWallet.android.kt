@@ -9,13 +9,13 @@ import breez_sdk_liquid.LiquidNetwork
 import breez_sdk_liquid.ListPaymentsRequest
 import breez_sdk_liquid.PayAmount
 import breez_sdk_liquid.Payment
+import breez_sdk_liquid.PaymentDetails
 import breez_sdk_liquid.PaymentMethod
 import breez_sdk_liquid.PaymentState
 import breez_sdk_liquid.PaymentType
 import breez_sdk_liquid.PrepareReceiveRequest
 import breez_sdk_liquid.PrepareSendRequest
 import breez_sdk_liquid.ReceivePaymentRequest
-import breez_sdk_liquid.PaymentDetails
 import breez_sdk_liquid.SdkEvent
 import breez_sdk_liquid.SendPaymentRequest
 import breez_sdk_liquid.connect
@@ -30,6 +30,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,20 +44,29 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 /**
- * Android `actual`: on-device Breez SDK Liquid wallet. Mainnet. Seed derived
- * deterministically from the Nostr identity via [WalletSeed] (HKDF), connected
- * with the same raw seed bytes used by iOS so an imported nsec restores the same
- * wallet across both platforms. API key from the gitignored BuildConfig field.
+ * Android `actual`: the on-device Breez SDK Liquid wallet, now LEGACY (see the
+ * common [LegacyBreezWallet] contract). Mainnet. Seed derived from the Nostr
+ * identity via [WalletSeed] (HKDF), byte-identical to iOS. API key from the
+ * gitignored BuildConfig field.
+ *
+ * Opened ONLY when its store already exists ([LegacyBreezStore]); nothing on
+ * the normal path creates `sonar-wallet/`. The one exception is the explicit
+ * post-restore check, which marks what it creates and removes it unless the
+ * derived wallet turns out to hold funds or history.
  */
-actual object WalletBridge {
+actual object LegacyBreezWallet {
 
     private const val CLEANUP_PENDING_KEY = "cleanup.pending"
+    /** Set with [CLEANUP_PENDING_KEY] when the interrupted cleanup was a panic
+     *  wipe, so recovery also removes every archive. */
+    private const val CLEANUP_ALL_KEY = "cleanup.all"
 
     private val lock = Mutex()
     @Volatile private var sdk: BindingLiquidSdk? = null
     @Volatile private var current: WalletState = WalletState.NotConfigured
-    @Volatile private var rates: Map<String, ExchangeRate> = emptyMap()
     @Volatile private var receiveOffer: String? = null
+    /** A `sync()` completed after the current connect (delete-gate input). */
+    @Volatile private var syncedSinceConnect = false
 
     /** Background home for listener-triggered balance refreshes — never the UI. */
     private val walletScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -65,8 +75,10 @@ actual object WalletBridge {
     /** Buffered so the SDK callback thread can `tryEmit` without ever blocking. */
     private val payments = MutableSharedFlow<WalletPaymentEvent>(extraBufferCapacity = 16)
     actual val paymentEvents: SharedFlow<WalletPaymentEvent> get() = payments
+    private val snapshotState = MutableStateFlow(LegacyWalletSnapshot())
+    actual val snapshot: StateFlow<LegacyWalletSnapshot> get() = snapshotState
     @Volatile private var balanceListenerId: String? = null
-    /** Bumped in [shutdown] (inside [lock]); [refreshBalance] drops its writes
+    /** Bumped on disconnect (inside [lock]); [refreshBalance] drops its writes
      *  if the epoch moved while `getInfo()` ran, so a listener-triggered
      *  refresh can never resurrect a torn-down wallet's balance. */
     @Volatile private var walletEpoch = 0
@@ -94,32 +106,66 @@ actual object WalletBridge {
      */
     const val CONNECT_TIMEOUT_MS = 20_000L
 
+    /** Non-terminal payment states: any of these blocks a delete. */
+    private val UNSETTLED_STATES = listOf(
+        PaymentState.CREATED,
+        PaymentState.PENDING,
+        PaymentState.REFUNDABLE,
+        PaymentState.REFUND_PENDING,
+        PaymentState.WAITING_FEE_ACCEPTANCE,
+    )
+
     private val ctx: Context get() = AppContextHolder.ctx
-    private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
     private fun cleanupPrefs() = ctx.getSharedPreferences("sonar.wallet.lifecycle", Context.MODE_PRIVATE)
+    private val store = LegacyBreezStore({ ctx.filesDir.absolutePath }, platformWalletFiles())
 
     private fun apiKey(): String = BuildConfig.BREEZ_API_KEY.trim()
 
-    actual fun isAvailable(): Boolean = apiKey().isNotEmpty()
+    actual fun hasApiKey(): Boolean = apiKey().isNotEmpty()
+
+    actual fun isPresent(accountId: String): Boolean =
+        runCatching { store.resolvePresent(accountId) }.getOrDefault(false)
 
     actual fun state(): WalletState = current
 
-    actual suspend fun setupIfNeeded(nsec: String): Unit = withContext(Dispatchers.IO) {
+    actual suspend fun openIfPresent(nsec: String): Boolean = withContext(Dispatchers.IO) {
         lock.withLock {
             recoverPendingCleanupLocked()
-            if (sdk != null) return@withContext
-            connectLocked(nsec)
+            if (sdk != null) return@withLock true
+            openExistingLocked(nsec)
         }
     }
 
     /**
-     * Connect + store the SDK. **Assumes [lock] is held and [sdk] is null.**
-     * Factored out of [setupIfNeeded] so [ensureLiveConnection] can reuse it
-     * inside the same lock acquisition (kotlinx `Mutex` is non-reentrant).
+     * Connect the legacy store for [nsec]'s account IF it exists. Assumes
+     * [lock] is held and [sdk] is null. The presence check runs BEFORE any
+     * directory is created, so a fresh install never grows `sonar-wallet/`.
      */
-    private suspend fun connectLocked(nsec: String) {
+    private suspend fun openExistingLocked(nsec: String): Boolean {
+        val accountId = cashuAccountId(nsec)
+        if (!store.resolvePresent(accountId)) {
+            current = WalletState.NotConfigured
+            snapshotState.value = LegacyWalletSnapshot()
+            return false
+        }
+        snapshotState.value = snapshotState.value.copy(present = true)
         val key = apiKey()
-        if (key.isEmpty()) { current = WalletState.NotConfigured; return }
+        if (key.isEmpty()) {
+            current = WalletState.NotConfigured
+            return false
+        }
+        connectLocked(nsec, key)
+        val node = sdk ?: return false
+        store.claim(accountId)
+        return node === sdk
+    }
+
+    /**
+     * Connect + store the SDK against the EXISTING working dir. **Assumes
+     * [lock] is held and [sdk] is null.** Never creates the store directory;
+     * callers decide that (only the restore check may).
+     */
+    private suspend fun connectLocked(nsec: String, key: String) {
         val secretHex = Bech32.nsecToSecretHex(nsec)
         if (secretHex == null) { current = WalletState.Failed("no identity"); return }
         current = WalletState.SettingUp
@@ -132,8 +178,7 @@ actual object WalletBridge {
             val work = async(Dispatchers.IO) {
                 val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(secretHex))
                 val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
-                    val dir = File(ctx.filesDir, "sonar-wallet/mainnet").apply { mkdirs() }
-                    workingDir = dir.absolutePath
+                    workingDir = File(store.workingDir).absolutePath
                 }
                 var node: BindingLiquidSdk? = null
                 var handedOff = false
@@ -141,10 +186,10 @@ actual object WalletBridge {
                     val connected = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
                     node = connected
                     currentCoroutineContext().ensureActive()
-                    val balanceSats = connected.getInfo().walletInfo.balanceSat.toLong()
+                    val info = connected.getInfo().walletInfo
                     currentCoroutineContext().ensureActive()
                     handedOff = true
-                    connected to balanceSats
+                    connected to info
                 } finally {
                     // Timeout/cancellation is cooperative only after the native
                     // call returns. Never leak that late node or let it retain a
@@ -162,26 +207,94 @@ actual object WalletBridge {
             // emitting the dead wallet's last balance alongside Failed state.
             outcome.isFailure -> {
                 balance.value = 0L
+                snapshotState.value = snapshotState.value.copy(connected = false)
                 WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
             }
             outcome.getOrNull() == null -> {
                 balance.value = 0L
+                snapshotState.value = snapshotState.value.copy(connected = false)
                 WalletState.Failed("wallet setup timed out")
             }
-            else -> outcome.getOrThrow()!!.let { (node, bal) ->
+            else -> outcome.getOrThrow()!!.let { (node, info) ->
                 sdk = node
-                balance.value = bal
+                syncedSinceConnect = false
+                balance.value = info.balanceSat.toLong()
+                snapshotState.value = LegacyWalletSnapshot(
+                    present = true,
+                    connected = true,
+                    balanceSats = info.balanceSat.toLong(),
+                    pendingSendSats = info.pendingSendSat.toLong(),
+                    pendingReceiveSats = info.pendingReceiveSat.toLong(),
+                )
                 startObservingBalance(node)
-                WalletState.Ready(bal)
+                WalletState.Ready(info.balanceSat.toLong())
             }
         }
     }
 
+    actual suspend fun runRestoreCheck(nsec: String): LegacyRestoreCheckOutcome = withContext(Dispatchers.IO) {
+        lock.withLock {
+            recoverPendingCleanupLocked()
+            val key = apiKey()
+            if (key.isEmpty()) return@withLock LegacyRestoreCheckOutcome.Skipped
+            val accountId = cashuAccountId(nsec)
+            if (sdk != null || store.resolvePresent(accountId)) {
+                return@withLock LegacyRestoreCheckOutcome.AlreadyPresent
+            }
+            if (!store.beginRestoreCheck()) return@withLock LegacyRestoreCheckOutcome.Failed
+            // The one path allowed to create the store — and it is marked, so
+            // a crash here never leaves something that looks like a kept wallet.
+            File(store.workingDir).mkdirs()
+            connectLocked(nsec, key)
+            val node = sdk ?: run {
+                store.deleteLive()
+                snapshotState.value = LegacyWalletSnapshot()
+                return@withLock LegacyRestoreCheckOutcome.Failed
+            }
+            // One empty pass is not proof (a sync can return before the
+            // history lands): an empty wallet is confirmed by a second pass.
+            val first = runCatching { restoreFactsLocked(node) }.getOrNull()
+            val confirm = if (first?.empty == true) {
+                delay(LEGACY_RESTORE_CONFIRM_DELAY_MS)
+                runCatching { restoreFactsLocked(node) }.getOrNull()
+            } else {
+                null
+            }
+            val verdict = legacyRestoreVerdict(first, confirm)
+            if (verdict == LegacyRestoreCheckOutcome.Kept && store.keepRestoreCheck(accountId)) {
+                syncedSinceConnect = true
+                requestBalanceRefresh()
+                return@withLock LegacyRestoreCheckOutcome.Kept
+            }
+            runCatching { disconnectLocked() }
+            store.deleteLive()
+            snapshotState.value = LegacyWalletSnapshot()
+            // A wallet that showed funds but could not be recorded as kept is
+            // a Failed check (retried from the seed), never a Discarded one.
+            if (verdict == LegacyRestoreCheckOutcome.Kept) LegacyRestoreCheckOutcome.Failed else verdict
+        }
+    }
+
+    /** One restore-check pass: sync, then read what the wallet holds. Assumes [lock] is held. */
+    private fun restoreFactsLocked(node: BindingLiquidSdk): LegacyRestoreFacts {
+        node.sync()
+        val info = node.getInfo().walletInfo
+        return LegacyRestoreFacts(
+            synced = syncedSinceConnect,
+            balanceSats = info.balanceSat.toLong(),
+            pendingSendSats = info.pendingSendSat.toLong(),
+            pendingReceiveSats = info.pendingReceiveSat.toLong(),
+            hasHistory = node.listPayments(ListPaymentsRequest(limit = 1u)).isNotEmpty(),
+            refundableSwaps = node.listRefundables().size,
+        )
+    }
+
     /**
-     * Bring the wallet to a live, connected state for a headless wake, atomically
-     * under [lock]: connect if there is no SDK, or probe a reused handle and
-     * reconnect it if its websocket died in Doze. Returns true when [sdk] is
-     * usable afterward.
+     * Bring the legacy wallet to a live, connected state for a headless Breez
+     * wake, atomically under [lock]: connect if there is no SDK (ONLY when the
+     * store exists — a push must never create a wallet), or probe a reused
+     * handle and reconnect it if its websocket died in Doze. Returns true when
+     * [sdk] is usable afterward.
      *
      * Replaces the caller-side `isConnectionLive() → shutdown() → setupIfNeeded()`
      * dance, which was check-then-act across three separate lock acquisitions —
@@ -191,11 +304,8 @@ actual object WalletBridge {
      */
     suspend fun ensureLiveConnection(nsec: String): Boolean = withContext(Dispatchers.IO) {
         lock.withLock {
-            // Same guard setupIfNeeded runs, for the same reason: an interrupted
-            // wipeLocalStorage() must finish before ANY seed is opened. Without
-            // it a headless wake reached connectLocked directly and could open
-            // the half-deleted working directory with the replacement identity's
-            // seed.
+            // Same guard openIfPresent runs, for the same reason: an interrupted
+            // delete must finish before ANY seed is opened.
             recoverPendingCleanupLocked()
             val existing = sdk
             // Mirror of RelayConnectionPolicy.shouldInvalidateOnPushWake: a push
@@ -229,7 +339,7 @@ actual object WalletBridge {
                 runCatching { existing.disconnect() }
                 sdk = null
             }
-            connectLocked(nsec)
+            openExistingLocked(nsec)
             sdk != null
         }
     }
@@ -238,12 +348,20 @@ actual object WalletBridge {
         val node = sdk ?: return@withContext 0L
         val epoch = walletEpoch
         try {
-            val bal = node.getInfo().walletInfo.balanceSat.toLong()
+            val info = node.getInfo().walletInfo
+            val bal = info.balanceSat.toLong()
             // Drop the writes if shutdown/re-setup won the race while the
             // blocking getInfo() ran — never resurrect a torn-down wallet.
             if (epoch == walletEpoch && sdk === node) {
                 current = WalletState.Ready(bal)
                 balance.value = bal
+                snapshotState.value = LegacyWalletSnapshot(
+                    present = true,
+                    connected = true,
+                    balanceSats = bal,
+                    pendingSendSats = info.pendingSendSat.toLong(),
+                    pendingReceiveSats = info.pendingReceiveSat.toLong(),
+                )
             }
             bal
         } catch (t: Throwable) { (current as? WalletState.Ready)?.balanceSats ?: 0L }
@@ -264,7 +382,10 @@ actual object WalletBridge {
                             emitPaymentEvent(e.details)
                             requestBalanceRefresh()
                         }
-                        is SdkEvent.Synced,
+                        is SdkEvent.Synced -> {
+                            syncedSinceConnect = true
+                            requestBalanceRefresh()
+                        }
                         is SdkEvent.DataSynced,
                         is SdkEvent.PaymentWaitingConfirmation,
                         is SdkEvent.PaymentPending,
@@ -430,8 +551,8 @@ actual object WalletBridge {
         receiveOffer ?: lock.withLock {
             receiveOffer ?: run {
                 val node = sdk ?: error("wallet not ready")
-                // Amountless reusable BOLT12 offer. Keep it stable across descriptor
-                // refreshes so peers do not race a rotated receive path.
+                // Amountless reusable BOLT12 offer. It only backs this wallet's
+                // own NDS webhook now; the PUBLISHED offer is the Cashu one.
                 val prepared = node.prepareReceivePayment(
                     PrepareReceiveRequest(PaymentMethod.BOLT12_OFFER, null)
                 )
@@ -452,7 +573,11 @@ actual object WalletBridge {
             // against a mid-send teardown is the appVisible guard in
             // [ensureLiveConnection]: a user-initiated send implies a visible
             // UI, and that path no longer probes or reconnects at all.
-            val node = lock.withLock { sdk } ?: return@withContext SendResult(false)
+            val node = lock.withLock { sdk } ?: return@withContext SendResult(
+                ok = false,
+                error = "The old wallet isn't connected. Try again in a moment.",
+                errorKind = SendErrorKind.NotReady,
+            )
             if (amountSats < 0) return@withContext SendResult(false)
             try {
                 val amount: PayAmount? =
@@ -479,6 +604,7 @@ actual object WalletBridge {
                         return@withContext SendResult(
                             ok = false,
                             error = SpendableBalance.insufficientMessage(sending, fee, bal),
+                            errorKind = SendErrorKind.InsufficientFunds,
                         )
                     }
                 }
@@ -493,27 +619,8 @@ actual object WalletBridge {
                     feesSats = payment.feesSat.toLong(),
                     settledAtSecs = payment.timestamp.toLong(),
                 )
-            } catch (t: Throwable) { SendResult(false) }
+            } catch (t: Throwable) { SendResult(false, errorKind = SendErrorKind.Failed) }
         }
-
-    actual suspend fun fetchRates(): List<ExchangeRate> = withContext(Dispatchers.IO) {
-        val node = sdk ?: return@withContext emptyList()
-        try {
-            val list = node.fetchFiatRates().map { ExchangeRate(it.coin.uppercase(), it.value) }
-            rates = list.associateBy { it.currency }
-            list
-        } catch (t: Throwable) { rates.values.toList() }
-    }
-
-    actual fun cachedRate(currency: FiatCurrency): ExchangeRate? = rates[currency.code]
-
-    actual fun hasLiveRate(): Boolean = Money.isLiveRate(rates[currency().code])
-
-    actual fun showFiat(): Boolean = prefs().getBoolean("wallet.showFiat", false)
-    actual fun setShowFiat(value: Boolean) { prefs().edit().putBoolean("wallet.showFiat", value).apply() }
-
-    actual fun currency(): FiatCurrency = FiatCurrency.of(prefs().getString("wallet.currency", "USD"))
-    actual fun setCurrency(value: FiatCurrency) { prefs().edit().putString("wallet.currency", value.code).apply() }
 
     actual suspend fun registerWebhook(url: String): Unit = withContext(Dispatchers.IO) {
         sdk?.registerWebhook(url)
@@ -521,6 +628,92 @@ actual object WalletBridge {
 
     actual suspend fun unregisterWebhook(): Unit = withContext(Dispatchers.IO) {
         sdk?.unregisterWebhook()
+    }
+
+    actual suspend fun deleteGate(): LegacyDeleteGate = withContext(Dispatchers.IO) {
+        lock.withLock { gateLocked() }
+    }
+
+    /** Read the gate facts. Assumes [lock] is held. Every read that fails is
+     *  reported as unknown, which [legacyDeleteGate] treats as NOT safe. */
+    private fun gateLocked(): LegacyDeleteGate {
+        val node = sdk ?: return LegacyDeleteGate.Blocked(
+            if (store.hasLiveStore()) LegacyDeleteBlock.NotConnected else LegacyDeleteBlock.Absent,
+        )
+        return legacyDeleteGate(gateFactsLocked(node))
+    }
+
+    private fun gateFactsLocked(node: BindingLiquidSdk): LegacyGateFacts {
+        val synced = runCatching { node.sync() }.isSuccess
+        syncedSinceConnect = synced
+        val info = runCatching { node.getInfo().walletInfo }.getOrNull()
+        val refundables = runCatching { node.listRefundables().size }.getOrNull()
+        val unsettled = runCatching {
+            node.listPayments(ListPaymentsRequest(states = UNSETTLED_STATES)).size
+        }.getOrNull()
+        return LegacyGateFacts(
+            connected = true,
+            syncedSinceConnect = synced,
+            confirmedSats = info?.balanceSat?.toLong(),
+            pendingSendSats = info?.pendingSendSat?.toLong(),
+            pendingReceiveSats = info?.pendingReceiveSat?.toLong(),
+            refundableSwaps = refundables,
+            unsettledPayments = unsettled,
+        )
+    }
+
+    actual suspend fun deleteIfSafe(): LegacyDeleteGate = withContext(Dispatchers.IO) {
+        lock.withLock {
+            val node = sdk ?: return@withLock gateLocked()
+            val before = gateFactsLocked(node)
+            val gate = legacyDeleteGate(before)
+            if (gate != LegacyDeleteGate.Safe) return@withLock gate
+            runCatching { node.unregisterWebhook() }
+            // A payment could settle while the webhook was being removed: read
+            // again, and delete only if nothing moved. (The webhook comes back
+            // with the next push registration if this stops here.)
+            val after = gateFactsLocked(node)
+            if (!legacyGateUnchanged(before, after)) {
+                val moved = legacyDeleteGate(after)
+                return@withLock if (moved == LegacyDeleteGate.Safe) {
+                    LegacyDeleteGate.Blocked(LegacyDeleteBlock.Unknown)
+                } else {
+                    moved
+                }
+            }
+            markCleanupPendingLocked(all = false)
+            disconnectLocked()
+            deleteStorageLocked(all = false)
+            completeCleanupLocked()
+            snapshotState.value = LegacyWalletSnapshot()
+            LegacyDeleteGate.Safe
+        }
+    }
+
+    actual suspend fun releaseForAccountReplacement(oldAccountId: String): Unit = withContext(Dispatchers.IO) {
+        lock.withLock {
+            recoverPendingCleanupLocked()
+            if (!store.hasLiveStore()) {
+                // Nothing that could hold funds: drop any empty leftover dir.
+                disconnectLocked()
+                store.deleteLive()
+                snapshotState.value = LegacyWalletSnapshot()
+                return@withLock
+            }
+            val gate = if (sdk != null) gateLocked() else LegacyDeleteGate.Blocked(LegacyDeleteBlock.NotConnected)
+            runCatching { sdk?.unregisterWebhook() }
+            disconnectLocked()
+            if (gate == LegacyDeleteGate.Safe) {
+                markCleanupPendingLocked(all = false)
+                deleteStorageLocked(all = false)
+                completeCleanupLocked()
+            } else {
+                // May hold funds: never delete. Put it aside for its account.
+                // Archive under the store's recorded owner when it has one.
+                check(store.archive(store.owner() ?: oldAccountId)) { "legacy wallet could not be archived" }
+            }
+            snapshotState.value = LegacyWalletSnapshot()
+        }
     }
 
     actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
@@ -531,29 +724,36 @@ actual object WalletBridge {
 
     actual suspend fun wipeLocalStorage(): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
-            markCleanupPendingLocked()
+            markCleanupPendingLocked(all = true)
             disconnectLocked()
-            deleteStorageLocked()
+            deleteStorageLocked(all = true)
             completeCleanupLocked()
+            snapshotState.value = LegacyWalletSnapshot()
         }
     }
 
-    /** Complete an interrupted destructive wipe before any seed can be opened. */
+    /** Complete an interrupted destructive delete before any seed can be opened. */
     private fun recoverPendingCleanupLocked() {
-        if (!cleanupPrefs().getBoolean(CLEANUP_PENDING_KEY, false)) return
+        val prefs = cleanupPrefs()
+        if (!prefs.getBoolean(CLEANUP_PENDING_KEY, false)) return
         disconnectLocked()
-        deleteStorageLocked()
+        deleteStorageLocked(all = prefs.getBoolean(CLEANUP_ALL_KEY, false))
         completeCleanupLocked()
     }
 
-    private fun markCleanupPendingLocked() {
-        check(cleanupPrefs().edit().putBoolean(CLEANUP_PENDING_KEY, true).commit()) {
+    private fun markCleanupPendingLocked(all: Boolean) {
+        check(
+            cleanupPrefs().edit()
+                .putBoolean(CLEANUP_PENDING_KEY, true)
+                .putBoolean(CLEANUP_ALL_KEY, all)
+                .commit()
+        ) {
             "wallet cleanup marker could not be persisted"
         }
     }
 
     private fun completeCleanupLocked() {
-        check(cleanupPrefs().edit().remove(CLEANUP_PENDING_KEY).commit()) {
+        check(cleanupPrefs().edit().remove(CLEANUP_PENDING_KEY).remove(CLEANUP_ALL_KEY).commit()) {
             "wallet cleanup marker could not be cleared"
         }
     }
@@ -569,16 +769,15 @@ actual object WalletBridge {
             throw IllegalStateException("wallet node did not disconnect cleanly", disconnectFailure)
         }
         sdk = null
+        syncedSinceConnect = false
         current = WalletState.NotConfigured
         balance.value = 0L
-        rates = emptyMap()
         receiveOffer = null
+        snapshotState.value = snapshotState.value.copy(connected = false)
     }
 
-    private fun deleteStorageLocked() {
-        val root = File(ctx.filesDir, "sonar-wallet")
-        if (root.exists() && (!root.deleteRecursively() || root.exists())) {
-            throw IllegalStateException("wallet storage could not be removed")
-        }
+    private fun deleteStorageLocked(all: Boolean) {
+        val removed = if (all) store.deleteEverything() else store.deleteLive()
+        if (!removed) throw IllegalStateException("wallet storage could not be removed")
     }
 }

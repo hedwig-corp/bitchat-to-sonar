@@ -10,7 +10,7 @@ and the wallet.
 ```
 composeApp/src/
   commonMain/   shared UI (screens, theme, desktop shell) + SonarAppState + expect decls
-  androidMain/  Android actuals (BLE mesh, Breez wallet, …) + MainActivity
+  androidMain/  Android actuals (BLE mesh, Cashu FFI, legacy Breez wallet, …) + MainActivity
   jvmMain/      Desktop actuals + Main.kt (Compose Desktop window)
   jvmTest/      Desktop FFI smoke test
 ```
@@ -28,7 +28,8 @@ composeApp/src/
 | BLE mesh: advertise + GATT server  |   ✅    |   ✅ macOS only, ⚪️ not implemented on Linux (Windows: crate does not build) |
 | BLE mesh: messaging (DMs/broadcast) |   ✅    |   ⚪️ next stage (Noise-over-GATT transport) |
 | Unify nearby payments (BLE)         |   ✅    |   ⚪️ not yet (same bridge, later) |
-| Lightning wallet (⚡PAY)            |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
+| Wallet (⚡PAY) — Cashu ecash        |   ✅    |   ✅ (same Rust `SonarCashuWallet`) |
+| Legacy Breez wallet (existing stores only) | ✅ | ✅ (needs a Breez key; never created) |
 
 Desktop covers the entire **internet-backed** surface — exactly the slice that
 interops cross-platform over the same Nostr relays — plus **BLE discovery**.
@@ -67,8 +68,9 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
   default. Enable **Settings → Approximate location** to resolve coarse
   city/region/country geohash channels from your IP (opt-in; sends your IP to a
   geolocation service). Or just join any geohash channel via Search.
-- The **Lightning wallet** is a documented follow-up (a JVM Breez build, or an
-  LDK/CLN/LND bridge).
+- The **wallet** is Cashu ecash at `mint.hedwig.sh` through the Rust core
+  (`wallet/CashuWalletEngine.kt` over `SonarCashuWallet`), on both targets.
+  Breez is a legacy wallet: opened only when its store already exists.
 
 ## Build & run — Desktop
 
@@ -142,7 +144,8 @@ ANDROID_NDK_HOME=/path/to/ndk ../../core/build-android.sh
 ```
 
 Put `sdk.dir` and `breez.apiKey` in gitignored `local.properties` (or export
-`BREEZ_API_KEY`). Debug may omit the key (Settings → Unavailable); release
+`BREEZ_API_KEY`). The Cashu wallet needs no key; the key only lets the legacy
+Breez wallet open (and the one post-restore check run). Debug may omit it; release
 `assembleRelease` / `bundleRelease` refuse without it. Release APKs are
 unsigned unless you configure signing.
 

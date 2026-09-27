@@ -49,8 +49,12 @@ private final class WalletBackgroundTaskLease {
 }
 #endif
 
-/// App-side facade over the Lightning wallet engine (Breez SDK Liquid via
-/// the local `WalletKit` Swift package).
+/// App-side facade over the LEGACY Lightning wallet engine (Breez SDK Liquid
+/// via the local `WalletKit` Swift package). Cashu is Sonar's wallet; this
+/// only ever OPENS a Breez wallet whose seed already exists on the device —
+/// see `LegacyBreezWallet`. The single exception is the one-time restore
+/// check (`allowCreatingWallet`), which may re-derive the seed from the
+/// restored nsec to look for funds.
 ///
 /// Design (mirrors `MarmotService`):
 /// - No singleton: construct one and inject it. The wrapped wallet owns
@@ -86,6 +90,9 @@ final class WalletBridgeService: ObservableObject {
     enum WalletBridgeError: Error, Equatable, LocalizedError {
         /// `BREEZ_API_KEY` is missing/empty — see docs/WALLET-INTEGRATION.md.
         case missingAPIKey
+        /// No legacy wallet exists on this device and creating one is not
+        /// allowed (Cashu is the wallet for new installs).
+        case noLegacyWallet
         /// Failure inside the wallet engine (Breez SDK, storage...).
         case core(String)
 
@@ -93,6 +100,8 @@ final class WalletBridgeService: ObservableObject {
             switch self {
             case .missingAPIKey:
                 return "Breez API key is missing from this app build."
+            case .noLegacyWallet:
+                return "There is no old Lightning wallet on this device."
             case .core(let message):
                 let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? "Wallet operation failed." : trimmed
@@ -146,21 +155,19 @@ final class WalletBridgeService: ObservableObject {
     }
     #endif
 
-    // MARK: - Money display
-
-    /// True only after a live-rate fetch returned the selected currency. The UI
-    /// shows fiat ONLY when this is true; otherwise sats (never a bundled rate).
-    @Published private(set) var hasLiveRate = false
-    /// Fires when display mode, currency, or rate availability changes.
-    let moneyDisplay = PassthroughSubject<Void, Never>()
-    private var ratesTask: Task<Void, Never>?
-    private static let moneyDefaultedKey = "sonar.money.defaulted"
-
-    /// Supplies 64-hex (32-byte) entropy to derive the wallet deterministically
-    /// on first run, or nil when the source identity is not ready yet. When
-    /// nil-returning (or unset) and no wallet exists, setup defers. Set by the
-    /// host so the wallet is reconstructable from the chat identity (nsec).
+    /// Supplies 64-hex (32-byte) entropy derived from the chat identity, or
+    /// nil when the identity is not ready. Used ONLY when
+    /// `allowCreatingWallet` is true (the one-time restore check).
     var entropyProvider: (() -> String?)?
+
+    /// False (the default): setup opens an existing legacy wallet or fails
+    /// with `.noLegacyWallet` — it never creates one. True only for the
+    /// one-time post-restore check, which derives the seed from the nsec.
+    var allowCreatingWallet = false
+
+    /// Bumped every time the node starts; a legacy snapshot is only valid for
+    /// the connection it was taken on ("a completed sync since connecting").
+    private(set) var connectionEpoch: UInt64 = 0
 
     /// - Parameter mainnet: pass false to point the node at testnet.
     init(mainnet: Bool = true) {
@@ -221,31 +228,21 @@ final class WalletBridgeService: ObservableObject {
             SecureLogger.info("Wallet setup: existing wallet=\(hasExistingWallet)", category: .session)
             #endif
             if !hasExistingWallet {
-                let entropyHex = entropyProvider?()
-                if let entropyHex {
-                    // Deterministic: wallet is reconstructable from the chat
-                    // identity (one identity = one wallet).
+                // Legacy only: never create a Breez wallet for a new install.
+                // The one exception is the post-restore check, which re-derives
+                // the SAME deterministic seed the old app would have created.
+                guard allowCreatingWallet else {
+                    state = .notConfigured
+                    throw WalletBridgeError.noLegacyWallet
+                }
+                guard let entropyHex = entropyProvider?() else {
                     #if DEBUG
-                    SecureLogger.info("Wallet setup: identity entropy ready; creating deterministic wallet", category: .session)
-                    #endif
-                    try await wallet.createWalletFromEntropy(entropyHex: entropyHex)
-                } else if entropyProvider != nil {
-                    // Identity not ready yet — defer; setupIfNeeded retries
-                    // once the identity exists (so we never create a random,
-                    // non-derivable wallet for a derived-wallet host).
-                    #if DEBUG
-                    SecureLogger.warning("Wallet setup deferred: identity entropy not ready", category: .session)
+                    SecureLogger.warning("Legacy wallet check deferred: identity entropy not ready", category: .session)
                     #endif
                     state = .notConfigured
                     throw WalletBridgeError.core("identity not ready for wallet derivation")
-                } else {
-                    // No derivation source configured: random wallet (the
-                    // standalone/back-compat path).
-                    #if DEBUG
-                    SecureLogger.warning("Wallet setup: no entropy provider; creating random wallet", category: .session)
-                    #endif
-                    try await wallet.createWallet()
                 }
+                try await wallet.createWalletFromEntropy(entropyHex: entropyHex)
             }
             #if canImport(UIKit)
             // Never start the Breez node before UIKit confirms an active
@@ -272,15 +269,12 @@ final class WalletBridgeService: ObservableObject {
         } catch let error as SonarWallet.WalletError {
             throw Self.map(error)
         }
+        connectionEpoch &+= 1
         startObservingBalance()
         state = .ready(balanceSats: 0)
         #if DEBUG
         SecureLogger.info("Wallet setup: ready", category: .session)
         #endif
-        // Money display: apply first-run defaults (fiat + locale currency) then
-        // fetch live rates and keep them fresh while ready.
-        applyFirstRunMoneyDefaults()
-        startRefreshingRates()
     }
 
     /// Stop the Breez node (e.g. on scene teardown). Setup can run again.
@@ -297,8 +291,6 @@ final class WalletBridgeService: ObservableObject {
         setupTask = nil
         balanceTask?.cancel()
         balanceTask = nil
-        ratesTask?.cancel()
-        ratesTask = nil
         try? await wallet.stopNode()
         state = .notConfigured
     }
@@ -314,8 +306,6 @@ final class WalletBridgeService: ObservableObject {
         setupTask = nil
         balanceTask?.cancel()
         balanceTask = nil
-        ratesTask?.cancel()
-        ratesTask = nil
         defer { state = .notConfigured }
         do {
             try await wallet.stopNode()
@@ -375,7 +365,7 @@ final class WalletBridgeService: ObservableObject {
     /// yet) doesn't leave the wallet down. `suspendedForBackground` is cleared only
     /// on success, so if all attempts fail the resume stays armed and the next
     /// foreground retries — the wallet never gets stuck `.notConfigured` until a
-    /// fresh `BridgedWallet`. No-op unless we previously suspended.
+    /// fresh `LegacyBreezWallet`. No-op unless we previously suspended.
     func resumeFromBackground() {
         suspendWhenActiveSendsFinish = false
         guard suspendedForBackground, !resumeInFlight else { return }
@@ -536,79 +526,16 @@ final class WalletBridgeService: ObservableObject {
         wallet.incomingPaymentsStream()
     }
 
-    // MARK: - Money display (forwarded to the SDK)
+    // MARK: - Legacy inspection
 
-    var displayMode: String { wallet.displayMode() }
-    var displayCurrency: String { wallet.displayCurrency() }
-
-    func supportedCurrencies() -> [SonarCurrency] {
-        wallet.supportedCurrencies().map {
-            SonarCurrency(code: $0.code, symbol: $0.symbol, decimals: $0.decimals)
-        }
-    }
-
-    func setDisplayMode(_ mode: String) async {
-        _ = await wallet.setDisplayMode(mode)
-        moneyDisplay.send()
-    }
-
-    func setDisplayCurrency(_ code: String) async {
-        _ = await wallet.setDisplayCurrency(code)
-        // A new currency needs a rate for it; refresh + recompute hasLiveRate.
-        await refreshRates()
-        moneyDisplay.send()
-    }
-
-    /// Effective money string: fiat (SDK) only when mode==fiat AND a live rate
-    /// exists; otherwise grouped sats (never the SDK's bundled fallback fiat).
-    func formatMoney(sats: Int64) -> String {
-        if displayMode == "fiat" && hasLiveRate {
-            return wallet.formatAmount(sats: sats)
-        }
-        return sonarFormatSats(sats)
-    }
-
-    /// Fiat text → sats at the live rate (callers gate on `hasLiveRate`).
-    func parseFiatInput(_ text: String) -> Int64 {
-        wallet.parseFiatInput(text, currencyCode: displayCurrency)
-    }
-
-    /// First run only: default to fiat display in the device-locale currency
-    /// (if supported, else EUR). Never overrides a later user choice.
-    private func applyFirstRunMoneyDefaults() {
-        guard !UserDefaults.standard.bool(forKey: Self.moneyDefaultedKey) else { return }
-        let supported = Set(supportedCurrencies().map(\.code))
-        let locale = Locale.current.currency?.identifier ?? "EUR"
-        let currency = supported.contains(locale) ? locale : (supported.contains("EUR") ? "EUR" : (supported.first ?? "USD"))
-        Task {
-            await self.setDisplayCurrency(currency)
-            await self.setDisplayMode("fiat")
-            // Mark first-run done only after both persist — if the app dies
-            // mid-Task the flag stays unset and we retry on next launch,
-            // instead of stranding the user in the SDK's bitcoin default.
-            UserDefaults.standard.set(true, forKey: Self.moneyDefaultedKey)
-        }
-    }
-
-    /// Fetch live rates now and recompute `hasLiveRate` for the selected
-    /// currency. Empty result (offline/error) → hasLiveRate=false → sats.
-    private func refreshRates() async {
-        let rates = await wallet.fetchExchangeRates()
-        let live = rates.contains { $0.currencyCode == displayCurrency }
-        if live != hasLiveRate { hasLiveRate = live; moneyDisplay.send() }
-    }
-
-    /// Refresh rates on ready and every few minutes while the node runs.
-    private func startRefreshingRates() {
-        ratesTask?.cancel()
-        ratesTask = Task { [weak self] in
-            while !Task.isCancelled {
-                // Stop the loop if the service is gone, so a missed shutdown()
-                // can't leave a bare 5-minute timer spinning forever.
-                guard let self else { return }
-                await self.refreshRates()
-                try? await Task.sleep(nanoseconds: 5 * 60 * 1_000_000_000)
-            }
+    /// Sync, then read what the delete gate needs. Throws when the node is not
+    /// running or the read fails; callers treat that as unknown (not safe).
+    func inspect() async throws -> SonarWallet.LegacyInspection {
+        guard case .ready = state else { throw WalletBridgeError.core("legacy wallet is not connected") }
+        do {
+            return try await wallet.syncAndInspect()
+        } catch let error as SonarWallet.WalletError {
+            throw Self.map(error)
         }
     }
 

@@ -72,8 +72,9 @@ struct SonarRadarScreen: View {
                     balance: store.balanceSats ?? 0,
                     money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
-                    onConfirmAmount: { dest, sats in
-                        store.confirmUnifyAmount(pay.peerId, destination: dest, sats: sats)
+                    usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
+                    onConfirmAmount: { dest, sats, feeFromAmount in
+                        store.confirmUnifyAmount(pay.peerId, destination: dest, sats: sats, feeFromAmount: feeFromAmount)
                     },
                     onClose: { store.dismissUnifyPay() }
                 )
