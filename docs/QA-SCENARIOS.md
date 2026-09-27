@@ -943,10 +943,12 @@ real mint and need the maintainer's approval of the amounts.
     read only. Add `-sonar.debug.cashuMintURL` to pay a local fake mint, and
     `-sonar.debug.route nearby` to open the radar. The ios-drive launch
     arguments split on spaces, so keep `<name>` to one word.
-  - Android: needs a real Unify Wallet receiver, or a second Sonar advertising
-    as one, and a funded wallet. There is no Android mint override, so a live
-    run moves real sats; the unit tests stand in for the radio with a served
-    URI.
+  - Android: needs a real Unify Wallet app in Bluetooth range and a funded
+    wallet. A second Sonar cannot stand in: Sonar skips Sonar-marked Unify
+    advertisers ("skip Sonar-marked Unify advertiser" in logcat), because
+    Sonar-to-Sonar payments take the Sonar path. There is no Android mint
+    override, so a live run also moves real sats. The unit tests stand in
+    for the radio with a served URI.
 - **Steps:** Radar → the Unify peer → **Send money**. Run it with four
   requests:
   - one that names its amount (`bitcoin:?lightning=<lnbc invoice>`): check the
