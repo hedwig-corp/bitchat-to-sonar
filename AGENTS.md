@@ -17,3 +17,23 @@ Signal treats the local database as the chat state. Network receive/send/sync pa
 ## Local Secrets Rule
 
 Do not commit payment, wallet, relay, signing, or API secrets. The Breez wallet key must stay in gitignored local configuration (`ios/Configs/Local.xcconfig` with `BREEZ_API_KEY = ...`) or an equivalent CI secret. When creating a new workspace/worktree or rebuilding for device testing, preserve the local secret by recreating/copying the gitignored config or passing the key through the build environment; verify presence without printing the value.
+
+## QA
+
+Before a change is merged, run the QA it needs with the `qa-run` skill
+([`.agents/skills/qa-run/SKILL.md`](.agents/skills/qa-run/SKILL.md)). Any
+agent can follow it; the only tools needed are a shell and git. Start with
+`scripts/qa/plan.sh`, which reads the diff and this machine and prints what
+to run, what cannot run here and why, and which sections of
+[`docs/QA-SCENARIOS.md`](docs/QA-SCENARIOS.md) to walk. The run ends with a
+QA report for the PR.
+
+The rules that matter most:
+- only dedicated emulators and simulators, never a physical phone;
+- `ANDROID_SERIAL` set for every Gradle device task;
+- secrets checked for presence only;
+- no real money.
+
+To hunt for bugs and fix them in a loop, use the maintainer skill `qa-pass`
+([`.agents/skills/qa-pass/SKILL.md`](.agents/skills/qa-pass/SKILL.md)).
+CLAUDE.md holds the full repository rules.

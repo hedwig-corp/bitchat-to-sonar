@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sonar QA run"
+  short_description: "Plan and run the QA a change needs on this machine; report pass / fail / not run for the PR"
+  default_prompt: "Use the qa-run skill: run scripts/qa/plan.sh, show me the plan, run the RUN tiers this machine supports (dedicated emulator/simulator only, never a phone), walk the WALK sections of docs/QA-SCENARIOS.md, and write the QA report for the PR with evidence and every NOT RUN reason."

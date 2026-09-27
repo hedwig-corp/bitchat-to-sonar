@@ -251,6 +251,12 @@ expectation, guarding test, origin) in the fix PR, and a scripted `qaNNN`
 step in `scripts/qa/android-smoke.sh` when it can be driven headlessly. Repeat
 the pass on the fixed build until a full round finds nothing new.
 
+Contributors, and anyone checking a single change, use the `qa-run` skill
+(`.agents/skills/qa-run/SKILL.md`). `scripts/qa/plan.sh` maps the diff to the
+tiers and registry sections it needs and lists what the machine cannot run.
+The run verifies and reports; it does not fix, push or merge. The skill is
+tool-neutral, so any agent can follow it; AGENTS.md points to it.
+
 ## Fix What We Break Rule
 
 When a change breaks existing behavior, fix the broken behavior directly before considering the work complete. Do not leave regressions for users to route around, and do not hide them with UI-only workarounds.
