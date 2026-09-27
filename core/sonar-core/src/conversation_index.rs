@@ -6,7 +6,7 @@ use crate::marmot::MarmotEngine;
 use crate::timezone::CachedPeerTimezone;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 pub struct ConversationIndex {
     db: Connection,
@@ -230,6 +230,30 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index create timezone_share_sent: {e}")))?;
         }
 
+        if current < 5 {
+            // Peer zones keyed by (sender, group). A per-sender row let a revoke
+            // sent into one chat erase the zone the same person still shares in
+            // another, and kept a stale clock everywhere once they stopped. An
+            // empty `iana_tz` is a revoke tombstone: it still carries its
+            // timestamp, so an older share replayed later cannot resurrect it.
+            //
+            // v3's per-sender rows have no group to migrate to, so drop them
+            // and clear our own sent-share records too: after the upgrade every
+            // sharer re-sends once and the new table fills per group.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_timezone_by_group (
+                    sender_pubkey_hex TEXT NOT NULL,
+                    group_id_hex      TEXT NOT NULL,
+                    iana_tz           TEXT NOT NULL,
+                    updated_at_secs   INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (sender_pubkey_hex, group_id_hex)
+                );
+                DROP TABLE IF EXISTS peer_timezone;
+                DELETE FROM timezone_share_sent;",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index create peer_timezone_by_group: {e}")))?;
+        }
+
         tx.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
             params![SCHEMA_VERSION],
@@ -408,30 +432,106 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index summary: {e}")))
     }
 
-    /// Persist a peer-authored timezone share if it is newer than the cached
-    /// value. Returns true only when the visible value changed: a newer share
-    /// of the same zone still advances `updated_at_secs` (so an older replay
-    /// stays rejected) but must not invalidate the host's chat UI.
+    /// Persist a peer-authored timezone share for one group if it is newer
+    /// than the cached value. An empty `zone` is a revoke tombstone. Returns
+    /// true only when the visible value changed: a newer share of the same
+    /// zone still advances `updated_at_secs` (so an older replay stays
+    /// rejected) but must not invalidate the host's chat UI.
     pub fn upsert_peer_timezone(
         &self,
         sender_pubkey_hex: &str,
+        group_id_hex: &str,
         zone: &str,
         updated_at_secs: u64,
     ) -> Result<bool> {
-        let previous = self.peer_timezone(sender_pubkey_hex)?;
+        let previous: Option<String> = self
+            .db
+            .query_row(
+                "SELECT iana_tz FROM peer_timezone_by_group
+                 WHERE sender_pubkey_hex = ?1 AND group_id_hex = ?2",
+                params![sender_pubkey_hex, group_id_hex],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| crate::Error::Storage(format!("index timezone read: {e}")))?;
         let written = self
             .db
             .execute(
-                "INSERT INTO peer_timezone (sender_pubkey_hex, iana_tz, updated_at_secs)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(sender_pubkey_hex) DO UPDATE SET
+                "INSERT INTO peer_timezone_by_group
+                    (sender_pubkey_hex, group_id_hex, iana_tz, updated_at_secs)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(sender_pubkey_hex, group_id_hex) DO UPDATE SET
                     iana_tz = excluded.iana_tz,
                     updated_at_secs = excluded.updated_at_secs
-                 WHERE excluded.updated_at_secs > peer_timezone.updated_at_secs",
-                params![sender_pubkey_hex, zone, updated_at_secs as i64],
+                 WHERE excluded.updated_at_secs > peer_timezone_by_group.updated_at_secs
+                    OR (excluded.updated_at_secs = peer_timezone_by_group.updated_at_secs
+                        AND excluded.iana_tz = '')",
+                params![sender_pubkey_hex, group_id_hex, zone, updated_at_secs as i64],
             )
             .map_err(|e| crate::Error::Storage(format!("index timezone upsert: {e}")))?;
-        Ok(written != 0 && previous.is_none_or(|p| p.zone != zone))
+        let visible_before = previous.filter(|z| !z.is_empty());
+        let visible_after = (!zone.is_empty()).then_some(zone);
+        Ok(written != 0 && visible_before.as_deref() != visible_after)
+    }
+
+    /// One sender's live zone in one group; `None` when never shared or revoked.
+    pub fn peer_timezone(
+        &self,
+        sender_pubkey_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<CachedPeerTimezone>> {
+        self.db
+            .query_row(
+                "SELECT iana_tz, updated_at_secs
+                 FROM peer_timezone_by_group
+                 WHERE sender_pubkey_hex = ?1 AND group_id_hex = ?2 AND iana_tz != ''",
+                params![sender_pubkey_hex, group_id_hex],
+                |row| {
+                    Ok(CachedPeerTimezone {
+                        zone: row.get(0)?,
+                        updated_at_secs: row.get::<_, i64>(1)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| crate::Error::Storage(format!("index timezone read: {e}")))
+    }
+
+    /// Every live `(sender_hex, group_hex, zone)` in these groups — one local
+    /// query for the chat list/header/member views. Never scans transcripts or
+    /// waits on relay/profile state; tombstones are skipped.
+    pub fn peer_timezones_in_groups(
+        &self,
+        group_id_hexes: &[String],
+    ) -> Result<Vec<(String, String, CachedPeerTimezone)>> {
+        let mut out = Vec::new();
+        let mut stmt = self
+            .db
+            .prepare(
+                "SELECT sender_pubkey_hex, iana_tz, updated_at_secs
+                 FROM peer_timezone_by_group
+                 WHERE group_id_hex = ?1 AND iana_tz != ''",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index timezone read: {e}")))?;
+        for group in group_id_hexes {
+            let rows = stmt
+                .query_map(params![group], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        CachedPeerTimezone {
+                            zone: row.get(1)?,
+                            updated_at_secs: row.get::<_, i64>(2)? as u64,
+                        },
+                    ))
+                })
+                .map_err(|e| crate::Error::Storage(format!("index timezone read: {e}")))?;
+            for row in rows {
+                let (sender, cached) =
+                    row.map_err(|e| crate::Error::Storage(format!("index timezone row: {e}")))?;
+                out.push((sender, group.clone(), cached));
+            }
+        }
+        Ok(out)
     }
 
     /// Every `(group_id_hex, zone, epoch)` this device has shared its own
@@ -479,26 +579,6 @@ impl ConversationIndex {
             )
             .map_err(|e| crate::Error::Storage(format!("index timezone sent delete: {e}")))?;
         Ok(())
-    }
-
-    /// Local-only lookup used by chat headers/member lists. This never scans
-    /// transcripts or waits on relay/profile state.
-    pub fn peer_timezone(&self, sender_pubkey_hex: &str) -> Result<Option<CachedPeerTimezone>> {
-        self.db
-            .query_row(
-                "SELECT iana_tz, updated_at_secs
-                 FROM peer_timezone
-                 WHERE sender_pubkey_hex = ?1",
-                params![sender_pubkey_hex],
-                |row| {
-                    Ok(CachedPeerTimezone {
-                        zone: row.get(0)?,
-                        updated_at_secs: row.get::<_, i64>(1)? as u64,
-                    })
-                },
-            )
-            .optional()
-            .map_err(|e| crate::Error::Storage(format!("index timezone read: {e}")))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -830,23 +910,23 @@ mod tests {
 
         let idx = ConversationIndex::open(&path, key).unwrap();
         assert!(idx
-            .upsert_peer_timezone("abc123", "America/New_York", 200)
+            .upsert_peer_timezone("abc123", "g1", "America/New_York", 200)
             .unwrap());
         assert!(!idx
-            .upsert_peer_timezone("abc123", "Europe/Zurich", 199)
+            .upsert_peer_timezone("abc123", "g1", "Europe/Zurich", 199)
             .unwrap());
         assert!(!idx
-            .upsert_peer_timezone("abc123", "Europe/Zurich", 200)
+            .upsert_peer_timezone("abc123", "g1", "Europe/Zurich", 200)
             .unwrap());
         // Same zone, newer timestamp: stored, but not a visible change.
         assert!(!idx
-            .upsert_peer_timezone("abc123", "America/New_York", 250)
+            .upsert_peer_timezone("abc123", "g1", "America/New_York", 250)
             .unwrap());
         assert!(!idx
-            .upsert_peer_timezone("abc123", "Europe/Zurich", 240)
+            .upsert_peer_timezone("abc123", "g1", "Europe/Zurich", 240)
             .unwrap());
         assert_eq!(
-            idx.peer_timezone("abc123").unwrap(),
+            idx.peer_timezone("abc123", "g1").unwrap(),
             Some(CachedPeerTimezone {
                 zone: "America/New_York".into(),
                 updated_at_secs: 250,
@@ -856,11 +936,51 @@ mod tests {
         drop(idx);
         let reopened = ConversationIndex::open(&path, key).unwrap();
         assert_eq!(
-            reopened.peer_timezone("abc123").unwrap(),
+            reopened.peer_timezone("abc123", "g1").unwrap(),
             Some(CachedPeerTimezone {
                 zone: "America/New_York".into(),
                 updated_at_secs: 250,
             })
+        );
+    }
+
+    #[test]
+    fn revoke_tombstone_is_per_group_and_blocks_older_replays() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        assert!(idx.upsert_peer_timezone("alice", "dm", "Asia/Tokyo", 100).unwrap());
+        assert!(idx.upsert_peer_timezone("alice", "grp", "Asia/Tokyo", 100).unwrap());
+
+        // Alice stops sharing in the DM only.
+        assert!(idx.upsert_peer_timezone("alice", "dm", "", 200).unwrap());
+        assert_eq!(idx.peer_timezone("alice", "dm").unwrap(), None);
+        assert_eq!(
+            idx.peer_timezone("alice", "grp").unwrap().map(|c| c.zone),
+            Some("Asia/Tokyo".into()),
+            "a revoke in one chat must not erase the zone shared in another"
+        );
+
+        // An older share replayed after the revoke stays hidden.
+        assert!(!idx.upsert_peer_timezone("alice", "dm", "Asia/Tokyo", 150).unwrap());
+        assert_eq!(idx.peer_timezone("alice", "dm").unwrap(), None);
+        // A repeated revoke is not a visible change.
+        assert!(!idx.upsert_peer_timezone("alice", "dm", "", 210).unwrap());
+
+        // Sharing again later shows it again.
+        assert!(idx.upsert_peer_timezone("alice", "dm", "Europe/Rome", 300).unwrap());
+        let live = idx
+            .peer_timezones_in_groups(&["dm".to_owned(), "grp".to_owned(), "none".to_owned()])
+            .unwrap();
+        let mut seen: Vec<(String, String, String)> = live
+            .into_iter()
+            .map(|(sender, group, cached)| (sender, group, cached.zone))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("alice".into(), "dm".into(), "Europe/Rome".into()),
+                ("alice".into(), "grp".into(), "Asia/Tokyo".into()),
+            ]
         );
     }
 
@@ -885,30 +1005,62 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v3_schema_adding_timezone_share_sent_table() {
+    fn migrates_v4_schema_to_per_group_peer_timezones() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
         let key = [0x66u8; 32];
         {
-            // A database written by an earlier build of this branch: v3,
-            // peer_timezone present, no sent-share table.
-            let idx = ConversationIndex::open(&path, key).unwrap();
-            idx.db
-                .execute_batch(
-                    "DROP TABLE timezone_share_sent;
-                     UPDATE schema_version SET version = 3;",
-                )
+            // A database written by the #607 build: v4, per-sender
+            // peer_timezone, a sent-share record.
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
                 .unwrap();
-            idx.upsert_peer_timezone("peer", "Asia/Kolkata", 9).unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    latest_content TEXT NOT NULL DEFAULT '',
+                    latest_sender TEXT NOT NULL DEFAULT '',
+                    latest_at_secs INTEGER NOT NULL DEFAULT 0,
+                    latest_mine INTEGER NOT NULL DEFAULT 0,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE peer_timezone (
+                    sender_pubkey_hex TEXT PRIMARY KEY,
+                    iana_tz TEXT NOT NULL,
+                    updated_at_secs INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO peer_timezone VALUES ('peer', 'Asia/Kolkata', 9);
+                 CREATE TABLE timezone_share_sent (
+                    group_id_hex TEXT PRIMARY KEY,
+                    iana_tz TEXT NOT NULL,
+                    epoch INTEGER NOT NULL
+                 );
+                 INSERT INTO timezone_share_sent VALUES ('g', 'Asia/Kolkata', 1);
+                 INSERT INTO schema_version(version) VALUES (4);",
+            )
+            .unwrap();
         }
 
         let idx = ConversationIndex::open(&path, key).unwrap();
-        idx.record_timezone_share_sent("g", "Asia/Kolkata", 1).unwrap();
-        assert_eq!(idx.timezone_shares_sent().unwrap().len(), 1);
-        assert_eq!(
-            idx.peer_timezone("peer").unwrap().unwrap().zone,
-            "Asia/Kolkata"
+        assert!(
+            idx.timezone_shares_sent().unwrap().is_empty(),
+            "sent-share records reset so every sharer re-sends into the new table"
         );
+        let old_table: i64 = idx
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'peer_timezone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_table, 0);
+        assert!(idx.upsert_peer_timezone("peer", "g", "Asia/Kolkata", 10).unwrap());
     }
 
     #[test]
@@ -941,10 +1093,10 @@ mod tests {
 
         let idx = ConversationIndex::open(&path, key).unwrap();
         assert!(idx
-            .upsert_peer_timezone("peer", "Pacific/Chatham", 42)
+            .upsert_peer_timezone("peer", "g", "Pacific/Chatham", 42)
             .unwrap());
         assert_eq!(
-            idx.peer_timezone("peer").unwrap().unwrap().zone,
+            idx.peer_timezone("peer", "g").unwrap().unwrap().zone,
             "Pacific/Chatham"
         );
     }

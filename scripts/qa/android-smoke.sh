@@ -126,6 +126,28 @@ privacy_note() {
   "$UI" dump 2>/dev/null | awk -F'\t' '$3 ~ /^(Sharing |Off for this chat|Off — follows)/ {print $3; exit}'
 }
 
+# toggle_checked <label> — "true"/"false" for the switch row whose subtree
+# carries <label>; empty when no checkable node holds it (not a switch).
+toggle_checked() {
+  adb -s "$QA_SERIAL" shell uiautomator dump /sdcard/qa-ui.xml >/dev/null 2>&1
+  adb -s "$QA_SERIAL" exec-out cat /sdcard/qa-ui.xml 2>/dev/null | python3 -c '
+import sys, xml.etree.ElementTree as ET
+label = sys.argv[1]
+try:
+    root = ET.fromstring(sys.stdin.read())
+except ET.ParseError:
+    sys.exit(0)
+for n in root.iter("node"):
+    if n.get("checkable") == "true" and any(label in (d.get("text") or "") for d in n.iter("node")):
+        print(n.get("checked"))
+        break' "$1"
+}
+
+# The DM header's peer clock ("10:27 AM · 12h 30m ahead"), if shown.
+header_clock() {
+  "$UI" dump 2>/dev/null | awk -F'\t' 'NR <= 6 && $3 ~ /[0-9]:[0-9][0-9].* · .*(ahead|behind)$/ {print $3; exit}'
+}
+
 settings_share_row() {
   go_home || return 1
   ui tapx "Settings"; sleep 2
@@ -335,6 +357,13 @@ qa043() { # no unlabelled interactive node on the main screens (A9/A21/A22/A28)
   sweep start-chat "Start a chat" 1.5
   sweep nearby "Nearby" 2
   sweep settings "Settings" 1.5
+  # Settings toggles are switches that report on/off (#607 QA). Read-only
+  # here: QA-093 flips "Share local time" and checks the state follows.
+  if settings_share_row; then
+    [[ -n "$(toggle_checked "Share local time")" ]] || bad+=("settings:Share local time is not a switch")
+  else
+    bad+=("settings:Share local time row not reached")
+  fi
   if [[ -n "${A_NPUB:-}" ]]; then
     go_home >/dev/null
     # The row previews the chat's LATEST message: QA-002's reply after it ran.
@@ -419,6 +448,44 @@ qa072() { # a peer's zone paints the DM header, with no bubble or unread (#607)
   fi
 }
 
+qa093() { # turning sharing off withdraws your time; a peer's revoke clears the header (#607)
+  [[ "${QA070_OFF:-}" == 1 ]] || { record QA-093 SKIP "needs QA-070's off default"; return; }
+  local zone st title t
+  zone="$(adb -s "$QA_SERIAL" shell getprop persist.sys.timezone | tr -d '\r')"
+  settings_share_row || { record QA-093 FAIL "no Share local time row in Settings"; return; }
+  ui tapx "Share local time"; sleep 1
+  st="$(toggle_checked "Share local time")"
+  if [[ "$st" != true ]]; then
+    record QA-093 FAIL "the switch did not report on after the tap (got '${st:-not a switch}')"; return
+  fi
+  if ! "$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$zone" 60 >/dev/null 2>&1; then
+    settings_share_row && ui tapx "Share local time"
+    record QA-093 FAIL "the peer never got $zone after turning sharing on"; return
+  fi
+  settings_share_row && ui tapx "Share local time"; sleep 1
+  st="$(toggle_checked "Share local time")"
+  if [[ "$st" != false ]]; then
+    record QA-093 FAIL "the switch did not report off after the second tap (got '${st:-not a switch}')"; return
+  fi
+  if ! "$PEERS" expect-no-tz "a-$RUN" "$APP_NPUB" 60 >/dev/null 2>&1; then
+    record QA-093 FAIL "turning sharing off did not withdraw $zone from the peer"; return
+  fi
+  # Receive side: QA-072's peer revokes; the app's header must drop its clock.
+  title="$(short_npub "$A_NPUB")"
+  open_chat_row "$title" || { record QA-093 FAIL "could not open QA-001's chat"; return; }
+  [[ -n "$(header_clock)" ]] || { record QA-093 SKIP "no peer clock before the revoke (needs QA-072)"; return; }
+  "$PEERS" revoke-tz "a-$RUN" "$APP_NPUB" >/dev/null 2>&1 ||
+    { record QA-093 FAIL "the peer could not revoke"; return; }
+  for t in $(seq 1 20); do [[ -z "$(header_clock)" ]] && break; sleep 2; done
+  if [[ -n "$(header_clock)" ]]; then
+    record QA-093 FAIL "the header kept the peer's clock after the peer revoked"
+  elif has "Unread messages"; then
+    record QA-093 FAIL "the revoke left an unread divider"
+  else
+    record QA-093 PASS "off withdrew $zone from the peer; the peer's revoke cleared the header"
+  fi
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -432,7 +499,7 @@ go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
 # Order matters: QA-002 reuses QA-001's chat, QA-005 opens QA-004's, and
 # QA-040 inspects the chat QA-005 left open.
-for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa050; do
+for s in qa001 qa002 qa003 qa004 qa005 qa040 qa007 qa041 qa043 qa070 qa071 qa072 qa093 qa050; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

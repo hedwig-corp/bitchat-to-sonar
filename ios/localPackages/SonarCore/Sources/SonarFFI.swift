@@ -1693,9 +1693,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
 
     /**
-     * Batch local-only cache lookup for visible DM/group members.
+     * Local-only batch read of the zones members shared into these MLS
+     * groups (hex). Look a zone up by the chat's own group: a person can
+     * share in one chat and not another.
      */
-    func peerTimezones(memberPubkeys: [String]) throws  -> [PeerTimezoneInfo]
+    func peerTimezones(groupIdHexes: [String]) throws  -> [PeerTimezoneInfo]
 
     /**
      * Pending multi-member group invites awaiting accept/decline.
@@ -1816,6 +1818,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * republish on the next connect.
      */
     func retryOutbox() throws
+
+    /**
+     * Withdraw this device's zone from these MLS groups (hex) when the user
+     * turns sharing off for them. Only groups that received a share get a
+     * revoke. Never call it for the transient empty allowlist of startup.
+     */
+    func revokeTimezoneShare(groupIdHexes: [String]) throws
 
     /**
      * Send an account-level direct NIP-17 DM to a plain bitchat peer. The
@@ -2638,13 +2647,15 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
 }
 
     /**
-     * Batch local-only cache lookup for visible DM/group members.
+     * Local-only batch read of the zones members shared into these MLS
+     * groups (hex). Look a zone up by the chat's own group: a person can
+     * share in one chat and not another.
      */
-open func peerTimezones(memberPubkeys: [String])throws  -> [PeerTimezoneInfo]  {
+open func peerTimezones(groupIdHexes: [String])throws  -> [PeerTimezoneInfo]  {
     return try  FfiConverterSequenceTypePeerTimezoneInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_peer_timezones(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceString.lower(memberPubkeys),$0
+        FfiConverterSequenceString.lower(groupIdHexes),$0
     )
 })
 }
@@ -2885,6 +2896,19 @@ open func retryMessage(messageIdHex: String)throws  -> String  {
 open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_retry_outbox(
             self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
+     * Withdraw this device's zone from these MLS groups (hex) when the user
+     * turns sharing off for them. Only groups that received a share get a
+     * revoke. Never call it for the transient empty allowlist of startup.
+     */
+open func revokeTimezoneShare(groupIdHexes: [String])throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_revoke_timezone_share(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(groupIdHexes),$0
     )
 }
 }
@@ -5266,17 +5290,25 @@ public func FfiConverterTypeNoiseKeypairHex_lower(_ value: NoiseKeypairHex) -> R
 
 
 /**
- * A peer's locally cached, privately shared IANA timezone.
+ * A peer's locally cached, privately shared IANA timezone in one group.
  */
 public struct PeerTimezoneInfo: Equatable, Hashable {
     public var senderNpub: String
+    /**
+     * MLS group the zone was shared into; sharing is per chat.
+     */
+    public var groupIdHex: String
     public var ianaTimezone: String
     public var updatedAtSecs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(senderNpub: String, ianaTimezone: String, updatedAtSecs: UInt64) {
+    public init(senderNpub: String,
+        /**
+         * MLS group the zone was shared into; sharing is per chat.
+         */groupIdHex: String, ianaTimezone: String, updatedAtSecs: UInt64) {
         self.senderNpub = senderNpub
+        self.groupIdHex = groupIdHex
         self.ianaTimezone = ianaTimezone
         self.updatedAtSecs = updatedAtSecs
     }
@@ -5298,6 +5330,7 @@ public struct FfiConverterTypePeerTimezoneInfo: FfiConverterRustBuffer {
         return
             try PeerTimezoneInfo(
                 senderNpub: FfiConverterString.read(from: &buf),
+                groupIdHex: FfiConverterString.read(from: &buf),
                 ianaTimezone: FfiConverterString.read(from: &buf),
                 updatedAtSecs: FfiConverterUInt64.read(from: &buf)
         )
@@ -5305,6 +5338,7 @@ public struct FfiConverterTypePeerTimezoneInfo: FfiConverterRustBuffer {
 
     public static func write(_ value: PeerTimezoneInfo, into buf: inout [UInt8]) {
         FfiConverterString.write(value.senderNpub, into: &buf)
+        FfiConverterString.write(value.groupIdHex, into: &buf)
         FfiConverterString.write(value.ianaTimezone, into: &buf)
         FfiConverterUInt64.write(value.updatedAtSecs, into: &buf)
     }
@@ -9533,7 +9567,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_peer_timezones() != 26725) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_peer_timezones() != 64590) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_group_invites() != 31608) {
@@ -9588,6 +9622,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 21048) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_revoke_timezone_share() != 27420) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_direct_dm() != 59899) {

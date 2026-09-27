@@ -132,14 +132,20 @@ if [[ -z "$UDID" ]]; then
 fi
 xcrun simctl bootstatus "$UDID" -b >/dev/null
 
-APP="$QA_HOME/DerivedData/Build/Products/Debug-iphonesimulator/Sonar.app"
+# DerivedData lives OUTSIDE $TMPDIR. macOS purges $TMPDIR files it thinks are
+# older than three days every night (~03:35), and an unpacked SwiftPM binary
+# artifact keeps its archive's old timestamps, so the purge deleted
+# breez_sdk_liquidFFI.xcframework/Info.plist and every next build failed with
+# "There is no Info.plist found" (#607 follow-up QA, twice). Per worktree.
+DERIVED="${QA_DERIVED_DATA:-$HOME/Library/Developer/Xcode/DerivedData/sonar-qa-$(basename "$ROOT")}"
+APP="$DERIVED/Build/Products/Debug-iphonesimulator/Sonar.app"
 if (( BUILD )); then
   echo ">> building signed Debug for $UDID" >&2
   set -o pipefail
   key_args=()
   [[ -n "$KEY_XCCONFIG" ]] && key_args=(-xcconfig "$KEY_XCCONFIG")
   if ! xcodebuild build -project "$ROOT/ios/bitchat.xcodeproj" -scheme "bitchat (iOS)" \
-      -configuration Debug -destination "id=$UDID" -derivedDataPath "$QA_HOME/DerivedData" \
+      -configuration Debug -destination "id=$UDID" -derivedDataPath "$DERIVED" \
       ARCHS=arm64 ONLY_ACTIVE_ARCH=YES EXCLUDED_ARCHS=x86_64 -allowProvisioningUpdates \
       ${key_args[@]+"${key_args[@]}"} > "$QA_HOME/ios-build.log" 2>&1; then
     grep -E "error:" "$QA_HOME/ios-build.log" | head -20 >&2

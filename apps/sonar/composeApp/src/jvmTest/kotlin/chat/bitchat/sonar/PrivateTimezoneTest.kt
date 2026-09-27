@@ -65,6 +65,29 @@ class PrivateTimezoneTest {
     }
 
     @Test
+    fun onlyGroupsThatStoppedSharingAreRevoked() {
+        assertEquals(listOf("b"), revokedTimezoneGroups(listOf("a", "b", "b"), listOf("a", "c")))
+        assertEquals(emptyList(), revokedTimezoneGroups(emptyList(), listOf("a")))
+        assertEquals(listOf("a"), revokedTimezoneGroups(listOf("a"), emptyList()))
+    }
+
+    @Test
+    fun peerZonesStayPerGroup() {
+        // Ana shares in the DM but revoked in the group: the group must not
+        // show the DM's zone, and lookups never fall back across chats.
+        val index = indexPeerTimezonesByGroup(
+            listOf(
+                SonarPeerTimezone("npub1ana", "AABB", "Asia/Tokyo", 10),
+                SonarPeerTimezone("npub1bo", "ccdd", "Europe/Rome", 11),
+            ),
+            canonical = { it.removePrefix("npub1") },
+        )
+        assertEquals("Asia/Tokyo", index["aabb"]?.get("ana")?.ianaIdentifier)
+        assertNull(index["ccdd"]?.get("ana"))
+        assertEquals("Europe/Rome", index["ccdd"]?.get("bo")?.ianaIdentifier)
+    }
+
+    @Test
     fun perChatOverrideBlobRoundtrips() {
         val encoded = encodeTimezoneShareMap(mapOf("abc" to true, "def" to false))
         assertEquals(mapOf("abc" to true, "def" to false), decodeTimezoneShareMap(encoded))

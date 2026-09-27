@@ -11,7 +11,7 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 | `scripts/qa/ios-setup.sh` | creates/boots a named QA simulator, signed Debug build, install, log stream (`chat.bitchat` + `sh.hedwig.sonar` subsystems) |
 | `scripts/qa/ios-share-smoke.sh` | iOS share sheet end to end (Files, Photos, a stand-in third-party app) → picker → peer; asserts name/MIME/sha256 on the recipient. Traps: scripts/qa/README.md |
 | `scripts/qa/android-ui.sh` | adb/uiautomator driver: `dump`, `tapx`/`tapt`, `wait`, `ime`, `shot` |
-| `scripts/qa/peers.sh` | fresh `sonar-cli` peers: `new`, `send`, `send-image`, `listen`, `expect` |
+| `scripts/qa/peers.sh` | fresh `sonar-cli` peers: `new`, `send`, `send-image`, `listen`, `expect`, `accept`/`groups`, timezone `share-tz`/`expect-tz`/`tz`/`revoke-tz`/`expect-no-tz` |
 | `scripts/qa/android-smoke.sh` | scripted registry scenarios on Android; exit status = failures |
 | `scripts/qa/idle-cpu.sh` | average CPU of the app over a window (Android `/proc`, iOS host `ps`) |
 | iOS Simulator MCP | `attach` first, then `tap`/`text`/`swipe`/`screenshot` in **points** |
@@ -45,6 +45,13 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 
 ## iOS traps
 
+- **Never keep DerivedData under `$TMPDIR`:** macOS purges it nightly by
+  timestamp, and unpacked SwiftPM binary artifacts keep their archive's old
+  mtimes, so the Breez xcframework's `Info.plist` vanishes and the next build
+  fails with "There is no Info.plist found". `ios-setup.sh` builds under
+  `~/Library/Developer/Xcode/DerivedData/sonar-qa-<worktree>` (override with
+  `QA_DERIVED_DATA`); pass the same outside-`$TMPDIR` path to any manual
+  `xcodebuild test -derivedDataPath`.
 - **Build signed, not with `scripts/bench/build-sim.sh`:** the unsigned bench
   build has no App Group, so the Marmot store never opens.
 - **Rust core:** `ios-setup.sh` needs `sonarffi.xcframework` built from this
@@ -75,8 +82,12 @@ the 2026-09-23 iOS (#615) and Android (#616) passes.
 
 ## Peers (`sonar-cli`)
 
-- Only **1:1 welcomes auto-join**; multi-member group invites stay pending,
-  so group delivery cannot be verified with CLI peers (group support: #547).
+- Only **1:1 welcomes auto-join**; a multi-member group invite stays pending
+  until `peers.sh accept <name>` (then `peers.sh groups <name>` lists it).
+- `peers.sh` rebuilds `core/target/release/sonar-cli` when any `core/` source
+  is newer than the binary. Before that check, a binary built hours earlier ran
+  the peers on old protocol code without a word; if you point `SONAR_CLI`
+  elsewhere, keeping it current is on you.
 - The default Blossom server (`push.sonar.hedwig.sh`) took **~36 s** for a
   33 KB upload on 2026-09-23 from both the app and the CLI; `nostr.download`
   took 6 s. Report upload time separately; do not file it as an app bug.

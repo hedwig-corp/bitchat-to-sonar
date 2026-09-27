@@ -166,8 +166,6 @@ struct ChatViewModelPresenceHandlingTests {
 
         viewModel.switchLocationChannel(to: .location(GeohashChannel(level: .city, geohash: geohash)))
 
-        let initialMessageCount = viewModel.messages.count
-
         // Create a presence event (kind 20001)
         let identity = try NostrIdentity.generate()
         let event = NostrEvent(
@@ -183,8 +181,11 @@ struct ChatViewModelPresenceHandlingTests {
 
         try? await Task.sleep(nanoseconds: 50_000_000)
 
-        // Message count should NOT increase
-        #expect(viewModel.messages.count == initialMessageCount)
+        // The presence event must not become a timeline row. Asserting on its
+        // id, not on the message count: switchLocationChannel appends its own
+        // system rows asynchronously, so a count taken right after it raced
+        // them (1 → 4) and failed on every run.
+        #expect(!viewModel.messages.contains { $0.id == signed.id })
     }
 
     @Test func handleNostrEvent_chatMessageUpdatesParticipant() async throws {

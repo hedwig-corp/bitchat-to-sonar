@@ -129,6 +129,17 @@ enum TimezoneAction {
         #[arg(long, default_value_t = 5)]
         settle_secs: u64,
     },
+    /// Withdraw this agent's zone from the 1:1 chat (--to) or a group (--group).
+    Revoke {
+        #[arg(long, conflicts_with = "group", required_unless_present = "group")]
+        to: Option<String>,
+        #[arg(long)]
+        group: Option<String>,
+        /// Keep the process alive this long so the background outbox publish
+        /// reaches the relays before exit.
+        #[arg(long, default_value_t = 5)]
+        settle_secs: u64,
+    },
     /// Sync, then print the zone each group member last shared with us.
     Show {
         /// Only print this member (npub1... or hex).
@@ -139,8 +150,11 @@ enum TimezoneAction {
         #[arg(long, default_value_t = 0)]
         wait_secs: u64,
         /// Only accept this exact zone for --from.
-        #[arg(long, requires = "from")]
+        #[arg(long, requires = "from", conflicts_with = "absent")]
         zone: Option<String>,
+        /// Succeed once --from has NO zone (never shared, or revoked).
+        #[arg(long, requires = "from")]
+        absent: bool,
     },
 }
 
@@ -375,8 +389,12 @@ enum Output {
     },
     PeerTimezone {
         sender: String,
+        group_id: String,
         zone: String,
         updated_at_secs: u64,
+    },
+    TimezoneRevoked {
+        group_id: String,
     },
     Message {
         group_id: String,
@@ -738,15 +756,7 @@ async fn timezone(loaded: LoadedConfig, action: TimezoneAction) -> Result<()> {
                 .transpose()?;
             let client = loaded.connect().await?;
             client.sync().await?;
-            let group_id = match (peer, group) {
-                (Some(peer), _) => find_dm_group(&client, peer)?.ok_or_else(|| {
-                    CliError::Message(
-                        "no 1:1 group with that peer yet; send a message first".into(),
-                    )
-                })?,
-                (None, Some(group)) => parse_group_id_hex(&group)?,
-                (None, None) => unreachable!("clap requires --to or --group"),
-            };
+            let group_id = resolve_share_group(&client, peer, group)?;
             let group_hex = hex::encode(group_id.as_slice());
             client.set_timezone_share_groups(vec![group_hex.clone()]).await;
             client.update_local_timezone(&zone).await?;
@@ -757,10 +767,30 @@ async fn timezone(loaded: LoadedConfig, action: TimezoneAction) -> Result<()> {
                 zone: zone.trim().to_owned(),
             })
         }
+        TimezoneAction::Revoke {
+            to,
+            group,
+            settle_secs,
+        } => {
+            let peer = to
+                .map(|to| {
+                    PublicKey::parse(&to)
+                        .map_err(|e| CliError::Message(format!("recipient pubkey: {e}")))
+                })
+                .transpose()?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = resolve_share_group(&client, peer, group)?;
+            let group_hex = hex::encode(group_id.as_slice());
+            client.revoke_timezone_share(vec![group_hex.clone()]).await;
+            tokio::time::sleep(Duration::from_secs(settle_secs)).await;
+            print_json(&Output::TimezoneRevoked { group_id: group_hex })
+        }
         TimezoneAction::Show {
             from,
             wait_secs,
             zone,
+            absent,
         } => {
             let from = from
                 .map(|f| {
@@ -773,27 +803,27 @@ async fn timezone(loaded: LoadedConfig, action: TimezoneAction) -> Result<()> {
             loop {
                 client.sync().await?;
                 client.drain_pending_marmot().await?;
-                let me = client.identity().public_key();
-                let mut members = BTreeSet::new();
-                for group in client.groups()? {
-                    members.extend(client.members(&group.mls_group_id)?);
-                }
-                members.remove(&me);
+                let groups: Vec<String> = client
+                    .groups()?
+                    .into_iter()
+                    .map(|g| hex::encode(g.mls_group_id.as_slice()))
+                    .collect();
+                let mut cached = client.peer_timezones(&groups);
                 if let Some(from) = from {
-                    members.retain(|m| *m == from);
+                    cached.retain(|(sender, _, _)| *sender == from);
                 }
-                let members: Vec<PublicKey> = members.into_iter().collect();
-                let cached = client.peer_timezones(&members);
                 let satisfied = match from {
                     None => true,
+                    Some(_) if absent => cached.is_empty(),
                     Some(_) => cached
                         .iter()
-                        .any(|(_, c)| zone.as_deref().is_none_or(|z| z == c.zone)),
+                        .any(|(_, _, c)| zone.as_deref().is_none_or(|z| z == c.zone)),
                 };
                 if satisfied || start.elapsed() >= Duration::from_secs(wait_secs) {
-                    for (sender, cached) in &cached {
+                    for (sender, group_id, cached) in &cached {
                         print_json(&Output::PeerTimezone {
                             sender: sender.to_bech32().expect("valid public key encodes as npub"),
+                            group_id: group_id.clone(),
                             zone: cached.zone.clone(),
                             updated_at_secs: cached.updated_at_secs,
                         })?;
@@ -1149,6 +1179,22 @@ fn message_output(msg: &sonar_core::marmot::ChatMessage) -> Output {
         created_at_secs: msg.created_at.as_secs(),
         mine: msg.mine,
         media,
+    }
+}
+
+/// The group a `timezone share|revoke` targets: the 1:1 chat with --to, or
+/// the --group hex.
+fn resolve_share_group(
+    client: &SonarClient,
+    peer: Option<PublicKey>,
+    group: Option<String>,
+) -> Result<GroupId> {
+    match (peer, group) {
+        (Some(peer), _) => find_dm_group(client, peer)?.ok_or_else(|| {
+            CliError::Message("no 1:1 group with that peer yet; send a message first".into())
+        }),
+        (None, Some(group)) => parse_group_id_hex(&group),
+        (None, None) => Err(CliError::Message("pass --to or --group".into())),
     }
 }
 
