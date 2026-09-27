@@ -49,6 +49,23 @@ final class MessageStore {
     private let privateDir: URL   // one file per peer: <fingerprint>.json
     private let channelDir: URL   // one file per channel: <channel>.json
     private let io = DispatchQueue(label: "chat.bitchat.sonar.messageStore")
+
+    /// A channel snapshot saved but not yet written, and the queued `io` write
+    /// that owns it. Later saves replace `messages` in place; the owning write
+    /// takes whatever is latest when it runs.
+    private struct PendingChannelSnapshot {
+        let writeID: UInt64
+        var messages: [BitchatMessage]
+    }
+
+    /// Guarded by `pendingLock`, keyed by channel id.
+    private var pendingChannelSnapshots: [String: PendingChannelSnapshot] = [:]
+    private var lastChannelWriteID: UInt64 = 0
+    private let pendingLock = NSLock()
+    #if DEBUG
+    /// Channel transcript writes performed by `saveChannel`. Only touched on `io`.
+    private var channelSaveWrites = 0
+    #endif
     private let cap = TransportConfig.privateChatCap
 
     /// Cap stored per channel transcript — matches the in-memory timeline cap
@@ -163,9 +180,16 @@ final class MessageStore {
     }
 
     func appendChannel(_ channelID: String, message: BitchatMessage) {
+        // Take any snapshot still waiting to be written so it lands before this
+        // append, and so a later save queues a fresh write after it instead of
+        // folding into the one queued ahead of us.
+        let pending = takePendingChannelSnapshot(channelID)
         io.async { [weak self] in
             guard let self else { return }
             let url = self.channelFileURL(for: channelID)
+            if let pending {
+                self.writeMessages(self.trimmed(pending, cap: self.channelCap), to: url)
+            }
             var messages = self.readMessages(at: url)
             guard !messages.contains(where: { $0.id == message.id }) else { return }
             messages.append(message)
@@ -175,11 +199,45 @@ final class MessageStore {
 
     /// Mirror an in-memory channel transcript exactly (write-through on a
     /// timeline refresh that may have reordered/deduped).
+    ///
+    /// Coalesced: the view model calls this with the whole transcript on every
+    /// refresh, so a burst of N messages used to queue N full JSON rewrites of
+    /// up to `channelCap` rows. Each snapshot supersedes the last, so only the
+    /// latest one is written. The backlog mattered beyond disk time:
+    /// `loadChannel` is synchronous on the caller's thread — the main thread,
+    /// on every channel switch — and waited behind all of it. 1,342 sends held
+    /// the main thread for 9 s in the unit suite.
     func saveChannel(_ channelID: String, messages: [BitchatMessage]) {
-        io.async { [weak self] in
-            guard let self else { return }
-            self.writeMessages(self.trimmed(messages, cap: self.channelCap), to: self.channelFileURL(for: channelID))
+        pendingLock.lock()
+        if pendingChannelSnapshots[channelID] != nil {
+            pendingChannelSnapshots[channelID]?.messages = messages
+            pendingLock.unlock()
+            return
         }
+        lastChannelWriteID &+= 1
+        let writeID = lastChannelWriteID
+        pendingChannelSnapshots[channelID] = PendingChannelSnapshot(writeID: writeID, messages: messages)
+        pendingLock.unlock()
+        io.async { [weak self] in
+            guard let self,
+                  let latest = self.takePendingChannelSnapshot(channelID, ownedBy: writeID) else { return }
+            #if DEBUG
+            self.channelSaveWrites += 1
+            #endif
+            self.writeMessages(self.trimmed(latest, cap: self.channelCap), to: self.channelFileURL(for: channelID))
+        }
+    }
+
+    /// Remove and return the channel's unwritten snapshot. A queued write
+    /// passes its own id so it never takes a snapshot that `appendChannel`
+    /// already claimed and a later save re-queued behind the append.
+    private func takePendingChannelSnapshot(_ channelID: String, ownedBy writeID: UInt64? = nil) -> [BitchatMessage]? {
+        pendingLock.lock()
+        defer { pendingLock.unlock() }
+        guard let pending = pendingChannelSnapshots[channelID],
+              writeID == nil || pending.writeID == writeID else { return nil }
+        pendingChannelSnapshots[channelID] = nil
+        return pending.messages
     }
 
     // MARK: - ⚡PAY ledger (generic Codable blob)
@@ -303,3 +361,15 @@ final class MessageStore {
         Data(id.utf8).sha256Fingerprint()
     }
 }
+
+#if DEBUG
+extension MessageStore {
+    /// Hold queued disk work until `_test_resumeIO()`, so a test can queue a
+    /// burst deterministically.
+    func _test_suspendIO() { io.suspend() }
+    func _test_resumeIO() { io.resume() }
+
+    /// Channel transcript writes `saveChannel` has performed.
+    var _test_channelSaveWrites: Int { io.sync { channelSaveWrites } }
+}
+#endif

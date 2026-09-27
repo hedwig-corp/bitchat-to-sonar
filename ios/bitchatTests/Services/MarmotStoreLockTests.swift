@@ -14,17 +14,14 @@ struct MarmotStoreLockTests {
 
     @Test func tryAcquireFailsWhileExclusiveHeld() throws {
         #if os(iOS)
-        // Uses the real App Group when available (simulator/device entitlements).
-        // If the group container is missing in this test host, skip.
-        guard MarmotStoreLock.lockFileURL(createDirectory: true) != nil else {
-            return
-        }
-        let first = try MarmotStoreLock.acquireExclusive()
+        let group = IsolatedAppGroup()
+        defer { group.remove() }
+        let first = try MarmotStoreLock.acquireExclusive(fileManager: group)
         defer { first.release() }
-        #expect(MarmotStoreLock.tryAcquireExclusive() == nil)
+        #expect(MarmotStoreLock.tryAcquireExclusive(fileManager: group) == nil)
         // Same-process second blocking acquire would hang — callers must reuse.
         first.release()
-        let second = MarmotStoreLock.tryAcquireExclusive()
+        let second = MarmotStoreLock.tryAcquireExclusive(fileManager: group)
         #expect(second != nil)
         second?.release()
         #endif
@@ -68,21 +65,39 @@ struct MarmotStoreLockTests {
     @Test("release lets NSE tryAcquire succeed — background suspend contract")
     func releaseUnblocksNseTryAcquire() throws {
         #if os(iOS)
-        guard MarmotStoreLock.lockFileURL(createDirectory: true) != nil else {
-            return
-        }
-        let held = try MarmotStoreLock.acquireExclusive()
-        #expect(MarmotStoreLock.tryAcquireExclusive() == nil)
-        if case .busy = MarmotStoreLock.tryAcquireExclusiveResult() {
+        let group = IsolatedAppGroup()
+        defer { group.remove() }
+        let held = try MarmotStoreLock.acquireExclusive(fileManager: group)
+        #expect(MarmotStoreLock.tryAcquireExclusive(fileManager: group) == nil)
+        if case .busy = MarmotStoreLock.tryAcquireExclusiveResult(fileManager: group) {
             // expected
         } else {
             Issue.record("expected .busy while exclusive held")
         }
         // App background path: closeNode → release. NSE must then hydrate.
         held.release()
-        let nse = MarmotStoreLock.tryAcquireExclusive()
+        let nse = MarmotStoreLock.tryAcquireExclusive(fileManager: group)
         #expect(nse != nil)
         nse?.release()
         #endif
+    }
+}
+
+/// An App Group container of the test's own. These tests take the exclusive
+/// lock, and the suite runs in parallel: on the one real App Group lock file,
+/// one test's hold made the other's "released, so NSE can acquire" check fail
+/// (`releaseUnblocksNseTryAcquire` and `tryAcquireFailsWhileExclusiveHeld`
+/// each failed this way on main). Only `containerURL` is redirected; the lock
+/// file keeps its real name and directory layout under it.
+private final class IsolatedAppGroup: FileManager {
+    private let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MarmotStoreLockTests-\(UUID().uuidString)", isDirectory: true)
+
+    override func containerURL(forSecurityApplicationGroupIdentifier groupIdentifier: String) -> URL? {
+        root
+    }
+
+    func remove() {
+        try? FileManager.default.removeItem(at: root)
     }
 }

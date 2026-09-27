@@ -140,3 +140,27 @@ enum TestError: Error {
 func sleep(_ seconds: TimeInterval) async throws {
     try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
 }
+
+extension MessageStore {
+    /// A store no other test can see. `ChatViewModel` writes each visible
+    /// channel through to its store and re-hydrates on every channel switch —
+    /// including the ones a global Tor or location event triggers — so view
+    /// models sharing `.shared` picked up each other's transcripts mid-test
+    /// (the Tor and presence tests saw another test's "Queued system" and
+    /// "tor restarting…" rows) and wrote into the host app's real history.
+    static func isolatedForTest() -> MessageStore {
+        _ = clearedTestRoot
+        return MessageStore(directoryName: "\(testRoot)/\(UUID().uuidString)")
+    }
+
+    private static let testRoot = "SonarTests-Messages"
+
+    /// Last run's stores, removed once per process before the first new one.
+    private static let clearedTestRoot: Void = {
+        guard let support = try? FileManager.default.url(
+            for: .applicationSupportDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: false
+        ) else { return }
+        try? FileManager.default.removeItem(at: support.appendingPathComponent(testRoot, isDirectory: true))
+    }()
+}

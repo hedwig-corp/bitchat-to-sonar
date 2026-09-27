@@ -160,6 +160,34 @@ final class MessageStoreTests: XCTestCase {
         XCTAssertEqual(store.loadChannel("mesh").map(\.content), ["a", "b"])
     }
 
+    /// The view model saves the whole transcript on every refresh; a burst
+    /// must cost one write of the newest snapshot, not one rewrite per save
+    /// (the backlog stalled the main thread on the next `loadChannel`).
+    func testChannelSaveBurstWritesOnlyTheLatestSnapshot() {
+        store._test_suspendIO()
+        var transcript: [BitchatMessage] = []
+        for i in 1...50 {
+            transcript.append(message(content: "m\(i)"))
+            store.saveChannel("mesh", messages: transcript)
+        }
+        store._test_resumeIO()
+
+        XCTAssertEqual(store.loadChannel("mesh").map(\.content), transcript.map(\.content))
+        XCTAssertEqual(store._test_channelSaveWrites, 1)
+    }
+
+    /// An append between two saves keeps its place: the second save must not
+    /// fold into the write queued before the append.
+    func testSaveAppendSaveKeepsCallOrder() {
+        store._test_suspendIO()
+        store.saveChannel("mesh", messages: [message(content: "a")])
+        store.appendChannel("mesh", message: message(content: "b"))
+        store.saveChannel("mesh", messages: [message(content: "c")])
+        store._test_resumeIO()
+
+        XCTAssertEqual(store.loadChannel("mesh").map(\.content), ["c"])
+    }
+
     func testChannelSurvivesNewStoreInstance() {
         store.appendChannel("mesh", message: message(content: "still here"))
         flush()

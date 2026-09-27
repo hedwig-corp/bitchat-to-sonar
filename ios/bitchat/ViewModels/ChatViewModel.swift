@@ -161,6 +161,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     let commandProcessor: CommandProcessor
     let messageRouter: MessageRouter
     let privateChatManager: PrivateChatManager
+    /// On-disk chat history: channel transcripts here, private chats through
+    /// `privateChatManager`. `.shared` in the app; tests pass their own so
+    /// parallel view models never read each other's transcripts.
+    let messageStore: MessageStore
     let unifiedPeerService: UnifiedPeerService
     let autocompleteService: AutocompleteService
     let deduplicationService: MessageDeduplicationService  // internal for test access
@@ -410,12 +414,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         keychain: KeychainManagerProtocol,
         idBridge: NostrIdentityBridge,
         identityManager: SecureIdentityStateManagerProtocol,
-        transport: Transport
+        transport: Transport,
+        messageStore: MessageStore = .shared
     ) {
         self.keychain = keychain
         self.idBridge = idBridge
         self.identityManager = identityManager
         self.meshService = transport
+        self.messageStore = messageStore
         self.publicMessagePipeline = PublicMessagePipeline()
         
         // Load persisted read receipts
@@ -429,7 +435,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         
         // Initialize services
         self.commandProcessor = CommandProcessor(identityManager: identityManager)
-        self.privateChatManager = PrivateChatManager(meshService: meshService)
+        self.privateChatManager = PrivateChatManager(meshService: meshService, store: messageStore)
         self.unifiedPeerService = UnifiedPeerService(meshService: meshService, idBridge: idBridge, identityManager: identityManager)
         let nostrTransport = NostrTransport(keychain: keychain, idBridge: idBridge)
         nostrTransport.senderPeerID = meshService.myPeerID
@@ -1957,7 +1963,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         privateChatManager.unreadMessages.removeAll()
         // Erase the on-disk message store: persisted mesh DMs and channel
         // transcripts are local-only on-device, so they must go too.
-        MessageStore.shared.wipeAll()
+        messageStore.wipeAll()
         objectWillChange.send()
     }
 
@@ -1976,7 +1982,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         for key in toRemove {
             privateChatManager.privateChats.removeValue(forKey: key)
             privateChatManager.unreadMessages.remove(key)
-            MessageStore.shared.deletePrivate(peerID: key)
+            messageStore.deletePrivate(peerID: key)
         }
         if let sel = selectedPrivateChatPeer, toRemove.contains(sel) {
             endPrivateChat()
@@ -1997,7 +2003,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
 
         // Erase the on-disk message store: persisted mesh DMs and channel
         // transcripts MUST be wiped on panic (they are local-only on-device).
-        MessageStore.shared.wipeAll()
+        messageStore.wipeAll()
 
         // Delete all keychain data (including Noise and Nostr keys)
         _ = keychain.deleteAllKeychainData()
@@ -2693,7 +2699,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         messages = timelineStore.messages(for: target)
         // Write-through: persist the visible channel transcript so public /
         // geohash history survives an app restart. Local-only on-device store.
-        MessageStore.shared.saveChannel(target.storeID, messages: messages)
+        messageStore.saveChannel(target.storeID, messages: messages)
     }
 
     /// Merge a channel's persisted transcript (from MessageStore) back into the
@@ -2701,7 +2707,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     /// Existing messages are deduped by id inside the timeline store.
     @MainActor
     func hydrateChannelFromStore(_ channel: ChannelID) {
-        let stored = MessageStore.shared.loadChannel(channel.storeID)
+        let stored = messageStore.loadChannel(channel.storeID)
         guard !stored.isEmpty else { return }
         switch channel {
         case .mesh:
