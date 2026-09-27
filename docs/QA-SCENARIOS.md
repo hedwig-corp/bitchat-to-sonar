@@ -936,15 +936,26 @@ real mint and need the maintainer's approval of the amounts.
   checked only against the balance.
 
 ### QA-126 — A nearby Unify send shows its amount and fee before paying
-- **Platforms:** both (manual: needs a Unify Wallet receiver in Bluetooth
-  range, or a second Sonar advertising as one; unit tests stand in for the
-  radio with a served URI).
-- **Steps:** Radar → a Unify peer → **Send sats**. Once with a receiver that
-  serves an amountless offer: type an amount and wait for "Network fee: up to
-  N sats". Once with a receiver whose request names an amount (a `bitcoin:`
-  URI with `amount=`, or a BOLT11 invoice with an amount). With the fake mint,
-  raise the fee between the quote and Send (`mint-proxy.py arm
-  inflate-melt-fee 40`).
+- **Platforms:** both.
+  - iOS simulator (no Bluetooth there): launch the DEBUG build with
+    `-sonar.debug.unifyPeer "<name>|<request>"`. That puts a synthetic Unify
+    receiver on the radar serving `<request>`, and stands in for the Bluetooth
+    read only. Add `-sonar.debug.cashuMintURL` to pay a local fake mint, and
+    `-sonar.debug.route nearby` to open the radar. The ios-drive launch
+    arguments split on spaces, so keep `<name>` to one word.
+  - Android: needs a real Unify Wallet receiver, or a second Sonar advertising
+    as one, and a funded wallet. There is no Android mint override, so a live
+    run moves real sats; the unit tests stand in for the radio with a served
+    URI.
+- **Steps:** Radar → the Unify peer → **Send money**. Run it with four
+  requests:
+  - one that names its amount (`bitcoin:?lightning=<lnbc invoice>`): check the
+    confirm step, then tap Send;
+  - the same, tapping **Cancel**;
+  - the same again, but raise the fee between the quote and Send
+    (`mint-proxy.py arm inflate-melt-fee 40`), then reopen the sheet;
+  - an amountless offer (a bare `lno1…`): type an amount, wait for "Network
+    fee: up to N sats", then Send.
 - **Expect:** nothing is paid when the sheet opens. The fee line shows before
   Send, and Send waits while "Checking the fee…" shows. A request that names
   its amount shows that amount with no keypad (iOS adds Cancel); for a BOLT11

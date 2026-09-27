@@ -2670,6 +2670,16 @@ final class SonarAppStore: ObservableObject {
             .contains(where: { defaults.string(forKey: $0) != nil }) {
             writeDebugReport("init onboarded=\(onboarded) sendMarmot=\(defaults.string(forKey: "sonar.debug.sendMarmot") ?? "nil") sendMeshDM=\(defaults.string(forKey: "sonar.debug.sendMeshDM") ?? "nil")")
         }
+        // QA hook (QA-126): `-sonar.debug.unifyPeer "<name>|<request>"` puts a
+        // synthetic Unify receiver on the radar that serves `<request>` (a
+        // `bitcoin:` URI or a bare `lno1`/`lnbc` string). It stands in for the
+        // Bluetooth read only, so the Unify pay sheet (fee line, confirm step,
+        // fee ceiling, the send itself) runs on a simulator, which has no
+        // Bluetooth. With `-sonar.debug.cashuMintURL` it pays a local fake mint.
+        if let raw = defaults.string(forKey: "sonar.debug.unifyPeer"),
+           let sep = raw.firstIndex(of: "|") {
+            debugUnifyPeer = (String(raw[..<sep]), String(raw[raw.index(after: sep)...]))
+        }
         // Smoke-test hook: `simctl launch <sim> <bundle> -sonar.debug.route
         // settings` lands in the argument domain (volatile, this launch
         // only) and deep-opens a screen for screenshot verification.
@@ -5834,6 +5844,15 @@ final class SonarAppStore: ObservableObject {
                 avatarSeed: peer.id
             ))
         }
+        #if DEBUG
+        if let debug = debugUnifyPeer {
+            items.append(SNPeerItem(
+                id: Self.unifyIDPrefix + Self.debugUnifyPeerID, name: debug.name, inRange: true, bars: 3,
+                hint: "Unify", detail: "Unify \u{00B7} pay only",
+                angle: 45, r: 150, unify: true, avatarSeed: Self.debugUnifyPeerID
+            ))
+        }
+        #endif
         return items
     }
 
@@ -10686,6 +10705,13 @@ final class SonarAppStore: ObservableObject {
     /// (tests; nil = the radio).
     var unifyPaymentURIReader: ((String) async throws -> String)?
 
+    #if DEBUG
+    /// QA hook (QA-126): a synthetic Unify receiver from
+    /// `-sonar.debug.unifyPeer "<name>|<request>"`. See the init.
+    var debugUnifyPeer: (name: String, uri: String)?
+    static let debugUnifyPeerID = "debug-peer"
+    #endif
+
     /// The sheet phase for a request read from a Unify receiver. A BOLT11
     /// invoice speaks for its own amount (the URI's `amount` does not
     /// override it, as when scanning); an amountless invoice cannot be paid.
@@ -10719,7 +10745,9 @@ final class SonarAppStore: ObservableObject {
             guard let self else { return }
             do {
                 let uri: String
-                if let read = self.unifyPaymentURIReader {
+                if let debugURI = self.debugUnifyURI(for: unifyId) {
+                    uri = debugURI
+                } else if let read = self.unifyPaymentURIReader {
                     uri = try await read(unifyId)
                 } else {
                     uri = try await self.unify.fetchPaymentURI(unifyId)
@@ -10734,6 +10762,15 @@ final class SonarAppStore: ObservableObject {
                 self.unifyPay = (id, .failed(msg))
             }
         }
+    }
+
+    /// The synthetic QA receiver's request (DEBUG builds only), or nil.
+    private func debugUnifyURI(for unifyId: String) -> String? {
+        #if DEBUG
+        return unifyId == Self.debugUnifyPeerID ? debugUnifyPeer?.uri : nil
+        #else
+        return nil
+        #endif
     }
 
     /// The user tapped Send on the Unify sheet (keypad or confirm).
