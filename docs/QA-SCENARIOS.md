@@ -936,6 +936,23 @@ real mint and need the maintainer's approval of the amounts.
   discarded quote and Send re-prepared and paid whatever the new reserve was,
   checked only against the balance.
 
+## Core test stability
+
+### QA-125 — Account-backup unit tests are stable under parallel runs
+- **Platforms:** core (both apps ship it)
+- **Steps:** `scripts/qa/core-flake-check.sh --runs 20`: `sonar-core`'s lib
+  suite 20 times each with default threads, `--test-threads 64` and
+  `--test-threads 1`.
+- **Expect:** 0 failed runs in every mode.
+- **Guard:** `a_fresh_process_for_one_account_leaves_another_seal_in_flight`
+- **Origin:** #614 QA. Two account-backup tests failed once in a workspace run
+  on a loaded Mac and passed on rerun. A test simulating a fresh process
+  cleared the whole process-wide policy cache; running in parallel, that
+  dropped other tests' in-flight seal fingerprints between their seal and
+  `record_backup_success`, so their next identical seal was not skipped. At
+  `--test-threads 64`, 9 of 40 runs of the backup tests failed, across five
+  tests. The clock was not involved: the unchanged-backup window is 7 days.
+
 ## Open questions (need a product decision, not a fix)
 
 - **Data usage (A24):** "Wi-Fi only" is stored but nothing reads it on either
