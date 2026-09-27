@@ -930,11 +930,39 @@ real mint and need the maintainer's approval of the amounts.
   `CashuWalletServiceTests.testADestinationPaymentAboveTheConsentedFeeFailsAndTryAgainPaysTheNewFee`,
   `CashuWalletUXTests.testTheConsentedCeilingIsTheFeeOnScreen`,
   `SonarPaymentStatusTests.testAFeeChangeIsStatedOnlyOnAFailedPayment`
-- **Not covered:** the Unify nearby sheet shows no fee (its offer is read over
-  BLE after Send), so a Unify send has no ceiling on either platform.
+- **Not covered here:** Unify nearby sends, see QA-126.
 - **Origin:** #614 maintainer review — the sheet's "up to N" came from a
   discarded quote and Send re-prepared and paid whatever the new reserve was,
   checked only against the balance.
+
+### QA-126 — A nearby Unify send shows its amount and fee before paying
+- **Platforms:** both (manual: needs a Unify Wallet receiver in Bluetooth
+  range, or a second Sonar advertising as one; unit tests stand in for the
+  radio with a served URI).
+- **Steps:** Radar → a Unify peer → **Send sats**. Once with a receiver that
+  serves an amountless offer: type an amount and wait for "Network fee: up to
+  N sats". Once with a receiver whose request names an amount (a `bitcoin:`
+  URI with `amount=`, or a BOLT11 invoice with an amount). With the fake mint,
+  raise the fee between the quote and Send (`mint-proxy.py arm
+  inflate-melt-fee 40`).
+- **Expect:** nothing is paid when the sheet opens. The fee line shows before
+  Send, and Send waits while "Checking the fee…" shows. A request that names
+  its amount shows that amount with no keypad (iOS adds Cancel); for a BOLT11
+  invoice, the invoice's own amount. An invoice without an amount is refused
+  ("This invoice has no amount…") before any keypad. A higher fee at Send is
+  refused with nothing sent ("The network fee is now up to M sats…"), and the
+  reopened sheet shows M.
+- **Guard:** `CashuWalletServiceTests.testAUnifyRequestThatNamesItsAmountIsPaidOnlyAfterConfirming`,
+  `CashuWalletServiceTests.testAUnifySendAboveTheFeeOnScreenIsRefusedWithTheNewFee`,
+  `CashuWalletServiceTests.testAUnifyRequestIsShownWithTheAmountThatWillBePaid`,
+  `WalletAppStateTest.aUnifyRequestThatNamesItsAmountIsPaidOnlyOnSendAtTheFeeShown`,
+  `WalletAppStateTest.aUnifySendAboveTheFeeOnScreenIsRefusedWithTheNewFee`,
+  `WalletAppStateTest.aUnifyRequestIsShownWithTheAmountThatWillBePaid`
+- **Origin:** #614 known gap. The Unify sheet showed no fee and passed no
+  ceiling, because the receiver's request was read over BLE only after Send.
+  iOS also paid a request that named its amount the moment it was read, with
+  the amount never on screen; Compose ignored that amount and paid the typed
+  one.
 
 ## Core test stability
 

@@ -768,7 +768,9 @@ struct SNWalletSetupSheetContent: View {
 /// The "Send sats" sheet for a Unify Wallet user discovered over Bluetooth.
 /// Unlike the ⚡PAY sealed-coin chat flow, this is a direct Lightning send to
 /// the receiver's served BOLT12/BOLT11 destination. The sheet walks the phases
-/// the store drives: fetching → (amount keypad | direct pay) → sent / failed.
+/// the store drives: fetching → (amount keypad | confirm the request's own
+/// amount) → sent / failed. Both show the fee before Send, and the fee on
+/// screen is the most the send pays.
 struct UnifyPaySheetView: View {
     let peerName: String
     let phase: SonarAppStore.UnifyPayPhase
@@ -778,8 +780,12 @@ struct UnifyPaySheetView: View {
     let fiatText: (Int64) -> String?
     /// See `SNPaySheet.usesFeeInclusiveMax`.
     var usesFeeInclusiveMax: Bool = false
-    /// `feeFromAmount` is true for an untouched fee-inclusive `Max`.
-    let onConfirmAmount: (_ destination: String, _ sats: Int64, _ feeFromAmount: Bool) -> Void
+    /// The fee quote for paying a destination (the store's
+    /// `feeQuoter(destination:)`); nil shows no fee line.
+    var feeQuoter: ((_ destination: String) -> SNFeeQuoter?)? = nil
+    /// `feeFromAmount` is true for an untouched fee-inclusive `Max`;
+    /// `maxFeeSats` is the fee on screen at the tap.
+    let onConfirmAmount: (_ destination: String, _ sats: Int64, _ feeFromAmount: Bool, _ maxFeeSats: Int64?) -> Void
     let onClose: () -> Void
 
     var body: some View {
@@ -796,7 +802,21 @@ struct UnifyPaySheetView: View {
                 money: money,
                 fiatText: fiatText,
                 usesFeeInclusiveMax: usesFeeInclusiveMax,
-                onSend: { sats, feeFromAmount in onConfirmAmount(destination, sats, feeFromAmount) }
+                quoteFee: feeQuoter?(destination),
+                onSend: { sats, feeFromAmount, maxFee in
+                    onConfirmAmount(destination, sats, feeFromAmount, maxFee)
+                }
+            )
+        case .confirm(let destination, let sats):
+            UnifyAmountKeypad(
+                peerName: peerName,
+                balance: balance,
+                money: money,
+                fiatText: fiatText,
+                fixedSats: sats,
+                quoteFee: feeQuoter?(destination),
+                onSend: { sats, _, maxFee in onConfirmAmount(destination, sats, false, maxFee) },
+                onCancel: onClose
             )
         case .paying(_, let sats):
             status(icon: .bolt, tint: SonarTheme.goldDeep,
@@ -849,23 +869,49 @@ struct UnifyPaySheetView: View {
 }
 
 /// Amount keypad for an amountless Unify offer (mirrors SNPaySheet's pad, but
-/// always sends "over Lightning" — Unify payments are never mesh ecash).
+/// always sends "over Lightning" — Unify payments are never mesh ecash). With
+/// `fixedSats` it is the confirm step for a request that names its amount: no
+/// keypad, the amount and the fee, Send and Cancel.
 private struct UnifyAmountKeypad: View {
     let peerName: String
     let balance: Int64
     let money: (Int64) -> String
     let fiatText: (Int64) -> String?
     var usesFeeInclusiveMax: Bool = false
-    /// `feeFromAmount` is true for an untouched fee-inclusive `Max`.
-    let onSend: (_ sats: Int64, _ feeFromAmount: Bool) -> Void
+    /// The request's own amount; nil shows the keypad.
+    var fixedSats: Int64? = nil
+    /// See `SNPaySheet.quoteFee`: the fee shown is the most the send pays.
+    var quoteFee: SNFeeQuoter? = nil
+    /// `feeFromAmount` is true for an untouched fee-inclusive `Max`;
+    /// `maxFeeSats` is the fee on screen at the tap
+    /// (`SNFeeQuote.consentedCeiling`).
+    let onSend: (_ sats: Int64, _ feeFromAmount: Bool, _ maxFeeSats: Int64?) -> Void
+    /// Back out without paying (the confirm step).
+    var onCancel: (() -> Void)? = nil
 
     @State private var v = ""
     @State private var maxSelected = false
+    @State private var feeState: SNFeeQuote.State = .hidden
 
-    private var sats: Int64 { Int64(v) ?? 0 }
+    private var sats: Int64 { fixedSats ?? (Int64(v) ?? 0) }
+    /// See `SNPaySheet.hasAmount`.
+    private var hasAmount: Bool { fixedSats != nil || !v.isEmpty }
     // See SNPaySheet.over (#141).
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
+    /// See `SNPaySheet.sendable`: Send waits while the fee is checking.
+    private var sendable: Bool {
+        can && !SNFeeQuote.blocksSend(feeState, hasQuoter: quoteFee != nil)
+    }
+    /// See `SNPaySheet.quoteSats`.
+    private var quoteSats: Int64 { (quoteFee != nil && can) ? sats : 0 }
+
+    private func send() {
+        guard sendable else { return }
+        // The fee on screen at the tap is the consent.
+        let maxFee = SNFeeQuote.consentedCeiling(feeState, hasQuoter: quoteFee != nil)
+        onSend(sats, maxSelected && fixedSats == nil, maxFee)
+    }
     /// See `SNPaySheet.maxAmount`.
     private var maxAmount: Int64 {
         usesFeeInclusiveMax
@@ -896,7 +942,7 @@ private struct UnifyAmountKeypad: View {
 
             VStack(spacing: 0) {
                 HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    Text(verbatim: v.isEmpty ? "0" : snPayFmt(sats))
+                    Text(verbatim: hasAmount ? snPayFmt(sats) : "0")
                         .font(SonarTheme.uiFont(size: 42, weight: .heavy))
                         .kerning(-42 * 0.02)
                         .foregroundColor(over ? SonarTheme.danger : SonarTheme.text)
@@ -912,71 +958,89 @@ private struct UnifyAmountKeypad: View {
             }
             .padding(EdgeInsets(top: 8, leading: 0, bottom: 2, trailing: 0))
 
-            HStack(spacing: 8) {
-                ForEach(chips, id: \.self) { c in
-                    Button { v = String(c); maxSelected = false } label: {
-                        Text(verbatim: snPayFmt(c))
-                            .font(SonarTheme.uiFont(size: 13, weight: .bold))
-                            .foregroundColor(SonarTheme.goldDeep)
-                            .padding(.vertical, 7)
-                            .padding(.horizontal, 14)
-                            .background(Capsule().fill(SonarTheme.goldSoft))
-                    }
-                    .buttonStyle(SNScaleStyle(scale: 0.95))
-                }
-                // "Max" = everything that can actually settle. Same policy as
-                // the main pay sheet — see SNPaySheet.maxAmount.
-                if maxAmount > 0 {
-                    Button {
-                        v = String(maxAmount)
-                        maxSelected = usesFeeInclusiveMax
-                    } label: {
-                        Text(verbatim: "Max")
-                            .font(SonarTheme.uiFont(size: 13, weight: .bold))
-                            .foregroundColor(SonarTheme.onGold)
-                            .padding(.vertical, 7)
-                            .padding(.horizontal, 16)
-                            .background(Capsule().fill(SonarTheme.goldFill))
-                    }
-                    .buttonStyle(SNScaleStyle(scale: 0.95))
-                }
-            }
-            .padding(EdgeInsets(top: 10, leading: 0, bottom: 2, trailing: 0))
-
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
-                ForEach(keys, id: \.self) { k in
-                    Button { tap(k) } label: {
-                        Group {
-                            if k == "del" {
-                                SNIcon(name: .back, size: 18, weight: 2.2)
-                            } else {
-                                Text(verbatim: k).font(SonarTheme.uiFont(size: 21, weight: .semibold))
-                            }
+            if fixedSats == nil {
+                HStack(spacing: 8) {
+                    ForEach(chips, id: \.self) { c in
+                        Button { v = String(c); maxSelected = false } label: {
+                            Text(verbatim: snPayFmt(c))
+                                .font(SonarTheme.uiFont(size: 13, weight: .bold))
+                                .foregroundColor(SonarTheme.goldDeep)
+                                .padding(.vertical, 7)
+                                .padding(.horizontal, 14)
+                                .background(Capsule().fill(SonarTheme.goldSoft))
                         }
-                        .foregroundColor(SonarTheme.text)
-                        .frame(maxWidth: .infinity)
-                        .padding(12)
-                        .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .buttonStyle(SNScaleStyle(scale: 0.95))
                     }
-                    .buttonStyle(SNRowPressStyle(cornerRadius: 12))
-                    .accessibilityLabel(k == "del" ? "Delete" : k)
+                    // "Max" = everything that can actually settle. Same policy as
+                    // the main pay sheet — see SNPaySheet.maxAmount.
+                    if maxAmount > 0 {
+                        Button {
+                            v = String(maxAmount)
+                            maxSelected = usesFeeInclusiveMax
+                        } label: {
+                            Text(verbatim: "Max")
+                                .font(SonarTheme.uiFont(size: 13, weight: .bold))
+                                .foregroundColor(SonarTheme.onGold)
+                                .padding(.vertical, 7)
+                                .padding(.horizontal, 16)
+                                .background(Capsule().fill(SonarTheme.goldFill))
+                        }
+                        .buttonStyle(SNScaleStyle(scale: 0.95))
+                    }
                 }
+                .padding(EdgeInsets(top: 10, leading: 0, bottom: 2, trailing: 0))
+
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
+                    ForEach(keys, id: \.self) { k in
+                        Button { tap(k) } label: {
+                            Group {
+                                if k == "del" {
+                                    SNIcon(name: .back, size: 18, weight: 2.2)
+                                } else {
+                                    Text(verbatim: k).font(SonarTheme.uiFont(size: 21, weight: .semibold))
+                                }
+                            }
+                            .foregroundColor(SonarTheme.text)
+                            .frame(maxWidth: .infinity)
+                            .padding(12)
+                            .contentShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                        .buttonStyle(SNRowPressStyle(cornerRadius: 12))
+                        .accessibilityLabel(k == "del" ? "Delete" : k)
+                    }
+                }
+                .padding(EdgeInsets(top: 8, leading: 18, bottom: 2, trailing: 18))
             }
-            .padding(EdgeInsets(top: 8, leading: 18, bottom: 2, trailing: 18))
 
             VStack(spacing: 6) {
-                SNPrimaryButton(label: "Send over the internet", net: true, disabled: !can) {
-                    guard can else { return }
-                    onSend(sats, maxSelected)
+                // See SNPaySheet: the space is kept while a quoter exists so
+                // the button never jumps.
+                if quoteFee != nil {
+                    Text(verbatim: SNFeeQuote.sheetLine(feeState) ?? " ")
+                        .font(SonarTheme.uiFont(size: 12.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text2)
+                        .frame(maxWidth: .infinity, minHeight: 17)
+                        .accessibilityHidden(feeState == .hidden)
                 }
+                SNPrimaryButton(label: "Send over the internet", net: true, disabled: !sendable, action: send)
                 Text(verbatim: "Instant over the internet, straight to \(peerName)\u{2019}s wallet.")
                     .font(SonarTheme.uiFont(size: 12))
                     .lineSpacing(12 * 0.5)
                     .foregroundColor(SonarTheme.text3)
                     .multilineTextAlignment(.center)
                     .padding(EdgeInsets(top: 2, leading: 14, bottom: 0, trailing: 14))
+                if let onCancel {
+                    SNGhostButton(label: "Cancel", action: onCancel)
+                }
             }
             .padding(EdgeInsets(top: 6, leading: 8, bottom: 0, trailing: 8))
+        }
+        // See SNPaySheet: re-quote whenever the sendable amount changes.
+        .task(id: quoteSats) {
+            feeState = SNFeeQuote.initialState(sats: quoteSats, quote: quoteFee)
+            if let next = await SNFeeQuote.resolve(sats: quoteSats, quote: quoteFee) {
+                feeState = next
+            }
         }
     }
 }

@@ -125,8 +125,15 @@ struct SonarMacRootView: View {
                     money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
                     usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
-                    onConfirmAmount: { dest, sats, feeFromAmount in
-                        store.confirmUnifyAmount(pay.peerId, destination: dest, sats: sats, feeFromAmount: feeFromAmount)
+                    feeQuoter: { store.feeQuoter(destination: $0) },
+                    onConfirmAmount: { dest, sats, feeFromAmount, maxFee in
+                        store.confirmUnifyAmount(
+                            pay.peerId,
+                            destination: dest,
+                            sats: sats,
+                            feeFromAmount: feeFromAmount,
+                            maxFeeSats: maxFee
+                        )
                     },
                     onClose: { store.dismissUnifyPay() }
                 )
