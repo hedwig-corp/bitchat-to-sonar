@@ -72,6 +72,30 @@ struct SNPeerLocalTimeFormatterTests {
     }
 
     @Test
+    func toggleRowsSpeakTheirState() {
+        #expect(SNSettingsTrail.toggle(true).accessibilityToggleValue == String(localized: "On"))
+        #expect(SNSettingsTrail.toggle(false).accessibilityToggleValue == String(localized: "Off"))
+        #expect(SNSettingsTrail.chevron.accessibilityToggleValue == nil)
+    }
+
+    @Test
+    func onlyGroupsThatStoppedSharingAreRevoked() {
+        #expect(snRevokedTimezoneGroups(before: ["a", "b", "b"], after: ["a", "c"]) == ["b"])
+        #expect(snRevokedTimezoneGroups(before: [], after: ["a"]).isEmpty)
+        #expect(snRevokedTimezoneGroups(before: ["a"], after: []) == ["a"])
+    }
+
+    @Test
+    func peerZonesStayPerGroup() {
+        let ana = "npub1" + String(repeating: "q", count: 58)
+        let index = snIndexPeerTimezonesByGroup([
+            MarmotService.PeerTimezone(senderNpub: ana, groupId: "AABB", ianaIdentifier: "Asia/Tokyo", updatedAt: Date()),
+        ])
+        #expect(index["aabb"]?[SNMarmotProfileCache.canonicalKey(ana)]?.ianaIdentifier == "Asia/Tokyo")
+        #expect(index["ccdd"] == nil, "a zone shared in one chat never shows in another")
+    }
+
+    @Test
     func mixedOffsetUsesCompactDesignCopy() {
         let utc = TimeZone(identifier: "UTC")!
         let display = SNPeerLocalTimeFormatter.display(

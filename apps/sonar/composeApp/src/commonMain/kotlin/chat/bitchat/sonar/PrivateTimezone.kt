@@ -80,6 +80,22 @@ internal fun timezoneOffsetParts(minutes: Int): Pair<Int, Int> = minutes / 60 to
 
 internal const val TIMEZONE_SHARE_BLOB_KEY = "timezone.shareByChat"
 
+/** Groups to send a revoke to after an explicit toggle: those that were in the
+ *  share allowlist before and are not after. */
+internal fun revokedTimezoneGroups(before: Collection<String>, after: Collection<String>): List<String> {
+    val keep = after.toSet()
+    return before.filter { it !in keep }.distinct()
+}
+
+/** Group hex → canonical sender → zone. A person can share in one chat and not
+ *  another, so lookups always name the chat's group. */
+internal fun indexPeerTimezonesByGroup(
+    zones: List<SonarPeerTimezone>,
+    canonical: (String) -> String,
+): Map<String, Map<String, SonarPeerTimezone>> =
+    zones.groupBy { it.groupIdHex.lowercase() }
+        .mapValues { (_, inGroup) -> inGroup.associateBy { canonical(it.senderNpub) } }
+
 /** Contact-profile note under *Share local time*. "Off" has two causes and
  *  they read differently: this chat's own override, or the Settings default.
  *  Mirrors iOS `snShareLocalTimeNote`. */

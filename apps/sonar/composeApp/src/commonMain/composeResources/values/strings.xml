@@ -262,7 +262,9 @@
     <string name="nobody_in_bluetooth_range_right_now">Nobody in Bluetooth range right now.</string>
     <string name="nsec">nsec</string>
     <string name="nsec1">nsec1...</string>
+    <string name="off">Off</string>
     <string name="offline">Offline</string>
+    <string name="on">On</string>
     <string name="online">Online</string>
     <string name="out_of_range_still_reachable">Out of range? Still reachable</string>
     <string name="paste_a_friend_s_npub_above_or_have">Paste a friend's npub above — or have them message yours from White Noise.</string>

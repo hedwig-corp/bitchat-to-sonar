@@ -25,6 +25,18 @@ func snNormalizeStickerPackCoordinate(_ coordinate: String) -> String {
     return "\(parts[0]):\(parts[1].lowercased()):\(parts[2])"
 }
 
+/// Group id → canonical npub → zone. Sharing is per chat: a person can share
+/// in one conversation and not another, so lookups always name the group.
+func snIndexPeerTimezonesByGroup(
+    _ zones: [MarmotService.PeerTimezone]
+) -> [String: [String: MarmotService.PeerTimezone]] {
+    var index: [String: [String: MarmotService.PeerTimezone]] = [:]
+    for zone in zones {
+        index[zone.groupId.lowercased(), default: [:]][SNMarmotProfileCache.canonicalKey(zone.senderNpub)] = zone
+    }
+    return index
+}
+
 enum SNMarmotProfileCache {
     static let defaultsKey = "marmot.profilesByNpub.v1"
     private static let cacheLimit = 4_096
@@ -425,7 +437,9 @@ final class MarmotChatModel: ObservableObject {
     @Published var groups: [MarmotService.MarmotGroup] = []
     /// Core-owned private timezone cache, hydrated from the local encrypted
     /// index with group metadata. No relay/profile lookup is involved.
-    @Published private(set) var peerTimezonesByNpub: [String: MarmotService.PeerTimezone] = [:]
+    /// Group id → canonical npub → zone that member shared into that group.
+    /// Sharing is per chat, so every lookup names the group.
+    @Published private(set) var peerTimezonesByGroup: [String: [String: MarmotService.PeerTimezone]] = [:]
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
     private var directChatSetupTasks: [String: (token: UUID, task: Task<String?, Never>)] = [:]
@@ -2862,18 +2876,32 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private func refreshPeerTimezones(for groups: [MarmotService.MarmotGroup]) async {
-        let members = groups.flatMap(\.memberNpubs).filter { $0 != npub }
-        let cached = await service.peerTimezones(memberNpubs: members)
-        self.peerTimezonesByNpub = Dictionary(
-            cached.map { (SNMarmotProfileCache.canonicalKey($0.senderNpub), $0) },
-            uniquingKeysWith: { current, _ in current }
-        )
+        let cached = await service.peerTimezones(groupIds: groups.map(\.id))
+        self.peerTimezonesByGroup = snIndexPeerTimezonesByGroup(cached)
     }
 
-    /// Accepts npub or 64-hex: group members arrive as npub, but the
-    /// Noise↔Nostr link of a folded mesh chat can hold either form.
-    func peerTimezone(for npub: String) -> MarmotService.PeerTimezone? {
-        peerTimezonesByNpub[SNMarmotProfileCache.canonicalKey(npub)]
+    /// A member's zone as shared into `groupId`. Accepts npub or 64-hex.
+    func peerTimezone(for npub: String, inGroup groupId: String) -> MarmotService.PeerTimezone? {
+        peerTimezonesByGroup[groupId.lowercased()]?[SNMarmotProfileCache.canonicalKey(npub)]
+    }
+
+    /// The zone a DM peer shared into our 1:1 group with them — for a folded
+    /// mesh chat that only knows the peer's npub (npub or 64-hex).
+    func peerTimezone(forDirectPeer npub: String) -> MarmotService.PeerTimezone? {
+        let peer = SNMarmotProfileCache.canonicalKey(npub)
+        guard let me = self.npub.map(SNMarmotProfileCache.canonicalKey) else { return nil }
+        for group in groups where group.memberNpubs.count == 2 {
+            let keys = Set(group.memberNpubs.map(SNMarmotProfileCache.canonicalKey))
+            if keys == [me, peer], let zone = peerTimezone(for: peer, inGroup: group.id) {
+                return zone
+            }
+        }
+        return nil
+    }
+
+    /// After an explicit toggle-off: tell those groups' members to drop our zone.
+    func revokeLocalTimezoneShare(groupIds: [String]) async {
+        await service.revokeTimezoneShare(groupIds)
     }
 
     /// Called for NSSystemTimeZoneDidChange and foreground reconciliation
@@ -5188,7 +5216,7 @@ final class MarmotChatModel: ObservableObject {
         relayConnected = false
         npub = nil
         groups = []
-        peerTimezonesByNpub = [:]
+        peerTimezonesByGroup = [:]
         pendingGroupInvites = []
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]

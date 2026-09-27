@@ -2,6 +2,8 @@ package chat.bitchat.sonar
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.runBlocking
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertNull
@@ -20,13 +22,22 @@ import kotlin.test.assertTrue
  */
 class ShareQueueOrderTest {
 
+    // SonarAppState starts background work on this scope (chat refresh, then a
+    // snapshot write into DesktopEnv). Join it before the test root goes away:
+    // left running, that write failed in whichever test ran next, as an
+    // UncaughtExceptionsBeforeTest in an unrelated runTest.
+    private val job = Job()
+
     private fun state(): SonarAppState {
         DesktopEnv.useTestRoot(kotlin.io.path.createTempDirectory("sonar-sharequeue").toFile())
-        return SonarAppState(CoroutineScope(Job()))
+        return SonarAppState(CoroutineScope(job))
     }
 
     @AfterTest
-    fun restore() = DesktopEnv.useTestRoot(null)
+    fun restore() {
+        runBlocking { job.cancelAndJoin() }
+        DesktopEnv.useTestRoot(null)
+    }
 
     private fun share(name: String) = SharedContent(
         text = null,

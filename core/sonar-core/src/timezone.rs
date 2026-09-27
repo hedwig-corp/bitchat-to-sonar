@@ -77,18 +77,42 @@ pub(crate) fn encode_timezone_share_payload(zone: &str) -> crate::Result<String>
     serde_json::to_string(&payload).map_err(crate::Error::from)
 }
 
-/// Parse an incoming kind-449 rumor body into a validated zone identifier.
+/// Body of a kind-449 that withdraws a share: the same v1 envelope with an
+/// empty zone. Receivers drop the sender's zone for the group it arrived in,
+/// so turning sharing off stops showing a clock that would go stale.
+pub(crate) fn encode_timezone_revoke_payload() -> String {
+    serde_json::to_string(&TimezoneSharePayload {
+        v: TIMEZONE_SHARE_VERSION,
+        zone: String::new(),
+    })
+    .expect("a two-field struct serializes")
+}
+
+/// A decoded kind-449 body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TimezoneShare {
+    /// The sender's current IANA zone.
+    Zone(String),
+    /// The sender stopped sharing with this group.
+    Revoked,
+}
+
+/// Parse an incoming kind-449 rumor body.
 ///
 /// Returns `None` (rather than erroring) for anything we cannot safely use — a
 /// malformed body, an unknown version, or an invalid zone — so a bad control
-/// message is simply ignored and never surfaces to the user.
-pub(crate) fn parse_timezone_share_payload(content: &str) -> Option<String> {
+/// message is simply ignored and never surfaces to the user. An empty zone is
+/// the revoke form, not an invalid one.
+pub(crate) fn parse_timezone_share_payload(content: &str) -> Option<TimezoneShare> {
     let payload: TimezoneSharePayload = serde_json::from_str(content).ok()?;
     if payload.v != TIMEZONE_SHARE_VERSION {
         return None;
     }
     let zone = normalize_zone(&payload.zone);
-    is_valid_iana_timezone(&zone).then_some(zone)
+    if zone.is_empty() {
+        return Some(TimezoneShare::Revoked);
+    }
+    is_valid_iana_timezone(&zone).then_some(TimezoneShare::Zone(zone))
 }
 
 /// Trim incidental whitespace a host might pass. IANA identifiers themselves
@@ -199,8 +223,8 @@ mod tests {
     fn encode_roundtrips_through_parse() {
         let json = encode_timezone_share_payload("Europe/Zurich").unwrap();
         assert_eq!(
-            parse_timezone_share_payload(&json).as_deref(),
-            Some("Europe/Zurich")
+            parse_timezone_share_payload(&json),
+            Some(TimezoneShare::Zone("Europe/Zurich".into()))
         );
     }
 
@@ -208,8 +232,8 @@ mod tests {
     fn encode_trims_incidental_whitespace() {
         let json = encode_timezone_share_payload("  America/New_York  ").unwrap();
         assert_eq!(
-            parse_timezone_share_payload(&json).as_deref(),
-            Some("America/New_York")
+            parse_timezone_share_payload(&json),
+            Some(TimezoneShare::Zone("America/New_York".into()))
         );
     }
 
@@ -217,6 +241,18 @@ mod tests {
     fn encode_rejects_invalid_zone() {
         assert!(encode_timezone_share_payload("not a zone!").is_err());
         assert!(encode_timezone_share_payload("").is_err());
+    }
+
+    #[test]
+    fn empty_zone_is_the_revoke_form() {
+        assert_eq!(
+            parse_timezone_share_payload(&encode_timezone_revoke_payload()),
+            Some(TimezoneShare::Revoked)
+        );
+        assert_eq!(
+            parse_timezone_share_payload("{\"v\":1,\"zone\":\"  \"}"),
+            Some(TimezoneShare::Revoked)
+        );
     }
 
     #[test]
