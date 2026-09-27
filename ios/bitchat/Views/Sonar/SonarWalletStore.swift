@@ -4,22 +4,16 @@
 //
 // Wallet abstraction behind the Sonar bitcoin payments UI
 // (docs/SONAR-PAYMENTS.md). The UI binds to `SonarWalletProviding`; the
-// real Lightning wallet (bitchat/Services/WalletBridgeService.swift) is
-// injected into SonarAppStore later — until then the app runs with
-// `UnconfiguredWallet`, which honestly reports "no wallet" everywhere:
-// the Settings row shows a "Set up" affordance, direct sends stay unavailable,
-// and no fiat line is ever rendered
-// from a fake rate.
+// primary wallet is Cashu (`CashuWallet`, backed by the Rust
+// `SonarCashuWallet` through `CashuWalletService`). The old Breez wallet
+// survives only as `LegacyBreezWallet`, held separately by the store while
+// its store exists on the device. `UnconfiguredWallet` honestly reports "no
+// wallet" everywhere and is what tests get by default.
 //
 // Money display (fiat-by-default + bitcoin toggle, currency picker, fiat
-// entry) is layered on top: the wallet exposes the persisted display mode
-// and currency, the supported-currency list, a `hasLiveRate` flag, a single
-// `format(sats:)` that returns the EFFECTIVE money string (fiat only when
-// the mode is fiat AND a live rate exists, otherwise sats), and a
-// `moneyDisplayChanged` publisher the UI re-renders on. See the brainstorm
-// docs/brainstorms/2026-06-12-money-display-fiat-toggle.md (Approach B):
-// the SDK owns conversion/formatting, Swift only renders and (for the
-// honest offline sats fallback) formats sats with grouping.
+// entry) is NOT a wallet concern: see `SonarMoneyDisplay`, which owns the
+// persisted mode/currency and the Yadio rates, so deleting or replacing a
+// wallet never resets the user's currency.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -28,22 +22,21 @@
 import Combine
 import Foundation
 
-/// Lifecycle of the on-device Lightning wallet.
+/// Lifecycle of an on-device wallet.
 enum SonarWalletState: Equatable {
-    /// No wallet exists on this phone yet.
-    ///
-    /// Also used briefly after a transient setup failure / background teardown
-    /// when a Breez key *is* present — do not treat this alone as "keyless
-    /// build". Use `SonarBreezBuildConfig.hasAPIKey` for that.
+    /// No wallet is open: no account yet, or (legacy Breez only) the node is
+    /// down after a transient failure / background teardown.
     case notConfigured
-    /// A wallet is being created / restored / synced.
+    /// Opening, with no balance known yet (not even a cached one).
     case settingUp
-    /// Wallet ready with a spendable balance (sats).
+    /// Open, with a spendable balance (sats). For Cashu this may be the
+    /// per-account cached balance until the mint answers — `connectivity`
+    /// says whether it is live.
     case ready(balanceSats: Int64)
 }
 
-/// Build-time Breez key presence (`Info.plist` ← xcconfig). Independent of
-/// `SonarWalletState`, which also covers transient setup failure.
+/// Build-time Breez key presence (`Info.plist` ← xcconfig). Gates the LEGACY
+/// Breez wallet only; the primary (Cashu) wallet needs no key.
 enum SonarBreezBuildConfig {
     static var hasAPIKey: Bool {
         guard let raw = Bundle.main.object(forInfoDictionaryKey: "BREEZ_API_KEY") as? String else {
@@ -51,6 +44,13 @@ enum SonarBreezBuildConfig {
         }
         return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+}
+
+/// Which wallet a payment is sent from: the primary (Cashu) wallet, or the
+/// legacy Breez wallet while it exists on the device.
+enum SNPaymentSource: Equatable {
+    case primary
+    case legacy
 }
 
 /// A fiat currency the wallet can display amounts in.
@@ -61,10 +61,27 @@ struct SonarCurrency: Equatable, Identifiable {
     var id: String { code }
 }
 
+/// A one-time invoice from `receiveInvoice`. Its payment arrives as an
+/// incoming `SonarWalletPayment` whose `id` equals `paymentId` (nil when the
+/// wallet cannot say), so the Receive sheet can tell THIS invoice was paid.
+struct SonarReceiveInvoice: Equatable, Sendable {
+    let invoice: String
+    let paymentId: String?
+}
+
 /// Wallet payment metadata surfaced to app state after a send settles.
 /// This is intentionally independent from the Breez SDK type so UI code does
 /// not import wallet internals.
 struct SonarWalletPayment: Equatable, Codable, Sendable {
+    /// Where a payment is. `pending` is NOT a failure: a Cashu melt may still
+    /// be routing, and its outcome arrives later as an update with the SAME
+    /// `id`. Never re-send a pending payment — that can pay twice.
+    enum Status: String, Codable, Sendable {
+        case complete
+        case pending
+        case failed
+    }
+
     let id: String
     let amountSats: Int64
     let isIncoming: Bool
@@ -72,6 +89,7 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
     let note: String?
     let feesSats: Int64?
     let preimage: String?
+    let status: Status
 
     init(
         id: String,
@@ -80,7 +98,8 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
         timestamp: Date,
         note: String?,
         feesSats: Int64? = nil,
-        preimage: String? = nil
+        preimage: String? = nil,
+        status: Status = .complete
     ) {
         self.id = id
         self.amountSats = amountSats
@@ -89,7 +108,46 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
         self.note = note
         self.feesSats = feesSats
         self.preimage = preimage
+        self.status = status
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, amountSats, isIncoming, timestamp, note, feesSats, preimage, status
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        amountSats = try c.decode(Int64.self, forKey: .amountSats)
+        isIncoming = try c.decode(Bool.self, forKey: .isIncoming)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        note = try c.decodeIfPresent(String.self, forKey: .note)
+        feesSats = try c.decodeIfPresent(Int64.self, forKey: .feesSats)
+        preimage = try c.decodeIfPresent(String.self, forKey: .preimage)
+        // Rows written before `status` existed were only ever settled sends.
+        status = try c.decodeIfPresent(Status.self, forKey: .status) ?? .complete
+    }
+}
+
+/// Whether the primary wallet can reach its backend right now. Drives the
+/// "mint offline — retrying" copy; never gates first paint.
+enum SonarWalletConnectivity: Equatable {
+    /// No wallet is open (no account yet, or a build without one).
+    case unavailable
+    /// Opening / first connect in flight.
+    case connecting
+    case online
+    /// Last connect failed; a retry is scheduled while foreground.
+    case offline
+}
+
+/// Balance breakdown for the wallet screens. `isLive` is false while the
+/// value is the per-account cache shown until the wallet answers.
+struct SonarWalletBalanceDetail: Equatable {
+    let confirmedSats: Int64
+    let pendingReceiveSats: Int64
+    let pendingSendSats: Int64
+    let isLive: Bool
 }
 
 /// Built once. `NumberFormatter` is expensive to allocate and this is on the
@@ -108,76 +166,137 @@ func sonarGroupedSats(_ sats: Int64) -> String {
     sonarSatsFormatter.string(from: NSNumber(value: sats)) ?? String(sats)
 }
 
-/// Minimal, locale-grouped sats formatting — the ONLY money formatting done
-/// in Swift. Used for the honest offline case (no live rate) where we must
-/// NOT show a fiat conversion. Everything else flows through the SDK.
+/// Minimal, locale-grouped sats formatting. Used for the honest offline case
+/// (no live rate) where we must NOT show a fiat conversion; fiat goes through
+/// `SonarMoneyDisplay`.
 func sonarFormatSats(_ sats: Int64) -> String {
     "\(sonarGroupedSats(sats)) sats"
 }
 
 /// What the payments UI needs from a wallet. Implementations must be safe
 /// to call from the main actor; `send`/`createOffer` may suspend.
+///
+/// Money DISPLAY (fiat/bitcoin mode, currency, rates) is not a wallet concern
+/// any more — it lives in `SonarMoneyDisplay`, so replacing or deleting a
+/// wallet never resets the user's currency.
 protocol SonarWalletProviding: AnyObject {
     var state: SonarWalletState { get }
     var statePublisher: AnyPublisher<SonarWalletState, Never> { get }
 
-    /// Pay `amountSats` to `destination` and return wallet metadata for local
-    /// payment activity.
-    @discardableResult
-    func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment
+    /// Backend reachability ("mint offline — retrying").
+    var connectivity: SonarWalletConnectivity { get }
+    /// Confirmed / pending breakdown; nil until anything is known.
+    var balanceDetail: SonarWalletBalanceDetail? { get }
+    /// Fires when `connectivity` or `balanceDetail` changes.
+    var detailChanged: AnyPublisher<Void, Never> { get }
 
-    /// Create a reusable BOLT12 offer that the counterpart can pay into.
+    /// THE published receive offer, when one is known locally. This is what
+    /// the descriptor, the BIP-353 handle, the Unify receiver and the BLE
+    /// payments capability advertise.
+    var cachedReceiveOffer: String? { get }
+    /// Emits the current offer and every change to it.
+    var receiveOfferPublisher: AnyPublisher<String?, Never> { get }
+
+    /// One custody-disclosure line for Settings, or nil for none.
+    var custodyDescription: String? { get }
+
+    /// Pay `amountSats` to `destination`. `amountSats` 0 lets an invoice speak
+    /// for its own amount. `feeFromAmount` is the `Max` send: the fee comes
+    /// out of `amountSats` instead of on top of it. A returned payment with
+    /// `status == .pending` is in flight, NOT failed; its outcome arrives
+    /// through `paymentUpdates()` with the same id.
+    ///
+    /// `maxFeeSats` is the fee the user agreed to on the send sheet (the
+    /// "up to N" it showed, 0 when it showed none); a wallet that quotes fees
+    /// refuses a higher one with `CashuWalletError.feeChanged` before paying.
+    /// nil = no fee was ever shown for this path. Required on purpose, so
+    /// every caller states it. Wallets without a fee quote (legacy Breez)
+    /// have no sheet fee and are always called with nil.
+    @discardableResult
+    func send(
+        destination: String,
+        amountSats: Int64,
+        note: String?,
+        feeFromAmount: Bool,
+        maxFeeSats: Int64?
+    ) async throws -> SonarWalletPayment
+
+    /// The reusable receive offer (creating it the first time if needed).
     func createOffer() async throws -> String
 
-    /// Incoming wallet payments as the wallet backend observes them. Older
-    /// backends may return an idle stream until they expose settlement events.
-    func incomingPayments() -> AsyncStream<SonarWalletPayment>
+    /// A one-off BOLT11 invoice, with the id its payment will carry.
+    func receiveInvoice(amountSats: Int64, description: String?) async throws -> SonarReceiveInvoice
 
-    // MARK: Money display
+    /// Price a send WITHOUT paying: the most the payment can cost on top of
+    /// `amountSats` (Cashu: the mint's fee reserve from `prepareSend`). Shown
+    /// on the send confirmation sheet only; the quote is discarded and `send`
+    /// prepares again, so a stale quote can never be paid — the fee shown is
+    /// the `maxFeeSats` that send holds the new quote to. `amountSats` 0 lets
+    /// an invoice speak for its own amount. Wallets without a quote throw.
+    func quoteFee(destination: String, amountSats: Int64) async throws -> Int64
 
-    /// Persisted display mode: "bitcoin" or "fiat".
-    var displayMode: String { get }
-    /// Persist a new display mode ("bitcoin"|"fiat").
-    func setDisplayMode(_ mode: String) async
+    /// Every payment update the backend observes, both directions, in order:
+    /// receives, in-flight sends, settlements and failures.
+    func paymentUpdates() -> AsyncStream<SonarWalletPayment>
 
-    /// Persisted display currency (ISO code, e.g. "EUR").
-    var displayCurrency: String { get }
-    /// Persist a new display currency (ISO code).
-    func setDisplayCurrency(_ code: String) async
+    /// Latest update this process saw for `id` (in-memory; no I/O). Lets a
+    /// caller that learns an id AFTER its outcome arrived catch up.
+    func latestPaymentUpdate(id: String) -> SonarWalletPayment?
 
-    /// Fiat currencies the user can pick (4 currencies; [] when unconfigured).
-    func supportedCurrencies() -> [SonarCurrency]
+    /// History lookup for one payment (local store read). nil when unknown.
+    func lookupPayment(id: String) async -> SonarWalletPayment?
 
-    /// True only after a successful rate fetch that returned the selected
-    /// currency. When false, money is shown/entered in SATS — never a fake
-    /// or bundled fiat rate. The fiat entry toggle is disabled while false.
-    var hasLiveRate: Bool { get }
+    /// Open the wallet for the signed-in account. Called after local paint;
+    /// local only, network continues in the background. Idempotent.
+    func start()
 
-    /// The EFFECTIVE money string for `sats`:
-    ///   - fiat (via the SDK formatter) when displayMode == "fiat" AND a live
-    ///     rate exists for the selected currency,
-    ///   - otherwise grouped sats ("12,345 sats").
-    /// NEVER a bundled/fallback fiat conversion.
-    func format(sats: Int64) -> String
+    /// Foreground: connect then sync. Background: disconnect, but never
+    /// under a send in flight.
+    func setForeground(_ foreground: Bool)
 
-    /// Convert typed fiat text to sats at the live rate. Callers must only use
-    /// fiat entry when `hasLiveRate` is true.
-    func parseFiatInput(_ text: String, currencyCode: String) -> Int64
+    /// Account replacement: release this account's wallet WITHOUT deleting
+    /// anything that may hold funds. Throws when that cannot be done safely
+    /// (e.g. a payment is still in flight).
+    func prepareForIdentityReplacement() async throws
 
-    /// Fires when the display mode, currency, or live-rate availability
-    /// changes, so the UI re-renders every amount.
-    var moneyDisplayChanged: AnyPublisher<Void, Never> { get }
+    /// Panic wipe: delete every local trace of this wallet. False when
+    /// something could not be removed.
+    func wipeForEmergency() async -> Bool
 }
 
 extension SonarWalletProviding {
-    /// True when the user prefers fiat AND a live rate makes it honest.
-    var effectiveShowsFiat: Bool {
-        displayMode == "fiat" && hasLiveRate
+    /// A plain send with no fee ceiling — for paths that never show a fee.
+    @discardableResult
+    func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
+        try await send(destination: destination, amountSats: amountSats, note: note, feeFromAmount: false, maxFeeSats: nil)
     }
 
-    func incomingPayments() -> AsyncStream<SonarWalletPayment> {
+    var connectivity: SonarWalletConnectivity { .unavailable }
+    var balanceDetail: SonarWalletBalanceDetail? { nil }
+    var detailChanged: AnyPublisher<Void, Never> { Empty().eraseToAnyPublisher() }
+    var cachedReceiveOffer: String? { nil }
+    var receiveOfferPublisher: AnyPublisher<String?, Never> { Just(nil).eraseToAnyPublisher() }
+    var custodyDescription: String? { nil }
+
+    func receiveInvoice(amountSats: Int64, description: String?) async throws -> SonarReceiveInvoice {
+        throw UnconfiguredWallet.WalletError.notConfigured
+    }
+
+    /// No quote (unconfigured, legacy Breez): the sheet simply shows no fee line.
+    func quoteFee(destination: String, amountSats: Int64) async throws -> Int64 {
+        throw UnconfiguredWallet.WalletError.notConfigured
+    }
+
+    func paymentUpdates() -> AsyncStream<SonarWalletPayment> {
         AsyncStream { continuation in continuation.finish() }
     }
+
+    func latestPaymentUpdate(id: String) -> SonarWalletPayment? { nil }
+    func lookupPayment(id: String) async -> SonarWalletPayment? { nil }
+    func start() {}
+    func setForeground(_ foreground: Bool) {}
+    func prepareForIdentityReplacement() async throws {}
+    func wipeForEmergency() async -> Bool { true }
 }
 
 /// Coalesces receive-offer creation so repeated descriptor refreshes keep
@@ -235,17 +354,16 @@ final class SonarReceiveOfferCache {
 }
 
 /// Default wallet: nothing is configured. Every operation fails loudly so
-/// no flow can pretend money moved. Money is always shown in sats (no rate,
-/// no currencies, fiat entry disabled).
+/// no flow can pretend money moved.
 final class UnconfiguredWallet: SonarWalletProviding {
     enum WalletError: LocalizedError {
         case notConfigured
 
         var errorDescription: String? {
             #if os(macOS)
-            return "Wallet is not configured on this Mac yet."
+            return String(localized: "Wallet is not configured on this Mac yet.")
             #else
-            return "No wallet is set up on this phone yet."
+            return String(localized: "No wallet is set up on this phone yet.")
             #endif
         }
     }
@@ -256,33 +374,17 @@ final class UnconfiguredWallet: SonarWalletProviding {
         Just(.notConfigured).eraseToAnyPublisher()
     }
 
-    func send(destination: String, amountSats: Int64, note: String?) async throws -> SonarWalletPayment {
+    func send(
+        destination: String,
+        amountSats: Int64,
+        note: String?,
+        feeFromAmount: Bool,
+        maxFeeSats: Int64?
+    ) async throws -> SonarWalletPayment {
         throw WalletError.notConfigured
     }
 
     func createOffer() async throws -> String {
         throw WalletError.notConfigured
-    }
-
-    // MARK: Money display (sats-only, no rate)
-
-    var displayMode: String { "bitcoin" }
-    func setDisplayMode(_ mode: String) async {}
-
-    var displayCurrency: String { "USD" }
-    func setDisplayCurrency(_ code: String) async {}
-
-    func supportedCurrencies() -> [SonarCurrency] { [] }
-
-    var hasLiveRate: Bool { false }
-
-    func format(sats: Int64) -> String { sonarFormatSats(sats) }
-
-    func parseFiatInput(_ text: String, currencyCode: String) -> Int64 {
-        Int64(text.filter(\.isNumber)) ?? 0
-    }
-
-    var moneyDisplayChanged: AnyPublisher<Void, Never> {
-        Empty().eraseToAnyPublisher()
     }
 }

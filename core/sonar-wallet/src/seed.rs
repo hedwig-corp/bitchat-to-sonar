@@ -30,6 +30,54 @@ pub fn entropy_hex(secret: &[u8; 32]) -> String {
     hex::encode(wallet_entropy(secret))
 }
 
+/// HKDF info for the Cashu (CDK) wallet seed. A DIFFERENT domain from
+/// [`SEED_INFO`] on purpose: the ecash wallet and the Breez wallet are
+/// separate funds domains, and sharing key material across custody models
+/// would let a compromise of one derive the other. Same salt, same ikm, so
+/// both remain restorable from the nsec alone.
+pub const CASHU_SEED_INFO: &[u8] = b"sonar-cashu-v1";
+
+/// Derive the 64-byte Cashu wallet seed (CDK's `WalletBuilder::seed` takes
+/// exactly 64 bytes; NUT-13 deterministic secrets derive from it, which is
+/// what makes ecash proofs recoverable from the account key).
+///
+/// HKDF-SHA256(ikm = secret, salt = [`SEED_SALT`], info =
+/// [`CASHU_SEED_INFO`], L = 64).
+pub fn cashu_wallet_seed(secret: &[u8; 32]) -> [u8; 64] {
+    let hk = Hkdf::<Sha256>::new(Some(SEED_SALT), secret);
+    let mut out = [0u8; 64];
+    hk.expand(CASHU_SEED_INFO, &mut out)
+        .expect("64 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
+/// HKDF info prefix for the NUT-20 key that locks the wallet's published
+/// BOLT12 offer (one reusable mint quote). Deriving it from the Cashu seed,
+/// rather than letting CDK draw a random key, means the offer's quote can be
+/// re-adopted from the nsec after its local store is lost — a random key
+/// would leave every payment made to the published offer unclaimable.
+pub const CASHU_OFFER_KEY_INFO: &[u8] = b"sonar-cashu-offer-nut20-v1";
+
+/// Derive the 32-byte secret for offer number `index` at `mint_url`.
+///
+/// HKDF-SHA256(ikm = cashu seed, salt = [`SEED_SALT`], info =
+/// [`CASHU_OFFER_KEY_INFO`] ‖ 0x00 ‖ mint_url ‖ 0x00 ‖ index as u32 BE,
+/// L = 32). The NUL separators keep (mint, index) pairs unambiguous. Bumping
+/// `index` rotates the offer without reusing its key.
+pub fn cashu_offer_key(cashu_seed: &[u8; 64], mint_url: &str, index: u32) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(SEED_SALT), cashu_seed);
+    let mut info = Vec::with_capacity(CASHU_OFFER_KEY_INFO.len() + mint_url.len() + 6);
+    info.extend_from_slice(CASHU_OFFER_KEY_INFO);
+    info.push(0);
+    info.extend_from_slice(mint_url.as_bytes());
+    info.push(0);
+    info.extend_from_slice(&index.to_be_bytes());
+    let mut out = [0u8; 32];
+    hk.expand(&info, &mut out)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    out
+}
+
 /// Decode an account secret from `nsec1…` bech32 or 64-char hex (the same two
 /// forms `sonar-cli` accepts for identity import).
 pub fn nsec_to_secret(input: &str) -> Result<[u8; 32]> {
@@ -54,6 +102,45 @@ pub fn nsec_to_secret(input: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Golden vector computed with an independent HKDF implementation
+    /// (python hmac/hashlib) that also reproduces the iOS vector below — pins
+    /// the Cashu seed derivation before any funds ever depend on it.
+    #[test]
+    fn cashu_seed_matches_golden_vector() {
+        let secret: [u8; 32] = core::array::from_fn(|i| i as u8);
+        assert_eq!(
+            hex::encode(cashu_wallet_seed(&secret)),
+            "a4c269b1558bf9951e4ff497ea3ccc0c27ea70d914ea4846c58a91ea68e6d32b\
+             b46e47af092552d3a23c11b421d39aecb31bc9bfe03bbc4c062c1423ddb5954a"
+        );
+        // Distinct domain from the Breez entropy: no shared prefix.
+        assert_ne!(
+            cashu_wallet_seed(&secret)[..32],
+            wallet_entropy(&secret)[..]
+        );
+    }
+
+    /// Golden vectors from an independent HKDF (python hmac/hashlib). The
+    /// published offer's quote can only be re-adopted from the nsec if this
+    /// derivation never changes.
+    #[test]
+    fn cashu_offer_key_matches_golden_vectors() {
+        let secret: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let seed = cashu_wallet_seed(&secret);
+        assert_eq!(
+            hex::encode(cashu_offer_key(&seed, "https://mint.hedwig.sh", 0)),
+            "31b3ad97b664323c6a63174d47945b18f8fcd7cc7a5c7a9c44d5fae0b692ff41"
+        );
+        assert_eq!(
+            hex::encode(cashu_offer_key(&seed, "https://mint.hedwig.sh", 1)),
+            "badc7fb643aa520f4c8567656d78f277e43cccec75051c8b034ac43baa02435b"
+        );
+        assert_ne!(
+            cashu_offer_key(&seed, "https://mint.hedwig.sh", 0),
+            cashu_offer_key(&seed, "https://other.mint", 0)
+        );
+    }
 
     /// Golden vector shared with
     /// `ios/bitchatTests/Services/SonarWalletDerivationTests.swift` — pins

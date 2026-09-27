@@ -125,6 +125,43 @@ class SonarPaymentActivityLedger(blob: String = "") {
         return true
     }
 
+    /** [markPaid] only if the row is still Pending. True when it transitioned. */
+    fun markPaidIfPending(id: String, walletPaymentId: String?, feesSats: Long?, settledAtSecs: Long): Boolean {
+        if (entries[id]?.status != SonarPaymentActivity.Status.Pending) return false
+        return markPaid(id, walletPaymentId, feesSats, settledAtSecs)
+    }
+
+    /** [markFailed] only if the row is still Pending. True when it transitioned. */
+    fun markFailedIfPending(id: String, message: String, nowSecs: Long): Boolean {
+        if (entries[id]?.status != SonarPaymentActivity.Status.Pending) return false
+        return markFailed(id, message, nowSecs)
+    }
+
+    /**
+     * [markPaidIfPending], and also a row that FAILED under this same wallet
+     * payment: the wallet later reported it paid, so the money left and the
+     * row must stop saying "you were not charged". A Paid row never moves.
+     */
+    fun markPaidIfUnsettled(id: String, walletPaymentId: String?, feesSats: Long?, settledAtSecs: Long): Boolean {
+        val e = entries[id] ?: return false
+        val paidAfterFailing = e.status == SonarPaymentActivity.Status.Failed &&
+            walletPaymentId != null && e.walletPaymentId == walletPaymentId
+        if (e.status != SonarPaymentActivity.Status.Pending && !paidAfterFailing) return false
+        return markPaid(id, walletPaymentId, feesSats, settledAtSecs)
+    }
+
+    /**
+     * A send the wallet reported as in flight: remember which wallet payment
+     * settles this row. Only a still-Pending row is linked; the status is left
+     * alone (it is NOT a failure and must never be re-sent).
+     */
+    fun linkWalletPayment(id: String, walletPaymentId: String): Boolean {
+        val e = entries[id] ?: return false
+        if (e.status != SonarPaymentActivity.Status.Pending || e.walletPaymentId == walletPaymentId) return false
+        entries[id] = e.copy(walletPaymentId = walletPaymentId)
+        return true
+    }
+
     fun serialize(): String = entries.values.joinToString("\n") { encodeLine(it) }
 
     private companion object {
@@ -386,6 +423,65 @@ object PaymentActivityStore {
     fun markFailed(id: String, message: String, nowSecs: Long = SonarClock.nowSecs()): Boolean {
         val changed = lock.withLock {
             if (!ledger().markFailed(id, message, nowSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
+    }
+
+    /**
+     * Settle a Pending row exactly once, whichever path gets there first: the
+     * send's own return, the wallet's outcome event, or the reconnect lookup.
+     * The check and the write happen under one lock, so only the winner gets
+     * `true` — and only the winner may send a ⚡PAY receipt.
+     */
+    fun markPaidIfPending(
+        id: String,
+        walletPaymentId: String?,
+        feesSats: Long?,
+        settledAtSecs: Long = SonarClock.nowSecs(),
+    ): Boolean {
+        val changed = lock.withLock {
+            if (!ledger().markPaidIfPending(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
+    }
+
+    /**
+     * [markPaidIfPending] that also moves a row that failed under the same
+     * wallet payment to Paid (a late Complete for an ambiguous send). Same
+     * single-winner guarantee: only the transition returns `true`.
+     */
+    fun markPaidIfUnsettled(
+        id: String,
+        walletPaymentId: String?,
+        feesSats: Long?,
+        settledAtSecs: Long = SonarClock.nowSecs(),
+    ): Boolean {
+        val changed = lock.withLock {
+            if (!ledger().markPaidIfUnsettled(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
+    }
+
+    /** [markPaidIfPending]'s failure twin. */
+    fun markFailedIfPending(id: String, message: String, nowSecs: Long = SonarClock.nowSecs()): Boolean {
+        val changed = lock.withLock {
+            if (!ledger().markFailedIfPending(id, message, nowSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
+    }
+
+    /** Link a Pending row to the wallet payment that will settle it. */
+    fun linkWalletPayment(id: String, walletPaymentId: String): Boolean {
+        val changed = lock.withLock {
+            if (!ledger().linkWalletPayment(id, walletPaymentId)) return@withLock false
             persist(); true
         }
         if (changed) version++

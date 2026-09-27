@@ -95,7 +95,7 @@ final class SonarPaymentStatusTests: XCTestCase {
             .resolving: "Nothing sent yet — your sats are still yours",
             .paying: "\(n) sats in flight — not yet settled",
             .slow: "Still in flight — held, not lost",
-            .sent: "\(n) sats delivered · proof received",
+            .sent: "\(n) sats delivered",
             .failedSafe: "Nothing left your wallet — balance unchanged",
             .refunded: "\(n) sats returned to your balance",
             .unknown: "Sats reserved — we’ll confirm or refund automatically"
@@ -108,6 +108,19 @@ final class SonarPaymentStatusTests: XCTestCase {
         }
         // Every phase must have one — this is the design's core promise.
         XCTAssertEqual(expected.count, SNPayPhase.allCases.count)
+    }
+
+    func testASettledPaymentNeverClaimsAProofItMayNotHave() {
+        // A payment inside one mint settles internally, with no preimage.
+        let lines = [
+            SNPayStatusCopy.hint(.sent, payee: "Ana", sats: 2_100),
+            SNPayStatusCopy.money(.sent, sats: 2_100).text,
+            SNPayStatusCopy.walletRow(.sent, elapsedSeconds: 0),
+            SNPayStatusCopy.homeStrip(.sent, payee: "Ana", sats: 2_100).sub
+        ]
+        for line in lines {
+            XCTAssertFalse(line.contains("proof"), line)
+        }
     }
 
     func testHeadlinesMatchTheDesign() {
@@ -169,6 +182,38 @@ final class SonarPaymentStatusTests: XCTestCase {
         XCTAssertEqual(
             SNPayStatusCopy.actions(status(.failedSafe, canRetry: true)).map(\.label),
             ["Try again", "Not now"]
+        )
+    }
+
+    /// A send refused because the fee rose states the NEW fee where "No
+    /// route" would be — `Try again` pays it, so it must be read first. Only
+    /// a concluded failure reads that way (Compose
+    /// `aFeeChangeIsStatedOnlyOnAFailedPayment`).
+    func testAFeeChangeIsStatedOnlyOnAFailedPayment() {
+        let failed = snPaymentStatus(
+            activity: activity(.failed), live: nil, now: Date(), canRetry: true, feeChangedSats: 40
+        )
+        XCTAssertEqual(failed.phase, .failedSafe)
+        XCTAssertEqual(failed.feeChangedSats, 40)
+        XCTAssertEqual(
+            SNPayStatusCopy.hint(for: failed),
+            "The network fee is now up to \(sonarFormatSats(40)). Nothing was sent — try again to pay it."
+        )
+        XCTAssertEqual(SNPayStatusCopy.actions(failed).map(\.label), ["Try again", "Not now"])
+
+        let paid = snPaymentStatus(
+            activity: activity(.paid), live: nil, now: Date(), canRetry: true, feeChangedSats: 40
+        )
+        XCTAssertNil(paid.feeChangedSats)
+        let inFlight = snPaymentStatus(
+            activity: activity(.pending), live: liveSend(), now: Date(), canRetry: true, feeChangedSats: 40
+        )
+        XCTAssertNil(inFlight.feeChangedSats)
+        let plainFailure = snPaymentStatus(activity: activity(.failed), live: nil, now: Date(), canRetry: true)
+        XCTAssertEqual(
+            SNPayStatusCopy.hint(for: plainFailure),
+            SNPayStatusCopy.hint(.failedSafe, payee: "Café Lumen", sats: 2_100),
+            "any other failure keeps the design's copy"
         )
     }
 

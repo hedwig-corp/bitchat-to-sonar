@@ -71,6 +71,8 @@ actual object Notifier {
 
     actual fun onPaymentOfferReady(offer: String) { /* no push webhooks on desktop */ }
 
+    actual suspend fun onLegacyWalletRemoved() { /* no push webhooks on desktop */ }
+
     actual suspend fun prepareForAccountReplacement() { /* no push on desktop */ }
 
     actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }

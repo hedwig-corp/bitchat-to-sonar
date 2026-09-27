@@ -74,6 +74,9 @@ import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.sonar
 import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.held_as_ecash_at_mint_hedwig_sh
+import chat.bitchat.sonar.resources.old_lightning_wallet
+import chat.bitchat.sonar.resources.your_wallet_from_before_sonar_moved_to
 import chat.bitchat.sonar.resources.backup_chats
 import chat.bitchat.sonar.resources.cancel
 import chat.bitchat.sonar.resources.chat_backup
@@ -184,29 +187,43 @@ fun SonarSettingsScreen(state: SonarAppState) {
 
             SNSectionLabel("Wallet")
             SNSettingsCard {
+                // The custody disclosure is this ONE line: ecash is held at the
+                // mint, which backs it with the Lightning side.
                 SNSettingsRow(
                     icon = SNIconName.Coin, tone = SNTone.Gold, label = "Balance",
-                    value = if (state.walletAvailable) state.money(balance) else "Unavailable",
-                    divider = state.walletAvailable,
-                ) { if (state.walletAvailable) state.push(Screen.WalletActivity) }
-                if (state.walletAvailable) {
+                    sub = stringResource(Res.string.held_as_ecash_at_mint_hedwig_sh),
+                    value = state.money(balance),
+                ) { state.push(Screen.WalletActivity) }
+                if (state.legacyWallet.present) {
                     SNSettingsRow(
-                        icon = SNIconName.Globe, label = "Currency", value = state.currency.code,
-                    ) { currencyPick = true }
-                    SNSettingsRow(
-                        icon = SNIconName.Bolt, label = "Bitcoin mode",
-                        sub = "Show sats and bitcoin networks",
-                        toggle = !state.showFiat, trail = SNTrail.None, divider = false,
-                    ) { state.toggleShowFiat() }
+                        icon = SNIconName.Bolt, label = stringResource(Res.string.old_lightning_wallet),
+                        sub = stringResource(Res.string.your_wallet_from_before_sonar_moved_to),
+                        value = if (state.legacyWallet.connected) state.money(state.legacyWallet.balanceSats) else null,
+                    ) { state.push(Screen.WalletActivity) }
                 }
+                SNSettingsRow(
+                    icon = SNIconName.Globe, label = "Currency", value = state.currency.code,
+                ) { currencyPick = true }
+                SNSettingsRow(
+                    icon = SNIconName.Bolt, label = "Bitcoin mode",
+                    sub = "Show sats and bitcoin networks",
+                    toggle = !state.showFiat, trail = SNTrail.None, divider = false,
+                ) { state.toggleShowFiat() }
             }
-            if (state.walletAvailable) {
-                // Both apps default to bitcoin display (Android `wallet.showFiat`
-                // = false, iOS `SonarWallet.displayMode()` = "bitcoin"); the note
-                // used to claim the opposite (QA-A23).
-                StNote("On by default — amounts show in sats, with Lightning and ecash. Turn off to see your currency instead.")
-            } else {
-                StNote("This build has no Breez API key, so Lightning stays off. Chat and restore still work.")
+            // Both apps default to bitcoin display (Android `wallet.showFiat`
+            // = false, iOS `SonarWallet.displayMode()` = "bitcoin"); the note
+            // used to claim the opposite (QA-A23).
+            StNote("On by default — amounts show in sats, with Lightning and ecash. Turn off to see your currency instead.")
+            // Which wallet the public address pays (only while there is
+            // something to say: it still pays the old wallet, an update is
+            // failing, or it can move back).
+            if (handleAddressNoticeVisible(state)) {
+                HandleAddressNotice(
+                    state,
+                    Modifier.padding(start = 14.dp, end = 14.dp, top = 4.dp, bottom = 8.dp)
+                        .clip(RoundedCornerShape(18.dp)).background(s.surface)
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                )
             }
 
             SNSectionLabel("Privacy & safety")

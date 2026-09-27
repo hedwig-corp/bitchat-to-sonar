@@ -1,0 +1,56 @@
+[package]
+name = "sonar-wallet-cdk"
+description = "Cashu (CDK) implementation of the sonar-wallet interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# A normal workspace member, unlike sonar-wallet-breez: the cdk + cdk-redb
+# tree carries NO libsqlite3-sys (redb storage), so there is no
+# `links = "sqlite3"` conflict with the workspace's SQLCipher, and the full
+# tree type-checks in ~35s — light enough for `cargo test --workspace`.
+
+[[bin]]
+name = "sonar-cashu-cli"
+path = "src/bin/sonar-cashu-cli.rs"
+
+[dependencies]
+sonar-wallet = { path = "../sonar-wallet" }
+# Wallet side only: the default feature set includes `mint` (the mint SERVER)
+# whose cdk-signatory build.rs needs protoc — a toolchain requirement the
+# workspace CI job rightly does not have, for server code a client never runs.
+cdk = { version = "0.18.1", default-features = false, features = ["wallet", "bip353"] }
+cdk-redb = "0.18.1"
+# Only to rebuild CDK's default (rate-limited HTTP) mint client around the
+# melt-recording connector (src/connector.rs); cdk already links both at
+# these versions and features.
+cdk-common = { version = "0.18.1", default-features = false, features = ["wallet", "http"] }
+cdk-http-client = { version = "0.18.1", default-features = false, features = ["bitreq"] }
+# The store error types, to tell a damaged file from an error opening a sound one.
+redb = "3.1"
+# Same version cdk itself uses; decodes BOLT11 invoices so an amount-bearing
+# invoice satisfies resolve_send_amount without the host re-supplying it.
+lightning-invoice = "0.34"
+clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+hex.workspace = true
+sha2 = "0.10"
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Same major as cdk-common; only to name a saga id when materializing the
+# saga table on a fresh store (see `build_wallet`).
+uuid = "1"
+# The melt-recording mint connector implements CDK's async trait; cdk
+# already links it.
+async-trait = "0.1"
+
+[features]
+# Exposes `test_mint::FakeMint` and `CdkWallet::with_connector` to other
+# crates' tests (sonar-ffi). Never enabled by a shipping build.
+test-support = []
+
+[dev-dependencies]
+# Signs real BOLT11 invoices for melt tests (same 0.32 cdk/lightning-invoice use).
+bitcoin = { version = "0.32", features = ["secp-recovery"] }

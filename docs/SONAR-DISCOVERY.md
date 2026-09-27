@@ -67,6 +67,11 @@ with:
 2. an optional BIP-353 payment address (`user@domain`), and
 3. a capability bitfield.
 
+Android may also append its BOLT12 offer (TLV `0x05`, 2-byte length), but only
+while the signed packet still fits one 512-byte BLE attribute value — a mint's
+offer (~400 chars) does not, and Android 13+ throws on a larger GATT notify or
+write. iOS never sends it. Payers read the offer from the Nostr descriptor.
+
 The normal bitchat announce remains untouched. `0x53` is deliberately not added
 to bitchat's `MessageType` enum; stock bitchat clients hit the unknown-type
 branch, ignore the payload, and continue relaying by TTL.

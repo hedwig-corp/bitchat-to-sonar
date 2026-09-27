@@ -56,6 +56,11 @@ struct SonarHandleClaimCard: View {
             }
             if let address = claimedAddress, !editingHandle {
                 claimedRow(address)
+                // Which wallet the address pays, and the confirmed move.
+                if address == store.coreClaimedHandle, SNHandleAddressNotice.isVisible(store) {
+                    SNHandleAddressNotice(store: store)
+                        .padding(.top, 2)
+                }
             } else {
                 claimField
             }
@@ -154,6 +159,14 @@ struct SonarHandleClaimCard: View {
             Text(verbatim: message)
                 .font(SonarTheme.uiFont(size: 12))
                 .foregroundColor(SonarTheme.danger)
+        }
+
+        if !isExternalDraft {
+            // A claim registers the address with the ecash wallet's offer.
+            Text("Payments to this address go to your wallet at mint.hedwig.sh.")
+                .font(SonarTheme.uiFont(size: 12))
+                .foregroundColor(SonarTheme.text3)
+                .fixedSize(horizontal: false, vertical: true)
         }
 
         HStack(spacing: 8) {

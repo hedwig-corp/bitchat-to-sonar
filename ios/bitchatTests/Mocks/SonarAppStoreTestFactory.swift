@@ -11,7 +11,9 @@ import Foundation
 @testable import Sonar
 
 @MainActor
-func makeIsolatedSonarAppStore() -> (store: SonarAppStore, cleanup: () -> Void) {
+func makeIsolatedSonarAppStore(
+    wallet: SonarWalletProviding = UnconfiguredWallet()
+) -> (store: SonarAppStore, cleanup: () -> Void) {
     let suiteName = "SonarAppStoreTestFactory-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suiteName)!
     let keychain = MockKeychain()
@@ -32,7 +34,8 @@ func makeIsolatedSonarAppStore() -> (store: SonarAppStore, cleanup: () -> Void) 
         chatViewModel: chatViewModel,
         marmot: marmot,
         keychain: keychain,
-        idBridge: idBridge
+        idBridge: idBridge,
+        wallet: wallet
     )
     return (store, { defaults.removePersistentDomain(forName: suiteName) })
 }

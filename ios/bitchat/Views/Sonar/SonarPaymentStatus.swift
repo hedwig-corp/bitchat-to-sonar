@@ -88,6 +88,11 @@ struct SNPaymentStatus: Equatable, Identifiable {
     /// Whether we still hold the destination needed to re-send. Destinations
     /// are only ever hashed in the ledger, so this is false after a relaunch.
     let canRetry: Bool
+    /// A `.failedSafe` payment the wallet refused because the network fee
+    /// rose above the one the user agreed to: the NEW fee. The screen then
+    /// states it instead of "No route" — the user must read it before `Try
+    /// again` pays it. nil for every other state.
+    var feeChangedSats: Int64? = nil
 }
 
 /// An external payment this process is sending right now.
@@ -184,6 +189,17 @@ enum SNPayStatusCopy {
         }
     }
 
+    /// The `.rs-hint` line for `status`. Deviation from the design's copy
+    /// table: a send refused because the network fee rose states the NEW fee
+    /// instead of "No route" — `Try again` pays it, so the user must read it
+    /// first. Mirrors the Compose status screen.
+    static func hint(for status: SNPaymentStatus) -> String {
+        if let fee = status.feeChangedSats {
+            return CashuWalletError.feeChangedMessage(feeSats: fee)
+        }
+        return hint(status.phase, payee: status.payeeName, sats: status.sats)
+    }
+
     static func hint(_ phase: SNPayPhase, payee: String, sats: Int64) -> String {
         switch phase {
         case .resolving:
@@ -193,7 +209,8 @@ enum SNPayStatusCopy {
         case .slow:
             return "The first route didn\u{2019}t answer. Trying another \u{2014} this can take a minute."
         case .sent:
-            return "They received \(amount(sats)) sats. You have cryptographic proof of payment."
+            // No proof claim: a payment inside one mint settles with no preimage.
+            return "They received \(amount(sats)) sats."
         case .failedSafe:
             return "No route to \(payee) right now. You were not charged."
         case .refunded:
@@ -214,7 +231,7 @@ enum SNPayStatusCopy {
         case .slow:
             return (.warn, "Still in flight \u{2014} held, not lost")
         case .sent:
-            return (.good, "\(amount(sats)) sats delivered \u{00B7} proof received")
+            return (.good, "\(amount(sats)) sats delivered")
         case .failedSafe:
             return (.safe, "Nothing left your wallet \u{2014} balance unchanged")
         case .refunded:
@@ -230,7 +247,7 @@ enum SNPayStatusCopy {
         case .resolving: return "Resolving destination\u{2026}"
         case .paying: return "Sending \u{00B7} \(elapsed(elapsedSeconds))"
         case .slow: return "Still trying \u{00B7} \(elapsed(elapsedSeconds))"
-        case .sent: return "Sent \u{00B7} proof stored"
+        case .sent: return "Sent \u{00B7} delivered"
         case .failedSafe: return "Not sent \u{00B7} not charged"
         case .refunded: return "Refunded to balance"
         case .unknown: return "Confirming \u{00B7} \(elapsed(elapsedSeconds))"
@@ -298,7 +315,7 @@ enum SNPayStatusCopy {
         case .slow:
             return ("Taking longer than usual", "\(payee) \u{00B7} still in flight")
         case .sent:
-            return ("Sent \(amount(sats)) sats", "\(payee) \u{00B7} proof stored")
+            return ("Sent \(amount(sats)) sats", "\(payee) \u{00B7} delivered")
         case .failedSafe:
             return ("Payment didn\u{2019}t go through", "\(payee) \u{00B7} you weren\u{2019}t charged")
         case .refunded:
@@ -338,7 +355,9 @@ func snPaymentStatus(
     activity: SonarPaymentActivity,
     live: SNLivePayment?,
     now: Date,
-    canRetry: Bool
+    canRetry: Bool,
+    /// The new fee when the wallet refused this send because the fee rose.
+    feeChangedSats: Int64? = nil
 ) -> SNPaymentStatus {
     if let live, activity.status == .pending {
         return SNPaymentStatus(
@@ -365,7 +384,10 @@ func snPaymentStatus(
         phase: phase,
         elapsedSeconds: Int(max(0, reference.timeIntervalSince(activity.createdAt))),
         preimage: activity.preimage,
-        canRetry: canRetry
+        canRetry: canRetry,
+        // Only a concluded failure is "the fee changed"; a row that later
+        // settled (or is still pending) says what it is.
+        feeChangedSats: phase == .failedSafe ? feeChangedSats : nil
     )
 }
 

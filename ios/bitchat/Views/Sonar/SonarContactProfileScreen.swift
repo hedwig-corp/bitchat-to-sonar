@@ -456,10 +456,21 @@ struct SonarContactProfileScreen: View {
                 transport: store.dmTransport(effectiveChatId),
                 money: { store.money($0) },
                 fiatText: { store.fiatText($0) },
+                usesFeeInclusiveMax: store.usesFeeInclusiveMax(.primary),
+                quoteFee: store.feeQuoter(forContact: effectiveChatId),
                 onClose: { paySheet = false },
-                onSend: { sats in
+                onSend: { sats, maxFee in
                     Task {
-                        if let message = await store.sendPay(effectiveChatId, sats: sats) {
+                        if let message = await store.sendPay(effectiveChatId, sats: sats, maxFeeSats: maxFee) {
+                            showToast(message)
+                        }
+                    }
+                },
+                onSendMax: { sats, maxFee in
+                    Task {
+                        if let message = await store.sendPay(
+                            effectiveChatId, sats: sats, maxFeeSats: maxFee, feeFromAmount: true
+                        ) {
                             showToast(message)
                         }
                     }

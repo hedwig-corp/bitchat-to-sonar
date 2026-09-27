@@ -1,0 +1,239 @@
+use std::sync::Mutex;
+
+use crate::{
+    bitcoin, elements,
+    model::{BtcHistory, BtcScriptBalance, LBtcHistory},
+};
+use anyhow::Result;
+use bitcoin::{consensus::deserialize, OutPoint, Script, TxOut};
+use boltz_client::Amount;
+use elements::{
+    hex::FromHex, OutPoint as ElementsOutPoint, Script as ElementsScript, TxOut as ElementsTxOut,
+};
+
+use crate::{
+    chain::{bitcoin::BitcoinChainService, liquid::LiquidChainService},
+    prelude::{RecommendedFees, Utxo},
+    utils,
+};
+
+#[derive(Default)]
+pub(crate) struct MockLiquidChainService {
+    history: Mutex<Vec<LBtcHistory>>,
+}
+
+impl MockLiquidChainService {
+    pub(crate) fn new() -> Self {
+        MockLiquidChainService::default()
+    }
+
+    pub(crate) fn set_history(&self, history: Vec<LBtcHistory>) -> &Self {
+        *self.history.lock().unwrap() = history;
+        self
+    }
+
+    pub(crate) fn get_history(&self) -> Vec<LBtcHistory> {
+        self.history.lock().unwrap().clone()
+    }
+}
+
+#[sdk_macros::async_trait]
+impl LiquidChainService for MockLiquidChainService {
+    async fn tip(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    async fn broadcast(&self, tx: &elements::Transaction) -> Result<elements::Txid> {
+        Ok(tx.txid())
+    }
+
+    async fn get_transaction_hex(
+        &self,
+        _txid: &elements::Txid,
+    ) -> Result<Option<elements::Transaction>> {
+        unimplemented!()
+    }
+
+    async fn get_transactions(
+        &self,
+        _txids: &[elements::Txid],
+    ) -> Result<Vec<elements::Transaction>> {
+        Ok(vec![])
+    }
+
+    async fn get_script_history_with_retry(
+        &self,
+        _script: &ElementsScript,
+        _retries: u64,
+    ) -> Result<Vec<LBtcHistory>> {
+        Ok(self.get_history().into_iter().collect())
+    }
+
+    async fn get_script_history(&self, _script: &ElementsScript) -> Result<Vec<LBtcHistory>> {
+        Ok(vec![])
+    }
+
+    async fn get_scripts_history_with_retry(
+        &self,
+        _scripts: &[ElementsScript],
+        _retries: u64,
+    ) -> Result<Vec<Vec<LBtcHistory>>> {
+        Ok(vec![])
+    }
+
+    async fn get_script_utxos(&self, _script: &ElementsScript) -> Result<Vec<Utxo>> {
+        Ok(vec![Utxo::Liquid(Box::new((
+            ElementsOutPoint::default(),
+            ElementsTxOut::default(),
+        )))])
+    }
+
+    async fn verify_tx(
+        &self,
+        _address: &elements::Address,
+        _tx_id: &str,
+        tx_hex: &str,
+        _verify_confirmation: bool,
+    ) -> Result<elements::Transaction> {
+        utils::deserialize_tx_hex(tx_hex)
+    }
+}
+
+pub(crate) struct MockBitcoinChainService {
+    history: Mutex<Vec<BtcHistory>>,
+    txs: Mutex<Vec<bitcoin::Transaction>>,
+    script_balance_sat: Mutex<u64>,
+}
+
+impl MockBitcoinChainService {
+    pub(crate) fn new() -> Self {
+        MockBitcoinChainService {
+            history: Mutex::new(vec![]),
+            txs: Mutex::new(vec![]),
+            script_balance_sat: Mutex::new(0),
+        }
+    }
+
+    pub(crate) fn set_history(&self, history: Vec<BtcHistory>) -> &Self {
+        *self.history.lock().unwrap() = history;
+        self
+    }
+
+    pub(crate) fn set_transactions(&self, txs: &[&str]) -> &Self {
+        *self.txs.lock().unwrap() = txs
+            .iter()
+            .map(|tx_hex| deserialize(&Vec::<u8>::from_hex(tx_hex).unwrap()).unwrap())
+            .collect();
+        self
+    }
+
+    pub(crate) fn set_script_balance_sat(&self, script_balance_sat: u64) -> &Self {
+        *self.script_balance_sat.lock().unwrap() = script_balance_sat;
+        self
+    }
+}
+
+#[sdk_macros::async_trait]
+impl BitcoinChainService for MockBitcoinChainService {
+    async fn tip(&self) -> Result<u32> {
+        Ok(0)
+    }
+
+    async fn broadcast(&self, tx: &bitcoin::Transaction) -> Result<bitcoin::Txid, anyhow::Error> {
+        Ok(tx.compute_txid())
+    }
+
+    async fn get_transactions_with_retry(
+        &self,
+        _txids: &[bitcoin::Txid],
+        _retries: u64,
+    ) -> Result<Vec<bitcoin::Transaction>> {
+        Ok(self.txs.lock().unwrap().clone())
+    }
+
+    async fn get_script_history_with_retry(
+        &self,
+        _script: &Script,
+        _retries: u64,
+    ) -> Result<Vec<BtcHistory>> {
+        Ok(self.history.lock().unwrap().clone().into_iter().collect())
+    }
+
+    async fn get_script_history(&self, _scripts: &Script) -> Result<Vec<BtcHistory>> {
+        Ok(vec![])
+    }
+
+    async fn get_scripts_history_with_retry(
+        &self,
+        _scripts: &[&Script],
+        _retries: u64,
+    ) -> Result<Vec<Vec<BtcHistory>>> {
+        Ok(vec![])
+    }
+
+    async fn get_script_utxos(&self, script: &Script) -> Result<Vec<Utxo>> {
+        Ok(self
+            .get_scripts_utxos(&[script])
+            .await?
+            .first()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn get_scripts_utxos(&self, scripts: &[&Script]) -> Result<Vec<Vec<Utxo>>> {
+        let scripts_utxos = scripts
+            .iter()
+            .map(|s| {
+                vec![Utxo::Bitcoin((
+                    OutPoint::default(),
+                    TxOut {
+                        value: Amount::from_sat(1000),
+                        script_pubkey: s.to_p2sh(),
+                    },
+                ))]
+            })
+            .collect();
+        Ok(scripts_utxos)
+    }
+
+    async fn script_get_balance(
+        &self,
+        _script: &boltz_client::bitcoin::Script,
+    ) -> Result<BtcScriptBalance> {
+        Ok(BtcScriptBalance {
+            confirmed: 0,
+            unconfirmed: 0,
+        })
+    }
+
+    async fn scripts_get_balance(&self, _scripts: &[&Script]) -> Result<Vec<BtcScriptBalance>> {
+        Ok(vec![])
+    }
+
+    async fn script_get_balance_with_retry(
+        &self,
+        _script: &boltz_client::bitcoin::Script,
+        _retries: u64,
+    ) -> Result<BtcScriptBalance> {
+        Ok(BtcScriptBalance {
+            confirmed: *self.script_balance_sat.lock().unwrap(),
+            unconfirmed: 0,
+        })
+    }
+
+    async fn verify_tx(
+        &self,
+        _address: &boltz_client::Address,
+        _tx_id: &str,
+        tx_hex: &str,
+        _verify_confirmation: bool,
+    ) -> Result<boltz_client::bitcoin::Transaction> {
+        Ok(deserialize(&Vec::<u8>::from_hex(tx_hex).map_err(
+            |err| anyhow::anyhow!("Could not deserialize transaction: {err:?}"),
+        )?)?)
+    }
+
+    async fn recommended_fees(&self) -> Result<RecommendedFees> {
+        unimplemented!()
+    }
+}

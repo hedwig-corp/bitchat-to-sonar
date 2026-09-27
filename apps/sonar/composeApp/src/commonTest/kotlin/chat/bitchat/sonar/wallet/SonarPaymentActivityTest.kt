@@ -62,6 +62,55 @@ class SonarPaymentActivityLedgerTest {
     }
 
     @Test
+    fun aPendingRowSettlesExactlyOnce() {
+        // The send's return, the outcome event and the reconnect lookup race to
+        // settle a Cashu send; only the first may send the ⚡PAY receipt.
+        val l = SonarPaymentActivityLedger()
+        l.recordPending(activity("a1"))
+        assertTrue(l.markPaidIfPending("a1", "quote-1", 1, 200))
+        assertFalse(l.markPaidIfPending("a1", "quote-1", 1, 201), "second settle loses")
+        assertFalse(l.markFailedIfPending("a1", "late failure", 202), "a paid row is never flipped to failed")
+        assertEquals(SonarPaymentActivity.Status.Paid, l.get("a1")!!.status)
+        assertEquals(200L, l.get("a1")!!.settledAtSecs)
+
+        l.recordPending(activity("a2"))
+        assertTrue(l.markFailedIfPending("a2", "no route", 300))
+        assertFalse(l.markPaidIfPending("a2", "quote-2", 1, 301))
+        assertEquals(SonarPaymentActivity.Status.Failed, l.get("a2")!!.status)
+    }
+
+    @Test
+    fun aFailedRowIsPaidOnlyByALateCompleteForItsOwnWalletPayment() {
+        val l = SonarPaymentActivityLedger()
+        l.recordPending(activity("a1"))
+        l.linkWalletPayment("a1", "quote-1")
+        assertTrue(l.markFailedIfPending("a1", "no route", 300))
+        assertFalse(l.markPaidIfUnsettled("a1", "quote-9", 1, 301), "another payment's outcome")
+        assertFalse(l.markPaidIfUnsettled("a1", null, 1, 301), "an outcome with no wallet id")
+        assertEquals(SonarPaymentActivity.Status.Failed, l.get("a1")!!.status)
+        assertTrue(l.markPaidIfUnsettled("a1", "quote-1", 1, 302), "the money left after all")
+        assertEquals(SonarPaymentActivity.Status.Paid, l.get("a1")!!.status)
+        assertNull(l.get("a1")!!.failure)
+        assertFalse(l.markPaidIfUnsettled("a1", "quote-1", 1, 303), "settles once")
+        assertFalse(l.markFailedIfPending("a1", "late failure", 304), "paid is final")
+
+        l.recordPending(activity("a2"))
+        assertTrue(l.markPaidIfUnsettled("a2", "quote-2", 1, 400), "a Pending row settles as before")
+    }
+
+    @Test
+    fun onlyAPendingRowIsLinkedToItsWalletPayment() {
+        val l = SonarPaymentActivityLedger()
+        l.recordPending(activity("a1"))
+        assertTrue(l.linkWalletPayment("a1", "quote-1"))
+        assertEquals(SonarPaymentActivity.Status.Pending, l.get("a1")!!.status, "linking is not settling")
+        assertEquals("quote-1", SonarPaymentActivityLedger(l.serialize()).get("a1")!!.walletPaymentId, "survives a restart")
+        l.markPaid("a1", "quote-1", 1, 200)
+        assertFalse(l.linkWalletPayment("a1", "quote-9"))
+        assertEquals("quote-1", l.get("a1")!!.walletPaymentId)
+    }
+
+    @Test
     fun markPaidAndFailedAreNoopsForUnknownIds() {
         val l = SonarPaymentActivityLedger()
         assertFalse(l.markPaid("nope", null, null, 1))
