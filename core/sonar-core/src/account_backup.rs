@@ -239,6 +239,12 @@ impl Default for BackupPolicy {
 /// Serializes policy RMW and holds an in-process cache so the message hot path
 /// can skip disk reads/writes once `dirty` is already set (and at most one
 /// remake bump while a seal/upload is in flight).
+///
+/// One cache for the whole process, and a reload from disk drops an in-flight
+/// seal fingerprint on purpose (crash semantics). A test that simulates a fresh
+/// process must therefore forget only its own entry (`forget_cached_policy`),
+/// never clear the map: tests run in parallel, and a global clear dropped other
+/// tests' in-flight fingerprints between their seal and `record_backup_success`.
 static POLICY_STATE: LazyLock<Mutex<HashMap<String, BackupPolicy>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1993,6 +1999,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Forget `db_path`'s cached policy, as a fresh process would, so the next
+    /// read comes off disk. Only this entry: see [`POLICY_STATE`].
+    fn forget_cached_policy(db_path: &Path) {
+        with_policy_state(|map| {
+            map.remove(&policy_cache_key(db_path));
+        });
+    }
+
     /// The whole point of [`backup_list_url`]: `Url::join` would drop `list`.
     #[test]
     fn list_url_keeps_the_list_segment() {
@@ -3478,6 +3492,30 @@ mod tests {
         );
     }
 
+    /// Simulating a fresh process for one account must not reach another
+    /// account's seal in flight. Clearing the whole cache here used to drop the
+    /// other seal's fingerprint before `record_backup_success`, so its next
+    /// identical seal re-uploaded, and five tests failed under parallel runs.
+    #[test]
+    fn a_fresh_process_for_one_account_leaves_another_seal_in_flight() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "66".repeat(32);
+        seed_account(&db_path, &key_hex);
+        let keys = Keys::generate();
+        let other = tempdir().unwrap();
+        let other_db = other.path().join("marmot.sqlite");
+
+        let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
+        forget_cached_policy(&other_db);
+        record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
+
+        assert!(matches!(
+            seal_account_backup_files(&keys, &db_path, &key_hex),
+            Err(Error::AccountBackupUnchanged)
+        ));
+    }
+
     /// A seal that stamped its fingerprint and then died must not leave one on
     /// disk: a later success would promote bytes that never reached Blossom,
     /// and every seal after that would skip against a blob the server lacks.
@@ -3494,9 +3532,9 @@ mod tests {
             },
         )
         .unwrap();
-        // Drop the in-process cache so the next read comes off disk, which is
-        // what a fresh process after a background kill actually does.
-        with_policy_state(|map| map.clear());
+        // Drop this account's cached policy so the next read comes off disk,
+        // which is what a fresh process after a background kill actually does.
+        forget_cached_policy(&db_path);
 
         let reloaded = load_backup_policy(&db_path);
         assert_eq!(reloaded.attempt_plain_hash, None);

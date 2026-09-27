@@ -29,6 +29,7 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 | `idle-cpu.sh` | Average app CPU over a window on Android or an iOS simulator. |
 | `ios-drive.sh` | Headless iOS UI driver: one XCUITest (generated from `ios-driver/`, outside the app's Xcode project) runs a `;`-separated step script — `launch`, `tapc:<label>`, `longpress:<text>`, `tap:👍`, `expect:<text>`, `count:<text>=n`, `shot`, `tree` — against the installed app by UDID. No Simulator panel needed. |
 | `qr-decode.swift` | Print QR payloads found in a screenshot (macOS CoreImage). |
+| `core-flake-check.sh` | Reruns a crate's unit tests many times (default threads, 64 and 1) to catch tests that fail only when another test interleaves with them; exit status = failed runs. QA-125. |
 | `mint-proxy.py` | Fault-injecting HTTP proxy between a DEBUG app (or `sonar-cashu-cli`) and a local fake-Lightning `cdk-mintd`: `arm lose-melt-answer`, `drop-melt` + `deliver`/`discard`, `delay-melt N`, `delay-mint-answer N`, `inflate-melt-fee N`, one fault per arm. Test sats only; wallet scenarios QA-120…122 and QA-124. |
 
 Safety: nothing here uninstalls or resets an app on a physical device; the
