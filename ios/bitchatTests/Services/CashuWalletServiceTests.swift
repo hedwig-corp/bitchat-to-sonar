@@ -479,6 +479,106 @@ final class CashuWalletServiceTests: XCTestCase {
         await service.releaseQuietly()
     }
 
+    // MARK: Unify nearby sends
+
+    /// A store whose Cashu wallet is ready, and a Unify receiver serving `uri`.
+    private func unifyStore(
+        _ native: FakeCashuNative,
+        serving uri: String
+    ) async -> (SonarAppStore, CashuWalletService, () -> Void) {
+        let service = CashuTestFixtures.service(native: native, base: base, defaults: defaults)
+        let wallet = CashuWallet(keychain: MockKeychain(), service: service)
+        await service.open(nsec: CashuTestFixtures.nsecA)
+        await waitUntil { service.connectivity == .online && service.balance?.isLive == true }
+        let (store, cleanup) = makeIsolatedSonarAppStore(wallet: wallet)
+        await waitUntil {
+            if case .ready = store.walletState { return true }
+            return false
+        }
+        store.unifyPaymentURIReader = { _ in uri }
+        return (store, service, cleanup)
+    }
+
+    private func waitForUnifyPhase(
+        _ store: SonarAppStore,
+        _ matches: @escaping (SonarAppStore.UnifyPayPhase) -> Bool
+    ) async {
+        await waitUntil { store.unifyPay.map { matches($0.phase) } ?? false }
+    }
+
+    /// A Unify receiver's request can name its own amount. It used to be paid
+    /// the moment it was read over Bluetooth, with the amount never on screen.
+    /// It now waits on a confirm step, and Send pays exactly that request.
+    func testAUnifyRequestThatNamesItsAmountIsPaidOnlyAfterConfirming() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 2
+        let (store, service, cleanup) = await unifyStore(
+            native, serving: "bitcoin:?lno=lno1unifyoffer&amount=0.000005"
+        )
+        defer { cleanup() }
+
+        store.sendSatsToUnify("unify:peer-1")
+        await waitForUnifyPhase(store) { if case .confirm = $0 { return true }; return false }
+        XCTAssertEqual(store.unifyPay?.phase, .confirm(destination: "lno1unifyoffer", sats: 500))
+        XCTAssertEqual(native.count("send"), 0, "nothing is paid before Send")
+        let quote = try XCTUnwrap(store.feeQuoter(destination: "lno1unifyoffer"))
+        let fee = try await quote(500)
+        XCTAssertEqual(fee, 2, "the confirm step prices this request")
+
+        store.confirmUnifyAmount("unify:peer-1", destination: "lno1unifyoffer", sats: 500, maxFeeSats: fee)
+        await waitForUnifyPhase(store) { if case .sent = $0 { return true }; return false }
+        XCTAssertEqual(native.sentPrepared.map(\.amountSats), [500])
+        await service.releaseQuietly()
+    }
+
+    /// The fee on the Unify sheet is the most the send pays. A higher reserve
+    /// at send time is refused with nothing spent and the new fee stated; the
+    /// fee read again from the sheet is then paid.
+    func testAUnifySendAboveTheFeeOnScreenIsRefusedWithTheNewFee() async throws {
+        let native = FakeCashuNative()
+        native.confirmedSats = 10_000
+        native.feeReserve = 40
+        let (store, service, cleanup) = await unifyStore(native, serving: "lightning:lno1unifyoffer")
+        defer { cleanup() }
+
+        store.sendSatsToUnify("unify:peer-1")
+        await waitForUnifyPhase(store) { if case .amount = $0 { return true }; return false }
+        store.confirmUnifyAmount("unify:peer-1", destination: "lno1unifyoffer", sats: 500, maxFeeSats: 3)
+        await waitForUnifyPhase(store) { if case .failed = $0 { return true }; return false }
+        XCTAssertEqual(store.unifyPay?.phase, .failed(feeChanged40))
+        XCTAssertEqual(native.count("send"), 0, "nothing is spent above the fee the user saw")
+
+        store.confirmUnifyAmount("unify:peer-1", destination: "lno1unifyoffer", sats: 500, maxFeeSats: 40)
+        await waitForUnifyPhase(store) { if case .sent = $0 { return true }; return false }
+        XCTAssertEqual(native.sentPrepared.map(\.amountSats), [500])
+        await service.releaseQuietly()
+    }
+
+    /// What the Unify sheet shows for a request: a BOLT11 invoice speaks for
+    /// its own amount (the URI's `amount` does not override it), an
+    /// amountless invoice is refused before any keypad, and an offer takes
+    /// the URI's amount or asks for one.
+    func testAUnifyRequestIsShownWithTheAmountThatWillBePaid() {
+        typealias Parsed = UnifyBIP321.Parsed
+        XCTAssertEqual(
+            SonarAppStore.unifyPayPhase(for: Parsed(lightning: "lnbc2500n1pinvoice", amountSats: 999)),
+            .confirm(destination: "lnbc2500n1pinvoice", sats: 250)
+        )
+        XCTAssertEqual(
+            SonarAppStore.unifyPayPhase(for: Parsed(lightning: "lnbc1pinvoice", amountSats: 500)),
+            .failed(SonarAppStore.amountlessInvoiceMessage)
+        )
+        XCTAssertEqual(
+            SonarAppStore.unifyPayPhase(for: Parsed(lightning: "lno1offer", amountSats: 700)),
+            .confirm(destination: "lno1offer", sats: 700)
+        )
+        XCTAssertEqual(
+            SonarAppStore.unifyPayPhase(for: Parsed(lightning: "lno1offer", amountSats: nil)),
+            .amount(destination: "lno1offer")
+        )
+    }
+
     // MARK: Helpers
 
     private func keychainWith(_ nsec: String) -> MockKeychain {

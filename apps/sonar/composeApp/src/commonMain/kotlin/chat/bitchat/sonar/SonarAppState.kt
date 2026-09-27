@@ -4003,9 +4003,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val lower = dest.lowercase()
         val isBolt11 = isBolt11Invoice(dest)
         if (isBolt11 && chat.bitchat.sonar.wallet.bolt11AmountSats(lower) == null) {
-            return DestinationCheck.Refuse(
-                "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
-            )
+            return DestinationCheck.Refuse(AMOUNTLESS_INVOICE_MESSAGE)
         }
         return DestinationCheck.Send(if (isBolt11) 0L else sats)
     }
@@ -4142,15 +4140,97 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Pay a nearby Unify user [amountSats] over Lightning: read their offer,
-     *  parse the BIP321 destination, and send. Surfaces the outcome via toast. */
-    fun sendSatsToUnify(peerId: String, amountSats: Long, feeFromAmount: Boolean = false) {
+    /**
+     * The request a nearby Unify user serves, as the pay sheet shows it. It is
+     * read over BLE when the sheet opens, so the fee (and an amount the request
+     * names) are on screen before Send; it used to be read only after Send, so
+     * the sheet could show no fee.
+     */
+    data class UnifyPayRequest(
+        val peerId: String,
+        /** What gets paid; null while reading, or when the read failed. */
+        val destination: String? = null,
+        /** The request's own amount (a BOLT11 invoice's, else the URI's): shown, no keypad. */
+        val fixedSats: Long? = null,
+        val failure: String? = null,
+    ) {
+        val reading: Boolean get() = destination == null && failure == null
+    }
+
+    /** The Unify request behind the open pay sheet (null = no sheet). */
+    var unifyPayRequest by mutableStateOf<UnifyPayRequest?>(null)
+        private set
+    private var unifyPayRead: CompletableDeferred<UnifyPayRequest>? = null
+
+    /** Reads a Unify receiver's served payment URI over BLE (tests stand in for the radio). */
+    internal var unifyOfferReader: suspend (String) -> String? = { UnifyRadio.fetchOffer(it) }
+
+    /** "Send sats" on a Unify peer: read their request now, before the sheet's Send. */
+    fun openUnifyPayment(peerId: String) {
+        val read = CompletableDeferred<UnifyPayRequest>()
+        unifyPayRead = read
+        unifyPayRequest = UnifyPayRequest(peerId)
+        scope.launch {
+            val request = readUnifyPayRequest(peerId)
+            read.complete(request)
+            if (unifyPayRead === read) unifyPayRequest = request
+        }
+    }
+
+    /** The Unify pay sheet closed. A read still running finishes on its own. */
+    fun closeUnifyPayment() {
+        unifyPayRead = null
+        unifyPayRequest = null
+    }
+
+    private suspend fun readUnifyPayRequest(peerId: String): UnifyPayRequest {
+        val raw = runCatching { unifyOfferReader(peerId) }.getOrNull()
+        val parsed = raw?.let { UnifyBIP321.parse(it) }
+            ?: return UnifyPayRequest(peerId, failure = "Couldn't read that user's payment request")
+        return unifyPayRequestFor(peerId, parsed)
+    }
+
+    /**
+     * What the sheet shows for a request: a BOLT11 invoice speaks for its own
+     * amount (the URI's `amount` does not override it, as when scanning), and
+     * an amountless one cannot be paid; anything else takes the URI's amount,
+     * or asks for one. Mirrors iOS `SonarAppStore.unifyPayPhase(for:)`.
+     */
+    internal fun unifyPayRequestFor(peerId: String, parsed: UnifyBIP321.Parsed): UnifyPayRequest {
+        val dest = parsed.lightning
+        if (isBolt11Invoice(dest)) {
+            val sats = chat.bitchat.sonar.wallet.bolt11AmountSats(dest.lowercase())
+                ?: return UnifyPayRequest(peerId, failure = AMOUNTLESS_INVOICE_MESSAGE)
+            return UnifyPayRequest(peerId, dest, fixedSats = sats)
+        }
+        return UnifyPayRequest(peerId, dest, fixedSats = parsed.amountSats)
+    }
+
+    /** The Unify sheet's fee line: waits for the request, then prices it like any destination. */
+    suspend fun quoteUnifyFee(peerId: String, sats: Long): Long? {
+        val request = unifyPayRead?.await()?.takeIf { it.peerId == peerId } ?: return null
+        return request.destination?.let { quoteSendFee(it, sats) }
+    }
+
+    /** Pay a nearby Unify user [amountSats] over Lightning, to the request the
+     *  sheet read, paying at most [maxFeeSats] in fees: the fee the sheet
+     *  showed at Send (`consentedFeeCeiling`). Surfaces the outcome via toast. */
+    fun sendSatsToUnify(peerId: String, amountSats: Long, maxFeeSats: Long?, feeFromAmount: Boolean = false) {
         walletSendBlockReason(fromLegacy = false)?.let { toast = it; return }
         if (amountSats <= 0) return
+        val read = unifyPayRead
         scope.launch {
-            val raw = UnifyRadio.fetchOffer(peerId)
-            val dest = raw?.let { UnifyBIP321.parse(it) }?.lightning
-            if (dest == null) { toast = "Couldn't read that user's payment request"; return@launch }
+            val request = read?.await()?.takeIf { it.peerId == peerId } ?: readUnifyPayRequest(peerId)
+            val dest = request.destination
+            if (dest == null) {
+                toast = request.failure ?: "Couldn't read that user's payment request"
+                return@launch
+            }
+            // A BOLT11 invoice gets no amount from us, exactly as the fee was quoted.
+            val walletAmount = when (val check = destinationSendAmount(dest, amountSats, fromLegacy = false)) {
+                is DestinationCheck.Send -> check.amountSats
+                is DestinationCheck.Refuse -> { toast = check.message; return@launch }
+            }
             // iOS parity (SonarAppStore.payUnify): a direct Lightning send —
             // Unify peers don't chat, so this shows up ONLY in the wallet
             // activity ledger, not as a ⚡PAY chat receipt.
@@ -4169,11 +4249,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     status = SonarPaymentActivity.Status.Pending,
                 )
             )
-            // No fee ceiling: the Unify sheet shows no fee line (the peer's
-            // offer is only read over BLE after Send), so there is no quote
-            // the user saw to hold the send to. Tracked gap, same on iOS.
+            // The fee the sheet showed is the most this send pays: a higher
+            // one is refused before anything is spent (FeeChanged, the toast
+            // below), and opening the sheet again shows the new fee.
             val result = WalletBridge.send(
-                dest, amountSats, "Sonar nearby", maxFeeSats = null, feeFromAmount = feeFromAmount,
+                dest, walletAmount, "Sonar nearby", maxFeeSats = maxFeeSats, feeFromAmount = feeFromAmount,
             ) { paymentId ->
                 PaymentActivityStore.linkWalletPayment(activityId, paymentId)
             }
@@ -4974,6 +5054,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     companion object {
         private const val AUTO_BACKUP_DISCLOSED_PREF = "auto_backup_disclosed"
+
+        /** A Lightning invoice without an amount cannot be paid: the wallet cannot set one for it. */
+        internal const val AMOUNTLESS_INVOICE_MESSAGE =
+            "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
     }
 
     /** Upgrades must open Settings (or finish onboarding) before any auto-upload. */

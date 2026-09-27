@@ -9863,6 +9863,11 @@ final class SonarAppStore: ObservableObject {
         case refuse(String)
     }
 
+    /// A Lightning invoice without an amount cannot be paid: the wallet
+    /// cannot set one for it.
+    static let amountlessInvoiceMessage =
+        "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
+
     private func destinationSendAmount(_ dest: String, sats: Int64, source: SNPaymentSource) -> SNDestinationCheck {
         guard let sender = sendingWallet(source), case .ready = sender.state else {
             return .refuse(String(localized: "Your wallet is still starting. Try again in a moment."))
@@ -9870,9 +9875,7 @@ final class SonarAppStore: ObservableObject {
         let lower = dest.lowercased()
         let isBolt11 = SNPayDestinationKind(dest) == .bolt11
         if isBolt11, SNScannedKind.bolt11AmountSats(lower) == nil {
-            return .refuse(
-                "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
-            )
+            return .refuse(Self.amountlessInvoiceMessage)
         }
         // Shared with the fee quote, so the quote prices what is sent.
         return .send(Self.walletAmount(forDestination: dest, sats: sats))
@@ -10663,6 +10666,10 @@ final class SonarAppStore: ObservableObject {
         case fetching
         /// Offer fetched; show the amount keypad (URI carried no amount).
         case amount(destination: String)
+        /// The request named its own amount: show it with the fee, and pay
+        /// only on Send. It used to be paid the moment it was read, with the
+        /// amount never on screen.
+        case confirm(destination: String, sats: Int64)
         /// Paying `sats` to `destination` over Lightning.
         case paying(destination: String, sats: Int64)
         /// Done.
@@ -10675,9 +10682,31 @@ final class SonarAppStore: ObservableObject {
     /// id stays alongside so the sheet can label itself.
     @Published var unifyPay: (peerId: String, phase: UnifyPayPhase)?
 
+    /// Stands in for the Bluetooth read of a Unify receiver's payment request
+    /// (tests; nil = the radio).
+    var unifyPaymentURIReader: ((String) async throws -> String)?
+
+    /// The sheet phase for a request read from a Unify receiver. A BOLT11
+    /// invoice speaks for its own amount (the URI's `amount` does not
+    /// override it, as when scanning); an amountless invoice cannot be paid.
+    /// Anything else takes the URI's amount, or asks for one.
+    static func unifyPayPhase(for parsed: UnifyBIP321.Parsed) -> UnifyPayPhase {
+        let destination = parsed.lightning
+        if SNPayDestinationKind(destination) == .bolt11 {
+            guard let sats = SNScannedKind.bolt11AmountSats(destination.lowercased()) else {
+                return .failed(amountlessInvoiceMessage)
+            }
+            return .confirm(destination: destination, sats: sats)
+        }
+        if let sats = parsed.amountSats {
+            return .confirm(destination: destination, sats: sats)
+        }
+        return .amount(destination: destination)
+    }
+
     /// Radar/list tap on a Unify peer chose "Send sats". Fetch the served
-    /// BIP321 URI, parse the Lightning destination, then either pay directly
-    /// (URI carried an amount) or prompt for an amount.
+    /// BIP321 URI, parse the Lightning destination, then show the amount it
+    /// carries (or a keypad) with the fee. Nothing is paid before Send.
     func sendSatsToUnify(_ id: String) {
         guard let unifyId = unifyPeerId(id) else { return }
         // Honest gate: a Unify peer still shows, but paying needs a wallet.
@@ -10689,16 +10718,17 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let uri = try await self.unify.fetchPaymentURI(unifyId)
+                let uri: String
+                if let read = self.unifyPaymentURIReader {
+                    uri = try await read(unifyId)
+                } else {
+                    uri = try await self.unify.fetchPaymentURI(unifyId)
+                }
                 guard let parsed = UnifyBIP321.parse(uri) else {
                     self.unifyPay = (id, .failed(UnifyNearbyError.noPayment.localizedDescription))
                     return
                 }
-                if let sats = parsed.amountSats {
-                    self.payUnify(id, destination: parsed.lightning, sats: sats)
-                } else {
-                    self.unifyPay = (id, .amount(destination: parsed.lightning))
-                }
+                self.unifyPay = (id, Self.unifyPayPhase(for: parsed))
             } catch {
                 let msg = (error as? UnifyNearbyError)?.errorDescription ?? error.localizedDescription
                 self.unifyPay = (id, .failed(msg))
@@ -10706,16 +10736,30 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// User entered an amount on the Unify pay keypad. `feeFromAmount`: the
-    /// user chose `Max`, so the fee comes out of the amount.
-    func confirmUnifyAmount(_ id: String, destination: String, sats: Int64, feeFromAmount: Bool = false) {
+    /// The user tapped Send on the Unify sheet (keypad or confirm).
+    /// `feeFromAmount`: an untouched `Max`, so the fee comes out of the
+    /// amount. `maxFeeSats`: the fee on screen at the tap, the most the send
+    /// may pay (`SNFeeQuote.consentedCeiling`).
+    func confirmUnifyAmount(
+        _ id: String,
+        destination: String,
+        sats: Int64,
+        feeFromAmount: Bool = false,
+        maxFeeSats: Int64?
+    ) {
         guard sats > 0 else { return }
-        payUnify(id, destination: destination, sats: sats, feeFromAmount: feeFromAmount)
+        payUnify(id, destination: destination, sats: sats, feeFromAmount: feeFromAmount, maxFeeSats: maxFeeSats)
     }
 
     /// Direct Lightning send to the Unify receiver's served offer/invoice. This
     /// is NOT the ⚡PAY sealed-coin chat path — Unify peers don't chat.
-    private func payUnify(_ id: String, destination: String, sats: Int64, feeFromAmount: Bool = false) {
+    private func payUnify(
+        _ id: String,
+        destination: String,
+        sats: Int64,
+        feeFromAmount: Bool = false,
+        maxFeeSats: Int64?
+    ) {
         let activityId = UUID().uuidString.lowercased()
         paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
@@ -10733,16 +10777,17 @@ final class SonarAppStore: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                // No fee ceiling: the Unify sheet shows no fee line (the
-                // peer's request is read over BLE, and an amount-carrying one
-                // is paid with no sheet at all), so there is no quote the user
-                // saw to hold the send to. Tracked gap, same on Compose.
+                // The fee the sheet showed is the most this send pays. A
+                // higher one is refused before anything is spent
+                // (`CashuWalletError.feeChanged`, shown below); reading the
+                // request again shows the new fee. A BOLT11 invoice gets no
+                // amount from us, exactly as the fee was quoted.
                 let payment = try await self.wallet.send(
                     destination: destination,
-                    amountSats: sats,
+                    amountSats: Self.walletAmount(forDestination: destination, sats: sats),
                     note: "Unify nearby payment \(activityId)",
                     feeFromAmount: feeFromAmount,
-                    maxFeeSats: nil
+                    maxFeeSats: maxFeeSats
                 )
                 let outcome = SonarWalletPaymentReconciler.applySendResult(
                     payment,

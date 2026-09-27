@@ -218,21 +218,32 @@ fun SonarRadarScreen(state: SonarAppState) {
                 )
             }
             Spacer(Modifier.width(12.dp))
-            SNPill("Send sats", primary = true, gold = true, onClick = { unifyCard = null; paySheet = p })
+            SNPill("Send sats", primary = true, gold = true, onClick = {
+                unifyCard = null
+                state.openUnifyPayment(p.id)
+                paySheet = p
+            })
         }
     }
     paySheet?.let { p ->
+        // The peer's request is read when the sheet opens: the fee line waits
+        // for it, and an amount the request names is shown fixed, no keypad.
+        val request = state.unifyPayRequest?.takeIf { it.peerId == p.id }
+        fun close() {
+            state.closeUnifyPayment()
+            paySheet = null
+        }
         chat.bitchat.sonar.PaySheet(
             peerName = p.name,
             balanceSats = state.walletBalanceSats(),
             mesh = false,
             fiatOf = { state.fiatOrNull(it) },
-            // No feeQuote: the Unify peer's offer is read over BLE only
-            // after Send, so this sheet shows no fee and the ceiling is null.
-            onSend = { sats, _ -> state.sendSatsToUnify(p.id, sats); paySheet = null },
-            onClose = { paySheet = null },
+            onSend = { sats, maxFee -> state.sendSatsToUnify(p.id, sats, maxFee); close() },
+            onClose = { close() },
+            fixedSats = request?.fixedSats,
             maxSats = state.maxSendableSats(),
-            onSendMax = { sats, _ -> state.sendSatsToUnify(p.id, sats, feeFromAmount = true); paySheet = null },
+            onSendMax = { sats, maxFee -> state.sendSatsToUnify(p.id, sats, maxFee, feeFromAmount = true); close() },
+            feeQuote = { sats -> state.quoteUnifyFee(p.id, sats) },
         )
     }
 }

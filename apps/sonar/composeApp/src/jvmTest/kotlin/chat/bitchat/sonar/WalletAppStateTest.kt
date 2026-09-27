@@ -258,6 +258,82 @@ class WalletAppStateTest {
         assertEquals(1, native.count("send"))
     }
 
+    // ── Unify nearby sends: the request is read when the sheet opens ──
+
+    /**
+     * A Unify receiver's request can name its own amount. The sheet now reads
+     * it when it opens and shows it fixed, with its fee. Nothing is paid until
+     * Send, and Send pays exactly that request, at most at the fee shown.
+     */
+    @Test
+    fun aUnifyRequestThatNamesItsAmountIsPaidOnlyOnSendAtTheFeeShown() = runBlocking {
+        native.confirmedSats = 10_000
+        native.feeReserveSats = 2
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+        s.unifyOfferReader = { "bitcoin:?lno=lno1unifyoffer&amount=0.000005" }
+
+        s.openUnifyPayment("u1")
+        waitUntil("read") { s.unifyPayRequest?.reading == false }
+        assertEquals(SonarAppState.UnifyPayRequest("u1", "lno1unifyoffer", fixedSats = 500), s.unifyPayRequest)
+        assertEquals(2L, s.quoteUnifyFee("u1", 500), "the sheet prices this request")
+        assertEquals(0, native.count("send"), "nothing is paid before Send")
+
+        s.sendSatsToUnify("u1", 500, maxFeeSats = 2)
+        waitUntil("sent") { native.count("send") == 1 }
+        assertEquals(listOf(500L), native.sentAmounts)
+    }
+
+    /**
+     * The fee on the Unify sheet is the most the send pays. A higher reserve at
+     * send time is refused with nothing spent and the new fee stated; paying
+     * again at the fee read from the reopened sheet goes through.
+     */
+    @Test
+    fun aUnifySendAboveTheFeeOnScreenIsRefusedWithTheNewFee() = runBlocking {
+        native.confirmedSats = 10_000
+        native.feeReserveSats = 40
+        val s = state()
+        s.setupWallet()
+        waitUntil("online") { WalletBridge.isOpen() && s.walletOnline }
+        s.unifyOfferReader = { "lightning:lno1unifyoffer" }
+
+        s.openUnifyPayment("u1")
+        waitUntil("read") { s.unifyPayRequest?.reading == false }
+        assertNull(s.unifyPayRequest?.fixedSats, "an amountless offer asks for the amount")
+        s.sendSatsToUnify("u1", 500, maxFeeSats = 3)
+        waitUntil("refused") { s.toast == feeChangedText(40) }
+        assertEquals(0, native.count("send"), "nothing is spent above the fee the user saw")
+
+        s.sendSatsToUnify("u1", 500, maxFeeSats = 40)
+        waitUntil("sent") { native.count("send") == 1 }
+        assertEquals(listOf(500L), native.sentAmounts)
+    }
+
+    /**
+     * What the Unify sheet shows for a request: a BOLT11 invoice speaks for its
+     * own amount (the URI's `amount` does not override it), an amountless one
+     * is refused before any keypad, and an offer takes the URI's amount or asks
+     * for one. Mirrors iOS `testAUnifyRequestIsShownWithTheAmountThatWillBePaid`.
+     */
+    @Test
+    fun aUnifyRequestIsShownWithTheAmountThatWillBePaid() {
+        val s = state()
+        fun request(lightning: String, amount: Long?) =
+            s.unifyPayRequestFor("u1", chat.bitchat.sonar.unify.UnifyBIP321.Parsed(lightning, amount))
+        assertEquals(
+            SonarAppState.UnifyPayRequest("u1", "lnbc2500n1pinvoice", fixedSats = 250),
+            request("lnbc2500n1pinvoice", 999),
+        )
+        assertEquals(
+            SonarAppState.UnifyPayRequest("u1", failure = SonarAppState.AMOUNTLESS_INVOICE_MESSAGE),
+            request("lnbc1pinvoice", 500),
+        )
+        assertEquals(SonarAppState.UnifyPayRequest("u1", "lno1offer", fixedSats = 700), request("lno1offer", 700))
+        assertEquals(SonarAppState.UnifyPayRequest("u1", "lno1offer"), request("lno1offer", null))
+    }
+
     @Test
     fun theReceiveSheetInvoiceIsTypedAndAnIncomingPaymentIsSurfaced() = runBlocking {
         val s = state()

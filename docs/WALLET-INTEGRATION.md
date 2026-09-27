@@ -174,7 +174,13 @@ Shared behaviour, pinned by tests on both platforms:
   fee. Nothing is spent. The payment fails with "The network fee is now up to
   N sats…". On the payment status screen **Try again** uses N as the new
   ceiling. A chat ⚡PAY shows the text as a toast, and the user re-opens the
-  sheet. Unify nearby sends show no fee and have no ceiling yet.
+  sheet.
+- A Unify nearby send works the same way. The receiver's request is read over
+  BLE when its sheet opens, so the fee is quoted before Send. A request that
+  names its amount is shown with that amount and its fee, and pays only on
+  Send; a BOLT11 invoice's own amount wins over the URI's `amount`, and an
+  invoice without an amount is refused. A higher fee at send time is refused
+  like any other; the user reopens the sheet and sees the new fee.
 
 ## Legacy Breez
 
