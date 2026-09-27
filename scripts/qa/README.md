@@ -1,12 +1,15 @@
 # Agent QA harness
 
-Scripts behind the `qa-pass` skill (`.agents/skills/qa-pass/SKILL.md`). They
-let an agent — or a human — run an end-to-end QA pass of the Sonar apps
+Scripts behind the `qa-run` skill (`.agents/skills/qa-run/SKILL.md`: check
+one change, report, any agent) and the `qa-pass` skill
+(`.agents/skills/qa-pass/SKILL.md`: find, fix and repeat). They let an
+agent, or a human, run an end-to-end QA pass of the Sonar apps
 against real White Noise/Marmot peers, and they grow with every pass: each
 bug found adds a scenario to [`docs/QA-SCENARIOS.md`](../../docs/QA-SCENARIOS.md)
 and, when it can be driven headlessly, a function to `android-smoke.sh`.
 
 ```bash
+scripts/qa/plan.sh                                   # what this change needs, what this machine can run
 cargo build -p sonar-cli --release --manifest-path core/Cargo.toml
 export QA_HOME="$TMPDIR/sonar-qa-$(basename "$PWD")"   # per worktree (the default)
 
@@ -20,7 +23,9 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 
 | Script | Purpose |
 |---|---|
-| `android-setup.sh` | Boot the dedicated AVD (`Sonar_QA_API_36`) by serial — refusing a port owned by another AVD, or an emulator another worktree set up in the same boot (`--take-over` overrides) — `installDebug` in place, logcat to `$QA_HOME`. `--fresh` clears app data for onboarding scenarios (emulators only). Refuses a missing Breez key / `google-services.json` unless `--allow-missing-config`. |
+| `plan.sh` | Read-only planner for `qa-run`: maps the diff (against `origin/main`, or `--base`/`--head`) to QA areas, checks the toolchain and gitignored config (presence only), and prints RUN (tiered commands), NOT RUN (with the reason) and WALK (registry sections). |
+| `ios-sim-type.sh` | Prints the device type and runtime for a new simulator: the newest iOS runtime and the newest iPhone Pro it supports (Xcode can list a newer device than the runtime runs). Used by `ios-setup.sh` and the `qa-run` test simulator. |
+| `android-setup.sh` | Boot the dedicated AVD (`Sonar_QA_API_36`) by serial — refusing a port owned by another AVD, or an emulator another worktree set up in the same boot (`--take-over` overrides) — `installDebug` in place, logcat to `$QA_HOME`. Builds the Rust core for the emulator's ABI (x86_64 on Linux/Intel hosts, as CI does). `--fresh` clears app data for onboarding scenarios (emulators only). Refuses a missing Breez key / `google-services.json` unless `--allow-missing-config`. |
 | `ios-setup.sh` | Create/boot this worktree's "Sonar QA <worktree>" simulator (so parallel agents never share one), build **signed** Debug (App Group ⇒ the Marmot store opens), install, stream the unified log. Refuses a stale `sonarffi.xcframework` (`--build-core` / `--trust-core`) and missing Breez / Firebase config unless `--allow-missing-config`; `BREEZ_API_KEY` in the environment counts. |
 | `android-ui.sh` | uiautomator driver: `dump`, `tapx`/`tapt`/`tapedit`, `wait`/`gone`, `ime`, `shot`. |
 | `peers.sh` | Fresh `sonar-cli` counterparties: `new`, `send`, `send-image`, `listen`, `expect`, and for reactions `id-of`, `react`, `expect-reaction`. |

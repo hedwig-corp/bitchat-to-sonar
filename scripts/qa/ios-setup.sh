@@ -124,9 +124,7 @@ esac
 
 UDID="$(xcrun simctl list devices available | sed -nE "s/^[[:space:]]+$NAME \(([0-9A-F-]+)\).*/\1/p" | head -1)"
 if [[ -z "$UDID" ]]; then
-  TYPE="$(xcrun simctl list devicetypes | grep -E '^iPhone [0-9]+ Pro \(' | sort -t' ' -k2,2n \
-    | tail -1 | sed -nE 's/^iPhone [0-9]+ Pro \((.*)\)$/\1/p')"
-  RUNTIME="$(xcrun simctl list runtimes available | sed -nE 's/^iOS .* - (com\.apple\.CoreSimulator\.SimRuntime\.iOS-[0-9-]+)$/\1/p' | tail -1)"
+  read -r TYPE RUNTIME < <("$ROOT/scripts/qa/ios-sim-type.sh")
   echo ">> creating simulator '$NAME' ($TYPE, $RUNTIME)" >&2
   UDID="$(xcrun simctl create "$NAME" "$TYPE" "$RUNTIME")"
 fi

@@ -33,6 +33,9 @@
 #   sdkmanager "system-images;android-36;google_apis_playstore;arm64-v8a"
 #   avdmanager create avd -n Sonar_QA_API_36 -d pixel_7 \
 #     -k "system-images;android-36;google_apis_playstore;arm64-v8a"
+# On a Linux or Intel host use the x86_64 image instead. The script reads the
+# emulator's ABI and builds the Debug Rust core for it, with the same switches
+# the CI device tests use (Debug is otherwise arm64-v8a only).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -76,9 +79,15 @@ if (( ${#missing[@]} )); then
   for gap in "${missing[@]}"; do echo "android: $gap" >> "$QA_HOME/config-gaps.txt"; done
 fi
 
-EMULATOR="${ANDROID_HOME:-$HOME/Library/Android/sdk}/emulator/emulator"
+SDK=""
+for d in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+         "$(sed -n 's/^sdk\.dir=//p' "$props" 2>/dev/null)" \
+         "$HOME/Library/Android/sdk" "$HOME/Android/Sdk"; do
+  [[ -n "$d" && -d "$d" ]] && { SDK="$d"; break; }
+done
+EMULATOR="$SDK/emulator/emulator"
 if ! adb devices | grep -q "^${SERIAL}[[:space:]]*device"; then
-  [[ -x "$EMULATOR" ]] || { echo "emulator binary not found (set ANDROID_HOME)" >&2; exit 1; }
+  [[ -n "$SDK" && -x "$EMULATOR" ]] || { echo "emulator binary not found (set ANDROID_HOME)" >&2; exit 1; }
   echo ">> booting $AVD on $SERIAL" >&2
   nohup "$EMULATOR" -avd "$AVD" -port "$PORT" -no-boot-anim -no-snapshot-save \
     > "$QA_HOME/emulator-$PORT.log" 2>&1 &
@@ -114,8 +123,15 @@ fi
 printf '%s\n%s\n' "$ROOT" "$boot_id" > "$OWNERS/$SERIAL"
 
 if (( INSTALL )); then
-  echo ">> installDebug on $SERIAL (in place)" >&2
-  (cd "$ROOT/apps/sonar" && ANDROID_SERIAL="$SERIAL" ./gradlew -q :composeApp:installDebug) >&2
+  abi="$(adb -s "$SERIAL" shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r')"
+  abi_args=()
+  if [[ "$abi" == x86_64 ]]; then
+    abi_args=(-Psonar.androidDebugAbi=x86_64)
+    export SONAR_ABIS='-t x86_64' SONAR_BINDINGS_ABI=x86_64
+  fi
+  echo ">> installDebug on $SERIAL (${abi:-unknown ABI}, in place)" >&2
+  (cd "$ROOT/apps/sonar" &&
+    ANDROID_SERIAL="$SERIAL" ./gradlew -q :composeApp:installDebug ${abi_args[@]+"${abi_args[@]}"}) >&2
 fi
 
 if (( FRESH )); then
