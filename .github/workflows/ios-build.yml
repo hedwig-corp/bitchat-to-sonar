@@ -95,12 +95,15 @@ jobs:
           for app in /Applications/Xcode*.app; do
             xb="$app/Contents/Developer/usr/bin/xcodebuild"
             if [ -x "$xb" ]; then
-              v="$("$xb" -version 2>/dev/null | awk '/Xcode/{print $2; exit}')"
+              # Some image copies abort (exit 134) on -version; || true keeps
+              # that from killing the probe under pipefail + set -e.
+              v="$( { "$xb" -version 2>/dev/null || true; } | awk '/Xcode/{print $2; exit}' )"
               vnum="${v%%.*}"
               case "$vnum" in ''|*[!0-9]*) vnum=0 ;; esac
               if [ "$vnum" -gt "$BESTV" ]; then BESTV=$vnum; BEST=$app; fi
             fi
           done
+          echo "probed: best=$BESTV ($BEST)"
           if [ "$BESTV" -lt 26 ]; then
             echo "::error::no Xcode >= 26 in this image (best=$BESTV); bump runs-on"
             exit 1
