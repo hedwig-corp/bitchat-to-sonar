@@ -177,6 +177,15 @@ After setup:
   `;`-separated step script (`launch; tapc:<label>; expect:<text>; tree; shot`).
   Read labels from `tree`, never coordinates from a screenshot.
 
+Two `ios-drive.sh` traps:
+- **A fresh account needs a fresh store.** `--nsec-file` swaps the identity,
+  but not the store on disk. On a simulator that already holds another
+  account, the store cannot open (the log says "Wrong encryption key"), and
+  Messages shows the old account's cached rows, so every result is about the
+  wrong account. Run `ios-setup.sh --no-build --fresh` first.
+- **`count:` counts elements, not rows.** A row's button and the text inside
+  it both match, so one row counts 2. Count rows from the `tree` dump.
+
 **Peers.** The other side of every conversation is a fresh `sonar-cli`
 identity:
 
