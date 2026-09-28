@@ -353,7 +353,9 @@ private struct SonarMacSidebar: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: { row in
-            if store.isMultiMemberMarmotGroupId(row.id) {
+            if store.isNoteToSelfConversation(row.id) {
+                Text("This deletes your notes from this device. Note to Self starts again, empty.")
+            } else if store.isMultiMemberMarmotGroupId(row.id) {
                 Text("This sends a leave update to the group and removes the conversation from this device.")
             } else {
                 Text("This removes the conversation from this device only. The other person isn't notified.")

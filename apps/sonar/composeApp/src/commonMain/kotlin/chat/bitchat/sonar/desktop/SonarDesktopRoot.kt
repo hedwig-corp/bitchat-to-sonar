@@ -225,6 +225,7 @@ fun SonarDesktopRoot(state: SonarAppState) {
                 DeleteChatSheet(
                     name = t.name,
                     isGroup = t.isGroup,
+                    isNoteToSelf = !t.isMesh && state.isNoteToSelfChat(t.id),
                     onDelete = {
                         if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
                         pendingDelete = null
