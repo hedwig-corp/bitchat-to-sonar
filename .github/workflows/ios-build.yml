@@ -73,6 +73,35 @@ jobs:
       # must not need the signing identity or any gitignored secret. The app
       # builds without `Local.xcconfig` / `GoogleService-Info.plist`; both are
       # optional at build time and only change runtime behaviour.
+      # The Mac that archives TestFlight runs Xcode 27; the package's C
+      # targets are trait-gated (swift-secp256k1 0.23.x) and trait support
+      # arrived with the 16.x-generation toolchains — under the image's
+      # 16.4 default the musig/schnorrsig C sources are dropped and the
+      # link dies on undefined secp256k1_* symbols (run 36470443213).
+      # Build on the toolchain that actually ships to TestFlight; probe
+      # every Xcode in the image by reported version, not by app-name
+      # glob, and fail loudly rather than drifting to an older default.
+      - name: Select the shipping Xcode
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          BEST=""; BESTV=0
+          for app in /Applications/Xcode*.app; do
+            xb="$app/Contents/Developer/usr/bin/xcodebuild"
+            if [ -x "$xb" ]; then
+              v="$("$xb" -version 2>/dev/null | awk '/Xcode/{print $2; exit}')"
+              vnum="${v%%.*}"
+              case "$vnum" in ''|*[!0-9]*) vnum=0 ;; esac
+              if [ "$vnum" -gt "$BESTV" ]; then BESTV=$vnum; BEST=$app; fi
+            fi
+          done
+          if [ "$BESTV" -lt 27 ]; then
+            echo "::error::no Xcode >= 27 in this image (best=$BESTV); bump runs-on to an image that ships it"
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$BEST/Contents/Developer" >> "$GITHUB_ENV"
+          "$BEST/Contents/Developer/usr/bin/xcodebuild" -version
+
       - name: xcodebuild (iOS Simulator)
         run: |
           set -euo pipefail
