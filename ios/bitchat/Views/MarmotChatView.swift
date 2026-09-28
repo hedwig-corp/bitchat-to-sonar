@@ -2800,14 +2800,19 @@ final class MarmotChatModel: ObservableObject {
     @discardableResult
     func loadLocalSummaries(resolveMembers: Bool = true) async -> Bool {
         do {
-            // Offline-safe solo MLS group — paint Note to Self without waiting
-            // on relays or KeyPackages (Signal-style always-present row).
-            if let id = try? await service.ensureNoteToSelf() {
+            var groups = try await service.groups()
+            // Note to Self is a local solo MLS group, so ensuring it never
+            // waits on relays. Ensure only while its id is unknown or gone from
+            // the list (deleted, wiped): each ensure reads the group list, and
+            // this loader runs on every conversation change.
+            let knownNoteToSelf = noteToSelfGroupId
+            if knownNoteToSelf.map({ id in !groups.contains { $0.id == id } }) ?? true,
+               let id = try? await service.ensureNoteToSelf() {
                 noteToSelfGroupId = id
-            } else if let id = try? await service.findNoteToSelf() {
-                noteToSelfGroupId = id
+                if !groups.contains(where: { $0.id == id }) {
+                    groups = try await service.groups()
+                }
             }
-            let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let pages = try await service.recentMessagePages(
                 groupLimit: Self.localSummaryGroupLimit,

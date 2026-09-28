@@ -932,6 +932,19 @@ func snSortDMRowsByRecency(_ rows: [SNDMRow]) -> [SNDMRow] {
     }
 }
 
+/// Note to Self stays at the top of Messages whatever its recency (Signal
+/// pins it the same way once it exists). Matched by group id, never by title,
+/// so a group someone named "Note to Self" is never pinned.
+func snPinNoteToSelfFirst(_ rows: [SNDMRow], noteToSelfGroupId: String?) -> [SNDMRow] {
+    guard let noteToSelfGroupId,
+          let index = rows.firstIndex(where: { $0.isMarmot && $0.marmotGroupId == noteToSelfGroupId })
+    else { return rows }
+    var pinned = rows
+    let row = pinned.remove(at: index)
+    pinned.insert(row, at: 0)
+    return pinned
+}
+
 /// Apply peer↔Marmot-group fold mappings in one pass. Home projection collects
 /// every alias while building rows and persists only when this returns
 /// `changed == true` — never one UserDefaults write per row mid-render.
@@ -6526,7 +6539,7 @@ final class SonarAppStore: ObservableObject {
                 let isNote = marmot.isNoteToSelf(group)
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
-                    title: isNote ? "Note to Self" : marmot.title(for: group),
+                    title: isNote ? String(localized: "Note to Self") : marmot.title(for: group),
                     preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) }
                         ?? (isNote ? "Tap to open" : "Secure group · reaches anywhere"),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
@@ -6687,7 +6700,10 @@ final class SonarAppStore: ObservableObject {
             )
         }
         let rows = Array(byKey.values) + pendingRows + pendingGroupRows + marmotRows
-        let sorted = snSortDMRowsByRecency(rows).map { row -> SNDMRow in
+        let sorted = snPinNoteToSelfFirst(
+            snSortDMRowsByRecency(rows),
+            noteToSelfGroupId: marmot.noteToSelfGroupId
+        ).map { row -> SNDMRow in
             var row = row
             row.muted = isChatMuted(row.id)
             return row

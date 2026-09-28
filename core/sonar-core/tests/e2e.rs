@@ -341,6 +341,41 @@ async fn ensure_note_to_self_creates_solo_marked_group_once() {
         .expect("is note to self"));
 }
 
+/// Both apps ensure Note to Self from refresh paths that can overlap on a
+/// cold start. Unserialized, each caller finds nothing and creates its own
+/// solo group, and the account ends up with two Note to Self chats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_ensure_note_to_self_creates_one_group() {
+    let alice = std::sync::Arc::new(
+        SonarClient::connect_in_memory(Identity::generate(), vec![])
+            .await
+            .expect("alice connects"),
+    );
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let alice = alice.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            alice.ensure_note_to_self().await.expect("ensure note to self")
+        }));
+    }
+    let mut ids = Vec::new();
+    for task in tasks {
+        ids.push(task.await.expect("ensure task"));
+    }
+    ids.dedup();
+    assert_eq!(ids.len(), 1, "every caller gets the same group");
+    let marked: Vec<_> = alice
+        .groups()
+        .expect("alice groups")
+        .into_iter()
+        .filter(|g| g.description == "sonar.note-to-self.v1")
+        .collect();
+    assert_eq!(marked.len(), 1, "one Note to Self group, not one per caller");
+}
+
 #[tokio::test]
 async fn ensure_note_to_self_works_offline_without_relay() {
     let alice = SonarClient::connect_in_memory(Identity::generate(), vec![])

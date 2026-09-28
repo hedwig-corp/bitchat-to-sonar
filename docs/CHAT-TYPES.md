@@ -51,13 +51,26 @@ Signal-style chat with yourself. It is a **marked pure Marmot solo group**, not 
 self-DM (`Client::start_dm` rejects self) and never mesh-folded:
 
 - Wire marker: group description `sonar.note-to-self.v1` (name `"Note to Self"`).
-- Members: only the local identity. Created via `ensure_note_to_self()` — local
-  MLS create with empty member KeyPackages; offline-safe.
-- Always pinned at the top of the Messages list on both apps.
-- Full chat surface (text/media/stickers) through the normal Marmot transcript
-  path; notifications and unread badges are suppressed for this group.
-- Identity: prefer the description marker / `is_note_to_self` over the display
-  name so a rename cannot fork the conversation.
+- Members: only the local identity. Created by `ensure_note_to_self()`: a local
+  MLS create with no member KeyPackages. No welcome is published and the live
+  resubscribe is scheduled, not awaited, so it works offline.
+- Ensure is serialized in core. Concurrent callers get one group; unlocked,
+  eight concurrent callers created duplicates in 10 of 10 runs. If duplicates
+  exist anyway (an older build, two devices on one account), the lowest group
+  id wins, so both apps agree on which one.
+- The apps call ensure only while the id is unknown or gone from the list,
+  never on every refresh: each call reads the group list.
+- Always pinned at the top of Messages: Compose via `homeMessageRows` (home
+  screen and desktop sidebar), iOS via `snPinNoteToSelfFirst`.
+- Full chat surface (text, media, stickers) through the normal Marmot
+  transcript path. Every message is your own, so no delivery path alerts for it.
+  The explicit gates on both apps also keep unread badges off.
+- Deleting it removes the group; the next refresh creates a new, empty one.
+- Identity: the description marker and group id, never the display name, so a
+  group someone else names "Note to Self" is never treated as yours.
+- Not shared with a second device on the same account: each install that
+  ensures creates its own solo group. A restore brings it back only as far as
+  chat backup restores the other chats. Both are follow-ups on #339.
 
 ## The identity model (which id are you holding?)
 
