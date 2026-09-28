@@ -384,6 +384,15 @@ qa136() { # writing to yourself: delivered, previewed, never unread (#339)
   go_home || { record QA-136 FAIL "could not reach the chat list"; return; }
   ui tapx "Note to Self"; sleep 2
   hasx "Back" || { record QA-136 FAIL "Note to Self did not open"; return; }
+  # Nobody else is in this chat: no "you and <peer>" copy, and no nudge or
+  # safety-number actions aimed at yourself.
+  [[ -n "$("$UI" find "only you can read this" 2>/dev/null)" ]] ||
+    { record QA-136 FAIL "banner does not say only you can read it"; return; }
+  ui tapx "Add to your message"; sleep 1
+  if hasx "Nudge" || hasx "Verify safety number"; then
+    record QA-136 FAIL "+ sheet offers Nudge or Verify safety number in Note to Self"; ui key 4; return
+  fi
+  ui key 4; sleep 1
   focus_composer
   ui type "qa136 note $RUN"
   ui tapx "Send" || { record QA-136 FAIL "no 'Send' control"; return; }
@@ -395,7 +404,7 @@ qa136() { # writing to yourself: delivered, previewed, never unread (#339)
   if near_label "Unread" "$ny" 120; then
     record QA-136 FAIL "your own note shows as unread"
   else
-    record QA-136 PASS "note sent; row previews it; no unread dot"
+    record QA-136 PASS "own-only banner, no nudge/verify; note sent; row previews it; no unread dot"
   fi
 }
 

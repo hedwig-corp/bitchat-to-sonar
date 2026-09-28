@@ -450,13 +450,21 @@ unread. See `docs/CHAT-TYPES.md`.
   - Both messages send.
   - The row previews the last message, has no unread dot, and no
     notification is posted.
-  - The header offers no call or pay, and nothing to add or manage members.
+  - The banner says only you can read it, and the header opens no profile.
+  - The + sheet has no Nudge, Verify safety number, Add people or Remove
+    people. The row actions say Delete, not Leave.
 - **How:**
-  - `android-smoke.sh` QA-136: send, then check the row preview and that no
+  - `android-smoke.sh` QA-136: checks the own-only banner, that the + sheet
+    has no Nudge or Verify, sends, then checks the row preview and that no
     "Unread" label sits on it.
-  - Photo and header: by hand or with `ios-drive.sh`.
+  - Photo and header on iOS: `ios-drive.sh` (`tree` inside the chat and on
+    the + sheet).
   - Guard: `NoteToSelfTest.noteToSelfNeverShowsUnreadWhileOtherChatsStillDo`.
-- **Origin:** #339 rebase QA.
+- **Origin:** #339 rebase QA:
+  - Compose said "only you and Note to Self can read this", offered Verify,
+    and its + sheet offered Nudge and Verify safety number.
+  - iOS offered Add people, Remove people, "Buzz everyone", and "Leave group"
+    in its row actions.
 
 ## Accessibility
 
