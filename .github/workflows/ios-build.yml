@@ -101,8 +101,8 @@ jobs:
               if [ "$vnum" -gt "$BESTV" ]; then BESTV=$vnum; BEST=$app; fi
             fi
           done
-          if [ "$BESTV" -lt 27 ]; then
-            echo "::error::no Xcode >= 27 in this image (best=$BESTV); bump runs-on to an image that ships it"
+          if [ "$BESTV" -lt 26 ]; then
+            echo "::error::no Xcode >= 26 in this image (best=$BESTV); bump runs-on"
             exit 1
           fi
           echo "DEVELOPER_DIR=$BEST/Contents/Developer" >> "$GITHUB_ENV"
