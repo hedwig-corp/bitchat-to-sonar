@@ -76,7 +76,11 @@ jobs:
       - name: xcodebuild (iOS Simulator)
         run: |
           set -euo pipefail
-          xcodebuild build \
+          # swift-secp256k1 0.23.x ships the audited SharedSourcesPlugin
+          # BuildToolPlugin (copies Sources/Shared into the plugin work dir);
+          # CLI validation gates it like the archive on Xcode 27 does. The flag
+          # must precede the action word — after build settings it is ignored.
+          xcodebuild -skipPackagePluginValidation build \
             -project ios/bitchat.xcodeproj \
             -scheme 'bitchat (iOS)' \
             -configuration Debug \
@@ -98,7 +102,7 @@ jobs:
             | jq -r '[.devices | to_entries[] | select(.key | test("iOS")) | .value[]
                       | select(.deviceTypeIdentifier | test("iPhone"))][0].udid')"
           test -n "$UDID" && test "$UDID" != null
-          xcodebuild test \
+          xcodebuild -skipPackagePluginValidation test \
             -project ios/bitchat.xcodeproj \
             -scheme 'bitchat (iOS)' \
             -configuration Debug \
