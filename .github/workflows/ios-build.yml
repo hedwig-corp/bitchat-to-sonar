@@ -87,29 +87,30 @@ jobs:
       # Build on the toolchain that actually ships to TestFlight; probe
       # every Xcode in the image by reported version, not by app-name
       # glob, and fail loudly rather than drifting to an older default.
-      - name: Select the shipping Xcode
+      # Trust the image's own default toolchain (the one the image provisions
+      # complete — hand-picked non-default copies can be missing platform
+      # components or abort on -version: runs 36473251407, 36478985931).
+      # Verify it, gate on the generation the package's traits need, print
+      # the evidence; the day the image promotes 27 this follows for free.
+      - name: Verify the default Xcode
         run: |
           set -euo pipefail
           ls -d /Applications/Xcode*.app
-          BEST=""; BESTV=0
-          for app in /Applications/Xcode*.app; do
-            xb="$app/Contents/Developer/usr/bin/xcodebuild"
-            if [ -x "$xb" ]; then
-              # Some image copies abort (exit 134) on -version; || true keeps
-              # that from killing the probe under pipefail + set -e.
-              v="$( { "$xb" -version 2>/dev/null || true; } | awk '/Xcode/{print $2; exit}' )"
-              vnum="${v%%.*}"
-              case "$vnum" in ''|*[!0-9]*) vnum=0 ;; esac
-              if [ "$vnum" -gt "$BESTV" ]; then BESTV=$vnum; BEST=$app; fi
-            fi
-          done
-          echo "probed: best=$BESTV ($BEST)"
-          if [ "$BESTV" -lt 26 ]; then
-            echo "::error::no Xcode >= 26 in this image (best=$BESTV); bump runs-on"
+          DEV="$(/usr/bin/xcode-select -p 2>/dev/null || true)"
+          if [ -z "$DEV" ] || [ ! -x "$DEV/usr/bin/xcodebuild" ]; then
+            DEV=/Applications/Xcode.app/Contents/Developer
+          fi
+          XB="$DEV/usr/bin/xcodebuild"
+          test -x "$XB"
+          v="$( { "$XB" -version 2>/dev/null || true; } | awk '/Xcode/{print $2; exit}' )"
+          vnum="${v%%.*}"; case "$vnum" in ''|*[!0-9]*) vnum=0 ;; esac
+          echo "default toolchain: $DEV (Xcode $v)"
+          if [ "$vnum" -lt 26 ]; then
+            echo "::error::default Xcode too old for the traits in swift-secp256k1 0.23.x (got $v); bump runs-on"
             exit 1
           fi
-          echo "DEVELOPER_DIR=$BEST/Contents/Developer" >> "$GITHUB_ENV"
-          "$BEST/Contents/Developer/usr/bin/xcodebuild" -version
+          test -d "$DEV/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk"
+          echo "DEVELOPER_DIR=$DEV" >> "$GITHUB_ENV"
 
       - name: xcodebuild (iOS Simulator)
         run: |
