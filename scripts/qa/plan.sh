@@ -43,7 +43,7 @@ fi
 
 # --- areas -----------------------------------------------------------------
 ios=0 android=0 core=0 corelib=0 wallet=0 breez=0 messaging=0 share=0 localtime=0
-ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0
+ui=0 i18n=0 perf=0 transcript=0 code=0 harness=0 ffi=0 mirror_kt=0 mirror_swift=0
 while IFS= read -r f; do
   b="${f##*/}"   # keyword areas match the file name: every Compose path contains "chat/bitchat"
   case "$f" in
@@ -54,6 +54,8 @@ while IFS= read -r f; do
   esac
   case "$f" in core/sonar-core/src/*) corelib=1 ;; esac
   case "$f" in scripts/qa/*) harness=1 ;; esac
+  case "$f" in core/sonar-ffi/src/*) ffi=1 ;; esac
+  case "$b" in SonarAppState.kt) mirror_kt=1 ;; SonarAppStore.swift) mirror_swift=1 ;; esac
   case "$f" in core/sonar-wallet*|*/wallet/*|*SonarWalletKit*) wallet=1 ;; esac
   case "$b" in *wallet*|*cashu*|*breez*|*unify*|*SonarPay*|*payment*) wallet=1 ;; esac
   case "$f" in core/sonar-wallet-breez/*) breez=1 ;; esac
@@ -93,7 +95,7 @@ breez_key=0
 
 echo "base: $BASE ($(git rev-parse --short "$MB")) · $(wc -l <<< "$changed" | tr -d ' ') changed files"
 areas=""
-for a in core wallet breez messaging transcript share localtime ui i18n perf harness; do
+for a in core ffi wallet breez messaging transcript share localtime ui i18n perf harness; do
   (( ${!a} )) && areas+=" $a"
 done
 printf 'areas:%s' "${areas:- (none)}"
@@ -122,6 +124,15 @@ run "T0  scripts/check-rng-hygiene.sh"
 (( ios )) && run "T0  scripts/check-stateobject-init.sh"
 (( share && ios )) && run "T0  scripts/check-share-extension-resources.sh"
 (( i18n )) && run "T0  python3 scripts/i18n/xcstrings_to_compose.py --check"
+if (( ffi )); then
+  # CI rebuilds the iOS core and fails on any drift in the committed bindings.
+  # A doc-comment edit on an exported item changes them too.
+  if (( xcode )) && have cargo; then
+    run "T1  core/build-ios.sh && git diff --exit-code -- ios/localPackages/SonarCore/Sources/SonarFFI.swift   # commit the regenerated file"
+  else
+    not "Swift bindings drift check: core/sonar-ffi changed, and regenerating SonarFFI.swift needs macOS + Xcode + Rust; CI will run it"
+  fi
+fi
 
 # Tier 1 — unit and UI tests at the call site (minutes).
 if (( core )); then
@@ -201,6 +212,10 @@ if (( wallet )); then
   (( breez_key )) || not "Legacy Breez wallet scenarios (QA-123): no Breez key in local config"
 fi
 (( messaging || core )) && WALK+=("docs/REGRESSIONS.md — the invariants this change must keep, on both platforms")
+(( messaging )) && WALK+=("docs/CHAT-TYPES.md — test both chat kinds (pure Marmot and mesh-folded)")
+if (( mirror_kt != mirror_swift )); then
+  WALK+=("Mirror pair changed on ONE side ($([[ $mirror_kt == 1 ]] && echo SonarAppState.kt || echo SonarAppStore.swift) only): check the other app has the same behaviour, or name the gap in the PR")
+fi
 (( code && ! messaging && ! share && ! localtime && ! ui && ! perf && ! wallet )) &&
   WALK+=("Messaging QA-001, QA-002 as a sanity pass: every build must still send and receive")
 
