@@ -60,7 +60,7 @@ import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.PendingOpenConversation
 import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.SonarScreenHost
-import chat.bitchat.sonar.mergeHomeMessageRows
+import chat.bitchat.sonar.homeMessageRows
 import chat.bitchat.sonar.muteChatIdFor
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.ui.SonarTheme
@@ -350,12 +350,7 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
             if (chatRows.isEmpty() && meshRows.isEmpty()) {
                 item { EmptyHint("No secure chats yet — use Search to paste an npub and start one.") }
             }
-            val mergedRows = pinNoteToSelfHomeRows(
-                mergeHomeMessageRows(meshRows, chatRows) { chatId ->
-                    state.marmotRow(chatId).tsSecs
-                },
-                noteToSelfGroupId = state.noteToSelfId(),
-            )
+            val mergedRows = state.homeMessageRows(meshRows, chatRows)
             items(mergedRows, key = { it.listKey }) { homeRow ->
                 when (homeRow) {
                     is HomeMessageRow.Mesh -> {

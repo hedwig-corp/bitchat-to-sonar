@@ -888,12 +888,6 @@ expect object SonarCore {
     /** Ensure the local Note to Self solo Marmot group exists. Offline-safe. */
     suspend fun ensureNoteToSelf(): String
 
-    /** Return the Note to Self group id when already present. */
-    suspend fun findNoteToSelf(): String?
-
-    /** True when [chatId] is this account's Note to Self conversation. */
-    suspend fun isNoteToSelf(chatId: String): Boolean
-
     /** Start a multi-member group with peers (npub or hex). Returns chat id. */
     suspend fun startGroup(members: List<String>, name: String): String
 

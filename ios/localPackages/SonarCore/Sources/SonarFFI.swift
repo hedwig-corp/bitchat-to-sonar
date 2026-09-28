@@ -2043,6 +2043,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func drainPendingMarmot() throws  -> [DrainNotificationInfo]
 
     /**
+     * Ensure the local Note to Self solo Marmot group exists. Offline-safe.
+     * Returns the group id as hex.
+     */
+    func ensureNoteToSelf() throws  -> String
+
+    /**
      * Re-subscribe with the current watermark and group set to self-heal
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
@@ -2875,6 +2881,18 @@ open func drainDirectDms() -> [DirectDmInfo]  {
 open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
     return try  FfiConverterSequenceTypeDrainNotificationInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_drain_pending_marmot(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * Ensure the local Note to Self solo Marmot group exists. Offline-safe.
+     * Returns the group id as hex.
+     */
+open func ensureNoteToSelf()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_ensure_note_to_self(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -11310,6 +11328,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_note_to_self() != 19450) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 56161) {

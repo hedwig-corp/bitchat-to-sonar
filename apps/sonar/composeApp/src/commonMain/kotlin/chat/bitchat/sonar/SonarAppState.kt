@@ -74,6 +74,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.TimeSource
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.note_to_self
 import chat.bitchat.sonar.resources.your_address_now_pays_your_new_wallet
 import chat.bitchat.sonar.resources.your_address_pays_your_old_wallet_again
 import chat.bitchat.sonar.resources.your_new_wallet_isn_t_ready_yet_try
@@ -908,9 +909,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     private var localCoreReady = false
     var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
+        private set
     /** Real MLS group id for Note to Self once [ensureNoteToSelf] completes. */
     private var noteToSelfGroupId by mutableStateOf<String?>(null)
-        private set
+    /** Localized row title, resolved once off the render path (getString suspends). */
+    private var noteToSelfTitle = NOTE_TO_SELF_TITLE
+    private var noteToSelfTitleResolved = false
     /** Encrypted timezone controls projected from the core's local cache. */
     /** MLS group hex → canonical member key → zone that member shared into
      *  that group. Sharing is per chat, so a lookup always names the group. */
@@ -6836,7 +6840,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  is blank, so fall back to the counterpart's short npub — never an empty
      *  title. Mirrors iOS `MarmotChatModel.title(for:)`. */
     fun chatTitle(chat: SonarChat): String {
-        if (isNoteToSelfChat(chat, noteToSelfGroupId)) return NOTE_TO_SELF_TITLE
+        if (isNoteToSelfChat(chat, noteToSelfGroupId)) return noteToSelfTitle
         pendingMarmotNpub(chat.id)?.let { pending ->
             profilesByNpub[canonicalProfileKey(pending)]?.bestName?.let { return it }
             return shortNpub(pending)
@@ -7144,6 +7148,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun openChat(chat: SonarChat, jumpMessageId: String? = null) {
+        if (chat.id == PENDING_NOTE_TO_SELF_ID) {
+            // The placeholder row paints before the solo group exists. Ensure
+            // is local (no relay), so create it and open the real chat rather
+            // than a transcript for an id no send can reach.
+            scope.launch {
+                val id = runCatching { SonarCore.ensureNoteToSelf() }.getOrNull() ?: return@launch
+                noteToSelfGroupId = id
+                val real = chats.firstOrNull { it.id == id }
+                    ?: SonarChat(id = id, name = noteToSelfTitle, members = listOf(npub))
+                openChat(real, jumpMessageId)
+            }
+            return
+        }
         // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
         // empty home leftover messages, then rebuild when the page lands.
         noteTranscriptOpen("marmot", chat.id, "begin", emptyList())
@@ -12305,6 +12322,24 @@ class SonarAppState(private val scope: CoroutineScope) {
      * pass with the gate deleted. That is not hypothetical: it is how the first
      * version of this test passed while the bug was fully restorable.
      */
+    /**
+     * Seeds a Note to Self group next to [others], as the refresh path leaves it
+     * once ensure has answered. `chats`, `unreadByChat` and the Note to Self id
+     * have private setters; the pin and the unread gate can only be pinned at
+     * their real call sites with all three in place.
+     */
+    internal fun seedNoteToSelfForTest(
+        noteId: String,
+        others: List<SonarChat>,
+        unread: Map<String, Long>,
+        latestSecs: Map<String, Long>,
+    ) {
+        chats = listOf(SonarChat(id = noteId, name = "Note to Self", members = listOf(npub))) + others
+        noteToSelfGroupId = noteId
+        unreadByChat = unread
+        chatSnapshotLatestByChat = latestSecs
+    }
+
     internal fun seedCallableChatForTest(chatId: String, peerNpub: String, descriptor: SonarDescriptor) {
         chats = listOf(SonarChat(id = chatId, name = "Peer", members = listOf(peerNpub, npub)))
         // Keyed exactly the way the lookup keys it. Keying it by the bech32 npub
@@ -13004,17 +13039,25 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun refreshChatsInner() {
         val previousOrder = chats.map { it.id }
-        // Note to Self is offline-safe (solo MLS group); ensure before listing
-        // so the pinned row can open/send without waiting on relays.
-        if (localCoreReady || started) {
-            runCatching { SonarCore.ensureNoteToSelf() }
-                .onSuccess { noteToSelfGroupId = it }
-                .onFailure {
-                    noteToSelfGroupId = runCatching { SonarCore.findNoteToSelf() }.getOrNull()
-                        ?: noteToSelfGroupId
-                }
+        var loadedChats = SonarCore.chats()
+        // Note to Self is a local solo MLS group, so ensuring it never waits on
+        // relays. Ensure only while its id is unknown or gone from the list
+        // (deleted, wiped): each ensure reads the group list, and this refresh
+        // runs on every conversation change.
+        val knownNoteToSelf = noteToSelfGroupId
+        if ((localCoreReady || started) &&
+            (knownNoteToSelf == null || loadedChats.none { it.id == knownNoteToSelf })
+        ) {
+            if (!noteToSelfTitleResolved) {
+                noteToSelfTitle = runCatching { getString(Res.string.note_to_self) }
+                    .getOrDefault(NOTE_TO_SELF_TITLE)
+                noteToSelfTitleResolved = true
+            }
+            runCatching { SonarCore.ensureNoteToSelf() }.onSuccess { id ->
+                noteToSelfGroupId = id
+                if (loadedChats.none { it.id == id }) loadedChats = SonarCore.chats()
+            }
         }
-        val loadedChats = SonarCore.chats()
         val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
         val summaries = if (localChats.isEmpty()) emptyList() else runCatching {

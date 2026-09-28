@@ -1982,6 +1982,10 @@ pub struct SonarClient {
     /// state, so two interleaved publishes could decide from state the other
     /// is mid-way through changing.
     profile_publish_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `ensure_note_to_self`'s find-then-create: both apps ensure
+    /// from refresh paths that can overlap on a cold start, and two unlocked
+    /// callers would each find nothing and create a second solo group.
+    note_to_self_lock: Arc<Mutex<()>>,
     /// Persistent Marmot DB path for auto-backup dirty marks (None in-memory).
     marmot_db_path: Option<PathBuf>,
     /// Atomic throttle + single-flight gate for the per-group catch-up pass;
@@ -2517,6 +2521,7 @@ impl SonarClient {
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
             profile_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
+            note_to_self_lock: Arc::new(Mutex::new(())),
             marmot_db_path: None,
             group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
         };
@@ -3237,11 +3242,16 @@ impl SonarClient {
     }
 
     /// Ensure the Signal-style Note to Self conversation exists: a solo MLS
-    /// group marked with [`SONAR_NOTE_TO_SELF_DESCRIPTION`]. Local-only — no
-    /// KeyPackage fetch or welcome publish — so it can complete offline.
+    /// group marked with [`SONAR_NOTE_TO_SELF_DESCRIPTION`].
     ///
-    /// Idempotent: returns the existing marked solo group when present.
+    /// Local-only: no KeyPackage fetch, no welcome, and the live-subscription
+    /// refresh is scheduled rather than awaited, so the row paints and accepts
+    /// sends offline (XChat-style startup rule). `publish_group_creation` is
+    /// not used because it awaits the relay resubscribe.
+    ///
+    /// Idempotent and serialized: concurrent callers get the same group.
     pub async fn ensure_note_to_self(&self) -> Result<GroupId> {
+        let _ensure = self.note_to_self_lock.lock().unwrap();
         if let Some(existing) = self.find_note_to_self_group()? {
             return Ok(existing);
         }
@@ -3251,31 +3261,48 @@ impl SonarClient {
             Vec::new(),
             self.relays.clone(),
         )?;
-        self.publish_group_creation(creation).await
+        let group_id = creation.group.mls_group_id;
+        if let Err(err) = self.engine.merge_pending_commit(&group_id) {
+            self.discard_unpublished_group_creation(&group_id);
+            return Err(err);
+        }
+        self.ensure_index_for_group(&group_id, SONAR_NOTE_TO_SELF_NAME);
+        self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
+        self.schedule_resubscribe_marmot_groups_if_live();
+        Ok(group_id)
     }
 
     /// Return the Note to Self group id when a marked solo group already exists.
+    ///
+    /// Only groups carrying the marker pay for a member read, so this stays
+    /// cheap with many chats. If more than one marked solo group exists (an
+    /// older build without the ensure lock, or two devices on one account),
+    /// the lowest group id wins, so every caller agrees on the same row.
     pub fn find_note_to_self_group(&self) -> Result<Option<GroupId>> {
-        let groups = self.engine.groups()?;
         let me = self.identity().public_key();
-        for group in groups {
+        let mut found: Option<GroupId> = None;
+        for group in self.engine.groups()? {
+            if group.description != SONAR_NOTE_TO_SELF_DESCRIPTION {
+                continue;
+            }
             let members = self.engine.members(&group.mls_group_id)?;
-            if Self::is_note_to_self_group(&group, &members, &me) {
-                return Ok(Some(group.mls_group_id));
+            if !Self::is_note_to_self_group(&group, &members, &me) {
+                continue;
+            }
+            if found
+                .as_ref()
+                .is_none_or(|f| group.mls_group_id.as_slice() < f.as_slice())
+            {
+                found = Some(group.mls_group_id);
             }
         }
-        Ok(None)
+        Ok(found)
     }
 
-    /// True when `group` is this identity's Note to Self conversation.
+    /// True when `group_id` is this account's Note to Self conversation (the
+    /// one [`Self::find_note_to_self_group`] answers, not merely any marked group).
     pub fn is_note_to_self_group_id(&self, group_id: &GroupId) -> Result<bool> {
-        let groups = self.engine.groups()?;
-        let Some(group) = groups.into_iter().find(|g| g.mls_group_id == *group_id) else {
-            return Ok(false);
-        };
-        let members = self.engine.members(group_id)?;
-        let me = self.identity().public_key();
-        Ok(Self::is_note_to_self_group(&group, &members, &me))
+        Ok(self.find_note_to_self_group()?.as_ref() == Some(group_id))
     }
 
     fn is_note_to_self_group(
