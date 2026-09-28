@@ -30,7 +30,13 @@ concurrency:
 jobs:
   ios-build:
     name: iOS app builds
-    runs-on: macos-15
+    # macos-15-arm64 tops out at Xcode 16.4 (run 36473251407 printed the
+    # whole catalog) and 16.x has no traits support, so the trait-gated C
+    # sources of swift-secp256k1 0.23.x never compile and the app fails to
+    # link. The floor must build on the toolchain the TestFlight archive is
+    # built on (27); the Select step below probes the image and refuses
+    # anything older.
+    runs-on: macos-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
