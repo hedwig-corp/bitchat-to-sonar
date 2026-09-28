@@ -418,13 +418,11 @@ unread. See `docs/CHAT-TYPES.md`.
      onboard with the network off.
   2. Have a peer message the app, so another chat is newer.
   3. Relaunch the app.
-  4. Delete Note to Self from its row actions.
 - **Expect:**
   - After step 1, a "Note to Self" row sits at the top without waiting for
     relays.
   - After step 2, it stays first even though the other chat is newer.
   - After step 3, there is still exactly one Note to Self row.
-  - After step 4, it comes back empty at the top.
 - **How:**
   - `android-smoke.sh` QA-135: first row and one row, before and after a
     relaunch.
@@ -446,6 +444,7 @@ unread. See `docs/CHAT-TYPES.md`.
   2. Send a text, then a photo.
   3. Go back to Messages.
   4. Open the chat header and the + sheet.
+  5. Delete Note to Self from its row actions.
 - **Expect:**
   - Both messages send.
   - The row previews the last message, has no unread dot, and no
@@ -453,10 +452,13 @@ unread. See `docs/CHAT-TYPES.md`.
   - The banner says only you can read it, and the header opens no profile.
   - The + sheet has no Nudge, Verify safety number, Add people or Remove
     people. The row actions say Delete, not Leave.
+  - Delete removes the notes, with copy that mentions no other person, and
+    Note to Self comes back empty at the top.
 - **How:**
   - `android-smoke.sh` QA-136: checks the own-only banner, that the + sheet
-    has no Nudge or Verify, sends, then checks the row preview and that no
-    "Unread" label sits on it.
+    has no Nudge or Verify, sends, checks the row preview and that no
+    "Unread" label sits on it, then deletes from the row and checks the note
+    is gone and Note to Self is back.
   - Photo and header on iOS: `ios-drive.sh` (`tree` inside the chat and on
     the + sheet).
   - Guard: `NoteToSelfTest.noteToSelfNeverShowsUnreadWhileOtherChatsStillDo`.
@@ -465,6 +467,9 @@ unread. See `docs/CHAT-TYPES.md`.
     and its + sheet offered Nudge and Verify safety number.
   - iOS offered Add people, Remove people, "Buzz everyone", and "Leave group"
     in its row actions.
+  - On Compose, Delete called leaveGroup (not a direct chat, so treated as a
+    group); its only member cannot leave, so the note stayed. The dialog also
+    said "the other person isn't notified".
 
 ## Accessibility
 
