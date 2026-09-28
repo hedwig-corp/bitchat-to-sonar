@@ -1,15 +1,65 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.14.0 (44)** · release tag **v0.1-alpha.14**
+Build: **Sonar 1.15.0 (45)** · release tag **v0.1-alpha.15**
 
-First alpha.14 cut after the 13.x hotfix train. Headline since 13.3: **group
-@mention chips/picker match the design** (#601), **Android bubble send time
-no longer clipped** (#600). Also still exercise: Android chat-open stability
-(#597/#599), reply-to-message, short-transcript + keyboard on iOS, Signal-style
-scroll/Home invalidation. Opening a chat should paint from local storage first;
+First alpha.15 cut after alpha.14. Headline: **the wallet is now Cashu —
+Breez is legacy** (#614), plus **emoji reactions on messages** (Marmot kind-7,
+iOS picker + chips), **your local time shared privately in encrypted chats**
+(#607), **Note to Self**, and the share-extension fixes that **send the file,
+not its path**. Opening a chat should still paint from local storage first;
 missed messages catch up in the background.
 
-## 1. Sync speed & catching up (headline)
+## 1. Cashu wallet (headline)
+
+- Updating from 1.14.x: **identity, nickname, contacts survive** and the
+  wallet comes up as **Cashu** — balance visible in sats (USD where shown).
+- Mint offline: the app retries the mint quietly in the background; no stuck
+  “connecting” state, no crash, and it recovers when the mint is reachable.
+- Send and receive a payment in a chat: the bubble moves sending → paid;
+  activity list newest-first with amount, peer, rail, fee, status.
+- **Offer backup / restore**: reinstall the app, restore the account — the
+  wallet **re-publishes its backed-up offer / payment address, not a brand-new
+  one**, so a peer holding your old address can still pay you.
+- Paying a peer with **no** published payment address is blocked, not a crash.
+- A nearby **Unify send shows its amount and fee before you pay**.
+- Legacy Breez: if you used the old wallet before this update, confirm the
+  old balance/identity survived or migrated as expected — report anything
+  that looks wrong either way.
+
+## 2. Reactions (new)
+
+- Long-press a message → reaction picker; pick an emoji → a chip appears on
+  the bubble, and the peer sees the same reaction.
+- Add a second reaction, change it, remove it — state agrees on both devices
+  and after reopening the chat.
+- Mixed content (emoji, long text, links) **with reactions** renders without
+  crashing, including in short chats opened with the keyboard up.
+
+## 3. Private local time (new, #607)
+
+- In an encrypted chat, message times reflect your local time; a peer sees a
+  time, not your raw timezone leak beyond what the setting allows.
+- Settings can **revoke local time** — after revoking, timestamps stop
+  exposing it; the toggle has a proper accessibility label.
+
+## 4. Note to Self (new)
+
+- Home always carries your pinned **Note to Self** — a solo chat that is
+  **local-only**: nothing is relayed to peers.
+- Write, edit and delete notes; **no peer or group actions** inside it (no
+  invites, no member list).
+- Delete it from its row → it comes back later, **empty**, still pinned.
+
+## 5. Share extension (iOS)
+
+- Share a **document** (pdf/zip) from another app into Sonar: the peer
+  receives the **actual file**, not a path, and can open it.
+- Sharing a **directory** is refused cleanly — no recursive-copy hang.
+- The chat offers the share you just made; a document is **never sent twice**.
+- Cold-share: accept a share while Sonar is fully closed — the chat opens with
+  the pending share intact (QA-092).
+
+## 6. Sync speed & catching up
 
 Missed messages should arrive quickly on wake/foreground, and one chat’s
 activity must never hold back another’s resync.
@@ -24,10 +74,8 @@ activity must never hold back another’s resync.
   (a newer send elsewhere must not skip them).
 - Fire several messages in a row; sending stays snappy and is not blocked
   behind background sync.
-- On Android/desktop: after a welcome creates a group or a live event arrives,
-  the open chat / list should refresh within seconds without a manual pull.
 
-## 2. Home list & conversation correctness
+## 7. Home list & conversation correctness
 
 - Home / Messages should order by **latest activity across transports** (mesh +
   relay), not leave a busy chat buried under an idle one.
@@ -36,72 +84,55 @@ activity must never hold back another’s resync.
 - Peer **nickname changes** should update list + transcript (not stick on the
   old name or a raw key).
 - You should **not** get spammy system “reconnected” alerts when BLE flaps.
+- A chat row whose cell kind changes (e.g. gains a reaction) **reloads** —
+  no stale half-rendered bubble.
 
-## 3. Multi-photo & media
+## 8. Media
 
-- Send **multiple photos** in one go: the transcript should show an album-style
-  card deck (xChat-style), not only a single image bubble.
+- Send **multiple photos** in one go: the transcript shows an album-style card
+  deck (xChat-style), not only a single image bubble.
 - Open the album / individual photos fullscreen; confirm save still works.
 - Animated GIFs still **animate** (not a frozen frame).
-- Stickers still send/receive (sticker kinds were moved to 30031/10031 — old
-  packs may need a re-publish if something looks empty).
-- Reopen a chat with stickers / attachments: previews should appear from
-  **local cache** immediately, not wait on Blossom/network.
-- In a **folded** mesh+relay chat, scroll up to load older history — older
-  pages must keep loading (not stop after the first window).
+- Reopen a chat with stickers / attachments: previews appear from **local
+  cache** immediately, not waiting on the network.
 
-## 4. Stability / crash fixes
+## 9. Stability / crash fixes
 
 - Mixed content (emoji, long text, links, reactions) renders without crashing.
 - Open a chat, **lock the phone** 30–60s, unlock — app should still be running
-  and the chat intact (no 0xdead10cc / cold relaunch from wallet work).
+  and the chat intact.
 - Send or receive a **payment**, then immediately lock or background for a
   minute. Come back: no crash, correct payment state.
 - Leave the app backgrounded several minutes locked, then reopen — resume, not
   crash-loop.
 
-## 5. Wallet & offline payments
-
-- After update: **identity, nickname, contacts, and wallet balance** survive.
-- Published **BOLT12 offer / payment address** still set; you remain payable
-  after reconnect / rename (offer must not get wiped by a later publish).
-- **Offline payments**: pay a peer whose app is closed/backgrounded; your
-  bubble moves sending → paid; they get woken to receive.
-- Direct wallet payments: gold payment bubble appears immediately; activity
-  list newest-first with amount, peer, rail, fee, status. Paying a peer with
-  **no** payment address is blocked, not a crash.
-
-## 6. Notifications
+## 10. Notifications
 
 - App backgrounded: message and payment produce **meaningful** notifications
-  (who/what), not generic placeholders; privacy toggle changes lock-screen
-  detail.
+  (who/what) — the undecorated generic placeholders are silenced (#604);
+  privacy toggle changes lock-screen detail.
 - Push wake / foreground should kick Marmot relay sync so chats catch up after
   a notification.
 
-## 7. Diagnostics (please use this)
+## 11. Diagnostics (please use this)
 
 - **Settings → Diagnostics → Share** exports a log.
 - Try verbose + privacy/redaction levels; confirm a shareable file is produced.
 - After slow sync, missing message, or crash: export **right away** and attach
   to the report.
 
-## 8. Account key durability
+## 12. Account key durability & restore
 
 - Updating must **not** mint a new account / nsec. If prefs are lost but the
-  keychain key remains, you should recover into the same account, not onboarding.
-
-## 8b. Restore account (nsec)
-
+  keychain key remains, you should recover into the same account, not
+  onboarding.
 - Fresh install: onboarding shows a clear **Restore account with private key**
-  button (not easy to miss). Paste a valid `nsec1…` → same identity + wallet
-  balance after Breez sync. If you previously used **Backup chats**, Marmot
-  history comes back from Blossom; otherwise local chats start empty.
-- Settings → **Backup chats**: uploads an encrypted Marmot backup (needs
-  network). Settings → **Restore account**: replace the current account with a
-  pasted nsec; confirm wipe; wallet rebuilds from that key; chats restore from
-  Blossom when a backup exists.
-- Invalid nsec shows an error and does not corrupt the current account.
+  button. Paste a valid `nsec1…` → same identity, and the **Cashu wallet
+  rebuilds from that key**; if you previously used **Backup chats**, Marmot
+  history comes back from Blossom.
+- Settings → **Backup chats** uploads an encrypted Marmot backup (needs
+  network). Invalid nsec shows an error and does not corrupt the current
+  account.
 
 ## Regression pass (still expected)
 
@@ -110,13 +141,18 @@ activity must never hold back another’s resync.
   missed-call rows.
 - Voice notes play on the platform you test (iOS / Android / desktop).
 - Profile edit on iOS matches Compose (name / photo) where parity shipped.
+- Multi-line composer grows as you type and collapses again when cleared.
+- With VoiceOver on, the chat and header buttons carry proper labels.
 
 ## Known gaps
 
 - Some newer payment/onboarding/safety-number strings are **English-only**;
   other languages fall back to English — expected, not a bug.
 - In-app QR camera scanning may still be limited; paste/share links work.
-- Archive for this cut was verified as a valid **iOS App Archive** (single
+- The Cashu migration keeps Breez as the legacy rail: peers on older builds
+  may still be reachable over it; flag anything that looks like a lost
+  balance rather than a display lag.
+- Archive for this cut must be verified as a valid **iOS App Archive** (single
   `Sonar.app`, both extensions in `PlugIns`, `ApplicationProperties` present).
   TestFlight upload still needs App Store Connect distribution signing via
   Xcode Organizer / `xcodebuild -exportArchive`.

@@ -1,12 +1,13 @@
-MARKETING_VERSION = 1.14.0
+MARKETING_VERSION = 1.15.0
 // App Store Connect rejects a second upload of a (MARKETING_VERSION,
 // CURRENT_PROJECT_VERSION) pair it has already accepted — it fails the
 // whole submission with "the state of the relationship 'buildUpload'".
 // A re-archive of the same marketing version therefore needs a fresh build
 // number, even when no source changed. 35 was consumed on 2026-07-31.
 // v0.1-alpha.13 shipped as 1.13.0/41; alpha.13.1 pre-14 cut uses build 42.
-// v0.1-alpha.14 ships as 1.14.0/44 (after 13.2 build 43).
-CURRENT_PROJECT_VERSION = 44
+// v0.1-alpha.14 shipped as 1.14.0/44 (after 13.2 build 43).
+// v0.1-alpha.15 ships as 1.15.0/45 (Cashu-wallet cut; TestFlight iOS + macOS).
+CURRENT_PROJECT_VERSION = 45
 
 IPHONEOS_DEPLOYMENT_TARGET = 16.0
 MACOSX_DEPLOYMENT_TARGET = 15.0
