@@ -1258,7 +1258,7 @@
 			repositoryURL = "https://github.com/21-DOT-DEV/swift-secp256k1";
 			requirement = {
 				kind = exactVersion;
-				version = 0.21.1;
+				version = 0.23.2;
 			};
 		};
 		FCE6EED212F8EC310C71459F /* XCRemoteSwiftPackageReference "breez-sdk-liquid-swift" */ = {

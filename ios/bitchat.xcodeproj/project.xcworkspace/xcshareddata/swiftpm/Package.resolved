@@ -1,5 +1,5 @@
 {
-  "originHash" : "4cf35ecc06c0c563624dcf8f28bb1ac218a372ddb6d9d9c28d4fd839f4c8b3e5",
+  "originHash" : "940337506882b6f5100c7d11b4f85c5c69a08e621fe1750c9fd2ae1dcfa6af04",
   "pins" : [
     {
       "identity" : "abseil-cpp-binary",
@@ -141,8 +141,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/21-DOT-DEV/swift-secp256k1",
       "state" : {
-        "revision" : "8c62aba8a3011c9bcea232e5ee007fb0b34a15e2",
-        "version" : "0.21.1"
+        "revision" : "e70a10e036a55fffea31568f0af92d69b6d449cd",
+        "version" : "0.23.2"
       }
     }
   ],
