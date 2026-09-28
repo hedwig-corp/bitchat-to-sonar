@@ -611,18 +611,29 @@ dials them (`link <tag>: up`, QA-128…084).
 - **Expect:** `Noise handshake started` then `ESTABLISHED` on the desktop, the
   phone shows the desktop as in range, both DMs arrive over Bluetooth.
 - **Guard:** `DesktopMeshInteropTest.aDesktopThatDialsAPhoneStartsTheHandshake`
-- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-128` (needs a connected phone; asserts on the phone's logcat too)
+- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-128` (needs a connected
+  phone; the phone's own delivery receipt for the DM is the far-side assertion,
+  so a desktop that only claims to have sent cannot pass)
 
 ### QA-129 — A dropped link is re-handshaken, not left half-dead
 - **Platforms:** desktop Linux ↔ Android (automated; hardware scripted)
 - **Steps:** QA-128 linked; toggle Bluetooth on the phone (or walk out of range
   and back); DM each way once the phone reappears.
-- **Expect:** `link to <name> dropped → Noise session reset`, a fresh handshake
-  on the new link, both DMs delivered. Android drops its Noise state with the
-  GATT connection and never initiates toward a central, so a kept session
-  showed the phone in range while every DM was silently discarded.
+- **Expect:** a fresh handshake on the new link and both DMs delivered. Android
+  drops its Noise state with the GATT connection and never initiates toward a
+  central, so a kept session showed the phone in range while every DM was
+  silently discarded.
+- **Note:** `link to <name> dropped → Noise session reset` appears only for a
+  link the desktop dialed. When the phone dialed us, bluster stubs the
+  disconnect callback, so the desktop cannot see the link go down and holds the
+  session until the phone's fresh m1 resets it (`re-handshake … → resetting
+  session`). Delivery after the outage is therefore the assertion; the
+  intermediate "session gone" state is not observable on that path, and
+  requiring it fails a link that recovers correctly.
 - **Guard:** `DesktopMeshInteropTest.aDroppedLinkIsRehandshakenNotLeftHalfDead`
-- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-129` (needs a connected phone; asserts on the phone's logcat too)
+- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-129` (needs a connected
+  phone; it pulls the phone's radio only once a Noise link really exists, then
+  restores it — nothing is installed or wiped)
 - **Origin:** D2 (#612 QA)
 
 ### QA-130 — Two phones in range link independently
@@ -667,8 +678,10 @@ dials them (`link <tag>: up`, QA-128…084).
   fragments of 205 bytes, which the desktop neither reassembled nor produced,
   so every long DM from a phone vanished silently.
 - **Guard:** `DesktopMeshInteropTest.aLongDmCrossesInBothDirections` (the
-- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-134` (needs a connected phone; asserts on the phone's logcat too)
   simulated radio enforces a 517-byte ATT MTU)
+- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-134` (needs a connected
+  phone; a 520-char DM is sent and the phone's own delivery receipt is the
+  proof it reassembled the fragments)
 - **Origin:** D7 (#612 QA — pre-existing, older than the central link)
 
 ## Settings
