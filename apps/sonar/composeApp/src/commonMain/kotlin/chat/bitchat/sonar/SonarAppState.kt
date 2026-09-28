@@ -7459,7 +7459,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
-        val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
+        // Note to Self is not direct, but it is no group to leave either: its
+        // only member cannot leave, so it takes the local delete, and the next
+        // refresh starts it again empty.
+        val isGroup = !isNoteToSelfChat(chatId) &&
+            chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         // A deduped direct row can represent several duplicate Marmot groups for
         // the same peer; delete the whole set so hidden duplicates don't resurface.
         val deleteIds = if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)

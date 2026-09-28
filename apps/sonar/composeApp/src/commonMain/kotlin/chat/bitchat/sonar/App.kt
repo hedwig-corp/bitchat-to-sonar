@@ -710,6 +710,7 @@ private fun HomeScreen(state: SonarAppState) {
         DeleteChatSheet(
             name = t.name,
             isGroup = t.isGroup,
+            isNoteToSelf = !t.isMesh && state.isNoteToSelfChat(t.id),
             onDelete = {
                 if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
                 pendingDelete = null
@@ -910,7 +911,13 @@ private fun WipeConfirmSheet(onWipe: () -> Unit, onClose: () -> Unit) {
 internal data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean, val isGroup: Boolean)
 
 @Composable
-internal fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit, onClose: () -> Unit) {
+internal fun DeleteChatSheet(
+    name: String,
+    isGroup: Boolean,
+    onDelete: () -> Unit,
+    onClose: () -> Unit,
+    isNoteToSelf: Boolean = false,
+) {
     val s = sonar
     TransientBackHandler(onClose)
     Box(
@@ -922,7 +929,9 @@ internal fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Uni
                 Text(if (isGroup) "Leave this group?" else "Delete this chat?", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    if (isGroup) {
+                    if (isNoteToSelf) {
+                        "Deletes your notes from this device. Note to Self starts again, empty."
+                    } else if (isGroup) {
                         "Sends a leave update to “$name” and removes the conversation from this device."
                     } else {
                         "Removes “$name” from this device only. The other person isn’t notified, and you can start the chat again later."
