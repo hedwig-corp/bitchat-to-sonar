@@ -605,15 +605,16 @@ dials them (`link <tag>: up`, QA-128…084).
   `DesktopMeshChannelNoticeTest.aWorkingMeshRadioGetsANormalChannel`
 
 ### QA-128 — A desktop that dials a phone links and carries DMs both ways
-- **Platforms:** desktop Linux ↔ Android (automated; hardware manual)
+- **Platforms:** desktop Linux ↔ Android (automated; hardware scripted)
 - **Steps:** a Linux desktop whose controller refuses to advertise, a phone in
   range with Sonar open; wait for the phone on the desktop radar; DM each way.
 - **Expect:** `Noise handshake started` then `ESTABLISHED` on the desktop, the
   phone shows the desktop as in range, both DMs arrive over Bluetooth.
 - **Guard:** `DesktopMeshInteropTest.aDesktopThatDialsAPhoneStartsTheHandshake`
+- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-128` (needs a connected phone; asserts on the phone's logcat too)
 
 ### QA-129 — A dropped link is re-handshaken, not left half-dead
-- **Platforms:** desktop Linux ↔ Android (automated; hardware manual)
+- **Platforms:** desktop Linux ↔ Android (automated; hardware scripted)
 - **Steps:** QA-128 linked; toggle Bluetooth on the phone (or walk out of range
   and back); DM each way once the phone reappears.
 - **Expect:** `link to <name> dropped → Noise session reset`, a fresh handshake
@@ -621,6 +622,7 @@ dials them (`link <tag>: up`, QA-128…084).
   GATT connection and never initiates toward a central, so a kept session
   showed the phone in range while every DM was silently discarded.
 - **Guard:** `DesktopMeshInteropTest.aDroppedLinkIsRehandshakenNotLeftHalfDead`
+- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-129` (needs a connected phone; asserts on the phone's logcat too)
 - **Origin:** D2 (#612 QA)
 
 ### QA-130 — Two phones in range link independently
@@ -659,12 +661,13 @@ dials them (`link <tag>: up`, QA-128…084).
 - **Origin:** D6 (#612 QA)
 
 ### QA-134 — A long DM crosses in both directions
-- **Platforms:** desktop ↔ Android / iPhone (automated; hardware manual)
+- **Platforms:** desktop ↔ Android / iPhone (automated; hardware scripted)
 - **Steps:** once linked (QA-128 or QA-131), send a ~500-character DM each way.
 - **Expect:** both arrive whole. Anything over 480 bytes travels as 0x20
   fragments of 205 bytes, which the desktop neither reassembled nor produced,
   so every long DM from a phone vanished silently.
 - **Guard:** `DesktopMeshInteropTest.aLongDmCrossesInBothDirections` (the
+- **Hardware:** `scripts/qa/desktop-smoke.sh --only QA-134` (needs a connected phone; asserts on the phone's logcat too)
   simulated radio enforces a 517-byte ATT MTU)
 - **Origin:** D7 (#612 QA — pre-existing, older than the central link)
 

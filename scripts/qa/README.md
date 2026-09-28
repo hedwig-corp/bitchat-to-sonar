@@ -15,6 +15,7 @@ scripts/qa/android-smoke.sh                          # scripted scenarios, exit 
 
 export QA_UDID="$(scripts/qa/ios-setup.sh)"          # QA simulator + signed Debug + log
 scripts/qa/ios-share-smoke.sh                        # share-sheet scenarios, exit = failures
+QA_ANDROID_SERIAL=<serial> scripts/qa/desktop-smoke.sh   # desktop mesh vs a real phone, exit = failures
 scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 ```
 
@@ -26,6 +27,7 @@ scripts/qa/idle-cpu.sh ios "$QA_UDID" 60 --max 3
 | `peers.sh` | Fresh `sonar-cli` counterparties: `new`, `send`, `send-image`, `listen`, `expect`, and for reactions `id-of`, `react`, `expect-reaction`. |
 | `android-smoke.sh` | Automated registry scenarios (`qaNNN` = `QA-NNN`). |
 | `ios-share-smoke.sh` | iOS share-sheet scenarios QA-080…092: shares real files into Sonar through the system share sheet (Files, Photos, and `ios-share/QAShareHost`, a stand-in third-party app), picks the chat with a fresh peer, and asserts on what the **peer** received (name, MIME, sha256). XCUITest driver in `ios-share/`, generated into `$QA_HOME/share/driver` — the app project is untouched. Pass scenario ids to run a subset. |
+| `desktop-smoke.sh` | Desktop Bluetooth mesh against a REAL phone (QA-128/129/134): drives `MeshLink` through `DesktopMeshHardwareDriver` (a jvmTest no-op unless `SONAR_QA_HARDWARE=1`, so CI never runs it) and asserts on BOTH the desktop's `QA:` lines and the phone's logcat, because a desktop-side "linked" claim alone hid a phone that had dropped its half. QA-129 toggles the phone's Bluetooth and restores it; nothing is installed, wiped or uninstalled. |
 | `idle-cpu.sh` | Average app CPU over a window on Android or an iOS simulator. |
 | `ios-drive.sh` | Headless iOS UI driver: one XCUITest (generated from `ios-driver/`, outside the app's Xcode project) runs a `;`-separated step script — `launch`, `tapc:<label>`, `longpress:<text>`, `tap:👍`, `expect:<text>`, `count:<text>=n`, `shot`, `tree` — against the installed app by UDID. No Simulator panel needed. |
 | `qr-decode.swift` | Print QR payloads found in a screenshot (macOS CoreImage). |
