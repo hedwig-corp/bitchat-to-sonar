@@ -67,14 +67,33 @@ near_label() {
   return 1
 }
 
+app_in_front() {
+  adb -s "$QA_SERIAL" shell dumpsys window 2>/dev/null | grep -m1 mCurrentFocus | grep -q chat.bitchat.sonar
+}
+
 go_home() {
   adb -s "$QA_SERIAL" shell am start -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
-  for _ in 1 2 3 4 5; do
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
     hasx "Start a chat" && return 0
-    ui key 4
+    # BACK at the root exits the app. On a cold start the first frames have
+    # no screen to leave, so wait a few seconds before stepping back, and
+    # relaunch if the app has left the foreground.
+    if ! app_in_front; then
+      adb -s "$QA_SERIAL" shell am start -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
+    elif (( i > 3 )) || hasx "Back"; then
+      ui key 4
+    fi
   done
   hasx "Start a chat"
+}
+
+# note_rows — how many Messages rows are titled "Note to Self" (on screen).
+note_rows() {
+  local n=0
+  while [[ -n "$("$UI" findx "Note to Self" $((n + 1)) 2>/dev/null)" ]]; do n=$((n + 1)); done
+  echo "$n"
 }
 
 open_chat_by_npub() {
@@ -334,6 +353,49 @@ qa004() { # inbound-first chat appears on the chat list, marked unread
     record QA-004 PASS "new chat row after ${t1}s, marked unread"
   else
     record QA-004 FAIL "row appeared after ${t1}s but has no unread indicator"
+  fi
+}
+
+qa135() { # Note to Self is the first Messages row, above newer chats, and only one (#339)
+  go_home || { record QA-135 FAIL "could not reach the chat list"; return; }
+  "$UI" wait "Note to Self" 20 >/dev/null || { record QA-135 FAIL "no Note to Self row on Messages"; return; }
+  # QA-004's chat is the newest one; by recency alone it would be first.
+  local oy ny n
+  oy="$(ycoord find "qa004 inbound $RUN")"
+  [[ -n "$oy" ]] || { record QA-135 SKIP "needs QA-004's newer chat on screen"; return; }
+  ny="$(ycoord findx "Note to Self")"
+  (( ny < oy )) || { record QA-135 FAIL "Note to Self (y=$ny) sits below a newer chat (y=$oy)"; return; }
+  n="$(note_rows)"
+  (( n == 1 )) || { record QA-135 FAIL "$n Note to Self rows"; return; }
+  adb -s "$QA_SERIAL" shell am force-stop chat.bitchat.sonar
+  go_home || { record QA-135 FAIL "chat list not reached after a relaunch"; return; }
+  "$UI" wait "Note to Self" 20 >/dev/null || { record QA-135 FAIL "Note to Self gone after a relaunch"; return; }
+  n="$(note_rows)"; ny="$(ycoord findx "Note to Self")"; oy="$(ycoord find "qa004 inbound $RUN")"
+  if (( n != 1 )); then
+    record QA-135 FAIL "$n Note to Self rows after a relaunch"
+  elif [[ -n "$oy" ]] && (( ny >= oy )); then
+    record QA-135 FAIL "Note to Self no longer first after a relaunch"
+  else
+    record QA-135 PASS "first row above a newer chat; one row; same after a relaunch"
+  fi
+}
+
+qa136() { # writing to yourself: delivered, previewed, never unread (#339)
+  go_home || { record QA-136 FAIL "could not reach the chat list"; return; }
+  ui tapx "Note to Self"; sleep 2
+  hasx "Back" || { record QA-136 FAIL "Note to Self did not open"; return; }
+  focus_composer
+  ui type "qa136 note $RUN"
+  ui tapx "Send" || { record QA-136 FAIL "no 'Send' control"; return; }
+  "$UI" wait "Sent ·" 30 >/dev/null || { record QA-136 FAIL "the note never reached 'Sent'"; return; }
+  go_home || { record QA-136 FAIL "could not return to the chat list"; return; }
+  "$UI" wait "qa136 note $RUN" 10 >/dev/null || { record QA-136 FAIL "the row does not preview the note"; return; }
+  local ny
+  ny="$(ycoord findx "Note to Self")"
+  if near_label "Unread" "$ny" 120; then
+    record QA-136 FAIL "your own note shows as unread"
+  else
+    record QA-136 PASS "note sent; row previews it; no unread dot"
   fi
 }
 
@@ -764,10 +826,11 @@ echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
 # Order matters: QA-002 and the reaction scenarios (QA-100..102, QA-106)
-# reuse QA-001's chat, QA-005 opens QA-004's, and QA-040 inspects the chat
+# reuse QA-001's chat, QA-135 needs QA-004's chat as the newest one, QA-005
+# opens QA-004's, and QA-040 inspects the chat
 # QA-005 left open. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

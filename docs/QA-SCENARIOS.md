@@ -404,6 +404,60 @@ nothing by design.
 - **Expect:** no row whose only effect is a "coming soon" toast.
 - **Origin:** A17 (#616)
 
+## Note to Self (#339)
+
+Note to Self is a solo Marmot group marked `sonar.note-to-self.v1`: it is
+created locally, with no relay, and is pinned at the top of Messages on both
+apps. Every message in it is yours, so it never alerts and never counts as
+unread. See `docs/CHAT-TYPES.md`.
+
+### QA-135 — Note to Self is always first, offline, and only once
+- **Platforms:** both (Android automated)
+- **Steps:**
+  1. On a freshly onboarded app, look at Messages. For the offline case,
+     onboard with the network off.
+  2. Have a peer message the app, so another chat is newer.
+  3. Relaunch the app.
+  4. Delete Note to Self from its row actions.
+- **Expect:**
+  - After step 1, a "Note to Self" row sits at the top without waiting for
+    relays.
+  - After step 2, it stays first even though the other chat is newer.
+  - After step 3, there is still exactly one Note to Self row.
+  - After step 4, it comes back empty at the top.
+- **How:**
+  - `android-smoke.sh` QA-135: first row and one row, before and after a
+    relaunch.
+  - iOS: `ios-drive.sh` (`tree` on Messages).
+  - Guards: `NoteToSelfTest.noteToSelfTopsTheMessagesListEvenWhenAnotherChatIsNewer`
+    (Compose, the list both home and desktop render);
+    `SonarNoteToSelfTests.noteToSelfTopsTheListEvenWhenOlder` (iOS);
+    `concurrent_ensure_note_to_self_creates_one_group` and
+    `ensure_note_to_self_works_offline_without_relay` (core, `tests/e2e.rs`).
+- **Origin:** #339 rebase QA:
+  - iOS sorted the row by recency, so it was never pinned.
+  - Two overlapping ensures created two groups (10/10 runs without the lock).
+  - Ensure awaited the relay resubscribe, so it was not local-only.
+
+### QA-136 — Writing to yourself never alerts or shows unread
+- **Platforms:** both (Android automated for text)
+- **Steps:**
+  1. Open Note to Self.
+  2. Send a text, then a photo.
+  3. Go back to Messages.
+  4. Open the chat header and the + sheet.
+- **Expect:**
+  - Both messages send.
+  - The row previews the last message, has no unread dot, and no
+    notification is posted.
+  - The header offers no call or pay, and nothing to add or manage members.
+- **How:**
+  - `android-smoke.sh` QA-136: send, then check the row preview and that no
+    "Unread" label sits on it.
+  - Photo and header: by hand or with `ios-drive.sh`.
+  - Guard: `NoteToSelfTest.noteToSelfNeverShowsUnreadWhileOtherChatsStillDo`.
+- **Origin:** #339 rebase QA.
+
 ## Accessibility
 
 ### QA-040 — Icon controls are labelled
