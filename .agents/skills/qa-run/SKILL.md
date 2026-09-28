@@ -207,6 +207,28 @@ When something looks wrong:
 3. Only then report it as a finding, with the steps, the platform and the
    log lines (`$QA_HOME/logcat-*.txt`, `$QA_HOME/ios-log-*.txt`).
 
+### A change that adds a feature
+
+If the feature has no scenario in `docs/QA-SCENARIOS.md`, the QA for it
+includes writing one: steps, expectations on both platforms, **How**, and
+**Guard** (the tests that fail without it). If it can be driven headlessly,
+add a `qaNNN` step to `scripts/qa/android-smoke.sh` too, so the next pass runs
+it by default.
+
+Pick ids that neither main nor an open PR already uses. Parallel PRs have
+collided before, and git merges two different `### QA-NNN` headings without a
+conflict:
+
+```bash
+grep -oE '^### QA-[0-9]+' docs/QA-SCENARIOS.md | sort -t- -k2 -n | tail -1
+for pr in $(gh pr list --state open --json number -q '.[].number'); do
+  gh pr diff "$pr" | grep -oE '^\+### QA-[0-9]+' | sed "s/^/#$pr /"; done
+```
+
+A test that pins a helper can stay green while the real call site is broken.
+Where you can, point the guard at the call site the UI renders, and check it
+goes red with the fix removed (see the regression-ledger rules in CLAUDE.md).
+
 ## 6. Report
 
 Put this in the PR description or a comment. Every row has evidence or a
