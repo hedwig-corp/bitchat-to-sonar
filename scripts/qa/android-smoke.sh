@@ -399,12 +399,33 @@ qa136() { # writing to yourself: delivered, previewed, never unread (#339)
   "$UI" wait "Sent ·" 30 >/dev/null || { record QA-136 FAIL "the note never reached 'Sent'"; return; }
   go_home || { record QA-136 FAIL "could not return to the chat list"; return; }
   "$UI" wait "qa136 note $RUN" 10 >/dev/null || { record QA-136 FAIL "the row does not preview the note"; return; }
-  local ny
+  local ny xy
   ny="$(ycoord findx "Note to Self")"
   if near_label "Unread" "$ny" 120; then
-    record QA-136 FAIL "your own note shows as unread"
+    record QA-136 FAIL "your own note shows as unread"; return
+  fi
+  # Delete from the row: its only member cannot leave, so it must take the
+  # local delete (not "Leave group"), and it comes back empty.
+  # Right after returning, the list is still settling around the new note, and
+  # a long-press can land as a tap that opens the chat. Retry once from Messages.
+  local try
+  for try in 1 2; do
+    sleep 2
+    xy="$("$UI" findx "Note to Self")"
+    ui longpress ${xy% *} ${xy#* }; sleep 2
+    hasx "Delete chat" && break
+    go_home >/dev/null
+  done
+  hasx "Delete chat" || { record QA-136 FAIL "row actions did not open on Note to Self"; return; }
+  hasx "Leave group" && { record QA-136 FAIL "row actions offer Leave group"; ui key 4; return; }
+  ui tapx "Delete chat"; sleep 1
+  ui tapx "Delete chat" -1; sleep 3
+  if ! "$UI" gone "qa136 note $RUN" 20 >/dev/null; then
+    record QA-136 FAIL "deleting Note to Self left the note in place"
+  elif ! "$UI" wait "Note to Self" 20 >/dev/null; then
+    record QA-136 FAIL "Note to Self did not come back after delete"
   else
-    record QA-136 PASS "own-only banner, no nudge/verify; note sent; row previews it; no unread dot"
+    record QA-136 PASS "own-only banner, no nudge/verify; note sent, previewed, never unread; delete brings it back empty"
   fi
 }
 
