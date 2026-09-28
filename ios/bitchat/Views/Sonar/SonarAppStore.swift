@@ -2423,6 +2423,10 @@ final class SonarAppStore: ObservableObject {
         invalidateHomeRows(on: marmot.$groups)
         invalidateHomeRows(on: marmot.$messagesByGroup)
         invalidateHomeRows(on: marmot.$unreadByGroup)
+        // The Note to Self id can land after the rows were built (ensure's
+        // change notification races the summary load); the pin, title,
+        // preview and unread gate all read it (Compose keys VisibleChatsKey on it).
+        invalidateHomeRows(on: marmot.$noteToSelfGroupId)
         invalidateHomeRows(on: marmot.$profilesByNpub)
         invalidateHomeRows(on: $sonarProfiles)
         invalidateHomeRows(on: $marmotVerified)
@@ -6108,7 +6112,19 @@ final class SonarAppStore: ObservableObject {
         guard let groupId = marmotGroupId(id),
               let group = marmotGroup(byId: groupId)
         else { return false }
+        // Note to Self has one member: never a group to manage or leave
+        // (Compose isMultiMemberChat parity). Callers that would otherwise
+        // treat "not a group" as a 1:1 with a peer check isNoteToSelfConversation.
+        if marmot.isNoteToSelf(group) { return false }
         return !marmot.isDirectGroup(group)
+    }
+
+    /// True when `id` resolves to this account's Note to Self group.
+    func isNoteToSelfConversation(_ id: String) -> Bool {
+        guard let groupId = marmotGroupId(id),
+              let group = marmotGroup(byId: groupId)
+        else { return false }
+        return marmot.isNoteToSelf(group)
     }
 
     func groupInviteContacts(excluding excluded: Set<String> = []) -> [SNGroupContact] {
