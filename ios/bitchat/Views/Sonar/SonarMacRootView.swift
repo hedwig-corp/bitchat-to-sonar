@@ -609,6 +609,8 @@ private struct MacConversationPane: View {
     private var channel: SNChannelItem { store.channelItem(id) }
     private var peer: SNPeerItem { store.peerItem(id) }
     private var isMultiMemberMarmot: Bool { !isChannel && store.isMultiMemberMarmotGroupId(id) }
+    /// Note to Self: no peer to verify or nudge (iOS SonarDMScreen parity).
+    private var isNoteToSelf: Bool { !isChannel && store.isNoteToSelfConversation(id) }
     private var verified: Bool { !isChannel && !isMultiMemberMarmot && store.isVerified(id) }
     private var transport: SNVia { isChannel ? (id == "mesh" ? .mesh : .internet) : store.dmTransport(id) }
 
@@ -839,6 +841,8 @@ private struct MacConversationPane: View {
     @ViewBuilder private var banner: some View {
         if isChannel {
             SNBanner(icon: .people, tone: .publicRoom, bold: "Public channel", rest: " - anyone nearby can read")
+        } else if isNoteToSelf {
+            SNBanner(icon: .lock, tone: .enc, bold: "End-to-end encrypted", rest: " - only you can read this")
         } else if verified {
             SNBanner(icon: .shieldCheck, tone: .enc, bold: "Verified", rest: " - you confirmed \(peer.name)'s safety number")
         } else if isMultiMemberMarmot {
@@ -969,9 +973,10 @@ private struct MacConversationPane: View {
                     openPaySheetOrWallet()
                 }
             }
-            if !isChannel {
+            if !isChannel && !isNoteToSelf {
                 // MSN-style nudge (docs/SONAR-TRILL.md). Same affordance as iOS
-                // SonarDMScreen — DMs and Marmot groups; public channels excluded.
+                // SonarDMScreen — DMs and Marmot groups; public channels and
+                // Note to Self excluded.
                 SNActionRow(
                     icon: .bell,
                     label: "Nudge",
@@ -1006,7 +1011,7 @@ private struct MacConversationPane: View {
                     removePeopleSheet = true
                 }
             }
-            if !isChannel && !isMultiMemberMarmot {
+            if !isChannel && !isMultiMemberMarmot && !isNoteToSelf {
                 SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
                     actionSheet = false
                     verifySheet = true

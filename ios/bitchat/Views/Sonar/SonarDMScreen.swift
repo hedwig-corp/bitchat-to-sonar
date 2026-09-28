@@ -190,6 +190,8 @@ struct SonarDMScreenContent: View {
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var isMarmot: Bool { store.marmotGroupId(peerId) != nil || store.isPendingSecureChat(peerId) }
     private var isMultiMemberMarmot: Bool { store.isMultiMemberMarmotGroupId(peerId) }
+    /// Note to Self: no peer to verify, nudge or open a profile for.
+    private var isNoteToSelf: Bool { store.isNoteToSelfConversation(peerId) }
     private var isSonar: Bool { store.sonarProfile(peerId) != nil }
     private var verified: Bool { !isMultiMemberMarmot && store.isVerified(peerId) }
     private var transport: SNVia { store.dmTransport(peerId) }
@@ -307,7 +309,9 @@ struct SonarDMScreenContent: View {
         VStack(spacing: 0) {
             SNNavHeader(onBack: { store.pop() }, content: {
                 Button {
-                    if isMultiMemberMarmot, store.marmotGroupId(peerId) != nil {
+                    if isNoteToSelf {
+                        return
+                    } else if isMultiMemberMarmot, store.marmotGroupId(peerId) != nil {
                         store.push(.groupInfo(peerId))
                     } else if !isMultiMemberMarmot {
                         store.push(.contactProfile(peerId, peer.name))
@@ -356,8 +360,10 @@ struct SonarDMScreenContent: View {
                     SNEmptyState(
                         icon: .lock,
                         iconSize: 24,
-                        title: "Say hi to \(peer.name)",
-                        desc: isMultiMemberMarmot
+                        title: isNoteToSelf ? peer.name : "Say hi to \(peer.name)",
+                        desc: isNoteToSelf
+                            ? "Only you can read what you send here."
+                            : isMultiMemberMarmot
                             ? "Messages here are end-to-end encrypted. Only group members can read them."
                             : "Messages here are end-to-end encrypted. Only the two of you can read them."
                     )
@@ -502,21 +508,24 @@ struct SonarDMScreenContent: View {
                     }
                 }
                 // MSN-style nudge (docs/SONAR-TRILL.md). DMs and Marmot groups
-                // only — public geohash channels have no nudge action.
-                SNActionRow(
-                    icon: .bell,
-                    label: "Nudge",
-                    desc: store.canSendTrill(peerId)
-                        ? (isMultiMemberMarmot
-                            ? "Buzz everyone to get their attention"
-                            : "Buzz \(peer.name)'s screen to get their attention")
-                        : "You just sent a nudge — give it a moment",
-                    disabled: !store.canSendTrill(peerId)
-                ) {
-                    sheet = false
-                    store.sendTrill(peerId)
-                    Task { @MainActor in
-                        await convo.loadNewestIfNeeded()
+                // only — public geohash channels have no nudge action, and
+                // Note to Self has nobody to buzz.
+                if !isNoteToSelf {
+                    SNActionRow(
+                        icon: .bell,
+                        label: "Nudge",
+                        desc: store.canSendTrill(peerId)
+                            ? (isMultiMemberMarmot
+                                ? "Buzz everyone to get their attention"
+                                : "Buzz \(peer.name)'s screen to get their attention")
+                            : "You just sent a nudge — give it a moment",
+                        disabled: !store.canSendTrill(peerId)
+                    ) {
+                        sheet = false
+                        store.sendTrill(peerId)
+                        Task { @MainActor in
+                            await convo.loadNewestIfNeeded()
+                        }
                     }
                 }
                 if store.canPrepareMedia(peerId) {
@@ -535,7 +544,7 @@ struct SonarDMScreenContent: View {
                         removePeopleSheet = true
                     }
                 }
-                if !isMultiMemberMarmot {
+                if !isMultiMemberMarmot && !isNoteToSelf {
                     SNActionRow(icon: .shield, label: "Verify safety number", desc: "Confirm this chat is secure") {
                         sheet = false
                         verifySheet = true
@@ -812,6 +821,12 @@ struct SonarDMScreenContent: View {
     private var banner: some View {
         if !isMarmot && !peer.inRange {
             outOfRangeBanner
+        } else if isNoteToSelf {
+            SNBanner(
+                icon: .lock, tone: .enc,
+                bold: "End-to-end encrypted",
+                rest: " — only you can read this"
+            )
         } else if verified {
             SNBanner(
                 icon: .shieldCheck, tone: .enc,

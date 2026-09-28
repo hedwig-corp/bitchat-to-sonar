@@ -1787,6 +1787,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
+    // Note to Self: one member, so no peer to verify, nudge or open a profile for.
+    val isNoteToSelf = state.isNoteToSelfChat(screen.id)
     val peerTimezone = if (isGroup) null else state.peerTimezoneForChat(screen.id)
     // Keyed on this phone's zone too: an OS timezone change repaints the delta
     // now instead of at the next minute tick.
@@ -2196,7 +2198,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             ) {
                 SNIconButton(SNIconName.Back, onClick = { state.back() })
                 Row(
-                    Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = canManageGroup || !isGroup) {
+                    Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = !isNoteToSelf && (canManageGroup || !isGroup)) {
                         if (canManageGroup) state.push(Screen.GroupInfo(screen.id))
                         else state.push(Screen.ContactProfile(screen.id, peerName))
                     },
@@ -2273,6 +2275,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
                 bold = "Verified", rest = " — you confirmed $peerName’s safety number"
             )
+        } else if (isNoteToSelf) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "End-to-end encrypted", rest = " — only you can read this"
+            )
         } else if (isGroup) {
             chat.bitchat.sonar.ui.SNBanner(
                 icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
@@ -2298,8 +2305,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 Box(modifier) {
                     chat.bitchat.sonar.ui.SNEmptyState(
                         icon = SNIconName.Lock,
-                        title = "Say hi to $peerName",
-                        desc = if (isGroup) {
+                        title = if (isNoteToSelf) peerName else "Say hi to $peerName",
+                        desc = if (isNoteToSelf) {
+                            "Only you can read what you send here."
+                        } else if (isGroup) {
                             "Messages here are end-to-end encrypted. Only group members can read them."
                         } else {
                             "Messages here are end-to-end encrypted. Only the two of you can read them."
@@ -2376,7 +2385,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         canSendPhoto = state.canSendMedia(screen.id),
         canSendFile = state.canPrepareMedia(screen.id),
         canSendPayment = state.hasDirectPaymentRoute(screen.id),
-        canVerify = !state.isMultiMemberChat(screen.id),
+        canVerify = !isNoteToSelf && !state.isMultiMemberChat(screen.id),
+        canNudge = !isNoteToSelf,
         canManageGroup = canManageGroup,
         isGroup = isGroup,
         nudgeEnabled = state.canSendTrill(screen.id),
@@ -2433,6 +2443,7 @@ private fun AddToMessageSheet(
     canSendFile: Boolean = false,
     canSendPayment: Boolean = true,
     canVerify: Boolean = true,
+    canNudge: Boolean = true,
     canManageGroup: Boolean = false,
     isGroup: Boolean = false,
     nudgeEnabled: Boolean = true,
@@ -2464,7 +2475,7 @@ private fun AddToMessageSheet(
                 // MSN-style trill: disabled (not hidden) during the 8 s
                 // per-chat sender cooldown. Geohash channels never show this
                 // sheet, so the nudge stays DM/group-only by construction.
-                Box(Modifier.alpha(if (nudgeEnabled) 1f else 0.45f)) {
+                if (canNudge) Box(Modifier.alpha(if (nudgeEnabled) 1f else 0.45f)) {
                     ActionRow(
                         SNIconName.Bell,
                         "Nudge",

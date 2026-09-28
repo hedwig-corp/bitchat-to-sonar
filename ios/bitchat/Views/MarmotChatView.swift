@@ -5388,13 +5388,15 @@ final class MarmotChatModel: ObservableObject {
         if wasPolling && connected { startPolling() }
     }
 
-    /// Short label for a 1:1 group: the other member's npub prefix.
+    /// True for this account's Note to Self group, by id (never by name).
     func isNoteToSelf(_ group: MarmotService.MarmotGroup) -> Bool {
         guard let noteToSelfGroupId else { return false }
         return group.id == noteToSelfGroupId
     }
 
+    /// Short label for a 1:1 group: the other member's npub prefix.
     func title(for group: MarmotService.MarmotGroup) -> String {
+        if isNoteToSelf(group) { return String(localized: "Note to Self") }
         let others = otherMembers(in: group)
         guard others.count == 1, let other = others.first else {
             return group.name.isEmpty ? "Group chat" : group.name
