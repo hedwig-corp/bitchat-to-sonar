@@ -1373,7 +1373,24 @@ const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
 /// re-fetching the event on every catch-up buys nothing (565–626 re-failures
 /// per pass on the alpha.15 iPhone, each an MDK lookup on the engine queue).
 const MDK_FAILED_PASS_BUDGET: u32 = 3;
+/// Deliveries of one event closer together than this are one pass: the live,
+/// initial and per-group catch-up paths can all hand over the same event
+/// within seconds, and three of them must not spend the budget before the
+/// winning commit arrives.
+const MDK_FAILED_PASS_MIN_GAP_SECS: u64 = 60;
+/// No event is retired sooner than this after its first failure, however many
+/// passes it saw: long enough for a fork's rollback to land and turn it
+/// Retryable. The echoes this budget targets fail for hours.
+const MDK_FAILED_RETIRE_AFTER_SECS: u64 = 10 * 60;
 const SYNC_STATE_FAILED_EVENT_CAP: usize = 4_000;
+
+/// How long one event has kept failing in MDK (`MDK_FAILED_PASS_BUDGET`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct FailedEventPasses {
+    passes: u32,
+    first_failed_secs: u64,
+    last_counted_secs: u64,
+}
 
 #[derive(Debug)]
 struct LiveEventDeduper {
@@ -1439,10 +1456,10 @@ struct SyncStateDisk {
     version: u32,
     watermark_secs: u64,
     processed_event_ids: Vec<String>,
-    /// Failed-pass counts per event id (`MDK_FAILED_PASS_BUDGET`). Absent in
+    /// Failed-pass records per event id (`MDK_FAILED_PASS_BUDGET`). Absent in
     /// older sidecars.
     #[serde(default)]
-    failed_event_passes: HashMap<String, u32>,
+    failed_event_passes: HashMap<String, FailedEventPasses>,
 }
 
 /// Point-in-time relay/sync diagnostics, serialized into the exported debug
@@ -1486,7 +1503,7 @@ struct SyncState {
     watermark_secs: u64,
     processed_event_ids: HashSet<String>,
     processed_event_order: VecDeque<String>,
-    failed_event_passes: HashMap<String, u32>,
+    failed_event_passes: HashMap<String, FailedEventPasses>,
     failed_event_order: VecDeque<String>,
     dirty: bool,
 }
@@ -1562,32 +1579,46 @@ impl SyncState {
         self.dirty = true;
     }
 
-    /// One more pass on which MDK answered Failed for `event_id`; returns the
-    /// count. At `MDK_FAILED_PASS_BUDGET` the entry is dropped and the caller
-    /// retires the event into the processed set.
-    fn record_failed_pass(&mut self, event_id: &str) -> u32 {
-        let count = match self.failed_event_passes.get_mut(event_id) {
-            Some(count) => {
-                *count += 1;
-                *count
+    /// MDK answered Failed for `event_id` again at `now_secs`. A delivery within
+    /// `MDK_FAILED_PASS_MIN_GAP_SECS` of the last counted one is the same pass.
+    /// Returns true when the event should be retired into the processed set:
+    /// `MDK_FAILED_PASS_BUDGET` counted passes AND at least
+    /// `MDK_FAILED_RETIRE_AFTER_SECS` since the first failure. A retired event
+    /// leaves the table.
+    fn record_failed_pass(&mut self, event_id: &str, now_secs: u64) -> bool {
+        let record = match self.failed_event_passes.get_mut(event_id) {
+            Some(record) => {
+                if now_secs.saturating_sub(record.last_counted_secs) < MDK_FAILED_PASS_MIN_GAP_SECS {
+                    return false;
+                }
+                record.passes += 1;
+                record.last_counted_secs = now_secs;
+                *record
             }
             None => {
-                self.failed_event_passes.insert(event_id.to_owned(), 1);
+                let record = FailedEventPasses {
+                    passes: 1,
+                    first_failed_secs: now_secs,
+                    last_counted_secs: now_secs,
+                };
+                self.failed_event_passes.insert(event_id.to_owned(), record);
                 self.failed_event_order.push_back(event_id.to_owned());
                 while self.failed_event_order.len() > SYNC_STATE_FAILED_EVENT_CAP {
                     if let Some(oldest) = self.failed_event_order.pop_front() {
                         self.failed_event_passes.remove(&oldest);
                     }
                 }
-                1
+                record
             }
         };
-        if count >= MDK_FAILED_PASS_BUDGET {
+        self.dirty = true;
+        let retire = record.passes >= MDK_FAILED_PASS_BUDGET
+            && now_secs.saturating_sub(record.first_failed_secs) >= MDK_FAILED_RETIRE_AFTER_SECS;
+        if retire {
             self.failed_event_passes.remove(event_id);
             self.failed_event_order.retain(|id| id != event_id);
         }
-        self.dirty = true;
-        count
+        retire
     }
 
     fn advance_watermark(&mut self, watermark_secs: u64) {
@@ -7260,17 +7291,17 @@ impl SonarClient {
                     // after an MLS commit rollback, and a later relay catch-up
                     // must then reach MDK so the message can be decrypted. That
                     // window is minutes, not forever — after
-                    // `MDK_FAILED_PASS_BUDGET` passes the event is retired, or
+                    // `MDK_FAILED_PASS_BUDGET` distinct passes spread over
+                    // `MDK_FAILED_RETIRE_AFTER_SECS` the event is retired, or
                     // every catch-up re-fetches and re-fails it.
-                    let passes = self
+                    let retire = self
                         .sync_state
                         .lock()
                         .unwrap()
-                        .record_failed_pass(&event.id.to_hex());
-                    if passes >= MDK_FAILED_PASS_BUDGET {
+                        .record_failed_pass(&event.id.to_hex(), Timestamp::now().as_secs());
+                    if retire {
                         tracing::debug!(
                             event_id = %event.id,
-                            passes,
                             context,
                             "marmot event failed in MDK on every pass; retiring it"
                         );
@@ -7280,7 +7311,6 @@ impl SonarClient {
                             event_id = %event.id,
                             event_created_at = event.created_at.as_secs(),
                             context,
-                            passes,
                             "marmot event failed in MDK; preserving rollback retry"
                         );
                     }
@@ -12115,36 +12145,36 @@ mod tests {
     }
 
     #[test]
-    fn sync_state_failed_passes_persist_and_retire_at_the_budget() {
+    fn sync_state_failed_passes_count_distinct_passes_and_survive_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sync.json");
+        let t0 = 1_000_000;
+        let gap = MDK_FAILED_PASS_MIN_GAP_SECS;
         let mut state = SyncState::new(Some(path.clone()), 0, Vec::new());
-        assert_eq!(state.record_failed_pass("poison"), 1);
-        assert_eq!(state.record_failed_pass("poison"), 2);
+        assert!(!state.record_failed_pass("poison", t0));
+        // The live, initial and per-group paths can all deliver it at once:
+        // one pass, not three (#629 review).
+        assert!(!state.record_failed_pass("poison", t0 + 1));
+        assert!(!state.record_failed_pass("poison", t0 + 2));
+        assert_eq!(state.failed_event_passes["poison"].passes, 1);
+        assert!(!state.record_failed_pass("poison", t0 + gap));
         state.save_if_dirty().unwrap();
 
-        // A restart between passes keeps the count.
+        // A restart between passes keeps the record.
         let mut reloaded = SyncState::load(Some(path), 0, false);
-        assert_eq!(reloaded.record_failed_pass("other"), 1);
-        assert_eq!(
-            reloaded.record_failed_pass("poison"),
-            MDK_FAILED_PASS_BUDGET,
-            "the third pass reaches the budget"
-        );
+        assert_eq!(reloaded.failed_event_passes["poison"].passes, 2);
+        // A third distinct pass, but still inside the rollback window.
+        assert!(!reloaded.record_failed_pass("poison", t0 + 2 * gap));
         assert!(
-            !reloaded.failed_event_passes.contains_key("poison"),
-            "a retired event leaves the table"
+            reloaded.record_failed_pass("poison", t0 + MDK_FAILED_RETIRE_AFTER_SECS),
+            "budget spent and the rollback window over"
         );
-        assert_eq!(reloaded.failed_event_passes.get("other"), Some(&1));
+        assert!(!reloaded.failed_event_passes.contains_key("poison"));
     }
 
-    #[tokio::test]
-    async fn an_event_mdk_keeps_failing_is_retired_after_the_pass_budget() {
-        // Plan item 4 (alpha.15): the 512 share echoes that build 45 never
-        // marked processed came back Unprocessable on every per-group
-        // catch-up (565–626 MDK failures per pass, every ~4 min). The same
-        // shape here: our own wrapper, created at the engine level so nothing
-        // marks it, fed back as a relay echo.
+    /// Our own wrapper, created at the engine level so nothing marks it, fed
+    /// back as a relay echo: MDK answers Failed on every delivery.
+    async fn alice_with_an_unmarked_own_echo() -> (SonarClient, nostr::Event) {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await
@@ -12165,24 +12195,54 @@ mod tests {
             .engine
             .create_and_process_timezone_share(&gid, &payload, Timestamp::now())
             .unwrap();
+        (alice, echo)
+    }
 
-        for pass in 1..MDK_FAILED_PASS_BUDGET {
-            let (report, _) = alice
-                .process_marmot_events(vec![echo.clone()], "live marmot event")
-                .await;
+    #[tokio::test]
+    async fn rapid_failed_deliveries_do_not_retire_an_event() {
+        // #629 review (P1): a losing-epoch message delivered through the live,
+        // initial and per-group catch-up paths within seconds must stay
+        // eligible for the rollback that makes it decryptable.
+        let (alice, echo) = alice_with_an_unmarked_own_echo().await;
+        for context in ["live marmot event", "initial per-group message catch-up", "group message"] {
+            let (report, _) = alice.process_marmot_events(vec![echo.clone()], context).await;
             assert_eq!(report.processed, 1);
-            assert!(
-                !alice.is_sync_event_processed(&echo.id),
-                "pass {pass}: still eligible for a rollback retry"
-            );
         }
+        assert!(!alice.is_sync_event_processed(&echo.id));
+        assert_eq!(
+            alice.sync_state.lock().unwrap().failed_event_passes[&echo.id.to_hex()].passes,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_mdk_keeps_failing_is_retired_after_the_pass_budget() {
+        // Plan item 4 (alpha.15): the 512 share echoes that build 45 never
+        // marked processed came back Unprocessable on every per-group
+        // catch-up (565–626 MDK failures per pass, every ~4 min).
+        let (alice, echo) = alice_with_an_unmarked_own_echo().await;
+        let id = echo.id.to_hex();
         let (report, _) = alice
             .process_marmot_events(vec![echo.clone()], "live marmot event")
             .await;
         assert_eq!(report.processed, 1);
+        // Two more passes, each one gap later, with the first failure already
+        // past the rollback window.
+        for _ in 1..MDK_FAILED_PASS_BUDGET {
+            {
+                let mut state = alice.sync_state.lock().unwrap();
+                let record = state.failed_event_passes.get_mut(&id).unwrap();
+                record.first_failed_secs -= MDK_FAILED_RETIRE_AFTER_SECS;
+                record.last_counted_secs -= MDK_FAILED_PASS_MIN_GAP_SECS;
+            }
+            assert!(!alice.is_sync_event_processed(&echo.id));
+            alice
+                .process_marmot_events(vec![echo.clone()], "group message")
+                .await;
+        }
         assert!(
             alice.is_sync_event_processed(&echo.id),
-            "the budget spent, the event is retired"
+            "three distinct passes past the rollback window retire it"
         );
         assert!(alice.sync_state.lock().unwrap().failed_event_passes.is_empty());
     }

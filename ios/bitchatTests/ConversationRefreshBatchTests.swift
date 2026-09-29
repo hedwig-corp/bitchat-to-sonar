@@ -33,6 +33,27 @@ struct ConversationRefreshBatchTests {
         #expect(plan.pageGroups == ["g7"])
     }
 
+    @Test func aFailedHydrationFallsBackToEveryChangedPage() {
+        // #629 review: the burst path removed every changed id before one
+        // summaries hydrate; a transient failure there dropped them all.
+        let changed = Set((0..<40).map { "g\($0)" })
+        let plan = snConversationRefreshPlan(changed: changed, viewing: ["g7"], threshold: 16)
+        #expect(
+            snConversationRefreshPageGroups(plan: plan, changed: changed, summariesHydrated: true)
+                == ["g7"]
+        )
+        #expect(
+            snConversationRefreshPageGroups(plan: plan, changed: changed, summariesHydrated: false)
+                == changed.sorted()
+        )
+        let small = snConversationRefreshPlan(changed: ["a", "b"], viewing: [], threshold: 16)
+        #expect(
+            snConversationRefreshPageGroups(plan: small, changed: ["a", "b"], summariesHydrated: false)
+                == ["a", "b"],
+            "no burst, no hydrate: the plan's pages stand"
+        )
+    }
+
     @Test func theThresholdIsExclusive() {
         let sixteen = Set((0..<16).map { "g\($0)" })
         #expect(

@@ -2527,13 +2527,21 @@ final class MarmotChatModel: ObservableObject {
                     viewing: self.viewingUnreadGroupIds,
                     threshold: Self.conversationRefreshBatchThreshold
                 )
+                var pageGroups = plan.pageGroups
                 if plan.reloadSummaries {
                     // A burst: one bounded summaries hydrate paints every row;
-                    // only the chats on screen still reload a page below.
-                    await self.loadLocalSummaries(resolveMembers: false)
+                    // only the chats on screen still reload a page below. If
+                    // that hydrate fails, fall back to every changed page so
+                    // no invalidation is dropped.
+                    let hydrated = await self.loadLocalSummaries(resolveMembers: false)
+                    pageGroups = snConversationRefreshPageGroups(
+                        plan: plan,
+                        changed: groups,
+                        summariesHydrated: hydrated
+                    )
                 }
                 var deferredBusyGroup = false
-                for changedGroupId in plan.pageGroups {
+                for changedGroupId in pageGroups {
                     if self.localTranscriptLoadingGroups.contains(changedGroupId) {
                         self.pendingConversationRefreshGroups.insert(changedGroupId)
                         deferredBusyGroup = true
@@ -5840,4 +5848,15 @@ func snConversationRefreshPlan(
         return (false, changed.sorted())
     }
     return (true, changed.filter { viewing.contains($0) }.sorted())
+}
+
+/// The pages a burst still reloads once its summaries hydrate has run. A
+/// failed hydrate (a transient local-read error) must not drop the burst's
+/// invalidations: every changed chat falls back to its bounded page load.
+func snConversationRefreshPageGroups(
+    plan: (reloadSummaries: Bool, pageGroups: [String]),
+    changed: Set<String>,
+    summariesHydrated: Bool
+) -> [String] {
+    plan.reloadSummaries && !summariesHydrated ? changed.sorted() : plan.pageGroups
 }

@@ -2926,10 +2926,15 @@ once; later passes merge into the queue the heartbeat drains).
   the fix re-shares once into the selected groups (newest 64, in batches of 8).
   Its old 512 share echoes were never marked processed, so per-group catch-up
   re-fetched and re-failed them on every pass — 565–626 MDK failures per pass
-  on 2026-09-29 — until `MDK_FAILED_PASS_BUDGET` (3 passes) retires them
-  (`client.rs::an_event_mdk_keeps_failing_is_retired_after_the_pass_budget`).
-  The budget is a judgment call: a rollback that would have rescued an event
-  after its third failing pass loses it, which is the state it was in anyway.
+  on 2026-09-29 — until the pass budget retires them: `MDK_FAILED_PASS_BUDGET`
+  (3) distinct passes at least `MDK_FAILED_PASS_MIN_GAP_SECS` (60 s) apart and
+  `MDK_FAILED_RETIRE_AFTER_SECS` (10 min) after the first failure
+  (`client.rs::an_event_mdk_keeps_failing_is_retired_after_the_pass_budget`;
+  `client.rs::rapid_failed_deliveries_do_not_retire_an_event` pins that the
+  live, initial and per-group paths delivering one event within seconds count
+  as one pass). The window is a judgment call: a rollback that lands more than
+  10 minutes after an event's first failure, and after three of its passes,
+  would find the event already retired — the state it was in anyway.
 - If `record_timezone_share_sent` fails on an open index (disk full, I/O), that
   process still falls back to its in-memory record.
 - Turning Share local time on still fans out to up to 256 groups in one burst,
