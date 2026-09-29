@@ -2919,11 +2919,13 @@ rate-limit notices, and `nos.lol` refusing subscriptions for minutes after).
 
 **Not guarded:**
 - A device that ran alpha.15 has no trustworthy record, so its first launch on
-  the fix re-shares once into every allowed group. Bounded, and once. Its old
-  512 share echoes were never marked processed, so per-group catch-up keeps
-  re-fetching and re-failing them until they age out of the one-hour floor
-  lookback (`GROUP_CATCHUP_FLOOR_LOOKBACK_SECS`); measured at 565–626 MDK
-  failures per pass on 2026-09-29.
+  the fix re-shares once into the selected groups (newest 64, in batches of 8).
+  Its old 512 share echoes were never marked processed, so per-group catch-up
+  re-fetched and re-failed them on every pass — 565–626 MDK failures per pass
+  on 2026-09-29 — until `MDK_FAILED_PASS_BUDGET` (3 passes) retires them
+  (`client.rs::an_event_mdk_keeps_failing_is_retired_after_the_pass_budget`).
+  The budget is a judgment call: a rollback that would have rescued an event
+  after its third failing pass loses it, which is the state it was in anyway.
 - If `record_timezone_share_sent` fails on an open index (disk full, I/O), that
   process still falls back to its in-memory record.
 - Turning Share local time on still fans out to up to 256 groups in one burst,
