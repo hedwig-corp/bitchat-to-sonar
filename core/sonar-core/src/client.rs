@@ -62,7 +62,16 @@ const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 /// A single timezone-change pass is intentionally bounded. Current Marmot
 /// group counts are far below this, but the defensive cap keeps corrupt local
 /// membership state from creating an unbounded MLS fan-out.
-const MAX_TIMEZONE_SHARE_GROUPS: usize = 256;
+/// Most groups one zone (re)share reaches. Selection is by index recency, so
+/// these are the chats the user talks in, not the first N of the group list
+/// (alpha.15 shared into 256 groups in list order, in one burst).
+const MAX_TIMEZONE_SHARE_GROUPS: usize = 64;
+/// A group whose newest message is older than this waits for its next open
+/// or send before it gets a share.
+const TIMEZONE_SHARE_ACTIVE_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
+/// Shares encrypted inside the host's call; the rest trickle at this many per
+/// idle heartbeat (`ensure_subscriptions`, at most 25 s apart on both hosts).
+const TIMEZONE_SHARE_BATCH: usize = 8;
 /// Accept modest clock skew, but never let a peer pin its cached timezone with
 /// an arbitrarily far-future rumor timestamp.
 const TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
@@ -1358,6 +1367,30 @@ impl GroupCatchupGate {
 
 const SYNC_STATE_VERSION: u32 = 1;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
+/// Passes on which MDK may keep answering Failed for one event before the
+/// sync layer retires it. A Failed record can turn Retryable after an MLS
+/// commit rollback, which happens within minutes of the fork; past that,
+/// re-fetching the event on every catch-up buys nothing (565–626 re-failures
+/// per pass on the alpha.15 iPhone, each an MDK lookup on the engine queue).
+const MDK_FAILED_PASS_BUDGET: u32 = 3;
+/// Deliveries of one event closer together than this are one pass: the live,
+/// initial and per-group catch-up paths can all hand over the same event
+/// within seconds, and three of them must not spend the budget before the
+/// winning commit arrives.
+const MDK_FAILED_PASS_MIN_GAP_SECS: u64 = 60;
+/// No event is retired sooner than this after its first failure, however many
+/// passes it saw: long enough for a fork's rollback to land and turn it
+/// Retryable. The echoes this budget targets fail for hours.
+const MDK_FAILED_RETIRE_AFTER_SECS: u64 = 10 * 60;
+const SYNC_STATE_FAILED_EVENT_CAP: usize = 4_000;
+
+/// How long one event has kept failing in MDK (`MDK_FAILED_PASS_BUDGET`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct FailedEventPasses {
+    passes: u32,
+    first_failed_secs: u64,
+    last_counted_secs: u64,
+}
 
 #[derive(Debug)]
 struct LiveEventDeduper {
@@ -1423,6 +1456,10 @@ struct SyncStateDisk {
     version: u32,
     watermark_secs: u64,
     processed_event_ids: Vec<String>,
+    /// Failed-pass records per event id (`MDK_FAILED_PASS_BUDGET`). Absent in
+    /// older sidecars.
+    #[serde(default)]
+    failed_event_passes: HashMap<String, FailedEventPasses>,
 }
 
 /// Point-in-time relay/sync diagnostics, serialized into the exported debug
@@ -1466,6 +1503,8 @@ struct SyncState {
     watermark_secs: u64,
     processed_event_ids: HashSet<String>,
     processed_event_order: VecDeque<String>,
+    failed_event_passes: HashMap<String, FailedEventPasses>,
+    failed_event_order: VecDeque<String>,
     dirty: bool,
 }
 
@@ -1481,12 +1520,21 @@ impl SyncState {
             .and_then(|bytes| serde_json::from_slice::<SyncStateDisk>(&bytes).ok())
             .filter(|state| state.version == SYNC_STATE_VERSION);
 
-        let (disk_watermark, processed_event_ids) = disk
-            .map(|state| (state.watermark_secs, state.processed_event_ids))
-            .unwrap_or((0, Vec::new()));
+        let (disk_watermark, processed_event_ids, failed_event_passes) = disk
+            .map(|state| {
+                (
+                    state.watermark_secs,
+                    state.processed_event_ids,
+                    state.failed_event_passes,
+                )
+            })
+            .unwrap_or_default();
         let watermark_secs = conservative_watermark(disk_watermark, fallback_watermark_secs);
 
-        Self::new(path, watermark_secs, processed_event_ids)
+        let mut state = Self::new(path, watermark_secs, processed_event_ids);
+        state.failed_event_order = failed_event_passes.keys().cloned().collect();
+        state.failed_event_passes = failed_event_passes;
+        state
     }
 
     fn new(path: Option<PathBuf>, watermark_secs: u64, processed_event_ids: Vec<String>) -> Self {
@@ -1495,6 +1543,8 @@ impl SyncState {
             watermark_secs,
             processed_event_ids: HashSet::new(),
             processed_event_order: VecDeque::new(),
+            failed_event_passes: HashMap::new(),
+            failed_event_order: VecDeque::new(),
             dirty: false,
         };
         for id in processed_event_ids {
@@ -1527,6 +1577,48 @@ impl SyncState {
             }
         }
         self.dirty = true;
+    }
+
+    /// MDK answered Failed for `event_id` again at `now_secs`. A delivery within
+    /// `MDK_FAILED_PASS_MIN_GAP_SECS` of the last counted one is the same pass.
+    /// Returns true when the event should be retired into the processed set:
+    /// `MDK_FAILED_PASS_BUDGET` counted passes AND at least
+    /// `MDK_FAILED_RETIRE_AFTER_SECS` since the first failure. A retired event
+    /// leaves the table.
+    fn record_failed_pass(&mut self, event_id: &str, now_secs: u64) -> bool {
+        let record = match self.failed_event_passes.get_mut(event_id) {
+            Some(record) => {
+                if now_secs.saturating_sub(record.last_counted_secs) < MDK_FAILED_PASS_MIN_GAP_SECS {
+                    return false;
+                }
+                record.passes += 1;
+                record.last_counted_secs = now_secs;
+                *record
+            }
+            None => {
+                let record = FailedEventPasses {
+                    passes: 1,
+                    first_failed_secs: now_secs,
+                    last_counted_secs: now_secs,
+                };
+                self.failed_event_passes.insert(event_id.to_owned(), record);
+                self.failed_event_order.push_back(event_id.to_owned());
+                while self.failed_event_order.len() > SYNC_STATE_FAILED_EVENT_CAP {
+                    if let Some(oldest) = self.failed_event_order.pop_front() {
+                        self.failed_event_passes.remove(&oldest);
+                    }
+                }
+                record
+            }
+        };
+        self.dirty = true;
+        let retire = record.passes >= MDK_FAILED_PASS_BUDGET
+            && now_secs.saturating_sub(record.first_failed_secs) >= MDK_FAILED_RETIRE_AFTER_SECS;
+        if retire {
+            self.failed_event_passes.remove(event_id);
+            self.failed_event_order.retain(|id| id != event_id);
+        }
+        retire
     }
 
     fn advance_watermark(&mut self, watermark_secs: u64) {
@@ -1574,6 +1666,7 @@ impl SyncState {
             version: SYNC_STATE_VERSION,
             watermark_secs: self.watermark_secs,
             processed_event_ids: self.processed_event_order.iter().cloned().collect(),
+            failed_event_passes: self.failed_event_passes.clone(),
         };
         let bytes = serde_json::to_vec(&disk)?;
         let tmp = sync_state_tmp_path(path);
@@ -1602,6 +1695,51 @@ struct MarmotProcessReport {
     processed: usize,
     retryable_failures: usize,
     oldest_retryable_secs: Option<u64>,
+}
+
+/// Holds one message id in `SonarClient::outbox_inflight_ids` for the life of
+/// its publish task. Whichever branch ends the task, the drop releases it.
+struct OutboxInflightGuard {
+    ids: Arc<Mutex<HashSet<String>>>,
+    id: String,
+    held: bool,
+}
+
+impl OutboxInflightGuard {
+    fn acquire(ids: &Arc<Mutex<HashSet<String>>>, id: &str) -> Option<Self> {
+        if ids.lock().unwrap().insert(id.to_owned()) {
+            Some(Self {
+                ids: ids.clone(),
+                id: id.to_owned(),
+                held: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Let another publish of this id start while this task sleeps its
+    /// backoff.
+    fn release(&mut self) {
+        if self.held {
+            self.ids.lock().unwrap().remove(&self.id);
+            self.held = false;
+        }
+    }
+
+    /// False when another task took the id over during the backoff.
+    fn reacquire(&mut self) -> bool {
+        if !self.held {
+            self.held = self.ids.lock().unwrap().insert(self.id.clone());
+        }
+        self.held
+    }
+}
+
+impl Drop for OutboxInflightGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl MarmotProcessReport {
@@ -1812,6 +1950,33 @@ fn load_timezone_shares_sent(
     }
 }
 
+/// Rank the allowlisted groups one zone share should reach: newest local
+/// transcript first, groups older than `TIMEZONE_SHARE_ACTIVE_WINDOW_SECS`
+/// dropped, capped at `MAX_TIMEZONE_SHARE_GROUPS`. `recency` is the index's
+/// `latest_at_secs` per group hex; a group with no row, or a row at 0 (the
+/// index materializes one per group at open), has no transcript yet — a chat
+/// just created — so it stays eligible and ranks last.
+fn select_timezone_share_groups(
+    candidates: Vec<(String, u64)>,
+    recency: &HashMap<String, u64>,
+    now_secs: u64,
+) -> Vec<(String, u64)> {
+    let floor = now_secs.saturating_sub(TIMEZONE_SHARE_ACTIVE_WINDOW_SECS);
+    let mut ranked: Vec<(String, u64, u64)> = candidates
+        .into_iter()
+        .filter_map(|(group_hex, epoch)| {
+            let latest_at = recency.get(&group_hex).copied().unwrap_or(0);
+            (latest_at == 0 || latest_at >= floor).then_some((group_hex, epoch, latest_at))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(MAX_TIMEZONE_SHARE_GROUPS);
+    ranked
+        .into_iter()
+        .map(|(group_hex, epoch, _)| (group_hex, epoch))
+        .collect()
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
@@ -1861,6 +2026,23 @@ pub struct SonarClient {
     /// Count of outbox publish tasks in flight. Historical catch-up yields while
     /// this is non-zero so user sends keep relay/runtime priority (P0).
     send_inflight: Arc<AtomicUsize>,
+    /// Message ids with a publish task in flight, so the outbox retries that
+    /// connect fires within milliseconds of each other (`subscribe_marmot`,
+    /// `sync`, `ensure_subscriptions`) cannot each publish the same pending
+    /// row. Released across a task's retry backoff, like `send_inflight`, so a
+    /// reconnect retry can still take over a stranded send.
+    outbox_inflight_ids: Arc<Mutex<HashSet<String>>>,
+    /// Set while a debounced outbox flush is scheduled (`schedule_outbox_flush`),
+    /// so an ack burst rewrites the sidecar once.
+    outbox_flush_pending: Arc<AtomicBool>,
+    /// Groups still owed the local-time share, newest first. A fan-out shares
+    /// `TIMEZONE_SHARE_BATCH` groups at once and queues the rest here;
+    /// `advance_timezone_share_trickle` drains a batch per idle heartbeat, a
+    /// chat open moves its group to the front.
+    timezone_share_queue: Arc<Mutex<VecDeque<String>>>,
+    /// The zone `timezone_share_queue` was planned for. While a plan for the
+    /// current zone is still draining, a new pass only refreshes the queue.
+    timezone_share_plan_zone: Arc<Mutex<Option<String>>>,
     /// Excludes sends from OUR in-flight membership changes. A membership flow
     /// (add/remove/leave/auto-commit) holds write from commit creation through
     /// publish+merge; send paths hold read around encrypt+local-write, so a
@@ -2180,6 +2362,10 @@ impl SonarClient {
         let pending_marmot_groups: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let send_inflight = Arc::new(AtomicUsize::new(0));
+        let outbox_inflight_ids = Arc::new(Mutex::new(HashSet::new()));
+        let outbox_flush_pending = Arc::new(AtomicBool::new(false));
+        let timezone_share_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let timezone_share_plan_zone = Arc::new(Mutex::new(None));
         let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
@@ -2482,6 +2668,10 @@ impl SonarClient {
             pending_marmot_groups,
             marmot_notify,
             send_inflight,
+            outbox_inflight_ids,
+            outbox_flush_pending,
+            timezone_share_queue,
+            timezone_share_plan_zone,
             membership_gate,
             buffer_drops_total,
             live_marmot_enabled,
@@ -3787,6 +3977,11 @@ impl SonarClient {
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(Some((group_name, message)), event_id);
+        // The first message into a chat moves its zone share to the front of
+        // the queue; the next heartbeat sends it. Never on the send path: the
+        // share is another MLS encryption and can wait on the membership gate,
+        // which a membership change holds across relay publication.
+        self.prioritize_timezone_share(&group_id_hex);
         self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
@@ -4789,6 +4984,18 @@ impl SonarClient {
         if self.relays.is_empty() {
             return publish_result_rx;
         }
+        // Connect runs three outbox retries within milliseconds of each other;
+        // on the alpha.15 iPhone each of 256 pending rows was published three
+        // times (768 publishes, 763 relay rate-limit notices). A dropped sender
+        // here reads like the no-relays return above: the first task carries
+        // the push notification, a duplicate never did.
+        let Some(mut inflight_guard) =
+            OutboxInflightGuard::acquire(&self.outbox_inflight_ids, &message_id_hex)
+        else {
+            tracing::debug!(message_id = %message_id_hex, "outbox publish already in flight");
+            return publish_result_rx;
+        };
+        let silent = self.outbox_state.lock().unwrap().is_silent(&message_id_hex);
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
         let outbox_publish_epoch = self.outbox_publish_epoch.clone();
@@ -4796,6 +5003,7 @@ impl SonarClient {
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
+        let outbox_flush_pending = self.outbox_flush_pending.clone();
         let reaction_index = self.engine.reaction_index();
         // Count the send before spawn so hosts that gate catch-up / shutdown on
         // `send_inflight == 0` cannot observe a gap between return and task start.
@@ -4829,6 +5037,10 @@ impl SonarClient {
                     let change_listener = change_listener.clone();
                     let group_id_hex = group_id_hex.clone();
                     move || {
+                        // A control row's ack or failure changes no transcript.
+                        if silent {
+                            return;
+                        }
                         if let Some(listener) = change_listener.lock().unwrap().clone() {
                             listener.on_conversation_changed(group_id_hex.clone());
                         }
@@ -4869,9 +5081,16 @@ impl SonarClient {
                     match outcome {
                         Ok(relay_url) => {
                             let rtt_ms = publish_started.elapsed().as_millis() as u64;
-                            let _ = outbox_state.lock().unwrap().mark_sent_by_message_id(
-                                &message_id_hex,
-                                Timestamp::now().as_secs(),
+                            // Lazy + debounced: 256 acks in one second used to
+                            // rewrite the whole sidecar 256 times (45 MB).
+                            outbox_state
+                                .lock()
+                                .unwrap()
+                                .mark_sent_by_message_id_lazy(&message_id_hex);
+                            crate::outbox::schedule_outbox_flush(
+                                outbox_state.clone(),
+                                outbox_flush_pending.clone(),
+                                crate::outbox::OUTBOX_ACK_FLUSH_DELAY,
                             );
                             tracing::info!(
                                 message_id = %message_id_hex,
@@ -4947,11 +5166,20 @@ impl SonarClient {
                     "send_publish_auto_retry_scheduled"
                 );
                 // Release send_inflight across the backoff so historical
-                // catch-up is not blocked for the full retry sleep.
+                // catch-up is not blocked for the full retry sleep, and the
+                // in-flight id so a reconnect retry can take the row over.
                 send_inflight.fetch_sub(1, Ordering::Relaxed);
                 inflight_held = false;
+                inflight_guard.release();
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
+                    break;
+                }
+                if !inflight_guard.reacquire() {
+                    tracing::debug!(
+                        message_id = %message_id_hex,
+                        "send_publish_auto_retry_taken_over"
+                    );
                     break;
                 }
                 let prepared = outbox_state.lock().unwrap().prepare_auto_retry(
@@ -5036,11 +5264,24 @@ impl SonarClient {
                 }
             }
         };
-        for (message_id_hex, group_id_hex, event) in retryable {
-            // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
-            self.notify_conversation_changed(&group_id_hex);
+        // One wake per group whose rows actually start publishing: not per
+        // row (256 wakes before a single publish had started on the alpha.15
+        // iPhone), not for control rows, and not for rows a running task
+        // already owns. group_id_hex is the MLS id stored at mark_pending —
+        // the same key hosts use.
+        let mut changed_groups: HashSet<String> = HashSet::new();
+        for (message_id_hex, group_id_hex, event, silent) in retryable {
+            let fresh = !self
+                .outbox_inflight_ids
+                .lock()
+                .unwrap()
+                .contains(&message_id_hex);
+            if fresh && !silent {
+                changed_groups.insert(group_id_hex.clone());
+            }
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
+        self.notify_conversations_changed(&changed_groups);
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {
@@ -6573,6 +6814,9 @@ impl SonarClient {
             Ok(report) => self.save_or_rewind_without_advancing_watermark(report)?,
             Err(err) => tracing::debug!(%err, "initial Marmot per-group catch-up failed"),
         }
+        // The local-time reshare trickles on this heartbeat: a batch per call,
+        // so it spreads over minutes and stops with the app in background.
+        self.advance_timezone_share_trickle().await;
         // The apps use this lightweight idle path instead of `sync()`. Retry
         // the durable outbox here too so a transient outage self-heals after
         // relay reconnection even when the user does not tap the retry button.
@@ -6681,6 +6925,8 @@ impl SonarClient {
             watermark_secs: state.watermark_secs,
             processed_event_ids: state.processed_event_ids.clone(),
             processed_event_order: state.processed_event_order.clone(),
+            failed_event_passes: state.failed_event_passes.clone(),
+            failed_event_order: state.failed_event_order.clone(),
             dirty: state.dirty,
         }
     }
@@ -6690,6 +6936,8 @@ impl SonarClient {
         state.watermark_secs = snapshot.watermark_secs;
         state.processed_event_ids = snapshot.processed_event_ids;
         state.processed_event_order = snapshot.processed_event_order;
+        state.failed_event_passes = snapshot.failed_event_passes;
+        state.failed_event_order = snapshot.failed_event_order;
         state.dirty = snapshot.dirty;
     }
 
@@ -7038,17 +7286,34 @@ impl SonarClient {
             match self.engine.process_incoming(&event).await {
                 Ok(Incoming::Failed) => {
                     // Count the delivery as handled so one bad ciphertext does
-                    // not pin the global watermark, but do NOT add it to Sonar's
-                    // durable processed-ID set. MDK can change a Failed record
-                    // to Retryable after an MLS commit rollback; a later relay
-                    // catch-up must then reach MDK so the missing message can be
-                    // decrypted and stored.
-                    tracing::debug!(
-                        event_id = %event.id,
-                        event_created_at = event.created_at.as_secs(),
-                        context,
-                        "marmot event failed in MDK; preserving rollback retry"
-                    );
+                    // not pin the global watermark. The durable processed-ID
+                    // set waits: MDK can change a Failed record to Retryable
+                    // after an MLS commit rollback, and a later relay catch-up
+                    // must then reach MDK so the message can be decrypted. That
+                    // window is minutes, not forever — after
+                    // `MDK_FAILED_PASS_BUDGET` distinct passes spread over
+                    // `MDK_FAILED_RETIRE_AFTER_SECS` the event is retired, or
+                    // every catch-up re-fetches and re-fails it.
+                    let retire = self
+                        .sync_state
+                        .lock()
+                        .unwrap()
+                        .record_failed_pass(&event.id.to_hex(), Timestamp::now().as_secs());
+                    if retire {
+                        tracing::debug!(
+                            event_id = %event.id,
+                            context,
+                            "marmot event failed in MDK on every pass; retiring it"
+                        );
+                        self.mark_sync_event_processed(&event.id);
+                    } else {
+                        tracing::debug!(
+                            event_id = %event.id,
+                            event_created_at = event.created_at.as_secs(),
+                            context,
+                            "marmot event failed in MDK; preserving rollback retry"
+                        );
+                    }
                     report.record_processed();
                 }
                 Ok(Incoming::GroupProposal(update)) => {
@@ -7448,6 +7713,8 @@ impl SonarClient {
     }
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
+        // Both hosts call this on chat open: the chat on screen shares first.
+        self.prioritize_timezone_share(group_id_hex);
         if let Some(ref idx) = self.conversation_index {
             // Notify only when the unread count actually moved. Hosts re-mark
             // the OPEN chat read on every change notification for it, so an
@@ -7474,6 +7741,7 @@ impl SonarClient {
     pub async fn update_local_timezone(&self, zone: &str) -> Result<()> {
         if zone.trim().is_empty() {
             *self.local_timezone.lock().unwrap() = None;
+            self.timezone_share_queue.lock().unwrap().clear();
             return Ok(());
         }
         let payload = crate::timezone::encode_timezone_share_payload(zone)?;
@@ -7549,7 +7817,12 @@ impl SonarClient {
                 allow.remove(id);
             }
         }
+        self.timezone_share_queue
+            .lock()
+            .unwrap()
+            .retain(|queued| !targets.contains(queued));
         let payload = crate::timezone::encode_timezone_revoke_payload();
+        let _outbox_batch = crate::outbox::OutboxSaveBatch::begin(&self.outbox_state);
         for group_id_hex in targets {
             if !self
                 .timezone_shared_with
@@ -7625,19 +7898,39 @@ impl SonarClient {
         }
     }
 
-    /// Encrypt at most one kind-449 rumor per active MLS group and publish
-    /// through the chat outbox. Per-group dedupe suppresses ordinary
-    /// sync/message triggers; failed creates stay eligible for retry.
-    async fn share_local_timezone_with_groups(&self) {
-        let Some(zone) = self.local_timezone.lock().unwrap().clone() else {
-            return;
-        };
-        let payload = match crate::timezone::encode_timezone_share_payload(&zone) {
-            Ok(payload) => payload,
+    /// The zone and its encoded payload, when there is a zone to share and a
+    /// durable place to record where it went.
+    fn timezone_share_payload(&self) -> Option<(String, String)> {
+        let zone = self.local_timezone.lock().unwrap().clone()?;
+        // The per-group dedupe is only as durable as the index it lives in.
+        // Without one, every process start and every iOS store reopen begins
+        // with an empty record and re-encrypts a share into every allowed
+        // group: 738 publishes in the first minute, and relays rate-limiting
+        // the account, on an alpha.15 iPhone whose index failed to open. Hold
+        // the zone and share once an open succeeds.
+        if self.conversation_index.is_none() {
+            // debug, not warn: sync passes call this, and the failed open
+            // already warned once at connect.
+            tracing::debug!("timezone share skipped: conversation index unavailable");
+            return None;
+        }
+        match crate::timezone::encode_timezone_share_payload(&zone) {
+            Ok(payload) => Some((zone, payload)),
             Err(err) => {
                 tracing::debug!(%err, "local timezone became invalid before share");
-                return;
+                None
             }
+        }
+    }
+
+    /// Plan one zone (re)share: rank the allowlisted groups by index recency
+    /// (`select_timezone_share_groups`), drop the ones that already hold this
+    /// zone at their current epoch, share `TIMEZONE_SHARE_BATCH` now and queue
+    /// the rest for the idle heartbeat. Ordinary sync/message triggers find
+    /// nothing due and return.
+    async fn share_local_timezone_with_groups(&self) {
+        let Some((zone, payload)) = self.timezone_share_payload() else {
+            return;
         };
         let groups = match self.engine.groups() {
             Ok(groups) => groups,
@@ -7650,36 +7943,160 @@ impl SonarClient {
         if allow.is_empty() {
             return;
         }
-        let mut groups: Vec<_> = groups
-            .into_iter()
-            .filter(|group| allow.contains(&hex::encode(group.mls_group_id.as_slice())))
+        let candidates: Vec<(String, u64)> = groups
+            .iter()
+            .map(|group| (hex::encode(group.mls_group_id.as_slice()), group.epoch))
+            .filter(|(group_hex, _)| allow.contains(group_hex))
             .collect();
-        if groups.len() > MAX_TIMEZONE_SHARE_GROUPS {
-            tracing::warn!(
-                groups = groups.len(),
-                cap = MAX_TIMEZONE_SHARE_GROUPS,
-                "timezone share group cap reached"
-            );
-            groups.truncate(MAX_TIMEZONE_SHARE_GROUPS);
+        let allowlisted = candidates.len();
+        let recency: HashMap<String, u64> = self
+            .conversation_summaries()
+            .into_iter()
+            .map(|summary| (summary.group_id_hex, summary.latest_at_secs))
+            .collect();
+        let selected =
+            select_timezone_share_groups(candidates, &recency, Timestamp::now().as_secs());
+        let selected_len = selected.len();
+        let due: Vec<String> = {
+            let shared = self.timezone_shared_with.lock().unwrap();
+            selected
+                .into_iter()
+                .filter(|(group_hex, epoch)| {
+                    shared.get(group_hex)
+                        != Some(&TimezoneShareDedupe {
+                            zone: zone.clone(),
+                            epoch: *epoch,
+                        })
+                })
+                .map(|(group_hex, _)| group_hex)
+                .collect()
+        };
+        // Hosts call this far more often than a plan drains: iOS twice per
+        // reconcile (groups, then zone), Compose after every chat refresh,
+        // the drain after every membership batch. Only the first pass of a
+        // plan shares a batch inside the call; while that plan is still
+        // draining, later passes merge newly due groups into the queue and
+        // leave the pacing to the heartbeat. Queued entries keep their place,
+        // so a chat the user just opened stays in front.
+        let (now_batch, queued) = {
+            let mut queue = self.timezone_share_queue.lock().unwrap();
+            let mut plan_zone = self.timezone_share_plan_zone.lock().unwrap();
+            let plan_running = !queue.is_empty() && plan_zone.as_deref() == Some(zone.as_str());
+            for group_hex in &due {
+                if !queue.contains(group_hex) {
+                    queue.push_back(group_hex.clone());
+                }
+            }
+            if queue.is_empty() {
+                return;
+            }
+            *plan_zone = Some(zone.clone());
+            let now_batch: Vec<String> = if plan_running {
+                Vec::new()
+            } else {
+                (0..TIMEZONE_SHARE_BATCH)
+                    .filter_map(|_| queue.pop_front())
+                    .collect()
+            };
+            (now_batch, queue.len())
+        };
+        tracing::info!(
+            allowlisted,
+            selected = selected_len,
+            due = due.len(),
+            now = now_batch.len(),
+            queued,
+            "timezone share pass"
+        );
+        if !now_batch.is_empty() {
+            self.share_timezone_batch(&now_batch, &zone, &payload).await;
         }
+    }
 
-        for group in groups {
-            let group_id = group.mls_group_id;
-            let group_id_hex = hex::encode(group_id.as_slice());
+    /// Share with the next `TIMEZONE_SHARE_BATCH` queued groups. Called from
+    /// the idle heartbeat, so a 64-group reshare spreads over a few minutes
+    /// and stops on its own when the app is backgrounded.
+    pub(crate) async fn advance_timezone_share_trickle(&self) {
+        let batch: Vec<String> = {
+            let mut queue = self.timezone_share_queue.lock().unwrap();
+            (0..TIMEZONE_SHARE_BATCH)
+                .filter_map(|_| queue.pop_front())
+                .collect()
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let Some((zone, payload)) = self.timezone_share_payload() else {
+            return;
+        };
+        tracing::info!(now = batch.len(), "timezone share trickle");
+        self.share_timezone_batch(&batch, &zone, &payload).await;
+    }
+
+    /// The chat the user just opened, or just wrote in, shares first: front of
+    /// the queue while a zone is set and the chat is allowlisted. It is queued
+    /// even when some share record exists, because only the batch knows the
+    /// group's current epoch: a chat older than the active window whose
+    /// members changed would otherwise never get the zone. The batch skips it
+    /// when zone and epoch already match. Cheap enough for every
+    /// `mark_conversation_read`: no engine read, no MLS work.
+    fn prioritize_timezone_share(&self, group_id_hex: &str) {
+        if self.local_timezone.lock().unwrap().is_none() {
+            return;
+        }
+        if !self
+            .timezone_share_group_ids
+            .lock()
+            .unwrap()
+            .contains(group_id_hex)
+        {
+            return;
+        }
+        let mut queue = self.timezone_share_queue.lock().unwrap();
+        queue.retain(|queued| queued != group_id_hex);
+        queue.push_front(group_id_hex.to_owned());
+    }
+
+    /// Encrypt one kind-449 per group and publish through the chat outbox,
+    /// under one sidecar write. Per-group dedupe (zone + epoch) suppresses
+    /// repeats; a failed create stays eligible for retry.
+    async fn share_timezone_batch(&self, group_hexes: &[String], zone: &str, payload: &str) {
+        let epochs: HashMap<String, (GroupId, u64)> = match self.engine.groups() {
+            Ok(groups) => groups
+                .into_iter()
+                .map(|group| {
+                    (
+                        hex::encode(group.mls_group_id.as_slice()),
+                        (group.mls_group_id, group.epoch),
+                    )
+                })
+                .collect(),
+            Err(err) => {
+                tracing::debug!(%err, "timezone share group list failed");
+                return;
+            }
+        };
+        // One sidecar write for the whole batch instead of one per group
+        // (256 groups wrote 45 MB of JSON on the alpha.15 iPhone).
+        let _outbox_batch = crate::outbox::OutboxSaveBatch::begin(&self.outbox_state);
+        for group_id_hex in group_hexes {
+            let Some((group_id, epoch)) = epochs.get(group_id_hex) else {
+                continue; // left or deleted since it was queued
+            };
             let wanted = TimezoneShareDedupe {
-                zone: zone.clone(),
-                epoch: group.epoch,
+                zone: zone.to_owned(),
+                epoch: *epoch,
             };
             {
                 let mut shared = self.timezone_shared_with.lock().unwrap();
-                if shared.get(&group_id_hex) == Some(&wanted) {
+                if shared.get(group_id_hex) == Some(&wanted) {
                     continue;
                 }
                 shared.insert(group_id_hex.clone(), wanted.clone());
             }
             if let Some(ref idx) = self.conversation_index {
                 if let Err(err) = idx.lock().unwrap().record_timezone_share_sent(
-                    &group_id_hex,
+                    group_id_hex,
                     &wanted.zone,
                     wanted.epoch,
                 ) {
@@ -7689,10 +8106,10 @@ impl SonarClient {
                 }
             }
             if let Err(err) = self
-                .publish_timezone_rumor(&group_id, &group_id_hex, &payload)
+                .publish_timezone_rumor(group_id, group_id_hex, payload)
                 .await
             {
-                self.remove_failed_timezone_share(&group_id_hex, &zone);
+                self.remove_failed_timezone_share(group_id_hex, zone);
                 tracing::debug!(%err, "timezone MLS share failed");
             }
         }
@@ -7724,7 +8141,16 @@ impl SonarClient {
                 "created timezone rumor did not persist as kind-449".into(),
             ));
         }
-        self.outbox_state.lock().unwrap().mark_pending(
+        // Skip our own relay echo, as `spawn_send_bookkeeping` does for every
+        // other send. MDK already moved this wrapper to Processed above, so the
+        // echo can only come back `Unprocessable`: never recorded, it was
+        // re-fetched and re-failed on every catch-up — 512 such echoes on the
+        // alpha.15 iPhone. In-memory only: a burst of shares must not rewrite
+        // the sync-state file once per group, and the drain persists it.
+        self.mark_sync_event_processed(&event.id);
+        // Silent: a share is no transcript change, so neither its retry nor
+        // its ack wakes the hosts (256 shares woke them ~1,500 times).
+        self.outbox_state.lock().unwrap().mark_pending_silent(
             group_id_hex.to_owned(),
             event.id.to_hex(),
             event.id.to_hex(),
@@ -8803,6 +9229,8 @@ mod tests {
             watermark_secs: Timestamp::now().as_secs() - 3600,
             processed_event_ids: HashSet::new(),
             processed_event_order: VecDeque::new(),
+            failed_event_passes: HashMap::new(),
+            failed_event_order: VecDeque::new(),
             dirty: false,
         };
         sync.rewind_for_retry(clamped);
@@ -8825,6 +9253,8 @@ mod tests {
             watermark_secs: now - 60,
             processed_event_ids: HashSet::new(),
             processed_event_order: VecDeque::new(),
+            failed_event_passes: HashMap::new(),
+            failed_event_order: VecDeque::new(),
             dirty: false,
         };
         sync.rewind_for_retry(report.oldest_retryable_secs.expect("retryable recorded"));
@@ -10625,6 +11055,7 @@ mod tests {
             version: SYNC_STATE_VERSION,
             watermark_secs: 1_000,
             processed_event_ids: vec!["abc".to_string()],
+            failed_event_passes: HashMap::new(),
         };
         fs::write(&path, serde_json::to_vec(&disk).expect("json")).expect("write state");
 
@@ -11217,6 +11648,689 @@ mod tests {
             before + 1,
             "a new zone still shares"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_keeps_the_index_and_share_dedupe_over_a_foreign_v4_stamp() {
+        // alpha.15 on a real iPhone: an unmerged branch build had stamped the
+        // index v4 without main's timezone tables, `connect` dropped the index,
+        // and each store open re-encrypted the share into every allowed group
+        // (738 publishes in the first minute, relays rate-limiting the account).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let key = [0x5au8; 32];
+        crate::conversation_index::tests::write_foreign_v4_index(
+            &crate::conversation_index::index_db_path_for_db(&db),
+            key,
+        );
+        let identity = Identity::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let group_hex = {
+            let alice = SonarClient::connect(identity.clone(), vec![], &db, key)
+                .await
+                .expect("alice");
+            assert!(
+                alice.conversation_index.is_some(),
+                "a foreign schema stamp must not cost the conversation index"
+            );
+            let creation = alice
+                .engine
+                .create_group(
+                    "alice & bob",
+                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    relays,
+                )
+                .unwrap();
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .unwrap();
+            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
+            alice.update_local_timezone("Europe/Zurich").await.unwrap();
+            assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 1);
+            group_hex
+        };
+
+        let alice = SonarClient::connect(identity, vec![], &db, key)
+            .await
+            .expect("alice reopens");
+        let before = alice.outbox_state.lock().unwrap().recorded_count();
+        alice.set_timezone_share_groups(vec![group_hex]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            before,
+            "a reopen with the same zone and epoch must not re-encrypt the share"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_waits_for_a_durable_dedupe() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        // What `connect` does when the index cannot open.
+        alice.conversation_index = None;
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+
+        alice.set_timezone_share_groups(vec![group_hex]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            0,
+            "without a durable sent-share record every open would re-broadcast"
+        );
+        assert_eq!(
+            alice.local_timezone.lock().unwrap().as_deref(),
+            Some("Europe/Zurich"),
+            "the zone is kept for when an index is available"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_outbox_retries_publish_each_pending_row_once() {
+        // Connect fires `retry_outbox` from subscribe_marmot, sync and
+        // ensure_subscriptions within milliseconds; each spawned its own
+        // publish of every pending row (768 publishes for 256 rows on the
+        // alpha.15 iPhone, and the relays rate-limited the account).
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        // A configured relay the pool never connects to: publishes fail fast,
+        // which is all this test needs from them.
+        alice.relays = relays.clone();
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        alice
+            .engine
+            .merge_pending_commit(&creation.group.mls_group_id)
+            .unwrap();
+        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+        let (event, _) = alice
+            .engine
+            .create_and_process_text_message(&creation.group.mls_group_id, "hi")
+            .unwrap();
+        alice
+            .outbox_state
+            .lock()
+            .unwrap()
+            .mark_pending(
+                group_hex,
+                event.id.to_hex(),
+                event.id.to_hex(),
+                event.as_json(),
+                Timestamp::now().as_secs(),
+            )
+            .unwrap();
+
+        alice.retry_outbox().await;
+        alice.retry_outbox().await;
+        alice.retry_outbox().await;
+        assert_eq!(
+            alice.send_inflight.load(Ordering::Relaxed),
+            1,
+            "three retries in a row must leave one publish task, not three"
+        );
+        assert_eq!(alice.outbox_inflight_ids.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_outbox_wakes_hosts_once_per_group_and_never_for_control_rows() {
+        // Plan item 2 (alpha.15): `retry_outbox` woke the hosts once per row
+        // before a single publish had started, and every ack woke them again;
+        // ~1,500 wakes for one fan-out, each a chat-list rebuild on iOS.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        alice.relays = relays.clone();
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        alice.set_conversation_change_listener(Some(listener.clone()));
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        let gid = creation.group.mls_group_id;
+        alice.engine.merge_pending_commit(&gid).unwrap();
+        let group_hex = hex::encode(gid.as_slice());
+        let now = Timestamp::now().as_secs();
+        for i in 0..3 {
+            let (event, _) = alice
+                .engine
+                .create_and_process_text_message(&gid, &format!("hi {i}"))
+                .unwrap();
+            alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .mark_pending(
+                    group_hex.clone(),
+                    event.id.to_hex(),
+                    event.id.to_hex(),
+                    event.as_json(),
+                    now,
+                )
+                .unwrap();
+        }
+        let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
+        for offset in 0..2u64 {
+            let (event, _) = alice
+                .engine
+                .create_and_process_timezone_share(&gid, &payload, Timestamp::from(now + offset))
+                .unwrap();
+            alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .mark_pending_silent(
+                    group_hex.clone(),
+                    event.id.to_hex(),
+                    event.id.to_hex(),
+                    event.as_json(),
+                    now,
+                )
+                .unwrap();
+        }
+
+        alice.retry_outbox().await;
+        assert_eq!(alice.send_inflight.load(Ordering::Relaxed), 5, "every row publishes");
+        assert_eq!(
+            listener.changed.lock().unwrap().as_slice(),
+            [group_hex.clone()],
+            "one wake for the group, none for the two control rows"
+        );
+
+        // The same rows again: every publish is already owned, nothing new.
+        alice.retry_outbox().await;
+        assert_eq!(listener.changed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn timezone_share_selection_ranks_by_recency_within_the_window() {
+        let day = 24 * 60 * 60;
+        let now = 100 * day;
+        let recency: HashMap<String, u64> = [
+            ("fresh".to_owned(), now - 60),
+            ("week".to_owned(), now - 7 * day),
+            ("stale".to_owned(), now - 31 * day),
+            ("empty".to_owned(), 0),
+        ]
+        .into_iter()
+        .collect();
+        let candidates: Vec<(String, u64)> = ["stale", "empty", "week", "unknown", "fresh"]
+            .into_iter()
+            .map(|g| (g.to_owned(), 1))
+            .collect();
+        let ranked: Vec<String> = select_timezone_share_groups(candidates, &recency, now)
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect();
+        assert_eq!(
+            ranked,
+            ["fresh", "week", "empty", "unknown"],
+            "newest first; no transcript yet ranks last; older than the window is out"
+        );
+
+        let many: Vec<(String, u64)> = (0..MAX_TIMEZONE_SHARE_GROUPS + 10)
+            .map(|i| (format!("g{i:03}"), 1))
+            .collect();
+        assert_eq!(
+            select_timezone_share_groups(many, &HashMap::new(), now).len(),
+            MAX_TIMEZONE_SHARE_GROUPS
+        );
+    }
+
+    /// `n` groups whose index rows are newest-first in creation order.
+    async fn alice_with_ranked_groups(dir: &Path, n: usize) -> (SonarClient, Vec<String>) {
+        let db = dir.join("marmot.sqlite");
+        let alice = SonarClient::connect(Identity::generate(), vec![], &db, [4u8; 32])
+            .await
+            .expect("alice");
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let now = Timestamp::now().as_secs();
+        let mut hexes = Vec::new();
+        for i in 0..n as u64 {
+            let bob = MarmotEngine::in_memory(Identity::generate());
+            let creation = alice
+                .engine
+                .create_group(
+                    "chat",
+                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    relays.clone(),
+                )
+                .unwrap();
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .unwrap();
+            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            alice
+                .conversation_index
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .upsert_summary(&group_hex, "chat", "hi", "peer", now - i, false, true)
+                .unwrap();
+            hexes.push(group_hex);
+        }
+        alice.set_timezone_share_groups(hexes.clone()).await;
+        (alice, hexes)
+    }
+
+    fn shared_hexes(alice: &SonarClient) -> HashSet<String> {
+        alice
+            .timezone_shared_with
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn timezone_share_shares_a_batch_now_and_trickles_the_rest_on_the_heartbeat() {
+        // Plan item 3 (alpha.15): one zone became 256 encrypted events in one
+        // burst, into the first 256 groups of the list. Now: newest chats
+        // first, a batch inside the host's call, the rest one batch per idle
+        // heartbeat.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 20).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let shared = shared_hexes(&alice);
+        assert_eq!(shared.len(), TIMEZONE_SHARE_BATCH, "one batch inside the call");
+        assert!(
+            hexes[..TIMEZONE_SHARE_BATCH].iter().all(|g| shared.contains(g)),
+            "the batch is the newest chats"
+        );
+        assert_eq!(
+            alice.timezone_share_queue.lock().unwrap().len(),
+            20 - TIMEZONE_SHARE_BATCH
+        );
+
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(shared_hexes(&alice).len(), 2 * TIMEZONE_SHARE_BATCH);
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(shared_hexes(&alice).len(), 20, "the queue drains in batches");
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 20);
+
+        // Another ordinary trigger finds nothing due.
+        alice.set_timezone_share_groups(hexes).await;
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 20);
+    }
+
+    #[tokio::test]
+    async fn opening_a_chat_moves_its_share_to_the_front_of_the_trickle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 20).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let oldest = hexes.last().unwrap().clone();
+        assert!(!shared_hexes(&alice).contains(&oldest));
+
+        // Both hosts call this on chat open.
+        alice.mark_conversation_read(&oldest);
+        alice.advance_timezone_share_trickle().await;
+        let shared = shared_hexes(&alice);
+        assert!(shared.contains(&oldest), "the chat on screen shares first");
+        assert!(
+            !shared.contains(&hexes[18]),
+            "the one it displaced waits for the next heartbeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_send_into_a_chat_queues_its_zone_first_off_the_send_path() {
+        // #629 review: sharing inside `send_text` put another MLS encryption,
+        // and a possible wait on the membership gate, before the send returned.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 20).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let oldest = hexes.last().unwrap().clone();
+        assert!(!shared_hexes(&alice).contains(&oldest));
+        let before = alice.outbox_state.lock().unwrap().recorded_count();
+
+        let gid = GroupId::from_slice(&hex::decode(&oldest).unwrap());
+        alice.send_text(&gid, "hello").await.unwrap();
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            before + 1,
+            "the send queues only the text"
+        );
+        assert_eq!(
+            alice.timezone_share_queue.lock().unwrap().front(),
+            Some(&oldest),
+            "its zone share is next in line"
+        );
+
+        alice.advance_timezone_share_trickle().await;
+        assert!(shared_hexes(&alice).contains(&oldest), "the next heartbeat sends it");
+    }
+
+    #[tokio::test]
+    async fn repeated_share_passes_do_not_drain_the_plan_at_once() {
+        // #629 review (P1): iOS reconciles with two calls, Compose after every
+        // chat refresh. Each pass used to clear the queue and share another
+        // batch, so a burst of refreshes drained the whole plan immediately.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 20).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(shared_hexes(&alice).len(), TIMEZONE_SHARE_BATCH);
+
+        for _ in 0..3 {
+            alice.set_timezone_share_groups(hexes.clone()).await;
+            alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        }
+        assert_eq!(
+            shared_hexes(&alice).len(),
+            TIMEZONE_SHARE_BATCH,
+            "later passes refresh the plan; the heartbeat paces it"
+        );
+        assert_eq!(
+            alice.timezone_share_queue.lock().unwrap().len(),
+            20 - TIMEZONE_SHARE_BATCH
+        );
+
+        // A real zone change is a new plan: its first batch goes out at once.
+        alice.update_local_timezone("Asia/Tokyo").await.unwrap();
+        let tokyo_now = alice
+            .timezone_shared_with
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|record| record.zone == "Asia/Tokyo")
+            .count();
+        assert_eq!(tokyo_now, TIMEZONE_SHARE_BATCH);
+    }
+
+    #[tokio::test]
+    async fn opening_a_stale_chat_reshares_after_its_members_changed() {
+        // #629 review: a chat outside the active window that already held a
+        // share was skipped on open because some record existed, so a member
+        // who joined after that share never got the zone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 1).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let group = hexes[0].clone();
+        assert!(shared_hexes(&alice).contains(&group));
+        let before = alice.outbox_state.lock().unwrap().recorded_count();
+        // What a membership change leaves behind: the record is for an older
+        // epoch than the group's current one.
+        alice
+            .timezone_shared_with
+            .lock()
+            .unwrap()
+            .get_mut(&group)
+            .unwrap()
+            .epoch -= 1;
+
+        alice.mark_conversation_read(&group);
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            before + 1,
+            "the open re-queues it and the batch reshares at the current epoch"
+        );
+
+        // Opening it again changes nothing: zone and epoch now match.
+        alice.mark_conversation_read(&group);
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn a_stale_chat_waits_for_its_next_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 2).await;
+        let stale = hexes[1].clone();
+        // `upsert_summary` only moves a row forward in time: rebuild it stale.
+        alice
+            .conversation_index
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove_group(&stale)
+            .unwrap();
+        alice
+            .conversation_index
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .upsert_summary(
+                &stale,
+                "chat",
+                "old",
+                "peer",
+                Timestamp::now().as_secs() - TIMEZONE_SHARE_ACTIVE_WINDOW_SECS - 60,
+                false,
+                true,
+            )
+            .unwrap();
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(shared_hexes(&alice), HashSet::from([hexes[0].clone()]));
+        assert!(alice.timezone_share_queue.lock().unwrap().is_empty());
+
+        alice.mark_conversation_read(&stale);
+        alice.advance_timezone_share_trickle().await;
+        assert!(shared_hexes(&alice).contains(&stale));
+    }
+
+    #[test]
+    fn sync_state_failed_passes_count_distinct_passes_and_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.json");
+        let t0 = 1_000_000;
+        let gap = MDK_FAILED_PASS_MIN_GAP_SECS;
+        let mut state = SyncState::new(Some(path.clone()), 0, Vec::new());
+        assert!(!state.record_failed_pass("poison", t0));
+        // The live, initial and per-group paths can all deliver it at once:
+        // one pass, not three (#629 review).
+        assert!(!state.record_failed_pass("poison", t0 + 1));
+        assert!(!state.record_failed_pass("poison", t0 + 2));
+        assert_eq!(state.failed_event_passes["poison"].passes, 1);
+        assert!(!state.record_failed_pass("poison", t0 + gap));
+        state.save_if_dirty().unwrap();
+
+        // A restart between passes keeps the record.
+        let mut reloaded = SyncState::load(Some(path), 0, false);
+        assert_eq!(reloaded.failed_event_passes["poison"].passes, 2);
+        // A third distinct pass, but still inside the rollback window.
+        assert!(!reloaded.record_failed_pass("poison", t0 + 2 * gap));
+        assert!(
+            reloaded.record_failed_pass("poison", t0 + MDK_FAILED_RETIRE_AFTER_SECS),
+            "budget spent and the rollback window over"
+        );
+        assert!(!reloaded.failed_event_passes.contains_key("poison"));
+    }
+
+    /// Our own wrapper, created at the engine level so nothing marks it, fed
+    /// back as a relay echo: MDK answers Failed on every delivery.
+    async fn alice_with_an_unmarked_own_echo() -> (SonarClient, nostr::Event) {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        let gid = creation.group.mls_group_id;
+        alice.engine.merge_pending_commit(&gid).unwrap();
+        let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
+        let (echo, _) = alice
+            .engine
+            .create_and_process_timezone_share(&gid, &payload, Timestamp::now())
+            .unwrap();
+        (alice, echo)
+    }
+
+    #[tokio::test]
+    async fn rapid_failed_deliveries_do_not_retire_an_event() {
+        // #629 review (P1): a losing-epoch message delivered through the live,
+        // initial and per-group catch-up paths within seconds must stay
+        // eligible for the rollback that makes it decryptable.
+        let (alice, echo) = alice_with_an_unmarked_own_echo().await;
+        for context in ["live marmot event", "initial per-group message catch-up", "group message"] {
+            let (report, _) = alice.process_marmot_events(vec![echo.clone()], context).await;
+            assert_eq!(report.processed, 1);
+        }
+        assert!(!alice.is_sync_event_processed(&echo.id));
+        assert_eq!(
+            alice.sync_state.lock().unwrap().failed_event_passes[&echo.id.to_hex()].passes,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_mdk_keeps_failing_is_retired_after_the_pass_budget() {
+        // Plan item 4 (alpha.15): the 512 share echoes that build 45 never
+        // marked processed came back Unprocessable on every per-group
+        // catch-up (565–626 MDK failures per pass, every ~4 min).
+        let (alice, echo) = alice_with_an_unmarked_own_echo().await;
+        let id = echo.id.to_hex();
+        let (report, _) = alice
+            .process_marmot_events(vec![echo.clone()], "live marmot event")
+            .await;
+        assert_eq!(report.processed, 1);
+        // Two more passes, each one gap later, with the first failure already
+        // past the rollback window.
+        for _ in 1..MDK_FAILED_PASS_BUDGET {
+            {
+                let mut state = alice.sync_state.lock().unwrap();
+                let record = state.failed_event_passes.get_mut(&id).unwrap();
+                record.first_failed_secs -= MDK_FAILED_RETIRE_AFTER_SECS;
+                record.last_counted_secs -= MDK_FAILED_PASS_MIN_GAP_SECS;
+            }
+            assert!(!alice.is_sync_event_processed(&echo.id));
+            alice
+                .process_marmot_events(vec![echo.clone()], "group message")
+                .await;
+        }
+        assert!(
+            alice.is_sync_event_processed(&echo.id),
+            "three distinct passes past the rollback window retire it"
+        );
+        assert!(alice.sync_state.lock().unwrap().failed_event_passes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timezone_share_fan_out_writes_the_outbox_once() {
+        // Plan item 1 (alpha.15): the sidecar is one JSON file rewritten per
+        // mutation, so a fan-out into N groups wrote it N times (45 MB for
+        // 256). The batch hold makes it one write at the end.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let alice = SonarClient::connect(Identity::generate(), vec![], &db, [3u8; 32])
+            .await
+            .expect("alice");
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut group_hexes = Vec::new();
+        for _ in 0..3 {
+            let bob = MarmotEngine::in_memory(Identity::generate());
+            let creation = alice
+                .engine
+                .create_group(
+                    "chat",
+                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    relays.clone(),
+                )
+                .unwrap();
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .unwrap();
+            group_hexes.push(hex::encode(creation.group.mls_group_id.as_slice()));
+        }
+        let before = alice.outbox_state.lock().unwrap().save_count();
+        alice.set_timezone_share_groups(group_hexes).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 3);
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().save_count(),
+            before + 1,
+            "three shares, one sidecar write"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_skips_its_own_relay_echo() {
+        // Every other send records its wrapper id so the relay echo never
+        // reaches MDK; the share did not, so each echo came back Unprocessable
+        // and was re-fetched and re-failed on every catch-up.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        alice
+            .engine
+            .merge_pending_commit(&creation.group.mls_group_id)
+            .unwrap();
+        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+
+        alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let queued = alice
+            .outbox_state
+            .lock()
+            .unwrap()
+            .retryable_events(Timestamp::now().as_secs(), &HashSet::from([group_hex]))
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        let (_, _, share, silent) = &queued[0];
+        assert!(silent, "a share is a control row: its retry and ack stay silent");
+        assert!(
+            alice.is_sync_event_processed(&share.id),
+            "the share's own echo must be skipped before MDK"
+        );
+
+        let (report, _) = alice
+            .process_marmot_events(vec![share.clone()], "live marmot event")
+            .await;
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.retryable_failures, 0);
     }
 
     #[tokio::test]
