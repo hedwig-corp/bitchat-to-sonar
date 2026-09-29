@@ -2,7 +2,7 @@
 # Tool: zsp — https://github.com/zapstore/zsp
 #
 # First-time whitelist: commit this file with your publisher `pubkey` (npub),
-# then `zsp publish --pre-release`. The relay fetches this file from GitHub and
+# then `scripts/zapstore-publish.sh`. The relay fetches this file from GitHub and
 # links your npub to the repo.
 #
 # Secrets are NEVER stored here — set SIGN_WITH in the environment (nsec / bunker
@@ -11,7 +11,7 @@
 repository: https://github.com/hedwig-corp/bitchat-to-sonar
 
 # Prefer the phone APK asset (exclude the fat universal build).
-# All GitHub alpha tags are pre-releases — always pass --pre-release to zsp.
+# All GitHub alpha tags are pre-releases — scripts/zapstore-publish.sh tells zsp to read them.
 match: "sonar-.*-android\\.apk$"
 
 # Optional: local signed phone APK when not fetching from GitHub.
