@@ -4,8 +4,8 @@ A pilot of Cash App's presenter architecture ([The state of managing state
 with Compose](https://code.cash.app/the-state-of-managing-state-with-compose),
 [Molecule 1.0](https://code.cash.app/molecule-1-0),
 [Flow testing with Turbine](https://code.cash.app/flow-testing-with-turbine))
-on the Compose Messages list: phone Home and the desktop sidebar. Android and
-desktop only. The native SwiftUI app is the primary Sonar app and is not
+on the Compose Messages list: phone Home, the desktop sidebar and the share
+picker. Android and desktop only. The native SwiftUI app is the primary Sonar app and is not
 touched; see [iOS gap](#ios-gap-and-the-path-into-sonar-core).
 
 A presenter is a `@Composable` function that takes `events: Flow<Event>` and
@@ -17,7 +17,8 @@ state, `LaunchedEffect`) and plain Kotlin control flow. No UI, no Android.
 ```
  SonarCore (FFI, local store)
    │  ChatListCore: chats · conversationSummaries · recentMessagePages
-   │                markConversationRead · conversationChanged
+   │                pendingGroupInvites · conversationChanged
+   │                markConversationRead · deleteChat · leaveGroup
    ▼
  ChatListRepository            the list's local data layer (moved out of SonarAppState)
    chats · messagesByChat · latestByChat · unreadByChat
@@ -33,7 +34,7 @@ state, `LaunchedEffect`) and plain Kotlin control flow. No UI, no Android.
    merge across transports · pin Note to Self · unread per folded group set
    filter · events → actions
    ▼
- HomeScreen (App.kt) / DesktopSidebar (SonarDesktopRoot.kt)
+ HomeScreen (App.kt) · DesktopSidebar (SonarDesktopRoot.kt) · SonarShareToScreen
    render model.rows; mute and Bluetooth presence resolved per visible row
 ```
 
@@ -46,9 +47,16 @@ the rest of the class, which reads them everywhere, did not change.
 ## How it runs
 
 **Production calls the presenter from the UI composition**
-(`state.chatListPresenter.present(events)` in `HomeScreen`, a
-`waitForHydration = false` instance in the desktop sidebar). The presenter's
+(`state.chatListPresenter.present(events)` in `HomeScreen`). The presenter's
 reads recompose on the UI frame clock, like the code it replaced.
+
+The other two surfaces reuse the same presenter class with a small
+`ChatListSources` decorator that changes what "open" means:
+- **Desktop sidebar:** open means select. The nav stack collapses to Home
+  first. It also passes `waitForHydration = false`, because it paints the
+  restored snapshot before the store opens.
+- **Share picker:** open means send the pending share there, then open it.
+  Its search box is the production caller of `ChatListEvent.Filter`.
 
 We did not use `launchMolecule` in production. Molecule is a test dependency
 only, so the app ships no new library. `launchMolecule` would add a second
@@ -83,13 +91,16 @@ Two traps we hit, both documented at `ChatListPresenterTest.models`:
 | `ChatListPresenterTest` (12) | first model painted before core answers, loading gate, desktop paints before hydration, merge + Note to Self pin across kinds, unread summed over folded groups (both kinds), mark-read → next model, a burst of writes → one model, filter, events → actions per kind, empty/invites, catch-up hint | presenter yes; the fold projection is faked |
 | `ChatListAppStateTest` (4) | a real `SonarAppState` over a fake `ChatListCore`: sidebar paints the restored snapshot with zero core calls, a local reload reorders and folds duplicate groups into one badged row, opening a folded 1:1 marks every duplicate group read, a mesh-folded person's White Noise unread badges their Bluetooth row and opening it marks exactly that group | yes, end to end through the real projection |
 | `NoteToSelfTest` (2 moved) | Note to Self pinned and never unread, now asserted on the rendered model | yes |
+| `ChatListScreensUiTest` (6) | Compose UI tests of the **rendered screens** over a real `SonarAppState` + fake core. Home: both chat kinds titled, unread dot on the duplicate-group 1:1 and the mesh-folded row only; tapping each opens its conversation and read-marks its exact group set; long-press → mute, then leave a group and delete a 1:1 (every duplicate group reaches the core); an invite banner accepts into a pending group chat. Desktop sidebar paints restored rows before hydration and selects, not pushes. The share picker titles 1:1s, filters by title and sends to the pick | yes: the real composables and taps |
 
 `ChatListAppStateTest` is the first test that constructs `SonarAppState` with
 its core faked at a seam and drives a real open path. `docs/REGRESSIONS.md`
 lists "anything needing a `SonarAppState` instance" as the highest-leverage
 gap in the repo. The `ChatListCore` seam is how to close it path by path.
 
-## Bug found: mesh-folded rows had no unread dot (fixed)
+## Bugs found (fixed)
+
+### Mesh-folded rows had no unread dot
 
 Compose built mesh-folded Home rows without `unread` or `verified`. A person
 met over Bluetooth who then wrote over White Noise never got a dot on Android
@@ -104,6 +115,17 @@ set `transcriptGroupIds` resolves when `openDm` read-marks the row. The
 presenter sums the live unread map over them. Resolving the set again per row
 would cost about 2 ms a row in Bech32 decodes (JVM, 278 groups), on the main
 dispatcher. Ledger entry R-052, QA-142.
+
+### The share picker showed 1:1 chats untitled
+
+The Android/desktop "Send to…" picker kept its own copy of the list and
+titled Marmot rows by the raw MLS group name, which is blank for most 1:1s:
+rows with no name and identical avatars, and a search that could not find a
+contact by name. Search had the same bug (QA-A13/A14) and fixed it in its own
+copy. The picker now renders the presenter's rows, so there is one copy.
+iOS (`SonarShareSheet` over `dmRows`) was already right. Ledger entry R-053,
+QA-143 (automated in `android-smoke.sh`). The picker's search field was also
+unlabelled for screen readers; it now reads "Search chats".
 
 ## Measurements
 
@@ -217,8 +239,7 @@ duplicated code.
 1. Move the remaining projection inputs to snapshot state (fold maps, version
    counters) so `visibleChats` / `marmotRow` can move into the presenter as
    `remember`ed derivations and their manual memo keys can go.
-2. Route the share picker (`SonarShareToScreen`) through the presenter's
-   `Filter` event. It filters Marmot rows by the raw group name, which is blank
-   for most 1:1s, the same bug Search fixed for QA-A13/A14.
+2. Move Search's chat section onto the presenter too, the last separate copy
+   of the rows (R-053 "Not guarded").
 3. Core `conversation_list` / conversation-level `mark_conversation_read`
    (table above), then the iOS per-screen model over it.

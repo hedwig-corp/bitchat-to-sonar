@@ -3003,6 +3003,49 @@ mesh kind.
   housekeeping cycle. The fold loop has already computed the set, so the row
   takes it from there in O(groups).
 
+## R-053 — Every chat-list surface titles a conversation by its display title
+
+**Invariant:** a surface that lists conversations (Home, the desktop sidebar,
+Search, the share picker) shows and searches each row by the same display
+title Home shows: the counterpart's kind-0 name or short npub for a 1:1, never
+the raw MLS group name.
+
+**Breaks as:** the Android/desktop share picker ("Send to…") listed most 1:1
+chats as blank rows with identical avatars, and searching it for a contact's
+name found nothing. You could not tell who you were sharing to.
+
+**Why:** a 1:1 group's stored name is blank, or a stale creation-time label
+(R-003 notes the same trap for titles). Search shipped this first (QA-A13/A14,
+#616) and was fixed by reading the cached row model; the share picker kept its
+own copy of the list and read `chat.name`.
+
+**Compose call sites:** the share picker now renders `ChatListPresenter` rows
+(`SonarShareToScreen`, via a `ShareToSources` decorator whose "open" sends the
+share, then opens), the same model Home and the desktop sidebar render; its
+search box sends `ChatListEvent.Filter`, which matches title, preview or raw
+group name. Search keeps `marmotRow(id).title`.
+
+**Apple call site:** `SonarShareSheet` titles and filters `store.dmRows`
+(title + preview), already correct; this was a Compose-only gap.
+
+**Guarded by:** `ChatListScreensUiTest.theSharePickerTitlesOneToOnesAndSendsToThePickedChat`
+(renders the real picker over a real `SonarAppState`; fails on the previous picker)
+
+**Also guarded by:** `ChatListPresenterTest.theFilterMatchesTitlesPreviewsAndRawGroupNames`,
+and `android-smoke.sh` QA-143 end to end on a device.
+
+**Not guarded:** that a future list surface uses the presenter rather than
+its own copy of the rows; this bug came back because a second copy existed.
+Search is still a separate copy (titles via `marmotRow`, not the presenter).
+
+**History:** QA-A13/A14 (#616, Search) → share picker (#559) → fixed here.
+
+**Rejected:**
+- *Swap `chat.name` for `marmotRow(id).title` inside the picker's own list.*
+  That fixes the title but keeps a second copy of the row list (order, Note to
+  Self pin, fold) that already drifted once. Rendering the presenter's model
+  removes the copy.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

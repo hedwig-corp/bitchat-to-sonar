@@ -418,6 +418,18 @@ nothing by design.
 - **Origin:** chat-list presenter pilot. Compose mesh rows never passed
   `unread` or `verified`, so Android and desktop showed no dot where iOS did.
 
+### QA-143 — The share picker titles chats like Home and sends to the pick
+- **Platforms:** both (Android automated; iOS already passes: `SonarShareSheet`
+  reads `dmRows`)
+- **Steps:** share text into Sonar from another app ("Send to…" opens); look at
+  the 1:1 rows; type part of a contact's shown name into the search box; tap it.
+- **Expect:** every row has the same title as on Home (no blank 1:1 rows);
+  the search narrows to that contact; the peer receives the shared text.
+- **How:** `android-smoke.sh` QA-143 · Guard: `ChatListScreensUiTest.theSharePickerTitlesOneToOnesAndSendsToThePickedChat` (R-053)
+- **Origin:** chat-list presenter pilot. The picker titled Marmot rows by the
+  raw group name, blank for most 1:1s (the QA-A13/A14 bug Search had fixed);
+  its search field was also unlabelled (NAF).
+
 ## Note to Self (#339)
 
 Note to Self is a solo Marmot group marked `sonar.note-to-self.v1`: it is
