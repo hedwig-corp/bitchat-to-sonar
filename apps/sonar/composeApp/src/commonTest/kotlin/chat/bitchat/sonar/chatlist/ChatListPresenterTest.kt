@@ -251,7 +251,7 @@ class ChatListPresenterTest {
     }
 
     @Test
-    fun theFilterMatchesTitlesAndRawGroupNames() = runTest {
+    fun theFilterMatchesTitlesPreviewsAndRawGroupNames() = runTest {
         val events = MutableSharedFlow<ChatListEvent>(extraBufferCapacity = 8)
         val sources = FakeChatListSources().apply {
             meshRows = listOf(sara)
@@ -269,6 +269,9 @@ class ChatListPresenterTest {
             events.emit(ChatListEvent.Filter("CREW"))
             assertEquals(listOf("Team"), awaitItem().rows.map { it.title })
             events.emit(ChatListEvent.Filter(" sara "))
+            assertEquals(listOf("Sara D"), awaitItem().rows.map { it.title })
+            // The last message matches too (iOS share sheet parity).
+            events.emit(ChatListEvent.Filter("BLUETOOTH"))
             assertEquals(listOf("Sara D"), awaitItem().rows.map { it.title })
             events.emit(ChatListEvent.Filter(""))
             assertEquals(3, awaitItem().rows.size)

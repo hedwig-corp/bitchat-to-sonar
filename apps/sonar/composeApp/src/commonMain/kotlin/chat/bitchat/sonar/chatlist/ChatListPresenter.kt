@@ -130,8 +130,12 @@ internal class ChatListPresenter(
         }
         val needle = query.trim()
         if (needle.isEmpty()) return rows
+        // The shown title first (a 1:1's group name is blank or a stale
+        // creation-time label), then the preview (iOS share sheet parity), then
+        // the raw group name.
         return rows.filter { row ->
             row.title.contains(needle, ignoreCase = true) ||
+                row.preview.contains(needle, ignoreCase = true) ||
                 (row is ChatListRow.Marmot && row.chat.name.contains(needle, ignoreCase = true))
         }
     }

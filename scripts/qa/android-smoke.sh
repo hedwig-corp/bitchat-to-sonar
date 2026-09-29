@@ -336,6 +336,32 @@ qa003() { # draft typed while the chat is pending survives reconcile (A19)
   fi
 }
 
+qa143() { # the share picker titles 1:1 rows like Home, searches by title, sends there (R-053)
+  local a b ta tb
+  a="$("$PEERS" npub "a-$RUN" 2>/dev/null)"; b="$("$PEERS" npub "b-$RUN" 2>/dev/null)"
+  [[ -n "$a" && -n "$b" ]] || { record QA-143 SKIP "needs QA-001's and QA-003's chats"; return; }
+  # Neither peer publishes a kind-0 profile, so Home titles both by short npub;
+  # their MLS group names are blank.
+  ta="${a:0:10}…${a: -4}"; tb="${b:0:10}…${b: -4}"
+  go_home >/dev/null
+  adb -s "$QA_SERIAL" shell am start -a android.intent.action.SEND -t text/plain \
+    --es android.intent.extra.TEXT "qa143 shared $RUN" -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
+  "$UI" wait "Send to…" 15 >/dev/null || { record QA-143 FAIL "the share picker never opened"; return; }
+  if ! hasx "$ta" || ! hasx "$tb"; then
+    record QA-143 FAIL "a 1:1 row in the picker has no title (R-053)"; return
+  fi
+  ui tapedit
+  ui type "${a:5:5}"                       # part of the shown title only
+  "$UI" gone "$tb" 10 >/dev/null || { record QA-143 FAIL "search by title did not narrow the rows"; return; }
+  hasx "$ta" || { record QA-143 FAIL "search by title hid the chat it names"; return; }
+  ui tapx "$ta"
+  if "$PEERS" expect "a-$RUN" "qa143 shared $RUN" 60 >/dev/null; then
+    record QA-143 PASS "rows titled like Home; search by title; shared text delivered to the picked chat"
+  else
+    record QA-143 FAIL "picked the chat, but the peer never received the shared text"
+  fi
+}
+
 qa004() { # inbound-first chat appears on the chat list, marked unread
   [[ -n "$APP_NPUB" ]] || { record QA-004 SKIP "needs the app npub from QA-001"; return; }
   "$PEERS" new "c-$RUN" >/dev/null || { record QA-004 FAIL "peer init failed"; return; }
@@ -856,11 +882,12 @@ echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 go_home >/dev/null || echo "warning: chat list not reached before the run" >&2
 sleep 3
 # Order matters: QA-002 and the reaction scenarios (QA-100..102, QA-106)
-# reuse QA-001's chat, QA-135 needs QA-004's chat as the newest one, QA-005
+# reuse QA-001's chat, QA-143 shares into QA-001's and QA-003's chats before
+# QA-004 makes a newer one, QA-135 needs QA-004's chat as the newest one, QA-005
 # opens QA-004's, and QA-040 inspects the chat
 # QA-005 left open. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa143 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

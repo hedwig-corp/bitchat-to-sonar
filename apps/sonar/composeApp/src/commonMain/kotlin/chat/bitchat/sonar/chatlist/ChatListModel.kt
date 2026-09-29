@@ -105,7 +105,8 @@ internal sealed interface ChatListEvent {
      *  at open is captured before the mark (see `docs/CHAT-TYPES.md`). */
     data class Open(val row: ChatListRow) : ChatListEvent
 
-    /** Narrow the rows to titles containing [query] (case-insensitive). */
+    /** Narrow the rows to those whose title, preview or group name contains
+     *  [query] (case-insensitive). Blank clears the filter. */
     data class Filter(val query: String) : ChatListEvent
 
     data class AcceptInvite(val inviteId: String) : ChatListEvent
