@@ -7929,6 +7929,7 @@ impl SonarClient {
     /// the rest for the idle heartbeat. Ordinary sync/message triggers find
     /// nothing due and return.
     async fn share_local_timezone_with_groups(&self) {
+        self.forget_abandoned_timezone_shares();
         let Some((zone, payload)) = self.timezone_share_payload() else {
             return;
         };
@@ -8017,6 +8018,11 @@ impl SonarClient {
     /// the idle heartbeat, so a 64-group reshare spreads over a few minutes
     /// and stops on its own when the app is backgrounded.
     pub(crate) async fn advance_timezone_share_trickle(&self) {
+        // An idle app still retries a share the outbox gave up on: the pass
+        // finds the group due again once its record is gone.
+        if self.forget_abandoned_timezone_shares() {
+            self.share_local_timezone_with_groups().await;
+        }
         let batch: Vec<String> = {
             let mut queue = self.timezone_share_queue.lock().unwrap();
             (0..TIMEZONE_SHARE_BATCH)
@@ -8160,6 +8166,42 @@ impl SonarClient {
         let _publish_ack =
             self.spawn_outbox_publish(event.id.to_hex(), group_id_hex.to_owned(), event);
         Ok(())
+    }
+
+    /// Forget the sent-share record of every group whose share the outbox gave
+    /// up on (`OUTBOX_RETRY_ATTEMPT_LIMIT` failed publishes). The record is
+    /// written before any relay accepts the share, so without this it claims
+    /// a delivery that never happened: every later pass finds the group
+    /// `due=0` and the members never see this device's clock until the zone
+    /// or the membership changes. Returns whether anything was forgotten.
+    fn forget_abandoned_timezone_shares(&self) -> bool {
+        let groups = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .take_abandoned_silent_groups();
+        if groups.is_empty() {
+            return false;
+        }
+        {
+            let mut shared = self.timezone_shared_with.lock().unwrap();
+            for group_id_hex in &groups {
+                shared.remove(group_id_hex);
+            }
+        }
+        if let Some(ref idx) = self.conversation_index {
+            let idx = idx.lock().unwrap();
+            for group_id_hex in &groups {
+                if let Err(err) = idx.forget_timezone_share_sent(group_id_hex) {
+                    tracing::debug!(%err, "abandoned timezone share record not forgotten");
+                }
+            }
+        }
+        tracing::info!(
+            groups = groups.len(),
+            "timezone share abandoned by the outbox; sharing again"
+        );
+        true
     }
 
     fn remove_failed_timezone_share(&self, group_id_hex: &str, zone: &str) {
@@ -11647,6 +11689,160 @@ mod tests {
             alice.outbox_state.lock().unwrap().recorded_count(),
             before + 1,
             "a new zone still shares"
+        );
+    }
+
+    /// Alice in a 1:1 group with Bob, sharing into it; no relays, so every
+    /// share stays in the outbox where a test can fail it.
+    async fn alice_sharing_with_bob(
+        db: &Path,
+        key: [u8; 32],
+        identity: Identity,
+    ) -> (SonarClient, String) {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let alice = SonarClient::connect(identity, vec![], db, key)
+            .await
+            .expect("alice");
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        alice
+            .engine
+            .merge_pending_commit(&creation.group.mls_group_id)
+            .unwrap();
+        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+        alice
+            .set_timezone_share_groups(vec![group_hex.clone()])
+            .await;
+        alice
+            .update_local_timezone("America/Los_Angeles")
+            .await
+            .unwrap();
+        (alice, group_hex)
+    }
+
+    /// Spend a row's whole publish budget, as a relay outage or a rate-limit
+    /// storm does.
+    fn abandon_outbox_row(alice: &SonarClient, message_id_hex: &str) {
+        let mut outbox = alice.outbox_state.lock().unwrap();
+        for attempt in 0..crate::outbox::OUTBOX_RETRY_ATTEMPT_LIMIT {
+            outbox
+                .mark_failed_by_message_id(
+                    message_id_hex,
+                    "rate-limited".into(),
+                    1 + u64::from(attempt),
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn timezone_share_the_outbox_gave_up_on_is_shared_again_on_the_heartbeat() {
+        // 2026-09-28, real iPhone + Pixel: the iPhone's sent-share record for
+        // their chat claimed a share the Pixel never received. Every pass
+        // found the chat `due=0`, so the Pixel header never showed the
+        // iPhone's clock until the user toggled sharing off and on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let (alice, group_hex) =
+            alice_sharing_with_bob(&db, [0x3cu8; 32], Identity::generate()).await;
+        let first = alice
+            .outbox_state
+            .lock()
+            .unwrap()
+            .message_ids_for_group(&group_hex);
+        assert_eq!(first.len(), 1, "one share queued");
+        abandon_outbox_row(&alice, &first[0]);
+
+        // An idle app: nothing but the heartbeat runs.
+        alice.advance_timezone_share_trickle().await;
+        let retried = alice
+            .outbox_state
+            .lock()
+            .unwrap()
+            .message_ids_for_group(&group_hex);
+        assert_eq!(
+            retried.len(),
+            1,
+            "the abandoned row is dropped, one new share queued"
+        );
+        assert_ne!(retried, first, "a fresh share, not the abandoned row");
+        assert!(shared_hexes(&alice).contains(&group_hex));
+
+        // It settles: later triggers find nothing due.
+        alice.advance_timezone_share_trickle().await;
+        alice
+            .set_timezone_share_groups(vec![group_hex.clone()])
+            .await;
+        assert_eq!(
+            alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .message_ids_for_group(&group_hex),
+            retried
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_abandoned_before_a_restart_is_shared_again() {
+        // The outbox gave up in an earlier process; the record and the dead
+        // row both survive on disk. The host's launch-time allowlist call
+        // must still reach the group.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let key = [0x3du8; 32];
+        let identity = Identity::generate();
+        let (group_hex, first) = {
+            let (alice, group_hex) = alice_sharing_with_bob(&db, key, identity.clone()).await;
+            let first = alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .message_ids_for_group(&group_hex);
+            abandon_outbox_row(&alice, &first[0]);
+            (group_hex, first)
+        };
+
+        let alice = SonarClient::connect(identity, vec![], &db, key)
+            .await
+            .expect("alice restarts");
+        alice
+            .set_timezone_share_groups(vec![group_hex.clone()])
+            .await;
+        alice
+            .update_local_timezone("America/Los_Angeles")
+            .await
+            .unwrap();
+        let retried = alice
+            .outbox_state
+            .lock()
+            .unwrap()
+            .message_ids_for_group(&group_hex);
+        assert_eq!(
+            retried.len(),
+            1,
+            "the dead row is dropped, one new share queued"
+        );
+        assert_ne!(retried, first);
+
+        alice
+            .set_timezone_share_groups(vec![group_hex.clone()])
+            .await;
+        assert_eq!(
+            alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .message_ids_for_group(&group_hex),
+            retried,
+            "one retry, not one per trigger"
         );
     }
 
