@@ -6,7 +6,10 @@ import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.MarmotRowModel
 import chat.bitchat.sonar.MeshDmRow
 import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.SonarConversationListKind
+import chat.bitchat.sonar.SonarConversationListRow
 import chat.bitchat.sonar.SonarConversationSummary
+import chat.bitchat.sonar.directMarmotPeerKey
 import chat.bitchat.sonar.SonarGroupInvite
 import chat.bitchat.sonar.SonarRecentTranscriptPage
 import kotlinx.coroutines.CompletableDeferred
@@ -47,6 +50,21 @@ internal class FakeChatListCore : ChatListCore {
         summariesCalls++
         if (failSummaries) error("summaries read failed")
         return summaries
+    }
+
+    /** The account's own npub, for [coreLikeConversationRows]' fold. */
+    var ownNpub = "npub1me"
+    var noteToSelfId: String? = null
+    /** When set, [conversationList] answers exactly this. */
+    var listRows: List<SonarConversationListRow>? = null
+    var failList = false
+    var listCalls = 0
+        private set
+
+    override suspend fun conversationList(): List<SonarConversationListRow> {
+        listCalls++
+        if (failList) error("conversation list read failed")
+        return listRows ?: coreLikeConversationRows(chats, summaries, ownNpub, noteToSelfId)
     }
 
     override suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
@@ -129,4 +147,57 @@ internal class FakeChatListSources : ChatListSources {
         marmotChats = rows.map { it.first }
         rowModels = rows.associate { it.first.id to it.second }
     }
+}
+
+/**
+ * What core's `conversation_list` answers for [chats] + [summaries]
+ * (`core/sonar-core/src/conversation_list.rs`): direct chats with the same
+ * counterpart fold into one row (newest group first, lowest id on a tie),
+ * unread is summed over the set and is 0 for Note to Self, which sorts first;
+ * then newest first, id on a tie. Core's own tests pin the real rule; this is
+ * the fake's copy so host tests see core-shaped rows.
+ */
+internal fun coreLikeConversationRows(
+    chats: List<SonarChat>,
+    summaries: List<SonarConversationSummary>,
+    ownNpub: String,
+    noteToSelfId: String?,
+): List<SonarConversationListRow> {
+    val byId = summaries.associateBy { it.groupIdHex }
+    val latest = { gid: String -> byId[gid]?.latestAtSecs ?: 0L }
+    val buckets = LinkedHashMap<String, MutableList<SonarChat>>()
+    for (chat in chats) {
+        val key = if (chat.id == noteToSelfId) "\u0000${chat.id}"
+        else directMarmotPeerKey(chat, ownNpub) ?: "\u0000${chat.id}"
+        buckets.getOrPut(key) { mutableListOf() } += chat
+    }
+    return buckets.values.map { set ->
+        val sorted = set.sortedWith(compareByDescending<SonarChat> { latest(it.id) }.thenBy { it.id })
+        val head = sorted.first()
+        val nts = head.id == noteToSelfId
+        val newest = sorted.firstNotNullOfOrNull { c -> byId[c.id]?.takeIf { it.latestAtSecs > 0 } }
+        SonarConversationListRow(
+            conversationId = head.id,
+            kind = when {
+                nts -> SonarConversationListKind.NoteToSelf
+                directMarmotPeerKey(head, ownNpub) != null -> SonarConversationListKind.Direct
+                else -> SonarConversationListKind.Group
+            },
+            groupIds = sorted.map { it.id },
+            counterpartHex = null,
+            name = sorted.firstOrNull { it.name.isNotEmpty() }?.name ?: "",
+            latestContent = newest?.latestContent ?: "",
+            latestSenderHex = newest?.latestSenderNpub ?: "",
+            latestAtSecs = newest?.latestAtSecs ?: 0L,
+            latestMine = newest?.latestMine ?: false,
+            latestGroupId = newest?.groupIdHex ?: head.id,
+            messageCount = sorted.sumOf { byId[it.id]?.messageCount ?: 0L },
+            unreadCount = if (nts) 0L else sorted.sumOf { byId[it.id]?.unreadCount ?: 0L },
+            version = sorted.sumOf { byId[it.id]?.messageCount ?: 0L } + sorted.size,
+        )
+    }.sortedWith(
+        compareByDescending<SonarConversationListRow> { it.kind == SonarConversationListKind.NoteToSelf }
+            .thenByDescending { it.latestAtSecs }
+            .thenBy { it.conversationId },
+    )
 }

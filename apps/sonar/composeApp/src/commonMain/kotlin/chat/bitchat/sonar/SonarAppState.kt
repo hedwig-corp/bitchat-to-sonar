@@ -564,6 +564,30 @@ internal fun dedupeDirectMarmotChats(
     return chats.filter { it.id in selectedIds }
 }
 
+/**
+ * One chat per conversation, using core's fold (`conversation_list`) when it
+ * is known: [groupIdsByGroup] maps each group id to its row's folded set, row
+ * group first, so the chat kept is the first of its set still present in
+ * [chats]. Chats core has not listed yet (a restored snapshot before the store
+ * answers) fall back to the local [dedupeDirectMarmotChats]. iOS folds with
+ * the same core rows, so both apps pick the same group (R-003).
+ */
+internal fun dedupeByConversationRows(
+    chats: List<SonarChat>,
+    ownNpub: String,
+    latestSecs: (String) -> Long,
+    groupIdsByGroup: Map<String, List<String>>,
+): List<SonarChat> {
+    if (groupIdsByGroup.isEmpty()) return dedupeDirectMarmotChats(chats, ownNpub, latestSecs)
+    val present = chats.mapTo(HashSet()) { it.id }
+    val unknown = chats.filter { it.id !in groupIdsByGroup }
+    val keptUnknown = dedupeDirectMarmotChats(unknown, ownNpub, latestSecs).mapTo(HashSet()) { it.id }
+    return chats.filter { chat ->
+        val set = groupIdsByGroup[chat.id]
+        if (set == null) chat.id in keptUnknown else set.firstOrNull { it in present } == chat.id
+    }
+}
+
 /** Stable conversation identity for BLE fingerprints that advertise the same
  *  Sonar account. Unlinked peers remain isolated by their Noise fingerprint. */
 internal fun meshConversationIdentityKey(peerId: String, linkedNpubHex: String?): String {
@@ -700,6 +724,8 @@ internal data class VisibleChatsKey(
     val ownNpub: String,
     val holdVersion: Int,
     val noteToSelfGroupId: String?,
+    /** [ChatListRepository.conversationRowsVersion]: core's fold changed. */
+    val conversationRowsVersion: Int = 0,
 )
 
 private fun decodeGroupFoldMap(blob: String): Map<String, String> =
@@ -2183,6 +2209,7 @@ class SonarAppState internal constructor(
             ownNpub = npub,
             holdVersion = holdInputsVersion,
             noteToSelfGroupId = noteToSelfGroupId,
+            conversationRowsVersion = chatList.conversationRowsVersion,
         )
     }
 
@@ -2203,10 +2230,11 @@ class SonarAppState internal constructor(
             if (held) holdActive = true
             it.id in foldedGroupIds || held || isBlockedMarmotChat(it)
         }
-        val deduped = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
+        val deduped = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeByConversationRows(
             chats = standalone,
             ownNpub = npub,
             latestSecs = ::localLatestTs,
+            groupIdsByGroup = chatList.groupIdsByGroup,
         )
         val result = withPinnedNoteToSelf(deduped)
         // Only cache the stable (no active settle window) computation. A held
@@ -2625,7 +2653,16 @@ class SonarAppState internal constructor(
     private fun directMarmotPeerKey(chat: SonarChat): String? =
         directMarmotPeerKey(chat, npub)
 
+    /** Core's folded set for [chatId] (`conversation_list`), row group first;
+     *  null until the store has answered once. */
+    private fun coreGroupIds(chatId: String): List<String>? = chatList.groupIdsByGroup[chatId]
+
     private fun duplicateDirectMarmotChats(chat: SonarChat): List<SonarChat> {
+        coreGroupIds(chat.id)?.let { set ->
+            val byId = if (set.size == 1) null else chats.associateBy { it.id }
+            val groups = if (byId == null) listOf(chat) else set.mapNotNull { byId[it] }
+            if (groups.isNotEmpty()) return groups
+        }
         val peerKey = directMarmotPeerKey(chat) ?: return listOf(chat)
         val groups = chats.filter { directMarmotPeerKey(it) == peerKey }
         return groups.ifEmpty { listOf(chat) }
@@ -2642,6 +2679,9 @@ class SonarAppState internal constructor(
     }
 
     private fun isSameDirectMarmotChat(leftId: String, rightId: String): Boolean {
+        coreGroupIds(leftId)?.let { set ->
+            if (coreGroupIds(rightId) != null) return set.size > 1 && rightId in set
+        }
         val left = chats.firstOrNull { it.id == leftId } ?: return false
         val right = chats.firstOrNull { it.id == rightId } ?: return false
         val leftKey = directMarmotPeerKey(left) ?: return false
@@ -5859,14 +5899,21 @@ class SonarAppState internal constructor(
     }
 
     private fun computeMarmotRowModels(rows: List<SonarChat>): Map<String, MarmotRowModel> {
-        // Peer-key → all its chat ids, built ONCE (was recomputed per row).
-        val idsByPeerKey = HashMap<String, MutableList<String>>()
-        for (c in chats) {
-            val pk = directMarmotPeerKey(c) ?: continue
-            idsByPeerKey.getOrPut(pk) { mutableListOf() }.add(c.id)
+        // Peer-key → all its chat ids, built at most ONCE, and only for chats
+        // core has not folded yet: with core rows known it costs nothing
+        // (it Bech32-decodes every member of every chat).
+        val idsByPeerKey by lazy {
+            val map = HashMap<String, MutableList<String>>()
+            for (c in chats) {
+                val pk = directMarmotPeerKey(c) ?: continue
+                map.getOrPut(pk) { mutableListOf() }.add(c.id)
+            }
+            map
         }
         fun groupedIds(chat: SonarChat): List<String> =
-            directMarmotPeerKey(chat)?.let { idsByPeerKey[it] } ?: listOf(chat.id)
+            coreGroupIds(chat.id)
+                ?: directMarmotPeerKey(chat)?.let { idsByPeerKey[it] }
+                ?: listOf(chat.id)
         return rows.associate { chat ->
             val pending = isPendingSecureChat(chat.id)
             val ids = if (pending) listOf(chat.id) else groupedIds(chat)

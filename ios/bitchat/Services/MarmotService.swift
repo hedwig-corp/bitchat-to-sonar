@@ -283,6 +283,34 @@ final class MarmotService: @unchecked Sendable {
         let plaintextSha256: String
     }
 
+    /// Kind of a core-computed Messages-list row (`conversationList`).
+    enum ConversationListKind: Sendable, Equatable {
+        case direct, group, noteToSelf
+    }
+
+    /// One Messages-list row computed by core: every Marmot group of one
+    /// conversation folded together (R-003), unread summed over `groupIds`
+    /// (R-052), Note to Self first. Compose renders the same rows, so the fold
+    /// is decided once for both apps.
+    struct ConversationListRow: Sendable, Equatable {
+        /// The group the row opens: newest in the set, lowest id on a tie.
+        let conversationId: String
+        let kind: ConversationListKind
+        /// Every folded group, `conversationId` first. Opening marks all read.
+        let groupIds: [String]
+        let counterpartHex: String?
+        let name: String
+        let latestContent: String
+        let latestSenderHex: String
+        let latestAt: Date
+        let latestMine: Bool
+        let latestGroupId: String
+        let messageCount: UInt64
+        /// Sum over `groupIds`; 0 for Note to Self.
+        let unreadCount: UInt64
+        let version: UInt64
+    }
+
     struct ConversationSummary: Sendable, Equatable {
         let groupIdHex: String
         let name: String
@@ -2348,6 +2376,37 @@ final class MarmotService: @unchecked Sendable {
                 )
             }
         }, default: [])
+    }
+
+    /// Core's Messages-list rows, in list order. Local only. nil when the read
+    /// failed, so callers keep the fold they have instead of dropping it.
+    func conversationList() async -> [ConversationListRow]? {
+        await readOnlyNonThrowing({ node in
+            guard let rows = try? node.conversationList(limit: 0, after: nil) else { return nil }
+            return rows.map { row in
+                let kind: ConversationListKind
+                switch row.kind {
+                case .direct: kind = .direct
+                case .group: kind = .group
+                case .noteToSelf: kind = .noteToSelf
+                }
+                return ConversationListRow(
+                    conversationId: row.conversationId,
+                    kind: kind,
+                    groupIds: row.groupIds,
+                    counterpartHex: row.counterpartHex,
+                    name: row.name,
+                    latestContent: row.latestContent,
+                    latestSenderHex: row.latestSenderHex,
+                    latestAt: Date(timeIntervalSince1970: TimeInterval(row.latestAtSecs)),
+                    latestMine: row.latestMine,
+                    latestGroupId: row.latestGroupId,
+                    messageCount: row.messageCount,
+                    unreadCount: row.unreadCount,
+                    version: row.version
+                )
+            }
+        }, default: nil)
     }
 
     func markConversationRead(groupId: String) async {

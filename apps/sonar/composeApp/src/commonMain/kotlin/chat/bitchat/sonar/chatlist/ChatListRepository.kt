@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.SonarConversationListRow
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarMsg
 import chat.bitchat.sonar.hydrateLocalConversationRows
@@ -82,6 +83,22 @@ internal class ChatListRepository(
     /** Newest message second per group, kept for rows with no real window. */
     var latestByChat: Map<String, Long> = initialLatestByChat
 
+    /** Core's Messages-list rows (`conversation_list`), from the last local
+     *  publish. Empty until the store answers once: callers then fall back
+     *  to their own fold, so a restored snapshot still paints. */
+    var conversationRows: List<SonarConversationListRow> = emptyList()
+        private set
+
+    /** Bumped whenever [conversationRows] changes; feeds memo keys. */
+    var conversationRowsVersion by mutableStateOf(0)
+        private set
+
+    /** Each group id → the folded set of the core row it belongs to, row
+     *  group first. The one answer to "which groups are this conversation"
+     *  for the list, open, mark-read and mute (R-003, R-052). */
+    var groupIdsByGroup: Map<String, List<String>> = emptyMap()
+        private set
+
     /** Unread count per Marmot group id. A mesh route id is never a key. */
     var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
         private set
@@ -127,6 +144,11 @@ internal class ChatListRepository(
         val pages = if (localChats.isEmpty()) emptyList() else runCatching {
             core.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
         }.getOrDefault(emptyList())
+        // null = the read failed: keep the rows we have rather than falling
+        // back to a wider scan (No Performance Regression Rule, item 2).
+        val rows = if (localChats.isEmpty()) emptyList() else runCatching {
+            core.conversationList()
+        }.getOrNull()
         val hydration = hydrateLocalConversationRows(
             activeChatIds = activeIds,
             existingMessagesByChat = messagesByChat,
@@ -134,6 +156,7 @@ internal class ChatListRepository(
             summaries = summaries,
             pages = pages,
         )
+        if (rows != null) applyConversationRows(rows)
         messagesByChat = hydration.messagesByChat
         latestByChat = hydration.latestByChat
         chats = orderChatsByLocalRecency(
@@ -143,10 +166,20 @@ internal class ChatListRepository(
         )
     }
 
+    private fun applyConversationRows(rows: List<SonarConversationListRow>) {
+        if (rows == conversationRows) return
+        conversationRows = rows
+        groupIdsByGroup = buildMap {
+            for (row in rows) for (gid in row.groupIds) put(gid, row.groupIds)
+        }
+        conversationRowsVersion++
+    }
+
     /** Drop the snapshot (wipe, restore, folded-chat delete). */
     fun clearSnapshot() {
         messagesByChat = emptyMap()
         latestByChat = emptyMap()
+        applyConversationRows(emptyList())
     }
 
     /**

@@ -277,6 +277,45 @@ func snDirectMarmotPeerKey(for group: MarmotService.MarmotGroup, ownNpub: String
     return others.count == 1 ? others.first : nil
 }
 
+/// Core's rows as a lookup: each group id → its row's folded set, row group
+/// first (the `conversationGroupIdsByGroup` shape).
+func snConversationGroupIdsByGroup(
+    _ rows: [MarmotService.ConversationListRow]
+) -> [String: [String]] {
+    var map: [String: [String]] = [:]
+    for row in rows {
+        for groupId in row.groupIds { map[groupId] = row.groupIds }
+    }
+    return map
+}
+
+/// `map` with `groupId` gone from every set (Delete/Leave paints before core
+/// answers again). Its row mates keep a set without it.
+func snDroppingConversationGroup(
+    _ groupId: String,
+    from map: [String: [String]]
+) -> [String: [String]] {
+    guard let set = map[groupId] else { return map }
+    var next = map
+    next[groupId] = nil
+    let remaining = set.filter { $0 != groupId }
+    for mate in remaining { next[mate] = remaining }
+    return next
+}
+
+/// The groups of `groupId`'s core row that are still in `groupsById`, in the
+/// row's order. nil when core has not listed `groupId` (fall back to the local
+/// fold) or none of its set is active.
+func snCoreFoldedGroups(
+    _ groupId: String,
+    sets: [String: [String]],
+    groupsById: [String: MarmotService.MarmotGroup]
+) -> [MarmotService.MarmotGroup]? {
+    guard let set = sets[groupId] else { return nil }
+    let groups = set.compactMap { groupsById[$0] }
+    return groups.isEmpty ? nil : groups
+}
+
 func snCanonicalDirectMarmotGroups(
     _ groups: [MarmotService.MarmotGroup],
     ownNpub: String?
@@ -466,6 +505,12 @@ final class MarmotChatModel: ObservableObject {
     /// Core-owned row metadata for every conversation. Kept separate from
     /// transcript pages so summary placeholders never render as chat bubbles.
     @Published private(set) var conversationSummariesByGroup: [String: MarmotService.ConversationSummary] = [:]
+    /// Core's fold (`conversationList`): each group id → the folded group set
+    /// of its Messages-list row, row group first. The one answer to "which
+    /// groups are this 1:1" for Home, open, mark-read and mute, shared with
+    /// Compose (R-003, R-052). Empty until the store answers once; callers
+    /// then fall back to the local `snCanonicalDirectMarmotGroups` fold.
+    @Published private(set) var conversationGroupIdsByGroup: [String: [String]] = [:]
     @Published var busy = false
     /// Serializes Settings → Backup chats so a second tap cannot seal while the
     /// first has already reopened SQLCipher (Compose joins jobs before FFI).
@@ -2663,6 +2708,7 @@ final class MarmotChatModel: ObservableObject {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let summaries = await service.conversationSummaries()
+            let listRows = await service.conversationList()
             await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             let summariesByGroup = Dictionary(
@@ -2673,6 +2719,7 @@ final class MarmotChatModel: ObservableObject {
             if self.conversationSummariesByGroup != summariesByGroup {
                 self.conversationSummariesByGroup = summariesByGroup
             }
+            publishConversationList(listRows)
             self.publishUnread(from: summaries)
             // `@Published` fires on every assignment, and the Home sinks on
             // `$groups` walked all 400 groups twice over for about a second on
@@ -2859,6 +2906,7 @@ final class MarmotChatModel: ObservableObject {
                 pageLimit: Self.localSummaryPageLimit
             )
             let summaries = await service.conversationSummaries()
+            let listRows = await service.conversationList()
             await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             let summariesByGroup = Dictionary(
@@ -2869,6 +2917,7 @@ final class MarmotChatModel: ObservableObject {
             if self.conversationSummariesByGroup != summariesByGroup {
                 self.conversationSummariesByGroup = summariesByGroup
             }
+            publishConversationList(listRows)
             // All service reads above suspend. Snapshot the live dictionary only
             // after they finish, then merge each result into that latest state in
             // one main-actor segment. A summary refresh can therefore never
@@ -3266,6 +3315,14 @@ final class MarmotChatModel: ObservableObject {
         for groupId in groupIds {
             unreadByGroup[groupId] = nil
         }
+    }
+
+    /// Publish core's fold. A failed read (nil) keeps the fold we have: it
+    /// degrades by doing less, never by splitting a person into two rows.
+    private func publishConversationList(_ rows: [MarmotService.ConversationListRow]?) {
+        guard let rows else { return }
+        let folded = snConversationGroupIdsByGroup(rows)
+        if folded != conversationGroupIdsByGroup { conversationGroupIdsByGroup = folded }
     }
 
     private func publishUnread(from summaries: [MarmotService.ConversationSummary]) {
@@ -5212,6 +5269,8 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         cancelBlankTranscriptRecovery(groupId: groupId)
         conversationSummariesByGroup[groupId] = nil
+        let folded = snDroppingConversationGroup(groupId, from: conversationGroupIdsByGroup)
+        if folded != conversationGroupIdsByGroup { conversationGroupIdsByGroup = folded }
         discardOptimistic(for: groupId)
         localTranscriptCursorByGroup[groupId] = nil
         localTranscriptHasOlderByGroup[groupId] = nil
@@ -5367,6 +5426,7 @@ final class MarmotChatModel: ObservableObject {
         pendingGroupInvites = []
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]
+        conversationGroupIdsByGroup = [:]
         unreadByGroup = [:]
         unreadSuppressGroupIds = []
         viewingUnreadGroupIds = []

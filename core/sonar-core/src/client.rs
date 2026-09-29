@@ -2135,6 +2135,12 @@ pub struct SonarClient {
     timezone_rumor_clock: Arc<Mutex<u64>>,
     /// Host-registered callback fired when a conversation summary changes.
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
+    /// Each active group's list shape (kind + counterpart) by group id hex,
+    /// with the MLS epoch it was read at. Membership only changes with a
+    /// commit and every commit moves the epoch, so an entry is valid exactly
+    /// while its epoch matches. Keeps [`Self::conversation_list`] from reading
+    /// every group's member list on every call.
+    conversation_shapes: Arc<Mutex<HashMap<String, (u64, crate::conversation_list::GroupShape)>>>,
     /// In-memory store for invite link secrets and pending join requests.
     invite_links: Arc<crate::invite_link::InviteLinkStore>,
     /// Cached push tokens for group members (pubkey hex → encrypted token).
@@ -2715,6 +2721,7 @@ impl SonarClient {
             timezone_share_group_ids: Arc::new(Mutex::new(HashSet::new())),
             timezone_rumor_clock: Arc::new(Mutex::new(0)),
             change_listener: Arc::new(Mutex::new(None)),
+            conversation_shapes: Arc::new(Mutex::new(HashMap::new())),
             invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
                 invite_link_state_path,
             )),
@@ -7782,6 +7789,71 @@ impl SonarClient {
     pub fn conversation_summary(&self, group_id_hex: &str) -> Option<ConversationSummary> {
         let idx = self.conversation_index.as_ref()?;
         idx.lock().unwrap().summary(group_id_hex).ok().flatten()
+    }
+
+    /// The Marmot half of the Messages list: one row per conversation, with
+    /// duplicate direct groups folded, unread summed over the folded set, and
+    /// Note to Self first. Newest first; `after` continues from the last row
+    /// of the previous page, and `limit == 0` returns every row.
+    ///
+    /// Local only: the MLS group table and the summary index. A group's
+    /// member list is read once per epoch (see `conversation_shapes`), so a
+    /// warm call is O(groups) in memory with no MLS member reads.
+    pub fn conversation_list(
+        &self,
+        limit: usize,
+        after: Option<&crate::conversation_list::ConversationListCursor>,
+    ) -> Result<Vec<crate::conversation_list::ConversationListRow>> {
+        let rows = self.conversation_list_rows()?;
+        Ok(crate::conversation_list::page(rows, limit, after))
+    }
+
+    fn conversation_list_rows(&self) -> Result<Vec<crate::conversation_list::ConversationListRow>> {
+        use crate::conversation_list::{build_rows, GroupShape};
+        let groups = self.engine.groups()?;
+        let me_hex = self.identity().public_key().to_hex();
+        let note_to_self = self.find_note_to_self_group()?.map(|g| hex::encode(g.as_slice()));
+        let mut shapes = Vec::with_capacity(groups.len());
+        {
+            let mut cache = self.conversation_shapes.lock().unwrap();
+            let mut live = HashSet::with_capacity(groups.len());
+            for group in &groups {
+                let gid = hex::encode(group.mls_group_id.as_slice());
+                let is_nts = note_to_self.as_deref() == Some(gid.as_str());
+                let cached = cache
+                    .get(&gid)
+                    .filter(|(epoch, shape)| {
+                        *epoch == group.epoch
+                            && shape.name == group.name
+                            && (shape.kind == crate::conversation_list::ConversationListKind::NoteToSelf)
+                                == is_nts
+                    })
+                    .map(|(_, shape)| shape.clone());
+                let shape = match cached {
+                    Some(shape) => shape,
+                    None => {
+                        let members: Vec<String> = self
+                            .engine
+                            .members(&group.mls_group_id)?
+                            .iter()
+                            .map(|pk| pk.to_hex())
+                            .collect();
+                        let shape = GroupShape::classify(&gid, &group.name, &members, &me_hex, is_nts);
+                        cache.insert(gid.clone(), (group.epoch, shape.clone()));
+                        shape
+                    }
+                };
+                live.insert(gid);
+                shapes.push(shape);
+            }
+            cache.retain(|gid, _| live.contains(gid));
+        }
+        let summaries: HashMap<String, ConversationSummary> = self
+            .conversation_summaries()
+            .into_iter()
+            .map(|s| (s.group_id_hex.clone(), s))
+            .collect();
+        Ok(build_rows(&shapes, &summaries))
     }
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
@@ -12989,6 +13061,108 @@ mod tests {
         // Turning it back on in the same zone shares again: the peer forgot it.
         alice.set_timezone_share_groups(vec![shared_hex]).await;
         assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 3);
+    }
+
+    /// Join `bob` to a fresh 1:1 group that `peer` creates, through the real
+    /// welcome path. Returns the group id.
+    async fn join_group_from(peer: &MarmotEngine, bob: &SonarClient, name: &str) -> GroupId {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let creation = peer.create_group(name, vec![bob_kp], relays).unwrap();
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob_pubkey, welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(member, _)| *member == bob.identity().public_key())
+            .unwrap();
+        let welcome = peer.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+        bob.process_marmot_events([welcome], "conversation list welcome")
+            .await;
+        group_id
+    }
+
+    async fn receive_text(peer: &MarmotEngine, bob: &SonarClient, group: &GroupId, text: &str) {
+        let (event, _) = peer.create_and_process_text_message(group, text).unwrap();
+        bob.process_marmot_events([event], "conversation list message")
+            .await;
+    }
+
+    /// The Messages list both apps render comes from core: Sara's two 1:1
+    /// groups are one row (R-003) whose unread is the sum over both, and one
+    /// marking that set clears exactly that row (R-052). Real welcome + receive path, so
+    /// the index rows, unread counting and member reads are the production ones.
+    #[tokio::test]
+    async fn conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row() {
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let luca = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+
+        let sara_old = join_group_from(&sara, &bob, "").await;
+        let luca_dm = join_group_from(&luca, &bob, "").await;
+        let sara_new = join_group_from(&sara, &bob, "").await;
+        receive_text(&sara, &bob, &sara_old, "old leg 1").await;
+        receive_text(&sara, &bob, &sara_old, "old leg 2").await;
+        receive_text(&luca, &bob, &luca_dm, "hi from luca").await;
+        // Timestamps are whole seconds: make Sara's new leg strictly newest.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        receive_text(&sara, &bob, &sara_new, "new leg").await;
+
+        let hex_of = |g: &GroupId| hex::encode(g.as_slice());
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows.len(), 2, "Sara's two groups are one row: {rows:#?}");
+        let sara_row = &rows[0];
+        assert_eq!(sara_row.kind, crate::conversation_list::ConversationListKind::Direct);
+        assert_eq!(sara_row.conversation_id, hex_of(&sara_new));
+        assert_eq!(sara_row.group_ids, vec![hex_of(&sara_new), hex_of(&sara_old)]);
+        assert_eq!(
+            sara_row.counterpart_hex.as_deref(),
+            Some(sara.identity().public_key().to_hex().as_str())
+        );
+        assert_eq!(sara_row.unread_count, 3);
+        assert_eq!(sara_row.latest_content, "new leg");
+        assert_eq!(rows[1].conversation_id, hex_of(&luca_dm));
+        assert_eq!(rows[1].unread_count, 1);
+
+        // Paging continues after the cursor without repeating a row.
+        let first = bob.conversation_list(1, None).unwrap();
+        let rest = bob.conversation_list(1, Some(&first[0].cursor())).unwrap();
+        assert_eq!(first[0].conversation_id, hex_of(&sara_new));
+        assert_eq!(rest[0].conversation_id, hex_of(&luca_dm));
+
+        // Opening the row marks its whole set (what both apps do with
+        // `group_ids`): both of Sara's legs clear, and only them.
+        for gid in &sara_row.group_ids {
+            bob.mark_conversation_read(gid);
+        }
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows[0].unread_count, 0);
+        assert_eq!(rows[1].unread_count, 1, "Luca's badge is untouched");
+    }
+
+    #[tokio::test]
+    async fn conversation_list_pins_note_to_self_and_never_counts_it_unread() {
+        let luca = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+        let luca_dm = join_group_from(&luca, &bob, "").await;
+        receive_text(&luca, &bob, &luca_dm, "hi").await;
+        let nts = bob.ensure_note_to_self().await.unwrap();
+
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].conversation_id, hex::encode(nts.as_slice()));
+        assert_eq!(rows[0].kind, crate::conversation_list::ConversationListKind::NoteToSelf);
+        assert_eq!(rows[0].unread_count, 0);
+        assert_eq!(rows[1].unread_count, 1);
     }
 
     #[tokio::test]

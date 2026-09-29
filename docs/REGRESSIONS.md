@@ -120,9 +120,19 @@ roughly halves it. The ranking is stable across all three.)
 
 **Call sites:** iOS `SonarAppStore.swift` (`dmRows` + `snCollapseMeshDMRowsByIdentity` / `sonarPeerKey`); Compose `SonarAppState.duplicateDirectMarmotChats` / `preferredDirectMarmotChat` / `peerIdForMarmotGroup` / `meshConversationAliasGroups`
 
+**Shared call site (duplicate direct groups):** since the core-owned chat list, the
+Marmot 1:1 fold is decided once in `core/sonar-core/src/conversation_list.rs`
+(`build_rows`, exported as `SonarNode.conversationList`). Both apps read its
+folded sets: iOS `MarmotChatModel.conversationGroupIdsByGroup` →
+`buildHomeDMRows` / `directMarmotGroups(matching:)`; Compose
+`ChatListRepository.groupIdsByGroup` → `dedupeByConversationRows` /
+`duplicateDirectMarmotChats` / `computeMarmotRowModels`. The local peer-key
+folds stay only as the fallback for groups core has not listed yet (a restored
+snapshot before the store opens).
+
 **Guarded by:** `ConversationRegressionSmokeTest.duplicateSaraGroupsKeepOneNewestTranscript`
 
-**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`
+**Also guarded by:** `client.rs::conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row`, `conversation_list.rs::duplicate_direct_groups_fold_into_one_row_that_sums_unread`, `ChatListAppStateTest.theCoreFoldDecidesWhichGroupRendersAndWhatOpeningMarksRead`, `ChatListAppStateTest.aFailedCoreListReadKeepsTheLastFold`, `DedupeByConversationRowsTest.coreSetPicksTheRowGroupEvenWhenLocalRecencyDisagrees`, `SonarCoreConversationFoldTests.coreSetResolvesInRowOrderAndSkipsGroupsThatAreGone`, `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`
 
 **Partly guarded:** the cited tests pin *chat-list* dedup and identity routing. The "one transcript" half is not pinned: if duplicate groups still collapse to one row but transcript loading stopped merging every duplicate group's messages, all of them stay green. See Unguarded.
 
@@ -2982,6 +2992,14 @@ Compose-only gap.
 badged, and opening it marks exactly the folded group)
 
 **Also guarded by:** `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs`
+
+**Shared since the core-owned list:** for pure Marmot rows the summed set is
+core's `ConversationListRow.group_ids`, and both apps mark exactly that set
+read on open, so the badge and the clear cannot disagree across platforms.
+Guarded in core by
+`client.rs::conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row`.
+The mesh-folded half above still resolves its set in each app, because the
+Bluetooth link table is not in core yet.
 
 **Not guarded:** the fold set refreshes on every `recomputeConversations`
 (each housekeeping cycle and conversation change), so a link learned between

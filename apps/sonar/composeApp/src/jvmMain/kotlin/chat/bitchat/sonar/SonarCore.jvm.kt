@@ -525,6 +525,31 @@ actual object SonarCore {
         }
     }
 
+    actual suspend fun conversationList(): List<SonarConversationListRow> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.conversationList(0u, null).map {
+            SonarConversationListRow(
+                conversationId = it.conversationId,
+                kind = when (it.kind) {
+                    uniffi.sonar_ffi.ConversationListKindInfo.DIRECT -> SonarConversationListKind.Direct
+                    uniffi.sonar_ffi.ConversationListKindInfo.GROUP -> SonarConversationListKind.Group
+                    uniffi.sonar_ffi.ConversationListKindInfo.NOTE_TO_SELF -> SonarConversationListKind.NoteToSelf
+                },
+                groupIds = it.groupIds,
+                counterpartHex = it.counterpartHex,
+                name = it.name,
+                latestContent = it.latestContent,
+                latestSenderHex = it.latestSenderHex,
+                latestAtSecs = it.latestAtSecs.toLong(),
+                latestMine = it.latestMine,
+                latestGroupId = it.latestGroupId,
+                messageCount = it.messageCount.toLong(),
+                unreadCount = it.unreadCount.toLong(),
+                version = it.version.toLong(),
+            )
+        }
+    }
+
     actual suspend fun updateLocalTimezone(ianaIdentifier: String): Unit = withContext(Dispatchers.IO) {
         node?.updateLocalTimezone(ianaIdentifier)
     }

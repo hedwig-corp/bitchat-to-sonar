@@ -7,6 +7,7 @@ import chat.bitchat.sonar.chatlist.ChatListEvent
 import chat.bitchat.sonar.chatlist.ChatListPresenter
 import chat.bitchat.sonar.chatlist.ChatListRow
 import chat.bitchat.sonar.chatlist.FakeChatListCore
+import chat.bitchat.sonar.chatlist.coreLikeConversationRows
 import chat.bitchat.sonar.chatlist.summary
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -151,6 +152,57 @@ class ChatListAppStateTest {
             assertEquals(listOf(saraGroup.id), core.markedRead)
             cancelAndIgnoreRemainingEvents()
         }
+    }
+
+    /**
+     * The row Compose renders for a person with duplicate groups is the one
+     * core picked (`conversation_list`), the same group iOS renders, even
+     * where the app's own fold would have picked another. Opening it marks
+     * core's whole set read.
+     */
+    @Test
+    fun theCoreFoldDecidesWhichGroupRendersAndWhatOpeningMarksRead() = runTest {
+        val core = FakeChatListCore().apply {
+            chats = listOf(giulia, giuliaAgain)
+            // Locally giulia (aa01) is newer, so the app's own fold keeps aa01.
+            summaries = listOf(summary(giulia.id, 900, unread = 1), summary(giuliaAgain.id, 500, unread = 1))
+            listRows = listOf(
+                coreLikeConversationRows(chats, summaries, me, null).single()
+                    .copy(conversationId = giuliaAgain.id, groupIds = listOf(giuliaAgain.id, giulia.id)),
+            )
+        }
+        val s = state(core)
+        s.chatList.refresh()
+        val events = MutableSharedFlow<ChatListEvent>(extraBufferCapacity = 4)
+
+        moleculeFlow(RecompositionMode.Immediate) { s.chatListPresenterForTest().present(events) }.test {
+            val row = expectMostRecentItem().rows.single { !isNoteToSelfPlaceholder(it.key) } as ChatListRow.Marmot
+            assertEquals(giuliaAgain.id, row.chat.id, "core's row group renders")
+            assertTrue(row.unread)
+            events.emit(ChatListEvent.Open(row))
+            awaitItem()
+            runCurrent()
+            assertEquals(setOf(giulia.id, giuliaAgain.id), core.markedRead.toSet())
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+
+    /** A failed core list read keeps the fold the list already had: it
+     *  degrades by doing less, never by splitting the person into two rows. */
+    @Test
+    fun aFailedCoreListReadKeepsTheLastFold() = runTest {
+        val core = FakeChatListCore().apply {
+            chats = listOf(giulia, giuliaAgain)
+            summaries = listOf(summary(giulia.id, 900), summary(giuliaAgain.id, 500))
+        }
+        val s = state(core)
+        s.chatList.refresh()
+        val folded = s.chatList.groupIdsByGroup
+        assertEquals(listOf(giulia.id, giuliaAgain.id), folded[giuliaAgain.id])
+        core.failList = true
+        s.chatList.refresh()
+        assertEquals(folded, s.chatList.groupIdsByGroup)
+        assertEquals(1, s.visibleChats.count { it.id == giulia.id || it.id == giuliaAgain.id })
     }
 
     /** The phone presenter, on a Home the test marks hydrated. */

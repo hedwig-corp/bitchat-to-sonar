@@ -1,6 +1,7 @@
 package chat.bitchat.sonar.chatlist
 
 import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.SonarConversationListRow
 import chat.bitchat.sonar.SonarConversationSummary
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarRecentTranscriptPage
@@ -28,6 +29,11 @@ internal interface ChatListCore {
      *  latest message preview fields, message count and unread count. */
     suspend fun conversationSummaries(): List<SonarConversationSummary>
 
+    /** The Marmot half of the Messages list as core folds it: one row per
+     *  conversation, duplicate direct groups folded, unread summed over each
+     *  row's groups, Note to Self first. The same rows iOS renders. */
+    suspend fun conversationList(): List<SonarConversationListRow>
+
     /** Bounded newest-message windows for the [groupLimit] most recent chats. */
     suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage>
 
@@ -44,6 +50,9 @@ internal object SonarCoreChatListCore : ChatListCore {
 
     override suspend fun conversationSummaries(): List<SonarConversationSummary> =
         SonarCore.conversationSummaries()
+
+    override suspend fun conversationList(): List<SonarConversationListRow> =
+        SonarCore.conversationList()
 
     override suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
         SonarCore.recentMessagePages(groupLimit, pageLimit)
