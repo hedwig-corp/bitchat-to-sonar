@@ -379,6 +379,25 @@ nothing by design.
 - **Expect:** a notification within ~10 s; the body respects the preview
   setting (off by default: "Open Sonar to read it."); the tap opens that chat
   with the divider per QA-005.
+- **Harness notes (2026-09-29, core-owned chat list QA):**
+  - Android freezes the app about 3 s after HOME and cuts its network, so only
+    a Transponder wake can deliver. The peer must hold the app's push token
+    (`<peer home>/marmot/marmot.sqlite.sonar-push-tokens.json` lists it) and
+    publish its kind-446 wake where the Transponder reads: its kind-10050
+    inbox relays (`nak req -k 10050 -a <transponder npub> wss://purplepag.es`;
+    nos.lol, nostr.relay.hedwig.sh, relay.damus.io that day).
+  - A shared QA Mac can be banned by relay.damus.io ("too many rate-limit
+    violations") and PoW-gated by nos.lol. The default `sonar-cli` relays then
+    land the wake only on relay.primal.net, which the Transponder does not
+    read. Run with `RUST_LOG=sonar_core=debug` and read the `OK` lines for the
+    wake's event id before blaming the app.
+  - Even with the wake on the Transponder's own relay, no FCM message reached
+    the emulator (no `SonarFCM` line), on this branch and on main alike.
+  - iOS simulator: `xcrun simctl push <udid> sh.hedwig.sonar <file>` with
+    `{"aps":{"alert":{…},"mutable-content":1},"source":"transponder"}` is
+    delivered and presented (SpringBoard log), but the notification service
+    extension does not run (no `sonar.nse.lastDiagnostic`), so decoration
+    needs a device.
 
 ### QA-021 — No banner for the chat you are reading
 - **Platforms:** iOS (manual, #615)
