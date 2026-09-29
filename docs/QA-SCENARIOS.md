@@ -404,6 +404,40 @@ nothing by design.
 - **Expect:** no row whose only effect is a "coming soon" toast.
 - **Origin:** A17 (#616)
 
+### QA-142 — A mesh-folded chat shows the unread dot of its White Noise messages
+- **Platforms:** both (manual: needs a Sonar peer met over Bluetooth, i.e. a
+  second emulator or phone with Bluetooth on; iOS already passes)
+- **Steps:** meet a Sonar peer over Bluetooth and exchange a message; take the
+  peer out of range (or turn its Bluetooth off) so the next message travels
+  over White Noise; with the app on the chat list, the peer sends a message.
+- **Expect:** the peer's one Home row shows the new preview **and** the unread
+  dot (announced "Unread"); opening it clears the dot; no second row for the
+  same person appears (R-003).
+- **How:** two QA emulators of your own with Bluetooth on (they share the
+  Mac's virtual radio, so check other agents' emulators have it off): the peer
+  DMs the app from Nearby → Message; the peer turns Bluetooth off (its header
+  then reads "Out of Bluetooth range — encrypted over the internet instead")
+  and sends again. Verified 2026-09-29 on `Sonar_QA_API_36_payne` +
+  `_payne_adv`: preview + "Unread" on the one Bluetooth row 5 s after the send;
+  opening it shows read BLE row | divider | White Noise row; back, no dot.
+- **Guard:** `ChatListAppStateTest.aMeshFoldedPersonsWhiteNoiseUnreadBadgesTheirBluetoothRow`,
+  `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs`,
+  `ChatListScreensUiTest.homeTitlesBothChatKindsAndDotsTheUnreadOnes` (R-052)
+- **Origin:** chat-list presenter pilot. Compose mesh rows never passed
+  `unread` or `verified`, so Android and desktop showed no dot where iOS did.
+
+### QA-143 — The share picker titles chats like Home and sends to the pick
+- **Platforms:** both (Android automated; iOS already passes: `SonarShareSheet`
+  reads `dmRows`)
+- **Steps:** share text into Sonar from another app ("Send to…" opens); look at
+  the 1:1 rows; type part of a contact's shown name into the search box; tap it.
+- **Expect:** every row has the same title as on Home (no blank 1:1 rows);
+  the search narrows to that contact; the peer receives the shared text.
+- **How:** `android-smoke.sh` QA-143 · Guard: `ChatListScreensUiTest.theSharePickerTitlesOneToOnesAndSendsToThePickedChat` (R-053)
+- **Origin:** chat-list presenter pilot. The picker titled Marmot rows by the
+  raw group name, blank for most 1:1s (the QA-A13/A14 bug Search had fixed);
+  its search field was also unlabelled (NAF).
+
 ## Note to Self (#339)
 
 Note to Self is a solo Marmot group marked `sonar.note-to-self.v1`: it is

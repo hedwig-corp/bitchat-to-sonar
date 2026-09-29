@@ -1,0 +1,258 @@
+# Chat-list presenter (Compose pilot)
+
+A pilot of Cash App's presenter architecture ([The state of managing state
+with Compose](https://code.cash.app/the-state-of-managing-state-with-compose),
+[Molecule 1.0](https://code.cash.app/molecule-1-0),
+[Flow testing with Turbine](https://code.cash.app/flow-testing-with-turbine))
+on the Compose Messages list: phone Home, the desktop sidebar and the share
+picker. Android and desktop only. The native SwiftUI app is the primary Sonar app and is not
+touched; see [iOS gap](#ios-gap-and-the-path-into-sonar-core).
+
+A presenter is a `@Composable` function that takes `events: Flow<Event>` and
+returns one immutable `Model`, using the Compose **runtime** only (`remember`,
+state, `LaunchedEffect`) and plain Kotlin control flow. No UI, no Android.
+
+## Layers
+
+```
+ SonarCore (FFI, local store)
+   │  ChatListCore: chats · conversationSummaries · recentMessagePages
+   │                pendingGroupInvites · conversationChanged
+   │                markConversationRead · deleteChat · leaveGroup
+   ▼
+ ChatListRepository            the list's local data layer (moved out of SonarAppState)
+   chats · messagesByChat · latestByChat · unreadByChat
+   refresh() single-flight + one trailing pass
+   collectChanges() per-chat 50 ms debounce
+   markRead() optimistic, suppressed while in flight
+   │
+   │        ChatListSources: the projection SonarAppState still owns
+   │        (mesh↔npub fold, duplicate-group dedupe, pending chats,
+   │         Note to Self, titles from kind-0, actions)
+   ▼        ▼
+ ChatListPresenter.present(events): ChatListModel
+   merge across transports · pin Note to Self · unread per folded group set
+   filter · events → actions
+   ▼
+ HomeScreen (App.kt) · DesktopSidebar (SonarDesktopRoot.kt) · SonarShareToScreen
+   render model.rows; mute and Bluetooth presence resolved per visible row
+```
+
+Files: `apps/sonar/composeApp/src/commonMain/kotlin/chat/bitchat/sonar/chatlist/`.
+
+`SonarAppState` keeps the same members (`chats`, `unreadByChat`,
+`refreshChats()`, `markGroupsRead()`), now delegating to the repository, so
+the rest of the class, which reads them everywhere, did not change.
+
+## How it runs
+
+**Production calls the presenter from the UI composition**
+(`state.chatListPresenter.present(events)` in `HomeScreen`). The presenter's
+reads recompose on the UI frame clock, like the code it replaced.
+
+The other two surfaces reuse the same presenter class with a small
+`ChatListSources` decorator that changes what "open" means:
+- **Desktop sidebar:** open means select. The nav stack collapses to Home
+  first. It also passes `waitForHydration = false`, because it paints the
+  restored snapshot before the store opens.
+- **Share picker:** open means send the pending share there, then open it.
+  Its search box is the production caller of `ChatListEvent.Filter`.
+
+We did not use `launchMolecule` in production. Molecule is a test dependency
+only, so the app ships no new library. `launchMolecule` would add a second
+`Recomposer` and a process-wide `Snapshot.registerGlobalWriteObserver`. That
+observer schedules an apply notification after any state write anywhere in
+the app, and `SonarAppState` has 86 state holders. Its `StateFlow` would also
+reach the UI one collector hop later. The Cash App case for it, feeding a
+View-based UI, does not apply to an all-Compose app.
+
+**Tests run it headless**: `moleculeFlow(RecompositionMode.Immediate) {
+presenter.present(events) }.flowOn(StandardTestDispatcher(testScheduler))`,
+asserted with Turbine (`awaitItem()`, `expectNoEvents()`). Plain JVM, no
+emulator, no relay.
+
+Two traps we hit, both documented at `ChatListPresenterTest.models`:
+
+1. **Turbine collects on an unconfined dispatcher.** Molecule schedules its
+   snapshot apply on the collecting context, so without `flowOn` every single
+   state write recomposes synchronously and emits its own model. A test that
+   asserts a burst coalesces then fails for a reason the app does not have.
+   A queued dispatcher is the faithful stand-in for the frame clock.
+2. **Unapplied setup writes.** State written before the flow starts is not
+   yet applied (nothing called `Snapshot.sendApplyNotifications()`), so the
+   first recomposition after start is a redundant copy of the first model.
+   The app's global snapshot manager applies as it goes, so tests flush first.
+
+## What the tests cover
+
+| Test | What it pins | Real call site? |
+|---|---|---|
+| `ChatListRepositoryTest` (9) | per-chat debounce (one chat, many chats), single-flight reload + one trailing pass, failure releases waiters, local paint from the summary index, optimistic mark-read held while in flight, failed mark releases suppression (#383), viewing suppress not stored, failed summary read keeps badges | yes: `SonarAppState` delegates to this class |
+| `ChatListPresenterTest` (12) | first model painted before core answers, loading gate, desktop paints before hydration, merge + Note to Self pin across kinds, unread summed over folded groups (both kinds), mark-read → next model, a burst of writes → one model, filter, events → actions per kind, empty/invites, catch-up hint | presenter yes; the fold projection is faked |
+| `ChatListAppStateTest` (4) | a real `SonarAppState` over a fake `ChatListCore`: sidebar paints the restored snapshot with zero core calls, a local reload reorders and folds duplicate groups into one badged row, opening a folded 1:1 marks every duplicate group read, a mesh-folded person's White Noise unread badges their Bluetooth row and opening it marks exactly that group | yes, end to end through the real projection |
+| `NoteToSelfTest` (2 moved) | Note to Self pinned and never unread, now asserted on the rendered model | yes |
+| `ChatListScreensUiTest` (6) | Compose UI tests of the **rendered screens** over a real `SonarAppState` + fake core. Home: both chat kinds titled, unread dot on the duplicate-group 1:1 and the mesh-folded row only; tapping each opens its conversation and read-marks its exact group set; long-press → mute, then leave a group and delete a 1:1 (every duplicate group reaches the core); an invite banner accepts into a pending group chat. Desktop sidebar paints restored rows before hydration and selects, not pushes. The share picker titles 1:1s, filters by title and sends to the pick | yes: the real composables and taps |
+
+`ChatListAppStateTest` is the first test that constructs `SonarAppState` with
+its core faked at a seam and drives a real open path. `docs/REGRESSIONS.md`
+lists "anything needing a `SonarAppState` instance" as the highest-leverage
+gap in the repo. The `ChatListCore` seam is how to close it path by path.
+
+## Bugs found (fixed)
+
+### Mesh-folded rows had no unread dot
+
+Compose built mesh-folded Home rows without `unread` or `verified`. A person
+met over Bluetooth who then wrote over White Noise never got a dot on Android
+or desktop, while iOS folds both into the row (`buildHomeDMRows`,
+`hasUnreadMarmotMessage(in: groupSet)`). This is the `docs/CHAT-TYPES.md` bug
+class: group-keyed state not resolved for the mesh kind. Writing the
+"both chat kinds" presenter test is what surfaced it.
+
+The fix carries on `MeshDmRow.groupIds` the groups `recomputeConversations`
+already folds into each row. Those are the linked npub's direct groups, the
+set `transcriptGroupIds` resolves when `openDm` read-marks the row. The
+presenter sums the live unread map over them. Resolving the set again per row
+would cost about 2 ms a row in Bech32 decodes (JVM, 278 groups), on the main
+dispatcher. Ledger entry R-052, QA-142.
+
+### The share picker showed 1:1 chats untitled
+
+The Android/desktop "Send to…" picker kept its own copy of the list and
+titled Marmot rows by the raw MLS group name, which is blank for most 1:1s:
+rows with no name and identical avatars, and a search that could not find a
+contact by name. Search had the same bug (QA-A13/A14) and fixed it in its own
+copy. The picker now renders the presenter's rows, so there is one copy.
+iOS (`SonarShareSheet` over `dmRows`) was already right. Ledger entry R-053,
+QA-143 (automated in `android-smoke.sh`). The picker's search field was also
+unlabelled for screen readers; it now reads "Search chats".
+
+## Measurements
+
+Dedicated emulator (`Sonar_QA_API_36_payne`, API 36, arm64), one onboarded
+account with 25 Marmot groups and 934 messages, Debug builds of `main` (e59b3cc23) and this branch
+installed in place over the same data. Rounds were interleaved (main, branch,
+main, branch…) because the Mac is shared: `main` alone varied 2–3× between
+rounds in whole-process idle CPU.
+
+| Metric | main | branch | How |
+|---|---|---|---|
+| Cold start to first frame (MainActivity holds its first draw until the local Home model is hydrated, so this is local-first list paint) | median 1564 ms, IQR 1524–1672 (n=20) | median 1602 ms, IQR 1527–1671 (n=20) | `am start -W` TotalTime after `force-stop`, 2 rounds × 10 |
+| Chat open, first transcript frame | medians 101.6 / 65.9 ms | medians 82.9 / 76.3 ms | `scripts/bench/android-chat-open-bench.sh`, 2 rounds × 10 |
+| Idle on Home, whole process (QA-050) | mean 2.02 %, median 1.88 % | mean 1.83 %, median 1.92 % | 3 rounds × 3 × 60 s |
+| Idle on Home, main thread only | mean 0.35 %, median 0.40 % | mean 0.32 %, median 0.42 % | `/proc/<pid>/task/<pid>/stat`, same windows |
+| Frames rendered while idle | 12 in 9 windows | 12 in 9 windows | `dumpsys gfxinfo`, same windows |
+
+All within noise; the interquartile ranges overlap almost exactly. A first
+A/B that recorded only whole-process CPU seemed to put the branch higher
+(means 2.30 % vs 1.53 %, n=6, not significant). The main-thread and frame
+split above is what showed that difference was host noise. Composition runs on
+the main thread, and it did no extra work.
+
+A later attributed A/B (after the share-picker change; 12 × 60 s windows per
+build, 3 rounds, logging the app's busiest log tags per window) explains the
+spread. Five windows in each build carried a periodic core burst (~1,500
+`SonarCore` log lines; ~10 % process, ~3 % main thread), identical in both:
+
+| Windows | main (main thread) | branch (main thread) |
+|---|---|---|
+| quiet (7 each) | median 0.20 %, mean 0.25 % | median 0.20 %, mean 0.22 % |
+| core burst (5 each) | mean 3.16 % | mean 3.14 % |
+
+The QA-050 smoke gate (≤ 3 % over 30 s) failed once at 3.13 % in exactly such
+a burst window. That periodic burst is a `main` cost: measured here, not fixed.
+
+JVM cost probe (278 direct chats, 10 mesh-folded people; M-series Mac;
+throwaway test, not committed):
+
+| Work | Cost |
+|---|---|
+| Full Marmot row-model rebuild. `main` paid this on **every unread change** (every arrival, every mark-read), because unread was a memo input | 6.76 ms |
+| Branch: one presenter pass per unread change (recompose + 279-row model) | 0.33 ms |
+| `transcriptGroupIds` for 10 mesh rows (why the fix reuses the fold map instead) | 21 ms |
+
+## Pain points
+
+- **An eager whole-list model vs viewport-bounded reads.** Two per-row fields,
+  mute and Bluetooth presence, walk the fold closure: `muteIdsFor` resolves
+  duplicate and folded groups, O(chats) with Bech32 decodes. The old UI paid
+  that only for visible rows. A model that carries them for every row pays it
+  for every row on every change. They stay per visible row in the renderer,
+  so the model is not quite "everything the UI needs". The real fix is
+  core-side: precomputed per-conversation fields (below) or a paged model
+  (Signal's `ConversationListDataSource`).
+- **Hidden inputs defeat `remember`.** Much of the projection reads plain
+  fields (`linkByFp`, `groupFoldMap`, version counters) that are not snapshot
+  state, so `remember(keys)` inside the presenter would go stale. The
+  presenter therefore reads the existing memoized projections (`visibleChats`,
+  `marmotRow`) and does only O(rows) work per recomposition. Moving that
+  projection into the presenter needs its inputs to become observable first.
+- **A value-returning composable is not a restart scope.** Called directly,
+  the presenter's reads invalidate the calling screen (`HomeScreen`), not a
+  scope of their own. That costs the header and FAB a skip check per change.
+  The measurements below show no regression.
+- **Events are asynchronous.** A tap now reaches `openChat` one dispatch
+  later, through the `LaunchedEffect` collector, instead of inside the click
+  handler. The chat-open measurement below starts at the push and does not
+  see this hop; it is sub-frame on the main looper.
+- **Synchronous consumers pin the data layer.** Thirty `refreshChats()`
+  callers await completion and then read `chats`, and delete paths write
+  `chats` and read it back immediately. A Molecule-owned data layer would
+  make those reads asynchronous, so the data stays in a plain repository
+  with snapshot state and only the projection is a presenter.
+
+## iOS gap and the path into sonar-core
+
+**Platform:** iOS (`ios/`). **Reason:** the SwiftUI app is the primary app
+and has its own, already memoized list (`SonarAppStore.dmRows`,
+`buildHomeDMRows`, R-039); a Compose presenter cannot run there, and this
+pilot does not retire the `SonarAppState.kt` ↔ `SonarAppStore.swift` mirror.
+The mesh unread fix has no iOS gap: iOS already folds unread into mesh rows.
+**Follow-up path:** move the shared list logic down into `sonar-core`, then
+give each host a thin per-screen model over it (this presenter on Compose, an
+`@Observable` list model on iOS).
+
+What both hosts implement twice today, and where it should live:
+
+| Logic | Compose today | iOS today | Proposed core home |
+|---|---|---|---|
+| Rows from the index + bounded pages, recency order with a stable tie-break | `ChatListRepository.publishLocal`, `hydrateLocalConversationRows`, `orderChatsByLocalRecency` | `MarmotChatModel` summaries + row cache | `conversation_list(limit, cursor)` over `conversation_summary` |
+| Duplicate direct groups → one row (R-003) | `dedupeDirectMarmotChats` / `directMarmotPeerKey` (Bech32 per member per call) | `directMarmotGroups(matchingGroupId:)` | fold by counterpart pubkey in the index (core already knows members) |
+| Unread summed over a conversation's groups; Note to Self never unread | `ChatListPresenter.rows` | `hasUnreadMarmotMessage(in:)`, `snPinNoteToSelfFirst` | `ConversationListRow.unread` |
+| Mark-read with in-flight suppression and viewing suppression | `ChatListRepository.markRead` / `applyUnread` | `viewingUnreadGroupIds` | `mark_conversation_read(conversation_id)` that marks the whole set and returns the new row, so hosts need no suppression set |
+| Change coalescing | per-chat 50 ms debounce + single-flight reload | `scheduleConversationRefresh` + R-037 coalescer | one `ConversationListChanged { ids }` per drain, batched in core |
+| Bluetooth ↔ White Noise fold (fingerprint ↔ npub) | `recomputeConversations`, `transcriptGroupIds`, `groupFoldMap` | `buildHomeDMRows`, `marmotGroupIdsByConversationId` | once the link table lives in core (mesh is moving to Rust, #309), return mesh-folded rows with their `group_ids` |
+
+A sketch of the core row, i.e. the fields `ChatListModel` needs, minus what is
+host-only (live Bluetooth presence, navigation):
+
+```rust
+pub struct ConversationListRow {
+    pub conversation_id: String,      // group id, or "mesh:<fingerprint>" once folded in core
+    pub kind: ConversationKind,       // Marmot | MeshFolded | NoteToSelf
+    pub group_ids: Vec<String>,       // the set unread is summed over and read-marking clears
+    pub title_hint: Option<String>,   // group name; hosts overlay kind-0 names until core caches them
+    pub preview: Option<MessagePreview>, // latest host-visible row (R-017 classification applied)
+    pub latest_at_secs: i64,
+    pub unread: u64,
+    pub muted_until: Option<i64>,     // lets the list drop the O(chats) mute walk
+}
+fn conversation_list(&self, limit: u32, after: Option<Cursor>) -> Result<Vec<ConversationListRow>>;
+fn mark_conversation_read(&self, conversation_id: &str) -> Result<ConversationListRow>;
+```
+
+With that API, `ChatListRepository` becomes a thin pager and `ChatListSources`
+mostly disappears. On iOS, `buildHomeDMRows` shrinks to mapping rows plus
+presence. The first step is the Marmot-only half (rows, duplicate fold,
+unread, mark-read). It needs no mesh state in core and removes the most
+duplicated code.
+
+## Next steps
+
+1. Move the remaining projection inputs to snapshot state (fold maps, version
+   counters) so `visibleChats` / `marmotRow` can move into the presenter as
+   `remember`ed derivations and their manual memo keys can go.
+2. Move Search's chat section onto the presenter too, the last separate copy
+   of the rows (R-053 "Not guarded").
+3. Core `conversation_list` / conversation-level `mark_conversation_read`
+   (table above), then the iOS per-screen model over it.

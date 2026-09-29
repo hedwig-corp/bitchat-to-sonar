@@ -25,19 +25,25 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import chat.bitchat.sonar.HomeMessageRow
 import chat.bitchat.sonar.SonarAppState
-import chat.bitchat.sonar.mergeHomeMessageRows
+import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.chatlist.ChatListEvent
+import chat.bitchat.sonar.chatlist.ChatListPresenter
+import chat.bitchat.sonar.chatlist.ChatListRow
+import chat.bitchat.sonar.chatlist.ChatListSources
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.flow.MutableSharedFlow
 
 /**
  * "Send to…" recipient picker for content arriving from the system share sheet.
@@ -62,21 +68,17 @@ fun SonarShareToScreen(state: SonarAppState) {
         return
     }
 
-    var q by remember { mutableStateOf("") }
-    val ql = q.trim().lowercase()
-    val rows: List<HomeMessageRow> = remember(state.meshDmRows, state.visibleChats, ql) {
-        val merged = mergeHomeMessageRows(state.meshDmRows, state.visibleChats) { chatId ->
-            state.marmotRow(chatId).tsSecs
-        }
-        if (ql.isEmpty()) merged
-        else merged.filter { row ->
-            val name = when (row) {
-                is HomeMessageRow.Mesh -> row.row.name
-                is HomeMessageRow.Marmot -> row.chat.name
-            }
-            name.lowercase().contains(ql)
-        }
+    // The same Messages rows as Home (display titles, Note to Self first), from
+    // the chat-list presenter. The search box narrows them with Filter events;
+    // picking a row sends the share there, then opens it (ShareToSources).
+    // Titling rows by the raw MLS group name left most 1:1s blank here — the
+    // QA-A13/A14 bug Search had already fixed (R-053).
+    val chatListEvents = remember { MutableSharedFlow<ChatListEvent>(extraBufferCapacity = 16) }
+    val presenter = remember(state) {
+        ChatListPresenter(state.chatList, ShareToSources(state), waitForHydration = false)
     }
+    val rows = presenter.present(chatListEvents).rows
+    var q by remember { mutableStateOf("") }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         Row(
@@ -128,10 +130,17 @@ fun SonarShareToScreen(state: SonarAppState) {
             Box(Modifier.weight(1f)) {
                 if (q.isEmpty()) Text("Search chats", color = s.text3, fontSize = 15.sp)
                 BasicTextField(
-                    value = q, onValueChange = { q = it }, singleLine = true,
+                    value = q,
+                    onValueChange = {
+                        q = it
+                        chatListEvents.tryEmit(ChatListEvent.Filter(it))
+                    },
+                    singleLine = true,
                     textStyle = TextStyle(color = s.text, fontSize = 15.sp),
                     cursorBrush = SolidColor(s.accent),
-                    modifier = Modifier.fillMaxWidth()
+                    // The placeholder is a sibling Text that disappears on
+                    // input, so the field needs its own spoken label (QA-A9).
+                    modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Search chats" }
                 )
             }
         }
@@ -140,7 +149,7 @@ fun SonarShareToScreen(state: SonarAppState) {
             if (rows.isEmpty()) {
                 item {
                     Text(
-                        if (ql.isEmpty()) "No chats yet. Start a chat first, then share into it."
+                        if (q.isBlank()) "No chats yet. Start a chat first, then share into it."
                         else "No chat matches that name.",
                         color = s.text3, fontSize = 13.5.sp, lineHeight = 18.sp,
                         modifier = Modifier.fillMaxWidth().padding(24.dp)
@@ -148,25 +157,10 @@ fun SonarShareToScreen(state: SonarAppState) {
                 }
             } else {
                 item { SNSectionLabel("Messages") }
-                items(rows, key = { it.listKey }) { homeRow ->
-                    val name = when (homeRow) {
-                        is HomeMessageRow.Mesh -> homeRow.row.name
-                        is HomeMessageRow.Marmot -> homeRow.chat.name
-                    }
+                items(rows, key = { it.key }) { row ->
                     Row(
                         Modifier.fillMaxWidth()
-                            .clickable {
-                                when (homeRow) {
-                                    is HomeMessageRow.Mesh ->
-                                        state.sendPendingShare(homeRow.listKey) {
-                                            state.openDm(homeRow.row.peerId, homeRow.row.name)
-                                        }
-                                    is HomeMessageRow.Marmot ->
-                                        state.sendPendingShare(homeRow.chat.id) {
-                                            state.openChat(homeRow.chat)
-                                        }
-                                }
-                            }
+                            .clickable { chatListEvents.tryEmit(ChatListEvent.Open(row)) }
                             .padding(horizontal = 16.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -174,16 +168,15 @@ fun SonarShareToScreen(state: SonarAppState) {
                         // out-of-range BLE peer cannot take an attachment, so
                         // the user should see that before picking it.
                         SonarAvatar(
-                            name,
+                            row.title,
                             44.dp,
-                            presence = homeRow is HomeMessageRow.Mesh &&
-                                state.dmInRange(homeRow.row.peerId),
+                            presence = row is ChatListRow.Mesh && state.dmInRange(row.peerId),
                         )
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                            Text(row.title, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                             Text(
-                                if (homeRow is HomeMessageRow.Mesh) "Bluetooth" else "Secure chat",
+                                if (row is ChatListRow.Mesh) "Bluetooth" else "Secure chat",
                                 color = s.text3, fontSize = 12.5.sp
                             )
                         }
@@ -192,6 +185,20 @@ fun SonarShareToScreen(state: SonarAppState) {
             }
         }
     }
+}
+
+/**
+ * The share picker's view of [SonarAppState.chatListSources]: opening a row
+ * first sends the pending share to that conversation (which leaves the picker),
+ * then opens it. Everything else is the Home list's projection unchanged.
+ */
+private class ShareToSources(
+    private val state: SonarAppState,
+    private val base: ChatListSources = state.chatListSources,
+) : ChatListSources by base {
+    override fun openChat(chat: SonarChat) = state.sendPendingShare(chat.id) { base.openChat(chat) }
+    override fun openDm(peerId: String, name: String) =
+        state.sendPendingShare("mesh:$peerId") { base.openDm(peerId, name) }
 }
 
 /** Short human byte count for the share preview strip. */
