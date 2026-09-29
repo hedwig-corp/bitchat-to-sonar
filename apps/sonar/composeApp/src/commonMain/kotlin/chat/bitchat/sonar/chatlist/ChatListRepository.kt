@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarConversationSummary
+import chat.bitchat.sonar.SonarGroupInvite
 import chat.bitchat.sonar.SonarMsg
 import chat.bitchat.sonar.hydrateLocalConversationRows
 import chat.bitchat.sonar.orderChatsByLocalRecency
@@ -108,6 +109,10 @@ internal class ChatListRepository(
 
     /** The local store's group list. */
     suspend fun loadChats(): List<SonarChat> = core.chats()
+
+    /** Pending multi-member group invites; empty when the store cannot say. */
+    suspend fun loadInvites(): List<SonarGroupInvite> =
+        runCatching { core.pendingGroupInvites() }.getOrDefault(emptyList())
 
     /**
      * Publish one coherent local snapshot of [localChats]: summaries for every

@@ -20,6 +20,7 @@ internal class FakeChatListCore : ChatListCore {
     var chats: List<SonarChat> = emptyList()
     var summaries: List<SonarConversationSummary> = emptyList()
     var pages: List<SonarRecentTranscriptPage> = emptyList()
+    var invites: List<SonarGroupInvite> = emptyList()
 
     /** While set and incomplete, [chats] suspends (a slow local read). */
     var chatsGate: CompletableDeferred<Unit>? = null
@@ -33,6 +34,8 @@ internal class FakeChatListCore : ChatListCore {
     var summariesCalls = 0
         private set
     val markedRead = mutableListOf<String>()
+    /** "delete:<id>" / "leave:<id>", in order. */
+    val removed = mutableListOf<String>()
 
     val changes = MutableSharedFlow<String>(extraBufferCapacity = 64)
     override val conversationChanged get() = changes
@@ -52,11 +55,23 @@ internal class FakeChatListCore : ChatListCore {
     override suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
         pages.take(groupLimit)
 
+    override suspend fun pendingGroupInvites(): List<SonarGroupInvite> = invites
+
     override suspend fun markConversationRead(groupIdHex: String) {
         markGate?.await()
         if (failMarks) error("mark failed")
         markedRead += groupIdHex
         summaries = summaries.map { if (it.groupIdHex == groupIdHex) it.copy(unreadCount = 0L) else it }
+    }
+
+    override suspend fun deleteChat(groupIdHex: String) = remove("delete", groupIdHex)
+
+    override suspend fun leaveGroup(groupIdHex: String) = remove("leave", groupIdHex)
+
+    private fun remove(how: String, groupIdHex: String) {
+        removed += "$how:$groupIdHex"
+        chats = chats.filterNot { it.id == groupIdHex }
+        summaries = summaries.filterNot { it.groupIdHex == groupIdHex }
     }
 }
 

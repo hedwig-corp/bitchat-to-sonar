@@ -7556,9 +7556,9 @@ class SonarAppState internal constructor(
         scope.launch {
             try {
                 if (isGroup) {
-                    SonarCore.leaveGroup(chatId)
+                    chatListCore.leaveGroup(chatId)
                 } else {
-                    for (id in deleteIds) SonarCore.deleteChat(id)
+                    for (id in deleteIds) chatListCore.deleteChat(id)
                 }
             } catch (t: Throwable) {
                 toast = if (isGroup) "couldn't leave group: ${t.message}" else "couldn't delete chat: ${t.message}"
@@ -7628,7 +7628,7 @@ class SonarAppState internal constructor(
         scope.launch {
             aliases.forEach { MessageStore.deleteMeshDm(it) }
             foldedGroups.forEach { group ->
-                runCatching { SonarCore.deleteChat(group.id) }
+                runCatching { chatListCore.deleteChat(group.id) }
                     .onFailure { toast = "couldn't delete chat: ${it.message}" }
             }
             if (foldedGroups.isNotEmpty()) refreshChats()
@@ -13129,7 +13129,7 @@ class SonarAppState internal constructor(
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
             }
         }
-        groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
+        groupInvites = chatList.loadInvites()
         resolvePendingMarmotChats()
         if (localCoreReady || started) {
             scope.launch { reconcileLocalTimezone() }
