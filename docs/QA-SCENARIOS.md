@@ -639,6 +639,32 @@ share a zone with the app and report the zone the app shared with it.
   `conversation_index.rs::revoke_tombstone_is_per_group_and_blocks_older_replays`
 - **Origin:** #607 known gap — a stale clock stayed after sharing was off.
 
+### QA-142 — A share lost on the way is sent again
+- **Platforms:** both. The fix is in core, so both apps get it. Tested only
+  in core: the harness cannot make relays drop one event.
+- **Steps (real accounts, the case that found it):** on two of your own
+  devices with *Share local time* on, open their 1:1 chat on each. Read the
+  sender's `sonar-core.log`, and on the receiver look for `cached private
+  timezone from group member`.
+- **Expect:** the receiver's DM header shows the sender's clock. A sender
+  pass that logs `due=0` while the receiver has no zone cached is this bug.
+  On a build before v6 the workaround is to toggle the chat's *Share local
+  time* off and on.
+- **Why the smoke never saw it:** every pass starts from a fresh account
+  with an empty sent-share record and healthy relays, so the first share
+  always arrives. The bug needs a record written while its publish was lost:
+  an alpha.15 burst into a rate-limiting relay, or the outbox spending all
+  20 publish attempts.
+- **Guard:** `client.rs::timezone_share_the_outbox_gave_up_on_is_shared_again_on_the_heartbeat`,
+  `client.rs::timezone_share_abandoned_before_a_restart_is_shared_again`,
+  `conversation_index.rs::v6_drops_sent_share_records_written_before_it_once`,
+  `outbox.rs::abandoned_control_rows_are_taken_and_chat_rows_are_kept`
+- **Not guarded:** a share that a relay acked but the peer never received.
+  Only a delivery receipt or a periodic re-share would catch it.
+- **Origin:** 2026-09-28 device report, real Pixel 10 Pro + iPhone 14 Pro
+  Max on alpha.15.1. The Pixel header read "Nearby · Bluetooth" instead of
+  the iPhone's time.
+
 ## Settings
 
 ### QA-060 — Settings copy matches behaviour
