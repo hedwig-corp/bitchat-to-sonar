@@ -2862,6 +2862,69 @@ closed with an error; there is no automatic recovery path for it.
 - *Check `needs_nut13_restore` after opening the store.* Shipped once (33c5712f1,
   reverting 6e63f6e3b on #586); the check can never see the db missing.
 
+## R-051 — The local-time share goes out once per group and epoch, not once per store open
+
+**Invariant:** a device re-encrypts its local-time share into a group only when
+the zone or that group's epoch changed — never because the process restarted or
+the iOS store reopened. The sent-share record is durable (`timezone_share_sent`
+in the conversation index), the index opens whatever `schema_version` is stamped
+on it, and with no index the share is not fanned out at all.
+
+**Breaks as:** every cold start and every foreground reopen encrypts a share into
+every allowed group (capped at 256) and publishes it to every Marmot relay. On
+alpha.15 (1.15.0/45), on an iPhone with 395 groups: 738 publishes in the first
+minute after launch, then 537 `rate limited` relay notices over three minutes,
+and an app that felt "super slow". The failed index also took the chat
+summaries and unread counts with it.
+
+**Why:** first time (#607 QA A1/i2), the dedupe lived only in process memory —
+37 publishes per launch on the QA account — and the fix persisted it in the
+index. Second time (alpha.15), that table existed in code but the index never
+opened. The unmerged branch `codex/fix-native-notification-sync` had stamped the
+device's index `schema_version = 4` with a different v3/v4
+(`notification_outbox`). alpha.15 took the stamp as proof, skipped main's v3/v4
+steps, and its v5 step failed with `no such table: timezone_share_sent`.
+`SonarClient::connect` carries on without an index, so the dedupe was back to
+process memory.
+
+**Core call site:** `conversation_index.rs::ConversationIndex::migrate` →
+`ensure_schema` (every table is ensured on every open; the stamp gates only the
+v5 data reset and is never lowered), and
+`client.rs::SonarClient::share_local_timezone_with_groups` (no index, no
+fan-out). This fixes both hosts; neither host call site changes.
+
+**Apple call site:** `SonarAppStore.reconcileTimezoneShare` →
+`MarmotChatModel.applyLocalTimezoneShare`, unchanged. It re-requests the share on
+every connect and foreground, which is only correct because core dedupes durably.
+
+**Compose call site:** `SonarAppState.reconcileLocalTimezone`, unchanged, same
+reason.
+
+**Guarded by:** `client.rs::connect_keeps_the_index_and_share_dedupe_over_a_foreign_v4_stamp`
+(the real `connect` over the device's index shape, then a reopen that must not
+re-encrypt), `client.rs::timezone_share_waits_for_a_durable_dedupe`,
+`conversation_index.rs::opens_a_foreign_v4_stamp_missing_the_timezone_tables`,
+`conversation_index.rs::opens_a_newer_stamp_by_ensuring_tables_without_lowering_it`
+
+**Also guarded by:** `client.rs::timezone_share_is_not_repeated_after_restart`
+(the first occurrence)
+
+**Not guarded:**
+- A device that ran alpha.15 has no trustworthy record, so its first launch on
+  the fix re-shares once into every allowed group. Bounded, and once.
+- If `record_timezone_share_sent` fails on an open index (disk full, I/O), that
+  process still falls back to its in-memory record.
+- Turning Share local time on still fans out to up to 256 groups in one burst,
+  each share rewriting the whole outbox sidecar. That is #607's design and is
+  not paced.
+
+**Rejected:**
+- *Bump `SCHEMA_VERSION` to 6 and re-run the timezone steps.* That fixes this one
+  device's shape but still trusts the stamp, so the next branch stamp repeats it.
+- *Wipe and rebuild the index when the migration fails.* `materialize_from`
+  restores summaries but resets every unread count and drops peer-zone revoke
+  tombstones, and it hides the migration defect rather than fixing it.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**

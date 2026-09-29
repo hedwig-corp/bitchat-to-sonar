@@ -7632,6 +7632,18 @@ impl SonarClient {
         let Some(zone) = self.local_timezone.lock().unwrap().clone() else {
             return;
         };
+        // The per-group dedupe is only as durable as the index it lives in.
+        // Without one, every process start and every iOS store reopen begins
+        // with an empty record and re-encrypts a share into every allowed
+        // group: 738 publishes in the first minute, and relays rate-limiting
+        // the account, on an alpha.15 iPhone whose index failed to open. Hold
+        // the zone and share once an open succeeds.
+        if self.conversation_index.is_none() {
+            // debug, not warn: sync passes call this, and the failed open
+            // already warned once at connect.
+            tracing::debug!("timezone share skipped: conversation index unavailable");
+            return;
+        }
         let payload = match crate::timezone::encode_timezone_share_payload(&zone) {
             Ok(payload) => payload,
             Err(err) => {
@@ -11216,6 +11228,95 @@ mod tests {
             alice.outbox_state.lock().unwrap().recorded_count(),
             before + 1,
             "a new zone still shares"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_keeps_the_index_and_share_dedupe_over_a_foreign_v4_stamp() {
+        // alpha.15 on a real iPhone: an unmerged branch build had stamped the
+        // index v4 without main's timezone tables, `connect` dropped the index,
+        // and each store open re-encrypted the share into every allowed group
+        // (738 publishes in the first minute, relays rate-limiting the account).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let key = [0x5au8; 32];
+        crate::conversation_index::tests::write_foreign_v4_index(
+            &crate::conversation_index::index_db_path_for_db(&db),
+            key,
+        );
+        let identity = Identity::generate();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let group_hex = {
+            let alice = SonarClient::connect(identity.clone(), vec![], &db, key)
+                .await
+                .expect("alice");
+            assert!(
+                alice.conversation_index.is_some(),
+                "a foreign schema stamp must not cost the conversation index"
+            );
+            let creation = alice
+                .engine
+                .create_group(
+                    "alice & bob",
+                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    relays,
+                )
+                .unwrap();
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .unwrap();
+            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
+            alice.update_local_timezone("Europe/Zurich").await.unwrap();
+            assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 1);
+            group_hex
+        };
+
+        let alice = SonarClient::connect(identity, vec![], &db, key)
+            .await
+            .expect("alice reopens");
+        let before = alice.outbox_state.lock().unwrap().recorded_count();
+        alice.set_timezone_share_groups(vec![group_hex]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            before,
+            "a reopen with the same zone and epoch must not re-encrypt the share"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_waits_for_a_durable_dedupe() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        // What `connect` does when the index cannot open.
+        alice.conversation_index = None;
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+
+        alice.set_timezone_share_groups(vec![group_hex]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            0,
+            "without a durable sent-share record every open would re-broadcast"
+        );
+        assert_eq!(
+            alice.local_timezone.lock().unwrap().as_deref(),
+            Some("Europe/Zurich"),
+            "the zone is kept for when an index is available"
         );
     }
 

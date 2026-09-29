@@ -152,116 +152,115 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index version read: {e}")))?;
 
         let current = current.unwrap_or(0);
-        if current >= SCHEMA_VERSION {
-            return Ok(());
-        }
 
-        // One transaction for ALL migration steps + the schema_version bump:
-        // SQLite DDL is transactional, and without this a process kill between
-        // an autocommitted ALTER and the version write leaves the db in a
-        // state where the next open re-runs the ALTER and fails forever
-        // ("duplicate column name"), silently degrading the index.
+        // One transaction for the schema ensure, the one-shot data steps and
+        // the schema_version bump: SQLite DDL is transactional, and without
+        // this a process kill between an autocommitted ALTER and the version
+        // write leaves the db in a state where the next open re-runs the ALTER
+        // and fails forever ("duplicate column name"), silently degrading the
+        // index. On an already-current db every statement below is a no-op
+        // that takes no write lock.
         let tx = self
             .db
             .unchecked_transaction()
             .map_err(|e| crate::Error::Storage(format!("index migrate begin: {e}")))?;
 
-        if current < 1 {
+        // The schema is ensured on EVERY open, whatever version is stamped.
+        // The stamp is not proof of what exists: an unmerged branch build
+        // stamped v4 onto a real iPhone with its own v3/v4 (a notification
+        // outbox), so alpha.15 skipped main's v3/v4 steps and failed on the
+        // missing `timezone_share_sent`. The whole index was then dropped —
+        // no summaries or unread counts, and no durable timezone-share dedupe,
+        // so every store open re-encrypted a share into up to 256 groups.
+        Self::ensure_schema(&tx)?;
+
+        if current < 5 {
+            // v3 kept peer zones per sender. A per-sender row let a revoke sent
+            // into one chat erase the zone the same person still shares in
+            // another, and kept a stale clock everywhere once they stopped.
+            // Those rows have no group to migrate to, so drop them and clear
+            // our own sent-share records too: after the upgrade every sharer
+            // re-sends once and `peer_timezone_by_group` fills per group.
             tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS conversation_summary (
-                    group_id_hex    TEXT PRIMARY KEY,
-                    name            TEXT NOT NULL DEFAULT '',
-                    latest_content  TEXT NOT NULL DEFAULT '',
-                    latest_sender   TEXT NOT NULL DEFAULT '',
-                    latest_at_secs  INTEGER NOT NULL DEFAULT 0,
-                    latest_mine     INTEGER NOT NULL DEFAULT 0,
-                    message_count   INTEGER NOT NULL DEFAULT 0,
-                    unread_count    INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE INDEX IF NOT EXISTS idx_summary_recency
-                    ON conversation_summary(latest_at_secs DESC);",
+                "DROP TABLE IF EXISTS peer_timezone;
+                DELETE FROM timezone_share_sent;",
             )
-            .map_err(|e| crate::Error::Storage(format!("index create table: {e}")))?;
+            .map_err(|e| crate::Error::Storage(format!("index reset peer timezones: {e}")))?;
         }
 
-        if current < 2 && !Self::has_column(&tx, "conversation_summary", "version")? {
+        // Never lower a stamp a newer build wrote: its extra tables are its
+        // own, and this build has just ensured every table it reads.
+        if current < SCHEMA_VERSION {
+            tx.execute(
+                "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
+                params![SCHEMA_VERSION],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index version write: {e}")))?;
+        }
+
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index migrate commit: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Create every table, index and column this build reads, if missing.
+    /// Idempotent by construction, so it is safe against any stamped version:
+    /// a partial migration, a branch build's divergent history, or a newer
+    /// build's schema.
+    fn ensure_schema(db: &Connection) -> Result<()> {
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversation_summary (
+                group_id_hex    TEXT PRIMARY KEY,
+                name            TEXT NOT NULL DEFAULT '',
+                latest_content  TEXT NOT NULL DEFAULT '',
+                latest_sender   TEXT NOT NULL DEFAULT '',
+                latest_at_secs  INTEGER NOT NULL DEFAULT 0,
+                latest_mine     INTEGER NOT NULL DEFAULT 0,
+                message_count   INTEGER NOT NULL DEFAULT 0,
+                unread_count    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_summary_recency
+                ON conversation_summary(latest_at_secs DESC);",
+        )
+        .map_err(|e| crate::Error::Storage(format!("index create table: {e}")))?;
+
+        if !Self::has_column(db, "conversation_summary", "version")? {
             // Additive per-conversation change counter (see ConversationSummary
-            // docs). Existing rows start at 0; every mutation bumps it. The
-            // column-existence guard makes the step idempotent even against a
-            // db that somehow recorded the old schema version with the column
-            // already present.
-            tx.execute_batch(
+            // docs). Existing rows start at 0; every mutation bumps it.
+            db.execute_batch(
                 "ALTER TABLE conversation_summary
                     ADD COLUMN version INTEGER NOT NULL DEFAULT 0;",
             )
             .map_err(|e| crate::Error::Storage(format!("index add version column: {e}")))?;
         }
 
-        if current < 3 {
-            // Private per-sender timezone metadata received over encrypted
-            // conversations (kind-449 timezone shares). Keyed by the sender's
-            // Nostr pubkey hex — a person has one system timezone regardless of
-            // how many conversations we share, and the sender only ever asserts
-            // their OWN zone. `CREATE TABLE IF NOT EXISTS` keeps the step
-            // idempotent under a non-atomic partial migration.
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS peer_timezone (
-                    sender_pubkey_hex TEXT PRIMARY KEY,
-                    iana_tz           TEXT NOT NULL,
-                    updated_at_secs   INTEGER NOT NULL DEFAULT 0
-                );",
-            )
-            .map_err(|e| crate::Error::Storage(format!("index create peer_timezone: {e}")))?;
-        }
-
-        if current < 4 {
-            // The zone this device last shared into each MLS group and the
-            // epoch it was encrypted at. Without it every process start (and
-            // every iOS store reopen) re-encrypted a kind-449 into every
-            // allowed group. Its own step, not folded into v3: builds of the
-            // timezone branch already wrote v3 databases.
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS timezone_share_sent (
-                    group_id_hex TEXT PRIMARY KEY,
-                    iana_tz      TEXT NOT NULL,
-                    epoch        INTEGER NOT NULL
-                );",
-            )
-            .map_err(|e| crate::Error::Storage(format!("index create timezone_share_sent: {e}")))?;
-        }
-
-        if current < 5 {
-            // Peer zones keyed by (sender, group). A per-sender row let a revoke
-            // sent into one chat erase the zone the same person still shares in
-            // another, and kept a stale clock everywhere once they stopped. An
-            // empty `iana_tz` is a revoke tombstone: it still carries its
-            // timestamp, so an older share replayed later cannot resurrect it.
-            //
-            // v3's per-sender rows have no group to migrate to, so drop them
-            // and clear our own sent-share records too: after the upgrade every
-            // sharer re-sends once and the new table fills per group.
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS peer_timezone_by_group (
-                    sender_pubkey_hex TEXT NOT NULL,
-                    group_id_hex      TEXT NOT NULL,
-                    iana_tz           TEXT NOT NULL,
-                    updated_at_secs   INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (sender_pubkey_hex, group_id_hex)
-                );
-                DROP TABLE IF EXISTS peer_timezone;
-                DELETE FROM timezone_share_sent;",
-            )
-            .map_err(|e| crate::Error::Storage(format!("index create peer_timezone_by_group: {e}")))?;
-        }
-
-        tx.execute(
-            "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
-            params![SCHEMA_VERSION],
+        // The zone this device last shared into each MLS group and the epoch
+        // it was encrypted at. Without it every process start (and every iOS
+        // store reopen) re-encrypted a kind-449 into every allowed group.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS timezone_share_sent (
+                group_id_hex TEXT PRIMARY KEY,
+                iana_tz      TEXT NOT NULL,
+                epoch        INTEGER NOT NULL
+            );",
         )
-        .map_err(|e| crate::Error::Storage(format!("index version write: {e}")))?;
+        .map_err(|e| crate::Error::Storage(format!("index create timezone_share_sent: {e}")))?;
 
-        tx.commit()
-            .map_err(|e| crate::Error::Storage(format!("index migrate commit: {e}")))?;
+        // Private peer zones received over encrypted conversations, keyed by
+        // (sender, group): a person can share in one chat and not another. An
+        // empty `iana_tz` is a revoke tombstone: it still carries its
+        // timestamp, so an older share replayed later cannot resurrect it.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS peer_timezone_by_group (
+                sender_pubkey_hex TEXT NOT NULL,
+                group_id_hex      TEXT NOT NULL,
+                iana_tz           TEXT NOT NULL,
+                updated_at_secs   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (sender_pubkey_hex, group_id_hex)
+            );",
+        )
+        .map_err(|e| crate::Error::Storage(format!("index create peer_timezone_by_group: {e}")))?;
 
         Ok(())
     }
@@ -624,7 +623,7 @@ impl ConversationIndex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1099,5 +1098,120 @@ mod tests {
             idx.peer_timezone("peer", "g").unwrap().unwrap().zone,
             "Pacific/Chatham"
         );
+    }
+
+    /// The shape of the index on the iPhone that made alpha.15 crawl: the
+    /// unmerged `codex/fix-native-notification-sync` build stamped v4 with its
+    /// own v3/v4 (`notification_outbox`), so main's v3/v4 never ran here.
+    pub(crate) fn write_foreign_v4_index(path: &Path, key: [u8; 32]) {
+        let db = Connection::open(path).unwrap();
+        let hex_key = hex::encode(key);
+        db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+            .unwrap();
+        db.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             CREATE TABLE conversation_summary (
+                group_id_hex TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                latest_content TEXT NOT NULL DEFAULT '',
+                latest_sender TEXT NOT NULL DEFAULT '',
+                latest_at_secs INTEGER NOT NULL DEFAULT 0,
+                latest_mine INTEGER NOT NULL DEFAULT 0,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO conversation_summary
+                (group_id_hex, name, latest_content, latest_sender,
+                 latest_at_secs, latest_mine, message_count, unread_count, version)
+                VALUES ('g1', 'Chat', 'kept', 'peer', 100, 0, 3, 2, 7);
+             CREATE TABLE notification_outbox (
+                message_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                created_at_secs INTEGER NOT NULL,
+                sender_pubkey TEXT NOT NULL,
+                group_name TEXT NOT NULL DEFAULT '',
+                content_preview TEXT NOT NULL DEFAULT '',
+                acknowledged INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO schema_version(version) VALUES (1);
+             INSERT INTO schema_version(version) VALUES (2);
+             INSERT INTO schema_version(version) VALUES (4);",
+        )
+        .unwrap();
+    }
+
+    fn stamped_version(idx: &ConversationIndex) -> u32 {
+        idx.db
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn opens_a_foreign_v4_stamp_missing_the_timezone_tables() {
+        // Before the fix: "index create peer_timezone_by_group: no such table:
+        // timezone_share_sent", the index was dropped, and the timezone share
+        // re-broadcast into up to 256 groups on every store open.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x77u8; 32];
+        write_foreign_v4_index(&path, key);
+
+        let idx = ConversationIndex::open(&path, key).expect("a foreign v4 stamp must open");
+        let s = idx.summary("g1").unwrap().unwrap();
+        assert_eq!(s.latest_content, "kept");
+        assert_eq!(s.unread_count, 2);
+        assert_eq!(s.version, 7);
+        assert_eq!(stamped_version(&idx), SCHEMA_VERSION);
+
+        idx.record_timezone_share_sent("g1", "America/Los_Angeles", 5)
+            .unwrap();
+        assert!(idx
+            .upsert_peer_timezone("peer", "g1", "Europe/Rome", 10)
+            .unwrap());
+        drop(idx);
+
+        let reopened = ConversationIndex::open(&path, key).unwrap();
+        assert_eq!(
+            reopened.timezone_shares_sent().unwrap(),
+            vec![("g1".to_owned(), "America/Los_Angeles".to_owned(), 5)],
+            "the sent-share dedupe must survive reopen once the stamp is current"
+        );
+        let branch_table: i64 = reopened
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'notification_outbox'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(branch_table, 1, "another build's tables are left alone");
+    }
+
+    #[test]
+    fn opens_a_newer_stamp_by_ensuring_tables_without_lowering_it() {
+        // A stamp from a newer (or branch) build used to short-circuit the
+        // migration entirely, so a table this build reads could be missing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x88u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version(version) VALUES (99);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        idx.upsert_summary("g1", "Chat", "hi", "peer", 100, false, true)
+            .unwrap();
+        idx.record_timezone_share_sent("g1", "Asia/Tokyo", 1).unwrap();
+        assert!(idx.upsert_peer_timezone("peer", "g1", "Asia/Tokyo", 1).unwrap());
+        assert_eq!(stamped_version(&idx), 99);
     }
 }
