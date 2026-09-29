@@ -4,7 +4,7 @@
 # docs/QA-SCENARIOS.md; add one here whenever a QA pass finds a bug that can
 # be driven headlessly (the registry says which ones are automated).
 #
-#   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003] [--max-idle-cpu 3]
+#   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003[,QA-004…]] [--max-idle-cpu 3]
 #   (set QA_APP_NPUB to run a scenario that needs the app's npub with --only)
 #   QA_ALLOW_WIPE=1 also runs QA-118, which CLEARS the app's data: throwaway
 #   emulators only, never a device or an emulator holding an account you need.
@@ -49,7 +49,9 @@ record() { # id status detail
   [[ "$2" == FAIL ]] && FAILED=$((FAILED + 1))
   return 0
 }
-want() { [[ -z "$ONLY" || "$ONLY" == "$1" ]]; }
+# --only takes one id or a comma list (QA-001,QA-003,QA-143): scenarios that
+# reuse an earlier one's chat need that one in the list too.
+want() { [[ -z "$ONLY" || ",$ONLY," == *",$1,"* ]]; }
 ui() { "$UI" "$@" >/dev/null 2>&1; }
 has() { [[ -n "$("$UI" find "$1" 2>/dev/null)" ]]; }
 hasx() { [[ -n "$("$UI" findx "$1" 2>/dev/null)" ]]; }
@@ -344,8 +346,10 @@ qa143() { # the share picker titles 1:1 rows like Home, searches by title, sends
   # their MLS group names are blank.
   ta="${a:0:10}…${a: -4}"; tb="${b:0:10}…${b: -4}"
   go_home >/dev/null
+  # No spaces in the text: `adb shell` re-splits its arguments, and a space
+  # turns the rest of the text into `am` arguments ("unable to resolve Intent").
   adb -s "$QA_SERIAL" shell am start -a android.intent.action.SEND -t text/plain \
-    --es android.intent.extra.TEXT "qa143 shared $RUN" -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
+    --es android.intent.extra.TEXT "qa143_shared_$RUN" -n chat.bitchat.sonar/.MainActivity >/dev/null 2>&1
   "$UI" wait "Send to…" 15 >/dev/null || { record QA-143 FAIL "the share picker never opened"; return; }
   if ! hasx "$ta" || ! hasx "$tb"; then
     record QA-143 FAIL "a 1:1 row in the picker has no title (R-053)"; return
@@ -355,7 +359,7 @@ qa143() { # the share picker titles 1:1 rows like Home, searches by title, sends
   "$UI" gone "$tb" 10 >/dev/null || { record QA-143 FAIL "search by title did not narrow the rows"; return; }
   hasx "$ta" || { record QA-143 FAIL "search by title hid the chat it names"; return; }
   ui tapx "$ta"
-  if "$PEERS" expect "a-$RUN" "qa143 shared $RUN" 60 >/dev/null; then
+  if "$PEERS" expect "a-$RUN" "qa143_shared_$RUN" 60 >/dev/null; then
     record QA-143 PASS "rows titled like Home; search by title; shared text delivered to the picked chat"
   else
     record QA-143 FAIL "picked the chat, but the peer never received the shared text"
