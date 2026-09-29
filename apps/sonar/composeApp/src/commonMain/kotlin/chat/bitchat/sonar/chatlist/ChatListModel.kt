@@ -35,9 +35,6 @@ internal data class ChatListModel(
         get() = rows.lastOrNull()?.key ?: invites.lastOrNull()?.let { inviteKey(it) }
 
     companion object {
-        /** The list before local hydration: nothing painted but a loading row. */
-        val Loading = ChatListModel(hydrated = false, catchingUp = false, invites = emptyList(), rows = emptyList())
-
         fun inviteKey(invite: SonarGroupInvite): String = "invite:" + invite.id
     }
 }
