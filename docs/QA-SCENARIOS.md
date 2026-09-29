@@ -31,8 +31,16 @@ is the build under test on a dedicated QA emulator/simulator.
   type → Send.
 - **Expect:** bubble reaches "Sent · internet"; the peer receives it within
   60 s; **the keyboard stays up** after the first send.
-- **How:** `android-smoke.sh` QA-001 · Guard: `ChatTranscriptBodyComposerFocusUiTest`
-- **Origin:** A10 (#616)
+- **How:** `android-smoke.sh` QA-001 · Guard: `ChatTranscriptBodyComposerFocusUiTest`,
+  `SNComposerFirstSendFocusTests.theFirstSendWithTheKeyboardUpRefocusesTheRebuiltComposer` (iOS).
+  iOS by hand or `ios-drive.sh`: run type and send in ONE driver session and
+  check the `Keyboard` element in the tree after the send. A new driver
+  session attaching drops the keyboard by itself, which looks like this bug.
+- **Origin:** A10 (#616). iOS failed it too (found 2026-09-29, core-owned
+  chat list QA; main had the same behaviour): the first message moves the
+  composer from the empty state into the transcript host, SwiftUI rebuilds it
+  there and its focus was lost. The screen now re-focuses the rebuilt
+  composer once, only when the field had focus at the send.
 
 ### QA-002 — Reply arrives in the open chat
 - **Platforms:** both (Android automated)
