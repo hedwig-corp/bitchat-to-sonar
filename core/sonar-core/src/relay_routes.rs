@@ -631,6 +631,10 @@ pub struct RelayRouter {
     /// Route relays in use by in-flight operations, so one operation's
     /// release cannot close a socket another still needs.
     in_use: Mutex<HashMap<RelayUrl, usize>>,
+    /// One distribution pass at a time: the foreground and background
+    /// publish paths can both start one on a first connect, and two passes
+    /// that each see "nothing exists" would mint two different defaults.
+    distribution_lock: tokio::sync::Mutex<()>,
 }
 
 impl RelayRouter {
@@ -659,6 +663,7 @@ impl RelayRouter {
             peer_routes: Mutex::new(peers),
             sticky: Mutex::new(HashSet::new()),
             in_use: Mutex::new(HashMap::new()),
+            distribution_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -949,6 +954,7 @@ impl RelayRouter {
         main: &Client,
         force: bool,
     ) -> DistributionReport {
+        let _pass = self.distribution_lock.lock().await;
         let now = now_secs();
         let mut report = DistributionReport::default();
         if !force && self.distributed_recently(now) {

@@ -5314,7 +5314,10 @@ impl SonarClient {
         };
         match self.engine.group_relays(&GroupId::from_slice(&bytes)) {
             Ok(relays) => {
-                let foreign = self.routes.foreign(relays);
+                // The list came from the welcome (creator-chosen): bound the
+                // fan-out and the sticky set to the routing maximum.
+                let mut foreign = self.routes.foreign(relays);
+                foreign.truncate(crate::relay_routes::MAX_GROUP_RELAYS);
                 if !foreign.is_empty() {
                     self.routes.keep_open(&foreign);
                 }
