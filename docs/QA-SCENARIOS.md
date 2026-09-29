@@ -413,8 +413,16 @@ nothing by design.
 - **Expect:** the peer's one Home row shows the new preview **and** the unread
   dot (announced "Unread"); opening it clears the dot; no second row for the
   same person appears (R-003).
+- **How:** two QA emulators of your own with Bluetooth on (they share the
+  Mac's virtual radio, so check other agents' emulators have it off): the peer
+  DMs the app from Nearby → Message; the peer turns Bluetooth off (its header
+  then reads "Out of Bluetooth range — encrypted over the internet instead")
+  and sends again. Verified 2026-09-29 on `Sonar_QA_API_36_payne` +
+  `_payne_adv`: preview + "Unread" on the one Bluetooth row 5 s after the send;
+  opening it shows read BLE row | divider | White Noise row; back, no dot.
 - **Guard:** `ChatListAppStateTest.aMeshFoldedPersonsWhiteNoiseUnreadBadgesTheirBluetoothRow`,
-  `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs` (R-052)
+  `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs`,
+  `ChatListScreensUiTest.homeTitlesBothChatKindsAndDotsTheUnreadOnes` (R-052)
 - **Origin:** chat-list presenter pilot. Compose mesh rows never passed
   `unread` or `verified`, so Android and desktop showed no dot where iOS did.
 

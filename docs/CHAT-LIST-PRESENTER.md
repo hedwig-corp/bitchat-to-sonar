@@ -149,6 +149,19 @@ A/B that recorded only whole-process CPU seemed to put the branch higher
 split above is what showed that difference was host noise. Composition runs on
 the main thread, and it did no extra work.
 
+A later attributed A/B (after the share-picker change; 12 × 60 s windows per
+build, 3 rounds, logging the app's busiest log tags per window) explains the
+spread. Five windows in each build carried a periodic core burst (~1,500
+`SonarCore` log lines; ~10 % process, ~3 % main thread), identical in both:
+
+| Windows | main (main thread) | branch (main thread) |
+|---|---|---|
+| quiet (7 each) | median 0.20 %, mean 0.25 % | median 0.20 %, mean 0.22 % |
+| core burst (5 each) | mean 3.16 % | mean 3.14 % |
+
+The QA-050 smoke gate (≤ 3 % over 30 s) failed once at 3.13 % in exactly such
+a burst window. That periodic burst is a `main` cost: measured here, not fixed.
+
 JVM cost probe (278 direct chats, 10 mesh-folded people; M-series Mac;
 throwaway test, not committed):
 
