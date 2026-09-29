@@ -2907,11 +2907,18 @@ re-encrypt), `client.rs::timezone_share_waits_for_a_durable_dedupe`,
 `conversation_index.rs::opens_a_newer_stamp_by_ensuring_tables_without_lowering_it`
 
 **Also guarded by:** `client.rs::timezone_share_is_not_repeated_after_restart`
-(the first occurrence)
+(the first occurrence) and `client.rs::timezone_share_skips_its_own_relay_echo`
+(the share's wrapper id joins the sync processed set like every other send, so
+its echo is not re-fetched and re-failed on every catch-up — 512 such echoes
+per pass on the same iPhone).
 
 **Not guarded:**
 - A device that ran alpha.15 has no trustworthy record, so its first launch on
-  the fix re-shares once into every allowed group. Bounded, and once.
+  the fix re-shares once into every allowed group. Bounded, and once. Its old
+  512 share echoes were never marked processed, so per-group catch-up keeps
+  re-fetching and re-failing them until they age out of the one-hour floor
+  lookback (`GROUP_CATCHUP_FLOOR_LOOKBACK_SECS`); measured at 565–626 MDK
+  failures per pass on 2026-09-29.
 - If `record_timezone_share_sent` fails on an open index (disk full, I/O), that
   process still falls back to its in-memory record.
 - Turning Share local time on still fans out to up to 256 groups in one burst,

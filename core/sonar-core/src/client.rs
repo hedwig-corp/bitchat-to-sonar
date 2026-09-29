@@ -7736,6 +7736,13 @@ impl SonarClient {
                 "created timezone rumor did not persist as kind-449".into(),
             ));
         }
+        // Skip our own relay echo, as `spawn_send_bookkeeping` does for every
+        // other send. MDK already moved this wrapper to Processed above, so the
+        // echo can only come back `Unprocessable`: never recorded, it was
+        // re-fetched and re-failed on every catch-up — 512 such echoes on the
+        // alpha.15 iPhone. In-memory only: a burst of shares must not rewrite
+        // the sync-state file once per group, and the drain persists it.
+        self.mark_sync_event_processed(&event.id);
         self.outbox_state.lock().unwrap().mark_pending(
             group_id_hex.to_owned(),
             event.id.to_hex(),
@@ -11318,6 +11325,52 @@ mod tests {
             Some("Europe/Zurich"),
             "the zone is kept for when an index is available"
         );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_skips_its_own_relay_echo() {
+        // Every other send records its wrapper id so the relay echo never
+        // reaches MDK; the share did not, so each echo came back Unprocessable
+        // and was re-fetched and re-failed on every catch-up.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        alice
+            .engine
+            .merge_pending_commit(&creation.group.mls_group_id)
+            .unwrap();
+        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+
+        alice.set_timezone_share_groups(vec![group_hex.clone()]).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let queued = alice
+            .outbox_state
+            .lock()
+            .unwrap()
+            .retryable_events(Timestamp::now().as_secs(), &HashSet::from([group_hex]))
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        let (_, _, share) = &queued[0];
+        assert!(
+            alice.is_sync_event_processed(&share.id),
+            "the share's own echo must be skipped before MDK"
+        );
+
+        let (report, _) = alice
+            .process_marmot_events(vec![share.clone()], "live marmot event")
+            .await;
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.retryable_failures, 0);
     }
 
     #[tokio::test]
