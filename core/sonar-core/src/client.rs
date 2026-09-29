@@ -2821,11 +2821,25 @@ impl SonarClient {
     /// logged, not returned. Event creation (MLS key material persistence) still
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = match self.engine.key_package_event(self.relays.clone()) {
+            Ok(event) => event,
+            Err(err) => {
+                // Without a published KeyPackage nobody can start a chat with
+                // us: never fail this quietly.
+                tracing::warn!(%err, "KeyPackage creation failed; not published");
+                return Err(err);
+            }
+        };
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
-            if let Err(err) = nostr.send_event(&event).await {
-                tracing::warn!(%err, "background KeyPackage publish failed");
+            match nostr.send_event(&event).await {
+                Ok(output) => tracing::info!(
+                    accepted = output.success.len(),
+                    rejected = output.failed.len(),
+                    rejections = ?output.failed.values().collect::<Vec<_>>(),
+                    "KeyPackage published"
+                ),
+                Err(err) => tracing::warn!(%err, "background KeyPackage publish failed"),
             }
         });
         Ok(())

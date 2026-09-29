@@ -140,7 +140,10 @@ actual object SonarCore {
             installConversationListener()
             previousNode?.close()
             runCatching { connected.retryOutbox() }
+            // Without a published KeyPackage no one can start a chat with us,
+            // so a failure is logged, never swallowed.
             runCatching { connected.publishKeyPackageBackground() }
+                .onFailure { android.util.Log.w("SonarCore", "KeyPackage publish failed", it) }
             npub
         }
     }

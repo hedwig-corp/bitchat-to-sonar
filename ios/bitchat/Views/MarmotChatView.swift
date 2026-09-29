@@ -3369,7 +3369,13 @@ final class MarmotChatModel: ObservableObject {
     /// guards for contacts.
     func publishIdentityAfterConnect(generation: UInt64) async {
         guard isCurrentIdentityPublish(generation) else { return }
-        try? await service.publishKeyPackageBackground()
+        // Without a published KeyPackage no one can start a chat with us, so a
+        // failure is logged, never swallowed (Compose logs the same call).
+        do {
+            try await service.publishKeyPackageBackground()
+        } catch {
+            SecureLogger.warning("⚠️ KeyPackage publish failed: \(error)", category: .session)
+        }
         guard isCurrentIdentityPublish(generation) else { return }
         let safeToPublish = await hydrateOwnProfileFromRelays()
         guard isCurrentIdentityPublish(generation) else { return }
