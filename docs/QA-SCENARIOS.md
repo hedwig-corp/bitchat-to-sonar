@@ -640,8 +640,16 @@ share a zone with the app and report the zone the app shared with it.
 - **Origin:** #607 known gap — a stale clock stayed after sharing was off.
 
 ### QA-142 — A share lost on the way is sent again
-- **Platforms:** both. The fix is in core, so both apps get it. Tested only
-  in core: the harness cannot make relays drop one event.
+- **Platforms:** both. The fix is in core, so both apps get it.
+- **How:** automated in core, and CI runs it on every PR (`cargo test
+  --workspace`). `timezone_share_lost_while_offline_reaches_the_peer_once_back_online`
+  drives the whole path through a relay. Alice shares while no relay is
+  reachable, the outbox gives up, and the lost rumor still uses up one MLS
+  message key. Alice relaunches online, and Bob must receive and decrypt
+  her zone. Without the fix Bob never gets it, the same symptom as on the
+  device. The Android smoke gets no separate step: there `sonar-cli` is the
+  sender, so the step would re-run this same core code, and the app's
+  header already has QA-072.
 - **Steps (real accounts, the case that found it):** on two of your own
   devices with *Share local time* on, open their 1:1 chat on each. Read the
   sender's `sonar-core.log`, and on the receiver look for `cached private
@@ -654,8 +662,10 @@ share a zone with the app and report the zone the app shared with it.
   with an empty sent-share record and healthy relays, so the first share
   always arrives. The bug needs a record written while its publish was lost:
   an alpha.15 burst into a rate-limiting relay, or the outbox spending all
-  20 publish attempts.
-- **Guard:** `client.rs::timezone_share_the_outbox_gave_up_on_is_shared_again_on_the_heartbeat`,
+  20 publish attempts. The backoff is 2, 2, 4, 8, 16 s and then 30 s, so
+  that takes only about 8 minutes offline with the app in the foreground.
+- **Guard:** `client.rs::timezone_share_lost_while_offline_reaches_the_peer_once_back_online`,
+  `client.rs::timezone_share_the_outbox_gave_up_on_is_shared_again_on_the_heartbeat`,
   `client.rs::timezone_share_abandoned_before_a_restart_is_shared_again`,
   `conversation_index.rs::v6_drops_sent_share_records_written_before_it_once`,
   `outbox.rs::abandoned_control_rows_are_taken_and_chat_rows_are_kept`

@@ -11790,6 +11790,128 @@ mod tests {
         );
     }
 
+    /// End to end through a relay: Alice shares while no relay is reachable
+    /// (a phone left offline in the foreground spends the 20-attempt budget
+    /// in about 8 minutes), so the relay never sees the share, and the lost
+    /// rumor still used up one MLS message key. After a relaunch with the
+    /// relay back, Bob must actually receive and decrypt her zone. Before the
+    /// fix her sent-share record said "delivered" and Bob never got it.
+    #[tokio::test]
+    async fn timezone_share_lost_while_offline_reaches_the_peer_once_back_online() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let relay_url = relay.url().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("alice.sqlite");
+        let key = [0x3eu8; 32];
+        let alice_identity = Identity::generate();
+        let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+            .await
+            .expect("bob connects");
+        bob.publish_key_package().await.expect("bob publishes kp");
+
+        let alice_hex = {
+            let alice =
+                SonarClient::connect(alice_identity.clone(), vec![relay_url.clone()], &db, key)
+                    .await
+                    .expect("alice connects");
+            let group = alice
+                .start_dm(bob.identity().public_key(), "alice & bob")
+                .await
+                .expect("alice starts dm");
+            alice.send_text(&group, "hello").await.expect("alice sends");
+            // Keep Alice up until Bob has the welcome and the hello.
+            for _ in 0..100 {
+                let _ = bob.sync().await;
+                if bob
+                    .groups()
+                    .ok()
+                    .and_then(|groups| groups.first().map(|g| g.mls_group_id.clone()))
+                    .is_some_and(|g| bob.messages(&g).map(|m| m.len()).unwrap_or(0) == 1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            hex::encode(group.as_slice())
+        };
+        let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+        assert_eq!(
+            bob.messages(&bob_group).expect("messages").len(),
+            1,
+            "bob has the hello"
+        );
+        let bob_hex = hex::encode(bob_group.as_slice());
+
+        // Offline: the share is encrypted and recorded as sent, and the
+        // outbox gives up on it without any relay seeing it.
+        {
+            let alice = SonarClient::connect(alice_identity.clone(), vec![], &db, key)
+                .await
+                .expect("alice opens offline");
+            // The hello's ack flush is debounced, so its row can still be on
+            // disk; the share is the row this call adds.
+            let before = alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .message_ids_for_group(&alice_hex);
+            alice
+                .set_timezone_share_groups(vec![alice_hex.clone()])
+                .await;
+            alice
+                .update_local_timezone("Asia/Tokyo")
+                .await
+                .expect("share");
+            let lost: Vec<String> = alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .message_ids_for_group(&alice_hex)
+                .into_iter()
+                .filter(|id| !before.contains(id))
+                .collect();
+            assert_eq!(lost.len(), 1, "the share is queued");
+            abandon_outbox_row(&alice, &lost[0]);
+        }
+
+        // Back online after a relaunch: what a host does on launch.
+        let alice = SonarClient::connect(alice_identity, vec![relay_url], &db, key)
+            .await
+            .expect("alice relaunches online");
+        alice.set_timezone_share_groups(vec![alice_hex]).await;
+        alice
+            .update_local_timezone("Asia/Tokyo")
+            .await
+            .expect("zone");
+
+        let mut zone = None;
+        for _ in 0..100 {
+            let _ = bob.drain_pending_marmot().await;
+            let _ = bob.sync().await;
+            if let Some((_, _, cached)) = bob
+                .peer_timezones(std::slice::from_ref(&bob_hex))
+                .into_iter()
+                .next()
+            {
+                zone = Some(cached.zone);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(
+            zone.as_deref(),
+            Some("Asia/Tokyo"),
+            "bob must receive the zone once alice is back online"
+        );
+        assert_eq!(
+            bob.messages(&bob_group).expect("messages").len(),
+            1,
+            "the share is not a transcript row"
+        );
+    }
+
     #[tokio::test]
     async fn timezone_share_abandoned_before_a_restart_is_shared_again() {
         // The outbox gave up in an earlier process; the record and the dead
