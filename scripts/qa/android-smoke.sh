@@ -6,6 +6,8 @@
 #
 #   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003] [--max-idle-cpu 3]
 #   (set QA_APP_NPUB to run a scenario that needs the app's npub with --only)
+#   QA_SLOW=1 also runs QA-142 (~12 min: airplane mode while a local-time share
+#   exhausts its publish budget, then the peer must still receive it).
 #   QA_ALLOW_WIPE=1 also runs QA-118, which CLEARS the app's data: throwaway
 #   emulators only, never a device or an emulator holding an account you need.
 #   On API 34+ images turn stylus handwriting off first
@@ -844,6 +846,72 @@ qa093() { # turning sharing off withdraws your time; a peer's revoke clears the 
   fi
 }
 
+# QA-142 helpers. Airplane mode must never outlive the step: the rest of the
+# smoke (and the next agent on this emulator) needs the network.
+qa142_online() {
+  adb -s "$QA_SERIAL" shell cmd connectivity airplane-mode disable >/dev/null 2>&1
+}
+qa142_set_zone() {
+  adb -s "$QA_SERIAL" shell service call alarm 3 s16 "$1" >/dev/null 2>&1
+}
+
+qa142() { # a share lost while offline is sent again once back online (#644)
+  # Every other scenario runs on a fresh account against healthy relays, so a
+  # first share always arrives. This one loses one on purpose. The phone is
+  # offline while its zone changes, the outbox spends the share's 20-attempt
+  # publish budget (about 8 min of backoff), and the phone comes back online.
+  # Before #644 its sent-share record said "delivered" and the peer never got
+  # the new zone.
+  [[ "${QA_SLOW:-0}" == 1 ]] ||
+    { record QA-142 SKIP "about 12 min offline: set QA_SLOW=1"; return; }
+  [[ "${QA070_OFF:-}" == 1 && -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] ||
+    { record QA-142 SKIP "needs QA-001 and QA-070's off default"; return; }
+  local zone lost="Pacific/Chatham" log fails=0 t got logpid
+  zone="$(adb -s "$QA_SERIAL" shell getprop persist.sys.timezone | tr -d '\r')"
+  [[ "$zone" == "$lost" ]] && lost="Asia/Kathmandu"
+  settings_share_row || { record QA-142 FAIL "no Share local time row in Settings"; return; }
+  ui tapx "Share local time"; sleep 1
+  if ! "$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$zone" 60 >/dev/null 2>&1; then
+    settings_share_row && ui tapx "Share local time"
+    record QA-142 FAIL "the peer never got $zone after turning sharing on"; return
+  fi
+  go_home >/dev/null   # the app stays in the foreground: backgrounded, it would stop retrying
+
+  log="$QA_HOME/qa142-logcat-$RUN.txt"
+  adb -s "$QA_SERIAL" logcat -c
+  adb -s "$QA_SERIAL" logcat -v brief 'SonarCore:*' '*:S' >"$log" 2>/dev/null &
+  logpid=$!
+  # An interrupted run must not leave the emulator offline or on another zone.
+  trap 'qa142_online; qa142_set_zone "'"$zone"'"; kill '"$logpid"' 2>/dev/null' EXIT INT TERM
+  adb -s "$QA_SERIAL" shell cmd connectivity airplane-mode enable >/dev/null 2>&1
+  sleep 3
+  qa142_set_zone "$lost"      # ACTION_TIMEZONE_CHANGED: a share that cannot leave the phone
+  # Wait for the outbox to give up on it: 20 failed publishes, at most 15 min.
+  for t in $(seq 1 180); do
+    fails="$(grep -c 'send_publish_failed' "$log" 2>/dev/null || true)"
+    [[ "${fails:-0}" -ge 20 ]] && break
+    sleep 5
+  done
+  qa142_online
+  kill "$logpid" 2>/dev/null
+  trap - EXIT INT TERM
+  if [[ "${fails:-0}" -lt 20 ]]; then
+    qa142_set_zone "$zone"
+    settings_share_row && ui tapx "Share local time"
+    record QA-142 FAIL "the outbox never gave up offline (${fails:-0} failed publishes in 15 min): is the app still retrying?"
+    return
+  fi
+
+  got="$("$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$lost" 180 2>/dev/null)"
+  qa142_set_zone "$zone"
+  settings_share_row && ui tapx "Share local time"      # restore QA-070's off default
+  if [[ -n "$got" ]]; then
+    record QA-142 PASS "the $lost share the outbox gave up on reached the peer once online"
+  else
+    record QA-142 FAIL "a share lost offline never reached the peer (sent-share record claims delivery; see $log)"
+  fi
+}
+
 qa050() { # idle CPU on the chat list
   go_home >/dev/null; sleep 10
   local out; out="$("$ROOT/scripts/qa/idle-cpu.sh" android "$QA_SERIAL" 30 --max "$MAX_IDLE" 2>&1)"
@@ -860,7 +928,7 @@ sleep 3
 # opens QA-004's, and QA-040 inspects the chat
 # QA-005 left open. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa142 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

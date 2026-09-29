@@ -19,6 +19,13 @@ becomes a scenario here, so the next pass checks it by default.
    platform can be driven, say why (Cross-Platform Feature Rule).
 5. A bug that has now happened **twice** also gets a `docs/REGRESSIONS.md`
    entry — this registry is the checklist, the ledger is the invariant.
+6. **Do not only test from a clean start.** A fresh account on healthy
+   relays hides every bug that needs earlier state: a publish lost to an
+   offline window or a rate-limiting relay, or a schema stamped by an older
+   build. When a fix is for such a bug, its scenario must *create* that
+   state. Examples: an offline window (QA-142, `QA_SLOW=1`), or an in-place
+   upgrade from the previous release on an emulator that is never
+   `--fresh`-ed. Proving that the happy path works is not enough.
 
 Peers are fresh `sonar-cli` identities from `scripts/qa/peers.sh`; "the app"
 is the build under test on a dedicated QA emulator/simulator.
@@ -641,15 +648,25 @@ share a zone with the app and report the zone the app shared with it.
 
 ### QA-142 — A share lost on the way is sent again
 - **Platforms:** both. The fix is in core, so both apps get it.
-- **How:** automated in core, and CI runs it on every PR (`cargo test
-  --workspace`). `timezone_share_lost_while_offline_reaches_the_peer_once_back_online`
-  drives the whole path through a relay. Alice shares while no relay is
-  reachable, the outbox gives up, and the lost rumor still uses up one MLS
-  message key. Alice relaunches online, and Bob must receive and decrypt
-  her zone. Without the fix Bob never gets it, the same symptom as on the
-  device. The Android smoke gets no separate step: there `sonar-cli` is the
-  sender, so the step would re-run this same core code, and the app's
-  header already has QA-072.
+- **How:** automated twice.
+  - **In core, on every PR** (CI runs `cargo test --workspace`):
+    `timezone_share_lost_while_offline_reaches_the_peer_once_back_online`.
+    Alice shares with no relay reachable, the outbox gives up, and the lost
+    rumor still uses up one MLS message key. Alice relaunches online, and
+    Bob must receive and decrypt her zone.
+  - **On the app:** `QA_SLOW=1 android-smoke.sh` runs QA-142, about 12 min.
+    1. Sharing on, and the peer confirms the current zone.
+    2. Airplane mode, then change the emulator timezone: a share that cannot
+       leave the phone.
+    3. Wait until logcat shows 20 `send_publish_failed`, so the outbox has
+       given up.
+    4. Back online: the peer must receive the new zone within 180 s.
+
+  Without the fix, the app's sent-share record claims delivery and the peer
+  never gets it. `plan.sh` asks for `QA_SLOW=1` whenever a diff touches the
+  outbox, local time, the conversation index or `client.rs`.
+  iOS: same core. The app side is QA-072 (header) plus a manual pass of the
+  steps below.
 - **Steps (real accounts, the case that found it):** on two of your own
   devices with *Share local time* on, open their 1:1 chat on each. Read the
   sender's `sonar-core.log`, and on the receiver look for `cached private
