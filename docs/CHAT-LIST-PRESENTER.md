@@ -103,7 +103,7 @@ already folds into each row. Those are the linked npub's direct groups, the
 set `transcriptGroupIds` resolves when `openDm` read-marks the row. The
 presenter sums the live unread map over them. Resolving the set again per row
 would cost about 2 ms a row in Bech32 decodes (JVM, 278 groups), on the main
-dispatcher. Ledger entry R-052, QA-142.
+dispatcher. Ledger entry R-052, QA-143.
 
 ## Measurements
 
@@ -211,6 +211,34 @@ mostly disappears. On iOS, `buildHomeDMRows` shrinks to mapping rows plus
 presence. The first step is the Marmot-only half (rows, duplicate fold,
 unread, mark-read). It needs no mesh state in core and removes the most
 duplicated code.
+
+## Shipped: the Marmot fold lives in sonar-core
+
+The first step of the path above has landed. `core/sonar-core/src/conversation_list.rs`
+builds one row per conversation and `SonarNode.conversationList(limit, after)`
+exports it. Both apps render the fold from it.
+
+- **Core owns:** duplicate direct groups fold into one row (same rule both
+  apps used: exactly one other member). The row group is the newest in the
+  set, lowest id on a tie. Unread is summed over the set, Note to Self is
+  never unread and sorts first, and rows are ordered newest first and paged
+  by cursor. Each group's shape is read once per MLS epoch, so a warm call
+  does no member reads.
+- **Compose reads it:** `ChatListRepository.publishLocal` reads the rows next
+  to the summaries and exposes `groupIdsByGroup`. `visibleChats`
+  (`dedupeByConversationRows`), `computeMarmotRowModels` and
+  `duplicateDirectMarmotChats` (open, mark-read, mute) take the set from it.
+  The Bech32 peer-key map is now built only on the fallback path.
+- **iOS reads it:** `MarmotChatModel.conversationGroupIdsByGroup` is published
+  from both hydrate paths. `buildHomeDMRows` and `directMarmotGroups(matching:)`
+  take the set from it.
+- **Fallback:** before the store answers once, both apps use their old local
+  fold, so a restored snapshot still paints first. A failed read keeps the
+  last fold, so it never splits a person into two rows.
+- **Still per app:** kind-0 titles, mute storage, verification, pending
+  "setting up" rows, blocked senders, the Bluetooth fold, and the row group
+  choice on a verified tie (iOS prefers a verified group).
+- **Guards:** R-003 and R-052 in `docs/REGRESSIONS.md`, and QA-144.
 
 ## Next steps
 

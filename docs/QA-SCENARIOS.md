@@ -441,7 +441,7 @@ nothing by design.
 - **Expect:** no row whose only effect is a "coming soon" toast.
 - **Origin:** A17 (#616)
 
-### QA-142 — A mesh-folded chat shows the unread dot of its White Noise messages
+### QA-143 — A mesh-folded chat shows the unread dot of its White Noise messages
 - **Platforms:** both (manual: needs a Sonar peer met over Bluetooth, i.e. a
   second emulator or phone with Bluetooth on; iOS already passes)
 - **Steps:** meet a Sonar peer over Bluetooth and exchange a message; take the
@@ -454,6 +454,30 @@ nothing by design.
   `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs` (R-052)
 - **Origin:** chat-list presenter pilot. Compose mesh rows never passed
   `unread` or `verified`, so Android and desktop showed no dot where iOS did.
+
+### QA-144 — Both apps fold a person's duplicate 1:1 groups the same way
+- **Platforms:** both. The fold is computed once in core
+  (`conversation_list`); iOS and Compose render its rows.
+- **How:** automated. Core drives two real 1:1 groups from the same peer
+  through the welcome and receive path and asserts one row, the summed
+  badge, and that marking the row's set clears it. The host tests pin that
+  each app renders core's row group and marks core's whole set read. On
+  devices, every Home row now comes from this path, so the Messaging smoke
+  (QA-001…008) exercises it; `sonar-cli` cannot create a second 1:1 group, so
+  the duplicate case itself is not driven on a device.
+- **Steps (manual, when two devices are available):** start a chat with the
+  same person from both sides at the same time, so two 1:1 groups exist; the
+  peer sends a message in each group.
+- **Expect:** one Home row for that person on both apps, badged; opening it
+  clears the badge for good (it does not come back on the next refresh); the
+  transcript holds both groups' messages (R-003).
+- **Guard:** `client.rs::conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row`,
+  `ChatListAppStateTest.theCoreFoldDecidesWhichGroupRendersAndWhatOpeningMarksRead`,
+  `ChatListAppStateTest.aFailedCoreListReadKeepsTheLastFold`,
+  `SonarCoreConversationFoldTests.coreSetResolvesInRowOrderAndSkipsGroupsThatAreGone`
+- **Origin:** core-owned chat list (follow-up to the #645 presenter pilot).
+  The two apps each folded duplicate groups themselves, with two copies of
+  the rule that had already drifted once (R-052).
 
 ## Note to Self (#339)
 
