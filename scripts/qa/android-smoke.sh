@@ -859,8 +859,9 @@ qa142() { # a share lost while offline is sent again once back online (#644)
   # Every other scenario runs on a fresh account against healthy relays, so a
   # first share always arrives. This one loses a share on purpose:
   #   1. The phone goes offline and its zone changes.
-  #   2. The outbox spends the share's whole 20-attempt publish budget
-  #      (about 8 min of backoff).
+  #   2. The outbox spends the share's whole 20-attempt publish budget. Offline,
+  #      every reconnect attempt re-publishes the row, so this takes about
+  #      2 min on an emulator, not the 8 min the backoff table implies.
   #   3. The phone comes back online.
   # Before #644 its sent-share record said "delivered" and the peer never got
   # the new zone.
@@ -896,7 +897,14 @@ qa142() { # a share lost while offline is sent again once back online (#644)
   # An interrupted run must not leave the emulator offline or on another zone.
   trap 'qa142_online; qa142_set_zone "'"$zone"'"; kill '"$logpid"' 2>/dev/null' EXIT INT TERM
   adb -s "$QA_SERIAL" shell cmd connectivity airplane-mode enable >/dev/null 2>&1
-  sleep 3
+  # Airplane mode takes a few seconds to drop the link. A share created
+  # before that reaches the relay while its ack is lost, the app counts a
+  # failure, and the step proves nothing. Wait until the network is gone.
+  for t in $(seq 1 30); do
+    adb -s "$QA_SERIAL" shell ping -c 1 -W 1 8.8.8.8 >/dev/null 2>&1 || break
+    sleep 1
+  done
+  sleep 2
   qa142_set_zone "$lost"      # ACTION_TIMEZONE_CHANGED: a share that cannot leave the phone
   # Wait until ONE share (one message_id) has failed 20 times, its whole
   # budget. At most 15 min.
@@ -907,6 +915,14 @@ qa142() { # a share lost while offline is sent again once back online (#644)
     sleep 5
   done
   sleep 30   # the next pass after the give-up, while still offline (the fix sweeps here)
+  # The share must really be lost: if the peer already has the zone, it
+  # leaked out before the link dropped and a pass below would mean nothing.
+  if "$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$lost" 1 >/dev/null 2>&1; then
+    qa142_online; kill "$logpid" 2>/dev/null; trap - EXIT INT TERM
+    qa142_set_zone "$zone"; qa142_chat_off "$title"
+    record QA-142 FAIL "harness: the $lost share reached the peer before the network dropped; nothing was lost, so nothing was tested"
+    return
+  fi
   qa142_online
   kill "$logpid" 2>/dev/null
   trap - EXIT INT TERM
@@ -917,7 +933,8 @@ qa142() { # a share lost while offline is sent again once back online (#644)
     return
   fi
 
-  got="$("$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$lost" 180 2>/dev/null)"
+  got=""
+  "$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$lost" 180 >/dev/null 2>&1 && got=1
   qa142_set_zone "$zone"
   qa142_chat_off "$title"
   if [[ -n "$got" ]]; then

@@ -660,11 +660,17 @@ share a zone with the app and report the zone the app shared with it.
        over every chat and no share runs out: the first draft of this step
        passed without ever reaching the fix. The peer confirms the current
        zone.
-    2. Airplane mode, then change the emulator timezone: a share that cannot
+    2. Airplane mode, and wait until the emulator is really offline: the
+       link takes a few seconds to drop. A share created before that
+       reaches the relay while its ack is lost, and the step would prove
+       nothing. Then change the emulator timezone: a share that cannot
        leave the phone.
     3. Wait until one share (one `message_id`) has 20 `send_publish_failed`
-       in logcat, its whole budget.
-    4. Back online: the peer must receive the new zone within 180 s.
+       in logcat, its whole budget. That takes about 2 min, because every
+       reconnect attempt re-publishes the row.
+    4. Check that the peer does NOT have the new zone yet. If it does, the
+       share leaked out and the step fails as a harness error.
+    5. Back online: the peer must receive the new zone within 180 s.
 
   Without the fix, the app's sent-share record claims delivery and the peer
   never gets it. `plan.sh` asks for `QA_SLOW=1` whenever a diff touches the
@@ -683,8 +689,10 @@ share a zone with the app and report the zone the app shared with it.
   with an empty sent-share record and healthy relays, so the first share
   always arrives. The bug needs a record written while its publish was lost:
   an alpha.15 burst into a rate-limiting relay, or the outbox spending all
-  20 publish attempts. The backoff is 2, 2, 4, 8, 16 s and then 30 s, so
-  that takes only about 8 minutes offline with the app in the foreground.
+  20 publish attempts. Offline, that takes about 2 min with the app in the
+  foreground (measured on an emulator), not the 8 min the 2/2/4/8/16/30 s
+  backoff table suggests: every relay reconnect attempt re-publishes the
+  row.
 - **Guard:** `client.rs::timezone_share_lost_while_offline_reaches_the_peer_once_back_online`,
   `client.rs::timezone_share_the_outbox_gave_up_on_is_shared_again_on_the_heartbeat`,
   `client.rs::timezone_share_abandoned_before_a_restart_is_shared_again`,
