@@ -751,3 +751,44 @@ good regression gates — ceiling N, `converged` yes/no, fork-heals yes/no, welc
 bytes. The **wall-clock** build/fan-out timings are machine-bound and are
 **report-only** (do not fail CI on them). Full method, findings, reproduce steps,
 and an agent prompt: [`GROUP-SCALE-SIM.md`](GROUP-SCALE-SIM.md).
+
+## Device log summary (relay-facing start cost)
+
+The cold-start harness above measures phases on a bench identity. The other
+half of a slow start is what the app does to the relays and to its own engine
+queue on a **real account**: how many events it publishes, whether relays
+rate-limit it, how long a first ack takes, how much MDK re-processing a
+catch-up pass costs, and whether the conversation index opened at all. Those
+are lines the app already writes to its on-device log files, and
+`scripts/bench/device-log-summary.sh` reads them out of the app container over
+`devicectl` (no root; works on a TestFlight build; removes nothing):
+
+```sh
+STAMP=$(date -u +%Y-%m-%dT%H:%M:%S)      # then launch / foreground / restart the app
+scripts/bench/device-log-summary.sh --device <udid> --since "$STAMP"
+```
+
+It reports, for the window: connects and index health; local-time share
+passes (`allowlisted`, `selected`, `due`, `now`, `queued`) and heartbeat
+trickles; publish starts per minute and unique rows (starts ≫ unique means a
+retry path is re-publishing); relay `rate limited` notices and rejected
+subscriptions; first-ack latency p50/p90; MDK `Failed` re-processing per pass
+and how many events the pass budget retired. The last line is a one-line
+`summary:` for before/after tables.
+
+Baseline this instrument was built against — alpha.15 (1.15.0/45), an iPhone
+with 395 groups and Share local time on, 2026-09-28/29:
+
+| metric | quiet account | alpha.15 first launch | after the fixes, first launch | after the fixes, restart |
+|---|---|---|---|---|
+| index open | ok | **failed** (foreign v4 stamp) | ok | ok |
+| publish starts / unique rows | — | 738 / 256 | 768 / 256 (one-time reshare, still 3× before the dedupe) | 0 / 0 |
+| relay `rate limited` notices | 0 | 537 | 778 | 5 |
+| first-ack p50 | 81 ms | — | 1,479 ms | — |
+| MDK `Failed` per catch-up pass | — | 512 | 565–626 | 527 → retired after 3 passes |
+| serial engine queue held by the share fan-out | — | ~3.4 s | 3.4 s | 0 |
+
+Run it after any change to the outbox, the local-time share, sync
+classification or connect-time retries, on the same account and the same
+launch sequence (cold launch, foreground reopen, restart), and quote the
+`summary:` lines side by side.
