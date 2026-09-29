@@ -24,7 +24,7 @@ run_apple() {
     fi
     destination="platform=iOS Simulator,id=$simulator_id"
   fi
-  xcodebuild \
+  xcodebuild -skipPackagePluginValidation \
     -quiet \
     -project "$ROOT/ios/bitchat.xcodeproj" \
     -scheme 'bitchat (iOS)' \
