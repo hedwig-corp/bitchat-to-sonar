@@ -179,6 +179,37 @@ impl RelayRoutesConfig {
         self.lookup_relays.is_empty() && self.indexers.is_empty()
     }
 
+    /// `SONAR_LOOKUP_RELAYS` in the process environment, or `default` when
+    /// unset. Read by the app host (the simulator and the desktop app see
+    /// the launching shell's environment) and by sonar-cli, so a QA harness
+    /// or a benchmark can keep a throwaway identity off the public
+    /// directory. See [`Self::parse_override`] for the values.
+    pub fn from_env(default: Self) -> Self {
+        match std::env::var("SONAR_LOOKUP_RELAYS") {
+            Ok(value) => Self::parse_override(&value),
+            Err(_) => default,
+        }
+    }
+
+    /// Empty or `none`: no lookups and no copies. `public`: the public
+    /// indexer set. Anything else: a comma-separated list of relays used as
+    /// a local directory that takes every record kind.
+    pub fn parse_override(value: &str) -> Self {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            Self::disabled()
+        } else if value.eq_ignore_ascii_case("public") {
+            Self::public()
+        } else {
+            Self::local(
+                value
+                    .split(',')
+                    .filter_map(|s| RelayUrl::parse(s.trim()).ok())
+                    .collect(),
+            )
+        }
+    }
+
     /// Indexers that accept `kind`.
     pub fn indexers_for(&self, kind: Kind) -> Vec<RelayUrl> {
         self.indexers
@@ -247,13 +278,13 @@ fn bounded(urls: Vec<RelayUrl>, cap: usize) -> Vec<RelayUrl> {
 }
 
 /// How many of the relays asked must answer before "nobody has it" is
-/// believed: all but a third, and never fewer than one. Indexers are
-/// redundant copies by design (they crawl the network and each other), so
-/// one dead indexer must not block every account's lists forever —
-/// relay.nostr.band went dark without notice — while one or two answering
-/// relays out of five are not enough to call a real list absent.
+/// believed: a majority, and never fewer than one. Indexers are redundant
+/// copies by design (they crawl the network and each other), so two dead
+/// indexers out of five must not block every account's lists and profile
+/// forever — relay.nostr.band went dark without notice — while one or two
+/// answers out of five are not enough to call a real list absent.
 pub fn absence_quorum(asked: usize) -> usize {
-    (asked - asked / 3).max(1)
+    (asked / 2 + 1).max(1)
 }
 
 /// NIP-01 replaceable-event order: the newer `created_at` wins, and on a tie
@@ -410,23 +441,47 @@ pub struct RouteFetch {
     pub attempted: usize,
 }
 
-/// Result of [`RelayRouter::lookup`]. `answered == 0`: nothing can be
-/// concluded. Below [`absence_quorum`]: what was found is real, but absence
-/// is not established. At or above it: absence is established too.
+/// Result of [`RelayRouter::lookup`]. Nobody answered: nothing can be
+/// concluded. Somebody answered: what was found is real. Absence is a
+/// separate, stricter conclusion — see [`Self::absence_confirmed`].
 #[derive(Debug, Default)]
 pub struct AccountLookup {
     pub events: Vec<Event>,
-    pub answered: usize,
-    pub asked: usize,
+    /// Our own relays (Marmot pool) that answered, of those asked.
+    pub own_answered: usize,
+    pub own_asked: usize,
+    /// Lookup relays (route pool) that answered, of those asked.
+    pub lookup_answered: usize,
+    pub lookup_asked: usize,
 }
 
 impl AccountLookup {
+    /// Some relay, ours or a lookup one, answered: found events are real
+    /// evidence, whatever the quorum says.
     pub fn reached_any(&self) -> bool {
-        self.answered > 0
+        self.own_answered + self.lookup_answered > 0
     }
 
+    /// "Nothing exists" is established. With a lookup set configured, a
+    /// quorum of it must have answered — our own relays answering "nothing"
+    /// proves nothing for an account that lives on the indexers. With none
+    /// configured, one own relay answering is the best evidence there is
+    /// (the profile merge's cache floor still applies).
     pub fn absence_confirmed(&self) -> bool {
-        self.answered > 0 && self.answered >= absence_quorum(self.asked)
+        if self.lookup_asked > 0 {
+            self.lookup_answered >= absence_quorum(self.lookup_asked)
+        } else {
+            self.own_answered > 0
+        }
+    }
+
+    /// The (answered, asked) pair the absence rule looks at, for reports.
+    pub fn quorum_counts(&self) -> (usize, usize) {
+        if self.lookup_asked > 0 {
+            (self.lookup_answered, self.lookup_asked)
+        } else {
+            (self.own_answered, self.own_asked)
+        }
     }
 }
 
@@ -435,12 +490,6 @@ impl AccountLookup {
 pub struct RoutePublish {
     pub accepted: Vec<RelayUrl>,
     pub failed: Vec<(RelayUrl, String)>,
-}
-
-impl RoutePublish {
-    pub fn any_accepted(&self) -> bool {
-        !self.accepted.is_empty()
-    }
 }
 
 pub(crate) fn relay_records_path_for_db(db_path: &Path) -> PathBuf {
@@ -788,27 +837,21 @@ impl RelayRouter {
 
     /// Our own records, looked up on our relays (through the Marmot pool)
     /// and the lookup set (through the route pool), merged, with the answer
-    /// count that decides what the result may prove. With a lookup set
-    /// configured only its answers count: an imported account's records
-    /// usually live on the indexers alone, so our relays answering "nothing"
-    /// proves nothing.
+    /// counts that decide what the result may prove.
     pub async fn lookup(&self, main: &Client, filter: Filter) -> AccountLookup {
         let (own, lookup) = tokio::join!(
             fetch_per_relay(main, &self.own_relays, filter.clone(), ROUTE_FETCH_TIMEOUT),
             self.fetch_from(&self.config.lookup_relays, filter),
         );
-        let (answered, asked) = if self.config.lookup_relays.is_empty() {
-            (own.completed, own.attempted)
-        } else {
-            (lookup.completed, lookup.attempted)
-        };
         let mut seen: HashSet<EventId> = own.events.iter().map(|e| e.id).collect();
         let mut events = own.events;
         events.extend(lookup.events.into_iter().filter(|e| seen.insert(e.id)));
         AccountLookup {
             events,
-            answered,
-            asked,
+            own_answered: own.completed,
+            own_asked: own.attempted,
+            lookup_answered: lookup.completed,
+            lookup_asked: lookup.attempted,
         }
     }
 
@@ -835,16 +878,41 @@ impl RelayRouter {
             report.lookup_failed = true;
             return report;
         }
+        // Hold the indexer sockets for the whole pass: the lookup and every
+        // record kind reuse them instead of paying a TLS handshake per kind.
+        let held = self
+            .acquire(
+                &self.foreign(
+                    self.config
+                        .lookup_relays
+                        .iter()
+                        .chain(self.config.indexers.iter().map(|i| &i.url))
+                        .cloned(),
+                ),
+            )
+            .await;
+        let report = self.distribute_pass(identity, main, now, report).await;
+        self.release(&held).await;
+        report
+    }
+
+    async fn distribute_pass(
+        &self,
+        identity: &Identity,
+        main: &Client,
+        now: u64,
+        mut report: DistributionReport,
+    ) -> DistributionReport {
         let me = identity.public_key();
         let found = self
             .lookup(main, Filter::new().author(me).kinds(RECORD_KINDS))
             .await;
-        let (answered, asked) = (found.answered, found.asked);
+        let (answered, asked) = found.quorum_counts();
         // "Nobody answered" is unknown, not absent.
         if !found.reached_any() {
             tracing::warn!(
-                asked,
-                lookup_relays = self.config.lookup_relays.len(),
+                own_asked = found.own_asked,
+                lookup_asked = found.lookup_asked,
                 "relay records: lookup reached no relay; publishing nothing"
             );
             report.lookup_failed = true;
@@ -872,7 +940,15 @@ impl RelayRouter {
         let mut states: BTreeMap<u16, RecordState> = BTreeMap::new();
         for kind in RECORD_KINDS {
             let existing = newest.remove(&kind);
-            let outcome = if kind == Kind::Metadata {
+            let outcome = if existing.is_none() && !absence_confirmed {
+                tracing::info!(
+                    kind = kind.as_u16(),
+                    answered,
+                    asked,
+                    "relay record not found, but too few lookup relays answered; deferred"
+                );
+                RecordOutcome::Deferred { answered, asked }
+            } else if kind == Kind::Metadata {
                 // Not ours to invent: the profile publish path creates it.
                 // Whatever exists is spread so lookups find it everywhere.
                 match existing {
@@ -895,14 +971,6 @@ impl RelayRouter {
                     }
                     None => RecordOutcome::Absent,
                 }
-            } else if existing.is_none() && !absence_confirmed {
-                tracing::info!(
-                    kind = kind.as_u16(),
-                    answered,
-                    asked,
-                    "relay record not found, but too few lookup relays answered; deferred"
-                );
-                RecordOutcome::Deferred { answered, asked }
             } else {
                 let action = match plan_record(existing, &self.own_relays, || {
                     default_record(identity, kind, &self.own_relays)
@@ -977,9 +1045,10 @@ impl RelayRouter {
             };
             report.actions.insert(kind.as_u16(), outcome);
         }
-        // A lookup short of the quorum acts on what it found but stamps
-        // nothing: a silent relay may hold a newer list, so the next connect
-        // must look again rather than wait out the interval.
+        // A lookup short of the quorum acts on what it found — an adopted
+        // list's relays stay usable for the KeyPackage copy — but claims no
+        // freshness: a silent relay may hold a newer list, so the next
+        // connect must look again rather than wait out the interval.
         if !absence_confirmed && !states.is_empty() {
             tracing::info!(
                 answered,
@@ -987,7 +1056,9 @@ impl RelayRouter {
                 kinds = states.len(),
                 "relay records acted on but not stamped: partial lookup"
             );
-            states.clear();
+            for state in states.values_mut() {
+                state.distributed_at = 0;
+            }
         }
         {
             let mut records = self.records.lock().unwrap();
@@ -1072,6 +1143,13 @@ impl SpreadOutcome {
 /// `Ok(empty)` both at EOSE and when its own timeout fires (or when the relay
 /// is not connected), so the inner call gets the full bound and the outer
 /// wait a shorter one, and only an answer inside the shorter one is an answer.
+///
+/// Fetches still running at the deadline are detached, never aborted: an
+/// aborted `fetch_events_from` skips its CLOSE, and a slow relay would
+/// accumulate dangling REQs on the connection until relays that cap
+/// subscriptions per connection start refusing new ones — on the Marmot
+/// pool that would hit the sync path. Detached, each finishes on its own
+/// bound and closes its subscription; a late answer is simply not counted.
 pub(crate) async fn fetch_per_relay(
     client: &Client,
     urls: &[RelayUrl],
@@ -1121,7 +1199,7 @@ pub(crate) async fn fetch_per_relay(
             Err(_) => break,
         }
     }
-    tasks.abort_all();
+    tasks.detach_all();
     out
 }
 
@@ -1361,26 +1439,59 @@ mod tests {
         wipe_relay_routes_for_db(&db).unwrap();
     }
 
-    /// One dead indexer out of five must not block absence forever; one or
+    /// Two dead indexers out of five must not block absence forever; one or
     /// two answers out of five must not establish it.
     #[test]
-    fn absence_needs_all_but_a_third_of_the_relays_asked() {
+    fn absence_needs_a_majority_of_the_relays_asked() {
         assert_eq!(absence_quorum(0), 1);
         assert_eq!(absence_quorum(1), 1);
         assert_eq!(absence_quorum(2), 2);
         assert_eq!(absence_quorum(3), 2);
-        assert_eq!(absence_quorum(5), 4);
+        assert_eq!(absence_quorum(5), 3);
         assert_eq!(absence_quorum(6), 4);
-        let at = |answered, asked| AccountLookup {
+    }
+
+    /// Existence needs one answer from anywhere; absence needs the lookup
+    /// quorum when a lookup set is configured, and any own relay otherwise.
+    #[test]
+    fn a_lookup_counts_own_relays_as_reached_but_not_as_absence_evidence() {
+        let at = |own: usize, own_asked: usize, lookup: usize, lookup_asked: usize| AccountLookup {
             events: Vec::new(),
-            answered,
-            asked,
+            own_answered: own,
+            own_asked,
+            lookup_answered: lookup,
+            lookup_asked,
         };
-        assert!(!at(0, 5).absence_confirmed());
-        assert!(!at(3, 5).absence_confirmed());
-        assert!(at(4, 5).absence_confirmed());
-        assert!(!at(1, 2).absence_confirmed());
-        assert!(at(0, 5).answered == 0 && !at(0, 5).reached_any());
+        // Indexers silent, own relays answered: reached, absence unknown.
+        let indexers_down = at(3, 5, 0, 5);
+        assert!(indexers_down.reached_any());
+        assert!(!indexers_down.absence_confirmed());
+        assert_eq!(indexers_down.quorum_counts(), (0, 5));
+        // Nobody at all.
+        assert!(!at(0, 5, 0, 5).reached_any());
+        // Below and at the lookup quorum.
+        assert!(!at(5, 5, 2, 5).absence_confirmed());
+        assert!(at(0, 5, 3, 5).absence_confirmed());
+        assert!(at(0, 5, 3, 5).reached_any());
+        // No lookup set: one own relay decides.
+        assert!(at(1, 5, 0, 0).absence_confirmed());
+        assert!(!at(0, 5, 0, 0).absence_confirmed());
+    }
+
+    #[test]
+    fn env_override_values() {
+        assert!(RelayRoutesConfig::parse_override("").is_disabled());
+        assert!(RelayRoutesConfig::parse_override(" none ").is_disabled());
+        assert_eq!(
+            RelayRoutesConfig::parse_override("Public"),
+            RelayRoutesConfig::public()
+        );
+        let local = RelayRoutesConfig::parse_override("ws://127.0.0.1:7777, wss://dir.example");
+        assert_eq!(
+            local.lookup_relays,
+            vec![url("ws://127.0.0.1:7777"), url("wss://dir.example")]
+        );
+        assert_eq!(local.indexers_for(Kind::InboxRelays).len(), 2);
     }
 
     /// A copy counts as distributed only when it reached one of our relays

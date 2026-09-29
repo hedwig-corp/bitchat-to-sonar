@@ -49,24 +49,30 @@ default published over an imported account's real list replaces it
 network-wide:
 
 - **Existence** is evidence from a single relay.
-- **Absence** needs a quorum of the lookup relays asked: all but a third
-  (`absence_quorum`: 4 of 5, 2 of 2). One dead indexer must not block every
-  account forever — relay.nostr.band went dark without notice — while one
-  answer is never enough. With a lookup set configured, our own relays
+- **Absence** needs a majority of the lookup relays asked (`absence_quorum`:
+  3 of 5, 2 of 2). Two dead indexers must not block every account forever —
+  relay.nostr.band went dark without notice — while one or two answers out of
+  five are never enough. With a lookup set configured, our own relays
   answering "nothing" proves nothing: an imported account usually lives on the
-  indexers only.
+  indexers only. With no lookup set, one own relay answering decides.
 - **The newest event** is chosen by NIP-01 order: newest `created_at`, lowest
   id on a tie — the one relays keep.
 - **Stamping.** A pass counts as done (and suppresses the next 24 h) only if
   it reached the quorum, and each record landed on one of our relays and, when
   any indexer takes its kind, on one indexer. Otherwise the next connect runs
-  it again.
+  it again. A pass short of the quorum still acts on what it found — an
+  adopted list's relays are kept for the KeyPackage copy — it just claims no
+  freshness.
 
 The profile publish (`publish_profile`, and the connect-time republish) uses
-the same lookup: it merges over the newest kind-0 found anywhere, and refuses
-to publish when none was found without a quorum — so a restore on a flaky
-network cannot replace a profile set in another client. A brand-new account
-whose first publish is refused this way gets it out on the next connect.
+the same lookup: a profile found on any relay — ours included — is merged
+over, whatever the indexers did; it refuses to publish only when none was
+found and the quorum was not reached — so a restore on a flaky network cannot
+replace a profile set in another client. A brand-new account whose first
+publish is refused this way gets it out on the next connect. The indexer copy
+of a published profile is spawned, not awaited, so a rename never waits on
+indexer handshakes; the next distribution pass re-copies anything that did
+not land.
 
 Defaults: `10002` = our relays, unmarked; `10050` = the Sonar relay plus two
 others (NIP-17 keeps it small); `10051` = the write set, for clients that
@@ -89,15 +95,17 @@ speak; `relay.nostr.band` is dead.
 
 ### Who reaches the public indexers
 
-Only the app host. `SonarClient::connect` and `connect_in_memory` use
-`RelayRoutesConfig::disabled()` — tests and tools never touch a relay they
-were not given. `sonar-ffi` calls `connect_with_routes(…, public())`.
-`sonar-cli` reads `SONAR_LOOKUP_RELAYS` (unset = public, empty or `none` =
-disabled, a comma list = those relays as a local directory), and
-`scripts/qa/peers.sh` defaults it to `none` so throwaway QA identities stay
-off the public directory. And the public set is dropped entirely when any of
-our own relays is a loopback/private address (a dev build pointed at a local
-relay).
+Only the app host, by default. `SonarClient::connect` and `connect_in_memory`
+use `RelayRoutesConfig::disabled()` — tests and tools never touch a relay they
+were not given. `sonar-ffi` passes `public()`, and `sonar-cli` is opt-in
+(unset = disabled). Both read `SONAR_LOOKUP_RELAYS` from the process
+environment: `none` or empty = off, `public` = the public set, a comma list =
+those relays as a local directory. The iOS QA driver launches the app with
+`none`, `scripts/qa/peers.sh` exports `none` for its peers, and the public set
+is dropped entirely when any of our own relays is a loopback/private address
+(a dev build pointed at a local relay). Known gap: Android emulator QA runs
+get no environment, so a fresh app build under `android-smoke.sh` publishes
+its throwaway identity's lists (tracked in #627).
 
 ### State on disk
 

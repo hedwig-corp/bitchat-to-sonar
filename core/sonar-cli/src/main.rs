@@ -1781,24 +1781,14 @@ fn random_hex_32() -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
-/// Where this CLI looks relay lists up and copies its own. Unset: the public
-/// indexers, like the apps. `SONAR_LOOKUP_RELAYS=` (empty) or `none`: no
-/// lookups and no copies — QA harnesses spinning up throwaway identities
-/// must not litter public indexers. A comma-separated list: those relays,
-/// each accepting every record kind (a local directory relay).
+/// Where this CLI looks relay lists up and copies its own. Opt-in: unset
+/// means no lookups and no copies, because most CLI identities are
+/// throwaway peers that must not litter the public directory.
+/// `SONAR_LOOKUP_RELAYS=public` behaves like the apps; a comma-separated
+/// list is a local directory relay set (every record kind); empty or `none`
+/// is explicit off.
 fn lookup_relays_from_env() -> RelayRoutesConfig {
-    match env::var("SONAR_LOOKUP_RELAYS") {
-        Err(_) => RelayRoutesConfig::public(),
-        Ok(value) if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("none") => {
-            RelayRoutesConfig::disabled()
-        }
-        Ok(value) => RelayRoutesConfig::local(
-            value
-                .split(',')
-                .filter_map(|s| RelayUrl::parse(s.trim()).ok())
-                .collect(),
-        ),
-    }
+    RelayRoutesConfig::from_env(RelayRoutesConfig::disabled())
 }
 
 fn validate_relay_strings(relays: Vec<String>) -> Result<Vec<String>> {

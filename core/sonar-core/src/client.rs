@@ -3196,9 +3196,10 @@ impl SonarClient {
     /// imported identity's profile usually lives on relays we are not on,
     /// and merging over the wrong (older or missing) copy is the wipe hole
     /// `resolve_profile_publish` guards against. Same evidence rule as the
-    /// relay lists: nothing answered is an error, and "no profile" is only
-    /// believed when a quorum of the lookup relays said so — our own relays
-    /// answering "none" proves nothing for an account that lives elsewhere.
+    /// relay lists: nothing answered (ours or theirs) is an error; a profile
+    /// found anywhere is used; and "no profile" is only believed when a
+    /// quorum of the lookup relays said so — our own relays answering
+    /// "none" proves nothing for an account that lives elsewhere.
     async fn fetch_own_metadata(
         nostr: &Client,
         routes: &RelayRouter,
@@ -3210,8 +3211,11 @@ impl SonarClient {
         if !found.reached_any() {
             return Err(Error::NoRelayConnected);
         }
-        let (answered, asked) = (found.answered, found.asked);
         let absence_confirmed = found.absence_confirmed();
+        let (answered, asked) = found.quorum_counts();
+        // A profile found on any relay — ours included — is the profile,
+        // whatever the indexers did; the quorum only decides whether "none
+        // found" may be believed.
         let newest = newest_metadata(found.events, &me);
         if newest.is_none() && !absence_confirmed {
             return Err(Error::RelayFetch(format!(
@@ -3223,10 +3227,13 @@ impl SonarClient {
 
     /// Publish a kind-0 to our relays and copy it to every indexer that
     /// accepts profiles, so an outbox-model client finds it without sharing
-    /// a relay with us. The indexer copy is best-effort.
+    /// a relay with us. The indexer copy is best-effort and spawned: the
+    /// foreground publish runs on the hosts' serial engine lane (iOS
+    /// `workQueue`), which must not wait on indexer handshakes, and the next
+    /// distribution pass re-copies whatever did not land.
     async fn publish_metadata_everywhere(
         nostr: &Client,
-        routes: &RelayRouter,
+        routes: &Arc<RelayRouter>,
         identity: &Identity,
         metadata: &Metadata,
     ) -> Result<()> {
@@ -3236,12 +3243,15 @@ impl SonarClient {
         nostr.send_event(&event).await?;
         let indexers = routes.foreign(routes.config().indexers_for(Kind::Metadata));
         if !indexers.is_empty() {
-            let out = routes.publish_to(&indexers, &event).await;
-            tracing::info!(
-                accepted = out.accepted.len(),
-                failed = out.failed.len(),
-                "profile copied to indexers"
-            );
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let out = routes.publish_to(&indexers, &event).await;
+                tracing::info!(
+                    accepted = out.accepted.len(),
+                    failed = out.failed.len(),
+                    "profile copied to indexers"
+                );
+            });
         }
         Ok(())
     }

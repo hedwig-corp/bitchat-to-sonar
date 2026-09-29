@@ -1086,17 +1086,19 @@ Being found without sharing a relay. Design and the decision table:
   `index.hzrd149.com`) but not the five Marmot relays. Connect. Then unblock
   all but two and reconnect. Then unblock all.
 - **Expect:** all blocked: the KeyPackage is published, no 10002/10050/10051
-  appears anywhere, the core logs `relay records: lookup reached no relay;
-  publishing nothing`. Two blocked (3 of 5 answer, quorum is 4): still no
-  default (`relay record not found, but too few lookup relays answered;
-  deferred`), and a rename is refused rather than published over a profile
-  the lookup could not read. All unblocked: the lists and the profile appear.
-  With exactly one indexer blocked, everything is published (one dead
-  indexer must not block the account).
+  appears anywhere, every list kind is logged as `relay record not found, but
+  too few lookup relays answered; deferred`. Three blocked (2 of 5 answer,
+  quorum is 3): still no default, and a *first* profile publish is refused
+  rather than published over a profile the lookup could not read — but a
+  rename of an account whose profile is already on the Marmot relays still
+  publishes (a found profile is the profile). Two blocked (3 of 5 answer):
+  everything is published; two dead indexers must not block the account.
 - **Guard:** `e2e::relay_routes::nothing_is_published_when_no_lookup_relay_answers`,
   `e2e::relay_routes::defaults_wait_for_a_lookup_quorum_but_a_found_list_does_not`,
   `e2e::relay_routes::a_profile_is_not_published_over_one_the_lookup_could_not_read`,
-  `relay_routes::tests::absence_needs_all_but_a_third_of_the_relays_asked`
+  `e2e::relay_routes::a_rename_publishes_when_own_relays_hold_the_profile_and_indexers_are_silent`,
+  `relay_routes::tests::absence_needs_a_majority_of_the_relays_asked`,
+  `relay_routes::tests::a_lookup_counts_own_relays_as_reached_but_not_as_absence_evidence`
 - **Origin:** #626 and the #628 review: "nobody answered" and "one relay had
   nothing" must never read as "nobody has one".
 
@@ -1111,6 +1113,7 @@ Being found without sharing a relay. Design and the decision table:
   that reached only our relays does not make the account findable).
 - **Guard:** `e2e::relay_routes::records_are_not_republished_within_the_interval_and_rebroadcast_unchanged_after`,
   `e2e::relay_routes::a_pass_that_reached_no_indexer_is_retried_on_the_next_connect`,
+  `e2e::relay_routes::a_kind_the_indexer_refuses_is_retried_not_stamped`,
   `relay_routes::tests::a_record_is_stamped_only_when_an_indexer_took_it`
 - **Origin:** #626; same churn class as the kind-0 republish fixed in #584.
 
