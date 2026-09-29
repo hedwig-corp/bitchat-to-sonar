@@ -81,6 +81,43 @@ How to run the analysis:
 
 Constraints and gotchas (all detailed in `docs/PERFORMANCE.md`): the build must be **Debug** (markers are private in Release) and **arm64-only** (Arti/sonarffi sim slices are arm64). CLI sim builds are unsigned and cannot get a Keychain entitlement for the `sh.hedwig.sonar` bundle id, so the benchmark path is **Keychain-independent** — adopt the `SONAR_BENCH_NSEC` identity and derive the DB key from it. All such hooks are `#if DEBUG` and gated on `SONAR_BENCH_NSEC`; never add a benchmark hook that changes behavior in Release. When reporting, quote `launch→t4`/`t0→t4` (cold → synced), `t2→t4` (relay path), `t3→t3a_publish_done` (publish latency — since #265 it runs CONCURRENTLY with the drain, and `t3→t3a` is only the dispatch), and `t3b→t4` (drain) against the baseline, and treat any regression that moves sync onto the critical path as a violation of the Signal-Comparable Performance Rule.
 
+## No Performance Regression Rule
+
+A change must never make Sonar slower than `main` on a path the user feels:
+launch, chat-list paint, chat open, send, scroll, foreground/background, or
+relay sync. alpha.15 (1.15.0/45) shipped exactly this class of bug. A new
+feature, Share local time, re-encrypted one fact into 256 groups on every store
+open, three retry triggers tripled it, and a failed index migration silently
+removed the record that should have stopped it. The result was 738 publishes
+per launch, the relays rate-limiting the account, and first-ack latency going
+from 81 ms to 1.5 s (PR #629, ledger R-051). Every change must:
+
+1. **Bound its fan-out.** Work emitted per group, contact, message or relay
+   needs an explicit cap, pacing (a small batch now, the rest on the idle
+   heartbeat, never one burst), and a durable "already done" record. A loop over
+   every group is a design smell: rank by recency and cap it.
+2. **Degrade by doing less, never more.** When a subsystem fails (index open,
+   migration, cache), the fallback must not be a correct-but-expensive path
+   such as re-broadcasting or a full scan. Skip the work and surface the
+   failure instead.
+3. **Dedupe shared work where it lives.** When several triggers (connect,
+   sync, heartbeat, foreground, push) can start the same work, dedupe in the
+   shared code with in-flight sets or single-flight, not at each call site.
+4. **Coalesce writes and wakes.** Rewriting a whole sidecar per row, or
+   notifying the hosts per row, turns a burst into O(n²) disk and O(n) UI
+   rebuilds. Batch them.
+5. **Measure before and after.** A change to startup, send/outbox, sync, the
+   conversation index, or anything that fans out quotes numbers in the PR:
+   `scripts/bench/device-log-summary.sh` on a real account and a physical
+   device, and/or the cold-start harness above. A regression against the
+   baselines in `docs/PERFORMANCE.md` blocks merge until it is fixed.
+
+**Always leave it faster.** Performance is a feature, not a cleanup task. A PR
+that touches a hot path should carry at least one measurable improvement, or
+say why none applies. When you measure a cost you are not fixing, open an issue
+with the number. Between two correct designs, prefer the one that does less
+work: lazy, bounded, cached, coalesced.
+
 ## Local Secrets Rule
 
 Do not commit payment, wallet, relay, signing, or API secrets. The Breez wallet key must stay in gitignored local configuration (`ios/Configs/Local.xcconfig` with `BREEZ_API_KEY = ...`) or an equivalent CI secret. When creating a new workspace/worktree or rebuilding for device testing, preserve the local secret by recreating/copying the gitignored config or passing the key through the build environment; verify presence without printing the value.

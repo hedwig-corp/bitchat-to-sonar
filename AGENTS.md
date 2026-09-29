@@ -10,6 +10,12 @@ When adding or changing a feature, cover the native Apple app (`ios/`) and the C
 
 Conversation and transcript changes must preserve Signal-comparable local-first performance. Opening an existing chat must paint from local storage first and must not wait on relay/server sync, full-history scans, or unrelated groups before first paint. If a change can make chat opening, sending, or scrolling meaningfully slower than Signal-style local database windowing, design a bounded local page/window path, move sync to the background, and document any platform gap with a follow-up path.
 
+## No Performance Regression Rule
+
+Never make Sonar slower than `main` on launch, chat-list paint, chat open, send, scroll, foreground/background, or relay sync. alpha.15 did: a feature re-encrypted one fact into 256 groups on every store open, three retry triggers tripled it, and a failed migration silently removed the record that should have stopped it. The result was 738 publishes per launch and a rate-limited account (PR #629). Bound every fan-out (cap it, pace it, keep a durable "already done" record), degrade by doing less rather than more when a subsystem fails, dedupe work that several triggers can start in the shared code, and coalesce per-row writes and host wakes. Measure before and after with `scripts/bench/device-log-summary.sh` or the cold-start harness (`docs/PERFORMANCE.md`), and quote the numbers in the PR. A regression blocks merge.
+
+Always push for performance: a PR that touches a hot path should leave at least one measurable improvement or say why none applies, and a cost you measure but do not fix gets an issue with the number. CLAUDE.md has the full rule.
+
 ## Signal-Style Conversation Design Notes
 
 Signal treats the local database as the chat state. Network receive/send/sync paths write into local storage first, then the chat list and transcript UI react to local database invalidation. Android pages local conversation rows from `ThreadTable` through `ConversationListDataSource` with a small paging window; iOS builds chat-list render state from local thread IDs through `CLVLoader` and caches row view models/content. Sonar conversation work should follow that model: maintain core-owned local conversation summaries ordered by latest message, hydrate visible chat rows from bounded local pages, open transcripts from bounded local message windows, and run relay sync only as a background database updater.
