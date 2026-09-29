@@ -1604,6 +1604,51 @@ struct MarmotProcessReport {
     oldest_retryable_secs: Option<u64>,
 }
 
+/// Holds one message id in `SonarClient::outbox_inflight_ids` for the life of
+/// its publish task. Whichever branch ends the task, the drop releases it.
+struct OutboxInflightGuard {
+    ids: Arc<Mutex<HashSet<String>>>,
+    id: String,
+    held: bool,
+}
+
+impl OutboxInflightGuard {
+    fn acquire(ids: &Arc<Mutex<HashSet<String>>>, id: &str) -> Option<Self> {
+        if ids.lock().unwrap().insert(id.to_owned()) {
+            Some(Self {
+                ids: ids.clone(),
+                id: id.to_owned(),
+                held: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Let another publish of this id start while this task sleeps its
+    /// backoff.
+    fn release(&mut self) {
+        if self.held {
+            self.ids.lock().unwrap().remove(&self.id);
+            self.held = false;
+        }
+    }
+
+    /// False when another task took the id over during the backoff.
+    fn reacquire(&mut self) -> bool {
+        if !self.held {
+            self.held = self.ids.lock().unwrap().insert(self.id.clone());
+        }
+        self.held
+    }
+}
+
+impl Drop for OutboxInflightGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl MarmotProcessReport {
     fn record_processed(&mut self) {
         self.processed += 1;
@@ -1861,6 +1906,12 @@ pub struct SonarClient {
     /// Count of outbox publish tasks in flight. Historical catch-up yields while
     /// this is non-zero so user sends keep relay/runtime priority (P0).
     send_inflight: Arc<AtomicUsize>,
+    /// Message ids with a publish task in flight, so the outbox retries that
+    /// connect fires within milliseconds of each other (`subscribe_marmot`,
+    /// `sync`, `ensure_subscriptions`) cannot each publish the same pending
+    /// row. Released across a task's retry backoff, like `send_inflight`, so a
+    /// reconnect retry can still take over a stranded send.
+    outbox_inflight_ids: Arc<Mutex<HashSet<String>>>,
     /// Excludes sends from OUR in-flight membership changes. A membership flow
     /// (add/remove/leave/auto-commit) holds write from commit creation through
     /// publish+merge; send paths hold read around encrypt+local-write, so a
@@ -2180,6 +2231,7 @@ impl SonarClient {
         let pending_marmot_groups: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let send_inflight = Arc::new(AtomicUsize::new(0));
+        let outbox_inflight_ids = Arc::new(Mutex::new(HashSet::new()));
         let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
@@ -2482,6 +2534,7 @@ impl SonarClient {
             pending_marmot_groups,
             marmot_notify,
             send_inflight,
+            outbox_inflight_ids,
             membership_gate,
             buffer_drops_total,
             live_marmot_enabled,
@@ -4789,6 +4842,17 @@ impl SonarClient {
         if self.relays.is_empty() {
             return publish_result_rx;
         }
+        // Connect runs three outbox retries within milliseconds of each other;
+        // on the alpha.15 iPhone each of 256 pending rows was published three
+        // times (768 publishes, 763 relay rate-limit notices). A dropped sender
+        // here reads like the no-relays return above: the first task carries
+        // the push notification, a duplicate never did.
+        let Some(mut inflight_guard) =
+            OutboxInflightGuard::acquire(&self.outbox_inflight_ids, &message_id_hex)
+        else {
+            tracing::debug!(message_id = %message_id_hex, "outbox publish already in flight");
+            return publish_result_rx;
+        };
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
         let outbox_publish_epoch = self.outbox_publish_epoch.clone();
@@ -4947,11 +5011,20 @@ impl SonarClient {
                     "send_publish_auto_retry_scheduled"
                 );
                 // Release send_inflight across the backoff so historical
-                // catch-up is not blocked for the full retry sleep.
+                // catch-up is not blocked for the full retry sleep, and the
+                // in-flight id so a reconnect retry can take the row over.
                 send_inflight.fetch_sub(1, Ordering::Relaxed);
                 inflight_held = false;
+                inflight_guard.release();
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
+                    break;
+                }
+                if !inflight_guard.reacquire() {
+                    tracing::debug!(
+                        message_id = %message_id_hex,
+                        "send_publish_auto_retry_taken_over"
+                    );
                     break;
                 }
                 let prepared = outbox_state.lock().unwrap().prepare_auto_retry(
@@ -11325,6 +11398,61 @@ mod tests {
             Some("Europe/Zurich"),
             "the zone is kept for when an index is available"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_outbox_retries_publish_each_pending_row_once() {
+        // Connect fires `retry_outbox` from subscribe_marmot, sync and
+        // ensure_subscriptions within milliseconds; each spawned its own
+        // publish of every pending row (768 publishes for 256 rows on the
+        // alpha.15 iPhone, and the relays rate-limited the account).
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        // A configured relay the pool never connects to: publishes fail fast,
+        // which is all this test needs from them.
+        alice.relays = relays.clone();
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        alice
+            .engine
+            .merge_pending_commit(&creation.group.mls_group_id)
+            .unwrap();
+        let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+        let (event, _) = alice
+            .engine
+            .create_and_process_text_message(&creation.group.mls_group_id, "hi")
+            .unwrap();
+        alice
+            .outbox_state
+            .lock()
+            .unwrap()
+            .mark_pending(
+                group_hex,
+                event.id.to_hex(),
+                event.id.to_hex(),
+                event.as_json(),
+                Timestamp::now().as_secs(),
+            )
+            .unwrap();
+
+        alice.retry_outbox().await;
+        alice.retry_outbox().await;
+        alice.retry_outbox().await;
+        assert_eq!(
+            alice.send_inflight.load(Ordering::Relaxed),
+            1,
+            "three retries in a row must leave one publish task, not three"
+        );
+        assert_eq!(alice.outbox_inflight_ids.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -2907,10 +2907,15 @@ re-encrypt), `client.rs::timezone_share_waits_for_a_durable_dedupe`,
 `conversation_index.rs::opens_a_newer_stamp_by_ensuring_tables_without_lowering_it`
 
 **Also guarded by:** `client.rs::timezone_share_is_not_repeated_after_restart`
-(the first occurrence) and `client.rs::timezone_share_skips_its_own_relay_echo`
+(the first occurrence), `client.rs::timezone_share_skips_its_own_relay_echo`
 (the share's wrapper id joins the sync processed set like every other send, so
 its echo is not re-fetched and re-failed on every catch-up — 512 such echoes
-per pass on the same iPhone).
+per pass on the same iPhone), and
+`client.rs::concurrent_outbox_retries_publish_each_pending_row_once` (connect
+fires `retry_outbox` from `subscribe_marmot`, `sync` and
+`ensure_subscriptions` within milliseconds; without the in-flight id set each
+pending row was published three times — 768 publishes for 256 rows, 763 relay
+rate-limit notices, and `nos.lol` refusing subscriptions for minutes after).
 
 **Not guarded:**
 - A device that ran alpha.15 has no trustworthy record, so its first launch on
