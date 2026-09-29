@@ -39,9 +39,9 @@ state, `LaunchedEffect`) and plain Kotlin control flow. No UI, no Android.
 
 Files: `apps/sonar/composeApp/src/commonMain/kotlin/chat/bitchat/sonar/chatlist/`.
 
-`SonarAppState` keeps the same public surface (`chats`, `unreadByChat`,
+`SonarAppState` keeps the same members (`chats`, `unreadByChat`,
 `refreshChats()`, `markGroupsRead()`), now delegating to the repository, so
-the other ~600 functions that read them did not change.
+the rest of the class, which reads them everywhere, did not change.
 
 ## How it runs
 
@@ -104,6 +104,37 @@ set `transcriptGroupIds` resolves when `openDm` read-marks the row. The
 presenter sums the live unread map over them. Resolving the set again per row
 would cost about 2 ms a row in Bech32 decodes (JVM, 278 groups), on the main
 dispatcher. Ledger entry R-052, QA-142.
+
+## Measurements
+
+Dedicated emulator (`Sonar_QA_API_36_payne`, API 36, arm64), one onboarded
+account with 25 Marmot groups and 934 messages, Debug builds of `main` (e59b3cc23) and this branch
+installed in place over the same data. Rounds were interleaved (main, branch,
+main, branch…) because the Mac is shared: `main` alone varied 2–3× between
+rounds in whole-process idle CPU.
+
+| Metric | main | branch | How |
+|---|---|---|---|
+| Cold start to first frame (MainActivity holds its first draw until the local Home model is hydrated, so this is local-first list paint) | median 1564 ms, IQR 1524–1672 (n=20) | median 1602 ms, IQR 1527–1671 (n=20) | `am start -W` TotalTime after `force-stop`, 2 rounds × 10 |
+| Chat open, first transcript frame | medians 101.6 / 65.9 ms | medians 82.9 / 76.3 ms | `scripts/bench/android-chat-open-bench.sh`, 2 rounds × 10 |
+| Idle on Home, whole process (QA-050) | mean 2.02 %, median 1.88 % | mean 1.83 %, median 1.92 % | 3 rounds × 3 × 60 s |
+| Idle on Home, main thread only | mean 0.35 %, median 0.40 % | mean 0.32 %, median 0.42 % | `/proc/<pid>/task/<pid>/stat`, same windows |
+| Frames rendered while idle | 12 in 9 windows | 12 in 9 windows | `dumpsys gfxinfo`, same windows |
+
+All within noise; the interquartile ranges overlap almost exactly. A first
+A/B that recorded only whole-process CPU seemed to put the branch higher
+(means 2.30 % vs 1.53 %, n=6, not significant). The main-thread and frame
+split above is what showed that difference was host noise. Composition runs on
+the main thread, and it did no extra work.
+
+JVM cost probe (278 direct chats, 10 mesh-folded people; M-series Mac;
+throwaway test, not committed):
+
+| Work | Cost |
+|---|---|
+| Full Marmot row-model rebuild. `main` paid this on **every unread change** (every arrival, every mark-read), because unread was a memo input | 6.76 ms |
+| Branch: one presenter pass per unread change (recompose + 279-row model) | 0.33 ms |
+| `transcriptGroupIds` for 10 mesh rows (why the fix reuses the fold map instead) | 21 ms |
 
 ## Pain points
 
