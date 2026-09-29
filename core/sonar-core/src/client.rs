@@ -1912,6 +1912,9 @@ pub struct SonarClient {
     /// row. Released across a task's retry backoff, like `send_inflight`, so a
     /// reconnect retry can still take over a stranded send.
     outbox_inflight_ids: Arc<Mutex<HashSet<String>>>,
+    /// Set while a debounced outbox flush is scheduled (`schedule_outbox_flush`),
+    /// so an ack burst rewrites the sidecar once.
+    outbox_flush_pending: Arc<AtomicBool>,
     /// Excludes sends from OUR in-flight membership changes. A membership flow
     /// (add/remove/leave/auto-commit) holds write from commit creation through
     /// publish+merge; send paths hold read around encrypt+local-write, so a
@@ -2232,6 +2235,7 @@ impl SonarClient {
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let send_inflight = Arc::new(AtomicUsize::new(0));
         let outbox_inflight_ids = Arc::new(Mutex::new(HashSet::new()));
+        let outbox_flush_pending = Arc::new(AtomicBool::new(false));
         let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
@@ -2535,6 +2539,7 @@ impl SonarClient {
             marmot_notify,
             send_inflight,
             outbox_inflight_ids,
+            outbox_flush_pending,
             membership_gate,
             buffer_drops_total,
             live_marmot_enabled,
@@ -4860,6 +4865,7 @@ impl SonarClient {
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
+        let outbox_flush_pending = self.outbox_flush_pending.clone();
         let reaction_index = self.engine.reaction_index();
         // Count the send before spawn so hosts that gate catch-up / shutdown on
         // `send_inflight == 0` cannot observe a gap between return and task start.
@@ -4933,9 +4939,16 @@ impl SonarClient {
                     match outcome {
                         Ok(relay_url) => {
                             let rtt_ms = publish_started.elapsed().as_millis() as u64;
-                            let _ = outbox_state.lock().unwrap().mark_sent_by_message_id(
-                                &message_id_hex,
-                                Timestamp::now().as_secs(),
+                            // Lazy + debounced: 256 acks in one second used to
+                            // rewrite the whole sidecar 256 times (45 MB).
+                            outbox_state
+                                .lock()
+                                .unwrap()
+                                .mark_sent_by_message_id_lazy(&message_id_hex);
+                            crate::outbox::schedule_outbox_flush(
+                                outbox_state.clone(),
+                                outbox_flush_pending.clone(),
+                                crate::outbox::OUTBOX_ACK_FLUSH_DELAY,
                             );
                             tracing::info!(
                                 message_id = %message_id_hex,
@@ -7623,6 +7636,7 @@ impl SonarClient {
             }
         }
         let payload = crate::timezone::encode_timezone_revoke_payload();
+        let _outbox_batch = crate::outbox::OutboxSaveBatch::begin(&self.outbox_state);
         for group_id_hex in targets {
             if !self
                 .timezone_shared_with
@@ -7748,6 +7762,9 @@ impl SonarClient {
             groups.truncate(MAX_TIMEZONE_SHARE_GROUPS);
         }
 
+        // One sidecar write for the whole fan-out instead of one per group
+        // (256 groups wrote 45 MB of JSON on the alpha.15 iPhone).
+        let _outbox_batch = crate::outbox::OutboxSaveBatch::begin(&self.outbox_state);
         for group in groups {
             let group_id = group.mls_group_id;
             let group_id_hex = hex::encode(group_id.as_slice());
@@ -11453,6 +11470,45 @@ mod tests {
             "three retries in a row must leave one publish task, not three"
         );
         assert_eq!(alice.outbox_inflight_ids.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn timezone_share_fan_out_writes_the_outbox_once() {
+        // Plan item 1 (alpha.15): the sidecar is one JSON file rewritten per
+        // mutation, so a fan-out into N groups wrote it N times (45 MB for
+        // 256). The batch hold makes it one write at the end.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let alice = SonarClient::connect(Identity::generate(), vec![], &db, [3u8; 32])
+            .await
+            .expect("alice");
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut group_hexes = Vec::new();
+        for _ in 0..3 {
+            let bob = MarmotEngine::in_memory(Identity::generate());
+            let creation = alice
+                .engine
+                .create_group(
+                    "chat",
+                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    relays.clone(),
+                )
+                .unwrap();
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .unwrap();
+            group_hexes.push(hex::encode(creation.group.mls_group_id.as_slice()));
+        }
+        let before = alice.outbox_state.lock().unwrap().save_count();
+        alice.set_timezone_share_groups(group_hexes).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 3);
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().save_count(),
+            before + 1,
+            "three shares, one sidecar write"
+        );
     }
 
     #[tokio::test]

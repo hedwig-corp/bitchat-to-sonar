@@ -7,6 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
@@ -56,6 +59,63 @@ pub(crate) struct OutboxState {
     path: Option<PathBuf>,
     entries: HashMap<String, OutboxEntry>,
     dirty: bool,
+    /// Depth of `suspend_saves` holds; writes resume at zero.
+    saves_suspended: u32,
+    /// Sidecar writes so far. Tests and the bench measure coalescing with it.
+    saves: u64,
+}
+
+/// How long the ack path waits before flushing the sidecar, so a burst of acks
+/// rewrites it once. A crash inside the window leaves acked rows Pending; the
+/// next `retry_outbox` republishes them and relays drop the duplicate by id.
+pub(crate) const OUTBOX_ACK_FLUSH_DELAY: Duration = Duration::from_millis(100);
+
+/// Flush the sidecar once, `delay` after the first request of a burst. The
+/// flag clears before the write, so a row marked after the write (and before
+/// this task ends) schedules the next flush instead of being lost.
+pub(crate) fn schedule_outbox_flush(
+    outbox: Arc<Mutex<OutboxState>>,
+    pending: Arc<AtomicBool>,
+    delay: Duration,
+) {
+    if pending.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        pending.store(false, Ordering::Release);
+        let result = outbox.lock().unwrap().save_if_dirty();
+        if let Err(err) = result {
+            tracing::debug!(%err, "outbox flush failed");
+        }
+    });
+}
+
+/// Holds the sidecar's disk writes for the life of a batch that mutates many
+/// rows (the local-time fan-out): one write at the end instead of one per row.
+/// Every row of such a batch carries the same one fact, so a crash inside it
+/// costs at most that batch, never a chat message.
+pub(crate) struct OutboxSaveBatch {
+    outbox: Arc<Mutex<OutboxState>>,
+}
+
+impl OutboxSaveBatch {
+    pub(crate) fn begin(outbox: &Arc<Mutex<OutboxState>>) -> Self {
+        outbox.lock().unwrap().suspend_saves();
+        Self {
+            outbox: outbox.clone(),
+        }
+    }
+}
+
+impl Drop for OutboxSaveBatch {
+    fn drop(&mut self) {
+        if let Ok(mut outbox) = self.outbox.lock() {
+            if let Err(err) = outbox.resume_saves() {
+                tracing::debug!(%err, "outbox batch flush failed");
+            }
+        }
+    }
 }
 
 impl OutboxState {
@@ -80,6 +140,8 @@ impl OutboxState {
             path,
             entries,
             dirty: false,
+            saves_suspended: 0,
+            saves: 0,
         }
     }
 
@@ -90,6 +152,35 @@ impl OutboxState {
     #[cfg(test)]
     pub(crate) fn recorded_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Hold disk writes while a caller mutates many rows. Holds nest; the
+    /// last `resume_saves` writes whatever is dirty.
+    pub fn suspend_saves(&mut self) {
+        self.saves_suspended += 1;
+    }
+
+    pub fn resume_saves(&mut self) -> Result<()> {
+        self.saves_suspended = self.saves_suspended.saturating_sub(1);
+        if self.saves_suspended == 0 {
+            self.save_if_dirty()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `mark_sent_by_message_id` without the disk write. The caller owes a
+    /// `schedule_outbox_flush`, which lets an ack burst rewrite the sidecar
+    /// once instead of once per ack.
+    pub fn mark_sent_by_message_id_lazy(&mut self, message_id_hex: &str) {
+        if self.entries.remove(message_id_hex).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Sidecar writes so far.
+    pub(crate) fn save_count(&self) -> u64 {
+        self.saves
     }
 
     pub fn mark_pending(
@@ -288,7 +379,7 @@ impl OutboxState {
     }
 
     fn save_if_dirty(&mut self) -> Result<()> {
-        if !self.dirty {
+        if !self.dirty || self.saves_suspended > 0 {
             return Ok(());
         }
         let Some(path) = self.path.as_ref() else {
@@ -313,6 +404,7 @@ impl OutboxState {
         fs::rename(&tmp, path)
             .map_err(|e| Error::Storage(format!("replace outbox state {}: {e}", path.display())))?;
         self.dirty = false;
+        self.saves += 1;
         Ok(())
     }
 }
@@ -649,5 +741,116 @@ mod tests {
             reloaded.status_for_message("message"),
             Some(DeliveryState::Pending)
         );
+    }
+}
+
+#[cfg(test)]
+mod coalescing_tests {
+    use super::*;
+
+    fn pending(outbox: &mut OutboxState, i: u32, json: &str) {
+        let id = format!("{i:064x}");
+        outbox
+            .mark_pending("g".into(), id.clone(), id, json.to_owned(), 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn suspended_saves_write_once_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        outbox.suspend_saves();
+        outbox.suspend_saves();
+        for i in 0..5 {
+            pending(&mut outbox, i, "{}");
+        }
+        assert_eq!(outbox.save_count(), 0);
+        assert!(!path.exists(), "no write while a hold is open");
+        outbox.resume_saves().unwrap();
+        assert_eq!(outbox.save_count(), 0, "the outer hold is still open");
+        outbox.resume_saves().unwrap();
+        assert_eq!(outbox.save_count(), 1);
+        assert_eq!(OutboxState::load(Some(path)).recorded_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn ack_flush_coalesces_a_burst() {
+        // Real time: `start_paused` needs tokio's test-util feature.
+        let delay = Duration::from_millis(10);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let outbox = Arc::new(Mutex::new(OutboxState::load(Some(path.clone()))));
+        for i in 0..20 {
+            pending(&mut outbox.lock().unwrap(), i, "{}");
+        }
+        let before = outbox.lock().unwrap().save_count();
+        let pending_flag = Arc::new(AtomicBool::new(false));
+        for i in 0..20u32 {
+            outbox
+                .lock()
+                .unwrap()
+                .mark_sent_by_message_id_lazy(&format!("{i:064x}"));
+            schedule_outbox_flush(outbox.clone(), pending_flag.clone(), delay);
+        }
+        assert_eq!(
+            outbox.lock().unwrap().save_count(),
+            before,
+            "nothing written yet"
+        );
+        tokio::time::sleep(delay * 6).await;
+        assert_eq!(
+            outbox.lock().unwrap().save_count(),
+            before + 1,
+            "one write for 20 acks"
+        );
+        assert_eq!(OutboxState::load(Some(path)).recorded_count(), 0);
+        assert!(
+            !pending_flag.load(Ordering::Acquire),
+            "a later burst can schedule again"
+        );
+    }
+
+    /// Measures item 1 of the alpha.15 plan: 256 pending + 256 sent rows,
+    /// row by row versus under one hold. Run with
+    /// `cargo test -p sonar-core --release -- --ignored --nocapture bench_outbox`.
+    #[test]
+    #[ignore]
+    fn bench_outbox_rewrite_cost() {
+        let json = "x".repeat(994); // a real kind-445 share wrapper is 994 bytes
+        for (label, hold) in [("row_by_row", false), ("one_hold", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("outbox.json");
+            let mut outbox = OutboxState::load(Some(path.clone()));
+            let mut bytes = 0u64;
+            let started = std::time::Instant::now();
+            if hold {
+                outbox.suspend_saves();
+            }
+            for i in 0..256 {
+                pending(&mut outbox, i, &json);
+                bytes += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            }
+            for i in 0..256u32 {
+                if hold {
+                    outbox.mark_sent_by_message_id_lazy(&format!("{i:064x}"));
+                } else {
+                    outbox
+                        .mark_sent_by_message_id(&format!("{i:064x}"), 1)
+                        .unwrap();
+                }
+                bytes += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            }
+            if hold {
+                outbox.resume_saves().unwrap();
+                bytes += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            }
+            println!(
+                "BENCH outbox_{label} writes={} bytes_written_kb={} ms={:.1}",
+                outbox.save_count(),
+                bytes / 1024,
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 }
