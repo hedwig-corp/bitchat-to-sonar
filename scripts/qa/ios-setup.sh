@@ -142,7 +142,7 @@ if (( BUILD )); then
   set -o pipefail
   key_args=()
   [[ -n "$KEY_XCCONFIG" ]] && key_args=(-xcconfig "$KEY_XCCONFIG")
-  if ! xcodebuild build -project "$ROOT/ios/bitchat.xcodeproj" -scheme "bitchat (iOS)" \
+  if ! xcodebuild -skipPackagePluginValidation build -project "$ROOT/ios/bitchat.xcodeproj" -scheme "bitchat (iOS)" \
       -configuration Debug -destination "id=$UDID" -derivedDataPath "$DERIVED" \
       ARCHS=arm64 ONLY_ACTIVE_ARCH=YES EXCLUDED_ARCHS=x86_64 -allowProvisioningUpdates \
       ${key_args[@]+"${key_args[@]}"} > "$QA_HOME/ios-build.log" 2>&1; then

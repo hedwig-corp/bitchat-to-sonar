@@ -35,7 +35,7 @@ echo ">> Building \"$SCHEME\" (Debug, iphonesimulator, arm64, unsigned) → $DER
 # arm64 ONLY: the Arti (libarti_bitchat.a) and sonarffi simulator slices are
 # arm64-only (Apple Silicon). 'generic/platform=iOS Simulator' would also try
 # the x86_64 slice and fail to link. Pin to arm64.
-xcodebuild build \
+xcodebuild -skipPackagePluginValidation build \
   -project "$PROJECT" \
   -scheme "$SCHEME" \
   -configuration Debug \
