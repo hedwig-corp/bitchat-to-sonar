@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.HomeMessageRow
+import chat.bitchat.sonar.MarmotRowModel
 import chat.bitchat.sonar.isNoteToSelfChat
 import chat.bitchat.sonar.mergeHomeMessageRows
 import chat.bitchat.sonar.pinNoteToSelfHomeRows
@@ -87,14 +88,14 @@ internal class ChatListPresenter(
         val noteToSelfId = sources.noteToSelfGroupId
         val unread = repository.unreadByChat
         fun anyUnread(groupIds: List<String>): Boolean = groupIds.any { (unread[it] ?: 0L) > 0L }
+        val models = sources.marmotRows
+        fun model(chatId: String) = models[chatId] ?: MarmotRowModel.placeholder(chatId)
 
         // One recency-ordered list across transports (Signal-style / iOS
         // SonarAppStore.dmRows), Note to Self pinned first. Sort keys are O(1):
         // mesh rows are precomputed, Marmot rows read the cached row model.
         val ordered = pinNoteToSelfHomeRows(
-            mergeHomeMessageRows(sources.meshRows, sources.marmotChats) { chatId ->
-                sources.marmotRow(chatId).tsSecs
-            },
+            mergeHomeMessageRows(sources.meshRows, sources.marmotChats) { chatId -> model(chatId).tsSecs },
             noteToSelfGroupId = noteToSelfId,
         )
         val rows = ordered.map { row ->
@@ -104,22 +105,24 @@ internal class ChatListPresenter(
                     title = row.row.name,
                     preview = row.row.preview,
                     tsSecs = row.row.tsSecs,
-                    unread = false,
-                    verified = false,
+                    // A person who writes over White Noise lands in a folded
+                    // group; the badge sums those groups (iOS dmRows parity).
+                    unread = anyUnread(row.row.groupIds),
+                    verified = row.row.verified,
                 )
                 is HomeMessageRow.Marmot -> {
-                    val model = sources.marmotRow(row.chat.id)
+                    val rowModel = model(row.chat.id)
                     val noteToSelf = isNoteToSelfChat(row.chat, noteToSelfId)
                     ChatListRow.Marmot(
                         chat = row.chat,
-                        title = model.title,
-                        preview = model.sub,
-                        tsSecs = model.tsSecs,
+                        title = rowModel.title,
+                        preview = rowModel.sub,
+                        tsSecs = rowModel.tsSecs,
                         // Your own notes are never unread.
-                        unread = !noteToSelf && anyUnread(model.groupIds),
-                        verified = model.verified,
-                        pending = model.pending,
-                        group = model.multiMember,
+                        unread = !noteToSelf && anyUnread(rowModel.groupIds),
+                        verified = rowModel.verified,
+                        pending = rowModel.pending,
+                        group = rowModel.multiMember,
                         noteToSelf = noteToSelf,
                     )
                 }

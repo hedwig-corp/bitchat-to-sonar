@@ -193,6 +193,26 @@ class ChatListPresenterTest {
     }
 
     @Test
+    fun aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs() = runTest {
+        // Sara was met over Bluetooth; she now writes over White Noise, so her
+        // unread message sits in a Marmot group folded into her mesh row.
+        val core = FakeChatListCore().apply { summaries = listOf(summary("g-sara", 500, unread = 2)) }
+        val repo = repository(core)
+        repo.refreshUnread()
+        val sources = FakeChatListSources().apply {
+            meshRows = listOf(sara.copy(groupIds = listOf("g-sara"), verified = true))
+        }
+        models(ChatListPresenter(repo, sources)).test {
+            val row = awaitItem().rows.single() as ChatListRow.Mesh
+            assertTrue(row.unread, "the dot a pure Marmot chat would show")
+            assertTrue(row.verified)
+            // Opening the mesh chat read-marks the same folded set.
+            repo.markRead(listOf("g-sara"))
+            assertFalse(awaitItem().rows.single().unread)
+        }
+    }
+
+    @Test
     fun markingAConversationReadClearsItsBadgeInTheNextModel() = runTest {
         val core = FakeChatListCore().apply { summaries = listOf(summary(giulia.id, 400, unread = 3)) }
         val repo = repository(core)

@@ -39,8 +39,9 @@ internal interface ChatListSources {
     /** The real Note to Self group id once ensured, else null. */
     val noteToSelfGroupId: String?
 
-    /** O(1) memoized row view model for a Marmot conversation. */
-    fun marmotRow(chatId: String): MarmotRowModel
+    /** Memoized row view models for [marmotChats], by chat id. Read once per
+     *  pass: every read re-checks the memo key. */
+    val marmotRows: Map<String, MarmotRowModel>
 
     fun openChat(chat: SonarChat)
     fun openDm(peerId: String, name: String)

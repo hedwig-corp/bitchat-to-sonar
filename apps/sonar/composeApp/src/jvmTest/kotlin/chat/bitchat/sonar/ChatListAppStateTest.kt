@@ -117,6 +117,42 @@ class ChatListAppStateTest {
         }
     }
 
+    @Test
+    fun aMeshFoldedPersonsWhiteNoiseUnreadBadgesTheirBluetoothRow() = runTest {
+        // The chat kind that motivated docs/CHAT-TYPES.md: a person met over
+        // Bluetooth who now writes over White Noise. Their unread message is in
+        // the folded Marmot group, not in any mesh buffer.
+        val saraHex = "02".repeat(32)
+        val saraNpub = chat.bitchat.sonar.crypto.Bech32.encode("npub", ByteArray(32) { 2 })!!
+        val saraGroup = SonarChat("cc01", "", listOf(me, saraNpub))
+        val core = FakeChatListCore().apply { summaries = listOf(summary(saraGroup.id, 900, unread = 1)) }
+        val s = state(core)
+        s.seedMeshFoldedPersonForTest(
+            peerId = "f3237e63aa11bb22",
+            npubHex = saraHex,
+            bleMessages = listOf(SonarMsg("ble-1", saraNpub, "hi over bluetooth", mine = false, tsSecs = 100)),
+            groups = listOf(saraGroup),
+        )
+        s.chatList.refreshUnread()
+        val events = MutableSharedFlow<ChatListEvent>(extraBufferCapacity = 4)
+
+        moleculeFlow(RecompositionMode.Immediate) { s.chatListPresenterForTest().present(events) }.test {
+            val rows = expectMostRecentItem().rows.filterNot { isNoteToSelfPlaceholder(it.key) }
+            // One row for Sara (the folded group is not a second chat), and it
+            // carries the White Noise leg's badge.
+            val sara = rows.single() as ChatListRow.Mesh
+            assertEquals("f3237e63aa11bb22", sara.peerId)
+            assertTrue(sara.unread)
+
+            // Opening her row read-marks exactly the folded group.
+            events.emit(ChatListEvent.Open(sara))
+            assertFalse(awaitItem().rows.single { !isNoteToSelfPlaceholder(it.key) }.unread)
+            runCurrent()
+            assertEquals(listOf(saraGroup.id), core.markedRead)
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+
     /** The phone presenter, on a Home the test marks hydrated. */
     private fun SonarAppState.chatListPresenterForTest(): ChatListPresenter {
         markHomeHydratedForTest()
