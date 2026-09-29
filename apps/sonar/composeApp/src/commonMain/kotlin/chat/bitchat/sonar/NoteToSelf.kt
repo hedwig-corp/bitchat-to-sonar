@@ -35,17 +35,3 @@ internal fun pinNoteToSelfHomeRows(
     if (pinned.isEmpty()) return rows
     return listOf(pinned.first()) + rest
 }
-
-/**
- * The Messages list shared by the phone home screen and the desktop sidebar:
- * mesh and Marmot rows merged by recency, then Note to Self on top. One
- * function, so the two lists cannot disagree about the pin.
- */
-internal fun SonarAppState.homeMessageRows(
-    meshRows: List<MeshDmRow>,
-    chatRows: List<SonarChat>,
-): List<HomeMessageRow> =
-    pinNoteToSelfHomeRows(
-        mergeHomeMessageRows(meshRows, chatRows) { chatId -> marmotRow(chatId).tsSecs },
-        noteToSelfGroupId = noteToSelfId(),
-    )
