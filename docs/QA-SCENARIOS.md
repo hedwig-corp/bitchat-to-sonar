@@ -404,6 +404,20 @@ nothing by design.
 - **Expect:** no row whose only effect is a "coming soon" toast.
 - **Origin:** A17 (#616)
 
+### QA-142 — A mesh-folded chat shows the unread dot of its White Noise messages
+- **Platforms:** both (manual: needs a Sonar peer met over Bluetooth, i.e. a
+  second emulator or phone with Bluetooth on; iOS already passes)
+- **Steps:** meet a Sonar peer over Bluetooth and exchange a message; take the
+  peer out of range (or turn its Bluetooth off) so the next message travels
+  over White Noise; with the app on the chat list, the peer sends a message.
+- **Expect:** the peer's one Home row shows the new preview **and** the unread
+  dot (announced "Unread"); opening it clears the dot; no second row for the
+  same person appears (R-003).
+- **Guard:** `ChatListAppStateTest.aMeshFoldedPersonsWhiteNoiseUnreadBadgesTheirBluetoothRow`,
+  `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs` (R-052)
+- **Origin:** chat-list presenter pilot. Compose mesh rows never passed
+  `unread` or `verified`, so Android and desktop showed no dot where iOS did.
+
 ## Note to Self (#339)
 
 Note to Self is a solo Marmot group marked `sonar.note-to-self.v1`: it is
