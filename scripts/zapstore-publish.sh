@@ -2,7 +2,7 @@
 # Publish the current Android alpha to Zapstore (https://zapstore.dev).
 #
 # Prerequisites:
-#   - zsp on PATH  (go install github.com/zapstore/zsp@latest)
+#   - zsp          (go install github.com/zapstore/zsp/cmd/zsp@latest)
 #   - SIGN_WITH    nsec1… | bunker://… | browser
 #   - Android release signing keystore + passwords (see below)
 #   - gh auth      optional; used as GITHUB_TOKEN to avoid API rate limits
@@ -20,7 +20,7 @@
 #   scripts/zapstore-publish.sh --local      # build + sign local phone APK, then publish
 #   scripts/zapstore-publish.sh --check      # dry-run fetch only
 #
-# All alpha tags are GitHub pre-releases → always passes --pre-release.
+# All alpha tags are GitHub pre-releases, so zsp always reads pre-releases.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,7 +34,21 @@ APKSIGNER="${APKSIGNER:-}"
 die() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
-need zsp
+# `go install` puts zsp in $GOPATH/bin, which many shells leave off PATH.
+ZSP="$(command -v zsp 2>/dev/null || true)"
+if [[ -z "$ZSP" ]]; then
+  gobin="$(go env GOPATH 2>/dev/null || echo "$HOME/go")/bin/zsp"
+  [[ -x "$gobin" ]] && ZSP="$gobin"
+fi
+[[ -n "$ZSP" ]] || die "missing dependency: zsp (go install github.com/zapstore/zsp/cmd/zsp@latest)"
+
+# zsp 0.5 replaced --pre-release with --prerelease-channel <name>; any name
+# turns on reading GitHub pre-releases. The published channel stays "main".
+if "$ZSP" publish --help 2>&1 | grep -q -- '--prerelease-channel'; then
+  PRERELEASE=(--prerelease-channel alpha)
+else
+  PRERELEASE=(--pre-release)
+fi
 
 # --- load signing props from local.properties if env unset --------------------
 lp="$REPO_ROOT/apps/sonar/local.properties"
@@ -119,8 +133,8 @@ export GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
 case "$MODE" in
   check)
-    echo "→ zsp publish --check --pre-release $CONFIG"
-    zsp publish --check --pre-release "$CONFIG"
+    echo "→ zsp publish --check ${PRERELEASE[*]} $CONFIG"
+    "$ZSP" publish --check "${PRERELEASE[@]}" "$CONFIG"
     ;;
   local)
     [[ -n "${SIGN_WITH:-}" ]] || die "set SIGN_WITH (nsec1…, bunker://…, or browser)"
@@ -137,7 +151,7 @@ case "$MODE" in
     [[ -f "$UNSIGNED" ]] || die "no release APK produced"
     sign_apk "$UNSIGNED" "$SIGNED_APK"
     echo "→ publishing local signed APK to Zapstore"
-    zsp publish --pre-release --quiet \
+    "$ZSP" publish "${PRERELEASE[@]}" --quiet \
       -r https://github.com/hedwig-corp/bitchat-to-sonar \
       "$SIGNED_APK"
     ;;
@@ -146,13 +160,13 @@ case "$MODE" in
     # Prefer publishing a freshly signed local phone APK if present; else GitHub.
     if [[ -f "$SIGNED_APK" ]]; then
       echo "→ publishing existing $SIGNED_APK"
-      zsp publish --pre-release --quiet \
+      "$ZSP" publish "${PRERELEASE[@]}" --quiet \
         -r https://github.com/hedwig-corp/bitchat-to-sonar \
         "$SIGNED_APK"
     else
       echo "→ publishing from GitHub release (must be v2+ signed APK)"
       echo "  tip: if the release asset is unsigned, run with --local first"
-      zsp publish --pre-release --quiet "$CONFIG"
+      "$ZSP" publish "${PRERELEASE[@]}" --quiet "$CONFIG"
     fi
     ;;
 esac

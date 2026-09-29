@@ -12,7 +12,7 @@ Publish Sonar’s Android alpha to [Zapstore](https://zapstore.dev) with
 | `scripts/zapstore-publish.sh` | Check / build+sign local / publish |
 | Release APK signing (Gradle) | Optional via env or `local.properties` |
 | GitHub release assets | Phone + universal APKs on `v0.1-alpha.9` (pre-release) |
-| `zsp` CLI | Install: `go install github.com/zapstore/zsp@latest` |
+| `zsp` CLI | Install: `go install github.com/zapstore/zsp/cmd/zsp@latest` |
 
 ## What you must provide (secrets — never commit)
 
@@ -60,13 +60,15 @@ signed asset to the GitHub release as well).
 ## Alpha tags are pre-releases
 
 All `v0.1-alpha.*` GitHub releases are marked **pre-release**. `zsp` ignores
-those unless you pass **`--pre-release`** (the publish script always does).
+those unless you pass **`--prerelease-channel <name>`** (zsp 0.5+; older zsp used
+`--pre-release`). The publish script detects the installed version and passes
+the right one.
 
 ## Commands
 
 ```bash
 # Install publisher CLI
-go install github.com/zapstore/zsp@latest
+go install github.com/zapstore/zsp/cmd/zsp@latest
 export PATH="$PATH:$(go env GOPATH)/bin"
 
 # Dry-run: can we fetch the phone APK from GitHub?
