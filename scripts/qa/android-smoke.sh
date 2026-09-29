@@ -4,7 +4,7 @@
 # docs/QA-SCENARIOS.md; add one here whenever a QA pass finds a bug that can
 # be driven headlessly (the registry says which ones are automated).
 #
-#   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003] [--max-idle-cpu 3]
+#   QA_SERIAL=emulator-5580 scripts/qa/android-smoke.sh [--only QA-003[,QA-NNN…]] [--max-idle-cpu 3]
 #   (set QA_APP_NPUB to run a scenario that needs the app's npub with --only)
 #   QA_SLOW=1 also runs QA-142 (~12 min: airplane mode while a local-time share
 #   exhausts its publish budget, then the peer must still receive it).
@@ -51,7 +51,7 @@ record() { # id status detail
   [[ "$2" == FAIL ]] && FAILED=$((FAILED + 1))
   return 0
 }
-want() { [[ -z "$ONLY" || "$ONLY" == "$1" ]]; }
+want() { [[ -z "$ONLY" || ",$ONLY," == *",$1,"* ]]; }   # --only QA-001,QA-070,QA-142
 ui() { "$UI" "$@" >/dev/null 2>&1; }
 has() { [[ -n "$("$UI" find "$1" 2>/dev/null)" ]]; }
 hasx() { [[ -n "$("$UI" findx "$1" 2>/dev/null)" ]]; }
@@ -857,23 +857,35 @@ qa142_set_zone() {
 
 qa142() { # a share lost while offline is sent again once back online (#644)
   # Every other scenario runs on a fresh account against healthy relays, so a
-  # first share always arrives. This one loses one on purpose. The phone is
-  # offline while its zone changes, the outbox spends the share's 20-attempt
-  # publish budget (about 8 min of backoff), and the phone comes back online.
+  # first share always arrives. This one loses a share on purpose:
+  #   1. The phone goes offline and its zone changes.
+  #   2. The outbox spends the share's whole 20-attempt publish budget
+  #      (about 8 min of backoff).
+  #   3. The phone comes back online.
   # Before #644 its sent-share record said "delivered" and the peer never got
   # the new zone.
   [[ "${QA_SLOW:-0}" == 1 ]] ||
     { record QA-142 SKIP "about 12 min offline: set QA_SLOW=1"; return; }
   [[ "${QA070_OFF:-}" == 1 && -n "${A_NPUB:-}" && -n "$APP_NPUB" ]] ||
     { record QA-142 SKIP "needs QA-001 and QA-070's off default"; return; }
-  local zone lost="Pacific/Chatham" log fails=0 t got logpid
+  local title zone lost="Pacific/Chatham" log top=0 t got logpid swept
+  title="$(short_npub "$A_NPUB")"
   zone="$(adb -s "$QA_SERIAL" shell getprop persist.sys.timezone | tr -d '\r')"
   [[ "$zone" == "$lost" ]] && lost="Asia/Kathmandu"
-  settings_share_row || { record QA-142 FAIL "no Share local time row in Settings"; return; }
+  # Share with THIS chat only (its own toggle; the Settings default stays off).
+  # Then exactly one share row exists, and its budget is what the step watches.
+  # With the default on, 20 failures spread over every chat and no single
+  # share ever runs out.
+  if ! open_chat_row "$title" || ! open_contact_privacy "$title"; then
+    record QA-142 FAIL "could not reach the contact's Privacy section"; return
+  fi
   ui tapx "Share local time"; sleep 1
+  if [[ "$(toggle_checked "Share local time")" != true ]]; then
+    record QA-142 FAIL "the chat's Share local time did not turn on"; return
+  fi
   if ! "$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$zone" 60 >/dev/null 2>&1; then
-    settings_share_row && ui tapx "Share local time"
-    record QA-142 FAIL "the peer never got $zone after turning sharing on"; return
+    qa142_chat_off "$title"
+    record QA-142 FAIL "the peer never got $zone after turning the chat's sharing on"; return
   fi
   go_home >/dev/null   # the app stays in the foreground: backgrounded, it would stop retrying
 
@@ -886,30 +898,40 @@ qa142() { # a share lost while offline is sent again once back online (#644)
   adb -s "$QA_SERIAL" shell cmd connectivity airplane-mode enable >/dev/null 2>&1
   sleep 3
   qa142_set_zone "$lost"      # ACTION_TIMEZONE_CHANGED: a share that cannot leave the phone
-  # Wait for the outbox to give up on it: 20 failed publishes, at most 15 min.
+  # Wait until ONE share (one message_id) has failed 20 times, its whole
+  # budget. At most 15 min.
   for t in $(seq 1 180); do
-    fails="$(grep -c 'send_publish_failed' "$log" 2>/dev/null || true)"
-    [[ "${fails:-0}" -ge 20 ]] && break
+    top="$(grep 'send_publish_failed' "$log" 2>/dev/null | grep -o 'message_id=[0-9a-f]*' |
+      sort | uniq -c | sort -rn | awk 'NR == 1 {print $1}')"
+    [[ "${top:-0}" -ge 20 ]] && break
     sleep 5
   done
+  sleep 30   # the next pass after the give-up, while still offline (the fix sweeps here)
   qa142_online
   kill "$logpid" 2>/dev/null
   trap - EXIT INT TERM
-  if [[ "${fails:-0}" -lt 20 ]]; then
-    qa142_set_zone "$zone"
-    settings_share_row && ui tapx "Share local time"
-    record QA-142 FAIL "the outbox never gave up offline (${fails:-0} failed publishes in 15 min): is the app still retrying?"
+  swept="$(grep -c 'timezone share abandoned by the outbox' "$log" 2>/dev/null || true)"
+  if [[ "${top:-0}" -lt 20 ]]; then
+    qa142_set_zone "$zone"; qa142_chat_off "$title"
+    record QA-142 FAIL "no share spent its budget offline (max ${top:-0} failed publishes in 15 min): is the app still retrying?"
     return
   fi
 
   got="$("$PEERS" expect-tz "a-$RUN" "$APP_NPUB" "$lost" 180 2>/dev/null)"
   qa142_set_zone "$zone"
-  settings_share_row && ui tapx "Share local time"      # restore QA-070's off default
+  qa142_chat_off "$title"
   if [[ -n "$got" ]]; then
-    record QA-142 PASS "the $lost share the outbox gave up on reached the peer once online"
+    record QA-142 PASS "the $lost share the outbox gave up on (20 failed publishes) reached the peer once online; sweep lines: ${swept:-0}"
   else
-    record QA-142 FAIL "a share lost offline never reached the peer (sent-share record claims delivery; see $log)"
+    record QA-142 FAIL "a share lost offline never reached the peer: the sent-share record claims delivery (see $log)"
   fi
+}
+
+# Turn the chat's own Share local time back off (QA-070's default).
+qa142_chat_off() {
+  open_chat_row "$1" && open_contact_privacy "$1" &&
+    [[ "$(toggle_checked "Share local time")" == true ]] && ui tapx "Share local time"
+  go_home >/dev/null
 }
 
 qa050() { # idle CPU on the chat list

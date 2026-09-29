@@ -655,11 +655,15 @@ share a zone with the app and report the zone the app shared with it.
     rumor still uses up one MLS message key. Alice relaunches online, and
     Bob must receive and decrypt her zone.
   - **On the app:** `QA_SLOW=1 android-smoke.sh` runs QA-142, about 12 min.
-    1. Sharing on, and the peer confirms the current zone.
+    1. Sharing on for the peer's chat only (its own toggle), so exactly one
+       share row exists. With the Settings default on, 20 failures spread
+       over every chat and no share runs out: the first draft of this step
+       passed without ever reaching the fix. The peer confirms the current
+       zone.
     2. Airplane mode, then change the emulator timezone: a share that cannot
        leave the phone.
-    3. Wait until logcat shows 20 `send_publish_failed`, so the outbox has
-       given up.
+    3. Wait until one share (one `message_id`) has 20 `send_publish_failed`
+       in logcat, its whole budget.
     4. Back online: the peer must receive the new zone within 180 s.
 
   Without the fix, the app's sent-share record claims delivery and the peer
