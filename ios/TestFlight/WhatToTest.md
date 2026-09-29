@@ -1,17 +1,26 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.15.1 (46)** · release tag **v0.1-alpha.15.1**
+Build: **Sonar 1.15.2 (47)** · **v0.1-alpha.15.2** (Apple-only; Android stays on 0.1-alpha.15.1)
 
-Hotfix on alpha.15. Headline: **launch should be fast again** (#629). Alpha.15
-could open with no conversation index (a foreign schema stamp skipped the
-timezone migration), then re-publish a local-time share into every group on
-each reopen — hundreds of publishes in the first minute, relays rate-limiting
-the account, home list empty. This cut repairs the index on open and does not
-fan the share out again. Still exercise Cashu, reactions, Note to Self, and
-the share extension from 1.15.0.
+Hotfix on alpha.15.1. **Headline: your local time now reaches the people you
+chat with** (#644).
 
+The phone recorded each chat as "shared" before any relay accepted the share.
+When that publish was lost, it never tried again, so a contact's chat header
+never showed your time. This build resends a share the app gave up on. It also
+re-shares once into your active chats: up to 64 recent ones, a few at a time.
 
-## 0. Launch speed (headline, #629)
+## 0. Local time in chats (headline, #644)
+
+- With **Settings → Privacy & safety → Share local time** on, ask a contact
+  on 1.15.2 (or Android) to open your chat. Their header should show your time
+  (`10:48 PM`, plus `· N hours ahead/behind` if you are in different zones).
+- The first launch re-shares into your recent chats in small batches. Leave
+  the app open a minute; it must not flood or slow down.
+- If a header still shows "Via internet" / "Nearby · Bluetooth" after a
+  minute, send **Settings → Diagnostics → Share** from **both** phones.
+
+## 0b. Launch speed (from 1.15.1, #629)
 
 - Kill the app, reopen it. Home should show your chats within a couple of
   seconds, not sit empty while the network thrashes.

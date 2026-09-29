@@ -1,4 +1,4 @@
-MARKETING_VERSION = 1.15.1
+MARKETING_VERSION = 1.15.2
 // App Store Connect rejects a second upload of a (MARKETING_VERSION,
 // CURRENT_PROJECT_VERSION) pair it has already accepted — it fails the
 // whole submission with "the state of the relationship 'buildUpload'".
@@ -8,7 +8,8 @@ MARKETING_VERSION = 1.15.1
 // v0.1-alpha.14 shipped as 1.14.0/44 (after 13.2 build 43).
 // v0.1-alpha.15 shipped as 1.15.0/45 (Cashu-wallet cut).
 // v0.1-alpha.15.1 ships as 1.15.1/46 (slow-launch index repair, #629).
-CURRENT_PROJECT_VERSION = 46
+// v0.1-alpha.15.2 ships as 1.15.2/47 (Apple-only: lost local-time share, #644).
+CURRENT_PROJECT_VERSION = 47
 
 IPHONEOS_DEPLOYMENT_TARGET = 16.0
 MACOSX_DEPLOYMENT_TARGET = 15.0
