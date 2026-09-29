@@ -1115,11 +1115,14 @@ impl SonarNode {
                 _ = interrupted.wait_for(|suspending| *suspending) => Err(
                     SonarFfiError::Core(format!("connect {SUSPEND_INTERRUPT_MARKER}"))
                 ),
-                result = SonarClient::connect(
+                // The app host is the one caller that spreads the account's
+                // relay lists and profile to the public indexers (#626).
+                result = SonarClient::connect_with_routes(
                     identity.inner.clone(),
                     relays,
                     &db_path,
                     db_key,
+                    sonar_core::relay_routes::RelayRoutesConfig::public(),
                 ) => result.map_err(Into::into),
             }
         })?;

@@ -58,6 +58,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 QA_HOME="${QA_HOME:-${TMPDIR:-/tmp}/sonar-qa-$(basename "$ROOT")}"
 CLI="${SONAR_CLI:-$ROOT/core/target/release/sonar-cli}"
 PEERS="$QA_HOME/peers"
+# Throwaway QA identities must not publish relay lists or profiles to the
+# public indexers (#626). A scenario that needs a directory relay sets
+# SONAR_LOOKUP_RELAYS to its own relay (sonar-cli: a comma list of relays).
+export SONAR_LOOKUP_RELAYS="${SONAR_LOOKUP_RELAYS-none}"
 mkdir -p "$PEERS"
 
 # Rebuild when missing or older than the core sources: a stale binary runs the
