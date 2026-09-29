@@ -62,7 +62,16 @@ const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 /// A single timezone-change pass is intentionally bounded. Current Marmot
 /// group counts are far below this, but the defensive cap keeps corrupt local
 /// membership state from creating an unbounded MLS fan-out.
-const MAX_TIMEZONE_SHARE_GROUPS: usize = 256;
+/// Most groups one zone (re)share reaches. Selection is by index recency, so
+/// these are the chats the user talks in, not the first N of the group list
+/// (alpha.15 shared into 256 groups in list order, in one burst).
+const MAX_TIMEZONE_SHARE_GROUPS: usize = 64;
+/// A group whose newest message is older than this waits for its next open
+/// or send before it gets a share.
+const TIMEZONE_SHARE_ACTIVE_WINDOW_SECS: u64 = 30 * 24 * 60 * 60;
+/// Shares encrypted inside the host's call; the rest trickle at this many per
+/// idle heartbeat (`ensure_subscriptions`, at most 25 s apart on both hosts).
+const TIMEZONE_SHARE_BATCH: usize = 8;
 /// Accept modest clock skew, but never let a peer pin its cached timezone with
 /// an arbitrarily far-future rumor timestamp.
 const TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
@@ -1857,6 +1866,33 @@ fn load_timezone_shares_sent(
     }
 }
 
+/// Rank the allowlisted groups one zone share should reach: newest local
+/// transcript first, groups older than `TIMEZONE_SHARE_ACTIVE_WINDOW_SECS`
+/// dropped, capped at `MAX_TIMEZONE_SHARE_GROUPS`. `recency` is the index's
+/// `latest_at_secs` per group hex; a group with no row, or a row at 0 (the
+/// index materializes one per group at open), has no transcript yet — a chat
+/// just created — so it stays eligible and ranks last.
+fn select_timezone_share_groups(
+    candidates: Vec<(String, u64)>,
+    recency: &HashMap<String, u64>,
+    now_secs: u64,
+) -> Vec<(String, u64)> {
+    let floor = now_secs.saturating_sub(TIMEZONE_SHARE_ACTIVE_WINDOW_SECS);
+    let mut ranked: Vec<(String, u64, u64)> = candidates
+        .into_iter()
+        .filter_map(|(group_hex, epoch)| {
+            let latest_at = recency.get(&group_hex).copied().unwrap_or(0);
+            (latest_at == 0 || latest_at >= floor).then_some((group_hex, epoch, latest_at))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    ranked.truncate(MAX_TIMEZONE_SHARE_GROUPS);
+    ranked
+        .into_iter()
+        .map(|(group_hex, epoch, _)| (group_hex, epoch))
+        .collect()
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
@@ -1915,6 +1951,11 @@ pub struct SonarClient {
     /// Set while a debounced outbox flush is scheduled (`schedule_outbox_flush`),
     /// so an ack burst rewrites the sidecar once.
     outbox_flush_pending: Arc<AtomicBool>,
+    /// Groups still owed the local-time share, newest first. A fan-out shares
+    /// `TIMEZONE_SHARE_BATCH` groups at once and queues the rest here;
+    /// `advance_timezone_share_trickle` drains a batch per idle heartbeat, a
+    /// chat open moves its group to the front.
+    timezone_share_queue: Arc<Mutex<VecDeque<String>>>,
     /// Excludes sends from OUR in-flight membership changes. A membership flow
     /// (add/remove/leave/auto-commit) holds write from commit creation through
     /// publish+merge; send paths hold read around encrypt+local-write, so a
@@ -2236,6 +2277,7 @@ impl SonarClient {
         let send_inflight = Arc::new(AtomicUsize::new(0));
         let outbox_inflight_ids = Arc::new(Mutex::new(HashSet::new()));
         let outbox_flush_pending = Arc::new(AtomicBool::new(false));
+        let timezone_share_queue = Arc::new(Mutex::new(VecDeque::new()));
         let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
@@ -2540,6 +2582,7 @@ impl SonarClient {
             send_inflight,
             outbox_inflight_ids,
             outbox_flush_pending,
+            timezone_share_queue,
             membership_gate,
             buffer_drops_total,
             live_marmot_enabled,
@@ -3845,6 +3888,7 @@ impl SonarClient {
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(Some((group_name, message)), event_id);
+        self.share_timezone_after_send(group_id).await;
         self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
     }
@@ -6677,6 +6721,9 @@ impl SonarClient {
             Ok(report) => self.save_or_rewind_without_advancing_watermark(report)?,
             Err(err) => tracing::debug!(%err, "initial Marmot per-group catch-up failed"),
         }
+        // The local-time reshare trickles on this heartbeat: a batch per call,
+        // so it spreads over minutes and stops with the app in background.
+        self.advance_timezone_share_trickle().await;
         // The apps use this lightweight idle path instead of `sync()`. Retry
         // the durable outbox here too so a transient outage self-heals after
         // relay reconnection even when the user does not tap the retry button.
@@ -7552,6 +7599,8 @@ impl SonarClient {
     }
 
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
+        // Both hosts call this on chat open: the chat on screen shares first.
+        self.prioritize_timezone_share(group_id_hex);
         if let Some(ref idx) = self.conversation_index {
             // Notify only when the unread count actually moved. Hosts re-mark
             // the OPEN chat read on every change notification for it, so an
@@ -7578,6 +7627,7 @@ impl SonarClient {
     pub async fn update_local_timezone(&self, zone: &str) -> Result<()> {
         if zone.trim().is_empty() {
             *self.local_timezone.lock().unwrap() = None;
+            self.timezone_share_queue.lock().unwrap().clear();
             return Ok(());
         }
         let payload = crate::timezone::encode_timezone_share_payload(zone)?;
@@ -7653,6 +7703,10 @@ impl SonarClient {
                 allow.remove(id);
             }
         }
+        self.timezone_share_queue
+            .lock()
+            .unwrap()
+            .retain(|queued| !targets.contains(queued));
         let payload = crate::timezone::encode_timezone_revoke_payload();
         let _outbox_batch = crate::outbox::OutboxSaveBatch::begin(&self.outbox_state);
         for group_id_hex in targets {
@@ -7730,13 +7784,10 @@ impl SonarClient {
         }
     }
 
-    /// Encrypt at most one kind-449 rumor per active MLS group and publish
-    /// through the chat outbox. Per-group dedupe suppresses ordinary
-    /// sync/message triggers; failed creates stay eligible for retry.
-    async fn share_local_timezone_with_groups(&self) {
-        let Some(zone) = self.local_timezone.lock().unwrap().clone() else {
-            return;
-        };
+    /// The zone and its encoded payload, when there is a zone to share and a
+    /// durable place to record where it went.
+    fn timezone_share_payload(&self) -> Option<(String, String)> {
+        let zone = self.local_timezone.lock().unwrap().clone()?;
         // The per-group dedupe is only as durable as the index it lives in.
         // Without one, every process start and every iOS store reopen begins
         // with an empty record and re-encrypts a share into every allowed
@@ -7747,14 +7798,25 @@ impl SonarClient {
             // debug, not warn: sync passes call this, and the failed open
             // already warned once at connect.
             tracing::debug!("timezone share skipped: conversation index unavailable");
-            return;
+            return None;
         }
-        let payload = match crate::timezone::encode_timezone_share_payload(&zone) {
-            Ok(payload) => payload,
+        match crate::timezone::encode_timezone_share_payload(&zone) {
+            Ok(payload) => Some((zone, payload)),
             Err(err) => {
                 tracing::debug!(%err, "local timezone became invalid before share");
-                return;
+                None
             }
+        }
+    }
+
+    /// Plan one zone (re)share: rank the allowlisted groups by index recency
+    /// (`select_timezone_share_groups`), drop the ones that already hold this
+    /// zone at their current epoch, share `TIMEZONE_SHARE_BATCH` now and queue
+    /// the rest for the idle heartbeat. Ordinary sync/message triggers find
+    /// nothing due and return.
+    async fn share_local_timezone_with_groups(&self) {
+        let Some((zone, payload)) = self.timezone_share_payload() else {
+            return;
         };
         let groups = match self.engine.groups() {
             Ok(groups) => groups,
@@ -7767,39 +7829,173 @@ impl SonarClient {
         if allow.is_empty() {
             return;
         }
-        let mut groups: Vec<_> = groups
-            .into_iter()
-            .filter(|group| allow.contains(&hex::encode(group.mls_group_id.as_slice())))
+        let candidates: Vec<(String, u64)> = groups
+            .iter()
+            .map(|group| (hex::encode(group.mls_group_id.as_slice()), group.epoch))
+            .filter(|(group_hex, _)| allow.contains(group_hex))
             .collect();
-        if groups.len() > MAX_TIMEZONE_SHARE_GROUPS {
-            tracing::warn!(
-                groups = groups.len(),
-                cap = MAX_TIMEZONE_SHARE_GROUPS,
-                "timezone share group cap reached"
-            );
-            groups.truncate(MAX_TIMEZONE_SHARE_GROUPS);
+        let allowlisted = candidates.len();
+        let recency: HashMap<String, u64> = self
+            .conversation_summaries()
+            .into_iter()
+            .map(|summary| (summary.group_id_hex, summary.latest_at_secs))
+            .collect();
+        let selected =
+            select_timezone_share_groups(candidates, &recency, Timestamp::now().as_secs());
+        let selected_len = selected.len();
+        let due: Vec<String> = {
+            let shared = self.timezone_shared_with.lock().unwrap();
+            selected
+                .into_iter()
+                .filter(|(group_hex, epoch)| {
+                    shared.get(group_hex)
+                        != Some(&TimezoneShareDedupe {
+                            zone: zone.clone(),
+                            epoch: *epoch,
+                        })
+                })
+                .map(|(group_hex, _)| group_hex)
+                .collect()
+        };
+        if due.is_empty() {
+            return;
         }
+        let now_batch: Vec<String> = due.iter().take(TIMEZONE_SHARE_BATCH).cloned().collect();
+        {
+            let mut queue = self.timezone_share_queue.lock().unwrap();
+            queue.clear();
+            queue.extend(due.iter().skip(TIMEZONE_SHARE_BATCH).cloned());
+        }
+        tracing::info!(
+            allowlisted,
+            selected = selected_len,
+            due = due.len(),
+            now = now_batch.len(),
+            queued = due.len().saturating_sub(now_batch.len()),
+            "timezone share pass"
+        );
+        self.share_timezone_batch(&now_batch, &zone, &payload).await;
+    }
 
-        // One sidecar write for the whole fan-out instead of one per group
+    /// Share with the next `TIMEZONE_SHARE_BATCH` queued groups. Called from
+    /// the idle heartbeat, so a 64-group reshare spreads over a few minutes
+    /// and stops on its own when the app is backgrounded.
+    pub(crate) async fn advance_timezone_share_trickle(&self) {
+        let batch: Vec<String> = {
+            let mut queue = self.timezone_share_queue.lock().unwrap();
+            (0..TIMEZONE_SHARE_BATCH)
+                .filter_map(|_| queue.pop_front())
+                .collect()
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let Some((zone, payload)) = self.timezone_share_payload() else {
+            return;
+        };
+        tracing::info!(now = batch.len(), "timezone share trickle");
+        self.share_timezone_batch(&batch, &zone, &payload).await;
+    }
+
+    /// The chat the user just opened shares first: front of the queue while a
+    /// zone is set and the chat is allowlisted. Cheap enough for every
+    /// `mark_conversation_read`; the batch re-checks the exact epoch.
+    fn prioritize_timezone_share(&self, group_id_hex: &str) {
+        if self.local_timezone.lock().unwrap().is_none() {
+            return;
+        }
+        if !self
+            .timezone_share_group_ids
+            .lock()
+            .unwrap()
+            .contains(group_id_hex)
+        {
+            return;
+        }
+        if self
+            .timezone_shared_with
+            .lock()
+            .unwrap()
+            .contains_key(group_id_hex)
+        {
+            // Holds some epoch already; a member change re-queues it through
+            // the drain's membership path.
+            return;
+        }
+        let mut queue = self.timezone_share_queue.lock().unwrap();
+        queue.retain(|queued| queued != group_id_hex);
+        queue.push_front(group_id_hex.to_owned());
+    }
+
+    /// The first message into a chat carries the zone along: an allowlisted
+    /// group that never received a share gets one now, in the send's own
+    /// call. Groups that hold an older epoch wait for the membership path.
+    async fn share_timezone_after_send(&self, group_id: &GroupId) {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        if !self
+            .timezone_share_group_ids
+            .lock()
+            .unwrap()
+            .contains(&group_id_hex)
+            || self
+                .timezone_shared_with
+                .lock()
+                .unwrap()
+                .contains_key(&group_id_hex)
+        {
+            return;
+        }
+        let Some((zone, payload)) = self.timezone_share_payload() else {
+            return;
+        };
+        self.timezone_share_queue
+            .lock()
+            .unwrap()
+            .retain(|queued| queued != &group_id_hex);
+        self.share_timezone_batch(std::slice::from_ref(&group_id_hex), &zone, &payload)
+            .await;
+    }
+
+    /// Encrypt one kind-449 per group and publish through the chat outbox,
+    /// under one sidecar write. Per-group dedupe (zone + epoch) suppresses
+    /// repeats; a failed create stays eligible for retry.
+    async fn share_timezone_batch(&self, group_hexes: &[String], zone: &str, payload: &str) {
+        let epochs: HashMap<String, (GroupId, u64)> = match self.engine.groups() {
+            Ok(groups) => groups
+                .into_iter()
+                .map(|group| {
+                    (
+                        hex::encode(group.mls_group_id.as_slice()),
+                        (group.mls_group_id, group.epoch),
+                    )
+                })
+                .collect(),
+            Err(err) => {
+                tracing::debug!(%err, "timezone share group list failed");
+                return;
+            }
+        };
+        // One sidecar write for the whole batch instead of one per group
         // (256 groups wrote 45 MB of JSON on the alpha.15 iPhone).
         let _outbox_batch = crate::outbox::OutboxSaveBatch::begin(&self.outbox_state);
-        for group in groups {
-            let group_id = group.mls_group_id;
-            let group_id_hex = hex::encode(group_id.as_slice());
+        for group_id_hex in group_hexes {
+            let Some((group_id, epoch)) = epochs.get(group_id_hex) else {
+                continue; // left or deleted since it was queued
+            };
             let wanted = TimezoneShareDedupe {
-                zone: zone.clone(),
-                epoch: group.epoch,
+                zone: zone.to_owned(),
+                epoch: *epoch,
             };
             {
                 let mut shared = self.timezone_shared_with.lock().unwrap();
-                if shared.get(&group_id_hex) == Some(&wanted) {
+                if shared.get(group_id_hex) == Some(&wanted) {
                     continue;
                 }
                 shared.insert(group_id_hex.clone(), wanted.clone());
             }
             if let Some(ref idx) = self.conversation_index {
                 if let Err(err) = idx.lock().unwrap().record_timezone_share_sent(
-                    &group_id_hex,
+                    group_id_hex,
                     &wanted.zone,
                     wanted.epoch,
                 ) {
@@ -7809,10 +8005,10 @@ impl SonarClient {
                 }
             }
             if let Err(err) = self
-                .publish_timezone_rumor(&group_id, &group_id_hex, &payload)
+                .publish_timezone_rumor(group_id, group_id_hex, payload)
                 .await
             {
-                self.remove_failed_timezone_share(&group_id_hex, &zone);
+                self.remove_failed_timezone_share(group_id_hex, zone);
                 tracing::debug!(%err, "timezone MLS share failed");
             }
         }
@@ -11568,6 +11764,202 @@ mod tests {
         // The same rows again: every publish is already owned, nothing new.
         alice.retry_outbox().await;
         assert_eq!(listener.changed.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn timezone_share_selection_ranks_by_recency_within_the_window() {
+        let day = 24 * 60 * 60;
+        let now = 100 * day;
+        let recency: HashMap<String, u64> = [
+            ("fresh".to_owned(), now - 60),
+            ("week".to_owned(), now - 7 * day),
+            ("stale".to_owned(), now - 31 * day),
+            ("empty".to_owned(), 0),
+        ]
+        .into_iter()
+        .collect();
+        let candidates: Vec<(String, u64)> = ["stale", "empty", "week", "unknown", "fresh"]
+            .into_iter()
+            .map(|g| (g.to_owned(), 1))
+            .collect();
+        let ranked: Vec<String> = select_timezone_share_groups(candidates, &recency, now)
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect();
+        assert_eq!(
+            ranked,
+            ["fresh", "week", "empty", "unknown"],
+            "newest first; no transcript yet ranks last; older than the window is out"
+        );
+
+        let many: Vec<(String, u64)> = (0..MAX_TIMEZONE_SHARE_GROUPS + 10)
+            .map(|i| (format!("g{i:03}"), 1))
+            .collect();
+        assert_eq!(
+            select_timezone_share_groups(many, &HashMap::new(), now).len(),
+            MAX_TIMEZONE_SHARE_GROUPS
+        );
+    }
+
+    /// `n` groups whose index rows are newest-first in creation order.
+    async fn alice_with_ranked_groups(dir: &Path, n: usize) -> (SonarClient, Vec<String>) {
+        let db = dir.join("marmot.sqlite");
+        let alice = SonarClient::connect(Identity::generate(), vec![], &db, [4u8; 32])
+            .await
+            .expect("alice");
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let now = Timestamp::now().as_secs();
+        let mut hexes = Vec::new();
+        for i in 0..n as u64 {
+            let bob = MarmotEngine::in_memory(Identity::generate());
+            let creation = alice
+                .engine
+                .create_group(
+                    "chat",
+                    vec![bob.key_package_event(relays.clone()).unwrap()],
+                    relays.clone(),
+                )
+                .unwrap();
+            alice
+                .engine
+                .merge_pending_commit(&creation.group.mls_group_id)
+                .unwrap();
+            let group_hex = hex::encode(creation.group.mls_group_id.as_slice());
+            alice
+                .conversation_index
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .upsert_summary(&group_hex, "chat", "hi", "peer", now - i, false, true)
+                .unwrap();
+            hexes.push(group_hex);
+        }
+        alice.set_timezone_share_groups(hexes.clone()).await;
+        (alice, hexes)
+    }
+
+    fn shared_hexes(alice: &SonarClient) -> HashSet<String> {
+        alice
+            .timezone_shared_with
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn timezone_share_shares_a_batch_now_and_trickles_the_rest_on_the_heartbeat() {
+        // Plan item 3 (alpha.15): one zone became 256 encrypted events in one
+        // burst, into the first 256 groups of the list. Now: newest chats
+        // first, a batch inside the host's call, the rest one batch per idle
+        // heartbeat.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 20).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let shared = shared_hexes(&alice);
+        assert_eq!(shared.len(), TIMEZONE_SHARE_BATCH, "one batch inside the call");
+        assert!(
+            hexes[..TIMEZONE_SHARE_BATCH].iter().all(|g| shared.contains(g)),
+            "the batch is the newest chats"
+        );
+        assert_eq!(
+            alice.timezone_share_queue.lock().unwrap().len(),
+            20 - TIMEZONE_SHARE_BATCH
+        );
+
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(shared_hexes(&alice).len(), 2 * TIMEZONE_SHARE_BATCH);
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(shared_hexes(&alice).len(), 20, "the queue drains in batches");
+        alice.advance_timezone_share_trickle().await;
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 20);
+
+        // Another ordinary trigger finds nothing due.
+        alice.set_timezone_share_groups(hexes).await;
+        assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 20);
+    }
+
+    #[tokio::test]
+    async fn opening_a_chat_moves_its_share_to_the_front_of_the_trickle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 20).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let oldest = hexes.last().unwrap().clone();
+        assert!(!shared_hexes(&alice).contains(&oldest));
+
+        // Both hosts call this on chat open.
+        alice.mark_conversation_read(&oldest);
+        alice.advance_timezone_share_trickle().await;
+        let shared = shared_hexes(&alice);
+        assert!(shared.contains(&oldest), "the chat on screen shares first");
+        assert!(
+            !shared.contains(&hexes[18]),
+            "the one it displaced waits for the next heartbeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_send_into_a_chat_carries_the_zone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 20).await;
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        let oldest = hexes.last().unwrap().clone();
+        assert!(!shared_hexes(&alice).contains(&oldest));
+        let before = alice.outbox_state.lock().unwrap().recorded_count();
+
+        let gid = GroupId::from_slice(&hex::decode(&oldest).unwrap());
+        alice.send_text(&gid, "hello").await.unwrap();
+        assert!(shared_hexes(&alice).contains(&oldest));
+        assert_eq!(
+            alice.outbox_state.lock().unwrap().recorded_count(),
+            before + 2,
+            "the text and its zone share"
+        );
+        assert!(
+            !alice.timezone_share_queue.lock().unwrap().contains(&oldest),
+            "no second share from the trickle"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_chat_waits_for_its_next_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (alice, hexes) = alice_with_ranked_groups(dir.path(), 2).await;
+        let stale = hexes[1].clone();
+        // `upsert_summary` only moves a row forward in time: rebuild it stale.
+        alice
+            .conversation_index
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .remove_group(&stale)
+            .unwrap();
+        alice
+            .conversation_index
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .upsert_summary(
+                &stale,
+                "chat",
+                "old",
+                "peer",
+                Timestamp::now().as_secs() - TIMEZONE_SHARE_ACTIVE_WINDOW_SECS - 60,
+                false,
+                true,
+            )
+            .unwrap();
+        alice.update_local_timezone("Europe/Zurich").await.unwrap();
+        assert_eq!(shared_hexes(&alice), HashSet::from([hexes[0].clone()]));
+        assert!(alice.timezone_share_queue.lock().unwrap().is_empty());
+
+        alice.mark_conversation_read(&stale);
+        alice.advance_timezone_share_trickle().await;
+        assert!(shared_hexes(&alice).contains(&stale));
     }
 
     #[tokio::test]

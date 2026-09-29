@@ -183,6 +183,7 @@ impl OutboxState {
     }
 
     /// Sidecar writes so far.
+    #[cfg(test)]
     pub(crate) fn save_count(&self) -> u64 {
         self.saves
     }
