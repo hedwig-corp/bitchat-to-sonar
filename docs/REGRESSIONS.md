@@ -2915,7 +2915,11 @@ per pass on the same iPhone), and
 fires `retry_outbox` from `subscribe_marmot`, `sync` and
 `ensure_subscriptions` within milliseconds; without the in-flight id set each
 pending row was published three times — 768 publishes for 256 rows, 763 relay
-rate-limit notices, and `nos.lol` refusing subscriptions for minutes after).
+rate-limit notices, and `nos.lol` refusing subscriptions for minutes after),
+and `client.rs::repeated_share_passes_do_not_drain_the_plan_at_once` (hosts
+call the fan-out far more often than a plan drains — iOS twice per reconcile,
+Compose after every chat refresh — so only a plan's first pass may share at
+once; later passes merge into the queue the heartbeat drains).
 
 **Not guarded:**
 - A device that ran alpha.15 has no trustworthy record, so its first launch on

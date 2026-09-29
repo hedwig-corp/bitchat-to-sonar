@@ -98,7 +98,11 @@ pub(crate) fn schedule_outbox_flush(
 /// Holds the sidecar's disk writes for the life of a batch that mutates many
 /// rows (the local-time fan-out): one write at the end instead of one per row.
 /// Every row of such a batch carries the same one fact, so a crash inside it
-/// costs at most that batch, never a chat message.
+/// costs at most that batch. The hold covers the whole shared outbox, and the
+/// batch awaits between rows, so a chat send can land inside it: a non-silent
+/// `mark_pending` writes through the hold (`insert_pending`), or a crash would
+/// lose that message's only durable row. Other mutations inside the hold fall
+/// back to the last durable state, which only ever retries a row once more.
 pub(crate) struct OutboxSaveBatch {
     outbox: Arc<Mutex<OutboxState>>,
 }
@@ -255,7 +259,13 @@ impl OutboxState {
         };
         self.entries.insert(message_id_hex, entry);
         self.dirty = true;
-        self.save_if_dirty()
+        if silent {
+            self.save_if_dirty()
+        } else {
+            // A chat message's row is its only durable record until a relay
+            // acknowledges it: write it now, through any batch hold.
+            self.write_if_dirty()
+        }
     }
 
     pub fn mark_sent_by_message_id(&mut self, message_id_hex: &str, _now_secs: u64) -> Result<()> {
@@ -431,7 +441,15 @@ impl OutboxState {
     }
 
     fn save_if_dirty(&mut self) -> Result<()> {
-        if !self.dirty || self.saves_suspended > 0 {
+        if self.saves_suspended > 0 {
+            return Ok(());
+        }
+        self.write_if_dirty()
+    }
+
+    /// `save_if_dirty` without the batch hold.
+    fn write_if_dirty(&mut self) -> Result<()> {
+        if !self.dirty {
             return Ok(());
         }
         let Some(path) = self.path.as_ref() else {
@@ -807,6 +825,36 @@ mod coalescing_tests {
             .unwrap();
     }
 
+    /// A control row, as the local-time fan-out queues it.
+    fn pending_silent(outbox: &mut OutboxState, i: u32, json: &str) {
+        let id = format!("{i:064x}");
+        outbox
+            .mark_pending_silent("g".into(), id.clone(), id, json.to_owned(), 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_chat_row_is_written_through_a_batch_hold() {
+        // #629 review: the hold covers the whole outbox, and the fan-out
+        // awaits between rows, so a chat send can land inside it. Its row is
+        // that message's only durable record until a relay acknowledges it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        outbox.suspend_saves();
+        outbox
+            .mark_pending_silent("g".into(), "share".into(), "share".into(), "{}".into(), 1)
+            .unwrap();
+        assert_eq!(outbox.save_count(), 0, "a control row waits for the batch");
+        outbox
+            .mark_pending("g".into(), "chat".into(), "chat".into(), "{}".into(), 1)
+            .unwrap();
+        assert_eq!(outbox.save_count(), 1, "a chat row writes through the hold");
+        let on_disk = OutboxState::load(Some(path.clone()));
+        assert_eq!(on_disk.status_for_message("chat"), Some(DeliveryState::Pending));
+        outbox.resume_saves().unwrap();
+    }
+
     #[test]
     fn suspended_saves_write_once_on_resume() {
         let dir = tempfile::tempdir().unwrap();
@@ -815,7 +863,7 @@ mod coalescing_tests {
         outbox.suspend_saves();
         outbox.suspend_saves();
         for i in 0..5 {
-            pending(&mut outbox, i, "{}");
+            pending_silent(&mut outbox, i, "{}");
         }
         assert_eq!(outbox.save_count(), 0);
         assert!(!path.exists(), "no write while a hold is open");
@@ -880,7 +928,7 @@ mod coalescing_tests {
                 outbox.suspend_saves();
             }
             for i in 0..256 {
-                pending(&mut outbox, i, &json);
+                pending_silent(&mut outbox, i, &json);
                 bytes += fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             }
             for i in 0..256u32 {
