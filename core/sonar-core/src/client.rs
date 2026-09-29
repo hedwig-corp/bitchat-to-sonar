@@ -4858,6 +4858,7 @@ impl SonarClient {
             tracing::debug!(message_id = %message_id_hex, "outbox publish already in flight");
             return publish_result_rx;
         };
+        let silent = self.outbox_state.lock().unwrap().is_silent(&message_id_hex);
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
         let outbox_publish_epoch = self.outbox_publish_epoch.clone();
@@ -4899,6 +4900,10 @@ impl SonarClient {
                     let change_listener = change_listener.clone();
                     let group_id_hex = group_id_hex.clone();
                     move || {
+                        // A control row's ack or failure changes no transcript.
+                        if silent {
+                            return;
+                        }
                         if let Some(listener) = change_listener.lock().unwrap().clone() {
                             listener.on_conversation_changed(group_id_hex.clone());
                         }
@@ -5122,11 +5127,24 @@ impl SonarClient {
                 }
             }
         };
-        for (message_id_hex, group_id_hex, event) in retryable {
-            // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
-            self.notify_conversation_changed(&group_id_hex);
+        // One wake per group whose rows actually start publishing: not per
+        // row (256 wakes before a single publish had started on the alpha.15
+        // iPhone), not for control rows, and not for rows a running task
+        // already owns. group_id_hex is the MLS id stored at mark_pending —
+        // the same key hosts use.
+        let mut changed_groups: HashSet<String> = HashSet::new();
+        for (message_id_hex, group_id_hex, event, silent) in retryable {
+            let fresh = !self
+                .outbox_inflight_ids
+                .lock()
+                .unwrap()
+                .contains(&message_id_hex);
+            if fresh && !silent {
+                changed_groups.insert(group_id_hex.clone());
+            }
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
+        self.notify_conversations_changed(&changed_groups);
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {
@@ -7833,7 +7851,9 @@ impl SonarClient {
         // alpha.15 iPhone. In-memory only: a burst of shares must not rewrite
         // the sync-state file once per group, and the drain persists it.
         self.mark_sync_event_processed(&event.id);
-        self.outbox_state.lock().unwrap().mark_pending(
+        // Silent: a share is no transcript change, so neither its retry nor
+        // its ack wakes the hosts (256 shares woke them ~1,500 times).
+        self.outbox_state.lock().unwrap().mark_pending_silent(
             group_id_hex.to_owned(),
             event.id.to_hex(),
             event.id.to_hex(),
@@ -11473,6 +11493,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_outbox_wakes_hosts_once_per_group_and_never_for_control_rows() {
+        // Plan item 2 (alpha.15): `retry_outbox` woke the hosts once per row
+        // before a single publish had started, and every ack woke them again;
+        // ~1,500 wakes for one fan-out, each a chat-list rebuild on iOS.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let mut alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("alice starts");
+        alice.relays = relays.clone();
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        alice.set_conversation_change_listener(Some(listener.clone()));
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let creation = alice
+            .engine
+            .create_group(
+                "alice & bob",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        let gid = creation.group.mls_group_id;
+        alice.engine.merge_pending_commit(&gid).unwrap();
+        let group_hex = hex::encode(gid.as_slice());
+        let now = Timestamp::now().as_secs();
+        for i in 0..3 {
+            let (event, _) = alice
+                .engine
+                .create_and_process_text_message(&gid, &format!("hi {i}"))
+                .unwrap();
+            alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .mark_pending(
+                    group_hex.clone(),
+                    event.id.to_hex(),
+                    event.id.to_hex(),
+                    event.as_json(),
+                    now,
+                )
+                .unwrap();
+        }
+        let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
+        for offset in 0..2u64 {
+            let (event, _) = alice
+                .engine
+                .create_and_process_timezone_share(&gid, &payload, Timestamp::from(now + offset))
+                .unwrap();
+            alice
+                .outbox_state
+                .lock()
+                .unwrap()
+                .mark_pending_silent(
+                    group_hex.clone(),
+                    event.id.to_hex(),
+                    event.id.to_hex(),
+                    event.as_json(),
+                    now,
+                )
+                .unwrap();
+        }
+
+        alice.retry_outbox().await;
+        assert_eq!(alice.send_inflight.load(Ordering::Relaxed), 5, "every row publishes");
+        assert_eq!(
+            listener.changed.lock().unwrap().as_slice(),
+            [group_hex.clone()],
+            "one wake for the group, none for the two control rows"
+        );
+
+        // The same rows again: every publish is already owned, nothing new.
+        alice.retry_outbox().await;
+        assert_eq!(listener.changed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn timezone_share_fan_out_writes_the_outbox_once() {
         // Plan item 1 (alpha.15): the sidecar is one JSON file rewritten per
         // mutation, so a fan-out into N groups wrote it N times (45 MB for
@@ -11544,7 +11642,8 @@ mod tests {
             .retryable_events(Timestamp::now().as_secs(), &HashSet::from([group_hex]))
             .unwrap();
         assert_eq!(queued.len(), 1);
-        let (_, _, share) = &queued[0];
+        let (_, _, share, silent) = &queued[0];
+        assert!(silent, "a share is a control row: its retry and ack stay silent");
         assert!(
             alice.is_sync_event_processed(&share.id),
             "the share's own echo must be skipped before MDK"

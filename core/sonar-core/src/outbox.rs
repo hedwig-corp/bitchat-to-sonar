@@ -52,6 +52,10 @@ pub(crate) struct OutboxEntry {
     pub attempts: u32,
     pub state: DeliveryState,
     pub last_error: Option<String>,
+    /// A control row (local-time share or revoke): no transcript change, so
+    /// its retries and acks never wake the hosts. Absent in older sidecars.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 #[derive(Debug)]
@@ -191,6 +195,51 @@ impl OutboxState {
         event_json: String,
         now_secs: u64,
     ) -> Result<()> {
+        self.insert_pending(
+            group_id_hex,
+            message_id_hex,
+            wrapper_event_id_hex,
+            event_json,
+            now_secs,
+            false,
+        )
+    }
+
+    /// `mark_pending` for a control row: same durability, but no host wake on
+    /// retry or ack.
+    pub fn mark_pending_silent(
+        &mut self,
+        group_id_hex: String,
+        message_id_hex: String,
+        wrapper_event_id_hex: String,
+        event_json: String,
+        now_secs: u64,
+    ) -> Result<()> {
+        self.insert_pending(
+            group_id_hex,
+            message_id_hex,
+            wrapper_event_id_hex,
+            event_json,
+            now_secs,
+            true,
+        )
+    }
+
+    pub fn is_silent(&self, message_id_hex: &str) -> bool {
+        self.entries
+            .get(message_id_hex)
+            .is_some_and(|entry| entry.silent)
+    }
+
+    fn insert_pending(
+        &mut self,
+        group_id_hex: String,
+        message_id_hex: String,
+        wrapper_event_id_hex: String,
+        event_json: String,
+        now_secs: u64,
+        silent: bool,
+    ) -> Result<()> {
         let entry = OutboxEntry {
             group_id_hex,
             message_id_hex: message_id_hex.clone(),
@@ -201,6 +250,7 @@ impl OutboxState {
             attempts: 0,
             state: DeliveryState::Pending,
             last_error: None,
+            silent,
         };
         self.entries.insert(message_id_hex, entry);
         self.dirty = true;
@@ -330,14 +380,14 @@ impl OutboxState {
         Ok((group_id_hex, event))
     }
 
-    /// Returns `(message_id_hex, group_id_hex, event)` for each retryable row.
-    /// `group_id_hex` is the MLS id hosts use for conversation refresh (not
-    /// the Nostr `#h` / `nostr_group_id`).
+    /// Returns `(message_id_hex, group_id_hex, event, silent)` for each
+    /// retryable row. `group_id_hex` is the MLS id hosts use for conversation
+    /// refresh (not the Nostr `#h` / `nostr_group_id`).
     pub fn retryable_events(
         &mut self,
         now_secs: u64,
         active_group_ids: &HashSet<String>,
-    ) -> Result<Vec<(String, String, Event)>> {
+    ) -> Result<Vec<(String, String, Event, bool)>> {
         let mut out = Vec::new();
         let before = self.entries.len();
         self.entries
@@ -362,6 +412,7 @@ impl OutboxState {
                 entry.message_id_hex.clone(),
                 entry.group_id_hex.clone(),
                 event,
+                entry.silent,
             ));
         }
         self.save_if_dirty()?;

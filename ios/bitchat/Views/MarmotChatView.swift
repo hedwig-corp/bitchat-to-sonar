@@ -406,6 +406,10 @@ final class MarmotChatModel: ObservableObject {
     private static let localTranscriptBusyRetryLimit = 21
     private static let localSummaryPageLimit: UInt32 = 20
     private static let localSummaryGroupLimit: UInt32 = 50
+    /// Above this many chats changed in one refresh pass, the pass hydrates
+    /// the chat list once from bounded summaries instead of reloading a page
+    /// per chat (see `snConversationRefreshPlan`).
+    static let conversationRefreshBatchThreshold = 16
     private static let relayReconnectRetryDelaySeconds: Double = 10
 
     @Published var npub: String?
@@ -2518,8 +2522,18 @@ final class MarmotChatModel: ObservableObject {
             while !self.pendingConversationRefreshGroups.isEmpty, !Task.isCancelled {
                 let groups = self.pendingConversationRefreshGroups
                 self.pendingConversationRefreshGroups.removeAll(keepingCapacity: true)
+                let plan = snConversationRefreshPlan(
+                    changed: groups,
+                    viewing: self.viewingUnreadGroupIds,
+                    threshold: Self.conversationRefreshBatchThreshold
+                )
+                if plan.reloadSummaries {
+                    // A burst: one bounded summaries hydrate paints every row;
+                    // only the chats on screen still reload a page below.
+                    await self.loadLocalSummaries(resolveMembers: false)
+                }
                 var deferredBusyGroup = false
-                for changedGroupId in groups {
+                for changedGroupId in plan.pageGroups {
                     if self.localTranscriptLoadingGroups.contains(changedGroupId) {
                         self.pendingConversationRefreshGroups.insert(changedGroupId)
                         deferredBusyGroup = true
@@ -5805,4 +5819,25 @@ struct MarmotConversationView: View {
         .padding(.vertical, 8)
         .background(SonarTheme.bg)
     }
+}
+
+/// Which chats a conversation-refresh pass reloads a page for.
+///
+/// Up to `threshold` changed chats, every one gets its bounded page reload.
+/// Above it the pass is a burst (an offline catch-up landing, a fan-out's
+/// acks): the chat list hydrates once from core's summaries, and only the
+/// chats being viewed still reload a page, because their transcripts must
+/// move. Anything else would cost a page read and a `messagesByGroup`
+/// republish per chat — ~1,500 of them in two seconds on the alpha.15
+/// iPhone. Compose reaches the same shape through `refreshChats()`'
+/// single-flight mutex.
+func snConversationRefreshPlan(
+    changed: Set<String>,
+    viewing: Set<String>,
+    threshold: Int
+) -> (reloadSummaries: Bool, pageGroups: [String]) {
+    guard changed.count > threshold else {
+        return (false, changed.sorted())
+    }
+    return (true, changed.filter { viewing.contains($0) }.sorted())
 }
