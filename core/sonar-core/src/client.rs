@@ -44,6 +44,7 @@ use crate::media_staging::{
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
+use crate::relay_routes::{group_relays_for, PeerRoutes, RelayRouter, RelayRoutesConfig};
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
     SONAR_DESCRIPTOR_KIND, SONAR_META_DESCRIPTOR_D_TAG,
@@ -1816,6 +1817,9 @@ pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
     relays: Vec<RelayUrl>,
+    /// The route pool: indexers, peers' relays, foreign group relays. Never
+    /// the Marmot pool — see `relay_routes` for why the two must not mix.
+    routes: Arc<RelayRouter>,
     geo: Arc<Mutex<HashMap<String, Vec<RawGeo>>>>,
     geo_dm: GeoDmBuf,
     direct_dm: DirectDmBuf,
@@ -2018,7 +2022,29 @@ impl SonarClient {
         db_path: impl AsRef<Path>,
         db_key: [u8; 32],
     ) -> Result<Self> {
+        Self::connect_with_routes(
+            identity,
+            relays,
+            db_path,
+            db_key,
+            RelayRoutesConfig::public(),
+        )
+        .await
+    }
+
+    /// [`Self::connect`] with an explicit lookup/indexer set. Production
+    /// uses [`RelayRoutesConfig::public`]; tests and private deployments
+    /// point at their own directory relay, and probes pass
+    /// [`RelayRoutesConfig::disabled`] to stay off the public indexers.
+    pub async fn connect_with_routes(
+        identity: Identity,
+        relays: Vec<RelayUrl>,
+        db_path: impl AsRef<Path>,
+        db_key: [u8; 32],
+        routes_config: RelayRoutesConfig,
+    ) -> Result<Self> {
         let db_path = db_path.as_ref();
+        let routes = RelayRouter::new(routes_config, relays.clone(), Some(db_path));
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
         let index_path = index_db_path_for_db(db_path);
         let index = match ConversationIndex::open(&index_path, db_key) {
@@ -2033,6 +2059,7 @@ impl SonarClient {
             identity,
             relays,
             engine,
+            routes,
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
@@ -2056,12 +2083,25 @@ impl SonarClient {
     /// Connect with a volatile in-memory store. State is lost when the client is
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
+        Self::connect_in_memory_with_routes(identity, relays, RelayRoutesConfig::disabled()).await
+    }
+
+    /// [`Self::connect_in_memory`] with a lookup/indexer set. In-memory
+    /// sessions default to [`RelayRoutesConfig::disabled`] so a test or probe
+    /// never reaches a public indexer by accident.
+    pub async fn connect_in_memory_with_routes(
+        identity: Identity,
+        relays: Vec<RelayUrl>,
+        routes_config: RelayRoutesConfig,
+    ) -> Result<Self> {
+        let routes = RelayRouter::new(routes_config, relays.clone(), None);
         let engine = MarmotEngine::in_memory(identity.clone());
         let index = Arc::new(Mutex::new(ConversationIndex::open_in_memory()?));
         Self::with_engine(
             identity,
             relays,
             engine,
+            routes,
             false,
             None,
             None,
@@ -2078,6 +2118,7 @@ impl SonarClient {
         identity: Identity,
         relays: Vec<RelayUrl>,
         engine: MarmotEngine,
+        routes: RelayRouter,
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
@@ -2465,6 +2506,7 @@ impl SonarClient {
             engine,
             nostr,
             relays,
+            routes: Arc::new(routes),
             geo,
             geo_dm,
             direct_dm,
@@ -2561,7 +2603,92 @@ impl SonarClient {
     pub async fn publish_key_package(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone())?;
         self.nostr.send_event(&event).await?;
+        // Awaited here, unlike the background path: callers of this variant
+        // want the account findable before returning, and a peer that
+        // follows our lists needs them on the indexers first. Distribution
+        // runs before the adopted-relay copy so a list adopted on this very
+        // pass already gets the package.
+        let report = self
+            .routes
+            .distribute_account_records(self.engine.identity(), &self.nostr, false)
+            .await;
+        tracing::debug!(?report, "relay records distributed (foreground)");
+        Self::spread_key_package(&self.routes, &event).await;
         Ok(())
+    }
+
+    /// Copy a freshly built KeyPackage to the write relays of an adopted
+    /// kind-10002 (another client's list that does not name our relays), so
+    /// a peer that follows the user's real list still finds the package.
+    async fn spread_key_package(routes: &RelayRouter, event: &Event) {
+        let adopted = routes.adopted_write_relays();
+        if adopted.is_empty() {
+            return;
+        }
+        let out = routes.publish_to(&adopted, event).await;
+        tracing::info!(
+            accepted = out.accepted.len(),
+            failed = out.failed.len(),
+            "KeyPackage copied to adopted write relays"
+        );
+    }
+
+    /// Distribute our relay lists and profile: look them up, publish
+    /// defaults only where nothing exists, copy to the indexers. Bounded and
+    /// safe to call on every connect — a pass within the last 24h is a
+    /// no-op, and a lookup that reaches no relay publishes nothing.
+    pub async fn distribute_account_records(
+        &self,
+        force: bool,
+    ) -> crate::relay_routes::DistributionReport {
+        self.routes
+            .distribute_account_records(self.engine.identity(), &self.nostr, force)
+            .await
+    }
+
+    /// The route pool's view of a peer: cached relay lists, resolved from
+    /// our relays plus the lookup set when stale.
+    pub async fn peer_routes(&self, peer: PublicKey) -> PeerRoutes {
+        self.routes.resolve_peer_routes(&self.nostr, peer).await
+    }
+
+    /// KeyPackage events for `author`: the Marmot pool first (every Sonar
+    /// peer publishes there, and it is already connected), then the relays
+    /// the peer's own lists name — their kind-10002 write set and any legacy
+    /// kind-10051 — through the route pool. Indexers are not consulted: none
+    /// stores kind 30443.
+    async fn fetch_key_package_events(
+        &self,
+        author: PublicKey,
+        filter: Filter,
+    ) -> Result<Vec<Event>> {
+        let events: Vec<Event> = self
+            .nostr
+            .fetch_events(filter.clone(), FETCH_TIMEOUT)
+            .await?
+            .into_iter()
+            .collect();
+        if !events.is_empty() {
+            return Ok(events);
+        }
+        let routes = self.routes.resolve_peer_routes(&self.nostr, author).await;
+        let relays = self.routes.foreign(routes.key_package_relays());
+        if relays.is_empty() {
+            return Ok(events);
+        }
+        let routed = self.routes.fetch_from(&relays, filter).await;
+        tracing::info!(
+            author = %author.to_hex(),
+            relays = relays.len(),
+            completed = routed.completed,
+            found = routed.events.len(),
+            "KeyPackage looked up on the peer's own relays"
+        );
+        Ok(routed
+            .events
+            .into_iter()
+            .filter(|e| e.pubkey == author)
+            .collect())
     }
 
     /// Like [`Self::publish_key_package`], but the relay send is spawned, not
@@ -2576,10 +2703,24 @@ impl SonarClient {
     pub async fn publish_key_package_background(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone())?;
         let nostr = self.nostr.clone();
+        let routes = self.routes.clone();
+        let identity = self.engine.identity().clone();
         tokio::spawn(async move {
             if let Err(err) = nostr.send_event(&event).await {
                 tracing::warn!(%err, "background KeyPackage publish failed");
             }
+            // Same task, after the KeyPackage: our default lists point at the
+            // relays the package just went to. Off the host's engine queue,
+            // so the lookup round trip never sits ahead of the first drain.
+            let report = routes
+                .distribute_account_records(&identity, &nostr, false)
+                .await;
+            if report.lookup_failed {
+                tracing::warn!("relay records not distributed: lookup reached no relay");
+            } else if !report.skipped_fresh {
+                tracing::info!(?report.actions, "relay records distributed");
+            }
+            Self::spread_key_package(&routes, &event).await;
         });
         Ok(())
     }
@@ -2600,12 +2741,7 @@ impl SonarClient {
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(KEY_PACKAGE_FETCH_LIMIT);
-        let mut events: Vec<Event> = self
-            .nostr
-            .fetch_events(filter, FETCH_TIMEOUT)
-            .await?
-            .into_iter()
-            .collect();
+        let mut events = self.fetch_key_package_events(author, filter).await?;
         events.sort_by_key(|e| std::cmp::Reverse(e.created_at));
         Ok(events)
     }
@@ -2670,7 +2806,7 @@ impl SonarClient {
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
-        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        let events = self.fetch_key_package_events(author, filter).await?;
         events
             .into_iter()
             .max_by_key(|e| e.created_at)
@@ -2688,7 +2824,7 @@ impl SonarClient {
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
-        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        let events = self.fetch_key_package_events(author, filter).await?;
         events
             .into_iter()
             .find(|event| event.id == event_id && event.pubkey == author)
@@ -2713,7 +2849,7 @@ impl SonarClient {
             .author(author)
             .identifier(d)
             .limit(1);
-        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        let events = self.fetch_key_package_events(author, filter).await?;
         events
             .into_iter()
             .filter(|event| event.pubkey == author && event.tags.identifier() == Some(d))
@@ -2872,7 +3008,7 @@ impl SonarClient {
         // instead of publishing blind — never destroy a profile we could
         // not read.
         let me = self.engine.identity().keys().public_key();
-        let current = self.nostr.fetch_metadata(me, FETCH_TIMEOUT).await?;
+        let current = Self::fetch_own_metadata(&self.nostr, &self.routes, me).await?;
         let cache_path = self.own_profile_cache_path();
         let cached = cache_path
             .as_deref()
@@ -2893,8 +3029,58 @@ impl SonarClient {
             }
             return Ok(());
         };
-        self.nostr.set_metadata(&metadata).await?;
+        Self::publish_metadata_everywhere(
+            &self.nostr,
+            &self.routes,
+            self.engine.identity(),
+            &metadata,
+        )
+        .await?;
         Self::persist_own_profile_cache(cache_path.as_deref(), &metadata);
+        Ok(())
+    }
+
+    /// Our current kind-0: newest across our relays and the lookup set. An
+    /// imported identity's profile usually lives on relays we are not on,
+    /// and merging over the wrong (older or missing) copy is the wipe hole
+    /// `resolve_profile_publish` guards against. `Err(NoRelayConnected)`
+    /// when nothing answered at all — never publish over a profile we could
+    /// not read.
+    async fn fetch_own_metadata(
+        nostr: &Client,
+        routes: &RelayRouter,
+        me: PublicKey,
+    ) -> Result<Option<Metadata>> {
+        let filter = Filter::new().author(me).kind(Kind::Metadata);
+        let fetched = routes.lookup(nostr, filter).await;
+        if fetched.completed == 0 && fetched.attempted > 0 {
+            return Err(Error::NoRelayConnected);
+        }
+        Ok(newest_metadata(fetched.events, &me))
+    }
+
+    /// Publish a kind-0 to our relays and copy it to every indexer that
+    /// accepts profiles, so an outbox-model client finds it without sharing
+    /// a relay with us. The indexer copy is best-effort.
+    async fn publish_metadata_everywhere(
+        nostr: &Client,
+        routes: &RelayRouter,
+        identity: &Identity,
+        metadata: &Metadata,
+    ) -> Result<()> {
+        let event = EventBuilder::metadata(metadata)
+            .build(identity.public_key())
+            .sign_with_keys(identity.keys())?;
+        nostr.send_event(&event).await?;
+        let indexers = routes.foreign(routes.config().indexers_for(Kind::Metadata));
+        if !indexers.is_empty() {
+            let out = routes.publish_to(&indexers, &event).await;
+            tracing::info!(
+                accepted = out.accepted.len(),
+                failed = out.failed.len(),
+                "profile copied to indexers"
+            );
+        }
         Ok(())
     }
 
@@ -2916,6 +3102,8 @@ impl SonarClient {
         // + republish must attach the fresh nip05, not a pre-lock snapshot.
         let claimed_handle = self.claimed_handle.clone();
         let me = self.engine.identity().keys().public_key();
+        let identity = self.engine.identity().clone();
+        let routes = self.routes.clone();
         let cache_path = self.own_profile_cache_path();
         let publish_lock = self.profile_publish_lock.clone();
         let name = name.to_string();
@@ -2927,7 +3115,7 @@ impl SonarClient {
             let claimed = claimed_handle.lock().unwrap().clone();
             // Skip (do not publish blind) when the current kind-0 cannot be
             // fetched — the next relay connect retries.
-            let current = match nostr.fetch_metadata(me, FETCH_TIMEOUT).await {
+            let current = match Self::fetch_own_metadata(&nostr, &routes, me).await {
                 Ok(m) => m,
                 Err(err) => {
                     tracing::warn!(%err, "skipping kind-0 republish: current profile fetch failed");
@@ -2951,7 +3139,9 @@ impl SonarClient {
                 }
                 return;
             };
-            if let Err(err) = nostr.set_metadata(&metadata).await {
+            if let Err(err) =
+                Self::publish_metadata_everywhere(&nostr, &routes, &identity, &metadata).await
+            {
                 tracing::warn!(%err, "background profile publish failed");
                 return;
             }
@@ -2963,7 +3153,10 @@ impl SonarClient {
     /// not published one. Used to show a human name/avatar for a Marmot member
     /// instead of a raw npub.
     pub async fn fetch_profile(&self, author: PublicKey) -> Result<Option<Profile>> {
-        let metadata = self.nostr.fetch_metadata(author, FETCH_TIMEOUT).await?;
+        let mut metadata = self.nostr.fetch_metadata(author, FETCH_TIMEOUT).await?;
+        if metadata.is_none() {
+            metadata = self.fetch_profile_via_routes(author).await;
+        }
         Ok(metadata.map(|m| Profile {
             name: m.name,
             display_name: m.display_name,
@@ -2971,6 +3164,25 @@ impl SonarClient {
             picture: m.picture,
             nip05: m.nip05,
         }))
+    }
+
+    /// A peer's kind-0 when our relays have none: their write relays first
+    /// (where they publish), then the lookup set (where profiles get copied).
+    async fn fetch_profile_via_routes(&self, author: PublicKey) -> Option<Metadata> {
+        let routes = self.routes.resolve_peer_routes(&self.nostr, author).await;
+        let relays = self.routes.foreign(
+            routes
+                .write
+                .iter()
+                .chain(self.routes.config().lookup_relays.iter())
+                .cloned(),
+        );
+        if relays.is_empty() {
+            return None;
+        }
+        let filter = Filter::new().author(author).kind(Kind::Metadata);
+        let fetched = self.routes.fetch_from(&relays, filter).await;
+        newest_metadata(fetched.events, &author)
     }
 
     /// The claimed human-readable handle (`name@domain`), if any. Local read —
@@ -3210,11 +3422,36 @@ impl SonarClient {
     /// Start a multi-member Marmot group: fetch each member's KeyPackage,
     /// create the MLS group, and deliver the gift-wrapped welcomes.
     pub async fn start_group(&self, members: Vec<PublicKey>, name: &str) -> Result<GroupId> {
-        let key_packages = self.fetch_key_packages_for_members(members).await?;
-        let creation = self
-            .engine
-            .create_group(name, key_packages, self.relays.clone())?;
+        let key_packages = self.fetch_key_packages_for_members(members.clone()).await?;
+        let relays = self.group_relays_for_members(&members).await;
+        let creation = self.engine.create_group(name, key_packages, relays)?;
         self.publish_group_creation(creation).await
+    }
+
+    /// Relays for a new group: ours, then each invitee's write relays
+    /// (cached by the KeyPackage lookup that just ran), so a member on a
+    /// disjoint relay set still receives what the others publish. Foreign
+    /// relays are kept open on the route pool for the group's sends.
+    async fn group_relays_for_members(&self, members: &[PublicKey]) -> Vec<RelayUrl> {
+        let me = self.identity().public_key();
+        let mut routes = Vec::with_capacity(members.len());
+        for member in members {
+            if *member == me {
+                continue;
+            }
+            routes.push(self.routes.resolve_peer_routes(&self.nostr, *member).await);
+        }
+        let relays = group_relays_for(&self.relays, &routes);
+        let foreign = self.routes.foreign(relays.iter().cloned());
+        if !foreign.is_empty() {
+            self.routes.keep_open(&foreign);
+            tracing::info!(
+                foreign = foreign.len(),
+                total = relays.len(),
+                "group relays include invitee relays"
+            );
+        }
+        relays
     }
 
     /// Start a 1:1 DM group with `peer`: fetch their KeyPackage, create the MLS
@@ -3232,11 +3469,12 @@ impl SonarClient {
             return Ok(existing);
         }
         let key_packages = self.fetch_key_packages_for_members(vec![peer]).await?;
+        let relays = self.group_relays_for_members(&[peer]).await;
         let creation = self.engine.create_group_with_description(
             name,
             SONAR_DIRECT_DM_DESCRIPTION,
             key_packages,
-            self.relays.clone(),
+            relays,
         )?;
         self.publish_group_creation(creation).await
     }
@@ -3348,7 +3586,7 @@ impl SonarClient {
 
         for (member, rumor) in creation.welcomes {
             match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
+                Ok(wrapped) => wrapped_welcomes.push((member, wrapped)),
                 Err(err) => {
                     self.discard_unpublished_group_creation(&group_id);
                     return Err(err);
@@ -3357,8 +3595,11 @@ impl SonarClient {
         }
 
         let mut published_welcomes = 0usize;
-        for wrapped in wrapped_welcomes {
-            if let Err(err) = self.publish_marmot_event(&wrapped, "group welcome").await {
+        for (member, wrapped) in wrapped_welcomes {
+            if let Err(err) = self
+                .publish_welcome(&member, &wrapped, "group welcome")
+                .await
+            {
                 if published_welcomes == 0 {
                     self.discard_unpublished_group_creation(&group_id);
                 } else {
@@ -3407,7 +3648,7 @@ impl SonarClient {
 
         for (member, rumor) in update.welcomes {
             match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
+                Ok(wrapped) => wrapped_welcomes.push((member, wrapped)),
                 Err(err) => {
                     if requires_commit_merge {
                         let _ = self.engine.clear_pending_commit(&group_id);
@@ -3427,9 +3668,9 @@ impl SonarClient {
             return Err(err.into());
         }
 
-        for wrapped in wrapped_welcomes {
+        for (member, wrapped) in wrapped_welcomes {
             if let Err(err) = self
-                .publish_marmot_event(&wrapped, "membership welcome")
+                .publish_welcome(&member, &wrapped, "membership welcome")
                 .await
             {
                 tracing::debug!(
@@ -3454,6 +3695,58 @@ impl SonarClient {
     async fn publish_marmot_event(&self, event: &Event, context: &'static str) -> Result<()> {
         let output = self.nostr.send_event(event).await?;
         require_relay_success(&output, context)
+    }
+
+    /// Deliver a gift-wrapped welcome: to our Marmot relays (the contextual
+    /// hint the spec allows — every Sonar peer reads there) and, through the
+    /// route pool, to the recipient's inbox relays, or their read relays
+    /// when they never published an inbox list. Succeeds when any relay
+    /// accepted it. A recipient with no lists at all still gets the
+    /// Marmot-pool copy, which is exactly what shipped before.
+    async fn publish_welcome(
+        &self,
+        recipient: &PublicKey,
+        wrapped: &Event,
+        context: &'static str,
+    ) -> Result<()> {
+        let routes = self
+            .routes
+            .resolve_peer_routes(&self.nostr, *recipient)
+            .await;
+        let foreign = self.routes.foreign(routes.welcome_relays());
+        let (own, routed) = tokio::join!(self.nostr.send_event(wrapped), async {
+            if foreign.is_empty() {
+                None
+            } else {
+                Some(self.routes.publish_to(&foreign, wrapped).await)
+            }
+        });
+        let routed_accepted = routed.as_ref().is_some_and(|r| r.any_accepted());
+        if let Some(routed) = &routed {
+            tracing::info!(
+                context,
+                recipient = %recipient.to_hex(),
+                inbox = routes.inbox.len(),
+                accepted = routed.accepted.len(),
+                failed = routed.failed.len(),
+                "welcome routed to the recipient's relays"
+            );
+        }
+        match own {
+            Ok(output) => match require_relay_success(&output, context) {
+                Ok(()) => Ok(()),
+                Err(err) if routed_accepted => {
+                    tracing::debug!(%err, "own relays refused the welcome; recipient relays took it");
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            },
+            Err(err) if routed_accepted => {
+                tracing::debug!(%err, "own relays failed the welcome; recipient relays took it");
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 
     async fn ensure_relays_connected(&self, relays: &[RelayUrl]) -> Result<()> {
@@ -4795,6 +5088,11 @@ impl SonarClient {
         let publish_epoch = outbox_publish_epoch.load(Ordering::Relaxed);
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
+        // Group relays outside the Marmot pool — a member on another relay
+        // set, or a group another client created — go through the route
+        // pool in the same first-ack race, so those members receive this.
+        let foreign_relays = self.foreign_group_relays(&group_id_hex);
+        let routes = self.routes.clone();
         let send_inflight = self.send_inflight.clone();
         let reaction_index = self.engine.reaction_index();
         // Count the send before spawn so hosts that gate catch-up / shutdown on
@@ -4858,6 +5156,27 @@ impl SonarClient {
                                 .cloned()
                                 .unwrap_or_else(|| "relay rejected event".to_string())),
                             Err(err) => Err(err.to_string()),
+                        };
+                        let _ = tx.send((outcome, started.elapsed().as_millis() as u64));
+                    });
+                }
+                for url in &foreign_relays {
+                    let url = url.clone();
+                    let routes = routes.clone();
+                    let event = event.clone();
+                    let tx = tx.clone();
+                    let url_log = url.to_string();
+                    tokio::spawn(async move {
+                        let started = Instant::now();
+                        let out = routes.publish_to(std::slice::from_ref(&url), &event).await;
+                        let outcome = if out.any_accepted() {
+                            Ok(url_log)
+                        } else {
+                            Err(out
+                                .failed
+                                .first()
+                                .map(|(_, why)| why.clone())
+                                .unwrap_or_else(|| "route relay rejected event".to_string()))
                         };
                         let _ = tx.send((outcome, started.elapsed().as_millis() as u64));
                     });
@@ -4985,6 +5304,27 @@ impl SonarClient {
             }
         });
         publish_result_rx
+    }
+
+    /// A group's routing relays that are not in the Marmot pool. Empty when
+    /// the group is unknown or its relays are all ours (the common case).
+    fn foreign_group_relays(&self, group_id_hex: &str) -> Vec<RelayUrl> {
+        let Ok(bytes) = hex::decode(group_id_hex) else {
+            return Vec::new();
+        };
+        match self.engine.group_relays(&GroupId::from_slice(&bytes)) {
+            Ok(relays) => {
+                let foreign = self.routes.foreign(relays);
+                if !foreign.is_empty() {
+                    self.routes.keep_open(&foreign);
+                }
+                foreign
+            }
+            Err(err) => {
+                tracing::debug!(%err, group = group_id_hex, "group relays unavailable; Marmot pool only");
+                Vec::new()
+            }
+        }
     }
 
     pub async fn reload_outbox_and_retry(&self) {
@@ -8255,6 +8595,7 @@ impl SonarClient {
         let sticker_result = wipe_sticker_cache_for_db(db_path);
         let handle_result = crate::handles::wipe_handle_state_for_db(db_path);
         let own_profile_result = crate::own_profile::wipe_own_profile_for_db(db_path);
+        let relay_routes_result = crate::relay_routes::wipe_relay_routes_for_db(db_path);
         let media_staging_result = wipe_media_staging_for_db(db_path);
         crate::account_backup::wipe_backup_policy_for_db(db_path);
         crate::account_backup::wipe_index_key_sidecar_for_db(db_path);
@@ -8264,6 +8605,7 @@ impl SonarClient {
         sticker_result?;
         handle_result?;
         own_profile_result?;
+        relay_routes_result?;
         media_staging_result
     }
 
@@ -8633,6 +8975,17 @@ fn sort_marmot_events_in_place(events: &mut [Event]) {
     });
 }
 
+/// The newest kind-0 by `author` among `events`, parsed. Signature and
+/// author are checked because the events may come from relays a peer's own
+/// list pointed us at.
+fn newest_metadata(events: Vec<Event>, author: &PublicKey) -> Option<Metadata> {
+    events
+        .into_iter()
+        .filter(|e| e.kind == Kind::Metadata && e.pubkey == *author && e.verify().is_ok())
+        .max_by_key(|e| (e.created_at, e.id))
+        .and_then(|e| Metadata::try_from(&e).ok())
+}
+
 fn require_relay_success(
     output: &nostr_sdk::pool::Output<EventId>,
     context: &'static str,
@@ -8668,6 +9021,42 @@ fn require_relay_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lookup/indexer set must never enter the Marmot pool: every
+    /// pool-wide `send_event` (group messages, welcomes, descriptors) and
+    /// every pool subscription would otherwise reach relays that exist only
+    /// to serve relay lists. Route traffic goes through the second pool.
+    #[tokio::test]
+    async fn lookup_relays_never_join_the_marmot_pool() {
+        let own = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("own relay starts");
+        let lookup = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("lookup relay starts");
+        let (own_url, lookup_url) = (own.url().await, lookup.url().await);
+        let client = SonarClient::connect_in_memory_with_routes(
+            crate::identity::Identity::generate(),
+            vec![own_url.clone()],
+            RelayRoutesConfig::local(vec![lookup_url.clone()]),
+        )
+        .await
+        .expect("client connects");
+        client
+            .publish_key_package()
+            .await
+            .expect("publish + distribute");
+        let report = client.distribute_account_records(true).await;
+        assert!(!report.lookup_failed, "{report:?}");
+
+        let pool: Vec<RelayUrl> = client.nostr.relays().await.into_keys().collect();
+        assert_eq!(
+            pool,
+            vec![own_url],
+            "lookup relay leaked into the Marmot pool"
+        );
+        assert!(client.relays.iter().all(|u| *u != lookup_url));
+    }
 
     /// "The relays did not answer" must not read as "no backups": the wallet
     /// would then create a new offer over a backed-up one.

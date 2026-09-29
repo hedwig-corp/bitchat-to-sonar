@@ -1044,6 +1044,79 @@ real mint and need the maintainer's approval of the amounts.
   the amount never on screen; Compose ignored that amount and paid the typed
   one.
 
+## Relay routes (#626)
+
+Being found, and finding peers, without sharing a relay. Design and the
+decision table: [`docs/RELAY-ROUTES.md`](RELAY-ROUTES.md). All five run
+headlessly in `core/sonar-core/tests/e2e.rs` (`relay_routes` module) against
+in-process `MockRelay`s; the app-level checks below are for a real build
+against public relays and need a second client (a `sonar-cli` on disjoint
+relays, or any outbox-model Nostr client).
+
+### QA-137 — Two accounts on disjoint relay sets complete a DM round trip
+- **Platforms:** both (core); app check on either.
+- **Steps:** Peer A: `sonar-cli` with `--relay` pointing at one relay only
+  and `SONAR_LOOKUP_RELAYS` at a third relay. Peer B: the app, whose five
+  relays do not include A's. Have A publish its KeyPackage. In the app, start
+  a chat with A's npub, send one message; A replies.
+- **Expect:** the app finds A's KeyPackage without sharing a relay with A
+  (`KeyPackage looked up on the peer's own relays` in the core log), the
+  group's relays include both sides' relays, A receives the welcome and the
+  message on its own relay, and A's reply arrives in the app. The app's
+  Marmot pool still lists only its five relays.
+- **Guard:** `e2e::relay_routes::disjoint_relay_sets_complete_a_dm_round_trip_through_a_lookup_relay`,
+  `client::tests::lookup_relays_never_join_the_marmot_pool`
+- **Origin:** #626 (was #113): every send and lookup went to the five
+  configured relays and nowhere else.
+
+### QA-138 — An imported account keeps the relay lists it already had
+- **Platforms:** both.
+- **Steps:** Take an nsec that already has a kind-10002 and kind-10050 from
+  another client (Damus, Amethyst) naming relays Sonar is not on. Import it
+  (restore), let the app connect, wait a minute.
+- **Expect:** on `purplepag.es` the account's 10002 and 10050 are the same
+  events as before (same ids, same `created_at`): nothing was replaced. The
+  app's KeyPackage is also on the write relay that list names. Any Nostr
+  client that follows the list can start a chat with the account.
+- **Guard:** `e2e::relay_routes::existing_relay_lists_are_kept_and_their_relays_adopted`,
+  `relay_routes::tests::plan_rebroadcasts_a_list_that_names_us_and_adopts_one_that_does_not`
+- **Origin:** #626. Kinds 10002/10050 are replaceable; a default published
+  over the user's real list replaces it network-wide.
+
+### QA-139 — Nothing is published when no lookup relay answers
+- **Platforms:** both.
+- **Steps:** Fresh account. Block the indexers (firewall `purplepag.es`,
+  `user.kindpag.es`, `indexer.coracle.social`, `relay.ditto.pub`,
+  `index.hzrd149.com`) but not the five Marmot relays. Connect.
+- **Expect:** the KeyPackage is published; no 10002/10050/10051 appears on
+  the Marmot relays; the core logs `relay records: lookup reached no relay;
+  publishing nothing`. Unblock, reconnect: the lists appear.
+- **Guard:** `e2e::relay_routes::nothing_is_published_when_no_lookup_relay_answers`
+- **Origin:** #626. "Nobody answered" must never read as "nobody has one".
+
+### QA-140 — Relay records are not republished on every connect
+- **Platforms:** both.
+- **Steps:** Connected account with lists already distributed. Toggle
+  airplane mode three times in a minute (three relay connects).
+- **Expect:** the 10002 on `purplepag.es` keeps its event id and
+  `created_at`; the core logs at most one `record spread` per kind per 24 h.
+- **Guard:** `e2e::relay_routes::records_are_not_republished_within_the_interval_and_rebroadcast_unchanged_after`
+- **Origin:** #626; same churn class as the kind-0 republish fixed in #584.
+
+### QA-141 — A peer without an inbox list still receives the welcome
+- **Platforms:** both.
+- **Steps:** Peer A: an account with a kind-10002 on an indexer but no
+  kind-10050 (a `sonar-cli` started with `SONAR_LOOKUP_RELAYS=none`, then a
+  10002 published for it by hand with `nak`). In the app, start a chat with
+  A.
+- **Expect:** the chat starts; A gets the welcome on its 10002 read relay
+  (`welcome routed to the recipient's relays` with `inbox=0` in the core log)
+  rather than the invite failing.
+- **Guard:** `e2e::relay_routes::welcome_falls_back_to_read_relays_when_the_recipient_has_no_inbox_list`,
+  `relay_routes::tests::welcome_relays_prefer_inbox_then_read_set`
+- **Origin:** #626. The current White Noise runtime hard-fails here
+  (`MissingMemberInboxRoute`); Sonar falls back instead.
+
 ## Core test stability
 
 ### QA-125 — Account-backup unit tests are stable under parallel runs

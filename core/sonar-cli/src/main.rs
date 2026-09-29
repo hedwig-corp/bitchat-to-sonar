@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sonar_core::client::{MediaUpload, SonarClient, DEFAULT_BLOSSOM_SERVER};
 use sonar_core::identity::Identity;
 use sonar_core::marmot::DeliveryState;
+use sonar_core::relay_routes::RelayRoutesConfig;
 use sonar_core::GroupId;
 use sonar_stickers::signal::{
     import_signal_pack_with_options, ImportedSignalPack, ImportedSignalSticker, SignalImportOptions,
@@ -1699,9 +1700,15 @@ impl LoadedConfig {
         ensure_private_dir(&db_dir)?;
         let identity = self.identity()?;
         let db_key = parse_db_key(&self.config.db_key_hex)?;
-        SonarClient::connect(identity, self.relays.clone(), db_dir.join(DB_FILE), db_key)
-            .await
-            .map_err(CliError::Sonar)
+        SonarClient::connect_with_routes(
+            identity,
+            self.relays.clone(),
+            db_dir.join(DB_FILE),
+            db_key,
+            lookup_relays_from_env(),
+        )
+        .await
+        .map_err(CliError::Sonar)
     }
 
     fn identity(&self) -> Result<Identity> {
@@ -1772,6 +1779,26 @@ fn random_hex_32() -> Result<String> {
     getrandom::getrandom(&mut bytes)
         .map_err(|e| CliError::Message(format!("secure random failed: {e}")))?;
     Ok(hex::encode(bytes))
+}
+
+/// Where this CLI looks relay lists up and copies its own. Unset: the public
+/// indexers, like the apps. `SONAR_LOOKUP_RELAYS=` (empty) or `none`: no
+/// lookups and no copies — QA harnesses spinning up throwaway identities
+/// must not litter public indexers. A comma-separated list: those relays,
+/// each accepting every record kind (a local directory relay).
+fn lookup_relays_from_env() -> RelayRoutesConfig {
+    match env::var("SONAR_LOOKUP_RELAYS") {
+        Err(_) => RelayRoutesConfig::public(),
+        Ok(value) if value.trim().is_empty() || value.trim().eq_ignore_ascii_case("none") => {
+            RelayRoutesConfig::disabled()
+        }
+        Ok(value) => RelayRoutesConfig::local(
+            value
+                .split(',')
+                .filter_map(|s| RelayUrl::parse(s.trim()).ok())
+                .collect(),
+        ),
+    }
 }
 
 fn validate_relay_strings(relays: Vec<String>) -> Result<Vec<String>> {
