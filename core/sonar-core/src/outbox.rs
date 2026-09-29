@@ -162,6 +162,18 @@ impl OutboxState {
         self.entries.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn message_ids_for_group(&self, group_id_hex: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .entries
+            .values()
+            .filter(|entry| entry.group_id_hex == group_id_hex)
+            .map(|entry| entry.message_id_hex.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Hold disk writes while a caller mutates many rows. Holds nest; the
     /// last `resume_saves` writes whatever is dirty.
     pub fn suspend_saves(&mut self) {
@@ -438,6 +450,33 @@ impl OutboxState {
             .filter(|entry| entry.attempts >= OUTBOX_RETRY_ATTEMPT_LIMIT)
             .map(|entry| entry.message_id_hex.clone())
             .collect()
+    }
+
+    /// Drop the control rows (local-time share or revoke) whose publish budget
+    /// is exhausted and return their groups. The share's "sent" record is
+    /// written before any relay accepts it, so an abandoned row leaves a
+    /// record claiming a delivery that never happened, and no later pass
+    /// shares into that group again. The caller forgets those records.
+    /// A failed save is logged, not returned: the rows are already out of
+    /// memory, and if they come back from disk on the next start the only
+    /// cost is one more share.
+    pub fn take_abandoned_silent_groups(&mut self) -> Vec<String> {
+        let mut groups: Vec<String> = Vec::new();
+        let before = self.entries.len();
+        self.entries.retain(|_, entry| {
+            let abandoned = entry.silent && entry.attempts >= OUTBOX_RETRY_ATTEMPT_LIMIT;
+            if abandoned && !groups.contains(&entry.group_id_hex) {
+                groups.push(entry.group_id_hex.clone());
+            }
+            !abandoned
+        });
+        if self.entries.len() != before {
+            self.dirty = true;
+            if let Err(err) = self.save_if_dirty() {
+                tracing::debug!(%err, "abandoned control rows not persisted");
+            }
+        }
+        groups
     }
 
     fn save_if_dirty(&mut self) -> Result<()> {
@@ -811,6 +850,51 @@ mod tests {
             reloaded.status_for_message("message"),
             Some(DeliveryState::Pending)
         );
+    }
+
+    #[test]
+    fn abandoned_control_rows_are_taken_and_chat_rows_are_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        for (group, id, silent) in [
+            ("g1", "share-g1", true),
+            ("g1", "revoke-g1", true),
+            ("g2", "share-g2", true),
+            ("g3", "chat-g3", false),
+        ] {
+            outbox
+                .insert_pending(group.into(), id.into(), id.into(), "{}".into(), 1, silent)
+                .expect("pending");
+        }
+        for id in ["share-g1", "revoke-g1", "chat-g3"] {
+            for attempt in 0..OUTBOX_RETRY_ATTEMPT_LIMIT {
+                outbox
+                    .mark_failed_by_message_id(id, "rate-limited".into(), 2 + u64::from(attempt))
+                    .expect("mark failed");
+            }
+        }
+        outbox
+            .mark_failed_by_message_id("share-g2", "rate-limited".into(), 2)
+            .expect("mark failed");
+
+        assert_eq!(outbox.take_abandoned_silent_groups(), vec!["g1".to_owned()]);
+        assert_eq!(outbox.status_for_message("share-g1"), None);
+        assert_eq!(outbox.status_for_message("revoke-g1"), None);
+        assert!(
+            outbox.status_for_message("share-g2").is_some(),
+            "a control row with budget left keeps retrying"
+        );
+        assert!(
+            outbox.status_for_message("chat-g3").is_some(),
+            "a failed chat message stays for the user's Retry"
+        );
+        assert!(
+            outbox.take_abandoned_silent_groups().is_empty(),
+            "taken once"
+        );
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(reloaded.status_for_message("share-g1"), None, "persisted");
     }
 }
 

@@ -6,7 +6,7 @@ use crate::marmot::MarmotEngine;
 use crate::timezone::CachedPeerTimezone;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 pub struct ConversationIndex {
     db: Connection,
@@ -186,6 +186,18 @@ impl ConversationIndex {
                 DELETE FROM timezone_share_sent;",
             )
             .map_err(|e| crate::Error::Storage(format!("index reset peer timezones: {e}")))?;
+        }
+
+        if current < 6 {
+            // A sent-share record is written before any relay accepts the
+            // share, and until v6 nothing cleared it when the publish was
+            // lost. alpha.15 fanned shares out in bursts while relays were
+            // rate-limiting the account, so a record from before v6 can claim
+            // a share that no member ever received — a peer who never sees our
+            // clock, and a sender that never resends. Drop them once: every
+            // sharer re-sends into its active chats, paced by the share queue.
+            tx.execute_batch("DELETE FROM timezone_share_sent;")
+                .map_err(|e| crate::Error::Storage(format!("index reset sent shares: {e}")))?;
         }
 
         // Never lower a stamp a newer build wrote: its extra tables are its
@@ -1000,6 +1012,45 @@ pub(crate) mod tests {
         assert_eq!(
             reopened.timezone_shares_sent().unwrap(),
             vec![("g1".to_owned(), "Asia/Tokyo".to_owned(), 4)]
+        );
+    }
+
+    #[test]
+    fn v6_drops_sent_share_records_written_before_it_once() {
+        // 2026-09-28, a real iPhone: its v5 record for the chat with a Pixel
+        // claimed a share the Pixel never received, so every pass found the
+        // chat `due=0` and the Pixel never showed the iPhone's clock.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x56u8; 32];
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        idx.record_timezone_share_sent("pixel-chat", "America/Los_Angeles", 3)
+            .unwrap();
+        idx.db
+            .execute_batch(
+                "DELETE FROM schema_version;
+                 INSERT INTO schema_version(version) VALUES (5);",
+            )
+            .unwrap();
+        drop(idx);
+
+        let upgraded = ConversationIndex::open(&path, key).unwrap();
+        assert!(
+            upgraded.timezone_shares_sent().unwrap().is_empty(),
+            "a pre-v6 record may claim a share nobody received"
+        );
+        assert_eq!(stamped_version(&upgraded), 6);
+        upgraded
+            .record_timezone_share_sent("pixel-chat", "America/Los_Angeles", 3)
+            .unwrap();
+        drop(upgraded);
+
+        let reopened = ConversationIndex::open(&path, key).unwrap();
+        assert_eq!(
+            reopened.timezone_shares_sent().unwrap(),
+            vec![("pixel-chat".to_owned(), "America/Los_Angeles".to_owned(), 3)],
+            "the reset runs once: a v6 record survives the next open"
         );
     }
 
