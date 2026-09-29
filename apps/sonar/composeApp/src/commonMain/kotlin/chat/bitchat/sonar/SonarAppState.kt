@@ -7,6 +7,11 @@ import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.backup.AccountBackupOutcome
 import chat.bitchat.sonar.backup.AutoBackupNetworkPolicy
 import chat.bitchat.sonar.backup.isNetworkMetered
+import chat.bitchat.sonar.chatlist.ChatListCore
+import chat.bitchat.sonar.chatlist.ChatListPresenter
+import chat.bitchat.sonar.chatlist.ChatListRepository
+import chat.bitchat.sonar.chatlist.ChatListSources
+import chat.bitchat.sonar.chatlist.SonarCoreChatListCore
 import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.store.MessageMerge
 import chat.bitchat.sonar.store.MessageStore
@@ -119,8 +124,6 @@ private const val NOTIFICATION_SEEN_MESSAGE_LIMIT = BACKGROUND_TRANSCRIPT_SCAN_L
 private const val BLANK_TRANSCRIPT_RETRY_START_MS = 100L
 private const val BLANK_TRANSCRIPT_RETRY_MAX_STEP_MS = 800L
 private const val BLANK_TRANSCRIPT_RETRY_BUDGET_MS = 8_000L
-private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
-private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 
 /** Backoff before rebuilding an attach that an invalidate superseded mid-flight.
  *  Short on purpose — the user is back in the foreground and the sockets we just
@@ -844,7 +847,10 @@ data class MarmotRowModel(
     val sub: String,
     val tsSecs: Long,
     val verified: Boolean,
-    val unread: Boolean,
+    /** Every Marmot group this row folds (duplicate direct groups for a 1:1,
+     *  the chat itself otherwise): the set its unread badge sums over and its
+     *  open read-marks. */
+    val groupIds: List<String>,
     val pending: Boolean,
     val multiMember: Boolean,
 )
@@ -859,7 +865,13 @@ class SonarAccountRestoreException(
     cause: Throwable? = null,
 ) : Exception(message, cause)
 
-class SonarAppState(private val scope: CoroutineScope) {
+class SonarAppState internal constructor(
+    private val scope: CoroutineScope,
+    /** The chat list's core seam; tests pass a fake. */
+    private val chatListCore: ChatListCore,
+) {
+    constructor(scope: CoroutineScope) : this(scope, SonarCoreChatListCore)
+
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
     private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
     private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob)
@@ -908,8 +920,26 @@ class SonarAppState(private val scope: CoroutineScope) {
     var homeMessagesHydrated by mutableStateOf(false)
         private set
     private var localCoreReady = false
-    var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
-        private set
+    /** The chat list's local data layer (rows, snapshot, unread), moved out of
+     *  this class behind [ChatListCore]. Constructed before anything reads
+     *  [chats]. */
+    internal val chatList = ChatListRepository(
+        core = chatListCore,
+        scope = scope,
+        initialChats = initialChatSnapshot.first,
+        initialMessagesByChat = initialChatSnapshot.second,
+        initialLatestByChat = initialChatSnapshotLatest,
+        viewingGroupIds = {
+            (screen as? Screen.Chat)?.id
+                ?.let { transcriptGroupIds(it) }
+                .orEmpty()
+                .toSet()
+        },
+        reload = { refreshChatsInner() },
+    )
+    var chats: List<SonarChat>
+        get() = chatList.chats
+        private set(value) { chatList.chats = value }
     /** Real MLS group id for Note to Self once [ensureNoteToSelf] completes. */
     private var noteToSelfGroupId by mutableStateOf<String?>(null)
     /** Localized row title, resolved once off the render path (getString suspends). */
@@ -926,23 +956,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     var systemTimeZoneId by mutableStateOf(currentSystemTimeZoneId())
         private set
     private var lastSharedSystemTimezone: String? = null
-    /** Monotonic counter bumped whenever [chatSnapshotMessagesByChat] is
-     *  reassigned. Feeds the [visibleChats] memo key so the dedupe ordering
-     *  (which depends on per-chat latest ts) re-runs when the snapshot changes. */
-    private var snapshotVersion = 0
-    private var chatSnapshotMessagesByChatBacking: Map<String, List<SonarMsg>> = initialChatSnapshot.second
+    /** Bounded newest rows per group ([ChatListRepository.messagesByChat]).
+     *  Reassignment bumps [ChatListRepository.messagesVersion], which feeds the
+     *  [visibleChats] memo key so the dedupe ordering (which depends on per-chat
+     *  latest ts) re-runs when the snapshot changes. */
     private var chatSnapshotMessagesByChat: Map<String, List<SonarMsg>>
-        get() = chatSnapshotMessagesByChatBacking
-        set(value) {
-            if (value !== chatSnapshotMessagesByChatBacking) {
-                chatSnapshotMessagesByChatBacking = value
-                snapshotVersion++
-            }
-        }
+        get() = chatList.messagesByChat
+        set(value) { chatList.messagesByChat = value }
     /** Thread-style local sort metadata restored before the encrypted core opens.
      *  Message bodies remain in the core database; this map only prevents the
      *  mixed mesh/Marmot Home list from treating every restored Marmot row as 0. */
-    private var chatSnapshotLatestByChat: Map<String, Long> = initialChatSnapshotLatest
+    private var chatSnapshotLatestByChat: Map<String, Long>
+        get() = chatList.latestByChat
+        set(value) { chatList.latestByChat = value }
 
     private fun localLatestTs(chatId: String): Long =
         chatSnapshotMessagesByChat[chatId]?.lastOrNull()?.tsSecs
@@ -1325,16 +1351,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun reloadNewestAfterSendIfNeeded(chatId: String) {
         if (canLoadNewestMessages(chatId)) scope.launch { loadNewestMessages(chatId) }
     }
-    var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
-        private set
-
-    /**
-     * In-flight mark-read suppress only. Summary refresh must not restore
-     * badges while `markConversationRead` is still running. Viewing suppress
-     * is applied ephemerally in [applyUnreadCounts] from the open chat id —
-     * never stored here (storing it let prune keep failed marks forever).
-     */
-    private val unreadSuppressGroupIds = linkedSetOf<String>()
+    /** Unread count per Marmot group id ([ChatListRepository.unreadByChat]). */
+    val unreadByChat: Map<String, Long> get() = chatList.unreadByChat
 
     /** Unread count per chat captured at open time — BEFORE opening zeroes the
      *  core unread counter — so the transcript can anchor at the first unread
@@ -1399,7 +1417,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatUnreadAnchor = emptyMap()
         openChatJumpMessageId = emptyMap()
         hydratedTranscripts = emptySet()
-        unreadSuppressGroupIds.clear()
+        chatList.clearUnreadSuppressions()
         // Every caller is a full teardown (account wipe, eraseAllChats,
         // restoreAccount). Echoes now outlive their first reconcile (R-025),
         // so a ledger that survives the wipe would render a pre-erase
@@ -1410,27 +1428,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
-    private fun markGroupsRead(groupIds: Collection<String>) {
-        if (groupIds.isEmpty()) return
-        val marked = groupIds.toSet()
-        unreadSuppressGroupIds.addAll(marked)
-        unreadByChat = unreadByChat - marked
-        scope.launch {
-            for (groupId in marked) {
-                runCatching { SonarCore.markConversationRead(groupId) }
-            }
-            // End in-flight suppress for this batch, then reconcile from core.
-            // Open-session suppress is re-applied inside applyUnreadCounts so a
-            // failed mark (or a message that landed after mark) cannot hide a
-            // real badge for the rest of the process.
-            val summaries = runCatching { SonarCore.conversationSummaries() }
-                .getOrNull()
-            unreadSuppressGroupIds.removeAll(marked)
-            // null = FFI failure — keep the current map (do not wipe every badge).
-            // emptyList() is a real empty inbox and must clear badges.
-            if (summaries != null) applyUnreadCounts(summaries)
-        }
-    }
+    private fun markGroupsRead(groupIds: Collection<String>) = chatList.markRead(groupIds)
 
     /**
      * Chats whose async local hydrate has published for the CURRENT open.
@@ -1462,7 +1460,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      * so it lands on the true tail instead of the BLE tail (see [openDm]).
      *
      * Synthetic chat-list placeholders are stripped: only the newest
-     * [LOCAL_SUMMARY_CHAT_LIMIT] chats carry real rows here, and a placeholder's
+     * [chat.bitchat.sonar.chatlist.LOCAL_SUMMARY_CHAT_LIMIT] chats carry real rows here, and a placeholder's
      * id can never dedupe against the real row the async page brings, so
      * seeding one renders a permanent duplicate bubble. A chat without real
      * cached rows simply gets no seed and settles via the catch-up gate.
@@ -1527,16 +1525,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  cycle collapse to a single trailing run (Signal-style: react to database
      *  invalidation, don't busy-poll). */
     private val housekeepingTrigger = Channel<Unit>(Channel.CONFLATED)
-    private val refreshMutex = Mutex()
     private val meshPersistenceMutex = Mutex()
     /** Match Apple's sendChain: preserve composer order across text, sticker,
      * control, receipt, and queued Marmot sends without serializing downloads. */
     private val marmotSendMutex = Mutex()
     private var marmotAccountGeneration = 0L
     private var marmotAccountMutationSuspended = false
-    private var refreshRunning = false
-    private var refreshPending = false
-    private var refreshCompletion: CompletableDeferred<Unit>? = null
     /** Ids of ☎CALL control messages already routed to the engine (dedup). */
     private val scannedCall = mutableSetOf<String>()
     /** Per-chat high-water mark of the newest message ts we have already fetched
@@ -2156,7 +2150,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingChatNpubs = pendingMarmotChatNpubs.mapValues { it.value.peerNpub },
             pendingGroupIds = pendingMarmotGroups.keys,
             socialVersion = socialVersion,
-            snapshotVersion = snapshotVersion,
+            snapshotVersion = chatList.messagesVersion,
             ownNpub = npub,
             holdVersion = holdInputsVersion,
             noteToSelfGroupId = noteToSelfGroupId,
@@ -5801,22 +5795,25 @@ class SonarAppState(private val scope: CoroutineScope) {
     // so a home paint was O(chats²) plus a per-row disk read for verify. These
     // are now precomputed ONCE per input change (peer-key grouping built a
     // single time) and read O(1) by the row via [marmotRow].
+    //
+    // Unread is deliberately NOT an input: the model carries each row's folded
+    // [MarmotRowModel.groupIds] and ChatListPresenter sums the live unread map
+    // over them, so a badge change (every arrival, every mark-read) no longer
+    // rebuilds every row model.
     private var marmotRowsKey: VisibleChatsKey? = null
-    private var marmotRowsUnread: Map<String, Long>? = null
     private var marmotRowsProfiles: Map<String, SonarProfile>? = null
     private var marmotRowsVerified = -1
     private var marmotRowsCache: Map<String, MarmotRowModel> = emptyMap()
 
     private fun marmotRowModels(): Map<String, MarmotRowModel> {
         val vkey = currentVisibleChatsKey()
-        val unread = unreadByChat
         val profiles = profilesByNpub
         // Reassigned-map identity (===) detects change without hashing entries.
-        if (marmotRowsKey == vkey && marmotRowsUnread === unread &&
+        if (marmotRowsKey == vkey &&
             marmotRowsProfiles === profiles && marmotRowsVerified == verifiedVersion
         ) return marmotRowsCache
         val models = computeMarmotRowModels(visibleChats)
-        marmotRowsKey = vkey; marmotRowsUnread = unread
+        marmotRowsKey = vkey
         marmotRowsProfiles = profiles; marmotRowsVerified = verifiedVersion
         marmotRowsCache = models
         return models
@@ -5849,8 +5846,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // a freshly-started chat under older history (iOS dmRows parity).
                 tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
                 verified = ids.any { it in verifiedChatIds },
-                unread = !isNoteToSelfChat(chat, noteToSelfGroupId) &&
-                    ids.sumOf { unreadByChat[it] ?: 0L } > 0,
+                groupIds = ids,
                 pending = pending && !isNoteToSelfChat(chat, noteToSelfGroupId),
                 multiMember = !isNoteToSelfChat(chat, noteToSelfGroupId) &&
                     isMultiMemberChat(chat.id),
@@ -5858,9 +5854,47 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** What [ChatListPresenter] reads from and asks of this state. */
+    internal val chatListSources: ChatListSources by lazy { AppChatListSources() }
+
+    /** The phone Home Messages list presenter. Stateless: its state lives in
+     *  the calling composition. */
+    internal val chatListPresenter by lazy { ChatListPresenter(chatList, chatListSources) }
+
+    /** [ChatListPresenter]'s view of this state: the conversation projection
+     *  the presenter does not own yet (folding, dedupe, pending, titles, mute,
+     *  presence). An inner class so the helpers behind it stay private. */
+    private inner class AppChatListSources : ChatListSources {
+        override val homeMessagesHydrated: Boolean get() = this@SonarAppState.homeMessagesHydrated
+        override val catchingUp: Boolean get() = syncing
+        override val groupInvites: List<SonarGroupInvite> get() = this@SonarAppState.groupInvites
+        override val meshRows: List<MeshDmRow> get() = meshDmRows
+        override val marmotChats: List<SonarChat> get() = visibleChats
+        override val noteToSelfGroupId: String? get() = this@SonarAppState.noteToSelfGroupId
+        override fun marmotRow(chatId: String): MarmotRowModel = this@SonarAppState.marmotRow(chatId)
+        override fun openChat(chat: SonarChat) = this@SonarAppState.openChat(chat)
+        override fun openDm(peerId: String, name: String) = this@SonarAppState.openDm(peerId, name)
+        override fun acceptGroupInvite(inviteId: String) = this@SonarAppState.acceptGroupInvite(inviteId)
+        override fun declineGroupInvite(inviteId: String) = this@SonarAppState.declineGroupInvite(inviteId)
+        override fun muteChat(conversationId: String, durationSecs: Long?) =
+            this@SonarAppState.muteChat(conversationId, durationSecs)
+        override fun unmuteChat(conversationId: String) = this@SonarAppState.unmuteChat(conversationId)
+        override fun deleteMarmotChat(chatId: String) = this@SonarAppState.deleteMarmotChat(chatId)
+        override fun deleteMeshDm(peerId: String) = this@SonarAppState.deleteMeshDm(peerId)
+    }
+
     /** O(1) precomputed home-row view model for [chatId] (see [marmotRowModels]). */
     fun marmotRow(chatId: String): MarmotRowModel =
-        marmotRowModels()[chatId] ?: MarmotRowModel(chatId, chatId, "Tap to open", 0L, false, false, false, false)
+        marmotRowModels()[chatId] ?: MarmotRowModel(
+            id = chatId,
+            title = chatId,
+            sub = "Tap to open",
+            tsSecs = 0L,
+            verified = false,
+            groupIds = listOf(chatId),
+            pending = false,
+            multiMember = false,
+        )
 
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
@@ -7534,9 +7568,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 notificationLatestSecs.remove(it)
                 stagedChangedPages.remove(it)
                 failedChangedPageReads.remove(it)
-                unreadByChat = unreadByChat - it
                 discardRetainedTranscript(it)
             }
+            chatList.forgetUnread(foldedGroupIdsToDelete)
             persistGroupFolds()
             clearChatSnapshot()
         }
@@ -12328,9 +12362,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      */
     /**
      * Seeds a Note to Self group next to [others], as the refresh path leaves it
-     * once ensure has answered. `chats`, `unreadByChat` and the Note to Self id
-     * have private setters; the pin and the unread gate can only be pinned at
-     * their real call sites with all three in place.
+     * once ensure has answered, on a hydrated Home. `chats`, `unreadByChat`, the
+     * Note to Self id and the hydration flag have private setters; the pin and
+     * the unread gate can only be pinned at their real call site (the chat-list
+     * presenter) with all of them in place.
      */
     internal fun seedNoteToSelfForTest(
         noteId: String,
@@ -12340,8 +12375,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     ) {
         chats = listOf(SonarChat(id = noteId, name = "Note to Self", members = listOf(npub))) + others
         noteToSelfGroupId = noteId
-        unreadByChat = unread
+        chatList.seedUnreadForTest(unread)
         chatSnapshotLatestByChat = latestSecs
+        homeMessagesHydrated = true
+    }
+
+    /** Test seam: a Home whose local model is coherent. [boot] needs a real
+     *  core to get there, so tests of the chat-list call site set it here. */
+    internal fun markHomeHydratedForTest() {
+        homeMessagesHydrated = true
     }
 
     internal fun seedCallableChatForTest(chatId: String, peerNpub: String, descriptor: SonarDescriptor) {
@@ -12973,77 +13015,18 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun clearChatSnapshot() {
-        chatSnapshotMessagesByChat = emptyMap()
-        chatSnapshotLatestByChat = emptyMap()
+        chatList.clearSnapshot()
         SonarCore.saveBlob(CHAT_SNAPSHOT_BLOB_KEY, "")
     }
 
     /** Coalesce concurrent refresh requests: one owner refreshes, other callers
-     *  await the same completion, and burst arrivals become one trailing pass. */
-    private suspend fun refreshChats() {
-        var owner = false
-        var completion: CompletableDeferred<Unit>? = null
-        refreshMutex.withLock {
-            if (refreshRunning) {
-                refreshPending = true
-                completion = refreshCompletion ?: CompletableDeferred<Unit>().also { refreshCompletion = it }
-            } else {
-                refreshRunning = true
-                completion = CompletableDeferred()
-                refreshCompletion = completion
-                owner = true
-            }
-        }
-        val currentCompletion = completion ?: return
-        if (!owner) {
-            currentCompletion.await()
-            return
-        }
-
-        var completed = false
-        var failure: Throwable? = null
-        try {
-            while (true) {
-                refreshChatsInner()
-                val finishedCompletion = refreshMutex.withLock {
-                    if (refreshPending) {
-                        refreshPending = false
-                        null
-                    } else {
-                        refreshRunning = false
-                        refreshCompletion.also { refreshCompletion = null }
-                    }
-                }
-                if (finishedCompletion != null) {
-                    finishedCompletion.complete(Unit)
-                    completed = true
-                    return
-                }
-            }
-        } catch (t: Throwable) {
-            failure = t
-            throw t
-        } finally {
-            if (!completed) {
-                withContext(NonCancellable) {
-                    val failedCompletion = refreshMutex.withLock {
-                        refreshRunning = false
-                        refreshPending = false
-                        refreshCompletion.also { refreshCompletion = null }
-                    }
-                    if (failedCompletion != null) {
-                        val error = failure
-                        if (error == null) failedCompletion.complete(Unit)
-                        else failedCompletion.completeExceptionally(error)
-                    }
-                }
-            }
-        }
-    }
+     *  await the same completion, and burst arrivals become one trailing pass
+     *  ([ChatListRepository.refresh]). */
+    private suspend fun refreshChats() = chatList.refresh()
 
     private suspend fun refreshChatsInner() {
         val previousOrder = chats.map { it.id }
-        var loadedChats = SonarCore.chats()
+        var loadedChats = chatList.loadChats()
         // Note to Self is a local solo MLS group, so ensuring it never waits on
         // relays. Ensure only while its id is unknown or gone from the list
         // (deleted, wiped): each ensure reads the group list, and this refresh
@@ -13059,38 +13042,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             runCatching { SonarCore.ensureNoteToSelf() }.onSuccess { id ->
                 noteToSelfGroupId = id
-                if (loadedChats.none { it.id == id }) loadedChats = SonarCore.chats()
+                if (loadedChats.none { it.id == id }) loadedChats = chatList.loadChats()
             }
         }
         val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
-        val activeIds = localChats.mapTo(hashSetOf()) { it.id }
-        val summaries = if (localChats.isEmpty()) emptyList() else runCatching {
-            SonarCore.conversationSummaries()
-        }.getOrDefault(emptyList())
-        val pages = if (localChats.isEmpty()) emptyList() else runCatching {
-                SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
-        }.getOrDefault(emptyList())
-        val hydration = hydrateLocalConversationRows(
-            activeChatIds = activeIds,
-            existingMessagesByChat = chatSnapshotMessagesByChat,
-            existingLatestByChat = chatSnapshotLatestByChat,
-            summaries = summaries,
-            pages = pages,
-        )
-
-        // Publish one coherent local snapshot. Previously `chats = loadedChats`
-        // rendered the core's raw order, then a suspension in
-        // `recentMessagePages()` let Compose paint again before the recency sort.
-        // That two-step hydrate was the visible startup reorder.
-        chatSnapshotMessagesByChat = hydration.messagesByChat
-        chatSnapshotLatestByChat = hydration.latestByChat
-        chats = orderChatsByLocalRecency(
-            chats = localChats,
-            latestSecs = { hydration.latestByChat[it] ?: 0L },
-            previousOrder = previousOrder,
-        )
+        chatList.publishLocal(localChats, previousOrder)
         persistChatSnapshot()
-        refreshUnreadCounts()
+        chatList.refreshUnread()
         for (c in chats) {
             c.members.forEach {
                 if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
@@ -13134,28 +13092,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    @OptIn(kotlinx.coroutines.FlowPreview::class)
-    /** Per-key debounce jobs for [collectConversationChanges]: rapid changes to
-     *  the SAME chat coalesce, but a burst across DIFFERENT chats no longer
-     *  drops the losers (a stream-wide `debounce` kept only the last groupId,
-     *  deferring the others' call/pay ring to a housekeeping cycle). */
-    private val conversationChangeJobs = mutableMapOf<String, Job>()
-    private var conversationChangesCollecting = false
-
-    private fun collectConversationChanges() {
-        if (conversationChangesCollecting) return
-        conversationChangesCollecting = true
-        SonarCore.conversationChanged
-            .onEach { groupIdHex ->
-                conversationChangeJobs.remove(groupIdHex)?.cancel()
-                conversationChangeJobs[groupIdHex] = scope.launch {
-                    delay(50)
-                    handleConversationChange(groupIdHex)
-                    conversationChangeJobs.remove(groupIdHex)
-                }
-            }
-            .launchIn(scope)
-    }
+    /** Handle core conversation changes, each chat debounced on its own
+     *  ([ChatListRepository.collectChanges]). Idempotent. */
+    private fun collectConversationChanges() =
+        chatList.collectChanges { groupIdHex -> handleConversationChange(groupIdHex) }
 
     private suspend fun handleConversationChange(groupIdHex: String) {
                 // PRIMARY delivery path: refresh + process the CHANGED chat
@@ -13214,32 +13154,6 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // counts, profile/presence/mesh upkeep) to the conflated
                 // housekeeping consumer instead of doing it inline per event.
                 requestHousekeeping()
-    }
-
-    private suspend fun refreshUnreadCounts() {
-        // null = FFI failure — keep the current map (same guard as markGroupsRead).
-        val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
-            ?: return
-        applyUnreadCounts(summaries)
-    }
-
-    private fun applyUnreadCounts(summaries: List<SonarConversationSummary>) {
-        // Viewing suppress is session-scoped and must NOT enter
-        // unreadSuppressGroupIds. Prune keeps still-unread in-flight ids; if
-        // openIds were folded into that set, a failed mark while viewing would
-        // leave the group suppressed forever after the user leaves (goose/glm
-        // NO-GO on #383). iOS keeps the same split via viewingUnreadGroupIds.
-        val openIds = (screen as? Screen.Chat)?.id
-            ?.let { transcriptGroupIds(it) }
-            .orEmpty()
-            .toSet()
-        val pruned = pruneConfirmedUnreadSuppressions(
-            unreadSuppressGroupIds.toSet(),
-            summaries,
-        )
-        unreadSuppressGroupIds.clear()
-        unreadSuppressGroupIds.addAll(pruned)
-        unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds)
     }
 
     /** Request a housekeeping pass. Conflated: many requests within one in-flight
@@ -13343,7 +13257,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val summaryByChat = summaries.associateBy { it.groupIdHex }
         // Only publish unread on a successful probe — getOrDefault(emptyList())
         // on failure would wipe every badge until the next cycle.
-        if (summariesResult.isSuccess) applyUnreadCounts(summaries)
+        if (summariesResult.isSuccess) chatList.applyUnread(summaries)
         // Incremental scan: only chats whose newest ts moved past the watermark
         // need a page fetch + ☎CALL / pay re-scan. Everything else is skipped —
         // this replaces the old O(chats) messagesPage()+re-parse every 4 s.
