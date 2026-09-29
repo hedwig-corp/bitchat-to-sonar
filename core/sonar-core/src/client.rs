@@ -3450,7 +3450,7 @@ impl SonarClient {
         let relays = group_relays_for(&self.relays, &routes);
         let foreign = self.routes.foreign(relays.iter().cloned());
         if !foreign.is_empty() {
-            self.routes.keep_open(&foreign);
+            self.routes.keep_open(&foreign).await;
             tracing::info!(
                 foreign = foreign.len(),
                 total = relays.len(),
@@ -5133,6 +5133,9 @@ impl SonarClient {
             let mut event = event;
             let mut group_id_hex = group_id_hex;
             let mut inflight_held = true;
+            if !foreign_relays.is_empty() {
+                routes.keep_open(&foreign_relays).await;
+            }
             // One task owns the publish + core auto-retry loop so a transient
             // outage self-heals without waiting for host idle
             // `ensure_subscriptions` (which never runs while the chat keeps
@@ -5342,9 +5345,6 @@ impl SonarClient {
                 // fan-out and the sticky set to the routing maximum.
                 let mut foreign = self.routes.foreign(relays);
                 foreign.truncate(crate::relay_routes::MAX_GROUP_RELAYS);
-                if !foreign.is_empty() {
-                    self.routes.keep_open(&foreign);
-                }
                 foreign
             }
             Err(err) => {

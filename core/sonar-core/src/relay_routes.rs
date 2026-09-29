@@ -645,8 +645,14 @@ pub struct RelayRouter {
     peer_routes_path: Option<PathBuf>,
     records: Mutex<RelayRecordsDisk>,
     peer_routes: Mutex<PeerRoutesDisk>,
-    /// Route relays a caller wants kept open (group relays of active chats).
-    sticky: Mutex<HashSet<RelayUrl>>,
+    /// Route relays a caller wants kept open (group relays of active chats),
+    /// with the tick they were last asked for: least recently asked is
+    /// evicted first when the set is full.
+    sticky: Mutex<HashMap<RelayUrl, u64>>,
+    sticky_clock: std::sync::atomic::AtomicU64,
+    /// Sidecar writers queue here so two finishing together cannot persist
+    /// the older map last. The in-memory state is never behind this lock.
+    sidecar_write_lock: Mutex<()>,
     /// Route relays in use by in-flight operations, so one operation's
     /// release cannot close a socket another still needs.
     in_use: Mutex<HashMap<RelayUrl, usize>>,
@@ -672,6 +678,10 @@ impl RelayRouter {
         if peers.version != PEER_ROUTES_VERSION {
             peers = PeerRoutesDisk::default();
         }
+        let config = RelayRoutesConfig {
+            lookup_relays: dedupe(config.lookup_relays),
+            indexers: config.indexers,
+        };
         Self {
             nostr: Client::default(),
             config,
@@ -680,7 +690,9 @@ impl RelayRouter {
             peer_routes_path,
             records: Mutex::new(records),
             peer_routes: Mutex::new(peers),
-            sticky: Mutex::new(HashSet::new()),
+            sticky: Mutex::new(HashMap::new()),
+            sticky_clock: std::sync::atomic::AtomicU64::new(0),
+            sidecar_write_lock: Mutex::new(()),
             in_use: Mutex::new(HashMap::new()),
             distribution_lock: tokio::sync::Mutex::new(()),
         }
@@ -699,18 +711,48 @@ impl RelayRouter {
     }
 
     /// Keep these route relays connected across operations (a group whose
-    /// relays are not ours). Idempotent.
-    pub fn keep_open(&self, urls: &[RelayUrl]) {
-        let mut sticky = self.sticky.lock().unwrap();
-        for url in urls {
-            if sticky.contains(url) {
-                continue;
+    /// relays are not ours). Idempotent. Bounded: past the cap the least
+    /// recently asked-for relay is evicted, and leaves the pool unless an
+    /// operation is using it right now (then its release removes it).
+    pub async fn keep_open(&self, urls: &[RelayUrl]) {
+        let evicted: Vec<RelayUrl> = {
+            let mut sticky = self.sticky.lock().unwrap();
+            let mut evicted = Vec::new();
+            for url in dedupe(urls.iter().cloned()) {
+                let tick = self
+                    .sticky_clock
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(last) = sticky.get_mut(&url) {
+                    *last = tick;
+                    continue;
+                }
+                while sticky.len() >= MAX_STICKY_ROUTE_RELAYS {
+                    let Some(oldest) = sticky
+                        .iter()
+                        .min_by_key(|(_, t)| **t)
+                        .map(|(u, _)| u.clone())
+                    else {
+                        break;
+                    };
+                    sticky.remove(&oldest);
+                    evicted.push(oldest);
+                }
+                sticky.insert(url, tick);
             }
-            if sticky.len() >= MAX_STICKY_ROUTE_RELAYS {
-                tracing::warn!(relay = %url, cap = MAX_STICKY_ROUTE_RELAYS, "route relay not kept open: sticky set full");
-                continue;
+            evicted
+        };
+        let idle: Vec<RelayUrl> = {
+            let in_use = self.in_use.lock().unwrap();
+            evicted
+                .into_iter()
+                .filter(|u| in_use.get(u).copied().unwrap_or(0) == 0)
+                .collect()
+        };
+        for url in idle {
+            tracing::info!(relay = %url, "route relay no longer kept open");
+            if let Err(err) = self.nostr.remove_relay(url.clone()).await {
+                tracing::debug!(%err, relay = %url, "evicted route relay remove failed");
             }
-            sticky.insert(url.clone());
         }
     }
 
@@ -823,9 +865,18 @@ impl RelayRouter {
             let sticky = self.sticky.lock().unwrap();
             urls.iter()
                 .filter(|url| {
-                    let count = in_use.entry((*url).clone()).or_insert(0);
-                    *count = count.saturating_sub(1);
-                    *count == 0 && !sticky.contains(*url)
+                    let zero = {
+                        let count = in_use.entry((*url).clone()).or_insert(0);
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    };
+                    if zero {
+                        // No entry outlives its last user: the map stays the
+                        // size of the relays in flight, not of every relay
+                        // ever touched.
+                        in_use.remove(*url);
+                    }
+                    zero && !sticky.contains_key(*url)
                 })
                 .cloned()
                 .collect()
@@ -894,6 +945,15 @@ impl RelayRouter {
         out
     }
 
+    /// Write a sidecar from a snapshot taken at this writer's turn. Writers
+    /// serialize on `sidecar_write_lock`, and each serializes the *current*
+    /// state under the data lock only briefly, so the last write always
+    /// carries the newest map and readers never wait on the disk.
+    fn persist(&self, path: Option<&Path>, snapshot: impl FnOnce() -> Option<Vec<u8>>) {
+        let _turn = self.sidecar_write_lock.lock().unwrap();
+        write_sidecar(path, snapshot());
+    }
+
     /// One filter against our own relays (through the Marmot pool) and the
     /// lookup set (through the route pool), merged. `completed` counts both.
     pub async fn lookup(&self, main: &Client, filter: Filter) -> RouteFetch {
@@ -948,9 +1008,10 @@ impl RelayRouter {
                 None => break,
             }
         }
-        let bytes = sidecar_bytes(&*cache);
         drop(cache);
-        write_sidecar(self.peer_routes_path.as_deref(), bytes);
+        self.persist(self.peer_routes_path.as_deref(), || {
+            sidecar_bytes(&*self.peer_routes.lock().unwrap())
+        });
     }
 
     /// Forget a cached peer, so the next resolve re-reads the relays. Used
@@ -958,9 +1019,10 @@ impl RelayRouter {
     pub fn forget_peer_routes(&self, peer: &PublicKey) {
         let mut cache = self.peer_routes.lock().unwrap();
         if cache.peers.remove(&peer.to_hex()).is_some() {
-            let bytes = sidecar_bytes(&*cache);
             drop(cache);
-            write_sidecar(self.peer_routes_path.as_deref(), bytes);
+            self.persist(self.peer_routes_path.as_deref(), || {
+                sidecar_bytes(&*self.peer_routes.lock().unwrap())
+            });
         }
     }
 
@@ -1169,15 +1231,28 @@ impl RelayRouter {
             };
             report.actions.insert(kind.as_u16(), outcome);
         }
-        let bytes = {
+        // A partial lookup (some relay silent) acts on what it found but
+        // stamps nothing: the silent relay may hold a newer list, so the
+        // next connect must look again rather than wait out the interval.
+        if !absence_confirmed && !states.is_empty() {
+            tracing::info!(
+                answered,
+                asked,
+                kinds = states.len(),
+                "relay records acted on but not stamped: partial lookup"
+            );
+            states.clear();
+        }
+        {
             let mut records = self.records.lock().unwrap();
             records.version = RELAY_RECORDS_VERSION;
             for (kind, state) in states {
                 records.records.insert(kind, state);
             }
-            sidecar_bytes(&*records)
-        };
-        write_sidecar(self.records_path.as_deref(), bytes);
+        }
+        self.persist(self.records_path.as_deref(), || {
+            sidecar_bytes(&*self.records.lock().unwrap())
+        });
         report
     }
 
@@ -1573,9 +1648,10 @@ mod tests {
                     },
                 );
             }
-            let bytes = sidecar_bytes(&*records);
             drop(records);
-            write_sidecar(router.records_path.as_deref(), bytes);
+            router.persist(router.records_path.as_deref(), || {
+                sidecar_bytes(&*router.records.lock().unwrap())
+            });
         }
         assert!(relay_records_path_for_db(&db).exists());
         assert!(peer_routes_path_for_db(&db).exists());
@@ -1661,11 +1737,13 @@ mod pool_tests {
                 .await;
             assert_eq!(out.completed, 1, "pass {pass} did not reach the relay");
         }
-        // Released: gone from the pool, not lingering as a dead handle.
+        // Released: gone from the pool, not lingering as a dead handle, and
+        // no zero-count bookkeeping left behind.
         assert!(router.nostr.relays().await.is_empty());
+        assert!(router.in_use.lock().unwrap().is_empty());
 
         // A sticky relay stays connected between uses.
-        router.keep_open(std::slice::from_ref(&url));
+        router.keep_open(std::slice::from_ref(&url)).await;
         let out = router
             .fetch_from(std::slice::from_ref(&url), filter.clone())
             .await;
@@ -1702,15 +1780,34 @@ mod pool_tests {
         assert!(router.nostr.relays().await.is_empty());
     }
 
-    /// The sticky set is bounded: a chain of welcomes naming attacker relays
-    /// cannot pin an unbounded number of sockets.
-    #[test]
-    fn sticky_relays_are_capped() {
+    /// The sticky set is bounded and evicts the least recently asked-for
+    /// relay: a chain of welcomes naming attacker relays cannot pin an
+    /// unbounded number of sockets, and a live group's relay still gets in.
+    #[tokio::test]
+    async fn sticky_relays_evict_least_recently_kept_past_the_cap() {
         let router = RelayRouter::new(RelayRoutesConfig::disabled(), Vec::new(), None);
         let urls: Vec<RelayUrl> = (0..MAX_STICKY_ROUTE_RELAYS + 5)
             .map(|i| RelayUrl::parse(&format!("wss://r{i}.example")).unwrap())
             .collect();
-        router.keep_open(&urls);
-        assert_eq!(router.sticky.lock().unwrap().len(), MAX_STICKY_ROUTE_RELAYS);
+        for url in &urls[..MAX_STICKY_ROUTE_RELAYS] {
+            router.keep_open(std::slice::from_ref(url)).await;
+        }
+        // Touch the first one again so it is no longer the oldest.
+        router.keep_open(std::slice::from_ref(&urls[0])).await;
+        for url in &urls[MAX_STICKY_ROUTE_RELAYS..] {
+            router.keep_open(std::slice::from_ref(url)).await;
+        }
+        let sticky = router.sticky.lock().unwrap();
+        assert_eq!(sticky.len(), MAX_STICKY_ROUTE_RELAYS);
+        assert!(
+            sticky.contains_key(&urls[0]),
+            "recently touched relay evicted"
+        );
+        for url in &urls[1..6] {
+            assert!(!sticky.contains_key(url), "oldest relay {url} not evicted");
+        }
+        for url in &urls[MAX_STICKY_ROUTE_RELAYS..] {
+            assert!(sticky.contains_key(url), "newest relay {url} refused");
+        }
     }
 }

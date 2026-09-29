@@ -49,7 +49,9 @@ out. Existence is evidence from a single relay; absence needs all of them.
 Kinds `10002`/`10050` are replaceable: publishing defaults over an imported
 account's real lists would replace them network-wide. A record counts as
 distributed only when at least one relay accepted it, so a copy that reached
-nothing is retried on the next pass instead of waiting out the interval.
+nothing is retried on the next pass instead of waiting out the interval; and a
+pass with any lookup relay silent stamps nothing at all, so the next connect
+looks again (the silent relay may hold a newer list than the one acted on).
 Changing an adopted list needs the user's say-so (follow-up).
 
 Defaults: `10002` = our relays, unmarked; `10050` = the Sonar relay plus two
@@ -90,7 +92,8 @@ set, newest per kind, sanitized (TLS only, plaintext only on loopback), capped
   capped at 16, so every member's own relays are in the group's routing.
 - **Group messages:** the outbox fan-out also publishes to the group's foreign
   relays, in the same first-ack race, so a member on a disjoint set receives
-  what we send.
+  what we send. Foreign group relays stay open between sends, bounded at 32
+  across all groups with least-recently-used eviction.
 
 ### Configuration
 

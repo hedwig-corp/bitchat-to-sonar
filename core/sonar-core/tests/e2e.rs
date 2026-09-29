@@ -1949,6 +1949,14 @@ mod relay_routes {
         let on_own = events_on(&url_own, pk, Kind::RelayList).await;
         assert_eq!(on_own.len(), 1);
         assert_eq!(on_own[0].id, list.id, "rebroadcast changed the event");
+
+        // Acted on, but not stamped: with a relay still silent, the next
+        // connect must look again (the silent one may hold a newer list).
+        let next = client.distribute_account_records(false).await;
+        assert!(
+            !next.skipped_fresh,
+            "partial lookup stamped freshness: {next:?}"
+        );
     }
 
     /// A welcome that reaches none of the recipient's inbox relays is a
