@@ -2176,6 +2176,15 @@ pub struct SonarClient {
     sticker_ref_prefetch_inflight: StickerRefPrefetchInflight,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// Which members already hold our current push token (see
+    /// `share_push_token_with_groups`), and where that record lives on disk.
+    push_share_ledger: Arc<Mutex<crate::push::PushShareLedger>>,
+    push_share_ledger_path: Option<PathBuf>,
+    /// Single-flight guard: sync, wake and registration all trigger a share
+    /// pass; concurrent triggers must not each send one.
+    push_share_inflight: Arc<AtomicBool>,
+    /// Token shares sent by this process (diagnostics and tests).
+    push_token_shares_sent: Arc<AtomicU64>,
     /// Incoming-message notifications produced by the forced-sync gap-recovery
     /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
     /// `drain_pending_marmot()`; the recovered messages are stored by the sync
@@ -2409,6 +2418,16 @@ impl SonarClient {
         let preferred_catchup_group = Arc::new(Mutex::new(None));
         let last_ensure_subscriptions_at = Arc::new(Mutex::new(None));
         let push_token_cache = crate::push::load_push_token_cache(push_token_cache_path.as_deref());
+        // The ledger sits next to the token cache (same db, same lifetime).
+        let push_share_ledger_path = push_token_cache_path.as_deref().map(|cache| {
+            let name = cache
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(crate::push::PUSH_TOKEN_CACHE_FILE_SUFFIX))
+                .unwrap_or("sonar")
+                .to_string();
+            crate::push::push_share_ledger_path_for_db(&cache.with_file_name(name))
+        });
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -2739,6 +2758,12 @@ impl SonarClient {
             )),
             sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
+            push_share_ledger: Arc::new(Mutex::new(crate::push::load_push_share_ledger(
+                push_share_ledger_path.as_deref(),
+            ))),
+            push_share_ledger_path,
+            push_share_inflight: Arc::new(AtomicBool::new(false)),
+            push_token_shares_sent: Arc::new(AtomicU64::new(0)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
@@ -8901,6 +8926,7 @@ impl SonarClient {
         let own_reg = push::OwnPushRegistration {
             encrypted_token_b64: content.clone(),
             server_pubkey,
+            fingerprint: push::push_token_fingerprint(plat, token, &server_pubkey),
         };
         *self.own_push_registration.lock().unwrap() = Some(own_reg);
 
@@ -8914,16 +8940,24 @@ impl SonarClient {
     /// via a NIP-44 encrypted DM (kind 447). Group members cache this to send
     /// sender-side notifications to us.
     async fn share_push_token_with_groups(&self) {
+        // One pass at a time: sync, the live short-circuit, wakes and token
+        // registration all end here, often together.
+        if self.push_share_inflight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _release = Release(&self.push_share_inflight);
+
         // Relay guard: skip when zero relays report `RelayStatus::Connected`
         // (empty write-relay set → `NoRelaysSpecified`, or configured relays
-        // not yet attached). The per-recipient gift-wrapped DM below goes
-        // through `self.nostr.send_event`; walking groups × members before a
-        // relay can accept floods the log (~275/session on a real 43-group
-        // account). This runs at the end of every sync/wake (`sync_inner`, the
-        // live short-circuit, and the token-update path), often before relays
-        // attach — deferring is free and never blocks chat open/send/scroll/
-        // paint. Take the relay map from the `.await` before touching any std
-        // Mutex so no guard is held across it.
+        // not yet attached). Deferring is free and never blocks chat
+        // open/send/scroll/paint. Take the relay map from the `.await` before
+        // touching any std Mutex so no guard is held across it.
         let connected_relays = self
             .nostr
             .relays()
@@ -8942,15 +8976,28 @@ impl SonarClient {
         let own_reg = self.own_push_registration.lock().unwrap().clone();
         let Some(reg) = own_reg else { return };
 
-        let groups = match self.engine.groups() {
-            Ok(g) => g,
+        let members = match self.push_share_members_by_recency() {
+            Ok(m) => m,
             Err(e) => {
-                tracing::warn!(%e, "push token share: failed to list groups");
+                tracing::warn!(%e, "push token share: failed to list group members");
                 return;
             }
         };
+        // Once per member per token, most recent chats first, a bounded batch
+        // per pass. Before this, every sync re-sent one gift-wrapped event to
+        // every member of every group (six passes in three minutes on a
+        // one-chat account; one event per member per pass on 278 groups).
+        let now = Timestamp::now().as_secs();
+        let (due, total_due) = self.push_share_ledger.lock().unwrap().due(
+            &reg.fingerprint,
+            &members,
+            now,
+            crate::push::PUSH_TOKEN_SHARE_BATCH,
+        );
+        if due.is_empty() {
+            return;
+        }
 
-        let my_pubkey = self.engine.identity().public_key();
         let payload = crate::push::PushTokenSharePayload {
             encrypted_token: reg.encrypted_token_b64.clone(),
             server_pubkey: reg.server_pubkey.to_hex(),
@@ -8963,25 +9010,67 @@ impl SonarClient {
             }
         };
 
-        for group in &groups {
-            let members = match self.engine.members(&group.mls_group_id) {
-                Ok(m) => m,
-                Err(_) => continue,
+        let mut shared = 0usize;
+        for member_hex in &due {
+            let Ok(member) = PublicKey::from_hex(member_hex) else {
+                continue;
             };
-            for member in &members {
-                if member == &my_pubkey {
-                    continue;
+            match self.send_push_token_dm(&member, &payload_json).await {
+                Ok(()) => {
+                    self.push_share_ledger
+                        .lock()
+                        .unwrap()
+                        .record(&reg.fingerprint, member_hex, now);
+                    shared += 1;
                 }
-                if let Err(e) = self.send_push_token_dm(member, &payload_json).await {
-                    tracing::debug!(
-                        recipient = %member,
-                        %e,
-                        "push token share DM failed"
-                    );
+                Err(e) => {
+                    tracing::debug!(recipient = %member, %e, "push token share DM failed");
                 }
             }
         }
-        tracing::info!("push token shared with group members");
+        self.push_token_shares_sent
+            .fetch_add(shared as u64, Ordering::Relaxed);
+        if shared > 0 {
+            let ledger = self.push_share_ledger.lock().unwrap().clone();
+            if let Err(e) =
+                crate::push::save_push_share_ledger(self.push_share_ledger_path.as_deref(), &ledger)
+            {
+                tracing::warn!(%e, "push token share: ledger save failed");
+            }
+        }
+        tracing::info!(
+            shared,
+            remaining = total_due.saturating_sub(shared),
+            "push token shared with group members"
+        );
+    }
+
+    /// Every other member of our active groups, pubkey hex, most recently
+    /// active conversation first (summary index order), each listed once.
+    fn push_share_members_by_recency(&self) -> Result<Vec<String>> {
+        let mut groups = self.engine.groups()?;
+        let latest: HashMap<String, u64> = self
+            .conversation_summaries()
+            .into_iter()
+            .map(|s| (s.group_id_hex, s.latest_at_secs))
+            .collect();
+        groups.sort_by_key(|g| {
+            std::cmp::Reverse(latest.get(&hex::encode(g.mls_group_id.as_slice())).copied().unwrap_or(0))
+        });
+        let me = self.engine.identity().public_key();
+        let mut seen = HashSet::new();
+        let mut members = Vec::new();
+        for group in &groups {
+            let Ok(group_members) = self.engine.members(&group.mls_group_id) else {
+                continue;
+            };
+            for member in group_members {
+                if member != me && seen.insert(member) {
+                    members.push(member.to_hex());
+                }
+            }
+        }
+        Ok(members)
     }
 
     /// NIP-44 encrypted DM carrying our push token info (kind 447).
@@ -9037,6 +9126,16 @@ impl SonarClient {
             // member (e.g. a rotated token) so a full cache never pins a stale
             // token. Defense-in-depth on top of the membership gate.
             let already_cached = cache.contains_key(&sender_hex);
+            // A member whose token changed (reinstall, rotation) has most
+            // likely lost ours too: share ours once more on the next pass.
+            // An identical re-send changes nothing, so two peers cannot keep
+            // re-sharing to each other.
+            let changed = cache
+                .get(&sender_hex)
+                .is_none_or(|old| old.encrypted_token_b64 != cached.encrypted_token_b64);
+            if changed {
+                self.push_share_ledger.lock().unwrap().forget(&sender_hex);
+            }
             if !crate::push::should_cache_push_token(token_len, cache.len(), already_cached) {
                 tracing::debug!("dropping push token share (oversized token or cache full)");
                 return Ok(());
@@ -10015,6 +10114,45 @@ mod tests {
         );
     }
 
+    /// Every sync and wake ends with a share pass. Three passes over two 1:1
+    /// chats must send two shares (one per member), not six; a new token
+    /// reaches both members once more. Real call site, real relay.
+    #[tokio::test]
+    async fn push_token_is_shared_once_per_member_not_on_every_sync() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let client = SonarClient::connect_in_memory(Identity::generate(), vec![relay.url().await])
+            .await
+            .expect("client connects");
+        for _ in 0..2 {
+            let peer = MarmotEngine::in_memory(Identity::generate());
+            let creation = client
+                .engine
+                .create_group("", vec![peer.key_package_event(relays.clone()).unwrap()], relays.clone())
+                .unwrap();
+            client.engine.merge_pending_commit(&creation.group.mls_group_id).unwrap();
+        }
+        let server_pubkey = Keys::generate().public_key();
+        let register = |token: &[u8]| crate::push::OwnPushRegistration {
+            encrypted_token_b64: "dGVzdA==".to_owned(),
+            server_pubkey,
+            fingerprint: crate::push::push_token_fingerprint(1, token, &server_pubkey),
+        };
+        *client.own_push_registration.lock().unwrap() = Some(register(b"token-1"));
+
+        for _ in 0..3 {
+            client.share_push_token_with_groups().await;
+        }
+        assert_eq!(client.push_token_shares_sent.load(Ordering::Relaxed), 2);
+
+        *client.own_push_registration.lock().unwrap() = Some(register(b"token-2"));
+        client.share_push_token_with_groups().await;
+        client.share_push_token_with_groups().await;
+        assert_eq!(client.push_token_shares_sent.load(Ordering::Relaxed), 4);
+    }
+
     #[tokio::test]
     async fn share_push_token_with_groups_noops_when_no_relay_connected() {
         // Behavioral coverage for the Connected-status guard on
@@ -10029,6 +10167,7 @@ mod tests {
         *client.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
             encrypted_token_b64: "dGVzdA==".to_owned(),
             server_pubkey,
+            fingerprint: "test".to_owned(),
         });
 
         let connected = client

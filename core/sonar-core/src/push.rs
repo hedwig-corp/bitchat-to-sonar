@@ -28,6 +28,16 @@ const TOKEN_PLAINTEXT_SIZE: usize = 1024;
 const PLATFORM_APNS: u8 = 0x01;
 const PLATFORM_FCM: u8 = 0x02;
 pub(crate) const PUSH_TOKEN_CACHE_FILE_SUFFIX: &str = ".sonar-push-tokens.json";
+/// Durable record of which members already hold our current push token.
+pub(crate) const PUSH_SHARE_LEDGER_FILE_SUFFIX: &str = ".sonar-push-shared.json";
+const PUSH_SHARE_LEDGER_VERSION: u32 = 1;
+/// Most token shares one pass sends. Every sync and wake ends with a pass, so
+/// a large account reaches everyone within a few passes instead of one burst
+/// of one gift-wrapped event per member (No Performance Regression Rule).
+pub(crate) const PUSH_TOKEN_SHARE_BATCH: usize = 16;
+/// Re-send an unchanged token to a member after this long, so a member who
+/// lost our token (reinstall without telling us) recovers within a week.
+pub(crate) const PUSH_TOKEN_RESHARE_SECS: u64 = 7 * 24 * 60 * 60;
 const PUSH_TOKEN_CACHE_VERSION: u32 = 1;
 pub(crate) const KIND_NOTIFICATION_REQUEST: u16 = 446;
 pub(crate) const KIND_PUSH_TOKEN_SHARE: u16 = 447;
@@ -136,6 +146,119 @@ pub(crate) struct CachedPushToken {
 pub(crate) struct OwnPushRegistration {
     pub encrypted_token_b64: String,
     pub server_pubkey: PublicKey,
+    /// [`push_token_fingerprint`] of the plaintext registration. The encrypted
+    /// token is re-randomized on every registration, so it cannot say whether
+    /// the token changed; this can.
+    pub fingerprint: String,
+}
+
+/// Stable id of a push registration: SHA-256 over platform, device token and
+/// push server key. Equal fingerprints mean members already holding our token
+/// need nothing new.
+pub(crate) fn push_token_fingerprint(platform: u8, token: &[u8], server: &PublicKey) -> String {
+    use sha2::Digest;
+    let mut hasher = Sha256::new();
+    hasher.update([platform]);
+    hasher.update((token.len() as u64).to_be_bytes());
+    hasher.update(token);
+    hasher.update(server.to_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Who already holds our current push token, and since when. Shares are sent
+/// once per member per token (plus a weekly refresh), never on every sync.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PushShareLedger {
+    version: u32,
+    /// Fingerprint the `shared_at` entries were sent with.
+    token_fingerprint: String,
+    /// Member pubkey hex → unix seconds of the last successful share.
+    shared_at: HashMap<String, u64>,
+}
+
+impl PushShareLedger {
+    /// Members (in the given recency order, duplicates ignored) that should
+    /// receive `fingerprint` now: never shared, shared a different token, or
+    /// last shared at least [`PUSH_TOKEN_RESHARE_SECS`] ago. At most `batch`.
+    pub(crate) fn due(
+        &self,
+        fingerprint: &str,
+        members_by_recency: &[String],
+        now_secs: u64,
+        batch: usize,
+    ) -> (Vec<String>, usize) {
+        let same_token = self.token_fingerprint == fingerprint;
+        let mut seen = std::collections::HashSet::new();
+        let mut due = Vec::new();
+        let mut total = 0usize;
+        for member in members_by_recency {
+            if !seen.insert(member.as_str()) {
+                continue;
+            }
+            let fresh = same_token
+                && self
+                    .shared_at
+                    .get(member)
+                    .is_some_and(|at| now_secs < at.saturating_add(PUSH_TOKEN_RESHARE_SECS));
+            if fresh {
+                continue;
+            }
+            total += 1;
+            if due.len() < batch {
+                due.push(member.clone());
+            }
+        }
+        (due, total)
+    }
+
+    /// Record a successful share of `fingerprint` to `member`. A new token
+    /// starts a new ledger: nobody holds it yet.
+    pub(crate) fn record(&mut self, fingerprint: &str, member: &str, now_secs: u64) {
+        if self.token_fingerprint != fingerprint {
+            self.token_fingerprint = fingerprint.to_string();
+            self.shared_at.clear();
+        }
+        self.version = PUSH_SHARE_LEDGER_VERSION;
+        self.shared_at.insert(member.to_string(), now_secs);
+    }
+
+    /// Forget `member`: they sent us a new token of their own (a reinstall or
+    /// rotation), so they probably lost ours. The next pass shares it again.
+    pub(crate) fn forget(&mut self, member: &str) -> bool {
+        self.shared_at.remove(member).is_some()
+    }
+}
+
+pub(crate) fn push_share_ledger_path_for_db(db_path: &Path) -> PathBuf {
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sonar");
+    db_path.with_file_name(format!("{file_name}{PUSH_SHARE_LEDGER_FILE_SUFFIX}"))
+}
+
+/// A missing or unreadable ledger is an empty one: the only cost is one more
+/// share per member, bounded by [`PUSH_TOKEN_SHARE_BATCH`] per pass.
+pub(crate) fn load_push_share_ledger(path: Option<&Path>) -> PushShareLedger {
+    path.and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<PushShareLedger>(&bytes).ok())
+        .filter(|ledger| ledger.version == PUSH_SHARE_LEDGER_VERSION)
+        .unwrap_or_default()
+}
+
+pub(crate) fn save_push_share_ledger(path: Option<&Path>, ledger: &PushShareLedger) -> crate::Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec(ledger)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, bytes).map_err(|e| {
+        crate::Error::Storage(format!("write push share ledger {}: {e}", tmp.display()))
+    })?;
+    fs::rename(&tmp, path).map_err(|e| {
+        crate::Error::Storage(format!("replace push share ledger {}: {e}", path.display()))
+    })?;
+    Ok(())
 }
 
 /// JSON payload sent inside NIP-44 DMs (kind 447) to share encrypted push
@@ -193,6 +316,13 @@ pub(crate) fn push_token_cache_path_for_db(db_path: &Path) -> PathBuf {
 }
 
 pub(crate) fn wipe_push_token_cache_for_db(db_path: &Path) -> crate::Result<()> {
+    match fs::remove_file(push_share_ledger_path_for_db(db_path)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(crate::Error::Storage(format!("remove push share ledger: {e}")));
+        }
+    }
     let path = push_token_cache_path_for_db(db_path);
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -360,5 +490,80 @@ mod tests {
 
         assert_eq!(entry.encrypted_token_b64, "updated-token");
         assert_eq!(entry.server_pubkey, server);
+    }
+
+    fn members(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn each_member_gets_a_token_once_until_it_changes() {
+        let mut ledger = PushShareLedger::default();
+        let all = members(&["a", "b", "a", "c"]);
+        let (due, total) = ledger.due("t1", &all, 100, PUSH_TOKEN_SHARE_BATCH);
+        assert_eq!(due, members(&["a", "b", "c"]), "a member in two groups is shared once");
+        assert_eq!(total, 3);
+        for m in &due {
+            ledger.record("t1", m, 100);
+        }
+        assert!(ledger.due("t1", &all, 200, 16).0.is_empty(), "a second sync shares nothing");
+        let (due, _) = ledger.due("t2", &all, 200, 16);
+        assert_eq!(due.len(), 3, "a new token reaches everyone again");
+        ledger.record("t2", "a", 200);
+        assert!(!ledger.shared_at.contains_key("b"), "recording a new token resets the ledger");
+    }
+
+    #[test]
+    fn a_pass_is_capped_and_the_rest_follow_on_later_passes() {
+        let mut ledger = PushShareLedger::default();
+        let all: Vec<String> = (0..40).map(|i| format!("m{i:02}")).collect();
+        let mut passes = 0;
+        loop {
+            let (due, total) = ledger.due("t", &all, 100, PUSH_TOKEN_SHARE_BATCH);
+            if due.is_empty() {
+                break;
+            }
+            assert!(due.len() <= PUSH_TOKEN_SHARE_BATCH);
+            assert_eq!(due[0], all[40 - total], "most recent members first");
+            for m in &due {
+                ledger.record("t", m, 100);
+            }
+            passes += 1;
+        }
+        assert_eq!(passes, 3);
+    }
+
+    #[test]
+    fn an_unchanged_token_is_refreshed_weekly_or_when_a_member_resets() {
+        let mut ledger = PushShareLedger::default();
+        ledger.record("t", "a", 1_000);
+        ledger.record("t", "b", 1_000);
+        let week = PUSH_TOKEN_RESHARE_SECS;
+        assert!(ledger.due("t", &members(&["a", "b"]), 1_000 + week - 1, 16).0.is_empty());
+        assert_eq!(ledger.due("t", &members(&["a", "b"]), 1_000 + week, 16).0.len(), 2);
+        assert!(ledger.forget("b"));
+        assert_eq!(ledger.due("t", &members(&["a", "b"]), 2_000, 16).0, members(&["b"]));
+    }
+
+    #[test]
+    fn the_ledger_survives_a_restart_and_is_wiped_with_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let path = push_share_ledger_path_for_db(&db);
+        let mut ledger = PushShareLedger::default();
+        ledger.record("t", "a", 5);
+        save_push_share_ledger(Some(&path), &ledger).unwrap();
+        assert_eq!(load_push_share_ledger(Some(&path)), ledger);
+        wipe_push_token_cache_for_db(&db).unwrap();
+        assert_eq!(load_push_share_ledger(Some(&path)), PushShareLedger::default());
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_encryption_randomness_but_not_the_token() {
+        let server = Keys::generate().public_key();
+        let a = push_token_fingerprint(1, b"device-token", &server);
+        assert_eq!(a, push_token_fingerprint(1, b"device-token", &server));
+        assert_ne!(a, push_token_fingerprint(1, b"other-token", &server));
+        assert_ne!(a, push_token_fingerprint(2, b"device-token", &server));
     }
 }
