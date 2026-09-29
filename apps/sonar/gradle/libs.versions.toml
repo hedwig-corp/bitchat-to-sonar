@@ -27,6 +27,13 @@ androidx-compose-ui-test = "1.7.6"
 junit = "4.13.2"
 okhttp = "5.3.0"
 androidx-work = "2.10.0"
+# Presenter tests (chat-list pilot). Molecule 2.0.0 is the newest release whose
+# JetBrains Compose runtime (1.6.10), coroutines (1.8.1) and stdlib (2.0.0)
+# are all at or below ours, so it upgrades nothing: 2.1.0 pulls coroutines
+# 1.10.2 + stdlib 2.1.20, and 2.2.0 constrains the Compose runtime to 1.9.0.
+# Turbine 1.2.0 is built on coroutines 1.9.0, the version we ship.
+molecule = "2.0.0"
+turbine = "1.2.0"
 
 [libraries]
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activityCompose" }
@@ -53,6 +60,8 @@ junit = { module = "junit:junit", version.ref = "junit" }
 okhttp-client = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
 okhttp-mockwebserver = { module = "com.squareup.okhttp3:mockwebserver3", version.ref = "okhttp" }
 androidx-work-runtime = { module = "androidx.work:work-runtime-ktx", version.ref = "androidx-work" }
+molecule-runtime = { module = "app.cash.molecule:molecule-runtime", version.ref = "molecule" }
+turbine = { module = "app.cash.turbine:turbine", version.ref = "turbine" }
 
 [plugins]
 multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
