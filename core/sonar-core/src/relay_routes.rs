@@ -94,6 +94,10 @@ pub const MAX_INBOX_RELAYS: usize = 3;
 pub const MAX_GROUP_RELAYS: usize = 16;
 /// Legacy kind-10051 lists are read for compatibility only; same bound as write.
 pub const MAX_LEGACY_KEY_PACKAGE_RELAYS: usize = 4;
+/// Foreign group relays kept open across sends, over all groups. A welcome
+/// names its group's relays (creator-chosen), so this bounds what a chain of
+/// malicious invites can pin in the route pool.
+pub const MAX_STICKY_ROUTE_RELAYS: usize = 32;
 
 /// How long a resolved peer route stays fresh. Relay lists change rarely;
 /// a stale list costs one missed fetch, which the caller's fallback covers.
@@ -232,7 +236,9 @@ impl PeerRoutes {
     ) -> Self {
         let mut newest: HashMap<Kind, &Event> = HashMap::new();
         for event in events {
-            if event.pubkey != *author {
+            // The pool verifies on receipt; checking again here costs little
+            // and keeps this decision independent of how the events arrived.
+            if event.pubkey != *author || event.verify().is_err() {
                 continue;
             }
             match event.kind {
@@ -504,6 +510,12 @@ pub enum RecordOutcome {
     },
     /// Kind 0 with no profile anywhere yet: the profile publish creates it.
     Absent,
+    /// Nothing found, but not every lookup relay answered, so absence is not
+    /// established and no default was published. Retried next pass.
+    Deferred {
+        answered: usize,
+        asked: usize,
+    },
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -591,15 +603,22 @@ fn load_json<T: Default + for<'de> Deserialize<'de>>(path: Option<&Path>) -> T {
     }
 }
 
-/// Atomic write (`<file>.tmp` + rename), like every other sidecar here.
-fn store_json<T: Serialize>(path: Option<&Path>, value: &T) {
-    let Some(path) = path else { return };
-    let bytes = match serde_json::to_vec(value) {
-        Ok(b) => b,
+/// Serialize under the lock (cheap); write with `write_sidecar` after the
+/// lock is dropped, so a slow disk never stalls other lookups.
+fn sidecar_bytes<T: Serialize>(value: &T) -> Option<Vec<u8>> {
+    match serde_json::to_vec(value) {
+        Ok(b) => Some(b),
         Err(err) => {
             tracing::warn!(%err, "relay routes sidecar serialize failed");
-            return;
+            None
         }
+    }
+}
+
+/// Atomic write (`<file>.tmp` + rename), like every other sidecar here.
+fn write_sidecar(path: Option<&Path>, bytes: Option<Vec<u8>>) {
+    let (Some(path), Some(bytes)) = (path, bytes) else {
+        return;
     };
     let name = path
         .file_name()
@@ -684,6 +703,13 @@ impl RelayRouter {
     pub fn keep_open(&self, urls: &[RelayUrl]) {
         let mut sticky = self.sticky.lock().unwrap();
         for url in urls {
+            if sticky.contains(url) {
+                continue;
+            }
+            if sticky.len() >= MAX_STICKY_ROUTE_RELAYS {
+                tracing::warn!(relay = %url, cap = MAX_STICKY_ROUTE_RELAYS, "route relay not kept open: sticky set full");
+                continue;
+            }
             sticky.insert(url.clone());
         }
     }
@@ -707,15 +733,22 @@ impl RelayRouter {
         }
     }
 
+    /// Fresh only when every list kind was distributed inside the interval.
+    /// A pass that got the profile out but deferred the lists (a lookup
+    /// relay was silent) must run again on the next connect.
     fn distributed_recently(&self, now: u64) -> bool {
         let records = self.records.lock().unwrap();
-        if records.records.is_empty() {
-            return false;
-        }
-        records
-            .records
-            .values()
-            .all(|r| now.saturating_sub(r.distributed_at) < DISTRIBUTION_MIN_INTERVAL.as_secs())
+        [
+            Kind::RelayList,
+            Kind::InboxRelays,
+            LEGACY_KEY_PACKAGE_RELAYS_KIND,
+        ]
+        .iter()
+        .all(|kind| {
+            records.records.get(&kind.as_u16()).is_some_and(|r| {
+                now.saturating_sub(r.distributed_at) < DISTRIBUTION_MIN_INTERVAL.as_secs()
+            })
+        })
     }
 
     // ── Route pool plumbing ──
@@ -724,10 +757,21 @@ impl RelayRouter {
     /// within `ROUTE_CONNECT_TIMEOUT`. Each connected relay is marked in use
     /// until `release` is called with it.
     async fn acquire(&self, urls: &[RelayUrl]) -> Vec<RelayUrl> {
+        let urls = dedupe(urls.iter().cloned());
+        // Reserve before connecting: a concurrent operation's release must
+        // not remove a relay this one is still waiting on.
+        {
+            let mut in_use = self.in_use.lock().unwrap();
+            for url in &urls {
+                *in_use.entry(url.clone()).or_insert(0) += 1;
+            }
+        }
         let mut handles = Vec::with_capacity(urls.len());
-        for url in dedupe(urls.iter().cloned()) {
+        let mut lost = Vec::new();
+        for url in urls {
             if let Err(err) = self.nostr.add_relay(url.clone()).await {
                 tracing::debug!(%err, relay = %url, "route relay add failed");
+                lost.push(url);
                 continue;
             }
             match self.nostr.relay(url.clone()).await {
@@ -737,7 +781,10 @@ impl RelayRouter {
                     }
                     handles.push((url, handle));
                 }
-                Err(err) => tracing::debug!(%err, relay = %url, "route relay handle missing"),
+                Err(err) => {
+                    tracing::debug!(%err, relay = %url, "route relay handle missing");
+                    lost.push(url);
+                }
             }
         }
         let waits = handles.iter().map(|(url, handle)| {
@@ -748,20 +795,19 @@ impl RelayRouter {
                 (url, handle.status() == RelayStatus::Connected)
             }
         });
-        let results = futures_util::future::join_all(waits).await;
-        let mut in_use = self.in_use.lock().unwrap();
-        results
-            .into_iter()
-            .filter_map(|(url, connected)| {
-                if connected {
-                    *in_use.entry(url.clone()).or_insert(0) += 1;
-                    Some(url)
-                } else {
-                    tracing::debug!(relay = %url, "route relay not connected in time");
-                    None
-                }
-            })
-            .collect()
+        let mut connected = Vec::new();
+        for (url, ok) in futures_util::future::join_all(waits).await {
+            if ok {
+                connected.push(url);
+            } else {
+                tracing::debug!(relay = %url, "route relay not connected in time");
+                lost.push(url);
+            }
+        }
+        if !lost.is_empty() {
+            self.release(&lost).await;
+        }
+        connected
     }
 
     /// Drop the in-use mark; take relays nobody needs any more out of the
@@ -813,28 +859,35 @@ impl RelayRouter {
                     .push((url.clone(), "route relay not connected".to_string()));
             }
         }
-        if !connected.is_empty() {
-            match tokio::time::timeout(
-                ROUTE_PUBLISH_TIMEOUT,
-                self.nostr.send_event_to(connected.clone(), event),
-            )
-            .await
-            {
+        // One send per relay, each with its own bound: a relay that accepts
+        // the socket and never answers must not take the others' OKs with it.
+        let sends = connected.iter().map(|url| {
+            let nostr = self.nostr.clone();
+            let url = url.clone();
+            async move {
+                let result = tokio::time::timeout(
+                    ROUTE_PUBLISH_TIMEOUT,
+                    nostr.send_event_to([url.clone()], event),
+                )
+                .await;
+                (url, result)
+            }
+        });
+        for (url, result) in futures_util::future::join_all(sends).await {
+            match result {
+                Ok(Ok(output)) if output.success.contains(&url) => out.accepted.push(url),
                 Ok(Ok(output)) => {
-                    out.accepted.extend(output.success);
-                    out.failed.extend(output.failed);
+                    let why = output
+                        .failed
+                        .get(&url)
+                        .cloned()
+                        .unwrap_or_else(|| "relay rejected event".to_string());
+                    out.failed.push((url, why));
                 }
-                Ok(Err(err)) => {
-                    for url in &connected {
-                        out.failed.push((url.clone(), err.to_string()));
-                    }
-                }
-                Err(_) => {
-                    for url in &connected {
-                        out.failed
-                            .push((url.clone(), "route publish timed out".to_string()));
-                    }
-                }
+                Ok(Err(err)) => out.failed.push((url, err.to_string())),
+                Err(_) => out
+                    .failed
+                    .push((url, "route publish timed out".to_string())),
             }
         }
         self.release(&connected).await;
@@ -895,7 +948,9 @@ impl RelayRouter {
                 None => break,
             }
         }
-        store_json(self.peer_routes_path.as_deref(), &*cache);
+        let bytes = sidecar_bytes(&*cache);
+        drop(cache);
+        write_sidecar(self.peer_routes_path.as_deref(), bytes);
     }
 
     /// Forget a cached peer, so the next resolve re-reads the relays. Used
@@ -903,7 +958,9 @@ impl RelayRouter {
     pub fn forget_peer_routes(&self, peer: &PublicKey) {
         let mut cache = self.peer_routes.lock().unwrap();
         if cache.peers.remove(&peer.to_hex()).is_some() {
-            store_json(self.peer_routes_path.as_deref(), &*cache);
+            let bytes = sidecar_bytes(&*cache);
+            drop(cache);
+            write_sidecar(self.peer_routes_path.as_deref(), bytes);
         }
     }
 
@@ -974,12 +1031,12 @@ impl RelayRouter {
         // "Nobody answered" is unknown, not absent. With a lookup set
         // configured, an answer from our own relays alone is not enough: an
         // imported account's lists typically live on the indexers only.
-        let lookup_ok = if self.config.lookup_relays.is_empty() {
-            own.completed > 0
+        let (answered, asked) = if self.config.lookup_relays.is_empty() {
+            (own.completed, own.attempted)
         } else {
-            lookup.completed > 0
+            (lookup.completed, lookup.attempted)
         };
-        if !lookup_ok {
+        if answered == 0 {
             tracing::warn!(
                 own_completed = own.completed,
                 lookup_completed = lookup.completed,
@@ -989,9 +1046,15 @@ impl RelayRouter {
             report.lookup_failed = true;
             return report;
         }
+        // Existence is evidence from a single relay; absence is not. A
+        // default would replace a real list network-wide, so "nothing
+        // exists" needs every lookup relay we asked to have answered — the
+        // one still holding the user's list may be the one that timed out.
+        let absence_confirmed = answered == asked;
         let mut newest: HashMap<Kind, Event> = HashMap::new();
         for event in own.events.into_iter().chain(lookup.events) {
-            if event.pubkey != me || !RECORD_KINDS.contains(&event.kind) {
+            if event.pubkey != me || !RECORD_KINDS.contains(&event.kind) || event.verify().is_err()
+            {
                 continue;
             }
             let replace = newest
@@ -1011,20 +1074,30 @@ impl RelayRouter {
                 match existing {
                     Some(event) => {
                         let accepted = self.spread(main, &event).await;
-                        states.insert(
-                            kind.as_u16(),
-                            RecordState {
-                                event_id: event.id.to_hex(),
-                                created_at: event.created_at.as_secs(),
-                                distributed_at: now,
-                                adopted: false,
-                                relays: Vec::new(),
-                            },
-                        );
+                        if accepted > 0 {
+                            states.insert(
+                                kind.as_u16(),
+                                RecordState {
+                                    event_id: event.id.to_hex(),
+                                    created_at: event.created_at.as_secs(),
+                                    distributed_at: now,
+                                    adopted: false,
+                                    relays: Vec::new(),
+                                },
+                            );
+                        }
                         RecordOutcome::Rebroadcast { accepted }
                     }
                     None => RecordOutcome::Absent,
                 }
+            } else if existing.is_none() && !absence_confirmed {
+                tracing::info!(
+                    kind = kind.as_u16(),
+                    answered,
+                    asked,
+                    "relay record not found, but not every lookup relay answered; deferred"
+                );
+                RecordOutcome::Deferred { answered, asked }
             } else {
                 let action = match plan_record(existing, &self.own_relays, || {
                     default_record(identity, kind, &self.own_relays)
@@ -1054,16 +1127,21 @@ impl RelayRouter {
                     }
                     RecordAction::Rebroadcast(event) => {
                         let accepted = self.spread(main, &event).await;
-                        states.insert(
-                            kind.as_u16(),
-                            RecordState {
-                                event_id: event.id.to_hex(),
-                                created_at: event.created_at.as_secs(),
-                                distributed_at: now,
-                                adopted: false,
-                                relays: list_relays(&event),
-                            },
-                        );
+                        // Stamped only when a relay took it: a copy that
+                        // reached nothing must be retried next pass, not
+                        // shelved for the interval.
+                        if accepted > 0 {
+                            states.insert(
+                                kind.as_u16(),
+                                RecordState {
+                                    event_id: event.id.to_hex(),
+                                    created_at: event.created_at.as_secs(),
+                                    distributed_at: now,
+                                    adopted: false,
+                                    relays: list_relays(&event),
+                                },
+                            );
+                        }
                         RecordOutcome::Rebroadcast { accepted }
                     }
                     RecordAction::Adopt(event) => {
@@ -1091,14 +1169,15 @@ impl RelayRouter {
             };
             report.actions.insert(kind.as_u16(), outcome);
         }
-        {
+        let bytes = {
             let mut records = self.records.lock().unwrap();
             records.version = RELAY_RECORDS_VERSION;
             for (kind, state) in states {
                 records.records.insert(kind, state);
             }
-            store_json(self.records_path.as_deref(), &*records);
-        }
+            sidecar_bytes(&*records)
+        };
+        write_sidecar(self.records_path.as_deref(), bytes);
         report
     }
 
@@ -1258,6 +1337,23 @@ mod tests {
         );
         let routes = PeerRoutes::from_events([&old, &forged, &new], &me.public_key());
         assert_eq!(routes.write, vec![url("wss://new.example")]);
+    }
+
+    /// A list whose signature does not check out is not a list, whatever
+    /// pubkey it claims. The pool verifies too; this keeps the decision
+    /// local to the code that acts on it.
+    #[test]
+    fn a_tampered_list_is_ignored() {
+        let me = Identity::generate();
+        let mut list = signed(
+            &me,
+            EventBuilder::relay_list([(url("wss://real.example"), None)]),
+        );
+        assert!(list.verify().is_ok());
+        list.tags = Tags::from_list(vec![Tag::relay_metadata(url("wss://forged.example"), None)]);
+        assert!(list.verify().is_err());
+        let routes = PeerRoutes::from_events([&list], &me.public_key());
+        assert!(routes.is_empty());
     }
 
     #[test]
@@ -1463,7 +1559,23 @@ mod tests {
                     relays: vec![url("wss://theirs.example")],
                 },
             );
-            store_json(router.records_path.as_deref(), &*records);
+            // Fresh only with every list kind recorded (a pass that
+            // deferred a kind must run again).
+            for kind in [Kind::InboxRelays, LEGACY_KEY_PACKAGE_RELAYS_KIND] {
+                records.records.insert(
+                    kind.as_u16(),
+                    RecordState {
+                        event_id: "cd".into(),
+                        created_at: 1,
+                        distributed_at: now_secs(),
+                        adopted: false,
+                        relays: own.clone(),
+                    },
+                );
+            }
+            let bytes = sidecar_bytes(&*records);
+            drop(records);
+            write_sidecar(router.records_path.as_deref(), bytes);
         }
         assert!(relay_records_path_for_db(&db).exists());
         assert!(peer_routes_path_for_db(&db).exists());
@@ -1475,6 +1587,13 @@ mod tests {
             vec![url("wss://theirs.example")]
         );
         assert!(reloaded.distributed_recently(now_secs()));
+        reloaded
+            .records
+            .lock()
+            .unwrap()
+            .records
+            .remove(&Kind::InboxRelays.as_u16());
+        assert!(!reloaded.distributed_recently(now_secs()));
 
         wipe_relay_routes_for_db(&db).unwrap();
         assert!(!relay_records_path_for_db(&db).exists());
@@ -1560,5 +1679,38 @@ mod pool_tests {
         assert_eq!(status, RelayStatus::Connected);
         let out = router.fetch_from(std::slice::from_ref(&url), filter).await;
         assert_eq!(out.completed, 1);
+    }
+
+    /// Two operations on one route relay at the same time: the first to
+    /// finish must not pull the socket out from under the second (the
+    /// in-use count is reserved before the connect wait, not after).
+    #[tokio::test]
+    async fn overlapping_operations_share_a_route_relay() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let url = relay.url().await;
+        let router = RelayRouter::new(RelayRoutesConfig::disabled(), Vec::new(), None);
+        let filter = Filter::new().kind(Kind::Metadata).limit(1);
+        for _ in 0..3 {
+            let (a, b) = tokio::join!(
+                router.fetch_from(std::slice::from_ref(&url), filter.clone()),
+                router.fetch_from(std::slice::from_ref(&url), filter.clone()),
+            );
+            assert_eq!((a.completed, b.completed), (1, 1));
+        }
+        assert!(router.nostr.relays().await.is_empty());
+    }
+
+    /// The sticky set is bounded: a chain of welcomes naming attacker relays
+    /// cannot pin an unbounded number of sockets.
+    #[test]
+    fn sticky_relays_are_capped() {
+        let router = RelayRouter::new(RelayRoutesConfig::disabled(), Vec::new(), None);
+        let urls: Vec<RelayUrl> = (0..MAX_STICKY_ROUTE_RELAYS + 5)
+            .map(|i| RelayUrl::parse(&format!("wss://r{i}.example")).unwrap())
+            .collect();
+        router.keep_open(&urls);
+        assert_eq!(router.sticky.lock().unwrap().len(), MAX_STICKY_ROUTE_RELAYS);
     }
 }

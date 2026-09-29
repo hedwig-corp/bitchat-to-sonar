@@ -37,14 +37,20 @@ looks the current event up on our relays **and** the lookup set, then:
 | Lookup outcome | Action |
 |---|---|
 | no lookup relay answered | publish **nothing**; retry next connect |
-| nothing found | publish Sonar's default, to our relays and the indexers |
-| found, names one of our relays | copy the existing signed event unchanged |
+| nothing found, but some lookup relay was silent | **deferred**: publish nothing for that kind; retry next connect |
+| nothing found and every lookup relay answered | publish Sonar's default, to our relays and the indexers |
+| found (on any relay), names one of our relays | copy the existing signed event unchanged |
 | found, does not name us (another client's list) | leave it alone; **adopt** it — the KeyPackage also goes to its write set |
 | kind `0` found | copy it to the indexers that take profiles; never invent one |
 
-"Nobody answered" is unknown, not absent. Kinds `10002`/`10050` are replaceable:
-publishing defaults over an imported account's real lists would replace them
-network-wide. Changing an adopted list needs the user's say-so (follow-up).
+"Nobody answered" is unknown, not absent, and so is "the relays that answered
+had nothing": the one still holding the user's list may be the one that timed
+out. Existence is evidence from a single relay; absence needs all of them.
+Kinds `10002`/`10050` are replaceable: publishing defaults over an imported
+account's real lists would replace them network-wide. A record counts as
+distributed only when at least one relay accepted it, so a copy that reached
+nothing is retried on the next pass instead of waiting out the interval.
+Changing an adopted list needs the user's say-so (follow-up).
 
 Defaults: `10002` = our relays, unmarked; `10050` = the Sonar relay plus two
 others (NIP-17 keeps it small); `10051` = the write set, for clients that still
@@ -75,8 +81,11 @@ set, newest per kind, sanitized (TLS only, plaintext only on loopback), capped
   peer's write set and legacy `10051` relays.
 - **Profile:** our relays, then the peer's write set, then the lookup set.
 - **Welcome:** our relays (the contextual hint the spec allows) **and** the
-  peer's inbox set, or their read set when they have no `10050`. Success is
-  any relay accepting it; a peer with no lists gets what shipped before.
+  peer's inbox set, or their read set when they have no `10050`. With an
+  inbox list, one of its relays (ours or foreign) must accept the welcome or
+  the send fails and the caller retries — a copy only on relays the peer never
+  reads is a silent non-delivery. A peer with no lists gets what shipped
+  before.
 - **New group:** relays = ours, then each invitee's write relays interleaved,
   capped at 16, so every member's own relays are in the group's routing.
 - **Group messages:** the outbox fan-out also publishes to the group's foreign

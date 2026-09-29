@@ -3170,19 +3170,25 @@ impl SonarClient {
     /// (where they publish), then the lookup set (where profiles get copied).
     async fn fetch_profile_via_routes(&self, author: PublicKey) -> Option<Metadata> {
         let routes = self.routes.resolve_peer_routes(&self.nostr, author).await;
-        let relays = self.routes.foreign(
-            routes
-                .write
-                .iter()
-                .chain(self.routes.config().lookup_relays.iter())
-                .cloned(),
-        );
-        if relays.is_empty() {
-            return None;
-        }
         let filter = Filter::new().author(author).kind(Kind::Metadata);
-        let fetched = self.routes.fetch_from(&relays, filter).await;
-        newest_metadata(fetched.events, &author)
+        // Their write relays first — where they publish — and the lookup set
+        // only when those have nothing, so a miss costs one bounded fan-out
+        // at a time rather than every relay at once.
+        let stages = [
+            self.routes.foreign(routes.write.iter().cloned()),
+            self.routes
+                .foreign(self.routes.config().lookup_relays.iter().cloned()),
+        ];
+        for relays in stages {
+            if relays.is_empty() {
+                continue;
+            }
+            let fetched = self.routes.fetch_from(&relays, filter.clone()).await;
+            if let Some(metadata) = newest_metadata(fetched.events, &author) {
+                return Some(metadata);
+            }
+        }
+        None
     }
 
     /// The claimed human-readable handle (`name@domain`), if any. Local read —
@@ -3721,7 +3727,17 @@ impl SonarClient {
                 Some(self.routes.publish_to(&foreign, wrapped).await)
             }
         });
-        let routed_accepted = routed.as_ref().is_some_and(|r| r.any_accepted());
+        let own_accepted: Vec<RelayUrl> = match own {
+            Ok(output) => output.success.into_iter().collect(),
+            Err(err) => {
+                tracing::debug!(%err, context, "welcome publish to own relays failed");
+                Vec::new()
+            }
+        };
+        let routed_accepted: Vec<RelayUrl> = routed
+            .as_ref()
+            .map(|r| r.accepted.clone())
+            .unwrap_or_default();
         if let Some(routed) = &routed {
             tracing::info!(
                 context,
@@ -3732,21 +3748,29 @@ impl SonarClient {
                 "welcome routed to the recipient's relays"
             );
         }
-        match own {
-            Ok(output) => match require_relay_success(&output, context) {
-                Ok(()) => Ok(()),
-                Err(err) if routed_accepted => {
-                    tracing::debug!(%err, "own relays refused the welcome; recipient relays took it");
-                    Ok(())
-                }
-                Err(err) => Err(err),
-            },
-            Err(err) if routed_accepted => {
-                tracing::debug!(%err, "own relays failed the welcome; recipient relays took it");
-                Ok(())
-            }
-            Err(err) => Err(err.into()),
+        if own_accepted.is_empty() && routed_accepted.is_empty() {
+            return Err(Error::NostrPublish(format!(
+                "{context}: no relay accepted the welcome"
+            )));
         }
+        // A welcome is delivered when it sits where the recipient reads
+        // gift wraps. With an inbox list, one of its relays — ours or
+        // foreign — must have taken it; a copy that only reached relays
+        // the recipient never reads is a silent non-delivery, so it fails
+        // here and the caller retries. Without an inbox list, any relay is
+        // the best available.
+        let inbox_hit = routes.inbox.is_empty()
+            || routes
+                .inbox
+                .iter()
+                .any(|u| own_accepted.contains(u) || routed_accepted.contains(u));
+        if !inbox_hit {
+            return Err(Error::NostrPublish(format!(
+                "{context}: none of the recipient's {} inbox relays accepted the welcome",
+                routes.inbox.len()
+            )));
+        }
+        Ok(())
     }
 
     async fn ensure_relays_connected(&self, relays: &[RelayUrl]) -> Result<()> {

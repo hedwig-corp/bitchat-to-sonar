@@ -1090,9 +1090,15 @@ relays, or any outbox-model Nostr client).
   `index.hzrd149.com`) but not the five Marmot relays. Connect.
 - **Expect:** the KeyPackage is published; no 10002/10050/10051 appears on
   the Marmot relays; the core logs `relay records: lookup reached no relay;
-  publishing nothing`. Unblock, reconnect: the lists appear.
-- **Guard:** `e2e::relay_routes::nothing_is_published_when_no_lookup_relay_answers`
-- **Origin:** #626. "Nobody answered" must never read as "nobody has one".
+  publishing nothing`. Unblock, reconnect: the lists appear. Variant: block
+  only *some* of the indexers — still no default is published (the core logs
+  `relay record not found, but not every lookup relay answered; deferred`),
+  while a list that does exist on a reachable indexer is copied at once.
+- **Guard:** `e2e::relay_routes::nothing_is_published_when_no_lookup_relay_answers`,
+  `e2e::relay_routes::defaults_wait_until_every_lookup_relay_answers_but_a_found_list_does_not`
+- **Origin:** #626. "Nobody answered" must never read as "nobody has one";
+  the review of #628 added the partial-answer rule (one silent indexer may be
+  the one holding the user's list).
 
 ### QA-140 — Relay records are not republished on every connect
 - **Platforms:** both.
@@ -1111,8 +1117,12 @@ relays, or any outbox-model Nostr client).
   A.
 - **Expect:** the chat starts; A gets the welcome on its 10002 read relay
   (`welcome routed to the recipient's relays` with `inbox=0` in the core log)
-  rather than the invite failing.
+  rather than the invite failing. Counter-case: give A a 10050 naming only a
+  dead relay — the chat start fails ("none of the recipient's 1 inbox relays
+  accepted the welcome") and no half-created chat is left behind, instead of
+  a success A would never see.
 - **Guard:** `e2e::relay_routes::welcome_falls_back_to_read_relays_when_the_recipient_has_no_inbox_list`,
+  `e2e::relay_routes::a_welcome_that_reaches_no_inbox_relay_fails_the_dm_start`,
   `relay_routes::tests::welcome_relays_prefer_inbox_then_read_set`
 - **Origin:** #626. The current White Noise runtime hard-fails here
   (`MissingMemberInboxRoute`); Sonar falls back instead.
