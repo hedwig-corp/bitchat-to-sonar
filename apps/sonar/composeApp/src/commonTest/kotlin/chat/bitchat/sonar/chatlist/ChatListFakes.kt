@@ -113,8 +113,7 @@ internal class FakeChatListSources : ChatListSources {
 
     val actions = mutableListOf<String>()
 
-    override fun marmotRow(chatId: String): MarmotRowModel =
-        rowModels[chatId] ?: error("no row model for $chatId")
+    override val marmotRows: Map<String, MarmotRowModel> get() = rowModels
 
     override fun openChat(chat: SonarChat) { actions += "openChat:${chat.id}" }
     override fun openDm(peerId: String, name: String) { actions += "openDm:$peerId:$name" }

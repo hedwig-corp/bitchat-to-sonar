@@ -425,7 +425,22 @@ sealed interface Screen {
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
-data class MeshDmRow(val peerId: String, val name: String, val preview: String, val tsSecs: Long)
+data class MeshDmRow(
+    val peerId: String,
+    val name: String,
+    val preview: String,
+    val tsSecs: Long,
+    /** The White Noise groups folded into this person's row (the linked
+     *  npub's direct groups): the set `transcriptGroupIds` resolves when the
+     *  open path read-marks the row, so the badge clears exactly when opening
+     *  does. Taken from the fold `recomputeConversations` already computes;
+     *  resolving it per row walks every group (O(chats) Bech32 decodes), which
+     *  neither a list recompose nor a housekeeping cycle should pay again. */
+    val groupIds: List<String> = emptyList(),
+    /** Safety number verified, over Bluetooth or on a folded White Noise leg
+     *  (iOS `dmRows` parity). */
+    val verified: Boolean = false,
+)
 
 /** A local contact that can be invited into a Marmot group. */
 data class GroupContact(val id: String, val title: String, val subtitle: String, val npub: String)
@@ -853,7 +868,21 @@ data class MarmotRowModel(
     val groupIds: List<String>,
     val pending: Boolean,
     val multiMember: Boolean,
-)
+) {
+    companion object {
+        /** A row with no cached model yet: its id, and "Tap to open". */
+        fun placeholder(chatId: String) = MarmotRowModel(
+            id = chatId,
+            title = chatId,
+            sub = "Tap to open",
+            tsSecs = 0L,
+            verified = false,
+            groupIds = listOf(chatId),
+            pending = false,
+            multiMember = false,
+        )
+    }
+}
 
 /**
  * Shared (commonMain) UI state for the Sonar app. Drives White Noise (Marmot)
@@ -4810,11 +4839,21 @@ class SonarAppState internal constructor(
         directMarmotChatIds(chatId).any { it in verifiedChatIds }
 
     fun markVerified(chatId: String) {
-        for (id in directMarmotChatIds(chatId)) {
+        val marked = directMarmotChatIds(chatId)
+        for (id in marked) {
             SonarCore.saveBlob("verified.$id", "1")
             verifiedChatIds += id
         }
         verifiedVersion++
+        // Mesh rows carry their verified flag (computed off the render path);
+        // update the affected ones now rather than at the next recompute.
+        meshDmRows = meshDmRows.map { row ->
+            if (!row.verified && (meshChatId(row.peerId) in marked || row.groupIds.any { it in marked })) {
+                row.copy(verified = true)
+            } else {
+                row
+            }
+        }
         payVersion++ // recompose verify-dependent UI
         toast = "Marked as verified"
     }
@@ -5871,7 +5910,7 @@ class SonarAppState internal constructor(
         override val meshRows: List<MeshDmRow> get() = meshDmRows
         override val marmotChats: List<SonarChat> get() = visibleChats
         override val noteToSelfGroupId: String? get() = this@SonarAppState.noteToSelfGroupId
-        override fun marmotRow(chatId: String): MarmotRowModel = this@SonarAppState.marmotRow(chatId)
+        override val marmotRows: Map<String, MarmotRowModel> get() = marmotRowModels()
         override fun openChat(chat: SonarChat) = this@SonarAppState.openChat(chat)
         override fun openDm(peerId: String, name: String) = this@SonarAppState.openDm(peerId, name)
         override fun acceptGroupInvite(inviteId: String) = this@SonarAppState.acceptGroupInvite(inviteId)
@@ -5885,16 +5924,7 @@ class SonarAppState internal constructor(
 
     /** O(1) precomputed home-row view model for [chatId] (see [marmotRowModels]). */
     fun marmotRow(chatId: String): MarmotRowModel =
-        marmotRowModels()[chatId] ?: MarmotRowModel(
-            id = chatId,
-            title = chatId,
-            sub = "Tap to open",
-            tsSecs = 0L,
-            verified = false,
-            groupIds = listOf(chatId),
-            pending = false,
-            multiMember = false,
-        )
+        marmotRowModels()[chatId] ?: MarmotRowModel.placeholder(chatId)
 
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
@@ -12380,6 +12410,24 @@ class SonarAppState internal constructor(
         homeMessagesHydrated = true
     }
 
+    /**
+     * Test seam: a person first met over Bluetooth ([peerId], [bleMessages])
+     * whose White Noise account ([npubHex], via the persisted 0x53 link) also
+     * has direct Marmot [groups], folded the way housekeeping folds them. The
+     * mesh-folded chat kind of docs/CHAT-TYPES.md, without a radio.
+     */
+    internal suspend fun seedMeshFoldedPersonForTest(
+        peerId: String,
+        npubHex: String,
+        bleMessages: List<SonarMsg>,
+        groups: List<SonarChat>,
+    ) {
+        chats = chats + groups
+        linkByFp[peerId] = npubHex
+        meshChats[peerId] = bleMessages
+        recomputeConversations()
+    }
+
     /** Test seam: a Home whose local model is coherent. [boot] needs a real
      *  core to get there, so tests of the chat-list call site set it here. */
     internal fun markHomeHydratedForTest() {
@@ -12923,6 +12971,10 @@ class SonarAppState internal constructor(
      *  later folds in the White Noise leg. */
     private fun refreshMeshDmRows() {
         val groups = meshConversationAliasGroups()
+        // The fold set and verified flag come from the last full recompute;
+        // this BLE-only pass keeps them so a badge does not blink off in
+        // between.
+        val folded = meshDmRows.associateBy { it.peerId }
         meshDmRows = groups.mapNotNull { aliases ->
             val peerId = selectCanonicalMeshPeerId(aliases, groupFoldMap.values.toSet()) ?: return@mapNotNull null
             if (isMeshContactBlocked(peerId)) return@mapNotNull null
@@ -12930,7 +12982,14 @@ class SonarAppState internal constructor(
                 .distinctBy { it.id }
                 .maxByOrNull { it.tsSecs }
                 ?: return@mapNotNull null
-            MeshDmRow(peerId, meshPeerName(peerId), messagePreview(last.content, last.stickerRef, last.media), last.tsSecs)
+            MeshDmRow(
+                peerId,
+                meshPeerName(peerId),
+                messagePreview(last.content, last.stickerRef, last.media),
+                last.tsSecs,
+                groupIds = folded[peerId]?.groupIds.orEmpty(),
+                verified = folded[peerId]?.verified ?: false,
+            )
         }
             .sortedByDescending { it.tsSecs }
     }
@@ -13004,7 +13063,23 @@ class SonarAppState internal constructor(
             persistGroupFolds()
             updateBleDiscoveryPolicy()
         }
-        meshDmRows = rowsByPeer.values.sortedByDescending { it.tsSecs }
+        // Each row's badge sums the groups folded into it above: the linked
+        // npub's direct groups, which is the set transcriptGroupIds resolves
+        // when openDm read-marks the row. Reusing the fold costs O(groups);
+        // re-resolving per row cost ~2 ms each in Bech32 decodes (JVM, 278
+        // groups), on the main dispatcher, every housekeeping cycle.
+        val groupIdsByPeer = HashMap<String, MutableList<String>>()
+        for ((groupId, peerId) in groupPeers) groupIdsByPeer.getOrPut(peerId) { mutableListOf() }.add(groupId)
+        meshDmRows = rowsByPeer.values
+            .map { row ->
+                val groupIds = groupIdsByPeer[row.peerId].orEmpty()
+                row.copy(
+                    groupIds = groupIds,
+                    verified = meshChatId(row.peerId) in verifiedChatIds ||
+                        groupIds.any { it in verifiedChatIds },
+                )
+            }
+            .sortedByDescending { it.tsSecs }
     }
 
     private fun persistChatSnapshot() {
