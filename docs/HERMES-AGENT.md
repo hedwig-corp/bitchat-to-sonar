@@ -346,8 +346,31 @@ Global flags: `--home <dir>` (else `SONAR_CLI_HOME`), `--relay <wss>` (repeatabl
 | `listen` hangs tool | Missing `--once` | Cron/tool calls must use `--once` |
 | Truncated / broken Hermes | Partial overwrite of `config.yaml` | Restore from `state-snapshots`; use `hermes config set` only |
 | "Too many pairing requests" | Pairing mode + extra traffic | Allowlist via env; disable typing/ack spam |
+| Replies feel slow although the LLM turn is quick | Each reply chunk is a fresh `sonar-cli send` process: open the store, connect, sync, publish, wait for the ack, then a 3 s push settle — ~4 s per chunk, serialized with a 0.4 s sleep between chunks (a 12-chunk answer lands over ~50 s) | Keep answers in few chunks; a long-lived send path is a tracked gap |
+| Gateway event loop stalls for up to 30 s on an inbound | The adapter runs `sonar-cli groups` **synchronously** on the loop (`subprocess.run`, 30 s timeout) every 5 min to refresh member counts; that command does a full relay sync against the live store | Move it to a thread (`asyncio.to_thread`) and cache longer |
+| `sonar-cli listen` silently stops delivering after days | The adapter spawns it with `stderr=PIPE` and never reads that pipe; the CLI's relay warnings (~0.7 KB per session, more on reconnect storms) eventually fill the 64 KB pipe and block the process | Read/drain stderr or point it at a log file |
+| Agent inbound latency grows with history | Before 2026-10 every wake rescanned every row of every group and rewrote `seen.json` (7,809 ids / 560 KB on one agent) | Upgrade the CLI: wakes now scan only the groups the core marked changed and the seen file is pruned to live rows |
+| Chat start takes 10 s+ per lookup | `relay.damus.io` stays connected but never answers a REQ once its NIP-42 AUTH challenge failed (`relay needs serviceUrl…`); every all-relay fetch waited for it | Upgrade the CLI/apps: KeyPackage lookups resolve on the relays that answer (QA-152) |
 
 ---
+
+## Host audit, 2026-09-30
+
+Measured on the production agent host (gateway Mode A, `~/.sonar-agent`,
+20 groups, 4,013 rows, 297 MB store):
+
+- Phone → agent delivery (gateway `inbound message` time minus the row's
+  `created_at`): 0.9–2.5 s on every text message of the last week; the
+  outliers in the log were media rows. The transport is not where replies
+  wait.
+- LLM turn (`response ready … time=`): 38 s to 2,550 s. That is what the
+  user feels, with no typing indicator or ack on Sonar (both disabled in the
+  config), so the chat shows nothing for minutes.
+- `sonar-cli groups` / `messages` on a copy of the store: 0.4 s each.
+- Host → Mac relay delivery of a CLI send: 0.3–1.3 s.
+- The installed binary was built 2026-08-07 while the checkout tracked
+  main; rebuild and reinstall after pulling (`cargo build -p sonar-cli
+  --release`, then copy to `~/.local/bin`).
 
 ## Smoke test (two temp homes)
 

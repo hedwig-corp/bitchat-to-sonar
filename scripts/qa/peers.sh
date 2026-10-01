@@ -9,6 +9,12 @@
 #   peers.sh npub <name>                      print the peer's npub
 #   peers.sh send <name> <to-npub> <text>     encrypted text DM
 #   peers.sh send-image <name> <to-npub> <file> [blossom-url]
+#   peers.sh seed-agent <name> <to-npub> [count] [group-name]
+#                                             agent-shaped history: <count> (40)
+#                                             ~3 KB replies in one process, the
+#                                             chat titled <group-name> ("Sonar
+#                                             agent · QA") — what a Hermes DM
+#                                             looks like after a few turns
 #   peers.sh listen <name> [secs]             JSON lines of inbound messages
 #                                             (streams; runs the full window)
 #   peers.sh expect <name> <substring> [secs] print the first inbound message JSON
@@ -104,6 +110,17 @@ case "$cmd" in
   send)
     name="${1:?send <name> <to> <text>}"; to="${2:?to npub}"; shift 2
     cli --home "$(home "$name")" send --to "$to" --text "$*" | grep '"type"' ;;
+  seed-agent)
+    # One `--repeat` run = one relay connect and one MLS epoch; 300 rows
+    # took 17 s on 2026-09-30. The text mirrors a Hermes reply chunk
+    # (max_chunk_chars 3200, paragraphs, no markdown).
+    name="${1:?seed-agent <name> <to> [count] [group-name]}"; to="${2:?to npub}"
+    count="${3:-40}"; gname="${4:-Sonar agent · QA}"
+    para="The agent reply explains how Marmot groups work with MLS epochs, commits and welcomes, why the outbox retries publishes in the background while the app paints from local storage first, and what the relays and Blossom uploads do in between."
+    text=""
+    while (( ${#text} < 3000 )); do text+="$para"$'\n\n'; done
+    cli --home "$(home "$name")" send --to "$to" --group-name "$gname" \
+      --text "$text" --repeat "$count" | grep '"type"' ;;
   send-image)
     name="${1:?send-image <name> <to> <file>}"; to="${2:?to npub}"; file="${3:?file}"
     blossom="${4:-https://nostr.download}"
