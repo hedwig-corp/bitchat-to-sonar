@@ -371,6 +371,11 @@ final class ConversationViewState: ObservableObject {
     /// Screens that only need rows read `messages`; the UIKit host consumes
     /// `renderState` so skip stays O(1) in the adapter.
     @Published private(set) var renderState = SNConversationRenderState.empty
+    /// Counts outgoing sends from this screen. The UIKit transcript host
+    /// watches it and brings the sent row onto screen even when the chat
+    /// was opened in history (unread divider) — see `TranscriptTailPinLatch
+    /// .ownSendAppended`.
+    @Published private(set) var ownSendRevision: UInt64 = 0
     /// Convenience for SwiftUI lists / empty checks — same rows as `renderState`.
     var messages: [SNMessage] { renderState.messages }
     @Published private(set) var hasOlderMessages = false
@@ -453,6 +458,13 @@ final class ConversationViewState: ObservableObject {
 
     /// Build and publish only when the result differs — the equality check is
     /// what turns unrelated store invalidations into no-ops for SwiftUI.
+    /// Call right after handing an outgoing message to the store, before the
+    /// echo repaint: the host snaps to the live edge on the apply that
+    /// carries the new tail (Signal: an own send always scrolls to bottom).
+    func noteOwnSend() {
+        ownSendRevision &+= 1
+    }
+
     func rebuildNow() {
         guard let store else { return }
         #if DEBUG

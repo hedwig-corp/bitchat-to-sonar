@@ -928,6 +928,24 @@ private struct SNQuickReactionGroup: View {
 
 /// Chips tuck 7 pt under a bubble whose edge is the last thing drawn. Media
 /// and sticker rows print their time below the image, and a delivery footer
+/// What VoiceOver reads for a bubble's delivery meta. A row that is still
+/// "Sending" (or failed) must never be announced as "Sent at …": the sighted
+/// footer shows the truth, and the QA driver reads this label to decide
+/// whether a send went out (QA-151).
+func snBubbleDeliveryAccessibilityLabel(
+    stateText: String?,
+    isPending: Bool,
+    isFailed: Bool,
+    time: String
+) -> String {
+    if isPending || isFailed, let stateText, !stateText.isEmpty {
+        // "Sending · internet" → "Sending"; "Couldn't send · internet" → "Couldn't send".
+        let bare = stateText.components(separatedBy: " · ").first ?? stateText
+        return bare
+    }
+    return "Sent at \(time)"
+}
+
 /// ("Sent · internet") ends an outgoing row: tucking there covers that text.
 func snChipsTuckUnderBubble(_ m: SNMessage, showsState: Bool) -> Bool {
     m.media.isEmpty && m.stickerRef == nil && !(m.mine && showsState)
@@ -1242,7 +1260,12 @@ struct SNMsgBubble: View {
                 .padding(.bottom, 1.5)
                 .textSelection(.disabled)
                 .allowsHitTesting(false)
-                .accessibilityLabel("Sent at \(m.time)")
+                .accessibilityLabel(snBubbleDeliveryAccessibilityLabel(
+                    stateText: m.state,
+                    isPending: m.state == "Sending" || m.state == "Uploading",
+                    isFailed: m.state == "Couldn't send",
+                    time: m.time
+                ))
                 }
             }
             .padding(EdgeInsets(top: 8, leading: 12, bottom: 9, trailing: 12))

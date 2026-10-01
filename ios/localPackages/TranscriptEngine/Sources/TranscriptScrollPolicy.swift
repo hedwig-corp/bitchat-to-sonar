@@ -128,12 +128,15 @@ public enum TranscriptScrollPolicy {
         jumpMessageId: String?,
         lastJumpMessageId: String?,
         expectedNewestDate: Date?,
-        lastExpectedNewestDate: Date?
+        lastExpectedNewestDate: Date?,
+        ownSendRevision: UInt64? = nil,
+        lastOwnSendRevision: UInt64? = nil
     ) -> Bool {
         guard let contentVersion, contentVersion == lastContentVersion else { return false }
         return unreadCountAtOpen == lastUnreadCountAtOpen
             && jumpMessageId == lastJumpMessageId
             && expectedNewestDate == lastExpectedNewestDate
+            && ownSendRevision == lastOwnSendRevision
     }
 
     public static func insetFollowDecision(
@@ -258,6 +261,20 @@ public struct TranscriptTailPinLatch {
         }
         guard wasPinned, appendedAtTail else { return .none }
         return .animate
+    }
+
+    /// Signal's rule for an outgoing message (`CVScrollAction` on send): the
+    /// sender's own row always brings the viewport to the live edge, however
+    /// far up in history the chat was opened (unread divider) or scrolled.
+    /// Re-pins the latch so the rows that follow keep tracking the tail.
+    ///
+    /// Without this, a chat opened at "Unread messages" above a long agent
+    /// reply swallowed every send: the row landed at the tail, off screen,
+    /// while the reader stayed parked on the first unread bubble (QA-150).
+    public mutating func ownSendAppended(itemCount: Int, tailID: String?) -> TranscriptTailPinAction {
+        wasPinned = true
+        updateSnapshot(itemCount: itemCount, tailID: tailID)
+        return .snap
     }
 
     public mutating func tailHidden(

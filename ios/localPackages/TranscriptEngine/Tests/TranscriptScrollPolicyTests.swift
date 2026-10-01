@@ -67,6 +67,58 @@ struct TranscriptScrollPolicyTests {
         )
     }
 
+    /// QA-150: a chat opened at the unread divider is "in history" for the
+    /// latch, so an appended row never followed — including the reader's own
+    /// send, which landed off screen below 300 unread agent replies. Signal
+    /// scrolls to the bottom on every outgoing message; so does the latch now.
+    @Test
+    func ownSendInHistorySnapsToTheTailAndRePins() {
+        var latch = TranscriptTailPinLatch()
+        latch.openInHistory(itemCount: 300, tailID: "m-299")
+        // Control: a peer's row appended while the reader is in history stays put.
+        #expect(
+            latch.itemsChanged(
+                itemCount: 301, tailID: "m-300",
+                isNearBottom: false, userScrolling: false, isPrepending: false
+            ) == .none
+        )
+        #expect(!latch.wasPinned)
+        // The reader's own send: snap, and pin so the reply that follows tracks.
+        #expect(latch.ownSendAppended(itemCount: 302, tailID: "echo-1") == .snap)
+        #expect(latch.wasPinned)
+        #expect(
+            latch.itemsChanged(
+                itemCount: 303, tailID: "m-301",
+                isNearBottom: true, userScrolling: false, isPrepending: false
+            ) == .animate
+        )
+    }
+
+    /// An own send with an unchanged transcript revision (echo not landed
+    /// yet, composer republish) must still reach the host: the skip path
+    /// would otherwise swallow the revision bump and the snap never runs.
+    @Test
+    func ownSendRevisionBumpIsNeverSkipped() {
+        #expect(
+            !TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 7, lastContentVersion: 7,
+                unreadCountAtOpen: 3, lastUnreadCountAtOpen: 3,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil,
+                ownSendRevision: 2, lastOwnSendRevision: 1
+            )
+        )
+        #expect(
+            TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 7, lastContentVersion: 7,
+                unreadCountAtOpen: 3, lastUnreadCountAtOpen: 3,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil,
+                ownSendRevision: 2, lastOwnSendRevision: 2
+            )
+        )
+    }
+
     @Test
     func insetFollowPinsWhenWasAtTail() {
         #expect(

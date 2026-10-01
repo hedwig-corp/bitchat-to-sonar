@@ -79,6 +79,10 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     var expectedNewestDate: Date?
     /// When set, open-action Jump wins over unread/live-edge (search / deep link).
     var jumpMessageId: String?
+    /// Bumped by the app on every outgoing send. A new value snaps the
+    /// transcript to the live edge once the sent row is in `entries`, even
+    /// when the chat was opened in history (Signal: own send → bottom).
+    var ownSendRevision: UInt64?
     var loadOlder: (() async -> Bool)?
     var loadNewest: (() async -> Void)?
     /// Host / collection / composer chrome background. Defaults to system; apps
@@ -109,6 +113,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         unreadCountAtOpen: UInt64? = nil,
         expectedNewestDate: Date? = nil,
         jumpMessageId: String? = nil,
+        ownSendRevision: UInt64? = nil,
         loadOlder: (() async -> Bool)? = nil,
         loadNewest: (() async -> Void)? = nil,
         transcriptBackgroundColor: UIColor = .systemBackground,
@@ -124,6 +129,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.unreadCountAtOpen = unreadCountAtOpen
         self.expectedNewestDate = expectedNewestDate
         self.jumpMessageId = jumpMessageId
+        self.ownSendRevision = ownSendRevision
         self.loadOlder = loadOlder
         self.loadNewest = loadNewest
         self.transcriptBackgroundColor = transcriptBackgroundColor
@@ -151,6 +157,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
+            ownSendRevision: ownSendRevision,
             contentVersion: contentVersion,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
@@ -173,6 +180,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
+            ownSendRevision: ownSendRevision,
             contentVersion: contentVersion,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
@@ -249,6 +257,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var unreadCountAtOpen: UInt64?
     private var expectedNewestDate: Date?
     private var jumpMessageId: String?
+    private var ownSendRevision: UInt64?
+    /// Set when `ownSendRevision` advances; consumed by the first apply whose
+    /// tail moved (the sent row landed, possibly after the newest-page reload).
+    private var pendingOwnSendSnap = false
     var onJumpSettled: (() -> Void)?
 
     private var unreadAnchorId: String?
@@ -460,6 +472,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         unreadCountAtOpen: UInt64?,
         expectedNewestDate: Date?,
         jumpMessageId: String? = nil,
+        ownSendRevision: UInt64? = nil,
         contentVersion: UInt64? = nil,
         loadOlder: (() async -> Bool)?,
         loadNewest: (() async -> Void)?,
@@ -490,7 +503,9 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             jumpMessageId: jumpMessageId,
             lastJumpMessageId: self.jumpMessageId,
             expectedNewestDate: expectedNewestDate,
-            lastExpectedNewestDate: self.expectedNewestDate
+            lastExpectedNewestDate: self.expectedNewestDate,
+            ownSendRevision: ownSendRevision,
+            lastOwnSendRevision: self.ownSendRevision
         ) {
             // SwiftUI rebuilds closures every turn; keep them fresh and keep
             // the live-edge open pump alive, but skip the O(n) snapshot
@@ -512,6 +527,10 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         self.unreadCountAtOpen = unreadCountAtOpen
         self.expectedNewestDate = expectedNewestDate
         self.jumpMessageId = jumpMessageId
+        if let ownSendRevision, ownSendRevision != self.ownSendRevision {
+            pendingOwnSendSnap = self.ownSendRevision != nil || ownSendRevision > 0
+        }
+        self.ownSendRevision = ownSendRevision
         self.loadOlder = loadOlder
         self.loadNewest = loadNewest
 
@@ -530,6 +549,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             applyOpenAction(.unreadDivider)
         } else if previousUnread != unreadCountAtOpen {
             applyOpenAction(transcriptOpenAction)
+        } else if pendingOwnSendSnap, revision != previousRevision {
+            followOwnSend()
         } else if revision != previousRevision {
             handleItemsChanged()
         } else if needsLiveEdgeOpen {
@@ -843,6 +864,18 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             isPrepending: isLoadingOlder
         )
         followTail(action, animateAppends: feedCaughtUp)
+    }
+
+    /// The sent row is in `entries`: leave history, land on the live edge and
+    /// re-pin so later appends follow. Runs regardless of the unread anchor,
+    /// a pending divider or a user scroll — an own send is the reader's
+    /// explicit move to the bottom (Signal `CVScrollAction` on send).
+    private func followOwnSend() {
+        pendingOwnSendSnap = false
+        hasLeftBottom = false
+        needsLiveEdgeOpen = false
+        let action = latch.ownSendAppended(itemCount: entries.count, tailID: entries.last?.id)
+        followTail(action, animateAppends: false)
     }
 
     private func scrollToUnreadDivider() {
