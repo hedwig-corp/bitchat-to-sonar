@@ -1070,6 +1070,17 @@ fn take_catchup_batch(
     batch
 }
 
+/// Catch-up inputs for one group that has a local transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupCatchupCandidate {
+    group_id_hex: String,
+    /// Relay floor: the newest stored peer chat row, 0 for full history (R-005).
+    floor: u64,
+    /// The newest stored chat row of any author. It only ranks the queue and is
+    /// never a fetch floor, so a later local send cannot hide peer messages.
+    last_activity_secs: u64,
+}
+
 /// One era-bucket of catch-up groups fetched in a single batched `#h` request.
 #[derive(Debug, PartialEq, Eq)]
 struct CatchupBucket {
@@ -1111,10 +1122,15 @@ fn catchup_bucket_since(entries: &[(String, u64)], lookback: u64) -> Option<u64>
 /// history) share one unbounded bucket.
 ///
 /// At most `max_buckets` buckets run this pass so per-pass relay work stays
-/// bounded and non-blocking. The bucket holding the FIRST (preferred/open-chat)
-/// batch entry is always kept; remaining slots go to the oldest-floor buckets
-/// (the most starved). Groups in dropped buckets are returned for requeue and
-/// make progress on a later pass, preserving the anti-starvation property.
+/// bounded and non-blocking. Buckets run in queue order: the bucket holding the
+/// FIRST (preferred/open-chat) batch entry is always kept, and remaining slots
+/// go to the bounded buckets holding the next-highest-ranked entries. The queue
+/// is ranked by recent chat activity, so the budget is spent on the chats most
+/// likely to be missing messages; the unbounded zero-floor bucket runs only
+/// when it holds the lead. Groups in dropped buckets are returned in batch
+/// order so the caller can put them back at the FRONT of the queue for the next
+/// pass. Sending them to the back would push the most active chats behind
+/// every dormant group (R-054).
 fn plan_catchup_buckets(
     batch: Vec<(String, u64)>,
     span: u64,
@@ -1125,6 +1141,12 @@ fn plan_catchup_buckets(
         return (Vec::new(), batch);
     }
     let lead_id = batch[0].0.clone();
+    let rank: HashMap<String, usize> = batch
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _))| (id.clone(), i))
+        .collect();
+    let rank_of = |id: &String| rank.get(id).copied().unwrap_or(usize::MAX);
 
     // Zero floors need full history; bounded floors bucket by proximity.
     let mut zero: Vec<(String, u64)> = Vec::new();
@@ -1152,13 +1174,15 @@ fn plan_catchup_buckets(
             buckets.push(vec![entry]);
         }
     }
-    // All zero-floor groups share one unbounded bucket, appended last (most
-    // expensive, so lowest priority unless it holds the lead group).
+    // Bounded buckets in queue order: the one holding the highest-ranked entry
+    // first. All zero-floor groups share one unbounded bucket, appended last
+    // (most expensive, so lowest priority unless it holds the lead group).
+    buckets.sort_by_key(|b| b.iter().map(|(id, _)| rank_of(id)).min());
     if !zero.is_empty() {
         buckets.push(zero);
     }
 
-    // Order the lead group's bucket first, then the rest in oldest-first order.
+    // Order the lead group's bucket first, then the rest in queue order.
     let lead_pos = buckets
         .iter()
         .position(|b| b.iter().any(|(id, _)| id == &lead_id));
@@ -1171,15 +1195,16 @@ fn plan_catchup_buckets(
 
     let mut kept: Vec<CatchupBucket> = Vec::new();
     let mut requeue: Vec<(String, u64)> = Vec::new();
-    for (rank, idx) in order.into_iter().enumerate() {
+    for (slot, idx) in order.into_iter().enumerate() {
         let entries = std::mem::take(&mut buckets[idx]);
-        if rank < max_buckets {
+        if slot < max_buckets {
             let since = catchup_bucket_since(&entries, lookback);
             kept.push(CatchupBucket { entries, since });
         } else {
             requeue.extend(entries);
         }
     }
+    requeue.sort_by_key(|(id, _)| rank_of(id));
     (kept, requeue)
 }
 
@@ -6509,25 +6534,37 @@ impl SonarClient {
             .insert(group_id_hex.to_string());
     }
 
-    fn group_message_catchup_floors(engine: &MarmotEngine) -> HashMap<String, u64> {
+    fn group_message_catchup_candidates(engine: &MarmotEngine) -> Vec<GroupCatchupCandidate> {
         let Ok(groups) = engine.groups() else {
-            return HashMap::new();
+            return Vec::new();
         };
         groups
             .into_iter()
             .filter_map(|group| {
-                let has_local_chat = engine
+                // The newest chat row proves a local transcript exists and
+                // ranks the group. Groups without one belong to the
+                // empty-transcript backfill.
+                let newest = engine
                     .messages_page(&group.mls_group_id, 1, 0)
-                    .map(|page| !page.is_empty())
-                    .unwrap_or(false);
-                if !has_local_chat {
-                    return None;
-                }
+                    .ok()?
+                    .into_iter()
+                    .next()?;
                 let floor = engine
                     .latest_remote_chat_message_secs(&group.mls_group_id)
                     .unwrap_or(0);
-                Some((hex::encode(group.nostr_group_id), floor))
+                Some(GroupCatchupCandidate {
+                    group_id_hex: hex::encode(group.nostr_group_id),
+                    floor,
+                    last_activity_secs: newest.created_at.as_secs(),
+                })
             })
+            .collect()
+    }
+
+    fn group_message_catchup_floors(engine: &MarmotEngine) -> HashMap<String, u64> {
+        Self::group_message_catchup_candidates(engine)
+            .into_iter()
+            .map(|c| (c.group_id_hex, c.floor))
             .collect()
     }
 
@@ -6540,7 +6577,7 @@ impl SonarClient {
         }
         let mut queue = self.initial_group_message_catchups.lock().unwrap();
         *queue =
-            Self::group_message_catchup_queue(Self::group_message_catchup_floors(&self.engine));
+            Self::group_message_catchup_queue(Self::group_message_catchup_candidates(&self.engine));
         tracing::info!(
             groups = queue.len(),
             "initial group message catch-up queued"
@@ -6589,10 +6626,38 @@ impl SonarClient {
         Self::push_group_message_catchup_back(&mut queue, group_id, floor);
     }
 
-    fn group_message_catchup_queue(floors: HashMap<String, u64>) -> VecDeque<(String, u64)> {
-        let mut entries: Vec<_> = floors.into_iter().collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        entries.into()
+    /// Put groups a pass did not reach back at the FRONT, keeping their order,
+    /// so the next pass takes them before anything ranked below them.
+    fn defer_initial_group_message_catchups(&self, entries: Vec<(String, u64)>) {
+        if entries.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            groups = entries.len(),
+            "group message catch-up deferred to next pass"
+        );
+        let mut queue = self.initial_group_message_catchups.lock().unwrap();
+        Self::push_group_message_catchups_front(&mut queue, entries);
+    }
+
+    /// Most recently active chat first (R-054). Each new client rebuilds this
+    /// queue, and on iOS that is every foreground, while a short visit runs
+    /// only a pass or two. Ranked by group id, a 400-group account repaired
+    /// the same few dormant groups on every visit and never reached the chat
+    /// the user was actually in. Ties fall back to the group id so the order
+    /// stays deterministic.
+    fn group_message_catchup_queue(
+        mut candidates: Vec<GroupCatchupCandidate>,
+    ) -> VecDeque<(String, u64)> {
+        candidates.sort_by(|a, b| {
+            b.last_activity_secs
+                .cmp(&a.last_activity_secs)
+                .then_with(|| a.group_id_hex.cmp(&b.group_id_hex))
+        });
+        candidates
+            .into_iter()
+            .map(|c| (c.group_id_hex, c.floor))
+            .collect()
     }
 
     fn push_group_message_catchup_back(
@@ -6602,6 +6667,16 @@ impl SonarClient {
     ) {
         queue.retain(|(queued_id, _)| queued_id != &group_id);
         queue.push_back((group_id, floor));
+    }
+
+    fn push_group_message_catchups_front(
+        queue: &mut VecDeque<(String, u64)>,
+        entries: Vec<(String, u64)>,
+    ) {
+        queue.retain(|(queued_id, _)| !entries.iter().any(|(id, _)| id == queued_id));
+        for entry in entries.into_iter().rev() {
+            queue.push_front(entry);
+        }
     }
 
     async fn run_initial_group_message_catchup(&self) -> Result<MarmotProcessReport> {
@@ -6656,10 +6731,9 @@ impl SonarClient {
             GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
             GROUP_CATCHUP_MAX_BUCKETS,
         );
-        // Groups that didn't fit this pass go back to the queue immediately.
-        for (group_id, floor) in dropped {
-            self.requeue_initial_group_message_catchup(group_id, floor);
-        }
+        // Groups that didn't fit this pass keep their place at the front of the
+        // queue. Only a group that actually failed rotates to the back.
+        self.defer_initial_group_message_catchups(dropped);
 
         let mut aggregate = MarmotProcessReport::default();
         let mut buckets = buckets.into_iter();
@@ -6683,16 +6757,14 @@ impl SonarClient {
                 }
                 Err(err) => {
                     // A fetch error is almost certainly transient (relay/network);
-                    // requeue this bucket and every bucket we haven't tried yet,
-                    // then stop stacking fetches this pass.
+                    // requeue this bucket, keep every bucket we haven't tried yet
+                    // at the front, then stop stacking fetches this pass.
                     for (group_id, floor) in bucket.entries {
                         self.requeue_initial_group_message_catchup(group_id, floor);
                     }
-                    for remaining in buckets.by_ref() {
-                        for (group_id, floor) in remaining.entries {
-                            self.requeue_initial_group_message_catchup(group_id, floor);
-                        }
-                    }
+                    let untried: Vec<(String, u64)> =
+                        buckets.by_ref().flat_map(|b| b.entries).collect();
+                    self.defer_initial_group_message_catchups(untried);
                     self.finish_catchup_pass(true);
                     return Err(err);
                 }
@@ -10603,6 +10675,103 @@ mod tests {
                 ("aaa".to_string(), 100),
             ]
         );
+    }
+
+    /// R-054: the catch-up queue a fresh client builds (on iOS, every
+    /// foreground) must lead with the chat the user was last active in, not
+    /// with whichever group id sorts first. On a 400-group account the id
+    /// order repaired the same dormant groups on every visit and never reached
+    /// the chat where the peer had replied while this device was offline.
+    #[tokio::test]
+    async fn catchup_queue_leads_with_most_recently_active_chat() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), vec![])
+            .await
+            .expect("alice connects");
+        let mut groups = Vec::new();
+        for i in 0..4 {
+            let peer = MarmotEngine::in_memory(Identity::generate());
+            let kp = peer.key_package_event(relays.clone()).expect("peer kp");
+            let creation = alice
+                .engine
+                .create_group(&format!("chat {i}"), vec![kp], relays.clone())
+                .expect("alice creates group");
+            let group_id = creation.group.mls_group_id.clone();
+            alice
+                .engine
+                .merge_pending_commit(&group_id)
+                .expect("alice merges pending commit");
+            let hello = alice
+                .engine
+                .create_text_message(&group_id, "hello")
+                .expect("alice creates hello");
+            alice
+                .engine
+                .process_incoming(&hello)
+                .await
+                .expect("alice stores hello");
+            groups.push((group_id, hex::encode(creation.group.nostr_group_id)));
+        }
+        // The chat the user is active in sorts LAST by group id, so a queue
+        // ordered by id cannot put it first by accident.
+        let (active_group, active_hex) = groups
+            .iter()
+            .max_by(|a, b| a.1.cmp(&b.1))
+            .cloned()
+            .expect("groups");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let latest = alice
+            .engine
+            .create_text_message(&active_group, "are you there?")
+            .expect("alice creates latest");
+        alice
+            .engine
+            .process_incoming(&latest)
+            .await
+            .expect("alice stores latest");
+
+        alice.populate_initial_group_message_catchups_once();
+        let batch = alice.take_initial_group_message_catchup_batch();
+        assert_eq!(batch.len(), groups.len());
+        assert_eq!(
+            batch[0].0, active_hex,
+            "the most recently active chat leads the first pass"
+        );
+    }
+
+    /// R-054: a pass spends its bucket budget in queue order, and the groups it
+    /// cannot fit keep their place at the FRONT of the queue. Before, the second
+    /// slot went to the oldest floor and every other group went to the back, so
+    /// the most active chats waited behind every dormant one.
+    #[test]
+    fn catchup_pass_keeps_unreached_groups_at_the_front() {
+        let now = 1_700_000_000u64;
+        let hour = 60 * 60;
+        // Ranked by activity; floors are hours apart, so each is its own bucket.
+        let mut queue = VecDeque::from([
+            ("active".to_string(), now),
+            ("second".to_string(), now - 5 * hour),
+            ("third".to_string(), now - 10 * hour),
+            ("dormant".to_string(), now - 400 * hour),
+            ("next".to_string(), now - 2 * hour),
+        ]);
+        let batch = take_catchup_batch(&mut queue, None, 4);
+        let (buckets, dropped) = plan_catchup_buckets(
+            batch,
+            GROUP_CATCHUP_BUCKET_SPAN_SECS,
+            GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
+            2,
+        );
+        let ids = |entries: &[(String, u64)]| -> Vec<String> {
+            entries.iter().map(|(id, _)| id.clone()).collect()
+        };
+        let kept: Vec<String> = buckets.iter().flat_map(|b| ids(&b.entries)).collect();
+        assert_eq!(kept, vec!["active", "second"]);
+        assert_eq!(ids(&dropped), vec!["third", "dormant"]);
+
+        SonarClient::push_group_message_catchups_front(&mut queue, dropped);
+        let queued: Vec<(String, u64)> = queue.into_iter().collect();
+        assert_eq!(ids(&queued), vec!["third", "dormant", "next"]);
     }
 
     #[test]
