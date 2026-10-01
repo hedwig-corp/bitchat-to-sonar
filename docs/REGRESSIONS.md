@@ -398,7 +398,7 @@ the send echo was cleared before the canonical row merged.
 
 **Not guarded:** the iOS tap → `refreshAfterForeground` wiring and the Compose notification-open → `forcedCatchupSync` / "catching up…" chip. Both need a constructible store (see Unguarded). Real-device APNs validation remains #262.
 
-**History:** #166 (foreground/push relay sync) → #252 (forced sync skipped the live batched `#h` fetch — primary invisible-on-open bug) → #254/#255 (catch-up starvation + push-tap kick + catching-up chip; consolidated here onto current main). Related floor starvation is R-005.
+**History:** #166 (foreground/push relay sync) → #252 (forced sync skipped the live batched `#h` fetch — primary invisible-on-open bug) → #254/#255 (catch-up starvation + push-tap kick + catching-up chip; consolidated here onto current main). Related floor starvation is R-005; queue order across short visits is R-054.
 
 **Rejected:**
 - *Waiting only on `scenePhase` / socket-connected "Online".* iOS cold-launch taps can miss the refresh, and "Online" lied while catch-up had not run.
@@ -2947,6 +2947,75 @@ once; later passes merge into the queue the heartbeat drains).
 - *Wipe and rebuild the index when the migration fails.* `materialize_from`
   restores summaries but resets every unread count and drops peer-zone revoke
   tombstones, and it hides the migration defect rather than fixing it.
+
+## R-054 — Per-group catch-up repairs the chats you are in first
+
+**Invariant:** the per-group relay catch-up queue a client builds is ranked by
+each chat's newest local chat row, newest first. A pass that cannot fit a
+group into its bucket budget keeps that group at the front of the queue, in
+order. Only a group whose fetch failed rotates to the back.
+
+**Breaks as:** two people who go offline at alternating times stop getting each
+other's messages. The peer replies while this device is suspended for longer
+than the 30-minute live tail, so the resubscribe burst never carries the
+reply. On iOS every foreground opens a fresh client, which rebuilt the queue
+in group-id order, and a short visit ran one or two passes of about two groups
+each. The chat the user was actually in was never reached. Field case,
+TestFlight 1.15.2/47, iPhone with 400 groups, 2026-09-29 to 10-01: every
+session's catch-up stopped at a group prefix at or below `0a6d`. The peer's
+group, `2a48…`, was last reached on Sep 29 at 06:27 UTC. Nothing she sent after
+that arrived, while the peer (Android) kept receiving his messages. No forced
+sync ran in that window (0 of about 60 foregrounds), so nothing else covered
+the gap, and the sync watermark stayed at Sep 29 06:20.
+
+**Core call site:** `client.rs::SonarClient::populate_initial_group_message_catchups_once`
+→ `group_message_catchup_queue` (the ranking), and
+`run_initial_group_message_catchup` → `plan_catchup_buckets` +
+`defer_initial_group_message_catchups` (the pass budget). This fixes both
+hosts; neither host call site changes.
+
+**Apple call site:** `MarmotChatModel.refreshAfterForeground` and the polling
+loop → `MarmotService.ensureSubscriptions` / `syncForce`, unchanged.
+
+**Compose call site:** `SonarAppState.poll` (heartbeat `ensureSubscriptions`)
+and `SonarAppState.forcedCatchupSync` (`syncForce`), unchanged.
+
+**Guarded by:** `client.rs::catchup_queue_leads_with_most_recently_active_chat`
+(the real `populate_initial_group_message_catchups_once` +
+`take_initial_group_message_catchup_batch` on an engine where the active chat
+sorts last by id), `client.rs::catchup_pass_keeps_unreached_groups_at_the_front`.
+Both fail on the old order: the first gets the smallest group id, the second
+spends the pass's second slot on the oldest floor and sends the rest to the
+back.
+
+**Also guarded by:** `client.rs::group_message_catchup_floor_uses_peer_message_not_later_local_send`
+(R-005: ranking uses the newest row of any author, but the fetch floor is
+still the newest PEER row).
+
+**Not guarded:**
+- Why the forced sync never ran on the phone. iOS queues `syncForce` on the
+  serial work queue behind connect, outbox and publish work, and a visit of
+  10 to 60 s ends before its turn. This fix makes the first catch-up pass of
+  each visit, which does run, repair the active chats. It does not make
+  `syncForce` run, and it does not advance the watermark.
+- A chat ranked low (a contact silent for weeks who writes while this device
+  is offline) still waits for later passes or a forced sync. Groups deep in a
+  400-group queue are not reached in a short visit; they are the least active
+  ones.
+- A forced sync after a long gap can hit a relay's 500-event cap and overflow
+  the live buffer (`dropped=384` on the same phone, Sep 29 06:20) and still
+  advance the watermark.
+
+**Rejected:**
+- *Persist the queue position across clients.* The position is meaningless
+  once new messages arrive, and resuming at group 66 of 400 still visits
+  dormant groups before the active one.
+- *Widen the live tail to the watermark.* The tail is thin on purpose: a
+  watermark days old re-floods cold start and steals the engine queue from
+  sends (#252, R-013).
+- *Rank by the fetch floor (newest peer row).* A chat where you sent last and
+  the peer replied while you were offline, the case reported here, ranks low
+  by peer activity but is the one most likely to be missing messages.
 
 ## Unguarded
 

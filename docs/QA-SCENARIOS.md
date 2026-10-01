@@ -389,6 +389,27 @@ nothing by design.
 - **Expect:** clock/battery/signal icons are light and visible on every screen.
 - **Origin:** A2 (#616)
 
+### QA-153 — A reply sent while you were away arrives on your next short visit
+- **Platforms:** both. The fix is in core, so both apps get it.
+- **How:** automated in core, and CI runs it on every PR (`cargo test
+  --workspace`): `client.rs::catchup_queue_leads_with_most_recently_active_chat`
+  builds the queue through the real call site, and
+  `catchup_pass_keeps_unreached_groups_at_the_front` pins the pass budget. The
+  smoke gets no scripted step. The bug needs a reply older than the 30-minute
+  live tail on an account with many groups, and a fresh QA account has a
+  handful.
+- **Steps (real accounts, the case that found it):** on an account with many
+  chats, send a message in chat X, then background the app (or switch off
+  data) for more than 30 minutes. The peer replies in X during that time.
+  Open the app for 15 s or so, and do not open X.
+- **Expect:** the reply is in X's row and transcript after that one short
+  visit. In `sonar-core.log`, the first `initial per-group message catch-up`
+  fetch after `initial group message catch-up queued` covers X's group.
+- **Origin:** TestFlight feedback 2026-10-01 (1.15.2/47): two people offline
+  at alternating times stopped getting each other's messages. The queue was
+  in group-id order and rebuilt on every foreground, so short visits never
+  reached the chat. R-054.
+
 ## Home and channels
 
 ### QA-030 — "Around you" names the selected tier
