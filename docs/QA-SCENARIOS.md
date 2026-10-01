@@ -410,6 +410,22 @@ nothing by design.
   in group-id order and rebuilt on every foreground, so short visits never
   reached the chat. R-054.
 
+### QA-154 — The UI stays responsive while relays sync
+- **Platforms:** iOS (manual, measured by the stall probe). Compose has no
+  sink of this shape; if a report comes in there, look at `visibleChats` jank.
+- **Steps:** on an account with hundreds of chats, background the app for a
+  few minutes, bring it back, and scroll the chat list and open a chat while
+  it catches up. Then pull `sonar-ios.log` from the app container (devicectl,
+  see `docs/PERFORMANCE.md`) and grep `main thread stalled`.
+- **Expect:** no `main thread stalled` line during the catch-up, and
+  `home.groupsSink` never appears in a `sections=` list. Before the fix: 15
+  stalls of 0.5–1.6 s in 45 s, every one in `home.groupsSink` (~1,040 ms
+  each) on a 400-group account.
+- **How:** manual on a device; `TimezoneShareGroupIdsTests` guards the
+  share-list build. The probe lines are the acceptance signal.
+- **Origin:** reported 2026-10-01 on 1.15.2/47 (iPhone 14 Pro Max, 400
+  groups). R-055.
+
 ## Home and channels
 
 ### QA-030 — "Around you" names the selected tier
