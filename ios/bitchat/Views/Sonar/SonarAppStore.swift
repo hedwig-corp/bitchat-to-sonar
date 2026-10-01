@@ -2536,10 +2536,13 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 guard let self else { return }
-                self.refreshBleKnownContactSnapshot()
-                self.applyBLEDiscoveryPolicy()
-                self.objectWillChange.send()
-                self.reconcileTimezoneShare()
+                SNMainThreadStallProbe.measure("home.groupsSink") {
+                    // `applyBLEDiscoveryPolicy` recomputes the known-contact
+                    // snapshot itself; a second walk here only doubled its cost.
+                    self.applyBLEDiscoveryPolicy()
+                    self.objectWillChange.send()
+                    self.reconcileTimezoneShare()
+                }
                 DispatchQueue.main.async { [weak self] in
                     self?.flushPendingMarmotSends()
                 }
@@ -3151,17 +3154,22 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func timezoneShareGroupIds() -> [String] {
-        var ids = Set<String>()
-        for group in marmot.groups {
-            let chatId = Self.marmotIDPrefix + group.id
-            if sharesLocalTime(withChatId: chatId) || sharesLocalTime(withChatId: group.id) {
-                ids.insert(group.id)
+        // Read the override map once. This ran `sharesLocalTime(withChatId:)`
+        // twice per group, and each call re-read the map from UserDefaults and
+        // walked `muteKeys` across every group: about a second on the main
+        // thread per `$groups` publish on a 400-group account (R-055).
+        let overrides = shareLocalTimeByChat
+        return snTimezoneShareGroupIds(
+            groupIds: marmot.groups.map(\.id),
+            mappedGroupIds: Array(marmotGroupIdsByConversationId.values),
+            marmotIDPrefix: Self.marmotIDPrefix,
+            overrides: overrides,
+            global: shareLocalTime,
+            aliasOverride: { [weak self] chatId in
+                guard let self else { return nil }
+                return self.timezoneShareKeys(forChatId: chatId).compactMap { overrides[$0] }.first
             }
-        }
-        for id in marmotGroupIdsByConversationId.values where sharesLocalTime(withChatId: id) {
-            ids.insert(id)
-        }
-        return Array(ids)
+        )
     }
 
     private func reconcileTimezoneShare() {
@@ -3952,9 +3960,12 @@ final class SonarAppStore: ObservableObject {
         for id in marmotGroupIdsByConversationId.keys {
             insert(id)
         }
+        // One fold-key set for the whole walk: computing it inside
+        // `sonarPeerKey(forNpub:)` made this loop O(groups × folded chats).
+        let persistedFoldPeerIds = persistedFoldPeerIds()
         for group in marmot.groups where marmot.isDirectGroup(group) {
             if let other = directOtherNpub(in: group),
-               let peerKey = sonarPeerKey(forNpub: other) {
+               let peerKey = sonarPeerKey(forNpub: other, persistedFoldPeerIds: persistedFoldPeerIds) {
                 insert(peerKey)
             }
         }
@@ -4945,12 +4956,22 @@ final class SonarAppStore: ObservableObject {
     /// stable alias (persisted fold target preferred) so mesh+Marmot collapse
     /// onto a single home row.
     func sonarPeerKey(forNpub npub: String) -> String? {
+        sonarPeerKey(forNpub: npub, persistedFoldPeerIds: persistedFoldPeerIds())
+    }
+
+    /// Callers that resolve many npubs in one pass compute the fold-key set
+    /// once and pass it in.
+    private func sonarPeerKey(forNpub npub: String, persistedFoldPeerIds: Set<String>) -> String? {
         let aliases = peerKeys(linkedToNpub: npub)
         guard !aliases.isEmpty else { return nil }
         return snSelectCanonicalMeshPeerId(
             aliases: aliases,
-            persistedFoldPeerIds: Set(marmotGroupIdsByConversationId.keys.map(Self.canonicalStoredKey))
+            persistedFoldPeerIds: persistedFoldPeerIds
         )
+    }
+
+    private func persistedFoldPeerIds() -> Set<String> {
+        Set(marmotGroupIdsByConversationId.keys.map(Self.canonicalStoredKey))
     }
 
     /// Every known 16-hex mesh key linked to `npub` (live 0x53, persisted
@@ -6441,7 +6462,7 @@ final class SonarAppStore: ObservableObject {
         #if DEBUG
         let buildStarted = CFAbsoluteTimeGetCurrent()
         #endif
-        let built = buildHomeDMRows(now: now)
+        let built = SNMainThreadStallProbe.measure("home.rows") { buildHomeDMRows(now: now) }
         #if DEBUG
         let buildMs = (CFAbsoluteTimeGetCurrent() - buildStarted) * 1000
         SecureLogger.info(
@@ -10300,6 +10321,12 @@ final class SonarAppStore: ObservableObject {
     /// groups whose in-memory `(latestSecs, count)` advanced since the last
     /// scan walk notify/pay/trill/call/media-cache content.
     private func processIncomingMarmotMessageSideEffects() {
+        SNMainThreadStallProbe.measure("home.sideEffects") {
+            processIncomingMarmotMessageSideEffectsBody()
+        }
+    }
+
+    private func processIncomingMarmotMessageSideEffectsBody() {
         let latest = marmotMessageScanMarks()
         let staged = marmotStagedPageRescanIds
         if !staged.isEmpty { marmotStagedPageRescanIds.removeAll(keepingCapacity: true) }
@@ -12005,4 +12032,48 @@ final class SonarAppStore: ObservableObject {
         case nil: return nil
         }
     }
+}
+
+/// The groups whose members receive our local time: the global switch plus
+/// the per-chat overrides, read once. For each group the override is looked
+/// up under both `marmot:<id>` and the bare id, and either one sharing is
+/// enough (the chat row and the transcript address the same group by the two
+/// forms). `aliasOverride` resolves an override stored under a chat alias (a
+/// folded mesh id, an alert key); it is consulted only for groups with no
+/// direct entry, and only when the map holds keys that are not group ids, so
+/// the common cases never walk aliases. Pure so the main-thread cost stays
+/// testable (R-055).
+func snTimezoneShareGroupIds(
+    groupIds: [String],
+    mappedGroupIds: [String],
+    marmotIDPrefix: String,
+    overrides: [String: Bool],
+    global: Bool,
+    aliasOverride: (String) -> Bool?
+) -> [String] {
+    let known = Set(groupIds).union(mappedGroupIds)
+    if overrides.isEmpty {
+        return global ? known.sorted() : []
+    }
+    func bare(_ key: String) -> String {
+        key.hasPrefix(marmotIDPrefix) ? String(key.dropFirst(marmotIDPrefix.count)) : key
+    }
+    let hasAliasKeys = overrides.keys.contains { !known.contains(bare($0)) }
+    // An override under either key form answers for both forms: the store's
+    // alias walk maps `marmot:<id>` to `<id>` and back. Only an override under
+    // some other alias needs `aliasOverride`.
+    func shares(chatId: String, otherForm: String) -> Bool {
+        if let direct = overrides[chatId] ?? overrides[otherForm] { return direct }
+        if hasAliasKeys, let alias = aliasOverride(chatId) { return alias }
+        return global
+    }
+    let groupIdSet = Set(groupIds)
+    return known.filter { id in
+        let prefixed = marmotIDPrefix + id
+        if groupIdSet.contains(id), shares(chatId: prefixed, otherForm: id) {
+            return true
+        }
+        return shares(chatId: id, otherForm: prefixed)
+    }
+    .sorted()
 }

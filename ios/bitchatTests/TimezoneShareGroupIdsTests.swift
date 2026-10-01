@@ -15,7 +15,8 @@ import Testing
 struct TimezoneShareGroupIdsTests {
     private let prefix = "marmot:"
 
-    @Test func noOverridesFollowsTheGlobalSwitch() {
+    @Test
+    func noOverridesFollowsTheGlobalSwitch() {
         var aliasLookups = 0
         let off = snTimezoneShareGroupIds(
             groupIds: ["g1", "g2"], mappedGroupIds: ["g3"], marmotIDPrefix: prefix,
@@ -32,7 +33,8 @@ struct TimezoneShareGroupIdsTests {
         #expect(aliasLookups == 0)
     }
 
-    @Test func aDirectOverrideWinsWithoutAnyAliasWalk() {
+    @Test
+    func aDirectOverrideWinsWithoutAnyAliasWalk() {
         var aliasLookups = 0
         let ids = snTimezoneShareGroupIds(
             groupIds: ["g1", "g2", "g3"], mappedGroupIds: [], marmotIDPrefix: prefix,
@@ -44,7 +46,8 @@ struct TimezoneShareGroupIdsTests {
         #expect(aliasLookups == 0, "only group keys in the map: no alias walk")
     }
 
-    @Test func eitherKeyFormSharingIsEnough() {
+    @Test
+    func eitherKeyFormSharingIsEnough() {
         let ids = snTimezoneShareGroupIds(
             groupIds: ["g1"], mappedGroupIds: [], marmotIDPrefix: prefix,
             overrides: ["marmot:g1": false, "g1": true], global: false,
@@ -53,7 +56,8 @@ struct TimezoneShareGroupIdsTests {
         #expect(ids == ["g1"])
     }
 
-    @Test func anAliasOverrideIsConsultedOnlyWhenAliasKeysExist() {
+    @Test
+    func anAliasOverrideIsConsultedOnlyWhenAliasKeysExist() {
         var asked: [String] = []
         let ids = snTimezoneShareGroupIds(
             groupIds: ["g1", "g2"], mappedGroupIds: [], marmotIDPrefix: prefix,
