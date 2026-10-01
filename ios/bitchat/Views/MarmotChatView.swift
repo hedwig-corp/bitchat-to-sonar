@@ -751,6 +751,12 @@ final class MarmotChatModel: ObservableObject {
             .receive(on: DispatchQueue.main)
             .collect(.byTimeOrCount(DispatchQueue.main, .milliseconds(50), 128))
             .sink { [weak self] groupIds in
+                if groupIds.count > 1 {
+                    SecureLogger.info(
+                        "conversation change burst groups=\(Set(groupIds).count) events=\(groupIds.count)",
+                        category: .session
+                    )
+                }
                 Task { @MainActor [weak self] in
                     self?.scheduleConversationRefresh(groupIds: groupIds)
                 }
@@ -2638,12 +2644,14 @@ final class MarmotChatModel: ObservableObject {
                 let overlay = (try? await service.reactionTallies(groupId: groupId, targetIds: staleIds)) ?? [:]
                 canonical = Self.overlayReactionTallies(canonical, tallies: overlay)
             }
-            var byGroup = messagesByGroup
-            byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
-            self.messagesByGroup = reconcileOptimistic(
-                into: byGroup,
-                freshRowsByGroup: [groupId: page]
-            )
+            SNMainThreadStallProbe.measure("page.publish") {
+                var byGroup = messagesByGroup
+                byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
+                self.messagesByGroup = reconcileOptimistic(
+                    into: byGroup,
+                    freshRowsByGroup: [groupId: page]
+                )
+            }
             transcriptLoaded = true
             // The blank-transcript recovery (#450) re-reads up to ten times;
             // running the metadata hydrate on each pass would mean 3 extra FFI
@@ -2657,15 +2665,25 @@ final class MarmotChatModel: ObservableObject {
             let summaries = await service.conversationSummaries()
             await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
-            self.conversationSummariesByGroup = Dictionary(
+            let summariesByGroup = Dictionary(
                 uniqueKeysWithValues: summaries
                     .filter { activeGroupIds.contains($0.groupIdHex) }
                     .map { ($0.groupIdHex, $0) }
             )
+            if self.conversationSummariesByGroup != summariesByGroup {
+                self.conversationSummariesByGroup = summariesByGroup
+            }
             self.publishUnread(from: summaries)
-            self.groups = groups
+            // `@Published` fires on every assignment, and the Home sinks on
+            // `$groups` walked all 400 groups twice over for about a second on
+            // the main thread (R-055), so unchanged metadata must not republish.
+            if self.groups != groups {
+                self.groups = groups
+            }
             dropResolvedPendingDirectChats()
-            self.pendingGroupInvites = invites
+            if self.pendingGroupInvites != invites {
+                self.pendingGroupInvites = invites
+            }
             SNMarmotChatSnapshotCache.save(
                 groups: groups,
                 messagesByGroup: self.messagesByGroup,
@@ -2843,15 +2861,19 @@ final class MarmotChatModel: ObservableObject {
             let summaries = await service.conversationSummaries()
             await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
-            self.conversationSummariesByGroup = Dictionary(
+            let summariesByGroup = Dictionary(
                 uniqueKeysWithValues: summaries
                     .filter { activeGroupIds.contains($0.groupIdHex) }
                     .map { ($0.groupIdHex, $0) }
             )
+            if self.conversationSummariesByGroup != summariesByGroup {
+                self.conversationSummariesByGroup = summariesByGroup
+            }
             // All service reads above suspend. Snapshot the live dictionary only
             // after they finish, then merge each result into that latest state in
             // one main-actor segment. A summary refresh can therefore never
             // publish a stale dictionary over a page/open/new-message update.
+            SNMainThreadStallProbe.measure("summaries.publish") {
             var byGroup = messagesByGroup
             var freshRowsByGroup: [String: [MarmotService.MarmotMessage]] = [:]
             for page in pages {
@@ -2892,28 +2914,40 @@ final class MarmotChatModel: ObservableObject {
                 byGroup[page.groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
             }
             self.publishUnread(from: summaries)
-            self.groups = groups
+            // `@Published` fires on every assignment, and the Home sinks on
+            // `$groups` walked all 400 groups twice over for about a second on
+            // the main thread (R-055), so unchanged metadata must not republish.
+            if self.groups != groups {
+                self.groups = groups
+            }
             dropResolvedPendingDirectChats()
-            self.pendingGroupInvites = invites
+            if self.pendingGroupInvites != invites {
+                self.pendingGroupInvites = invites
+            }
             self.messagesByGroup = reconcileOptimistic(
                 into: byGroup,
                 freshRowsByGroup: freshRowsByGroup
             )
-            SNMarmotChatSnapshotCache.save(
-                groups: groups,
-                messagesByGroup: self.messagesByGroup,
-                to: defaults
-            )
+            SNMainThreadStallProbe.measure("summaries.snapshotSave") {
+                SNMarmotChatSnapshotCache.save(
+                    groups: groups,
+                    messagesByGroup: self.messagesByGroup,
+                    to: defaults
+                )
+            }
             if resolveMembers {
-                let relayReady = service.isRelayConnected()
-                for group in groups {
-                    for member in group.memberNpubs where member != npub {
-                        ensureProfile(member)
-                        if relayReady {
-                            ensureSonarDescriptor(member)
+                SNMainThreadStallProbe.measure("summaries.resolveMembers") {
+                    let relayReady = service.isRelayConnected()
+                    for group in groups {
+                        for member in group.memberNpubs where member != npub {
+                            ensureProfile(member)
+                            if relayReady {
+                                ensureSonarDescriptor(member)
+                            }
                         }
                     }
                 }
+            }
             }
             return true
         } catch {
@@ -2924,7 +2958,10 @@ final class MarmotChatModel: ObservableObject {
 
     private func refreshPeerTimezones(for groups: [MarmotService.MarmotGroup]) async {
         let cached = await service.peerTimezones(groupIds: groups.map(\.id))
-        self.peerTimezonesByGroup = snIndexPeerTimezonesByGroup(cached)
+        let indexed = snIndexPeerTimezonesByGroup(cached)
+        if self.peerTimezonesByGroup != indexed {
+            self.peerTimezonesByGroup = indexed
+        }
     }
 
     /// A member's zone as shared into `groupId`. Accepts npub or 64-hex.
@@ -3237,10 +3274,13 @@ final class MarmotChatModel: ObservableObject {
             unreadSuppressGroupIds,
             summaries: tuples
         )
-        unreadByGroup = SNUnreadCounts.unreadByGroup(
+        let next = SNUnreadCounts.unreadByGroup(
             from: tuples,
             suppressing: unreadSuppressGroupIds.union(viewingUnreadGroupIds)
         )
+        if unreadByGroup != next {
+            unreadByGroup = next
+        }
     }
 
     /// Publish our own kind-0 profile so peers see our nickname, not our npub.
