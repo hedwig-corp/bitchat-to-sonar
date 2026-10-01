@@ -43,6 +43,9 @@ struct BitchatApp: App {
         // Configure before t0 so Wi-Fi / CoreDevice benches can pull markers from
         // the app log when idevicesyslog (USB) is unavailable.
         SonarDiagnostics.configureAppSink()
+        // Names the main-actor work running whenever the UI stops answering;
+        // the diagnostics log is the only view into a shipped build's freezes.
+        SNMainThreadStallProbe.start()
         #if DEBUG
         // SONAR_BENCH: earliest in-process cold-start marker (T0) + benchmark
         // provisioning. DEBUG-only — the markers are only %{public}@ (visible in
