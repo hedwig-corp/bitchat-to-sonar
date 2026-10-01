@@ -3017,6 +3017,63 @@ still the newest PEER row).
   the peer replied while you were offline, the case reported here, ranks low
   by peer activity but is the one most likely to be missing messages.
 
+## R-055 — Unchanged chat metadata must not republish, and `$groups` sinks stay O(groups)
+
+**Invariant:** `MarmotChatModel` publishes `groups`, `pendingGroupInvites`,
+`conversationSummariesByGroup`, `peerTimezonesByGroup` and `unreadByGroup`
+only when the value changed. The `SonarAppStore` sinks on `marmot.$groups` do
+bounded single-pass work: one known-contact snapshot, with one fold-key set
+for the whole walk, and one timezone-share list built from a single read of
+the override map.
+
+**Breaks as:** the iOS UI freezes while relays sync. Every local page load
+republished the unchanged 400-group list, and each publish ran the `$groups`
+sink for about 1,040 ms on the main thread. Measured 2026-10-01 with
+`SNMainThreadStallProbe` on 1.15.2/47 (iPhone 14 Pro Max, 400 groups): 15
+publishes in 45 s, each a 0.5–1.6 s stall, every one inside
+`home.groupsSink`; the Home rows rebuild (`home.rows`, ~59 ms) ran two or
+three times a second on top. The sink walked the contact snapshot twice, each
+`sonarPeerKey(forNpub:)` rebuilt the persisted fold set (groups × folded
+chats), and `timezoneShareGroupIds()` re-read the per-chat share map from
+UserDefaults and walked `muteKeys` twice per group (800 reads, groups²).
+
+**Why:** second occurrence of #178's typing-lag shape: a `$groups` sink doing
+per-group work through unmemoized helpers (2,200 bech32 decodes per burst
+then). #178 memoized the decode; the walks around it kept growing with the
+group count, and the local-time share (#607) added a third quadratic pass.
+
+**Apple call sites:** `MarmotChatModel.loadLocalSummaries`,
+`loadLocalPage(hydrateMetadata:)`, `refreshPeerTimezones`, `publishUnread`
+(publish only on change); `SonarAppStore` `marmot.$groups` sink →
+`applyBLEDiscoveryPolicy` → `refreshBleKnownContactSnapshot` (one fold set,
+`sonarPeerKey(forNpub:persistedFoldPeerIds:)`), `reconcileTimezoneShare` →
+`timezoneShareGroupIds` → `snTimezoneShareGroupIds`.
+
+**Compose call site:** `SonarAppState.reconcileLocalTimezone` runs as a
+coroutine launched on `scope` and builds its list with
+`mlsTimezoneShareGroupIds` over `chats`; it is not driven by a per-publish
+sink, and no freeze was reported there. Not changed here. The same per-chat
+cost would show as `visibleChats` jank, not a frozen UI.
+
+**Guarded by:** `TimezoneShareGroupIdsTests.noOverridesFollowsTheGlobalSwitch`,
+`TimezoneShareGroupIdsTests.aDirectOverrideWinsWithoutAnyAliasWalk` (alias
+lookups are counted and must be zero when the map holds only group keys),
+`TimezoneShareGroupIdsTests.eitherKeyFormSharingIsEnough`,
+`TimezoneShareGroupIdsTests.anAliasOverrideIsConsultedOnlyWhenAliasKeysExist`.
+
+**Not guarded:** the publish-only-on-change guards and the single snapshot
+walk need a constructible `MarmotChatModel` / `SonarAppStore` (see
+Unguarded). `SNMainThreadStallProbe` ships in every build and writes
+`main thread stalled ms=… sections=[…]` to the diagnostics log; a report of
+a frozen UI starts there, not with hypotheses.
+
+**Rejected:**
+- *Move the `$groups` sink off the main thread.* The snapshot feeds the BLE
+  discovery policy and the Home rows from main-actor state; the fix is to run
+  it rarely and in linear time, not concurrently.
+- *Throttle the sink.* A one-second stall every few seconds is still a
+  one-second stall.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
