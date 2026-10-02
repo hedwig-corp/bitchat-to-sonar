@@ -91,6 +91,9 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var loadOlder: (() async -> Bool)? = nil
     var loadNewest: (() async -> Void)? = nil
     var unreadCountAtOpen: UInt64? = nil
+    /// Core's unread anchor (`openConversation`). iOS only: the macOS list
+    /// (`SNMsgList`) still walks for its anchor (tracked gap).
+    var unreadAnchorHint: String? = nil
     var expectedNewestDate: Date? = nil
     /// Search / deep-link jump; see #372 for Sonar search wiring.
     var jumpMessageId: String? = nil
@@ -130,6 +133,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
+            unreadAnchorHint: unreadAnchorHint,
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
             onJumpSettled: onJumpSettled,

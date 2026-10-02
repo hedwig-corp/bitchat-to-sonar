@@ -597,19 +597,49 @@ pub enum MessageClassInfo {
     },
     /// `☎CALL|…` signaling line — hidden from the transcript.
     CallControl,
+    /// `⚡TRILL|1|<id>` nudge — render the nudge pill, never the raw line.
+    Trill { trill_id: String },
+}
+
+/// What a transcript row's delivery footer says.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryLabelInfo {
+    /// Someone else's message: no footer.
+    Received,
+    /// Own send waiting on a relay ack.
+    Sending,
+    /// Own send with photos waiting on a relay ack.
+    Uploading,
+    Sent,
+    /// The outbox gave up; offer retry.
+    Failed,
+}
+
+fn delivery_label_info(label: sonar_core::marmot::DeliveryLabel) -> DeliveryLabelInfo {
+    use sonar_core::marmot::DeliveryLabel as L;
+    match label {
+        L::Received => DeliveryLabelInfo::Received,
+        L::Sending => DeliveryLabelInfo::Sending,
+        L::Uploading => DeliveryLabelInfo::Uploading,
+        L::Sent => DeliveryLabelInfo::Sent,
+        L::Failed => DeliveryLabelInfo::Failed,
+    }
 }
 
 /// FFI-friendly decrypted chat message.
 #[derive(uniffi::Record)]
 pub struct MessageInfo {
     pub id_hex: String,
+    /// The MLS group that holds it: react, reply and retry go here. A
+    /// conversation page mixes the rows of several groups.
+    pub group_id_hex: String,
     pub sender_npub: String,
     pub content: String,
     pub created_at_secs: u64,
     /// True when the local identity sent it.
     pub mine: bool,
-    /// Local delivery state: received, pending, sent, or failed.
-    pub delivery_state: String,
+    /// The delivery footer, decided in core; hosts only localize it.
+    pub delivery: DeliveryLabelInfo,
     /// Encrypted media attachments (Marmot MIP-04), empty for a plain text message.
     pub media: Vec<MediaInfo>,
     /// Sticker reference if this message is a sticker send (nil for text/media).
@@ -620,6 +650,15 @@ pub struct MessageInfo {
     pub reply: Option<ReplyRefInfo>,
     /// Aggregated kind-7 chips. Empty when nobody has reacted.
     pub reactions: Vec<ReactionTallyInfo>,
+}
+
+/// One transcript page across a conversation's groups.
+#[derive(uniffi::Record)]
+pub struct ConversationPageInfo {
+    /// Newest first.
+    pub messages: Vec<MessageInfo>,
+    /// More rows exist past the last one.
+    pub has_more: bool,
 }
 
 /// Target-keyed kind-7 tallies for overlaying retained historical rows.
@@ -642,7 +681,13 @@ pub struct ReactionTallyInfo {
 pub struct ReplyRefInfo {
     pub parent_id_hex: String,
     pub parent_npub: Option<String>,
+    /// The sender's quote snapshot, as received. Render `chip` instead.
     pub preview: Option<String>,
+    /// The quoted message is ours ("You").
+    pub parent_mine: bool,
+    /// What the quote chip shows, resolved in core across the conversation's
+    /// folded groups. `Empty`: show the "Message" fallback.
+    pub chip: ConversationPreviewInfo,
 }
 
 /// FFI-friendly sticker reference carried on a chat message.
@@ -863,6 +908,152 @@ impl sonar_core::client::MediaUploadObserver for FfiMediaUploadObserver<'_> {
 
     fn is_cancelled(&self) -> bool {
         self.listener.is_cancelled()
+    }
+}
+
+/// What kind of conversation a Messages-list row is.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationListKindInfo {
+    /// A 1:1. Duplicate groups with the same counterpart are one row.
+    Direct,
+    /// Any other group.
+    Group,
+    /// This account's Note to Self. Never unread; sorted first.
+    NoteToSelf,
+}
+
+/// One Messages-list row computed by core: every group of one conversation
+/// folded together. Both apps render these instead of folding groups
+/// themselves. Hosts overlay what core does not own: kind-0 names, mute,
+/// verification, pending setup rows and the Bluetooth fold.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ConversationListRowInfo {
+    /// The group the row opens: the newest in the set, lowest id on a tie.
+    pub conversation_id: String,
+    pub kind: ConversationListKindInfo,
+    /// Every folded group, `conversation_id` first. Unread is summed over
+    /// it, and opening the row marks all of it read.
+    pub group_ids: Vec<String>,
+    /// The other member's pubkey hex for a 1:1.
+    pub counterpart_hex: Option<String>,
+    /// MLS group name, empty for most 1:1s.
+    pub name: String,
+    /// The title to show; `None` = the host's localized fallback
+    /// ("Note to Self", "Group chat", or the counterpart's short npub).
+    pub title: Option<String>,
+    /// The newest message, ready to localize.
+    pub preview: ConversationPreviewInfo,
+    pub latest_content: String,
+    /// Pubkey hex of the newest message's sender.
+    pub latest_sender_hex: String,
+    pub latest_at_secs: u64,
+    pub latest_mine: bool,
+    /// The group holding the newest message.
+    pub latest_group_id: String,
+    pub message_count: u64,
+    /// Sum over `group_ids`; always 0 for Note to Self.
+    pub unread_count: u64,
+    /// Equal versions mean an unchanged row (cache key).
+    pub version: u64,
+}
+
+/// What a Messages-list row's newest message is. Hosts only localize it;
+/// classification happens once, in core, for both apps.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum ConversationPreviewInfo {
+    Empty,
+    Text { text: String },
+    Photos { count: u32 },
+    Videos { count: u32 },
+    VoiceNote,
+    /// `name` is empty when the sender gave none.
+    File { name: String },
+    Sticker,
+    VoiceCall,
+    Nudge,
+    Payment,
+    JsonPayload,
+}
+
+fn conversation_preview_info(
+    preview: sonar_core::conversation_list::ConversationPreview,
+) -> ConversationPreviewInfo {
+    use sonar_core::conversation_list::ConversationPreview as P;
+    match preview {
+        P::Empty => ConversationPreviewInfo::Empty,
+        P::Text(text) => ConversationPreviewInfo::Text { text },
+        P::Photos(count) => ConversationPreviewInfo::Photos { count },
+        P::Videos(count) => ConversationPreviewInfo::Videos { count },
+        P::VoiceNote => ConversationPreviewInfo::VoiceNote,
+        P::File(name) => ConversationPreviewInfo::File { name },
+        P::Sticker => ConversationPreviewInfo::Sticker,
+        P::VoiceCall => ConversationPreviewInfo::VoiceCall,
+        P::Nudge => ConversationPreviewInfo::Nudge,
+        P::Payment => ConversationPreviewInfo::Payment,
+        P::JsonPayload => ConversationPreviewInfo::JsonPayload,
+    }
+}
+
+/// What the transcript needs when a conversation opens (see
+/// `SonarNode::open_conversation`).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ConversationOpenInfo {
+    /// Every folded group, row group first.
+    pub group_ids: Vec<String>,
+    /// Unread at the moment of opening, before it was marked read.
+    pub unread_count: u64,
+    /// The oldest unread message (hex); the divider goes above it.
+    pub unread_anchor_id: Option<String>,
+    /// Newest message second across the set: the transcript is not complete
+    /// until it holds a row this new.
+    pub newest_at_secs: u64,
+}
+
+/// A display name to remember for titling the Messages list.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct PeerNameInfo {
+    pub pubkey_hex: String,
+    pub name: String,
+}
+
+/// Where the next page starts: the last row of the previous page.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ConversationListCursorInfo {
+    pub latest_at_secs: u64,
+    pub conversation_id: String,
+    pub pinned: bool,
+}
+
+fn conversation_list_kind_info(
+    kind: sonar_core::conversation_list::ConversationListKind,
+) -> ConversationListKindInfo {
+    use sonar_core::conversation_list::ConversationListKind as K;
+    match kind {
+        K::Direct => ConversationListKindInfo::Direct,
+        K::Group => ConversationListKindInfo::Group,
+        K::NoteToSelf => ConversationListKindInfo::NoteToSelf,
+    }
+}
+
+fn conversation_list_row_info(
+    row: sonar_core::conversation_list::ConversationListRow,
+) -> ConversationListRowInfo {
+    ConversationListRowInfo {
+        conversation_id: row.conversation_id,
+        kind: conversation_list_kind_info(row.kind),
+        group_ids: row.group_ids,
+        counterpart_hex: row.counterpart_hex,
+        name: row.name,
+        title: row.title,
+        preview: conversation_preview_info(row.preview),
+        latest_content: row.latest_content,
+        latest_sender_hex: row.latest_sender_hex,
+        latest_at_secs: row.latest_at_secs,
+        latest_mine: row.latest_mine,
+        latest_group_id: row.latest_group_id,
+        message_count: row.message_count,
+        unread_count: row.unread_count,
+        version: row.version,
     }
 }
 
@@ -1479,11 +1670,15 @@ impl SonarNode {
     }
 
     /// Encrypt + publish a text message to the group.
-    pub fn send_text(&self, group_id_hex: String, text: String) -> FfiResult<()> {
+    /// Send `text`; returns the stored message's id (hex). The row is written
+    /// locally before this returns: hosts key their "Sending" bubble by this
+    /// id and match the transcript row exactly (R-001, R-002).
+    pub fn send_text(&self, group_id_hex: String, text: String) -> FfiResult<String> {
         let group_id = parse_group_id(&group_id_hex)?;
-        self.runtime
+        let id = self
+            .runtime
             .block_on(self.client.send_text(&group_id, &text))?;
-        Ok(())
+        Ok(id.to_hex())
     }
 
     /// Like `send_text`, attaching a NIP-C7 reply pointer.
@@ -1494,19 +1689,19 @@ impl SonarNode {
         reply_to_hex: String,
         reply_to_npub: String,
         preview: Option<String>,
-    ) -> FfiResult<()> {
+    ) -> FfiResult<String> {
         let group_id = parse_group_id(&group_id_hex)?;
         let parent_id = nostr::EventId::from_hex(&reply_to_hex)
             .map_err(|e| SonarFfiError::InvalidInput(format!("reply_to: {e}")))?;
         let parent_pk = PublicKey::parse(&reply_to_npub)
             .map_err(invalid("reply_to npub"))?;
         let reply = sonar_core::reply::ReplyTo::new(parent_id, parent_pk, preview);
-        self.runtime.block_on(self.client.send_text_with_reply(
+        let id = self.runtime.block_on(self.client.send_text_with_reply(
             &group_id,
             &text,
             Some(&reply),
         ))?;
-        Ok(())
+        Ok(id.to_hex())
     }
 
     /// Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message.
@@ -1537,15 +1732,16 @@ impl SonarNode {
         pack_coordinate: String,
         shortcode: String,
         plaintext_sha256: String,
-    ) -> FfiResult<()> {
+    ) -> FfiResult<String> {
         let group_id = parse_group_id(&group_id_hex)?;
         let pack = sonar_stickers::PackAddress::parse(&pack_coordinate)
             .map_err(|e| SonarFfiError::InvalidInput(format!("bad pack coordinate: {e}")))?;
         let sticker_ref = sonar_stickers::StickerRef::new(pack, shortcode, plaintext_sha256)
             .map_err(|e| SonarFfiError::InvalidInput(format!("bad sticker ref: {e}")))?;
-        self.runtime
+        let id = self
+            .runtime
             .block_on(self.client.send_sticker(&group_id, &sticker_ref))?;
-        Ok(())
+        Ok(id.to_hex())
     }
 
     /// Fetch a sticker pack from relays by its pack address.
@@ -1928,6 +2124,69 @@ impl SonarNode {
         self.client.mark_conversation_read(&group_id_hex);
     }
 
+    /// The unread divider's row for `unread_count` across `group_id_hexes`,
+    /// without marking anything read. iOS captures the count at push and marks
+    /// read itself; this is core's anchor for that count (hex), or nil.
+    pub fn conversation_unread_anchor(
+        &self,
+        group_id_hexes: Vec<String>,
+        unread_count: u64,
+    ) -> FfiResult<Option<String>> {
+        let groups = group_id_hexes
+            .iter()
+            .map(|hex| parse_group_id(hex))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self
+            .client
+            .conversation_unread_anchor(&groups, unread_count)?
+            .map(|id| id.to_hex()))
+    }
+
+    /// Open the conversation containing `group_id_hex`: capture the unread
+    /// count and anchor (oldest unread across every folded group, own sends
+    /// and hidden control lines skipped), then mark the whole set read, in one
+    /// step. Hosts call this instead of reading unread and marking read
+    /// themselves, so the two can never race. Local only.
+    pub fn open_conversation(&self, group_id_hex: String) -> FfiResult<ConversationOpenInfo> {
+        let open = self.client.open_conversation(&group_id_hex)?;
+        Ok(ConversationOpenInfo {
+            group_ids: open.group_ids,
+            unread_count: open.unread_count,
+            unread_anchor_id: open.unread_anchor_id.map(|id| id.to_hex()),
+            newest_at_secs: open.newest_at_secs,
+        })
+    }
+
+    /// Remember display names for titling the Messages list (hosts seed it
+    /// from their profile caches once; `fetch_profile` keeps it current).
+    /// Returns how many changed; their conversations are notified.
+    pub fn remember_peer_names(&self, names: Vec<PeerNameInfo>) -> u32 {
+        let pairs: Vec<(String, String)> =
+            names.into_iter().map(|n| (n.pubkey_hex, n.name)).collect();
+        self.client.remember_peer_names(&pairs) as u32
+    }
+
+    /// The Marmot half of the Messages list, folded and ordered by core:
+    /// Note to Self first, then newest first. `after` continues from the
+    /// previous page's last row; `limit` 0 returns every row. Local only.
+    pub fn conversation_list(
+        &self,
+        limit: u32,
+        after: Option<ConversationListCursorInfo>,
+    ) -> FfiResult<Vec<ConversationListRowInfo>> {
+        let cursor = after.map(|c| sonar_core::conversation_list::ConversationListCursor {
+            latest_at_secs: c.latest_at_secs,
+            conversation_id: c.conversation_id,
+            pinned: c.pinned,
+        });
+        Ok(self
+            .client
+            .conversation_list(limit as usize, cursor.as_ref())?
+            .into_iter()
+            .map(conversation_list_row_info)
+            .collect())
+    }
+
     /// Stable newest-first transcript page ordered by
     /// `(created_at DESC, event_id DESC)`. The cursor is exclusive; callers
     /// should pass the final message tuple from the previous page.
@@ -1951,6 +2210,39 @@ impl SonarNode {
             limit as usize,
         )?;
         Ok(msgs.into_iter().map(message_info).collect())
+    }
+
+    /// One transcript page for a whole conversation: the rows of every group
+    /// in `group_id_hexes` in one `(created_at DESC, event_id DESC)` order,
+    /// de-duplicated, cut at `limit`. Pass the last row of the previous page
+    /// as the exclusive cursor. Errors when no group could be read, so an
+    /// unreadable store never paints as an empty chat (R-018).
+    pub fn conversation_cursor_page(
+        &self,
+        group_id_hexes: Vec<String>,
+        before_secs: Option<u64>,
+        before_id_hex: Option<String>,
+        limit: u32,
+    ) -> FfiResult<ConversationPageInfo> {
+        let groups = group_id_hexes
+            .iter()
+            .map(|hex| parse_group_id(hex))
+            .collect::<Result<Vec<_>, _>>()?;
+        let before_id = before_id_hex
+            .as_deref()
+            .map(EventId::from_hex)
+            .transpose()
+            .map_err(invalid("cursor event id"))?;
+        let page = self.client.conversation_cursor_page(
+            &groups,
+            before_secs,
+            before_id.as_ref(),
+            limit as usize,
+        )?;
+        Ok(ConversationPageInfo {
+            messages: page.rows.into_iter().map(message_info).collect(),
+            has_more: page.has_more,
+        })
     }
 
     /// Target-keyed kind-7 tallies for already-loaded transcript ids.
@@ -3323,18 +3615,24 @@ fn message_class_info(c: sonar_core::marmot::MessageClassification) -> MessageCl
             preimage_hex,
         },
         C::CallControl => MessageClassInfo::CallControl,
+        C::Trill { trill_id } => MessageClassInfo::Trill { trill_id },
     }
 }
 
 fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
     MessageInfo {
         id_hex: m.id.to_hex(),
+        group_id_hex: hex::encode(m.group_id.as_slice()),
         sender_npub: m.sender.to_bech32().expect("npub encoding cannot fail"),
         classification: message_class_info(m.classification),
         content: m.content,
         created_at_secs: m.created_at.as_secs(),
         mine: m.mine,
-        delivery_state: m.delivery_state.as_str().to_string(),
+        delivery: delivery_label_info(sonar_core::marmot::delivery_label(
+            m.mine,
+            m.delivery_state,
+            &m.media,
+        )),
         media: m
             .media
             .into_iter()
@@ -3356,6 +3654,8 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             parent_id_hex: r.parent_id.to_hex(),
             parent_npub: r.parent_pubkey.and_then(|pk| pk.to_bech32().ok()),
             preview: r.preview,
+            parent_mine: r.parent_mine,
+            chip: conversation_preview_info(r.chip),
         }),
         reactions: m
             .reactions

@@ -277,14 +277,106 @@ func snDirectMarmotPeerKey(for group: MarmotService.MarmotGroup, ownNpub: String
     return others.count == 1 ? others.first : nil
 }
 
-func snCanonicalDirectMarmotGroups(
-    _ groups: [MarmotService.MarmotGroup],
-    ownNpub: String?
-) -> [String: [MarmotService.MarmotGroup]] {
-    groups.reduce(into: [:]) { result, group in
-        guard let key = snDirectMarmotPeerKey(for: group, ownNpub: ownNpub) else { return }
-        result[key, default: []].append(group)
+/// Rows safe to keep in plain UserDefaults: no message text. A text preview
+/// becomes `.empty` and `latestContent` is dropped; media kinds, titles, times
+/// and badges stay (the old snapshot kept group names and ids, the same class
+/// of metadata).
+func snSnapshotSafeRows(
+    _ rows: [MarmotService.ConversationListRow]
+) -> [MarmotService.ConversationListRow] {
+    rows.map { row in
+        var preview = row.preview
+        switch preview {
+        case .text, .file: preview = .empty
+        default: break
+        }
+        return MarmotService.ConversationListRow(
+            conversationId: row.conversationId,
+            kind: row.kind,
+            groupIds: row.groupIds,
+            counterpartHex: row.counterpartHex,
+            name: row.name,
+            title: row.title,
+            preview: preview,
+            latestContent: "",
+            latestSenderHex: row.latestSenderHex,
+            latestAt: row.latestAt,
+            latestMine: row.latestMine,
+            latestGroupId: row.latestGroupId,
+            messageCount: row.messageCount,
+            unreadCount: row.unreadCount,
+            version: row.version
+        )
     }
+}
+
+/// Core's rows as a lookup: each group id → its row's folded set, row group
+/// first (the `conversationGroupIdsByGroup` shape).
+func snConversationGroupIdsByGroup(
+    _ rows: [MarmotService.ConversationListRow]
+) -> [String: [String]] {
+    var map: [String: [String]] = [:]
+    for row in rows {
+        for groupId in row.groupIds { map[groupId] = row.groupIds }
+    }
+    return map
+}
+
+/// `map` with `groupId` gone from every set (Delete/Leave paints before core
+/// answers again). Its row mates keep a set without it.
+func snDroppingConversationGroup(
+    _ groupId: String,
+    from map: [String: [String]]
+) -> [String: [String]] {
+    guard let set = map[groupId] else { return map }
+    var next = map
+    next[groupId] = nil
+    let remaining = set.filter { $0 != groupId }
+    for mate in remaining { next[mate] = remaining }
+    return next
+}
+
+/// `rows` with `groupId` gone: its row loses that group, and a row left with
+/// no group disappears (Delete/Leave paints before core answers again).
+func snDroppingConversationRowGroup(
+    _ groupId: String,
+    from rows: [MarmotService.ConversationListRow]
+) -> [MarmotService.ConversationListRow] {
+    rows.compactMap { row in
+        guard row.groupIds.contains(groupId) else { return row }
+        let remaining = row.groupIds.filter { $0 != groupId }
+        guard let head = remaining.first else { return nil }
+        return MarmotService.ConversationListRow(
+            conversationId: row.conversationId == groupId ? head : row.conversationId,
+            kind: row.kind,
+            groupIds: remaining,
+            counterpartHex: row.counterpartHex,
+            name: row.name,
+            title: row.title,
+            preview: row.preview,
+            latestContent: row.latestContent,
+            latestSenderHex: row.latestSenderHex,
+            latestAt: row.latestAt,
+            latestMine: row.latestMine,
+            latestGroupId: row.latestGroupId,
+            messageCount: row.messageCount,
+            unreadCount: row.unreadCount,
+            version: row.version
+        )
+    }
+}
+
+/// The groups of `groupId`'s core row that are still in `groupsById`, in the
+/// row's order. nil when core has not listed `groupId` (fall back to the local
+/// fold) or none of its set is active.
+func snCoreFoldedGroups(
+    _ groupId: String,
+    sets: [String: [String]],
+    groupsById: [String: MarmotService.MarmotGroup]
+) -> [MarmotService.MarmotGroup]? {
+    guard let set = sets[groupId] else { return nil }
+    let groups = set.compactMap { groupsById[$0] }
+    return groups.isEmpty ? nil : groups
 }
 
 func snResolvedMarmotAuthorName(
@@ -334,25 +426,52 @@ enum SNMarmotChatSnapshotCache {
 
     private struct Snapshot: Codable {
         let groups: [MarmotService.MarmotGroup]
+        /// Core's Messages-list rows, so Home paints before the store opens.
+        /// Message text is stripped (see `snSnapshotSafeRows`): this cache is
+        /// plain UserDefaults, outside the encrypted chat database.
+        var rows: [MarmotService.ConversationListRow]?
     }
 
     static func load(from defaults: UserDefaults) -> ([MarmotService.MarmotGroup], [String: [MarmotService.MarmotMessage]]) {
+        let (groups, _) = loadWithRows(from: defaults)
+        return (groups, [:])
+    }
+
+    static func loadWithRows(
+        from defaults: UserDefaults
+    ) -> ([MarmotService.MarmotGroup], [MarmotService.ConversationListRow]) {
         guard let data = defaults.data(forKey: defaultsKey),
               let snapshot = try? JSONDecoder().decode(Snapshot.self, from: data)
-        else { return ([], [:]) }
+        else { return ([], []) }
         // Rewrite older snapshots that included message bodies/media outside the
         // encrypted chat database. The startup cache is row metadata only.
-        save(groups: snapshot.groups, messagesByGroup: [:], to: defaults)
-        return (snapshot.groups, [:])
+        let rows = snSnapshotSafeRows(snapshot.rows ?? [])
+        save(groups: snapshot.groups, rows: rows, to: defaults)
+        return (snapshot.groups, rows)
     }
 
     static func save(
         groups: [MarmotService.MarmotGroup],
         messagesByGroup: [String: [MarmotService.MarmotMessage]],
+        rows: [MarmotService.ConversationListRow]? = nil,
         to defaults: UserDefaults
     ) {
         _ = messagesByGroup
-        let snapshot = Snapshot(groups: groups)
+        save(groups: groups, rows: rows, to: defaults)
+    }
+
+    private static func save(
+        groups: [MarmotService.MarmotGroup],
+        rows: [MarmotService.ConversationListRow]?,
+        to defaults: UserDefaults
+    ) {
+        var snapshot = Snapshot(groups: groups)
+        if let rows {
+            snapshot.rows = snSnapshotSafeRows(rows)
+        } else if let data = defaults.data(forKey: defaultsKey),
+                  let previous = try? JSONDecoder().decode(Snapshot.self, from: data) {
+            snapshot.rows = previous.rows
+        }
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         defaults.set(data, forKey: defaultsKey)
     }
@@ -466,6 +585,18 @@ final class MarmotChatModel: ObservableObject {
     /// Core-owned row metadata for every conversation. Kept separate from
     /// transcript pages so summary placeholders never render as chat bubbles.
     @Published private(set) var conversationSummariesByGroup: [String: MarmotService.ConversationSummary] = [:]
+    /// Core's fold (`conversationList`): each group id → the folded group set
+    /// of its Messages-list row, row group first. The one answer to "which
+    /// groups are this 1:1" for Home, open, mark-read and mute, shared with
+    /// Compose (R-003, R-052). Empty until the store answers once; callers
+    /// then fall back to the local `snDirectMarmotPeerKey` fold.
+    @Published private(set) var conversationGroupIdsByGroup: [String: [String]] = [:]
+    /// Core's Messages-list screen model (`conversationList`): one row per
+    /// Marmot conversation, titled, previewed, badged and ordered by core.
+    /// Home renders these; it no longer folds, titles or previews groups.
+    @Published private(set) var conversationRows: [MarmotService.ConversationListRow] = []
+    /// Names already handed to core this process (seeded once, then on change).
+    private var seededPeerNameKeys = Set<String>()
     @Published var busy = false
     /// Serializes Settings → Backup chats so a second tap cannot seal while the
     /// first has already reopened SQLCipher (Compose joins jobs before FFI).
@@ -616,6 +747,11 @@ final class MarmotChatModel: ObservableObject {
     /// Canonical rows that predate each optimistic echo in the local transcript.
     /// They must not be mistaken for the relay copy of a later identical send.
     private var preexistingCanonicalMessageIDsByOptimisticID: [String: Set<String>] = [:]
+    /// Optimistic echo id → the id of the row core stored for that send (core
+    /// returns it from `sendText`/`sendSticker`). Known → the echo resolves to
+    /// exactly that row; the content/time match below is only for the moment
+    /// before the send returns, and for media.
+    private var canonicalIDByOptimisticID: [String: String] = [:]
     private var stickerPacksByCoordinate: [String: StickerPackInfo] = [:]
     private var stickerPackLRU: [String] = []
     private var stickerImagesBySHA256: [String: Data] = [:]
@@ -649,6 +785,88 @@ final class MarmotChatModel: ObservableObject {
     /// refreshes must preserve their older edge or they can create a gap behind
     /// the cursor while an older-page read is suspended.
     private var localTranscriptPreservesOlderEdgeGroups: Set<String> = []
+
+    /// The groups whose transcript pages are read together with `groupId`: its
+    /// folded set from core's chat-list rows, sorted so every member resolves
+    /// the same set, or the group alone. Core merges the set into one page
+    /// (`conversation_cursor_page`), so the set shares one cursor and one
+    /// has-older flag, keyed by [`localTranscriptPageKey`]. A single-group
+    /// chat's key is its group id: it pages exactly as before.
+    func localTranscriptPageGroups(_ groupId: String) -> [String] {
+        guard let set = conversationGroupIdsByGroup[groupId], set.count > 1, set.contains(groupId) else {
+            return [groupId]
+        }
+        return set.sorted()
+    }
+
+    func localTranscriptPageKey(_ groupId: String) -> String {
+        localTranscriptPageGroups(groupId).joined(separator: ",")
+    }
+
+    /// The set's retained rows, and which group's window each sits in (rows
+    /// from older snapshots and local echoes carry no `groupId`).
+    private func localTranscriptPageWindow(
+        _ groups: [String]
+    ) -> (rows: [MarmotService.MarmotMessage], origin: [String: String]) {
+        var rows: [MarmotService.MarmotMessage] = []
+        var origin: [String: String] = [:]
+        for group in groups {
+            for message in messagesByGroup[group] ?? [] {
+                rows.append(message)
+                origin[message.id] = group
+            }
+        }
+        return (rows, origin)
+    }
+
+    /// Split a set's window back into each group's window: canonical rows and
+    /// echoes by the group that holds them, and the freshly read page rows
+    /// likewise for echo reconciliation. One group: everything stays in it.
+    nonisolated static func splitLocalTranscriptPage(
+        canonical: [MarmotService.MarmotMessage],
+        echoes: [MarmotService.MarmotMessage],
+        page: [MarmotService.MarmotMessage],
+        groups: [String],
+        origin: [String: String],
+        fallback: String
+    ) -> (byGroup: [String: [MarmotService.MarmotMessage]], fresh: [String: [MarmotService.MarmotMessage]]) {
+        func owner(_ message: MarmotService.MarmotMessage) -> String {
+            let group = message.groupId ?? origin[message.id] ?? fallback
+            return groups.contains(group) ? group : fallback
+        }
+        let canonicalByGroup = Dictionary(grouping: canonical, by: owner)
+        let echoesByGroup = Dictionary(grouping: echoes, by: owner)
+        let pageByGroup = Dictionary(grouping: page, by: owner)
+        var byGroup: [String: [MarmotService.MarmotMessage]] = [:]
+        var fresh: [String: [MarmotService.MarmotMessage]] = [:]
+        for group in groups {
+            byGroup[group] = mergeMessages(
+                existing: canonicalByGroup[group] ?? [],
+                incoming: echoesByGroup[group] ?? []
+            )
+            fresh[group] = pageByGroup[group] ?? []
+        }
+        return (byGroup, fresh)
+    }
+
+    /// Reaction tallies live per group: ask each group for its own rows.
+    private func localTranscriptReactionTallies(
+        _ ids: [String],
+        rows: [MarmotService.MarmotMessage],
+        origin: [String: String],
+        fallback: String
+    ) async -> [String: [MarmotService.MarmotReactionTally]] {
+        let groupById = Dictionary(
+            rows.map { ($0.id, $0.groupId ?? origin[$0.id] ?? fallback) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var tallies: [String: [MarmotService.MarmotReactionTally]] = [:]
+        for (group, targets) in Dictionary(grouping: ids, by: { groupById[$0] ?? fallback }) {
+            let overlay = (try? await service.reactionTallies(groupId: group, targetIds: targets)) ?? [:]
+            tallies.merge(overlay) { first, _ in first }
+        }
+        return tallies
+    }
     /// Serializes outgoing sends so rapid-fire messages arrive in order.
     private var sendChain: Task<Void, Never>?
     /** Deletion increments this generation and awaits the tail task. Tasks
@@ -670,6 +888,10 @@ final class MarmotChatModel: ObservableObject {
             return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
         }
         if message.deliveryState == "failed" { return "Couldn't send" }
+        if message.deliveryState == "uploading" { return "Uploading" }
+        // "pending" from core is a send without photos; the media rule below
+        // only still decides for rows from snapshots written before core
+        // sent "uploading".
         if message.deliveryState == "pending" {
             return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
         }
@@ -744,9 +966,11 @@ final class MarmotChatModel: ObservableObject {
         self.defaults = defaults
         self.profilesByNpub = SNMarmotProfileCache.load(from: defaults)
         self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.load(from: defaults)
-        let cached = SNMarmotChatSnapshotCache.load(from: defaults)
+        let cached = SNMarmotChatSnapshotCache.loadWithRows(from: defaults)
         self.groups = cached.0
-        self.messagesByGroup = cached.1
+        self.messagesByGroup = [:]
+        self.conversationRows = cached.1
+        self.conversationGroupIdsByGroup = snConversationGroupIdsByGroup(cached.1)
         self.conversationChangeSub = service.conversationChanged
             .receive(on: DispatchQueue.main)
             .collect(.byTimeOrCount(DispatchQueue.main, .milliseconds(50), 128))
@@ -2548,7 +2772,7 @@ final class MarmotChatModel: ObservableObject {
                 }
                 var deferredBusyGroup = false
                 for changedGroupId in pageGroups {
-                    if self.localTranscriptLoadingGroups.contains(changedGroupId) {
+                    if self.localTranscriptLoadingGroups.contains(self.localTranscriptPageKey(changedGroupId)) {
                         self.pendingConversationRefreshGroups.insert(changedGroupId)
                         deferredBusyGroup = true
                         continue
@@ -2587,25 +2811,27 @@ final class MarmotChatModel: ObservableObject {
         mode: LocalTranscriptLoadMode,
         hydrateMetadata: Bool = true
     ) async -> Bool {
-        guard localTranscriptLoadingGroups.insert(groupId).inserted else { return false }
-        defer { localTranscriptLoadingGroups.remove(groupId) }
+        let pageGroups = localTranscriptPageGroups(groupId)
+        let pageKey = pageGroups.joined(separator: ",")
+        guard localTranscriptLoadingGroups.insert(pageKey).inserted else { return false }
+        defer { localTranscriptLoadingGroups.remove(pageKey) }
         var transcriptLoaded = false
         do {
             // Transcript first: group metadata and invites are unrelated to the
             // first visible frame and must not sit ahead of the selected page.
-            let rawPage = try await service.messagesCursorPage(
-                groupId: groupId,
+            let rawPage = try await service.conversationCursorPage(
+                groupIds: pageGroups,
                 limit: UInt32(Self.localTranscriptPageLimit + 1)
             )
             let page = Array(rawPage.prefix(Self.localTranscriptPageLimit))
-            let existing = messagesByGroup[groupId] ?? []
+            let (existing, origin) = localTranscriptPageWindow(pageGroups)
             let existingCanonical = existing.filter { !Self.isLocalTranscriptEcho($0) }
             let echoes = existing.filter(Self.isLocalTranscriptEcho)
             let shouldPreserveHistoricalWindow = mode == .preserveHistoricalWindow
                 && !existingCanonical.isEmpty
             var canonical: [MarmotService.MarmotMessage]
             if shouldPreserveHistoricalWindow {
-                let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
+                let pinnedToOlderEdge = localTranscriptPreservesOlderEdgeGroups.contains(pageKey)
                 let merged = Self.mergeMessages(existing: existingCanonical, incoming: page)
                 // Match Signal's same-location reload: keep every local page
                 // already loaded. Before the retained cap, merge in live rows;
@@ -2617,9 +2843,9 @@ final class MarmotChatModel: ObservableObject {
                     retainedLimit: Self.localTranscriptRetainedLimit,
                     preservingOlderEdge: pinnedToOlderEdge
                 )
-                localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-                localTranscriptHasOlderByGroup[groupId] =
-                    localTranscriptHasOlderByGroup[groupId] == true
+                localTranscriptCursorByGroup[pageKey] = Self.oldestCursor(in: canonical)
+                localTranscriptHasOlderByGroup[pageKey] =
+                    localTranscriptHasOlderByGroup[pageKey] == true
                     || rawPage.count > Self.localTranscriptPageLimit
                     || merged.count > Self.localTranscriptRetainedLimit
             } else {
@@ -2635,21 +2861,27 @@ final class MarmotChatModel: ObservableObject {
                     Self.mergeMessages(existing: concurrentNewest, incoming: page)
                         .suffix(Self.localTranscriptRetainedLimit)
                 )
-                localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-                localTranscriptHasOlderByGroup[groupId] = rawPage.count > Self.localTranscriptPageLimit
-                localTranscriptPreservesOlderEdgeGroups.remove(groupId)
+                localTranscriptCursorByGroup[pageKey] = Self.oldestCursor(in: canonical)
+                localTranscriptHasOlderByGroup[pageKey] = rawPage.count > Self.localTranscriptPageLimit
+                localTranscriptPreservesOlderEdgeGroups.remove(pageKey)
             }
             let staleIds = canonical.map(\.id).filter { id in !page.contains { $0.id == id } }
             if !staleIds.isEmpty {
-                let overlay = (try? await service.reactionTallies(groupId: groupId, targetIds: staleIds)) ?? [:]
+                let overlay = await localTranscriptReactionTallies(
+                    staleIds, rows: canonical, origin: origin, fallback: groupId
+                )
                 canonical = Self.overlayReactionTallies(canonical, tallies: overlay)
             }
             SNMainThreadStallProbe.measure("page.publish") {
                 var byGroup = messagesByGroup
-                byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
+                let split = Self.splitLocalTranscriptPage(
+                    canonical: canonical, echoes: echoes, page: page,
+                    groups: pageGroups, origin: origin, fallback: groupId
+                )
+                for (group, rows) in split.byGroup { byGroup[group] = rows }
                 self.messagesByGroup = reconcileOptimistic(
                     into: byGroup,
-                    freshRowsByGroup: [groupId: page]
+                    freshRowsByGroup: split.fresh
                 )
             }
             transcriptLoaded = true
@@ -2663,6 +2895,7 @@ final class MarmotChatModel: ObservableObject {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let summaries = await service.conversationSummaries()
+            let listRows = await service.conversationList()
             await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             let summariesByGroup = Dictionary(
@@ -2673,6 +2906,7 @@ final class MarmotChatModel: ObservableObject {
             if self.conversationSummariesByGroup != summariesByGroup {
                 self.conversationSummariesByGroup = summariesByGroup
             }
+            publishConversationList(listRows)
             self.publishUnread(from: summaries)
             // `@Published` fires on every assignment, and the Home sinks on
             // `$groups` walked all 400 groups twice over for about a second on
@@ -2710,28 +2944,35 @@ final class MarmotChatModel: ObservableObject {
 
     /// Page the next local database window before the oldest retained canonical
     /// row. Returns true only when at least one new row was prepended.
-    func loadOlderLocalPage(groupId: String) async -> Bool {
-        guard localTranscriptHasOlderByGroup[groupId] == true,
-              let cursor = localTranscriptCursorByGroup[groupId],
-              localTranscriptLoadingGroups.insert(groupId).inserted else {
-            return false
+    /// Read one older page into the group's window. Returns how many of its
+    /// rows the window did not hold when the page merged: the growth measured
+    /// against the window at merge time, so a newest-page reload that trims the
+    /// window while this read is in flight cannot make a real page look empty.
+    @discardableResult
+    func loadOlderLocalPage(groupId: String) async -> Int {
+        let pageGroups = localTranscriptPageGroups(groupId)
+        let pageKey = pageGroups.joined(separator: ",")
+        guard localTranscriptHasOlderByGroup[pageKey] == true,
+              let cursor = localTranscriptCursorByGroup[pageKey],
+              localTranscriptLoadingGroups.insert(pageKey).inserted else {
+            return 0
         }
-        defer { localTranscriptLoadingGroups.remove(groupId) }
+        defer { localTranscriptLoadingGroups.remove(pageKey) }
 
-        let existing = messagesByGroup[groupId] ?? []
-        let preservedOlderEdgeBeforeLoad = localTranscriptPreservesOlderEdgeGroups.contains(groupId)
+        let existing = localTranscriptPageWindow(pageGroups).rows
+        let preservedOlderEdgeBeforeLoad = localTranscriptPreservesOlderEdgeGroups.contains(pageKey)
         if existing.lazy.filter({ !Self.isLocalTranscriptEcho($0) }).count
             >= Self.localTranscriptRetainedLimit {
             // Close the race before the database await: a concurrent summary
             // refresh must not evict the cursor row while this page is in
             // flight, otherwise the two retained ranges would have a gap.
-            localTranscriptPreservesOlderEdgeGroups.insert(groupId)
+            localTranscriptPreservesOlderEdgeGroups.insert(pageKey)
         }
         let pageCount = Self.localTranscriptPageLimit
 
         do {
-            let rawPage = try await service.messagesCursorPage(
-                groupId: groupId,
+            let rawPage = try await service.conversationCursorPage(
+                groupIds: pageGroups,
                 beforeSecs: cursor.beforeSecs,
                 beforeIdHex: cursor.beforeId,
                 limit: UInt32(pageCount + 1)
@@ -2740,7 +2981,8 @@ final class MarmotChatModel: ObservableObject {
             // A summary/new-message invalidation may have landed while the DB
             // read was suspended. Merge into the latest group snapshot so the
             // prepend cannot overwrite a newer row or optimistic echo.
-            let latestExisting = messagesByGroup[groupId] ?? existing
+            let latest = localTranscriptPageWindow(pageGroups)
+            let latestExisting = latest.rows.isEmpty ? existing : latest.rows
             let latestCanonical = latestExisting.filter { !Self.isLocalTranscriptEcho($0) }
             let latestIDs = Set(latestCanonical.map(\.id))
             // Keep the edge that the user is paging toward. Once the retained
@@ -2750,50 +2992,57 @@ final class MarmotChatModel: ObservableObject {
             let mergedCanonical = Self.mergeMessages(existing: latestCanonical, incoming: page)
             let canonical = Array(mergedCanonical.prefix(Self.localTranscriptRetainedLimit))
             if mergedCanonical.count > Self.localTranscriptRetainedLimit {
-                localTranscriptPreservesOlderEdgeGroups.insert(groupId)
+                localTranscriptPreservesOlderEdgeGroups.insert(pageKey)
             }
             let retainedIDs = Set(canonical.map(\.id))
-            let added = page.contains {
+            let added = page.filter {
                 !latestIDs.contains($0.id) && retainedIDs.contains($0.id)
-            }
-            localTranscriptCursorByGroup[groupId] = Self.oldestCursor(in: canonical)
-            localTranscriptHasOlderByGroup[groupId] = rawPage.count > pageCount
+            }.count
+            localTranscriptCursorByGroup[pageKey] = Self.oldestCursor(in: canonical)
+            localTranscriptHasOlderByGroup[pageKey] = rawPage.count > pageCount
 
             let echoes = latestExisting.filter(Self.isLocalTranscriptEcho)
             var byGroup = messagesByGroup
-            byGroup[groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
+            let split = Self.splitLocalTranscriptPage(
+                canonical: canonical, echoes: echoes, page: page,
+                groups: pageGroups, origin: latest.origin, fallback: groupId
+            )
+            for (group, rows) in split.byGroup { byGroup[group] = rows }
             messagesByGroup = reconcileOptimistic(
                 into: byGroup,
-                freshRowsByGroup: [groupId: page]
+                freshRowsByGroup: split.fresh
             )
             return added
         } catch {
             if !preservedOlderEdgeBeforeLoad {
-                localTranscriptPreservesOlderEdgeGroups.remove(groupId)
+                localTranscriptPreservesOlderEdgeGroups.remove(pageKey)
             }
             self.errorText = Self.describe(error)
-            return false
+            return 0
         }
     }
 
-    func loadOlderLocalPageWhenAvailable(groupId: String) async -> Bool {
+    /// [`loadOlderLocalPage`] that waits out a loader already busy for this
+    /// group. Returns the rows the page added (0: nothing new).
+    func loadOlderLocalPageWhenAvailable(groupId: String) async -> Int {
         for attempt in 0..<Self.localTranscriptBusyRetryLimit {
-            if await loadOlderLocalPage(groupId: groupId) { return true }
-            guard localTranscriptLoadingGroups.contains(groupId),
-                  attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
+            let added = await loadOlderLocalPage(groupId: groupId)
+            if added > 0 { return added }
+            guard localTranscriptLoadingGroups.contains(localTranscriptPageKey(groupId)),
+                  attempt + 1 < Self.localTranscriptBusyRetryLimit else { return 0 }
             do {
                 try await Task.sleep(nanoseconds: 50_000_000)
             } catch {
-                return false
+                return 0
             }
         }
-        return false
+        return 0
     }
 
     func loadNewestLocalPageWhenAvailable(groupId: String) async -> Bool {
         for attempt in 0..<Self.localTranscriptBusyRetryLimit {
             if await loadLocalPage(groupId: groupId, mode: .newestPage) { return true }
-            guard localTranscriptLoadingGroups.contains(groupId),
+            guard localTranscriptLoadingGroups.contains(localTranscriptPageKey(groupId)),
                   attempt + 1 < Self.localTranscriptBusyRetryLimit else { return false }
             do {
                 try await Task.sleep(nanoseconds: 50_000_000)
@@ -2805,7 +3054,7 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func hasOlderLocalMessages(groupId: String) -> Bool {
-        localTranscriptHasOlderByGroup[groupId] == true
+        localTranscriptHasOlderByGroup[localTranscriptPageKey(groupId)] == true
     }
 
     func localTranscriptCanonicalMessageIDs(groupId: String) -> Set<String> {
@@ -2859,6 +3108,7 @@ final class MarmotChatModel: ObservableObject {
                 pageLimit: Self.localSummaryPageLimit
             )
             let summaries = await service.conversationSummaries()
+            let listRows = await service.conversationList()
             await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             let summariesByGroup = Dictionary(
@@ -2869,6 +3119,7 @@ final class MarmotChatModel: ObservableObject {
             if self.conversationSummariesByGroup != summariesByGroup {
                 self.conversationSummariesByGroup = summariesByGroup
             }
+            publishConversationList(listRows)
             // All service reads above suspend. Snapshot the live dictionary only
             // after they finish, then merge each result into that latest state in
             // one main-actor segment. A summary refresh can therefore never
@@ -2889,7 +3140,8 @@ final class MarmotChatModel: ObservableObject {
                 let echoes = merged.filter(Self.isLocalTranscriptEcho)
                 let mergedCanonical = merged.filter { !Self.isLocalTranscriptEcho($0) }
                 let canonical: [MarmotService.MarmotMessage]
-                if localTranscriptPreservesOlderEdgeGroups.contains(page.groupId) {
+                let pageKey = localTranscriptPageKey(page.groupId)
+                if localTranscriptPreservesOlderEdgeGroups.contains(pageKey) {
                     // Keep a contiguous historical window. Newer rows remain
                     // in the database and are picked up by loadLocalPage when
                     // the user returns to the live edge.
@@ -2897,18 +3149,34 @@ final class MarmotChatModel: ObservableObject {
                 } else {
                     canonical = Array(mergedCanonical.suffix(Self.localTranscriptRetainedLimit))
                 }
-                if localTranscriptCursorByGroup[page.groupId] != nil {
+                if let current = localTranscriptCursorByGroup[pageKey] {
                     // Summary refresh can trim the oldest cached row while the
                     // window is at the live edge. Advance the cursor in the same
                     // main-actor publication; otherwise the next older query
                     // starts before the evicted cursor and skips those rows.
-                    localTranscriptCursorByGroup[page.groupId] = Self.oldestCursor(in: canonical)
-                    if !localTranscriptPreservesOlderEdgeGroups.contains(page.groupId),
+                    let pageGroups = localTranscriptPageGroups(page.groupId)
+                    if pageGroups.count == 1 {
+                        localTranscriptCursorByGroup[pageKey] = Self.oldestCursor(in: canonical)
+                    } else {
+                        // A folded set pages as one merged window. A quiet
+                        // group's newest rows can sit older than that window's
+                        // boundary; moving the cursor down to them would skip
+                        // the other groups' rows in between. Only a trim (the
+                        // cursor moving newer) moves it.
+                        let setCanonical = canonical + pageGroups
+                            .filter { $0 != page.groupId }
+                            .flatMap { (byGroup[$0] ?? []).filter { !Self.isLocalTranscriptEcho($0) } }
+                        if let trimmed = Self.oldestCursor(in: setCanonical),
+                           Self.cursor(trimmed, isNewerThan: current) {
+                            localTranscriptCursorByGroup[pageKey] = trimmed
+                        }
+                    }
+                    if !localTranscriptPreservesOlderEdgeGroups.contains(pageKey),
                        mergedCanonical.count > canonical.count {
                         // Rows evicted from memory are still in the local DB and
                         // must remain pageable even if the prior lookahead had
                         // reached the then-current beginning of history.
-                        localTranscriptHasOlderByGroup[page.groupId] = true
+                        localTranscriptHasOlderByGroup[pageKey] = true
                     }
                 }
                 byGroup[page.groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
@@ -3094,11 +3362,16 @@ final class MarmotChatModel: ObservableObject {
     func preserveLocalTranscriptWindow(groupId: String) {
         guard messagesByGroup[groupId]?.contains(where: { !Self.isLocalTranscriptEcho($0) }) == true
         else { return }
-        localTranscriptPreservesOlderEdgeGroups.insert(groupId)
+        localTranscriptPreservesOlderEdgeGroups.insert(localTranscriptPageKey(groupId))
     }
 
     private static func isLocalTranscriptEcho(_ message: MarmotService.MarmotMessage) -> Bool {
         message.id.hasPrefix(optimisticIDPrefix) || message.id.hasPrefix(failedOptimisticIDPrefix)
+    }
+
+    private static func cursor(_ lhs: LocalTranscriptCursor, isNewerThan rhs: LocalTranscriptCursor) -> Bool {
+        if lhs.beforeSecs != rhs.beforeSecs { return lhs.beforeSecs > rhs.beforeSecs }
+        return lhs.beforeId > rhs.beforeId
     }
 
     private static func oldestCursor(
@@ -3242,6 +3515,11 @@ final class MarmotChatModel: ObservableObject {
         return task
     }
 
+    /// Core's unread anchor for the count an open captured (read-only).
+    func conversationUnreadAnchor(groupIds: [String], unreadCount: UInt64) async -> String? {
+        await service.conversationUnreadAnchor(groupIds: groupIds, unreadCount: unreadCount)
+    }
+
     func markConversationRead(groupId: String) {
         unreadSuppressGroupIds.insert(groupId)
         unreadByGroup[groupId] = nil
@@ -3266,6 +3544,45 @@ final class MarmotChatModel: ObservableObject {
         for groupId in groupIds {
             unreadByGroup[groupId] = nil
         }
+    }
+
+    /// Publish core's fold. A failed read (nil) keeps the fold we have: it
+    /// degrades by doing less, never by splitting a person into two rows.
+    private func publishConversationList(_ rows: [MarmotService.ConversationListRow]?) {
+        guard let rows else { return }
+        let folded = snConversationGroupIdsByGroup(rows)
+        if folded != conversationGroupIdsByGroup { conversationGroupIdsByGroup = folded }
+        if rows != conversationRows {
+            conversationRows = rows
+            SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: [:], rows: rows, to: defaults)
+        }
+        seedPeerNamesIfNeeded(for: rows)
+    }
+
+    /// Hand core the names this app already knows for the people in `rows`
+    /// that core has no title for, once per name: core then titles the rows
+    /// itself, and `fetchProfile` keeps them current.
+    private func seedPeerNamesIfNeeded(for rows: [MarmotService.ConversationListRow]) {
+        var names: [(pubkeyHex: String, name: String)] = []
+        for row in rows where row.kind == .direct && row.title == nil {
+            guard let hex = row.counterpartHex, !seededPeerNameKeys.contains(hex) else { continue }
+            let npub = SNMarmotProfileCache.canonicalKey(hex)
+            if let name = displayName(forNpub: npub) {
+                names.append((hex, name))
+                seededPeerNameKeys.insert(hex)
+            } else {
+                ensureProfile(npub)
+            }
+        }
+        guard !names.isEmpty else { return }
+        Task { await service.rememberPeerNames(names) }
+    }
+
+    /// Whether any of `groupIds` has its badge held off right now: a mark-read
+    /// still in flight, or the chat is on screen. Home applies this to core's
+    /// row unread so a badge clears the moment the chat opens.
+    func isUnreadSuppressed(groupIds: [String]) -> Bool {
+        groupIds.contains { unreadSuppressGroupIds.contains($0) || viewingUnreadGroupIds.contains($0) }
     }
 
     private func publishUnread(from summaries: [MarmotService.ConversationSummary]) {
@@ -3312,7 +3629,13 @@ final class MarmotChatModel: ObservableObject {
     /// guards for contacts.
     func publishIdentityAfterConnect(generation: UInt64) async {
         guard isCurrentIdentityPublish(generation) else { return }
-        try? await service.publishKeyPackageBackground()
+        // Without a published KeyPackage no one can start a chat with us, so a
+        // failure is logged, never swallowed (Compose logs the same call).
+        do {
+            try await service.publishKeyPackageBackground()
+        } catch {
+            SecureLogger.warning("⚠️ KeyPackage publish failed: \(error)", category: .session)
+        }
         guard isCurrentIdentityPublish(generation) else { return }
         let safeToPublish = await hydrateOwnProfileFromRelays()
         guard isCurrentIdentityPublish(generation) else { return }
@@ -3816,10 +4139,12 @@ final class MarmotChatModel: ObservableObject {
                 source: byGroup[groupId] ?? [],
                 pending: pending,
                 exclusionsByOptimisticID: preexistingCanonicalMessageIDsByOptimisticID,
-                freshCanonical: freshRowsByGroup[groupId] ?? []
+                freshCanonical: freshRowsByGroup[groupId] ?? [],
+                canonicalIDByOptimisticID: canonicalIDByOptimisticID
             )
             for echo in pending where !reconciliation.survivors.contains(where: { $0.id == echo.id }) {
                 preexistingCanonicalMessageIDsByOptimisticID[echo.id] = nil
+                canonicalIDByOptimisticID[echo.id] = nil
             }
             if reconciliation.survivors.isEmpty {
                 pendingOptimistic[groupId] = nil
@@ -3886,7 +4211,8 @@ final class MarmotChatModel: ObservableObject {
         source: [MarmotService.MarmotMessage],
         pending: [MarmotService.MarmotMessage],
         exclusionsByOptimisticID: [String: Set<String>] = [:],
-        freshCanonical: [MarmotService.MarmotMessage] = []
+        freshCanonical: [MarmotService.MarmotMessage] = [],
+        canonicalIDByOptimisticID: [String: String] = [:]
     ) -> OptimisticReconciliation {
         let canonical = source.filter { !isLocalTranscriptEcho($0) }
         let windowedIDs = Set(canonical.map(\.id))
@@ -3897,13 +4223,22 @@ final class MarmotChatModel: ObservableObject {
         var survivors: [MarmotService.MarmotMessage] = []
         var admitted: [MarmotService.MarmotMessage] = []
         for optimistic in pending {
-            if let match = unmatchedCanonical.firstIndex(where: {
-                serverMessage(
-                    $0,
-                    matchesOptimistic: optimistic,
-                    excludingServerIDs: exclusionsByOptimisticID[optimistic.id] ?? []
-                )
-            }) {
+            let match: Int?
+            if let canonicalID = canonicalIDByOptimisticID[optimistic.id] {
+                // Exact: core told us which row this send wrote. Until that row
+                // is read back the echo stays "Sending"; an identical older
+                // row can never consume it.
+                match = unmatchedCanonical.firstIndex { $0.id.caseInsensitiveCompare(canonicalID) == .orderedSame }
+            } else {
+                match = unmatchedCanonical.firstIndex(where: {
+                    serverMessage(
+                        $0,
+                        matchesOptimistic: optimistic,
+                        excludingServerIDs: exclusionsByOptimisticID[optimistic.id] ?? []
+                    )
+                })
+            }
+            if let match {
                 let fulfilled = unmatchedCanonical.remove(at: match)
                 if !windowedIDs.contains(fulfilled.id) {
                     admitted.append(fulfilled)
@@ -3933,6 +4268,7 @@ final class MarmotChatModel: ObservableObject {
 
     private func discardOptimistic(id: String, from groupId: String) {
         preexistingCanonicalMessageIDsByOptimisticID[id] = nil
+        canonicalIDByOptimisticID[id] = nil
         pendingOptimistic[groupId]?.removeAll { $0.id == id }
         messagesByGroup[groupId, default: []].removeAll { $0.id == id }
     }
@@ -3940,6 +4276,7 @@ final class MarmotChatModel: ObservableObject {
     private func discardOptimistic(for groupId: String) {
         pendingOptimistic[groupId]?.forEach {
             preexistingCanonicalMessageIDsByOptimisticID[$0.id] = nil
+            canonicalIDByOptimisticID[$0.id] = nil
         }
         pendingOptimistic[groupId] = nil
     }
@@ -4051,7 +4388,11 @@ final class MarmotChatModel: ObservableObject {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await self.publishText(trimmed, to: groupId, reply: reply)
+                let storedID = try await self.publishText(trimmed, to: groupId, reply: reply)
+                self.canonicalIDByOptimisticID[echo.id] = storedID
+                // The row is already in the store: reconcile now so the echo
+                // resolves even when no further change arrives.
+                self.messagesByGroup = self.reconcileOptimistic(into: self.messagesByGroup)
             } catch {
                 self.discardOptimistic(id: echo.id, from: groupId)
                 onFailure?()
@@ -4070,12 +4411,12 @@ final class MarmotChatModel: ObservableObject {
         _ text: String,
         to groupId: String,
         reply: MarmotService.MarmotReplyRef?
-    ) async throws {
+    ) async throws -> String {
         if let reply,
            snCanEmitNipC7(parentId: reply.parentId, parentNpub: reply.parentNpub),
            let npub = reply.parentNpub
         {
-            try await service.sendTextReply(
+            return try await service.sendTextReply(
                 groupId: groupId,
                 text: text,
                 replyToHex: reply.parentId,
@@ -4083,7 +4424,7 @@ final class MarmotChatModel: ObservableObject {
                 preview: reply.preview
             )
         } else {
-            try await service.sendText(groupId: groupId, text: text)
+            return try await service.sendText(groupId: groupId, text: text)
         }
     }
 
@@ -4577,12 +4918,14 @@ final class MarmotChatModel: ObservableObject {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await self.service.sendSticker(
+                let storedID = try await self.service.sendSticker(
                     groupId: groupId,
                     packCoordinate: packCoordinate,
                     shortcode: shortcode,
                     plaintextSha256: plaintextSha256
                 )
+                self.canonicalIDByOptimisticID[echo.id] = storedID
+                self.messagesByGroup = self.reconcileOptimistic(into: self.messagesByGroup)
                 onComplete?()
             } catch {
                 self.pendingOptimistic[groupId]?.removeAll { $0.id == echo.id }
@@ -4636,7 +4979,7 @@ final class MarmotChatModel: ObservableObject {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await self.service.sendSticker(
+                _ = try await self.service.sendSticker(
                     groupId: groupId,
                     packCoordinate: packCoordinate,
                     shortcode: shortcode,
@@ -5212,11 +5555,17 @@ final class MarmotChatModel: ObservableObject {
         messagesByGroup[groupId] = nil
         cancelBlankTranscriptRecovery(groupId: groupId)
         conversationSummariesByGroup[groupId] = nil
+        let folded = snDroppingConversationGroup(groupId, from: conversationGroupIdsByGroup)
+        if folded != conversationGroupIdsByGroup { conversationGroupIdsByGroup = folded }
+        let rows = snDroppingConversationRowGroup(groupId, from: conversationRows)
+        if rows != conversationRows { conversationRows = rows }
         discardOptimistic(for: groupId)
-        localTranscriptCursorByGroup[groupId] = nil
-        localTranscriptHasOlderByGroup[groupId] = nil
-        localTranscriptLoadingGroups.remove(groupId)
-        localTranscriptPreservesOlderEdgeGroups.remove(groupId)
+        for key in Set([groupId, localTranscriptPageKey(groupId)]) {
+            localTranscriptCursorByGroup[key] = nil
+            localTranscriptHasOlderByGroup[key] = nil
+            localTranscriptLoadingGroups.remove(key)
+            localTranscriptPreservesOlderEdgeGroups.remove(key)
+        }
         unreadByGroup[groupId] = nil
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
@@ -5367,11 +5716,15 @@ final class MarmotChatModel: ObservableObject {
         pendingGroupInvites = []
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]
+        conversationGroupIdsByGroup = [:]
+        conversationRows = []
+        seededPeerNameKeys = []
         unreadByGroup = [:]
         unreadSuppressGroupIds = []
         viewingUnreadGroupIds = []
         pendingOptimistic = [:]
         preexistingCanonicalMessageIDsByOptimisticID = [:]
+        canonicalIDByOptimisticID = [:]
         localTranscriptCursorByGroup = [:]
         localTranscriptHasOlderByGroup = [:]
         localTranscriptLoadingGroups = []

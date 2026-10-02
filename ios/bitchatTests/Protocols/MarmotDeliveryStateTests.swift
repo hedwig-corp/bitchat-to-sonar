@@ -87,4 +87,15 @@ struct MarmotDeliveryStateTests {
         )
         #expect(MarmotChatModel.stateText(for: message(isMine: false, deliveryState: "received")) == nil)
     }
+
+    /// Core words the footer (`DeliveryLabelInfo`); the stored string keeps
+    /// the values older snapshots hold, and "uploading" is the new one.
+    @Test
+    func coreDeliveryLabelsMapOntoTheStoredStates() {
+        #expect(MarmotService.deliveryState(.sending) == "pending")
+        #expect(MarmotService.deliveryState(.uploading) == "uploading")
+        #expect(MarmotService.deliveryState(.failed) == "failed")
+        #expect(MarmotChatModel.stateText(for: message(deliveryState: "uploading")) == "Uploading")
+        #expect(MarmotChatModel.stateText(for: message(deliveryState: MarmotService.deliveryState(.sent))) == "Sent")
+    }
 }

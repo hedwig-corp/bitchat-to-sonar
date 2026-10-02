@@ -332,6 +332,10 @@ internal fun reconcileSendEchoes(
     // this argument silently while every helper-level test stayed green; the
     // omission was the bug (#290). Passing emptyList() must be a visible choice.
     freshCanonical: List<SonarMsg>,
+    /** Echo id → the id of the row core stored for that send (core returns
+     *  it from `send`). Known, it is the ONLY row that fulfils the echo; the
+     *  content/time match is for the moment before the send returns. */
+    canonicalIdByEcho: Map<String, String> = emptyMap(),
 ): SendEchoReconciliation {
     val windowedIds = published.mapTo(hashSetOf()) { it.id }
     val outOfWindow = freshCanonical.filter {
@@ -347,11 +351,16 @@ internal fun reconcileSendEchoes(
     // hide an older send whose result is still unknown.
     for (echo in echoes.asReversed()) {
         if (echo.state == "Couldn't send") continue
-        val match = eligibleCanonicalRowsForSendEcho(
-            echo = echo,
-            published = ownCandidates[echo.content].orEmpty(),
-            excludedPublishedIds = excludedPublishedIdsByEcho[echo.id].orEmpty(),
-        ).firstOrNull { it.id !in consumedPublished }
+        val storedId = canonicalIdByEcho[echo.id]
+        val match = if (storedId != null) {
+            candidates.firstOrNull { it.id.equals(storedId, ignoreCase = true) && it.id !in consumedPublished }
+        } else {
+            eligibleCanonicalRowsForSendEcho(
+                echo = echo,
+                published = ownCandidates[echo.content].orEmpty(),
+                excludedPublishedIds = excludedPublishedIdsByEcho[echo.id].orEmpty(),
+            ).firstOrNull { it.id !in consumedPublished }
+        }
         if (match != null) {
             fulfilled.add(echo.id)
             consumedPublished.add(match.id)
@@ -491,7 +500,7 @@ internal fun isTranscriptVisibleRow(
     msg.classification?.let { klass ->
         return when (klass) {
             is SonarMsgClass.PayDone, is SonarMsgClass.CallControl -> false
-            is SonarMsgClass.Text, is SonarMsgClass.PayReceipt -> true
+            is SonarMsgClass.Text, is SonarMsgClass.PayReceipt, is SonarMsgClass.Trill -> true
         }
     }
     val pay = PayLine.decode(msg.content)

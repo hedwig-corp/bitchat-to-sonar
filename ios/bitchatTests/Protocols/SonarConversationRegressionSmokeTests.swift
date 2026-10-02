@@ -18,24 +18,6 @@ struct SonarConversationRegressionSmokeTests {
     }
 
     @Test
-    func saraAndVincenzoRemainSeparateCryptographicConversations() {
-        let own = npub(1)
-        let sara = npub(2)
-        let vincenzo = npub(3)
-        let groups = [
-            MarmotService.MarmotGroup(id: "sara-old", name: "", memberNpubs: [own, sara]),
-            MarmotService.MarmotGroup(id: "vincenzo", name: "", memberNpubs: [own, vincenzo]),
-            MarmotService.MarmotGroup(id: "sara-new", name: "", memberNpubs: [own, sara]),
-        ]
-
-        let grouped = snCanonicalDirectMarmotGroups(groups, ownNpub: own)
-
-        #expect(grouped.count == 2)
-        #expect(grouped[sara]?.map(\.id) == ["sara-old", "sara-new"])
-        #expect(grouped[vincenzo]?.map(\.id) == ["vincenzo"])
-    }
-
-    @Test
     func newSaraMessageMovesOnlySaraRowAndKeepsSaraTitle() {
         let old = Date(timeIntervalSince1970: 100)
         let new = Date(timeIntervalSince1970: 300)
@@ -46,11 +28,7 @@ struct SonarConversationRegressionSmokeTests {
                 isMarmot: false, lastDate: old
             ),
             SNDMRow(
-                id: "sara", title: snFoldedDirectMarmotHomeTitle(
-                    isDirectGroup: true,
-                    marmotProfileTitle: "Sara D",
-                    peerDerivedTitle: "Vincenzo-Mac"
-                ), preview: "Good morning", time: "", unread: true,
+                id: "sara", title: "Sara D", preview: "Good morning", time: "", unread: true,
                 presence: false, verified: false, isMarmot: false, lastDate: new
             ),
         ]
@@ -80,52 +58,6 @@ struct SonarConversationRegressionSmokeTests {
 
         #expect(snSortDMRowsByRecency(rows).map(\.id) == ["sara", "vincenzo"])
         #expect(snSortDMRowsByRecency(Array(rows.reversed())).map(\.id) == ["sara", "vincenzo"])
-    }
-
-    @Test
-    func summaryHydratesConversationOutsideBoundedTranscriptPages() {
-        let summary = MarmotService.ConversationSummary(
-            groupIdHex: "outside-window",
-            name: "",
-            latestContent: "Good morning",
-            latestSenderNpub: npub(2),
-            latestAt: Date(timeIntervalSince1970: 300),
-            latestMine: false,
-            messageCount: 7,
-            unreadCount: 1
-        )
-
-        let row = snMarmotHomeRowMessage(loaded: nil, summary: summary)
-
-        #expect(row?.content == "Good morning")
-        #expect(row?.createdAt == summary.latestAt)
-        #expect(row?.id == "summary:outside-window:7")
-    }
-
-    @Test
-    func realTranscriptMessageWinsWhenItMatchesSummary() {
-        let date = Date(timeIntervalSince1970: 300)
-        let peer = npub(2)
-        let loaded = MarmotService.MarmotMessage(
-            id: "real-message",
-            senderNpub: peer,
-            content: "Good morning",
-            createdAt: date,
-            isMine: false,
-            media: []
-        )
-        let summary = MarmotService.ConversationSummary(
-            groupIdHex: "sara",
-            name: "",
-            latestContent: loaded.content,
-            latestSenderNpub: peer,
-            latestAt: date,
-            latestMine: false,
-            messageCount: 7,
-            unreadCount: 0
-        )
-
-        #expect(snMarmotHomeRowMessage(loaded: loaded, summary: summary)?.id == loaded.id)
     }
 
     @Test

@@ -60,7 +60,7 @@ self-DM (`Client::start_dm` rejects self) and never mesh-folded:
   id wins, so both apps agree on which one.
 - The apps call ensure only while the id is unknown or gone from the list,
   never on every refresh: each call reads the group list.
-- Always pinned at the top of Messages: Compose via `homeMessageRows` (home
+- Always pinned at the top of Messages: Compose via `ChatListPresenter` (home
   screen and desktop sidebar), iOS via `snPinNoteToSelfFirst`.
 - Full chat surface (text, media, stickers) through the normal Marmot
   transcript path. Every message is your own, so no delivery path alerts for it.
@@ -254,7 +254,8 @@ the read-marking uses, or the two will disagree for one of the two chat kinds.
 |---|---|---|
 | Open paths | `SonarAppState.openChat` / `openDm` | `SonarAppStore.openedDM`, `push(.dm)` |
 | Id folding | `transcriptGroupIds`, `canonicalMeshPeerId`, `meshPeerAliases`, `duplicateDirectMarmotChats` | `marmotGroupId`, `directMarmotGroups(matchingGroupId:)`, `marmotGroup(forNpub:)` |
-| Unread source | `unreadByChat` (from `SonarCore.conversationSummaries()`) | `MarmotChatModel.unreadByGroup` (lags; direct read: `unreadCount(forGroups:)`) |
+| Unread source | `unreadByChat` (`ChatListRepository`, from `conversationSummaries()`) | `MarmotChatModel.unreadByGroup` (lags; direct read: `unreadCount(forGroups:)`) |
+| Chat-list rows | `ChatListPresenter` over `ChatListRepository` + `ChatListSources` (`chatlist/`); a mesh row's badge sums `MeshDmRow.groupIds` | `SonarAppStore.dmRows` / `buildHomeDMRows` |
 | Catch-up gate | `latestKnownMessageSecs` | `expectedNewestMessageDate` |
 | Transcript UI | `ChatScreen` in `App.kt` (feed, anchor, `TranscriptTailPinning`) | `SNMsgList` in `SonarComponents.swift` (`sn-bottom` sentinel, `sn-unread`) |
 | BLE rows | `MessageStore`, `refreshMeshTranscriptWindow` | `ChatViewModel` private chats |

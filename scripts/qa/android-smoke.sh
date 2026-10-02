@@ -850,6 +850,29 @@ qa050() { # idle CPU on the chat list
   if [[ $? -eq 0 ]]; then record QA-050 PASS "$out"; else record QA-050 FAIL "$out (max $MAX_IDLE%)"; fi
 }
 
+qa157() { # an unread open pages back to the first message (QA-157)
+  [[ -n "$APP_NPUB" ]] || { record QA-157 SKIP "needs QA-001 (the app npub)"; return; }
+  go_home >/dev/null || { record QA-157 FAIL "chat list not reached"; return; }
+  "$PEERS" new "u-$RUN" >/dev/null || { record QA-157 FAIL "peer init failed"; return; }
+  # More than one 30-row page, all unread: the open lands on the divider at the
+  # top of the first page, and only the top-edge pager can reach message 01.
+  local i
+  for i in $(seq -w 1 40); do
+    "$PEERS" send "u-$RUN" "$APP_NPUB" "qa157 $RUN $i" >/dev/null || { record QA-157 FAIL "peer send $i failed"; return; }
+  done
+  "$UI" wait "qa157 $RUN 40" 90 >/dev/null || { record QA-157 FAIL "the chat row never showed the last message"; return; }
+  ui tapt "qa157 $RUN 40"
+  "$UI" wait "Unread messages" 20 >/dev/null || { record QA-157 FAIL "opened without the unread divider"; return; }
+  local k
+  for k in $(seq 1 12); do
+    has "qa157 $RUN 01" && { record QA-157 PASS "reached message 01 after $k swipe(s) from the unread open"; go_home >/dev/null; return; }
+    ui swipe 540 700 540 1900 200
+    sleep 1.5
+  done
+  record QA-157 FAIL "scrolling up from the unread open never reached message 01"
+  go_home >/dev/null
+}
+
 echo "Sonar Android smoke — run $RUN on $QA_SERIAL (peers in $QA_HOME/peers)"
 # Settle first: right after (re)install the app is still cold-starting and
 # drops input injected into its first screens.
@@ -860,7 +883,7 @@ sleep 3
 # opens QA-004's, and QA-040 inspects the chat
 # QA-005 left open. QA-118 runs last: it clears the app's data (only with
 # QA_ALLOW_WIPE=1).
-for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa050 qa118; do
+for s in qa001 qa002 qa100 qa101 qa102 qa106 qa003 qa004 qa135 qa136 qa005 qa040 qa007 qa041 qa107 qa116 qa043 qa070 qa071 qa072 qa093 qa157 qa050 qa118; do
   id="QA-${s#qa}"
   want "$id" || continue
   "$s"

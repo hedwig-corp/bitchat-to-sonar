@@ -206,4 +206,19 @@ class SonarReplyTest {
         assertEquals("parent-mid", sonarMeshReplyToWire(child))
         assertEquals(null, sonarMeshReplyToWire(null))
     }
+
+    /** Core resolves the chip; Compose only words it with the labels it has. */
+    @Test
+    fun aCoreChipIsWordedWithTheLocalizedTypedLabels() {
+        fun label(chip: SonarConversationPreview) = sonarReplyChipLabel(chip, "Payment", "Photo", "Sticker")
+        assertEquals("see you", label(SonarConversationPreview.Text("  see you ")))
+        assertEquals("Photo", label(SonarConversationPreview.Photos(3)))
+        assertEquals("Photo", label(SonarConversationPreview.VoiceNote), "any attachment, as before")
+        assertEquals("Sticker", label(SonarConversationPreview.Sticker))
+        assertEquals("Payment", label(SonarConversationPreview.Payment))
+        // No raw ⚡TRILL / ☎CALL line, and no label we cannot localize yet: the fallback.
+        assertEquals(null, label(SonarConversationPreview.Nudge))
+        assertEquals(null, label(SonarConversationPreview.VoiceCall))
+        assertEquals(null, label(SonarConversationPreview.Empty))
+    }
 }

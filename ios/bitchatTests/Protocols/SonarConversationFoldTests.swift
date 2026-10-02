@@ -9,28 +9,6 @@ import Testing
 
 struct SonarConversationFoldTests {
     @Test
-    func foldedDirectHomeTitleUsesMarmotProfile() {
-        let title = snFoldedDirectMarmotHomeTitle(
-            isDirectGroup: true,
-            marmotProfileTitle: "Sara D",
-            peerDerivedTitle: "Wrong BLE Name"
-        )
-
-        #expect(title == "Sara D")
-    }
-
-    @Test
-    func nonDirectHomeTitleKeepsPeerDerivedName() {
-        let title = snFoldedDirectMarmotHomeTitle(
-            isDirectGroup: false,
-            marmotProfileTitle: "Room Profile",
-            peerDerivedTitle: "Builders Room"
-        )
-
-        #expect(title == "Builders Room")
-    }
-
-    @Test
     func sameNpubMeshFingerprintsShareIdentityKey() {
         let npub = String(repeating: "ab", count: 32)
         #expect(

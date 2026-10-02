@@ -37,8 +37,13 @@ struct SNConversationTranscriptLoadResult {
 
     var added: Bool { maxSourceGrowth > 0 }
 
-    mutating func record(before: Set<String>, after: Set<String>) {
-        maxSourceGrowth = max(maxSourceGrowth, after.subtracting(before).count)
+    /// `loaded` is what the page itself added at merge time. The set
+    /// difference alone undercounts when a newest-page reload trimmed the
+    /// window after `before` was taken and the page restored those rows: the
+    /// growth then reads 0, the source limit never grows, and the top edge
+    /// stalls with older rows already in memory.
+    mutating func record(before: Set<String>, after: Set<String>, loaded: Int = 0) {
+        maxSourceGrowth = max(maxSourceGrowth, after.subtracting(before).count, loaded)
         movedRetainedWindow = movedRetainedWindow || !before.subtracting(after).isEmpty
     }
 }
