@@ -1,26 +1,42 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.15.2 (47)** · **v0.1-alpha.15.2** (Apple-only; Android stays on 0.1-alpha.15.1)
+Build: **Sonar 1.15.3 (48)** · **v0.1-alpha.15.3** (Android 0.1-alpha.15.3, code 26)
 
-Hotfix on alpha.15.1. **Headline: your local time now reaches the people you
-chat with** (#644).
+Point release on alpha.15. **Headlines: messages you missed while away arrive
+on your next visit (#649), and the chat list no longer freezes while it
+catches up (#650).**
 
-The phone recorded each chat as "shared" before any relay accepted the share.
-When that publish was lost, it never tried again, so a contact's chat header
-never showed your time. This build resends a share the app gave up on. It also
-re-shares once into your active chats: up to 64 recent ones, a few at a time.
+## 0. Messages missed while you were away (headline, #649)
 
-## 0. Local time in chats (headline, #644)
+When two people were offline at alternating times, replies that landed while
+the app was away for more than 30 minutes could stay missing for days. The
+catch-up now runs the chats you were most recently active in first.
+
+- Send a message in a chat, then leave Sonar in the background (or switch off
+  data) for more than 30 minutes while the other person replies.
+- Open Sonar for about 15 seconds **without** opening that chat. The reply
+  should already be in the chat row and in the transcript.
+- Especially useful on accounts with many chats: the chat you were last in
+  must not wait behind old, quiet ones.
+
+## 0a. No freezing while syncing (headline, iOS, #650)
+
+- Background the app a few minutes, bring it back, and while it catches up
+  scroll the chat list and open a chat. Nothing should stall or stutter.
+- If it does freeze: **Settings → Diagnostics → Share** right away. The log
+  now names what blocked the screen.
+
+## 0b. Local time in chats (from 1.15.2, #644)
 
 - With **Settings → Privacy & safety → Share local time** on, ask a contact
-  on 1.15.2 (or Android) to open your chat. Their header should show your time
+  on 1.15.2+ (or Android 0.1-alpha.15.3) to open your chat. Their header should show your time
   (`10:48 PM`, plus `· N hours ahead/behind` if you are in different zones).
 - The first launch re-shares into your recent chats in small batches. Leave
   the app open a minute; it must not flood or slow down.
 - If a header still shows "Via internet" / "Nearby · Bluetooth" after a
   minute, send **Settings → Diagnostics → Share** from **both** phones.
 
-## 0b. Launch speed (from 1.15.1, #629)
+## 0c. Launch speed (from 1.15.1, #629)
 
 - Kill the app, reopen it. Home should show your chats within a couple of
   seconds, not sit empty while the network thrashes.
