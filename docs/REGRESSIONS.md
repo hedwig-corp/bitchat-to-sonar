@@ -3074,6 +3074,75 @@ a frozen UI starts there, not with hypotheses.
 - *Throttle the sink.* A one-second stall every few seconds is still a
   one-second stall.
 
+## R-056 — Nothing relay-bound and unbounded runs on the queue `sync_force` uses
+
+**Invariant:** on iOS, relay-only lookups and publishes (kind-0 profiles,
+Sonar descriptors, wallet offer backups) run on their own lanes, never on the
+serial `MarmotService.workQueue` that `syncForce` shares. In core, the push
+token is shared with each group member once per token (durable record in the
+sync sidecar, re-sent weekly), at most `PUSH_TOKEN_SHARE_BATCH` per pass, most
+recently active chats first, and from a spawned task, so no sync waits for
+those relay acks.
+
+**Breaks as:** missed messages stay missing after the app comes back. On
+1.15.2–1.15.3 the foreground gap sync never ran in a visit (0 of ~60
+foregrounds, 2026-09-29 to 10-01), so the watermark froze at Sep 29. Measured
+with `marmot workQueue op=… waited_ms=… ran_ms=…` on the reporter's iPhone
+(400 groups): once the lookups left the queue, `syncForce` started 4.6 s into
+the visit and its fetch finished in 1.4 s, then sat 33 s in
+`share_push_token_with_groups`, about 400 sequential gift-wrap publishes
+re-sent on every sync. Chat-open `syncOnce`, `preferCatchupGroup` and
+`markConversationRead` waited 18–34 s behind it, and suspend interrupted it.
+
+**Why:** third time relay I/O on a serial lane starved sync: #265 moved the
+identity publishes off `workQueue` (25–57 s `t3→t3a`), R-013/#252 found the
+same queue holding push-wake drains, and this. The push-token share is the
+same unbounded per-group fan-out as alpha.15's timezone storm (R-051): no
+"already done" record, one publish per member on every trigger.
+
+**Core call site:** `client.rs::share_push_token_with_groups` (planner
+`plan_push_token_shares`, record `SyncState::push_token_share_due` /
+`mark_push_token_shared`, fingerprint `push::registration_fingerprint`). It
+runs at the end of every `sync_inner`, on the live short-circuit, and on
+`register_push_token`; push wakes (frozen cursor) skip it. Both hosts.
+
+**Apple call site:** `MarmotService.lookupLane` (`fetchProfile`,
+`fetchSonarDescriptor`, `fetchWalletOfferBackups`) and `publishLane`
+(`publishSonarDescriptor`, `publishWalletOfferBackup`); `run` /
+`runNonThrowing` log any work-queue op waiting or running over 1 s;
+`MarmotChatModel.refreshAfterForeground` logs each step.
+
+**Compose call site:** `SonarAppState` runs each FFI call on
+`Dispatchers.IO` with no serial engine lane, so the lookups never queued
+there; it gets the core push-token fix unchanged.
+
+**Guarded by:** `client.rs::push_token_share_dms_each_member_once_across_passes`
+(mock relay; Bob shares two groups with Alice; two passes must deliver one DM,
+not four), `client.rs::push_token_share_plan_takes_each_member_once_and_caps_the_batch`,
+`client.rs::push_token_share_is_due_only_for_a_new_token_or_after_the_reshare_window`,
+`client.rs::push_token_share_record_survives_a_restart`,
+`MarmotLookupLaneTests.profileFetchDoesNotWaitBehindTheWorkQueue`,
+`MarmotLookupLaneTests.descriptorFetchDoesNotWaitBehindTheWorkQueue`,
+`MarmotLookupLaneTests.descriptorPublishDoesNotWaitBehindTheWorkQueue`,
+`MarmotLookupLaneTests.walletOfferBackupCallsDoNotWaitBehindTheWorkQueue`
+(each parks `workQueue` for 2 s and fails if the call waits; all four failed
+on the old routing), and `MarmotLookupLaneTests.syncForceStillRunsOnTheWorkQueue`
+(control: the seam really parks the queue).
+
+**Not guarded:** that `refreshAfterForeground` reaches `syncForce` in a short
+visit; its timing markers in `sonar-ios.log` are the check. Other relay work
+still on `workQueue` (`retryOutbox`, the timezone calls, `ensureSubscriptions`'
+catch-up) is bounded but not lane-tested. A member who wipes their push cache
+waits up to `PUSH_TOKEN_RESHARE_SECS` (7 days) for our token unless it changes.
+
+**Rejected:**
+- *Concurrent lookups on `readQueue`.* A 400-member sweep parks hundreds of
+  GCD threads in blocking UniFFI calls and starves the transcript reads.
+- *An in-memory "already shared" set.* iOS rebuilds the client on every
+  foreground; the storm would recur on every visit.
+- *Dedupe by the token ciphertext.* It is re-encrypted with a fresh nonce on
+  every registration, so it never matches.
+
 ## Unguarded
 
 - **A 2-member pending welcome must remain visible in both hosts' invite UI.**
