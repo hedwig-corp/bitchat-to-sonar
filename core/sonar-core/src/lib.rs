@@ -8,6 +8,7 @@ pub mod account_backup;
 pub mod call;
 pub mod client;
 pub mod conversation_index;
+pub mod conversation_list;
 pub mod error;
 pub mod geohash;
 pub mod handles;

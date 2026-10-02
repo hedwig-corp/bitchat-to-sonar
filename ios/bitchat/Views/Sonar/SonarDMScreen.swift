@@ -169,6 +169,10 @@ struct SonarDMScreenContent: View {
     }
 
     @State private var sheet = false
+    /// Set by the first send of a chat when the field had focus: the composer
+    /// is rebuilt inside the transcript host, and this makes the new one take
+    /// focus once so the keyboard stays up (QA-001).
+    @State private var refocusComposerAfterFirstSend = false
     @State private var verifySheet = false
     @State private var showKey = false
     @State private var paySheet = false
@@ -300,7 +304,17 @@ struct SonarDMScreenContent: View {
             // Always pass the roster; SNComposer derives suggestions from the
             // bound draft locally (no store-wide mention-query publish).
             mentionRoster: store.mentionRoster(forConversationId: peerId),
-            focusRequest: store.composerReply(for: peerId)?.parentId
+            focusRequest: store.composerReply(for: peerId)?.parentId,
+            onSendFocusState: { focused in
+                if snRefocusComposerAfterSend(
+                    transcriptWasEmpty: convo.messages.isEmpty,
+                    composerFocused: focused
+                ) {
+                    refocusComposerAfterFirstSend = true
+                }
+            },
+            focusOnAppear: refocusComposerAfterFirstSend && !convo.messages.isEmpty,
+            onFocusOnAppearConsumed: { refocusComposerAfterFirstSend = false }
         )
         }
     }
@@ -1333,4 +1347,13 @@ private extension Data {
         (self[index(startIndex, offsetBy: 4)] == 0x37 || self[index(startIndex, offsetBy: 4)] == 0x39) &&
         self[index(startIndex, offsetBy: 5)] == 0x61
     }
+}
+
+/// Whether a send must re-focus the composer that replaces this one. Only the
+/// first message of a chat moves the composer from the empty state into the
+/// transcript host, where SwiftUI rebuilds it and drops its focus; later sends
+/// keep the same field. A send made without focus (hardware keyboard closed,
+/// sticker tray) must not raise the keyboard.
+func snRefocusComposerAfterSend(transcriptWasEmpty: Bool, composerFocused: Bool) -> Bool {
+    transcriptWasEmpty && composerFocused
 }

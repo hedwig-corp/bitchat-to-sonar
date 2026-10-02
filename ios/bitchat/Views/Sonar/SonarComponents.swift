@@ -4753,6 +4753,15 @@ struct SNComposer: View {
     /// quoted message's id, so choosing Reply puts the cursor in the composer
     /// (Signal behaviour) instead of leaving the user to tap it.
     var focusRequest: String? = nil
+    /// Called with the field's focus state just before a text send. The DM
+    /// screen uses it to keep the keyboard up across the first message of a
+    /// chat, when the composer moves from the empty state into the transcript
+    /// host and is rebuilt there (QA-001).
+    var onSendFocusState: (Bool) -> Void = { _ in }
+    /// Focus the field once when this composer appears (the rebuilt composer
+    /// after a first send), then report it through `onFocusOnAppearConsumed`.
+    var focusOnAppear: Bool = false
+    var onFocusOnAppearConsumed: () -> Void = {}
 
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
@@ -4846,6 +4855,7 @@ struct SNComposer: View {
             let cmd = tx.dropFirst().split(separator: " ").first.map(String.init)?.lowercased() ?? ""
             onCommand(cmd)
         } else {
+            onSendFocusState(composerFocused)
             onSend(tx)
         }
     }
@@ -5038,7 +5048,17 @@ struct SNComposer: View {
                     .font(SonarTheme.uiFont(size: 16))
                     .foregroundColor(SonarTheme.text)
                     .focused($composerFocused)
-                    .onAppear { fieldText = text }
+                    .onAppear {
+                        fieldText = text
+                        if focusOnAppear {
+                            // Next turn: a field just hosted in the transcript's
+                            // UIKit container is not in the responder chain yet.
+                            DispatchQueue.main.async {
+                                composerFocused = true
+                                onFocusOnAppearConsumed()
+                            }
+                        }
+                    }
                     .onChange(of: fieldText) { newValue in
                         if newValue != text { text = newValue }
                     }

@@ -143,6 +143,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
+import chat.bitchat.sonar.chatlist.ChatListEvent
+import chat.bitchat.sonar.chatlist.ChatListModel
+import chat.bitchat.sonar.chatlist.ChatListRow
 import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.add_to_your_message
 import chat.bitchat.sonar.resources.emoji_and_stickers
@@ -193,6 +196,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
@@ -475,6 +479,11 @@ private fun HomeScreen(state: SonarAppState) {
     var pendingDelete by remember { mutableStateOf<DeleteTarget?>(null) }
     var pendingInvite by remember { mutableStateOf<SonarGroupInvite?>(null) }
     val meshCount = state.meshPeers.size
+    // The Messages list is one immutable model from ChatListPresenter; taps
+    // go back to it as events. Local-first: the model is built from local
+    // state only, so the list never waits on a relay.
+    val chatListEvents = remember { MutableSharedFlow<ChatListEvent>(extraBufferCapacity = 16) }
+    val chatList = state.chatListPresenter.present(chatListEvents)
     // Triple-tap the title within 1.2s → emergency wipe (1:1 with iOS).
     LaunchedEffect(titleTaps) { if (titleTaps in 1..2) { kotlinx.coroutines.delay(1200); titleTaps = 0 } }
 
@@ -528,7 +537,7 @@ private fun HomeScreen(state: SonarAppState) {
                     online = state.relayOnline,
                     connecting = state.connecting || state.relayConnecting,
                     meshCount = meshCount,
-                    syncing = state.syncing,
+                    syncing = chatList.catchingUp,
                 ) { connSheet = true }
             }
 
@@ -576,70 +585,62 @@ private fun HomeScreen(state: SonarAppState) {
                     }
                 }
                 item { SNSectionLabel("Messages") }
-                if (!state.homeMessagesHydrated) {
+                if (!chatList.hydrated) {
                     item { LocalMessagesLoading() }
                 } else {
-                    val invites = state.groupInvites
-                    val meshRows = state.meshDmRows
-                    val chatRows = state.visibleChats
-                    if (invites.isEmpty() && chatRows.isEmpty() && meshRows.isEmpty()) item { EmptyMessages() }
+                    if (chatList.empty) item { EmptyMessages() }
                     // ONE recency-ordered list across transports (Signal-style /
-                    // iOS SonarAppStore.dmRows): mesh/folded + Marmot-only were two
-                    // separately-sorted segments. Shared merge helper; invites stay
-                    // pinned on top as actionable banners. Sort keys are O(1)
-                    // cached (meshDmRows precomputed, marmotRow cached row VM —
-                    // pending rows use creation time, not epoch zero).
-                    val mergedRows = state.homeMessageRows(meshRows, chatRows)
+                    // iOS SonarAppStore.dmRows), merged and pinned by the
+                    // presenter; invites stay pinned on top as actionable banners.
                     // The hairline hides under the last row of the list (design
                     // .bc-list .bc-row:last-child::after { display: none }).
-                    val lastRowKey = mergedRows.lastOrNull()?.listKey
-                        ?: invites.lastOrNull()?.let { "invite:" + it.id }
-                    items(invites, key = { "invite:" + it.id }) { invite ->
+                    val lastRowKey = chatList.lastKey
+                    items(chatList.invites, key = { ChatListModel.inviteKey(it) }) { invite ->
                         val title = invite.groupName.ifBlank { "Group chat" }
                         ConvRow(
                             avatar = { SonarAvatar(title, 52.dp, presence = false) },
                             title = title,
                             sub = "${invite.memberCount} members · invite",
                             lock = true,
-                            divider = "invite:" + invite.id != lastRowKey,
+                            divider = ChatListModel.inviteKey(invite) != lastRowKey,
                         ) { pendingInvite = invite }
                     }
-                    items(mergedRows, key = { it.listKey }) { homeRow ->
-                        when (homeRow) {
-                            is HomeMessageRow.Mesh -> {
-                                val mesh = homeRow.row
+                    items(chatList.rows, key = { it.key }) { row ->
+                        // Mute and Bluetooth presence walk the fold closure, so
+                        // they are resolved here, for the rows on screen only,
+                        // never for the whole list on every model.
+                        when (row) {
+                            is ChatListRow.Mesh -> {
                                 // BLE-mesh DM (incl. ones started by a peer messaging us)
                                 // — over Bluetooth, so a cyan dot instead of the internet
                                 // lock. A Sonar peer's White Noise leg is folded into
                                 // this row (one row/person).
                                 ConvRow(
-                                    avatar = { SonarAvatar(mesh.name, 52.dp, presence = state.dmInRange(mesh.peerId)) },
-                                    title = mesh.name, sub = mesh.preview, lock = false,
-                                    time = rowTimeLabel(mesh.tsSecs),
-                                    muted = state.isChatMuted("mesh:" + mesh.peerId),
-                                    divider = homeRow.listKey != lastRowKey,
-                                    onLongClick = { pendingRowActions = DeleteTarget(mesh.peerId, mesh.name, isMesh = true, isGroup = false) },
-                                ) { state.openDm(mesh.peerId, mesh.name) }
+                                    avatar = { SonarAvatar(row.title, 52.dp, presence = state.dmInRange(row.peerId)) },
+                                    title = row.title, sub = row.preview, lock = false,
+                                    time = rowTimeLabel(row.tsSecs),
+                                    verified = row.verified,
+                                    unread = row.unread,
+                                    muted = state.isChatMuted(row.conversationId),
+                                    divider = row.key != lastRowKey,
+                                    onLongClick = { pendingRowActions = DeleteTarget(row.peerId, row.title, isMesh = true, isGroup = false) },
+                                ) { chatListEvents.tryEmit(ChatListEvent.Open(row)) }
                             }
-                            is HomeMessageRow.Marmot -> {
-                                val chat = homeRow.chat
-                                // O(1) precomputed row model — no per-row disk read or
-                                // O(chats) walk during composition (Signal cached row VM).
-                                val row = state.marmotRow(chat.id)
+                            is ChatListRow.Marmot -> {
                                 ConvRow(
                                     avatar = { SonarAvatar(row.title, 52.dp, presence = false) },
                                     title = row.title,
-                                    sub = row.sub,
+                                    sub = row.preview,
                                     lock = true,
                                     time = if (row.tsSecs > 0L) rowTimeLabel(row.tsSecs) else "",
                                     verified = row.verified,
                                     unread = row.unread,
-                                    muted = state.isChatMuted(chat.id),
-                                    divider = homeRow.listKey != lastRowKey,
+                                    muted = state.isChatMuted(row.conversationId),
+                                    divider = row.key != lastRowKey,
                                     onLongClick = if (row.pending) null else {
-                                        { pendingRowActions = DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember) }
+                                        { pendingRowActions = DeleteTarget(row.chat.id, row.title, isMesh = false, isGroup = row.group) }
                                     },
-                                ) { state.openChat(chat) }
+                                ) { chatListEvents.tryEmit(ChatListEvent.Open(row)) }
                             }
                         }
                     }
@@ -681,8 +682,8 @@ private fun HomeScreen(state: SonarAppState) {
     pendingInvite?.let { invite ->
         GroupInviteSheet(
             invite = invite,
-            onAccept = { state.acceptGroupInvite(invite.id); pendingInvite = null },
-            onDecline = { state.declineGroupInvite(invite.id); pendingInvite = null },
+            onAccept = { chatListEvents.tryEmit(ChatListEvent.AcceptInvite(invite.id)); pendingInvite = null },
+            onDecline = { chatListEvents.tryEmit(ChatListEvent.DeclineInvite(invite.id)); pendingInvite = null },
             onClose = { pendingInvite = null }
         )
     }
@@ -701,8 +702,8 @@ private fun HomeScreen(state: SonarAppState) {
         MuteSheet(
             name = t.name,
             muted = state.isChatMuted(muteId),
-            onMute = { durationSecs -> state.muteChat(muteId, durationSecs); pendingMute = null },
-            onUnmute = { state.unmuteChat(muteId); pendingMute = null },
+            onMute = { durationSecs -> chatListEvents.tryEmit(ChatListEvent.Mute(muteId, durationSecs)); pendingMute = null },
+            onUnmute = { chatListEvents.tryEmit(ChatListEvent.Unmute(muteId)); pendingMute = null },
             onClose = { pendingMute = null }
         )
     }
@@ -712,7 +713,7 @@ private fun HomeScreen(state: SonarAppState) {
             isGroup = t.isGroup,
             isNoteToSelf = !t.isMesh && state.isNoteToSelfChat(t.id),
             onDelete = {
-                if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
+                chatListEvents.tryEmit(ChatListEvent.Delete(t.id, mesh = t.isMesh))
                 pendingDelete = null
             },
             onClose = { pendingDelete = null }

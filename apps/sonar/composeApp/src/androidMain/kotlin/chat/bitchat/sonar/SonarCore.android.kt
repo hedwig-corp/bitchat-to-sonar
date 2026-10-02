@@ -140,7 +140,10 @@ actual object SonarCore {
             installConversationListener()
             previousNode?.close()
             runCatching { connected.retryOutbox() }
+            // Without a published KeyPackage no one can start a chat with us,
+            // so a failure is logged, never swallowed.
             runCatching { connected.publishKeyPackageBackground() }
+                .onFailure { android.util.Log.w("SonarCore", "KeyPackage publish failed", it) }
             npub
         }
     }
@@ -518,6 +521,31 @@ actual object SonarCore {
                 latestMine = it.latestMine,
                 messageCount = it.messageCount.toLong(),
                 unreadCount = it.unreadCount.toLong(),
+            )
+        }
+    }
+
+    actual suspend fun conversationList(): List<SonarConversationListRow> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.conversationList(0u, null).map {
+            SonarConversationListRow(
+                conversationId = it.conversationId,
+                kind = when (it.kind) {
+                    uniffi.sonar_ffi.ConversationListKindInfo.DIRECT -> SonarConversationListKind.Direct
+                    uniffi.sonar_ffi.ConversationListKindInfo.GROUP -> SonarConversationListKind.Group
+                    uniffi.sonar_ffi.ConversationListKindInfo.NOTE_TO_SELF -> SonarConversationListKind.NoteToSelf
+                },
+                groupIds = it.groupIds,
+                counterpartHex = it.counterpartHex,
+                name = it.name,
+                latestContent = it.latestContent,
+                latestSenderHex = it.latestSenderHex,
+                latestAtSecs = it.latestAtSecs.toLong(),
+                latestMine = it.latestMine,
+                latestGroupId = it.latestGroupId,
+                messageCount = it.messageCount.toLong(),
+                unreadCount = it.unreadCount.toLong(),
+                version = it.version.toLong(),
             )
         }
     }

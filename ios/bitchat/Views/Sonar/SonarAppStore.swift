@@ -2423,6 +2423,7 @@ final class SonarAppStore: ObservableObject {
         invalidateHomeRows(on: marmot.$groups)
         invalidateHomeRows(on: marmot.$messagesByGroup)
         invalidateHomeRows(on: marmot.$unreadByGroup)
+        invalidateHomeRows(on: marmot.$conversationGroupIdsByGroup)
         // The Note to Self id can land after the rows were built (ensure's
         // change notification races the summary load); the pin, title,
         // preview and unread gate all read it (Compose keys VisibleChatsKey on it).
@@ -6063,6 +6064,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func directMarmotGroups(matching group: MarmotService.MarmotGroup) -> [MarmotService.MarmotGroup] {
+        let sets = marmot.conversationGroupIdsByGroup
+        if let set = sets[group.id] {
+            if set.count == 1 { return [group] }
+            let byId = Dictionary(marmot.groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            if let folded = snCoreFoldedGroups(group.id, sets: sets, groupsById: byId) { return folded }
+        }
         guard let peerKey = directMarmotPeerKey(in: group) else { return [group] }
         let groups = marmot.groups.filter { directMarmotPeerKey(in: $0) == peerKey }
         return groups.isEmpty ? [group] : groups
@@ -6569,6 +6576,12 @@ final class SonarAppStore: ObservableObject {
         // showing a second row.
         var marmotRows: [SNDMRow] = []
         let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
+        // Core's fold (`conversationList`) decides which groups are one 1:1,
+        // the same sets Compose renders; the local peer-key fold covers only
+        // groups core has not listed yet (restored snapshot, first launch).
+        let coreFoldSets = marmot.conversationGroupIdsByGroup
+        let groupsById = Dictionary(marmot.groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var renderedDirectGroupIds = Set<String>()
         var renderedDirectPeerKeys = Set<String>()
         for group in marmot.groups {
             let last = marmot.homeRowMessage(groupId: group.id)
@@ -6591,13 +6604,18 @@ final class SonarAppStore: ObservableObject {
             }
             let peerKey = directMarmotPeerKey(in: group)
             let groupSet: [MarmotService.MarmotGroup]
-            if let peerKey {
+            if renderedDirectGroupIds.contains(group.id) { continue }
+            if let coreSet = snCoreFoldedGroups(group.id, sets: coreFoldSets, groupsById: groupsById) {
+                groupSet = coreSet
+                if let peerKey { renderedDirectPeerKeys.insert(peerKey) }
+            } else if let peerKey {
                 if renderedDirectPeerKeys.contains(peerKey) { continue }
                 renderedDirectPeerKeys.insert(peerKey)
                 groupSet = directGroupsByPeer[peerKey] ?? [group]
             } else {
                 groupSet = [group]
             }
+            renderedDirectGroupIds.formUnion(groupSet.map(\.id))
             let latest = latestMarmotMessage(in: groupSet)
             let rowGroup = preferredDirectMarmotGroup(in: groupSet) ?? group
             let rowGroupId = latest?.groupId ?? rowGroup.id

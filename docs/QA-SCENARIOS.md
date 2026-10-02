@@ -31,8 +31,16 @@ is the build under test on a dedicated QA emulator/simulator.
   type → Send.
 - **Expect:** bubble reaches "Sent · internet"; the peer receives it within
   60 s; **the keyboard stays up** after the first send.
-- **How:** `android-smoke.sh` QA-001 · Guard: `ChatTranscriptBodyComposerFocusUiTest`
-- **Origin:** A10 (#616)
+- **How:** `android-smoke.sh` QA-001 · Guard: `ChatTranscriptBodyComposerFocusUiTest`,
+  `SNComposerFirstSendFocusTests.theFirstSendWithTheKeyboardUpRefocusesTheRebuiltComposer` (iOS).
+  iOS by hand or `ios-drive.sh`: run type and send in ONE driver session and
+  check the `Keyboard` element in the tree after the send. A new driver
+  session attaching drops the keyboard by itself, which looks like this bug.
+- **Origin:** A10 (#616). iOS failed it too (found 2026-09-29, core-owned
+  chat list QA; main had the same behaviour): the first message moves the
+  composer from the empty state into the transcript host, SwiftUI rebuilds it
+  there and its focus was lost. The screen now re-focuses the rebuilt
+  composer once, only when the field had focus at the send.
 
 ### QA-002 — Reply arrives in the open chat
 - **Platforms:** both (Android automated)
@@ -371,6 +379,25 @@ nothing by design.
 - **Expect:** a notification within ~10 s; the body respects the preview
   setting (off by default: "Open Sonar to read it."); the tap opens that chat
   with the divider per QA-005.
+- **Harness notes (2026-09-29, core-owned chat list QA):**
+  - Android freezes the app about 3 s after HOME and cuts its network, so only
+    a Transponder wake can deliver. The peer must hold the app's push token
+    (`<peer home>/marmot/marmot.sqlite.sonar-push-tokens.json` lists it) and
+    publish its kind-446 wake where the Transponder reads: its kind-10050
+    inbox relays (`nak req -k 10050 -a <transponder npub> wss://purplepag.es`;
+    nos.lol, nostr.relay.hedwig.sh, relay.damus.io that day).
+  - A shared QA Mac can be banned by relay.damus.io ("too many rate-limit
+    violations") and PoW-gated by nos.lol. The default `sonar-cli` relays then
+    land the wake only on relay.primal.net, which the Transponder does not
+    read. Run with `RUST_LOG=sonar_core=debug` and read the `OK` lines for the
+    wake's event id before blaming the app.
+  - Even with the wake on the Transponder's own relay, no FCM message reached
+    the emulator (no `SonarFCM` line), on this branch and on main alike.
+  - iOS simulator: `xcrun simctl push <udid> sh.hedwig.sonar <file>` with
+    `{"aps":{"alert":{…},"mutable-content":1},"source":"transponder"}` is
+    delivered and presented (SpringBoard log), but the notification service
+    extension does not run (no `sonar.nse.lastDiagnostic`), so decoration
+    needs a device.
 
 ### QA-021 — No banner for the chat you are reading
 - **Platforms:** iOS (manual, #615)
@@ -440,6 +467,44 @@ nothing by design.
 - **Platforms:** both (manual)
 - **Expect:** no row whose only effect is a "coming soon" toast.
 - **Origin:** A17 (#616)
+
+### QA-143 — A mesh-folded chat shows the unread dot of its White Noise messages
+- **Platforms:** both (manual: needs a Sonar peer met over Bluetooth, i.e. a
+  second emulator or phone with Bluetooth on; iOS already passes)
+- **Steps:** meet a Sonar peer over Bluetooth and exchange a message; take the
+  peer out of range (or turn its Bluetooth off) so the next message travels
+  over White Noise; with the app on the chat list, the peer sends a message.
+- **Expect:** the peer's one Home row shows the new preview **and** the unread
+  dot (announced "Unread"); opening it clears the dot; no second row for the
+  same person appears (R-003).
+- **Guard:** `ChatListAppStateTest.aMeshFoldedPersonsWhiteNoiseUnreadBadgesTheirBluetoothRow`,
+  `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs` (R-052)
+- **Origin:** chat-list presenter pilot. Compose mesh rows never passed
+  `unread` or `verified`, so Android and desktop showed no dot where iOS did.
+
+### QA-144 — Both apps fold a person's duplicate 1:1 groups the same way
+- **Platforms:** both. The fold is computed once in core
+  (`conversation_list`); iOS and Compose render its rows.
+- **How:** automated. Core drives two real 1:1 groups from the same peer
+  through the welcome and receive path and asserts one row, the summed
+  badge, and that marking the row's set clears it. The host tests pin that
+  each app renders core's row group and marks core's whole set read. On
+  devices, every Home row now comes from this path, so the Messaging smoke
+  (QA-001…008) exercises it; `sonar-cli` cannot create a second 1:1 group, so
+  the duplicate case itself is not driven on a device.
+- **Steps (manual, when two devices are available):** start a chat with the
+  same person from both sides at the same time, so two 1:1 groups exist; the
+  peer sends a message in each group.
+- **Expect:** one Home row for that person on both apps, badged; opening it
+  clears the badge for good (it does not come back on the next refresh); the
+  transcript holds both groups' messages (R-003).
+- **Guard:** `client.rs::conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row`,
+  `ChatListAppStateTest.theCoreFoldDecidesWhichGroupRendersAndWhatOpeningMarksRead`,
+  `ChatListAppStateTest.aFailedCoreListReadKeepsTheLastFold`,
+  `SonarCoreConversationFoldTests.coreSetResolvesInRowOrderAndSkipsGroupsThatAreGone`
+- **Origin:** core-owned chat list (follow-up to the #645 presenter pilot).
+  The two apps each folded duplicate groups themselves, with two copies of
+  the rule that had already drifted once (R-052).
 
 ## Note to Self (#339)
 

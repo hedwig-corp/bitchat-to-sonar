@@ -735,6 +735,36 @@ data class SonarConversationSummary(
     val unreadCount: Long,
 )
 
+/** Kind of a core-computed Messages-list row (`conversation_list`). */
+enum class SonarConversationListKind { Direct, Group, NoteToSelf }
+
+/**
+ * One Messages-list row computed by core (`SonarNode.conversationList`): every
+ * Marmot group of one conversation folded together (R-003), unread summed over
+ * [groupIds] (R-052), Note to Self first. iOS renders the same rows, so the
+ * fold and the badge are decided once. The app overlays what core does not
+ * own: kind-0 titles, mute, verification, pending rows, the Bluetooth fold.
+ */
+data class SonarConversationListRow(
+    /** The group the row opens: newest in the set, lowest id on a tie. */
+    val conversationId: String,
+    val kind: SonarConversationListKind,
+    /** Every folded group, [conversationId] first. Opening marks all read. */
+    val groupIds: List<String>,
+    val counterpartHex: String?,
+    val name: String,
+    val latestContent: String,
+    val latestSenderHex: String,
+    val latestAtSecs: Long,
+    val latestMine: Boolean,
+    val latestGroupId: String,
+    val messageCount: Long,
+    /** Sum over [groupIds]; 0 for Note to Self. */
+    val unreadCount: Long,
+    /** Equal versions mean an unchanged row. */
+    val version: Long,
+)
+
 /** A public message in a geohash channel. */
 data class SonarChannelMsg(
     val id: String,
@@ -1055,6 +1085,9 @@ expect object SonarCore {
     /** Precomputed conversation summaries from the core-owned index, ordered
      *  by latest message timestamp (newest first). */
     suspend fun conversationSummaries(): List<SonarConversationSummary>
+
+    /** Every core-computed Messages-list row, in list order (local only). */
+    suspend fun conversationList(): List<SonarConversationListRow>
 
     /** Update and privately fan out this device's current OS timezone. */
     suspend fun updateLocalTimezone(ianaIdentifier: String)

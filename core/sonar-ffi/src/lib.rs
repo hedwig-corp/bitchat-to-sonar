@@ -866,6 +866,86 @@ impl sonar_core::client::MediaUploadObserver for FfiMediaUploadObserver<'_> {
     }
 }
 
+/// What kind of conversation a Messages-list row is.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationListKindInfo {
+    /// A 1:1. Duplicate groups with the same counterpart are one row.
+    Direct,
+    /// Any other group.
+    Group,
+    /// This account's Note to Self. Never unread; sorted first.
+    NoteToSelf,
+}
+
+/// One Messages-list row computed by core: every group of one conversation
+/// folded together. Both apps render these instead of folding groups
+/// themselves. Hosts overlay what core does not own: kind-0 names, mute,
+/// verification, pending setup rows and the Bluetooth fold.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ConversationListRowInfo {
+    /// The group the row opens: the newest in the set, lowest id on a tie.
+    pub conversation_id: String,
+    pub kind: ConversationListKindInfo,
+    /// Every folded group, `conversation_id` first. Unread is summed over
+    /// it, and opening the row marks all of it read.
+    pub group_ids: Vec<String>,
+    /// The other member's pubkey hex for a 1:1.
+    pub counterpart_hex: Option<String>,
+    /// MLS group name, empty for most 1:1s.
+    pub name: String,
+    pub latest_content: String,
+    /// Pubkey hex of the newest message's sender.
+    pub latest_sender_hex: String,
+    pub latest_at_secs: u64,
+    pub latest_mine: bool,
+    /// The group holding the newest message.
+    pub latest_group_id: String,
+    pub message_count: u64,
+    /// Sum over `group_ids`; always 0 for Note to Self.
+    pub unread_count: u64,
+    /// Equal versions mean an unchanged row (cache key).
+    pub version: u64,
+}
+
+/// Where the next page starts: the last row of the previous page.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ConversationListCursorInfo {
+    pub latest_at_secs: u64,
+    pub conversation_id: String,
+    pub pinned: bool,
+}
+
+fn conversation_list_kind_info(
+    kind: sonar_core::conversation_list::ConversationListKind,
+) -> ConversationListKindInfo {
+    use sonar_core::conversation_list::ConversationListKind as K;
+    match kind {
+        K::Direct => ConversationListKindInfo::Direct,
+        K::Group => ConversationListKindInfo::Group,
+        K::NoteToSelf => ConversationListKindInfo::NoteToSelf,
+    }
+}
+
+fn conversation_list_row_info(
+    row: sonar_core::conversation_list::ConversationListRow,
+) -> ConversationListRowInfo {
+    ConversationListRowInfo {
+        conversation_id: row.conversation_id,
+        kind: conversation_list_kind_info(row.kind),
+        group_ids: row.group_ids,
+        counterpart_hex: row.counterpart_hex,
+        name: row.name,
+        latest_content: row.latest_content,
+        latest_sender_hex: row.latest_sender_hex,
+        latest_at_secs: row.latest_at_secs,
+        latest_mine: row.latest_mine,
+        latest_group_id: row.latest_group_id,
+        message_count: row.message_count,
+        unread_count: row.unread_count,
+        version: row.version,
+    }
+}
+
 /// FFI-friendly conversation summary from the core-owned index.
 #[derive(uniffi::Record)]
 pub struct ConversationSummaryInfo {
@@ -1926,6 +2006,27 @@ impl SonarNode {
 
     pub fn mark_conversation_read(&self, group_id_hex: String) {
         self.client.mark_conversation_read(&group_id_hex);
+    }
+
+    /// The Marmot half of the Messages list, folded and ordered by core:
+    /// Note to Self first, then newest first. `after` continues from the
+    /// previous page's last row; `limit` 0 returns every row. Local only.
+    pub fn conversation_list(
+        &self,
+        limit: u32,
+        after: Option<ConversationListCursorInfo>,
+    ) -> FfiResult<Vec<ConversationListRowInfo>> {
+        let cursor = after.map(|c| sonar_core::conversation_list::ConversationListCursor {
+            latest_at_secs: c.latest_at_secs,
+            conversation_id: c.conversation_id,
+            pinned: c.pinned,
+        });
+        Ok(self
+            .client
+            .conversation_list(limit as usize, cursor.as_ref())?
+            .into_iter()
+            .map(conversation_list_row_info)
+            .collect())
     }
 
     /// Stable newest-first transcript page ordered by
