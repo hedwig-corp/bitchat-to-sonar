@@ -80,3 +80,8 @@ ran its own quote-parent fill, so a group could not see its twin's rows.
    - **Rows keep their group:** `SNMessage.marmotGroupID` holds the row's own group, so reactions go to the group that holds the message.
    - **Summary refresh:** for a set, the summary refresh may move the cursor only newer (a trim). A quiet group's newest rows can sit below the merged window, and dropping the cursor to them would skip the other groups' rows.
    - **A single-group chat pages exactly as before:** its key is its group id and its page is that group's page.
+
+Device QA, 2026-10-02: a folded chat was built from two `sonar-cli` homes
+sharing one key, 20 + 25 texts. Both apps show one row, page all 45 rows in
+merged order, deliver a reaction to the leg that holds the message, and chip
+a reply that quotes the other leg.

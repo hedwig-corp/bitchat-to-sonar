@@ -550,6 +550,8 @@ nothing by design.
   - all 45 rows in merged order when paging to the top;
   - 👍 on a first-leg row reached that leg's group;
   - a reply sent into the second leg showed the chip "Sonar agent DM / fold a 03".
+
+  Verified the same on Android, with identical chip wording.
 - **Guard:** `client.rs::a_reply_quoting_the_twin_group_gets_its_chip_from_core`,
   `reply.rs::the_chip_prefers_a_typed_parent_then_the_snapshot_then_the_parent_text`,
   `MarmotReplyChipTests.aChipFromCoreRendersWithoutTheParentInThisGroup`,
@@ -593,6 +595,9 @@ nothing by design.
     retried.
     - Fix: key the effect on `unreadAnchorId`. Retry a failed top-edge load
       a few times while the reader is still at the top.
+    - A folded chat opened while its second group was still being folded in
+      can fail past those retries. A failed load now re-arms the trigger on
+      the next feed change: one retry per change, never a loop.
 
 ## Note to Self (#339)
 

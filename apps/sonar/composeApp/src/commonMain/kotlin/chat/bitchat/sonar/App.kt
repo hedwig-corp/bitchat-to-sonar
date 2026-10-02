@@ -1741,14 +1741,29 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         state.clearOpenChatJump(screen.id)
     }
 
+    // A top-edge load that failed (retries included) re-arms on the next feed
+    // change: a folded chat can open while its second group is still being
+    // folded in, and the page only exists once it lands. One retry per feed
+    // change after a failure, never an eager loop while the reader idles at
+    // the top (QA-157).
+    var topEdgeFailedAtSize by remember(screen.id) { mutableStateOf(-1) }
+    var topEdgeRearm by remember(screen.id) { mutableStateOf(0) }
+    val currentFeedSize by rememberUpdatedState(feed.size)
+    LaunchedEffect(screen.id, feed.size) {
+        if (topEdgeFailedAtSize >= 0 && feed.size != topEdgeFailedAtSize) {
+            topEdgeFailedAtSize = -1
+            topEdgeRearm++
+        }
+    }
     // Load one local cursor page when the reader reaches the top. Capture a
     // stable visible message and pixel offset, then restore it after prepend so
     // the existing content does not jump under the reader's finger.
     LaunchedEffect(screen.id, listState) {
         snapshotFlow {
-            didInitialScroll && listState.layoutInfo.totalItemsCount > 0 &&
+            val atTop = didInitialScroll && listState.layoutInfo.totalItemsCount > 0 &&
                 listState.firstVisibleItemIndex <= 2
-        }.distinctUntilChanged().filter { it }.collect {
+            atTop to topEdgeRearm
+        }.distinctUntilChanged().filter { it.first }.collect {
             val visibleInfo = listState.layoutInfo.visibleItemsInfo
             val anchor = visibleInfo.firstOrNull { it.key.toString().startsWith("m:") }
                 ?: visibleInfo.firstOrNull()
@@ -1771,6 +1786,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 loaded = state.loadOlderMessages(screen.id)
             }
             if (!loaded) {
+                topEdgeFailedAtSize = currentFeedSize
                 isPrepending = false
                 return@collect
             }
