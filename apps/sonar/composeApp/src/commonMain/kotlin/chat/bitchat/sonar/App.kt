@@ -1220,6 +1220,10 @@ internal fun upsertCallRecordList(list: MutableList<CallRecord>, record: CallRec
 
 /** Flattened LazyColumn rows so day chips / unread own stable keys (Signal).
  *  Internal (not private) so tests pin the real feed-flattening call site. */
+/** Retries of a top-edge older-page load that failed while the reader stayed at the top. */
+private const val TOP_EDGE_LOAD_RETRIES = 4
+private const val TOP_EDGE_LOAD_RETRY_MS = 300L
+
 internal sealed interface ChatFeedListItem {
     data class Day(val epochDay: Long, val label: String) : ChatFeedListItem
     data object Unread : ChatFeedListItem
@@ -1616,7 +1620,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // White Noise leg in, which can insert only OLDER rows. That leaves the
     // newest key untouched while shifting every index — the tail moves and the
     // viewport is left showing older content until something re-anchors it.
-    LaunchedEffect(screen.id, newestFeedKey, feed.size, state.openChatUnread[screen.id]) {
+    // Keyed on the resolved anchor too: an unread open leaves didInitialScroll
+    // unset until the freeze effect above places the divider, and placing it
+    // changes none of the other keys. Without it the retry never ran, the
+    // top-edge pager (gated on didInitialScroll) never fired, and scrolling up
+    // from an unread open stopped at the first loaded page (QA-157).
+    LaunchedEffect(screen.id, newestFeedKey, feed.size, state.openChatUnread[screen.id], unreadAnchorId) {
         if (feed.isEmpty()) return@LaunchedEffect
         val hydrated = feedCaughtUp(feed)
         // Settled unread takes over from provisional live edge. Do NOT force
@@ -1749,7 +1758,19 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 pixelOffset = anchor.offset,
             )
             isPrepending = true
-            if (!state.loadOlderMessages(screen.id)) {
+            // The flow only fires on arriving at the top. A load that fails
+            // while the reader is still there (an unread open lands at the top
+            // while its windows are still settling) would otherwise never be
+            // retried: swiping at the top changes nothing the flow watches.
+            // A few short retries, only while still at the top (QA-157).
+            var loaded = state.loadOlderMessages(screen.id)
+            var retries = 0
+            while (!loaded && retries < TOP_EDGE_LOAD_RETRIES && listState.firstVisibleItemIndex <= 2) {
+                kotlinx.coroutines.delay(TOP_EDGE_LOAD_RETRY_MS)
+                retries++
+                loaded = state.loadOlderMessages(screen.id)
+            }
+            if (!loaded) {
                 isPrepending = false
                 return@collect
             }

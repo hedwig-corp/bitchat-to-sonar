@@ -530,26 +530,39 @@ nothing by design.
   the caption.
 
 ### QA-157 — Scrolling up from an unread open reaches the first message
-- **Platforms:** both (found on iOS).
-- **Steps:** a fresh peer sends 35 numbered texts while the app is on
-  Messages. Open the chat (it opens at the unread divider), then scroll to
-  the top.
-- **Expect:** older pages load until message 01 is on screen, in order with
-  no gap. On Android the same with 70 texts.
-- **How:** on iOS, drive it with `scripts/qa/ios-drive.sh`
+- **Platforms:** both. On each, the bug had its own cause.
+- **Steps:** a fresh peer sends more than one page of numbered texts (iOS 35,
+  Android 40 to 70) while the app is on Messages. Open the chat, which opens
+  at the unread divider, then scroll to the top.
+- **Expect:** the chat opens at the divider. Older pages load until message
+  01 is on screen, in order, with no gap.
+- **How:** Android is scripted as `qa157` in `scripts/qa/android-smoke.sh`.
+  On iOS, drive it with `scripts/qa/ios-drive.sh`
   (`tapc:<last text>;swipedown×5;tree:top`) and read the labels in the tree.
-  On Android use `scripts/qa/android-ui.sh swipe`.
 - **Guard:** `ConversationTranscriptWindowTests.aPageRestoringRowsAConcurrentReloadTrimmedStillCountsAsGrowth`
-  pins the growth measurement. It does not pin that `SonarAppStore.loadOlderDM`
-  passes the page's own count; the device run does.
-- **Origin:** core screen models (#652). Opening through core
-  `open_conversation` takes longer than the old mark-read, so its
-  conversation-changed reload lands while the first older page is in flight.
-  That reload trimmed the group's window from 35 rows to 30, the older page
-  restored the 5, and `loadOlderDM` measured growth as the set difference
-  against a snapshot taken before the trim, which read 0. The view never grew
-  its source limit, so scrolling stopped at message 05. Now growth is what the
-  page added at merge time.
+  pins the iOS growth measurement, and `client.rs::open_conversation_anchors_at_the_oldest_unread_across_folded_groups`
+  pins the read-only anchor. The Compose fixes are in `ChatScreen` effects
+  with no unit seam; `qa157` is their guard.
+- **Origin:** device QA of the core screen models (#652).
+  - **iOS (regression from #652):** opening through core `open_conversation`
+    ran its mark read after the anchor scan. The mark and the reload it
+    triggers landed after the host had placed the divider, so the chat opened
+    at the tail. The reload also trimmed the group's window from 35 rows to
+    30 while the first older page was in flight, and `loadOlderDM` measured
+    that page's growth as a set difference against the untrimmed window,
+    which read 0. The view never grew its source limit, so scrolling stopped
+    at message 05.
+    - Fix: mark read at once, as before. Ask core only for the anchor
+      (`conversation_unread_anchor`). Count what the page added at merge
+      time.
+  - **Android (on main before this work):** the initial-scroll effect left
+    `didInitialScroll` unset until the divider resolved, and was not keyed on
+    the anchor, so the top-edge pager it gates never fired. With that keyed,
+    the pager's first call landed while the windows were still settling and
+    returned false. The trigger only fires on arriving at the top, so it never
+    retried.
+    - Fix: key the effect on `unreadAnchorId`. Retry a failed top-edge load
+      a few times while the reader is still at the top.
 
 ## Note to Self (#339)
 
