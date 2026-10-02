@@ -266,16 +266,6 @@ func snCanonicalConversationTitle(_ value: String) -> String {
         .lowercased()
 }
 
-/// A folded direct DM keeps the Marmot counterpart's profile title. BLE radar
-/// names are transport metadata and must never relabel an encrypted transcript.
-func snFoldedDirectMarmotHomeTitle(
-    isDirectGroup: Bool,
-    marmotProfileTitle: String,
-    peerDerivedTitle: String
-) -> String {
-    isDirectGroup ? marmotProfileTitle : peerDerivedTitle
-}
-
 /// A stored call record: its timeline `date` (used to merge it
 /// chronologically into the transcript) plus the prebuilt CallLog message.
 struct SNCallRecord: Identifiable, Equatable {
@@ -2423,6 +2413,8 @@ final class SonarAppStore: ObservableObject {
         invalidateHomeRows(on: marmot.$groups)
         invalidateHomeRows(on: marmot.$messagesByGroup)
         invalidateHomeRows(on: marmot.$unreadByGroup)
+        invalidateHomeRows(on: marmot.$conversationGroupIdsByGroup)
+        invalidateHomeRows(on: marmot.$conversationRows)
         // The Note to Self id can land after the rows were built (ensure's
         // change notification races the summary load); the pin, title,
         // preview and unread gate all read it (Compose keys VisibleChatsKey on it).
@@ -5195,11 +5187,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func hasRecentMarmotActivityForCapabilitySettle(
-        _ latestMessage: MarmotService.MarmotMessage?,
+        _ latestAt: Date?,
         now: Date
     ) -> Bool {
-        guard let latestMessage else { return false }
-        let age = now.timeIntervalSince(latestMessage.createdAt)
+        guard let latestAt else { return false }
+        let age = now.timeIntervalSince(latestAt)
         return age > -Self.capabilitySettleWindow && age < Self.capabilitySettleWindow
     }
 
@@ -5213,13 +5205,12 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func shouldHoldStandaloneMarmotGroup(
-        _ group: MarmotService.MarmotGroup,
-        latestMessage: MarmotService.MarmotMessage?,
+    private func shouldHoldStandaloneMarmotRow(
+        title rowTitle: String,
+        latestAt: Date?,
         now: Date
     ) -> Bool {
-        guard marmot.isDirectGroup(group) else { return false }
-        let title = snCanonicalConversationTitle(marmot.title(for: group))
+        let title = snCanonicalConversationTitle(rowTitle)
         guard !title.isEmpty else { return false }
         let my = chatViewModel.meshService.myPeerID
         // Hold if a name-matched peer is still settling capabilities.
@@ -5230,7 +5221,7 @@ final class SonarAppStore: ObservableObject {
                 return true
             }
         }
-        guard hasRecentMarmotActivityForCapabilitySettle(latestMessage, now: now) else { return false }
+        guard hasRecentMarmotActivityForCapabilitySettle(latestAt, now: now) else { return false }
         // Also hold if ANY mesh peer is still within its settle window and
         // hasn't resolved capabilities yet — the pending 0x53 announce may be
         // the one that provides the name we need to fold by.  This broad fallback
@@ -6063,6 +6054,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func directMarmotGroups(matching group: MarmotService.MarmotGroup) -> [MarmotService.MarmotGroup] {
+        let sets = marmot.conversationGroupIdsByGroup
+        if let set = sets[group.id] {
+            if set.count == 1 { return [group] }
+            let byId = Dictionary(marmot.groups.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            if let folded = snCoreFoldedGroups(group.id, sets: sets, groupsById: byId) { return folded }
+        }
         guard let peerKey = directMarmotPeerKey(in: group) else { return [group] }
         let groups = marmot.groups.filter { directMarmotPeerKey(in: $0) == peerKey }
         return groups.isEmpty ? [group] : groups
@@ -6071,19 +6068,6 @@ final class SonarAppStore: ObservableObject {
     private func directMarmotGroups(matchingGroupId groupId: String) -> [MarmotService.MarmotGroup] {
         guard let group = marmotGroup(byId: groupId) else { return [] }
         return directMarmotGroups(matching: group)
-    }
-
-    private func latestMarmotMessage(
-        in groups: [MarmotService.MarmotGroup]
-    ) -> (groupId: String, message: MarmotService.MarmotMessage)? {
-        var latest: (groupId: String, message: MarmotService.MarmotMessage)?
-        for group in groups {
-            guard let message = marmot.homeRowMessage(groupId: group.id) else { continue }
-            if latest == nil || message.createdAt > latest!.message.createdAt {
-                latest = (group.id, message)
-            }
-        }
-        return latest
     }
 
     private func preferredDirectMarmotGroup(
@@ -6100,12 +6084,26 @@ final class SonarAppStore: ObservableObject {
         }.first
     }
 
-    private func hasUnreadMarmotMessage(in groups: [MarmotService.MarmotGroup]) -> Bool {
-        groups.contains { (marmot.unreadByGroup[$0.id] ?? 0) > 0 }
-    }
-
     private func hasVerifiedMarmotGroup(in groups: [MarmotService.MarmotGroup]) -> Bool {
         groups.contains { marmotVerified[$0.id] ?? false }
+    }
+
+    /// Ask core where the unread divider goes for the count this open
+    /// captured. Read-only: the chat was already marked read the old way, at
+    /// once, so the mark and the reload it triggers land before the
+    /// transcript places the divider (QA-157). Core's anchor is used whenever
+    /// that row is loaded; the local walk stays the fallback.
+    private func fetchUnreadAnchor(_ id: String, groupId: String) {
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        guard let unread = unreadCountAtOpenByDM[id], unread > 0 else { return }
+        Task { [weak self] in
+            guard let self,
+                  let anchor = await self.marmot.conversationUnreadAnchor(groupIds: ids, unreadCount: unread),
+                  self.unreadCountAtOpenByDM[id] == unread
+            else { return }
+            self.unreadAnchorIdAtOpenByDM[id] = anchor.lowercased()
+        }
     }
 
     private func markMarmotGroupsRead(matchingGroupId groupId: String) {
@@ -6568,44 +6566,39 @@ final class SonarAppStore: ObservableObject {
         // (the DM screen renders both transcripts merged) instead of
         // showing a second row.
         var marmotRows: [SNDMRow] = []
-        let directGroupsByPeer = snCanonicalDirectMarmotGroups(marmot.groups, ownNpub: marmot.npub)
-        var renderedDirectPeerKeys = Set<String>()
-        for group in marmot.groups {
-            let last = marmot.homeRowMessage(groupId: group.id)
-            guard marmot.isDirectGroup(group) else {
-                let isNote = marmot.isNoteToSelf(group)
+        // The Marmot half is core's screen model (`conversationList`): one row
+        // per conversation, already folded (duplicate 1:1s), titled, previewed,
+        // badged and ordered in core, the same rows Compose renders. This app
+        // only overlays what core does not own: the Bluetooth fold below,
+        // blocking, verification, mute, pending rows and the capability hold.
+        for row in marmot.conversationRows {
+            let rowGroupId = row.conversationId
+            let lastDate: Date? = row.latestAt.timeIntervalSince1970 > 0 ? row.latestAt : nil
+            let preview = Self.previewText(row.preview)
+            let unread = row.kind != .noteToSelf
+                && row.unreadCount > 0
+                && !marmot.isUnreadSuppressed(groupIds: row.groupIds)
+            let verified = row.groupIds.contains { marmotVerified[$0] ?? false }
+            guard row.kind == .direct else {
+                let isNote = row.kind == .noteToSelf
                 marmotRows.append(SNDMRow(
-                    id: Self.marmotIDPrefix + group.id,
-                    title: isNote ? String(localized: "Note to Self") : marmot.title(for: group),
-                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) }
-                        ?? (isNote ? "Tap to open" : "Secure group · reaches anywhere"),
-                    time: last.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: isNote ? false : (marmot.unreadByGroup[group.id] ?? 0) > 0,
+                    id: Self.marmotIDPrefix + rowGroupId,
+                    title: isNote ? String(localized: "Note to Self") : (row.title ?? "Group chat"),
+                    preview: preview ?? (isNote ? "Tap to open" : "Secure group · reaches anywhere"),
+                    time: lastDate.map { Self.listTime($0) } ?? "",
+                    unread: unread,
                     presence: false,
                     verified: false,
                     isMarmot: true,
-                    lastDate: last?.createdAt,
-                    marmotGroupId: group.id
+                    lastDate: lastDate,
+                    marmotGroupId: rowGroupId
                 ))
                 continue
             }
-            let peerKey = directMarmotPeerKey(in: group)
-            let groupSet: [MarmotService.MarmotGroup]
-            if let peerKey {
-                if renderedDirectPeerKeys.contains(peerKey) { continue }
-                renderedDirectPeerKeys.insert(peerKey)
-                groupSet = directGroupsByPeer[peerKey] ?? [group]
-            } else {
-                groupSet = [group]
-            }
-            let latest = latestMarmotMessage(in: groupSet)
-            let rowGroup = preferredDirectMarmotGroup(in: groupSet) ?? group
-            let rowGroupId = latest?.groupId ?? rowGroup.id
-            let rowLast = latest?.message
-            let otherNpub = directOtherNpub(in: rowGroup) ?? peerKey
+            let otherNpub = row.counterpartHex.map { SNMarmotProfileCache.canonicalKey($0) }
+            let title = row.title ?? otherNpub.map { Self.shortNpub($0) } ?? rowGroupId
             // Whole counterpart blocked → suppress this 1:1 chat from the list,
-            // the same way a blocked mesh peer never surfaces a row. `peerKey`
-            // is already reserved above so no duplicate row can slip through.
+            // the same way a blocked mesh peer never surfaces a row.
             if let otherNpub, isMarmotSenderBlocked(otherNpub) { continue }
             // Live peer id (when currently discovered over 0x53) gives us mesh
             // presence; the persisted fingerprint still lets us build the SAME
@@ -6631,33 +6624,28 @@ final class SonarAppStore: ObservableObject {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
                 // into that one row instead of showing a duplicate conversation.
                 foldMappings.append((existing.id, rowGroupId))
-                let rowTitle = snFoldedDirectMarmotHomeTitle(
-                    isDirectGroup: marmot.isDirectGroup(rowGroup),
-                    marmotProfileTitle: marmot.title(for: rowGroup),
-                    peerDerivedTitle: existing.title
-                )
-                if let rowLast, rowLast.createdAt > (existing.lastDate ?? .distantPast) {
+                if let lastDate, lastDate > (existing.lastDate ?? .distantPast) {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
-                        title: rowTitle,
-                        preview: Self.previewText(rowLast.content, stickerRef: rowLast.stickerRef, media: rowLast.media),
-                        time: Self.listTime(rowLast.createdAt),
-                        unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
+                        title: title,
+                        preview: preview ?? existing.preview,
+                        time: Self.listTime(lastDate),
+                        unread: existing.unread || unread,
                         presence: existing.presence,
-                        verified: existing.verified || hasVerifiedMarmotGroup(in: groupSet),
+                        verified: existing.verified || verified,
                         isMarmot: false,
-                        lastDate: rowLast.createdAt,
+                        lastDate: lastDate,
                         marmotGroupId: rowGroupId
                     )
-                } else if existing.title != rowTitle {
+                } else {
                     byKey[foldKey] = SNDMRow(
                         id: existing.id,
-                        title: rowTitle,
+                        title: title,
                         preview: existing.preview,
                         time: existing.time,
-                        unread: existing.unread || hasUnreadMarmotMessage(in: groupSet),
+                        unread: existing.unread || unread,
                         presence: existing.presence,
-                        verified: existing.verified || hasVerifiedMarmotGroup(in: groupSet),
+                        verified: existing.verified || verified,
                         isMarmot: existing.isMarmot,
                         lastDate: existing.lastDate,
                         marmotGroupId: rowGroupId
@@ -6671,39 +6659,34 @@ final class SonarAppStore: ObservableObject {
                 // duplicate.
                 let rowId = liveSonarPeerId ?? foldKey
                 foldMappings.append((rowId, rowGroupId))
-                let rowTitle = snFoldedDirectMarmotHomeTitle(
-                    isDirectGroup: marmot.isDirectGroup(rowGroup),
-                    marmotProfileTitle: marmot.title(for: rowGroup),
-                    peerDerivedTitle: peerDisplayName(rowId)
-                )
                 byKey[foldKey] = SNDMRow(
                     id: rowId,
-                    title: rowTitle,
-                    preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? networkLabel(forPeer: rowId),
-                    time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: hasUnreadMarmotMessage(in: groupSet),
+                    title: title,
+                    preview: preview ?? networkLabel(forPeer: rowId),
+                    time: lastDate.map { Self.listTime($0) } ?? "",
+                    unread: unread,
                     presence: liveSonarPeerId != nil && meshReachable(rowId),
-                    verified: isVerified(rowId) || hasVerifiedMarmotGroup(in: groupSet),
+                    verified: isVerified(rowId) || verified,
                     isMarmot: false,
-                    lastDate: rowLast?.createdAt,
+                    lastDate: lastDate,
                     marmotGroupId: rowGroupId
                 )
                 continue
             }
-            if shouldHoldStandaloneMarmotGroup(rowGroup, latestMessage: rowLast, now: now) {
+            if shouldHoldStandaloneMarmotRow(title: title, latestAt: lastDate, now: now) {
                 holdActive = true
                 continue
             }
             marmotRows.append(SNDMRow(
                 id: Self.marmotIDPrefix + rowGroupId,
-                title: marmot.title(for: rowGroup),
-                preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure chat · reaches anywhere",
-                time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
-                unread: hasUnreadMarmotMessage(in: groupSet),
+                title: title,
+                preview: preview ?? "Secure chat · reaches anywhere",
+                time: lastDate.map { Self.listTime($0) } ?? "",
+                unread: unread,
                 presence: false,
-                verified: hasVerifiedMarmotGroup(in: groupSet),
+                verified: verified,
                 isMarmot: true,
-                lastDate: rowLast?.createdAt,
+                lastDate: lastDate,
                 marmotGroupId: rowGroupId
             ))
         }
@@ -6925,11 +6908,13 @@ final class SonarAppStore: ObservableObject {
         var result = SNConversationTranscriptLoadResult.none
         for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
             let before = marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
-            if await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id) {
+            let loaded = await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id)
+            if loaded > 0 {
                 marmotStagedPageRescanIds.insert(group.id)
                 result.record(
                     before: before,
-                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id),
+                    loaded: loaded
                 )
             }
         }
@@ -9278,6 +9263,10 @@ final class SonarAppStore: ObservableObject {
     /// Consumed by the transcript to anchor at the first unread row with a
     /// divider (Signal-style); cleared when the route pops.
     @Published var unreadCountAtOpenByDM: [String: UInt64] = [:]
+    /// The unread anchor core computed when the DM opened (`openConversation`):
+    /// the row the divider goes above, the same row Compose anchors at. The
+    /// transcript uses it whenever that row is loaded.
+    @Published var unreadAnchorIdAtOpenByDM: [String: String] = [:]
 
     /// Search / deep-link jump for the current DM open (#372). Not `@Published`
     /// — set once at push; host reads it on first apply.
@@ -9298,6 +9287,7 @@ final class SonarAppStore: ObservableObject {
     /// the alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
+        unreadAnchorIdAtOpenByDM[id] = nil
         if let jump = pendingJumpMessageIdByDM.removeValue(forKey: id) {
             jumpMessageIdAtOpenByDM[id] = jump
         } else {
@@ -9425,6 +9415,7 @@ final class SonarAppStore: ObservableObject {
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
             markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
+            fetchUnreadAnchor(id, groupId: knownMarmotGroupId)
         }
         // Bind badge suppression as soon as the DM is considered open — even
         // when navigation used a custom `present` path that skipped `push`.
@@ -10705,6 +10696,25 @@ final class SonarAppStore: ObservableObject {
         if SonarPayMessage.decode(content) != nil { return "\u{20BF} Payment" }
         if content.isEmpty, !media.isEmpty { return Self.mediaPreviewLabel(media) }
         return content
+    }
+
+    /// Words core's semantic preview (`conversationList`) for a Home row; nil
+    /// when the conversation has no message yet. The same wording as
+    /// `previewText(_:stickerRef:media:)`, which mesh rows still use.
+    static func previewText(_ preview: MarmotService.ConversationPreview) -> String? {
+        switch preview {
+        case .empty: return nil
+        case .text(let text): return text
+        case .photos(let count): return count > 1 ? "\(count) photos" : "Photo"
+        case .videos(let count): return count > 1 ? "\(count) videos" : "Video"
+        case .voiceNote: return "Voice note"
+        case .file(let name): return name.isEmpty ? "File" : name
+        case .sticker: return "Sticker"
+        case .voiceCall: return "Voice call"
+        case .nudge: return "Nudge"
+        case .payment: return "\u{20BF} Payment"
+        case .jsonPayload: return "JSON payload"
+        }
     }
 
     /// "Photo" / "3 photos" / "Voice note" / filename for a media-only message.

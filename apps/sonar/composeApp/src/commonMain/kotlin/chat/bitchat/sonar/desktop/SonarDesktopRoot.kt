@@ -51,7 +51,10 @@ import chat.bitchat.sonar.CallScreen
 import chat.bitchat.sonar.ChatRowActionsSheet
 import chat.bitchat.sonar.DeleteChatSheet
 import chat.bitchat.sonar.DeleteTarget
-import chat.bitchat.sonar.HomeMessageRow
+import chat.bitchat.sonar.chatlist.ChatListEvent
+import chat.bitchat.sonar.chatlist.ChatListPresenter
+import chat.bitchat.sonar.chatlist.ChatListRow
+import chat.bitchat.sonar.chatlist.ChatListSources
 import chat.bitchat.sonar.MeshRadio
 import chat.bitchat.sonar.MuteSheet
 import chat.bitchat.sonar.Screen
@@ -60,7 +63,6 @@ import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.PendingOpenConversation
 import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.SonarScreenHost
-import chat.bitchat.sonar.homeMessageRows
 import chat.bitchat.sonar.muteChatIdFor
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.ui.SonarTheme
@@ -73,6 +75,7 @@ import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.withContext
 import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.chat_details
@@ -243,9 +246,29 @@ private fun SonarAppState.select(open: SonarAppState.() -> Unit) {
     open()
 }
 
+/**
+ * The desktop sidebar's view of [SonarAppState.chatListSources]. Clicking a
+ * sidebar row selects it: the nav stack collapses to Home before the chat
+ * opens, so the content pane's Back acts as "deselect".
+ */
+private class DesktopSidebarSources(
+    private val state: SonarAppState,
+    private val base: ChatListSources = state.chatListSources,
+) : ChatListSources by base {
+    override fun openChat(chat: SonarChat) = state.select { base.openChat(chat) }
+    override fun openDm(peerId: String, name: String) = state.select { base.openDm(peerId, name) }
+}
+
 @Composable
 private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) -> Unit) {
     val s = sonar
+    // Same presenter as the phone Home list. The sidebar has no launch splash,
+    // so it paints the restored snapshot before hydration, as it always did.
+    val chatListEvents = remember { MutableSharedFlow<ChatListEvent>(extraBufferCapacity = 16) }
+    val chatListPresenter = remember(state) {
+        ChatListPresenter(state.chatList, DesktopSidebarSources(state), waitForHydration = false)
+    }
+    val chatList = chatListPresenter.present(chatListEvents)
     val savedChannels = state.channels.filter { gh ->
         gh != "mesh" && state.locationChannels.none { it.geohash == gh }
     }
@@ -346,33 +369,27 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
             // as phone HomeScreen / iOS dmRows). Mesh is typically empty on
             // desktop; still merge so a future BLE path stays ordered correctly.
             item { SNSectionLabel("Messages") }
-            val meshRows = state.meshDmRows
-            val chatRows = state.visibleChats
-            if (chatRows.isEmpty() && meshRows.isEmpty()) {
+            if (chatList.rows.isEmpty()) {
                 item { EmptyHint("No secure chats yet — use Search to paste an npub and start one.") }
             }
-            val mergedRows = state.homeMessageRows(meshRows, chatRows)
-            items(mergedRows, key = { it.listKey }) { homeRow ->
-                when (homeRow) {
-                    is HomeMessageRow.Mesh -> {
-                        val row = homeRow.row
+            items(chatList.rows, key = { it.key }) { row ->
+                when (row) {
+                    is ChatListRow.Mesh -> {
                         DmRow(
-                            selected = (state.screen as? Screen.Chat)?.id == homeRow.listKey,
-                            name = row.name, preview = row.preview, mesh = true, verified = false,
-                            onRowActions = { onRowActions(DeleteTarget(row.peerId, row.name, isMesh = true, isGroup = false)) },
-                        ) { state.select { openDm(row.peerId, row.name) } }
+                            selected = (state.screen as? Screen.Chat)?.id == row.key,
+                            name = row.title, preview = row.preview, mesh = true, verified = false,
+                            onRowActions = { onRowActions(DeleteTarget(row.peerId, row.title, isMesh = true, isGroup = false)) },
+                        ) { chatListEvents.tryEmit(ChatListEvent.Open(row)) }
                     }
-                    is HomeMessageRow.Marmot -> {
-                        val chat = homeRow.chat
-                        val row = state.marmotRow(chat.id)
+                    is ChatListRow.Marmot -> {
                         DmRow(
-                            selected = (state.screen as? Screen.Chat)?.id == chat.id,
-                            name = row.title, preview = row.sub, mesh = false,
+                            selected = (state.screen as? Screen.Chat)?.id == row.chat.id,
+                            name = row.title, preview = row.preview, mesh = false,
                             verified = row.verified,
                             onRowActions = if (row.pending) null else {
-                                { onRowActions(DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember)) }
+                                { onRowActions(DeleteTarget(row.chat.id, row.title, isMesh = false, isGroup = row.group)) }
                             },
-                        ) { state.select { openChat(chat) } }
+                        ) { chatListEvents.tryEmit(ChatListEvent.Open(row)) }
                     }
                 }
             }

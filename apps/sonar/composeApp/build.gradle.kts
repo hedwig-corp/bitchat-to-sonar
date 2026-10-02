@@ -208,6 +208,11 @@ kotlin {
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation(libs.coroutines.test)
+            // Presenters are plain @Composable functions over the Compose
+            // runtime; production calls them from the UI composition, tests
+            // run them headless with Molecule and assert with Turbine.
+            implementation(libs.molecule.runtime)
+            implementation(libs.turbine)
         }
         // Compose UI tests live in jvmTest, not commonTest: they need a real
         // composition + layout pass, which the Android *unit* test target

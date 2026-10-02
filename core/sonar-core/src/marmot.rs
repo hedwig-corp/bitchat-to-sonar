@@ -350,6 +350,12 @@ macro_rules! dispatch {
 }
 
 /// The Marmot engine: one per identity, owns MLS group state via MDK.
+/// The `created_at` second for our next chat rumor: now, unless that second
+/// is already used, then the one after the last used (see `chat_rumor_clock`).
+pub(crate) fn next_rumor_second(now_secs: u64, last_secs: u64) -> u64 {
+    now_secs.max(last_secs.saturating_add(1))
+}
+
 pub struct MarmotEngine {
     storage: Storage,
     identity: Identity,
@@ -360,6 +366,13 @@ pub struct MarmotEngine {
     /// is never held across an await, so a concurrent send waits for at most
     /// one in-flight mutation, never for a relay fetch.
     write_lock: std::sync::Mutex<()>,
+    /// Last `created_at` second given to one of our chat rumors (text,
+    /// sticker, media). A rumor's id hashes its second-resolution timestamp and
+    /// content, so two identical messages sent in one second had ONE id and the
+    /// second was lost, and same-second sends could reorder. Each rumor takes
+    /// `max(now, last + 1)`: unique ids, send order kept, and a burst of k
+    /// sends ends at most k-1 seconds ahead (the kind-449 clock's rule).
+    chat_rumor_clock: std::sync::Mutex<u64>,
     /// Kind-7 index keyed by target, plus the rumor ids whose outbox publish
     /// exhausted auto-retries (hydrate skips those so a locally echoed `mine`
     /// chip cannot look sent forever). See [`crate::reaction::ReactionIndex`].
@@ -634,6 +647,7 @@ impl MarmotEngine {
             storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            chat_rumor_clock: std::sync::Mutex::new(0),
             reactions: Arc::new(crate::reaction::ReactionIndex::in_memory()),
             dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::in_memory()),
             db_path: None,
@@ -691,6 +705,7 @@ impl MarmotEngine {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            chat_rumor_clock: std::sync::Mutex::new(0),
             reactions: Arc::new(reactions),
             // Persistent engine ⇒ persisted window. The iOS NSE builds a
             // fresh engine per push wake, so an in-memory budget here would
@@ -1537,8 +1552,15 @@ impl MarmotEngine {
         } else {
             content.to_string()
         };
+        let created_at = {
+            let mut last = self.chat_rumor_clock.lock().unwrap();
+            let secs = next_rumor_second(Timestamp::now().as_secs(), *last);
+            *last = secs;
+            Timestamp::from_secs(secs)
+        };
         Ok(EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), body)
             .tags(tags)
+            .custom_created_at(created_at)
             .build(self.identity.public_key()))
     }
 

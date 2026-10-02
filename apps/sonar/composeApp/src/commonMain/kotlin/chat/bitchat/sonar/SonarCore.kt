@@ -535,6 +535,80 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
     return chats to emptyMap()
 }
 
+/**
+ * Core's Messages-list rows as snapshot lines (`r\t…`), so Home paints them
+ * before the encrypted store opens. Message text never enters this plain
+ * preferences blob: a text or file-name preview is stored as empty, the same
+ * metadata-only rule as the chat lines above (iOS: `snSnapshotSafeRows`).
+ */
+internal fun encodeConversationRowSnapshot(rows: List<SonarConversationListRow>): String =
+    buildString {
+        rows.forEach { row ->
+            val (tag, arg) = when (val p = row.preview) {
+                is SonarConversationPreview.Photos -> "photos" to p.count.toString()
+                is SonarConversationPreview.Videos -> "videos" to p.count.toString()
+                SonarConversationPreview.VoiceNote -> "voice" to ""
+                SonarConversationPreview.Sticker -> "sticker" to ""
+                SonarConversationPreview.VoiceCall -> "call" to ""
+                SonarConversationPreview.Nudge -> "nudge" to ""
+                SonarConversationPreview.Payment -> "payment" to ""
+                SonarConversationPreview.JsonPayload -> "json" to ""
+                else -> "" to ""
+            }
+            append("r\t")
+            append(hexEnc(row.conversationId)).append('\t')
+            append(row.kind.name).append('\t')
+            append(row.groupIds.joinToString(",") { hexEnc(it) }).append('\t')
+            append(hexEnc(row.counterpartHex.orEmpty())).append('\t')
+            append(hexEnc(row.title.orEmpty())).append('\t')
+            append(tag).append('\t').append(arg).append('\t')
+            append(row.latestAtSecs).append('\t')
+            append(row.unreadCount).append('\t')
+            append(row.version).append('\t')
+            append(hexEnc(row.name))
+            append('\n')
+        }
+    }
+
+internal fun decodeConversationRowSnapshot(blob: String): List<SonarConversationListRow> =
+    blob.lineSequence().mapNotNull { line ->
+        val p = line.split('\t')
+        if (p.firstOrNull() != "r" || p.size != 12) return@mapNotNull null
+        val id = hexDec(p[1]) ?: return@mapNotNull null
+        val kind = runCatching { SonarConversationListKind.valueOf(p[2]) }.getOrNull() ?: return@mapNotNull null
+        val groups = p[3].split(",").mapNotNull { hexDec(it) }.filter { it.isNotEmpty() }
+        if (groups.isEmpty()) return@mapNotNull null
+        val count = p[7].toIntOrNull() ?: 1
+        val preview = when (p[6]) {
+            "photos" -> SonarConversationPreview.Photos(count)
+            "videos" -> SonarConversationPreview.Videos(count)
+            "voice" -> SonarConversationPreview.VoiceNote
+            "sticker" -> SonarConversationPreview.Sticker
+            "call" -> SonarConversationPreview.VoiceCall
+            "nudge" -> SonarConversationPreview.Nudge
+            "payment" -> SonarConversationPreview.Payment
+            "json" -> SonarConversationPreview.JsonPayload
+            else -> SonarConversationPreview.Empty
+        }
+        SonarConversationListRow(
+            conversationId = id,
+            kind = kind,
+            groupIds = groups,
+            counterpartHex = hexDec(p[4])?.takeIf { it.isNotEmpty() },
+            name = hexDec(p[11]).orEmpty(),
+            title = hexDec(p[5])?.takeIf { it.isNotEmpty() },
+            preview = preview,
+            latestContent = "",
+            latestSenderHex = "",
+            latestAtSecs = p[8].toLongOrNull() ?: 0L,
+            latestMine = false,
+            latestGroupId = id,
+            messageCount = 0L,
+            unreadCount = p[9].toLongOrNull() ?: 0L,
+            version = p[10].toLongOrNull() ?: 0L,
+        )
+    }.toList()
+
 /** Latest local message timestamp per chat from the metadata-only snapshot. */
 internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
     buildMap {
@@ -735,6 +809,67 @@ data class SonarConversationSummary(
     val unreadCount: Long,
 )
 
+/** What core hands the transcript when a conversation opens
+ *  (`open_conversation`): captured, then the set is marked read, in one step. */
+data class SonarConversationOpen(
+    val groupIds: List<String>,
+    /** Unread at the moment of opening, before it was marked read. */
+    val unreadCount: Long,
+    /** The oldest unread message; the divider goes above it. */
+    val unreadAnchorId: String?,
+    /** Newest message second across the set. */
+    val newestAtSecs: Long,
+)
+
+/** Kind of a core-computed Messages-list row (`conversation_list`). */
+enum class SonarConversationListKind { Direct, Group, NoteToSelf }
+
+/** A row's newest message as core classified it; the app only words it. */
+sealed interface SonarConversationPreview {
+    data object Empty : SonarConversationPreview
+    data class Text(val text: String) : SonarConversationPreview
+    data class Photos(val count: Int) : SonarConversationPreview
+    data class Videos(val count: Int) : SonarConversationPreview
+    data object VoiceNote : SonarConversationPreview
+    data class File(val name: String) : SonarConversationPreview
+    data object Sticker : SonarConversationPreview
+    data object VoiceCall : SonarConversationPreview
+    data object Nudge : SonarConversationPreview
+    data object Payment : SonarConversationPreview
+    data object JsonPayload : SonarConversationPreview
+}
+
+/**
+ * One Messages-list row computed by core (`SonarNode.conversationList`): every
+ * Marmot group of one conversation folded together (R-003), unread summed over
+ * [groupIds] (R-052), Note to Self first. iOS renders the same rows, so the
+ * fold and the badge are decided once. The app overlays what core does not
+ * own: kind-0 titles, mute, verification, pending rows, the Bluetooth fold.
+ */
+data class SonarConversationListRow(
+    /** The group the row opens: newest in the set, lowest id on a tie. */
+    val conversationId: String,
+    val kind: SonarConversationListKind,
+    /** Every folded group, [conversationId] first. Opening marks all read. */
+    val groupIds: List<String>,
+    val counterpartHex: String?,
+    val name: String,
+    /** Core-resolved title; null = the app's localized fallback. */
+    val title: String? = null,
+    /** The newest message, ready to word. */
+    val preview: SonarConversationPreview = SonarConversationPreview.Empty,
+    val latestContent: String,
+    val latestSenderHex: String,
+    val latestAtSecs: Long,
+    val latestMine: Boolean,
+    val latestGroupId: String,
+    val messageCount: Long,
+    /** Sum over [groupIds]; 0 for Note to Self. */
+    val unreadCount: Long,
+    /** Equal versions mean an unchanged row. */
+    val version: Long,
+)
+
 /** A public message in a geohash channel. */
 data class SonarChannelMsg(
     val id: String,
@@ -924,8 +1059,9 @@ expect object SonarCore {
     /** Request to join a group via an invite link token. */
     suspend fun requestJoinViaLink(token: String)
 
-    /** Send an encrypted text message to a chat. */
-    suspend fun send(chatId: String, text: String)
+    /** Send an encrypted text message to a chat. Returns the id of the row
+     *  core stored, which keys the "Sending" echo (R-001, R-002). */
+    suspend fun send(chatId: String, text: String): String
 
     /** Like [send], attaching a NIP-C7 reply pointer. */
     suspend fun sendReply(
@@ -934,7 +1070,7 @@ expect object SonarCore {
         replyToHex: String,
         replyToNpub: String,
         preview: String?,
-    )
+    ): String
 
     /** Encrypt + publish a NIP-25 kind-7 reaction on a Marmot message. */
     suspend fun sendReaction(
@@ -1002,13 +1138,13 @@ expect object SonarCore {
     /** Cooperative cancel for quiet resume / in-flight Blossom work. */
     suspend fun cancelAllMediaUploads()
 
-    /** Send a sticker message to a chat. */
+    /** Send a sticker message to a chat; returns the stored row's id. */
     suspend fun sendSticker(
         chatId: String,
         packCoordinate: String,
         shortcode: String,
         plaintextSha256: String,
-    )
+    ): String
 
     /** Fetch a sticker pack from relays by author + identifier. */
     suspend fun fetchStickerPack(
@@ -1055,6 +1191,16 @@ expect object SonarCore {
     /** Precomputed conversation summaries from the core-owned index, ordered
      *  by latest message timestamp (newest first). */
     suspend fun conversationSummaries(): List<SonarConversationSummary>
+
+    /** Every core-computed Messages-list row, in list order (local only). */
+    suspend fun conversationList(): List<SonarConversationListRow>
+
+    /** Seed core's name cache (titles the Messages list): pubkey hex → name. */
+    suspend fun rememberPeerNames(names: Map<String, String>)
+
+    /** Open the conversation containing [groupIdHex]: unread count + anchor,
+     *  then the whole folded set marked read, in one core step. */
+    suspend fun openConversation(groupIdHex: String): SonarConversationOpen
 
     /** Update and privately fan out this device's current OS timezone. */
     suspend fun updateLocalTimezone(ianaIdentifier: String)

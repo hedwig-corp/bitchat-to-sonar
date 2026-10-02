@@ -940,6 +940,10 @@ const MEMBERSHIP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(8);
 /// would silently miss a just-received welcome. Mirrors White Noise's
 /// `GIFTWRAP_LOOKBACK_BUFFER`.
 const GIFTWRAP_LOOKBACK_SECS: u64 = 7 * 24 * 60 * 60;
+/// Rows per folded group `open_conversation` reads to place the unread anchor
+/// (the hosts' retained transcript window). More unread than that anchors at
+/// the oldest row read.
+pub const OPEN_ANCHOR_SCAN_ROWS: usize = 500;
 
 /// Safety overlap subtracted from the watermark on every incremental fetch, to
 /// cover clock skew and events that landed on a relay mid-sync. Already-seen
@@ -2135,6 +2139,12 @@ pub struct SonarClient {
     timezone_rumor_clock: Arc<Mutex<u64>>,
     /// Host-registered callback fired when a conversation summary changes.
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
+    /// Each active group's list shape (kind + counterpart) by group id hex,
+    /// with the MLS epoch it was read at. Membership only changes with a
+    /// commit and every commit moves the epoch, so an entry is valid exactly
+    /// while its epoch matches. Keeps [`Self::conversation_list`] from reading
+    /// every group's member list on every call.
+    conversation_shapes: Arc<Mutex<HashMap<String, (u64, crate::conversation_list::GroupShape)>>>,
     /// In-memory store for invite link secrets and pending join requests.
     invite_links: Arc<crate::invite_link::InviteLinkStore>,
     /// Cached push tokens for group members (pubkey hex → encrypted token).
@@ -2170,6 +2180,15 @@ pub struct SonarClient {
     sticker_ref_prefetch_inflight: StickerRefPrefetchInflight,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
+    /// Which members already hold our current push token (see
+    /// `share_push_token_with_groups`), and where that record lives on disk.
+    push_share_ledger: Arc<Mutex<crate::push::PushShareLedger>>,
+    push_share_ledger_path: Option<PathBuf>,
+    /// Single-flight guard: sync, wake and registration all trigger a share
+    /// pass; concurrent triggers must not each send one.
+    push_share_inflight: Arc<AtomicBool>,
+    /// Token shares sent by this process (diagnostics and tests).
+    push_token_shares_sent: Arc<AtomicU64>,
     /// Incoming-message notifications produced by the forced-sync gap-recovery
     /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
     /// `drain_pending_marmot()`; the recovered messages are stored by the sync
@@ -2403,6 +2422,16 @@ impl SonarClient {
         let preferred_catchup_group = Arc::new(Mutex::new(None));
         let last_ensure_subscriptions_at = Arc::new(Mutex::new(None));
         let push_token_cache = crate::push::load_push_token_cache(push_token_cache_path.as_deref());
+        // The ledger sits next to the token cache (same db, same lifetime).
+        let push_share_ledger_path = push_token_cache_path.as_deref().map(|cache| {
+            let name = cache
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(crate::push::PUSH_TOKEN_CACHE_FILE_SUFFIX))
+                .unwrap_or("sonar")
+                .to_string();
+            crate::push::push_share_ledger_path_for_db(&cache.with_file_name(name))
+        });
 
         let handler_geo = geo.clone();
         let handler_dm = geo_dm.clone();
@@ -2715,6 +2744,7 @@ impl SonarClient {
             timezone_share_group_ids: Arc::new(Mutex::new(HashSet::new())),
             timezone_rumor_clock: Arc::new(Mutex::new(0)),
             change_listener: Arc::new(Mutex::new(None)),
+            conversation_shapes: Arc::new(Mutex::new(HashMap::new())),
             invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
                 invite_link_state_path,
             )),
@@ -2732,6 +2762,12 @@ impl SonarClient {
             )),
             sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
+            push_share_ledger: Arc::new(Mutex::new(crate::push::load_push_share_ledger(
+                push_share_ledger_path.as_deref(),
+            ))),
+            push_share_ledger_path,
+            push_share_inflight: Arc::new(AtomicBool::new(false)),
+            push_token_shares_sent: Arc::new(AtomicU64::new(0)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
@@ -2789,11 +2825,25 @@ impl SonarClient {
     /// logged, not returned. Event creation (MLS key material persistence) still
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = match self.engine.key_package_event(self.relays.clone()) {
+            Ok(event) => event,
+            Err(err) => {
+                // Without a published KeyPackage nobody can start a chat with
+                // us: never fail this quietly.
+                tracing::warn!(%err, "KeyPackage creation failed; not published");
+                return Err(err);
+            }
+        };
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
-            if let Err(err) = nostr.send_event(&event).await {
-                tracing::warn!(%err, "background KeyPackage publish failed");
+            match nostr.send_event(&event).await {
+                Ok(output) => tracing::info!(
+                    accepted = output.success.len(),
+                    rejected = output.failed.len(),
+                    rejections = ?output.failed.values().collect::<Vec<_>>(),
+                    "KeyPackage published"
+                ),
+                Err(err) => tracing::warn!(%err, "background KeyPackage publish failed"),
             }
         });
         Ok(())
@@ -3179,13 +3229,63 @@ impl SonarClient {
     /// instead of a raw npub.
     pub async fn fetch_profile(&self, author: PublicKey) -> Result<Option<Profile>> {
         let metadata = self.nostr.fetch_metadata(author, FETCH_TIMEOUT).await?;
-        Ok(metadata.map(|m| Profile {
+        let profile = metadata.map(|m| Profile {
             name: m.name,
             display_name: m.display_name,
             about: m.about,
             picture: m.picture,
             nip05: m.nip05,
-        }))
+        });
+        if let Some(name) = profile.as_ref().and_then(|p| p.best_name()) {
+            self.remember_peer_names(&[(author.to_hex(), name.to_string())]);
+        }
+        Ok(profile)
+    }
+
+    /// Record display names (pubkey hex, name) for titling the Messages list,
+    /// and notify the conversations whose title changed, so hosts repaint just
+    /// those rows. Hosts seed it from their own profile caches once; after
+    /// that `fetch_profile` keeps it current. Bounded per call.
+    pub fn remember_peer_names(&self, names: &[(String, String)]) -> usize {
+        const MAX_NAMES_PER_CALL: usize = 500;
+        let Some(ref idx) = self.conversation_index else {
+            return 0;
+        };
+        let now = Timestamp::now().as_secs();
+        let mut changed_peers = HashSet::new();
+        {
+            let idx = idx.lock().unwrap();
+            for (pubkey_hex, name) in names.iter().take(MAX_NAMES_PER_CALL) {
+                match idx.set_peer_name(&pubkey_hex.to_lowercase(), name, now) {
+                    Ok(true) => {
+                        changed_peers.insert(pubkey_hex.to_lowercase());
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(%e, "peer name write failed"),
+                }
+            }
+        }
+        if changed_peers.is_empty() {
+            return 0;
+        }
+        // Only the 1:1s with those people show the new title.
+        let groups: Vec<String> = self
+            .conversation_shapes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|(_, shape)| {
+                shape
+                    .counterpart_hex
+                    .as_ref()
+                    .is_some_and(|peer| changed_peers.contains(peer))
+            })
+            .map(|(_, shape)| shape.group_id_hex.clone())
+            .collect();
+        if !groups.is_empty() {
+            self.notify_conversations_changed(&groups.iter().cloned().collect());
+        }
+        changed_peers.len()
     }
 
     /// The claimed human-readable handle (`name@domain`), if any. Local read —
@@ -3961,7 +4061,11 @@ impl SonarClient {
     /// first, Sonar marks the row pending in the outbox, and relay publish runs
     /// in the background. Publish success/failure only updates local delivery
     /// state; it does not gate transcript visibility.
-    pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
+    /// Send `text`; returns the stored message's id. It is written locally
+    /// before this returns, so hosts key their "Sending" bubble by this id and
+    /// match the transcript row exactly, instead of guessing by content and
+    /// time (R-001, R-002).
+    pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<EventId> {
         self.send_text_with_reply(group_id, text, None).await
     }
 
@@ -3970,7 +4074,7 @@ impl SonarClient {
         group_id: &GroupId,
         text: &str,
         reply: Option<&crate::reply::ReplyTo>,
-    ) -> Result<()> {
+    ) -> Result<EventId> {
         let local_started = Instant::now();
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
@@ -3999,6 +4103,7 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        let message_id = message.id;
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(Some((group_name, message)), event_id);
@@ -4008,7 +4113,7 @@ impl SonarClient {
         // which a membership change holds across relay publication.
         self.prioritize_timezone_share(&group_id_hex);
         self.spawn_push_notification(group_id.clone(), publish_ack);
-        Ok(())
+        Ok(message_id)
     }
 
     /// Encrypt a NIP-25 kind-7 reaction, persist it locally, then publish.
@@ -4072,14 +4177,17 @@ impl SonarClient {
         let sync_watermark_frozen = self.sync_watermark_frozen.clone();
         let marmot_db_path = self.marmot_db_path.clone();
         let event_id_hex = event_id.to_hex();
+        let change_listener = self.change_listener.clone();
         std::thread::spawn(move || {
             if let (Some(ref idx), Some((group_name, message))) = (&conversation_index, index_row) {
+                let group_id_hex_for_notify = hex::encode(message.group_id.as_slice());
                 let group_id_hex = hex::encode(message.group_id.as_slice());
                 let name = group_name.as_deref().unwrap_or("");
-                if let Err(e) = idx.lock().unwrap().upsert_summary(
+                if let Err(e) = idx.lock().unwrap().upsert_summary_with_kind(
                     &group_id_hex,
                     name,
                     &index_preview(&message),
+                    &preview_kind_for(&message),
                     &message.sender.to_string(),
                     message.created_at.as_secs(),
                     message.mine,
@@ -4088,6 +4196,15 @@ impl SonarClient {
                     message.classification.is_transcript_visible(),
                 ) {
                     tracing::warn!(%e, "deferred index upsert failed");
+                } else {
+                    // The send path notified before this deferred write, so a
+                    // host reloading on that notification could read the old
+                    // row and keep the previous preview. Notify again once the
+                    // row the Messages list renders actually holds the send.
+                    let listener = change_listener.lock().unwrap().clone();
+                    if let Some(listener) = listener {
+                        listener.on_conversation_changed(group_id_hex_for_notify);
+                    }
                 }
             }
             if let Some(ref db_path) = marmot_db_path {
@@ -4216,7 +4333,8 @@ impl SonarClient {
 
     /// Send a sticker message to a group. Follows the same Signal-style
     /// local-first sequencing as `send_text`.
-    pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<()> {
+    /// Send a sticker; returns the stored message's id (see [`Self::send_text`]).
+    pub async fn send_sticker(&self, group_id: &GroupId, sticker_ref: &StickerRef) -> Result<EventId> {
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
@@ -4234,9 +4352,10 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        let message_id = message.id;
         self.spawn_send_bookkeeping(Some((group_name, message)), event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);
-        Ok(())
+        Ok(message_id)
     }
 
     /// Fetch a sticker pack by its pack address coordinate.
@@ -7784,6 +7903,156 @@ impl SonarClient {
         idx.lock().unwrap().summary(group_id_hex).ok().flatten()
     }
 
+    /// The Marmot half of the Messages list: one row per conversation, with
+    /// duplicate direct groups folded, unread summed over the folded set, and
+    /// Note to Self first. Newest first; `after` continues from the last row
+    /// of the previous page, and `limit == 0` returns every row.
+    ///
+    /// Local only: the MLS group table and the summary index. A group's
+    /// member list is read once per epoch (see `conversation_shapes`), so a
+    /// warm call is O(groups) in memory with no MLS member reads.
+    pub fn conversation_list(
+        &self,
+        limit: usize,
+        after: Option<&crate::conversation_list::ConversationListCursor>,
+    ) -> Result<Vec<crate::conversation_list::ConversationListRow>> {
+        let rows = self.conversation_list_rows()?;
+        Ok(crate::conversation_list::page(rows, limit, after))
+    }
+
+    /// Open the conversation containing `group_id_hex`: everything the
+    /// transcript needs at that moment, computed once in core for both apps,
+    /// then the whole folded set is marked read.
+    ///
+    /// The unread anchor is the oldest unread message (the "Unread messages"
+    /// divider goes above it): walking newest first over every folded group in
+    /// one `(created_at, id)` order, it is the `unread_count`-th visible
+    /// message from someone else. Hidden control lines never count (R-017),
+    /// so the walk and the counter agree. Capture and mark-read are one step,
+    /// so no host can read a count that its own mark already zeroed.
+    ///
+    /// Local only and bounded: at most [`OPEN_ANCHOR_SCAN_ROWS`] rows per group.
+    pub fn open_conversation(&self, group_id_hex: &str) -> Result<crate::conversation_list::ConversationOpen> {
+        let rows = self.conversation_list_rows()?;
+        let row = rows
+            .iter()
+            .find(|row| row.group_ids.iter().any(|g| g == group_id_hex));
+        let group_ids: Vec<String> = row
+            .map(|r| r.group_ids.clone())
+            .unwrap_or_else(|| vec![group_id_hex.to_string()]);
+        let note_to_self = row.is_some_and(|r| {
+            r.kind == crate::conversation_list::ConversationListKind::NoteToSelf
+        });
+        let mut unread_count = 0u64;
+        let mut newest_at_secs = 0u64;
+        for gid in &group_ids {
+            if let Some(summary) = self.conversation_summary(gid) {
+                unread_count += summary.unread_count;
+                newest_at_secs = newest_at_secs.max(summary.latest_at_secs);
+            }
+        }
+        if note_to_self {
+            unread_count = 0;
+        }
+        let groups: Vec<GroupId> = group_ids
+            .iter()
+            .filter_map(|gid| hex::decode(gid).ok())
+            .map(|bytes| GroupId::from_slice(&bytes))
+            .collect();
+        let unread_anchor_id = self.conversation_unread_anchor(&groups, unread_count)?;
+        for gid in &group_ids {
+            self.mark_conversation_read(gid);
+        }
+        Ok(crate::conversation_list::ConversationOpen {
+            group_ids,
+            unread_count,
+            unread_anchor_id,
+            newest_at_secs,
+        })
+    }
+
+    /// Where the "N unread" divider goes for `unread_count` across `group_ids`:
+    /// the oldest unread visible incoming row (R-017), read from at most
+    /// [`OPEN_ANCHOR_SCAN_ROWS`] rows per group. Marks nothing read.
+    ///
+    /// iOS captures the count itself when the chat is pushed and marks read at
+    /// once, as before; it asks core only for the anchor. Marking through
+    /// [`Self::open_conversation`] made the mark (and the reload it triggers)
+    /// land after the transcript had placed the divider, and the chat opened at
+    /// the tail (QA-157).
+    pub fn conversation_unread_anchor(
+        &self,
+        group_ids: &[GroupId],
+        unread_count: u64,
+    ) -> Result<Option<nostr::EventId>> {
+        if unread_count == 0 || group_ids.is_empty() {
+            return Ok(None);
+        }
+        let limit = OPEN_ANCHOR_SCAN_ROWS.min((unread_count as usize).saturating_mul(4) + 32);
+        let mut merged: Vec<ChatMessage> = Vec::new();
+        for group in group_ids {
+            merged.extend(self.engine.messages_cursor_page(group, None, None, limit)?);
+        }
+        Ok(crate::conversation_list::unread_anchor(&mut merged, unread_count))
+    }
+
+    fn conversation_list_rows(&self) -> Result<Vec<crate::conversation_list::ConversationListRow>> {
+        use crate::conversation_list::GroupShape;
+        let groups = self.engine.groups()?;
+        let me_hex = self.identity().public_key().to_hex();
+        let note_to_self = self.find_note_to_self_group()?.map(|g| hex::encode(g.as_slice()));
+        let mut shapes = Vec::with_capacity(groups.len());
+        {
+            let mut cache = self.conversation_shapes.lock().unwrap();
+            let mut live = HashSet::with_capacity(groups.len());
+            for group in &groups {
+                let gid = hex::encode(group.mls_group_id.as_slice());
+                let is_nts = note_to_self.as_deref() == Some(gid.as_str());
+                let cached = cache
+                    .get(&gid)
+                    .filter(|(epoch, shape)| {
+                        *epoch == group.epoch
+                            && shape.name == group.name
+                            && (shape.kind == crate::conversation_list::ConversationListKind::NoteToSelf)
+                                == is_nts
+                    })
+                    .map(|(_, shape)| shape.clone());
+                let shape = match cached {
+                    Some(shape) => shape,
+                    None => {
+                        let members: Vec<String> = self
+                            .engine
+                            .members(&group.mls_group_id)?
+                            .iter()
+                            .map(|pk| pk.to_hex())
+                            .collect();
+                        let shape = GroupShape::classify(&gid, &group.name, &members, &me_hex, is_nts);
+                        cache.insert(gid.clone(), (group.epoch, shape.clone()));
+                        shape
+                    }
+                };
+                live.insert(gid);
+                shapes.push(shape);
+            }
+            cache.retain(|gid, _| live.contains(gid));
+        }
+        let summaries: HashMap<String, ConversationSummary> = self
+            .conversation_summaries()
+            .into_iter()
+            .map(|s| (s.group_id_hex.clone(), s))
+            .collect();
+        let counterparts: Vec<&str> = shapes
+            .iter()
+            .filter_map(|s| s.counterpart_hex.as_deref())
+            .collect();
+        let names = self
+            .conversation_index
+            .as_ref()
+            .and_then(|idx| idx.lock().unwrap().peer_names(&counterparts).ok())
+            .unwrap_or_default();
+        Ok(crate::conversation_list::build_rows_with_names(&shapes, &summaries, &names))
+    }
+
     pub fn mark_conversation_read(&self, group_id_hex: &str) {
         // Both hosts call this on chat open: the chat on screen shares first.
         self.prioritize_timezone_share(group_id_hex);
@@ -8324,10 +8593,11 @@ impl SonarClient {
         if let Some(ref idx) = self.conversation_index {
             let group_id_hex = hex::encode(message.group_id.as_slice());
             let name = group_name.unwrap_or("");
-            if let Err(e) = idx.lock().unwrap().upsert_summary(
+            if let Err(e) = idx.lock().unwrap().upsert_summary_with_kind(
                 &group_id_hex,
                 name,
                 &index_preview(message),
+                &preview_kind_for(message),
                 &message.sender.to_string(),
                 message.created_at.as_secs(),
                 message.mine,
@@ -8829,6 +9099,7 @@ impl SonarClient {
         let own_reg = push::OwnPushRegistration {
             encrypted_token_b64: content.clone(),
             server_pubkey,
+            fingerprint: push::push_token_fingerprint(plat, token, &server_pubkey),
         };
         *self.own_push_registration.lock().unwrap() = Some(own_reg);
 
@@ -8842,16 +9113,24 @@ impl SonarClient {
     /// via a NIP-44 encrypted DM (kind 447). Group members cache this to send
     /// sender-side notifications to us.
     async fn share_push_token_with_groups(&self) {
+        // One pass at a time: sync, the live short-circuit, wakes and token
+        // registration all end here, often together.
+        if self.push_share_inflight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        struct Release<'a>(&'a AtomicBool);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _release = Release(&self.push_share_inflight);
+
         // Relay guard: skip when zero relays report `RelayStatus::Connected`
         // (empty write-relay set → `NoRelaysSpecified`, or configured relays
-        // not yet attached). The per-recipient gift-wrapped DM below goes
-        // through `self.nostr.send_event`; walking groups × members before a
-        // relay can accept floods the log (~275/session on a real 43-group
-        // account). This runs at the end of every sync/wake (`sync_inner`, the
-        // live short-circuit, and the token-update path), often before relays
-        // attach — deferring is free and never blocks chat open/send/scroll/
-        // paint. Take the relay map from the `.await` before touching any std
-        // Mutex so no guard is held across it.
+        // not yet attached). Deferring is free and never blocks chat
+        // open/send/scroll/paint. Take the relay map from the `.await` before
+        // touching any std Mutex so no guard is held across it.
         let connected_relays = self
             .nostr
             .relays()
@@ -8870,15 +9149,28 @@ impl SonarClient {
         let own_reg = self.own_push_registration.lock().unwrap().clone();
         let Some(reg) = own_reg else { return };
 
-        let groups = match self.engine.groups() {
-            Ok(g) => g,
+        let members = match self.push_share_members_by_recency() {
+            Ok(m) => m,
             Err(e) => {
-                tracing::warn!(%e, "push token share: failed to list groups");
+                tracing::warn!(%e, "push token share: failed to list group members");
                 return;
             }
         };
+        // Once per member per token, most recent chats first, a bounded batch
+        // per pass. Before this, every sync re-sent one gift-wrapped event to
+        // every member of every group (six passes in three minutes on a
+        // one-chat account; one event per member per pass on 278 groups).
+        let now = Timestamp::now().as_secs();
+        let (due, total_due) = self.push_share_ledger.lock().unwrap().due(
+            &reg.fingerprint,
+            &members,
+            now,
+            crate::push::PUSH_TOKEN_SHARE_BATCH,
+        );
+        if due.is_empty() {
+            return;
+        }
 
-        let my_pubkey = self.engine.identity().public_key();
         let payload = crate::push::PushTokenSharePayload {
             encrypted_token: reg.encrypted_token_b64.clone(),
             server_pubkey: reg.server_pubkey.to_hex(),
@@ -8891,25 +9183,67 @@ impl SonarClient {
             }
         };
 
-        for group in &groups {
-            let members = match self.engine.members(&group.mls_group_id) {
-                Ok(m) => m,
-                Err(_) => continue,
+        let mut shared = 0usize;
+        for member_hex in &due {
+            let Ok(member) = PublicKey::from_hex(member_hex) else {
+                continue;
             };
-            for member in &members {
-                if member == &my_pubkey {
-                    continue;
+            match self.send_push_token_dm(&member, &payload_json).await {
+                Ok(()) => {
+                    self.push_share_ledger
+                        .lock()
+                        .unwrap()
+                        .record(&reg.fingerprint, member_hex, now);
+                    shared += 1;
                 }
-                if let Err(e) = self.send_push_token_dm(member, &payload_json).await {
-                    tracing::debug!(
-                        recipient = %member,
-                        %e,
-                        "push token share DM failed"
-                    );
+                Err(e) => {
+                    tracing::debug!(recipient = %member, %e, "push token share DM failed");
                 }
             }
         }
-        tracing::info!("push token shared with group members");
+        self.push_token_shares_sent
+            .fetch_add(shared as u64, Ordering::Relaxed);
+        if shared > 0 {
+            let ledger = self.push_share_ledger.lock().unwrap().clone();
+            if let Err(e) =
+                crate::push::save_push_share_ledger(self.push_share_ledger_path.as_deref(), &ledger)
+            {
+                tracing::warn!(%e, "push token share: ledger save failed");
+            }
+        }
+        tracing::info!(
+            shared,
+            remaining = total_due.saturating_sub(shared),
+            "push token shared with group members"
+        );
+    }
+
+    /// Every other member of our active groups, pubkey hex, most recently
+    /// active conversation first (summary index order), each listed once.
+    fn push_share_members_by_recency(&self) -> Result<Vec<String>> {
+        let mut groups = self.engine.groups()?;
+        let latest: HashMap<String, u64> = self
+            .conversation_summaries()
+            .into_iter()
+            .map(|s| (s.group_id_hex, s.latest_at_secs))
+            .collect();
+        groups.sort_by_key(|g| {
+            std::cmp::Reverse(latest.get(&hex::encode(g.mls_group_id.as_slice())).copied().unwrap_or(0))
+        });
+        let me = self.engine.identity().public_key();
+        let mut seen = HashSet::new();
+        let mut members = Vec::new();
+        for group in &groups {
+            let Ok(group_members) = self.engine.members(&group.mls_group_id) else {
+                continue;
+            };
+            for member in group_members {
+                if member != me && seen.insert(member) {
+                    members.push(member.to_hex());
+                }
+            }
+        }
+        Ok(members)
     }
 
     /// NIP-44 encrypted DM carrying our push token info (kind 447).
@@ -8965,6 +9299,16 @@ impl SonarClient {
             // member (e.g. a rotated token) so a full cache never pins a stale
             // token. Defense-in-depth on top of the membership gate.
             let already_cached = cache.contains_key(&sender_hex);
+            // A member whose token changed (reinstall, rotation) has most
+            // likely lost ours too: share ours once more on the next pass.
+            // An identical re-send changes nothing, so two peers cannot keep
+            // re-sharing to each other.
+            let changed = cache
+                .get(&sender_hex)
+                .is_none_or(|old| old.encrypted_token_b64 != cached.encrypted_token_b64);
+            if changed {
+                self.push_share_ledger.lock().unwrap().forget(&sender_hex);
+            }
             if !crate::push::should_cache_push_token(token_len, cache.len(), already_cached) {
                 tracing::debug!("dropping push token share (oversized token or cache full)");
                 return Ok(());
@@ -9052,6 +9396,39 @@ fn blossom_upload_timeout(len: usize) -> Duration {
 /// Preview label for machine-sent JSON payloads (agents/bots, interop control).
 /// Shared with conversation_index::sanitize_preview_label — keep in sync.
 pub(crate) const JSON_PAYLOAD_PREVIEW_LABEL: &str = "JSON payload";
+
+/// What [`index_preview`] stored, as a machine-readable kind for the Messages
+/// list (`conversation_list::preview_for` decodes it): `text`, `json`,
+/// `sticker`, `photo:N`, `video:N`, `voice`, `file`. Call, payment and nudge
+/// lines are `text`; the list classifies their content with the same decoder
+/// notifications use.
+pub(crate) fn preview_kind_for(message: &ChatMessage) -> String {
+    if !message.content.is_empty() {
+        return if looks_like_json_payload(&message.content) { "json" } else { "text" }.to_owned();
+    }
+    if message.sticker_ref.is_some() {
+        return "sticker".to_owned();
+    }
+    let media = &message.media;
+    let Some(first) = media.first() else {
+        return String::new();
+    };
+    if media.iter().all(|m| m.mime_type.starts_with("image/")) {
+        return format!("photo:{}", media.len());
+    }
+    if media.iter().all(|m| m.mime_type.starts_with("video/")) {
+        return format!("video:{}", media.len());
+    }
+    if first.mime_type.starts_with("audio/") {
+        "voice".to_owned()
+    } else if first.mime_type.starts_with("image/") {
+        "photo:1".to_owned()
+    } else if first.mime_type.starts_with("video/") {
+        "video:1".to_owned()
+    } else {
+        "file".to_owned()
+    }
+}
 
 pub(crate) fn index_preview(message: &ChatMessage) -> String {
     if !message.content.is_empty() {
@@ -9798,6 +10175,37 @@ mod tests {
     }
 
     #[test]
+    fn unread_anchor_skips_own_sends_and_hidden_control_lines() {
+        use crate::marmot::MessageClassification as C;
+        let row = |seed: u8, secs: u64, mine: bool, class: C| ChatMessage {
+            id: test_event_id(seed),
+            group_id: GroupId::from_slice(&[1u8; 32]),
+            sender: Keys::generate().public_key(),
+            content: String::new(),
+            created_at: Timestamp::from_secs(secs),
+            mine,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: class,
+            reply: None,
+            reactions: vec![],
+        };
+        // Oldest → newest: read, unread A, own, call signal, unread B.
+        let mut rows = vec![
+            row(5, 50, false, C::CallControl),
+            row(1, 10, false, C::Text),
+            row(4, 40, false, C::Text),
+            row(2, 20, false, C::Text),
+            row(3, 30, true, C::Text),
+        ];
+        // Two unread (R-017 counts only A and B): the anchor is A, not the call.
+        assert_eq!(crate::conversation_list::unread_anchor(&mut rows, 2), Some(test_event_id(2)));
+        // More unread than rows read: the oldest visible incoming row.
+        assert_eq!(crate::conversation_list::unread_anchor(&mut rows, 9), Some(test_event_id(1)));
+    }
+
+    #[test]
     fn index_preview_labels_json_payloads_without_leaking_raw_json() {
         let msg = |content: &str| ChatMessage {
             id: test_event_id(9),
@@ -9943,6 +10351,45 @@ mod tests {
         );
     }
 
+    /// Every sync and wake ends with a share pass. Three passes over two 1:1
+    /// chats must send two shares (one per member), not six; a new token
+    /// reaches both members once more. Real call site, real relay.
+    #[tokio::test]
+    async fn push_token_is_shared_once_per_member_not_on_every_sync() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let client = SonarClient::connect_in_memory(Identity::generate(), vec![relay.url().await])
+            .await
+            .expect("client connects");
+        for _ in 0..2 {
+            let peer = MarmotEngine::in_memory(Identity::generate());
+            let creation = client
+                .engine
+                .create_group("", vec![peer.key_package_event(relays.clone()).unwrap()], relays.clone())
+                .unwrap();
+            client.engine.merge_pending_commit(&creation.group.mls_group_id).unwrap();
+        }
+        let server_pubkey = Keys::generate().public_key();
+        let register = |token: &[u8]| crate::push::OwnPushRegistration {
+            encrypted_token_b64: "dGVzdA==".to_owned(),
+            server_pubkey,
+            fingerprint: crate::push::push_token_fingerprint(1, token, &server_pubkey),
+        };
+        *client.own_push_registration.lock().unwrap() = Some(register(b"token-1"));
+
+        for _ in 0..3 {
+            client.share_push_token_with_groups().await;
+        }
+        assert_eq!(client.push_token_shares_sent.load(Ordering::Relaxed), 2);
+
+        *client.own_push_registration.lock().unwrap() = Some(register(b"token-2"));
+        client.share_push_token_with_groups().await;
+        client.share_push_token_with_groups().await;
+        assert_eq!(client.push_token_shares_sent.load(Ordering::Relaxed), 4);
+    }
+
     #[tokio::test]
     async fn share_push_token_with_groups_noops_when_no_relay_connected() {
         // Behavioral coverage for the Connected-status guard on
@@ -9957,6 +10404,7 @@ mod tests {
         *client.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
             encrypted_token_b64: "dGVzdA==".to_owned(),
             server_pubkey,
+            fingerprint: "test".to_owned(),
         });
 
         let connected = client
@@ -12989,6 +13437,237 @@ mod tests {
         // Turning it back on in the same zone shares again: the peer forgot it.
         alice.set_timezone_share_groups(vec![shared_hex]).await;
         assert_eq!(alice.outbox_state.lock().unwrap().recorded_count(), 3);
+    }
+
+    /// Join `bob` to a fresh 1:1 group that `peer` creates, through the real
+    /// welcome path. Returns the group id.
+    async fn join_group_from(peer: &MarmotEngine, bob: &SonarClient, name: &str) -> GroupId {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let creation = peer.create_group(name, vec![bob_kp], relays).unwrap();
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob_pubkey, welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(member, _)| *member == bob.identity().public_key())
+            .unwrap();
+        let welcome = peer.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+        bob.process_marmot_events([welcome], "conversation list welcome")
+            .await;
+        group_id
+    }
+
+    async fn receive_text(peer: &MarmotEngine, bob: &SonarClient, group: &GroupId, text: &str) {
+        let (event, _) = peer.create_and_process_text_message(group, text).unwrap();
+        bob.process_marmot_events([event], "conversation list message")
+            .await;
+    }
+
+    /// The Messages list both apps render comes from core: Sara's two 1:1
+    /// groups are one row (R-003) whose unread is the sum over both, and one
+    /// marking that set clears exactly that row (R-052). Real welcome + receive path, so
+    /// the index rows, unread counting and member reads are the production ones.
+    #[tokio::test]
+    async fn conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row() {
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let luca = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+
+        let sara_old = join_group_from(&sara, &bob, "").await;
+        let luca_dm = join_group_from(&luca, &bob, "").await;
+        let sara_new = join_group_from(&sara, &bob, "").await;
+        receive_text(&sara, &bob, &sara_old, "old leg 1").await;
+        receive_text(&sara, &bob, &sara_old, "old leg 2").await;
+        receive_text(&luca, &bob, &luca_dm, "hi from luca").await;
+        // Timestamps are whole seconds: make Sara's new leg strictly newest.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        receive_text(&sara, &bob, &sara_new, "new leg").await;
+
+        let hex_of = |g: &GroupId| hex::encode(g.as_slice());
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows.len(), 2, "Sara's two groups are one row: {rows:#?}");
+        let sara_row = &rows[0];
+        assert_eq!(sara_row.kind, crate::conversation_list::ConversationListKind::Direct);
+        assert_eq!(sara_row.conversation_id, hex_of(&sara_new));
+        assert_eq!(sara_row.group_ids, vec![hex_of(&sara_new), hex_of(&sara_old)]);
+        assert_eq!(
+            sara_row.counterpart_hex.as_deref(),
+            Some(sara.identity().public_key().to_hex().as_str())
+        );
+        assert_eq!(sara_row.unread_count, 3);
+        assert_eq!(sara_row.latest_content, "new leg");
+        assert_eq!(rows[1].conversation_id, hex_of(&luca_dm));
+        assert_eq!(rows[1].unread_count, 1);
+
+        // Paging continues after the cursor without repeating a row.
+        let first = bob.conversation_list(1, None).unwrap();
+        let rest = bob.conversation_list(1, Some(&first[0].cursor())).unwrap();
+        assert_eq!(first[0].conversation_id, hex_of(&sara_new));
+        assert_eq!(rest[0].conversation_id, hex_of(&luca_dm));
+
+        // Opening the row marks its whole set (what both apps do with
+        // `group_ids`): both of Sara's legs clear, and only them.
+        for gid in &sara_row.group_ids {
+            bob.mark_conversation_read(gid);
+        }
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows[0].unread_count, 0);
+        assert_eq!(rows[1].unread_count, 1, "Luca's badge is untouched");
+    }
+
+    /// The Messages list is titled and previewed in core: a 1:1 takes the
+    /// counterpart's remembered name, a changed name notifies only that chat,
+    /// and the preview is a semantic kind (here a photo) for hosts to word.
+    #[tokio::test]
+    async fn conversation_list_titles_and_previews_rows_in_core() {
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        bob.set_conversation_change_listener(Some(listener.clone()));
+        let group = join_group_from(&sara, &bob, "").await;
+        receive_text(&sara, &bob, &group, "hi bob").await;
+        let gid = hex::encode(group.as_slice());
+
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows[0].title, None, "no name known yet");
+        assert_eq!(
+            rows[0].preview,
+            crate::conversation_list::ConversationPreview::Text("hi bob".into())
+        );
+
+        listener.changed.lock().unwrap().clear();
+        let sara_hex = sara.identity().public_key().to_hex();
+        assert_eq!(bob.remember_peer_names(&[(sara_hex.clone(), "Sara".into())]), 1);
+        assert_eq!(listener.changed.lock().unwrap().as_slice(), [gid.as_str()]);
+        assert_eq!(bob.conversation_list(0, None).unwrap()[0].title.as_deref(), Some("Sara"));
+
+        // The same name again is not a change: no repaint.
+        listener.changed.lock().unwrap().clear();
+        assert_eq!(bob.remember_peer_names(&[(sara_hex, "Sara".into())]), 0);
+        assert!(listener.changed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rumor_seconds_never_repeat_and_follow_the_wall_clock() {
+        use crate::marmot::next_rumor_second;
+        assert_eq!(next_rumor_second(100, 0), 100, "wall clock when the second is free");
+        assert_eq!(next_rumor_second(100, 100), 101, "a used second is never reused");
+        assert_eq!(next_rumor_second(100, 103), 104, "a burst runs ahead by its length");
+        assert_eq!(next_rumor_second(200, 104), 200, "then snaps back to the wall clock");
+    }
+
+    /// A send returns the id of the row it stored, so both apps match their
+    /// "Sending" bubble to the transcript row by id, never by content and time
+    /// (R-001, R-002). Two identical texts in a row get two distinct ids.
+    #[tokio::test]
+    async fn send_returns_the_id_of_the_stored_transcript_row() {
+        let luca = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let group = join_group_from(&luca, &bob, "").await;
+        let first = bob.send_text(&group, "same words").await.unwrap();
+        let second = bob.send_text(&group, "same words").await.unwrap();
+        assert_ne!(first, second, "identical texts are distinct rows");
+        let rows = bob.messages(&group).unwrap();
+        let mine: Vec<_> = rows.iter().filter(|m| m.mine).map(|m| m.id).collect();
+        assert!(mine.contains(&first) && mine.contains(&second), "{mine:?}");
+        let row = rows.iter().find(|m| m.id == second).unwrap();
+        assert_eq!(row.content, "same words");
+        assert!(row.mine);
+    }
+
+    /// Opening a chat is one core step for both apps: the unread count and
+    /// the anchor (the oldest unread message, across every folded group, own
+    /// sends skipped) are captured, then the whole set is marked read.
+    #[tokio::test]
+    async fn open_conversation_anchors_at_the_oldest_unread_across_folded_groups() {
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+        let old_leg = join_group_from(&sara, &bob, "").await;
+        let new_leg = join_group_from(&sara, &bob, "").await;
+        let hex_of = |g: &GroupId| hex::encode(g.as_slice());
+        receive_text(&sara, &bob, &old_leg, "already read").await;
+        bob.open_conversation(&hex_of(&old_leg)).unwrap();
+
+        receive_text(&sara, &bob, &old_leg, "first new").await;
+        bob.send_text(&new_leg, "my own reply").await.unwrap();
+        receive_text(&sara, &bob, &new_leg, "second new").await;
+
+        let first_new = bob
+            .messages(&old_leg)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "first new")
+            .unwrap()
+            .id;
+        let open = bob.open_conversation(&hex_of(&new_leg)).unwrap();
+        assert_eq!(open.unread_count, 2);
+        assert_eq!(open.unread_anchor_id, Some(first_new), "the oldest unread, in the other leg");
+        assert_eq!(open.group_ids.len(), 2);
+        assert!(open.newest_at_secs > 0);
+
+        let again = bob.open_conversation(&hex_of(&old_leg)).unwrap();
+        assert_eq!(again.unread_count, 0, "opening marked the whole set read");
+        assert_eq!(again.unread_anchor_id, None);
+
+        // The read-only anchor (iOS) gives the same row for the count the app
+        // captured, and marks nothing.
+        receive_text(&sara, &bob, &old_leg, "third new").await;
+        let legs = [old_leg.clone(), new_leg.clone()];
+        let third = bob
+            .messages(&old_leg)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.content == "third new")
+            .unwrap()
+            .id;
+        assert_eq!(bob.conversation_unread_anchor(&legs, 1).unwrap(), Some(third));
+        assert_eq!(bob.conversation_unread_anchor(&legs, 3).unwrap(), Some(first_new));
+        assert_eq!(bob.conversation_unread_anchor(&legs, 0).unwrap(), None);
+        assert_eq!(
+            bob.conversation_summary(&hex_of(&old_leg)).unwrap().unread_count,
+            1,
+            "asking for the anchor marked nothing read"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_list_pins_note_to_self_and_never_counts_it_unread() {
+        let luca = MarmotEngine::in_memory(Identity::generate());
+        let mut bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        bob.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().unwrap(),
+        )));
+        let luca_dm = join_group_from(&luca, &bob, "").await;
+        receive_text(&luca, &bob, &luca_dm, "hi").await;
+        let nts = bob.ensure_note_to_self().await.unwrap();
+
+        let rows = bob.conversation_list(0, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].conversation_id, hex::encode(nts.as_slice()));
+        assert_eq!(rows[0].kind, crate::conversation_list::ConversationListKind::NoteToSelf);
+        assert_eq!(rows[0].unread_count, 0);
+        assert_eq!(rows[1].unread_count, 1);
     }
 
     #[tokio::test]

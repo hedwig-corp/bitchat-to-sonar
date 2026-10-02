@@ -12,6 +12,9 @@ import BitLogger
 final class SNTranscriptHostRenderContext: ObservableObject {
     var msgs: [SNMessage] = []
     var msgIndexByID: [String: Int] = [:]
+    /// Core's unread anchor for this open (`openConversation`). Wins over the
+    /// local walk whenever that row is loaded.
+    var unreadAnchorHint: String?
     /// Cached host entries for the current upstream revision — rebuilt only
     /// when `upstreamRenderRevision` advances (not on every SwiftUI body).
     private(set) var hostEntries: [TranscriptHostEntry] = []
@@ -331,6 +334,10 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             },
             unreadAnchorResolver: { [weak self] entries, unreadCount in
                 guard let self else { return nil }
+                if let hint = self.unreadAnchorHint,
+                   let hinted = entries.first(where: { $0.id.caseInsensitiveCompare(hint) == .orderedSame }) {
+                    return hinted.id
+                }
                 var remaining = unreadCount
                 var anchor: String?
                 for entry in entries.reversed() {
@@ -430,6 +437,8 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let loadOlder: (() async -> Bool)?
     let loadNewest: (() async -> Void)?
     let unreadCountAtOpen: UInt64?
+    /// Core's unread anchor (`openConversation`); see the render context.
+    var unreadAnchorHint: String? = nil
     let expectedNewestDate: Date?
     /// Search / deep-link jump target; wins over unread/live-edge open (#372).
     var jumpMessageId: String? = nil
@@ -469,6 +478,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
             loadNewest: loadNewest,
             transcriptBackgroundColor: UIColor(SonarTheme.bg),
             prepareForUpdate: {
+                renderContext.unreadAnchorHint = unreadAnchorHint
                 renderContext.sync(
                     renderState: renderState,
                     showAuthors: showAuthors,
