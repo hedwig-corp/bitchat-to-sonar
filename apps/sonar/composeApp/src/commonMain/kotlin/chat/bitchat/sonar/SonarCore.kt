@@ -63,6 +63,8 @@ data class SonarMsg(
     val reply: SonarReplyRef? = null,
     /// Aggregated kind-7 chips. Empty when nobody has reacted.
     val reactions: List<SonarReactionTally> = emptyList(),
+    /// The MLS group holding a core row; null for mesh rows and local echoes.
+    val groupId: String? = null,
 )
 
 /** Aggregated emoji chip for one parent message. */
@@ -1252,6 +1254,16 @@ expect object SonarCore {
     /** Cursor-based message page — newest first, before the given cursor. */
     suspend fun messagesCursorPage(
         chatId: String,
+        beforeSecs: Long? = null,
+        beforeIdHex: String? = null,
+        limit: Int,
+    ): List<SonarMsg>
+
+    /** One page for a whole conversation: the rows of every group in
+     *  [groupIds] merged by core in one order, newest first, before the
+     *  exclusive cursor. Throws when no group could be read (R-018). */
+    suspend fun conversationCursorPage(
+        groupIds: List<String>,
         beforeSecs: Long? = null,
         beforeIdHex: String? = null,
         limit: Int,

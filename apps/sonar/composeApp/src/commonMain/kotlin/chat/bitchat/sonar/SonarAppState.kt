@@ -1323,7 +1323,9 @@ class SonarAppState internal constructor(
      */
     private val retainedTranscriptByChat = mutableMapOf<String, List<SonarMsg>>()
 
-    /** One bounded canonical DB window per folded Marmot source group. */
+    /** One bounded canonical DB window for a conversation's White Noise
+     *  groups, merged by core (`conversationCursorPage`), keyed by
+     *  [transcriptWindowKey]. A single-group chat's key is its group id. */
     private data class TranscriptGroupWindow(
         val rows: List<SonarMsg>,
         val hasMore: Boolean,
@@ -2598,7 +2600,7 @@ class SonarAppState internal constructor(
     /** Drop leave/reopen paint cache when a conversation is deleted or erased. */
     private fun discardRetainedTranscript(chatId: String) {
         retainedTranscriptByChat.remove(chatId)
-        transcriptWindows.remove(chatId)
+        transcriptWindows.keys.removeAll { key -> key == chatId || chatId in key.split(',') }
     }
 
     /** Prefer last leave paint, else snapshot — never open on empty when we can avoid it. */
@@ -3068,6 +3070,7 @@ class SonarAppState internal constructor(
      *  `mesh:<peer>` — passing that to core would fail `parse_group_id`. */
     private fun marmotGroupIdForReaction(chatId: String, message: SonarMsg): String? {
         if (isMeshChat(chatId) && !message.viaInternet) return null
+        message.groupId?.let { return it }
         transcriptWindows.entries.firstOrNull { (_, window) ->
             window.rows.any { it.id.equals(message.id, ignoreCase = true) }
         }?.let { return it.key }
@@ -11955,41 +11958,54 @@ class SonarAppState internal constructor(
                 .thenBy { it.id }
         )
 
-    private suspend fun latestCursorPage(groupId: String): List<SonarMsg>? = runCatching {
-        SonarCore.messagesCursorPage(
-            chatId = groupId,
+    /** One key per White Noise group set, whatever order the set came in. */
+    private fun transcriptWindowKey(groupIds: List<String>): String =
+        groupIds.distinct().sorted().joinToString(",")
+
+    /** Newest page for the whole set, merged by core (one order, one cursor).
+     *  Null when unreadable: the core call throws rather than answer empty. */
+    private suspend fun latestCursorPage(groupIds: List<String>): List<SonarMsg>? = runCatching {
+        SonarCore.conversationCursorPage(
+            groupIds = groupIds,
             beforeSecs = null,
             beforeIdHex = null,
             limit = TRANSCRIPT_PAGE_FETCH_SIZE,
         )
     }.getOrNull()
 
+    private fun snapshotTranscriptRows(groupIds: List<String>): List<SonarMsg> =
+        groupIds.flatMap { chatSnapshotMessagesByChat[it].orEmpty() }
+            .sortedWith(compareBy<SonarMsg> { it.tsSecs }.thenBy { it.id })
+            .takeLast(TRANSCRIPT_PAGE_SIZE)
+
     /** Refresh the newest local rows without replacing pages already prepended. */
     private suspend fun refreshTranscriptGroupWindow(
-        groupId: String,
+        groupIds: List<String>,
         sessionChatId: String,
         generation: Long,
     ): List<SonarMsg> {
-        val fetched = latestCursorPage(groupId)
-        val untrusted = transcriptReadIsUntrusted(fetched, started, localLatestTs(groupId))
+        val key = transcriptWindowKey(groupIds)
+        val fetched = latestCursorPage(groupIds)
+        val knownLatest = groupIds.maxOfOrNull { localLatestTs(it) } ?: 0L
+        val untrusted = transcriptReadIsUntrusted(fetched, started, knownLatest)
         if (!isCurrentTranscriptSession(sessionChatId, generation)) {
             return when {
-                untrusted -> chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+                untrusted -> snapshotTranscriptRows(groupIds)
                 else -> visibleTranscriptPage(fetched.orEmpty())
             }
         }
 
-        var current = transcriptWindows[groupId]
+        var current = transcriptWindows[key]
         if (untrusted) {
             // Keep whatever is already painted; only fall through to the
             // snapshot when there is nothing to keep.
             if (current != null && current.rows.isNotEmpty()) return current.rows
-            val fallback = chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+            val fallback = snapshotTranscriptRows(groupIds)
             // Never cache an empty window. A cached blank is indistinguishable
             // from a real one at the `current != null` check above, so it would
             // shadow the store on every later refresh and pin the chat black.
             if (fallback.isNotEmpty()) {
-                transcriptWindows[groupId] = TranscriptGroupWindow(fallback, hasMore = false)
+                transcriptWindows[key] = TranscriptGroupWindow(fallback, hasMore = false)
             }
             return fallback
         }
@@ -12000,21 +12016,27 @@ class SonarAppState internal constructor(
         val newest = visibleTranscriptPage(page)
         // Remember the freshly read page before any pinned/bounded filtering can
         // drop it: send-echo reconciliation must still see an outgoing row that
-        // the render window refuses to admit.
-        freshCanonicalByGroup[groupId] = newest
+        // the render window refuses to admit. Split by the row's group: echoes
+        // reconcile per target group.
+        for (groupId in groupIds) {
+            freshCanonicalByGroup[groupId] = newest.filter {
+                it.groupId == groupId || (it.groupId == null && groupIds.size == 1)
+            }
+        }
         // Retained rows the newest page does not cover carry stale tallies:
         // overlay them from core's reaction index. Fetch BEFORE taking the
         // window this refresh writes back — an older-page load can land during
         // the suspension, and merging into a window read before it would drop
         // its rows and write back its stale `loadingOlder`.
         val newestIds = newest.mapTo(HashSet()) { it.id }
-        val staleIds = current?.rows.orEmpty().map { it.id }.filterNot { it in newestIds }
-        val overlay = if (staleIds.isEmpty()) {
-            emptyMap()
-        } else {
-            runCatching { SonarCore.reactionTallies(groupId, staleIds) }.getOrDefault(emptyMap())
+        val staleRows = current?.rows.orEmpty().filterNot { it.id in newestIds }
+        val overlay = HashMap<String, List<SonarReactionTally>>()
+        // Tallies live per group: ask each group for its own retained rows.
+        for ((groupId, rows) in staleRows.groupBy { it.groupId ?: groupIds.first() }) {
+            overlay += runCatching { SonarCore.reactionTallies(groupId, rows.map { it.id }) }
+                .getOrDefault(emptyMap())
         }
-        current = transcriptWindows[groupId]
+        current = transcriptWindows[key]
         val unboundedCount = (current?.rows.orEmpty() + newest).distinctBy { it.id }.size
         val merged = overlayReactionTallies(
             refreshTranscriptRows(
@@ -12029,7 +12051,7 @@ class SonarAppState internal constructor(
             current != null -> current.hasMore || page.size > TRANSCRIPT_PAGE_SIZE
             else -> page.size > TRANSCRIPT_PAGE_SIZE
         }
-        transcriptWindows[groupId] = TranscriptGroupWindow(
+        transcriptWindows[key] = TranscriptGroupWindow(
             rows = merged,
             hasMore = hasMore,
             loadingOlder = current?.loadingOlder == true,
@@ -12136,19 +12158,14 @@ class SonarAppState internal constructor(
         chatId: String,
         generation: Long = transcriptGeneration,
     ): List<SonarMsg> {
-        val groups = duplicateDirectMarmotChats(chatId)
-        if (groups.isEmpty()) {
-            return refreshConversationRows(
-                refreshTranscriptGroupWindow(chatId, chatId, generation),
-                chatId,
-                generation,
-            )
-        }
-        val merged = ArrayList<SonarMsg>()
-        for (group in groups) {
-            merged += refreshTranscriptGroupWindow(group.id, chatId, generation)
-        }
-        return refreshConversationRows(merged, chatId, generation)
+        // Core merges the folded groups into one page; the set is the one
+        // `transcriptGroupIds` (and so `loadOlderMessages`) resolves too.
+        val groupIds = duplicateDirectMarmotChats(chatId).map { it.id }.ifEmpty { listOf(chatId) }
+        return refreshConversationRows(
+            refreshTranscriptGroupWindow(groupIds, chatId, generation),
+            chatId,
+            generation,
+        )
     }
 
     private suspend fun marmotMessagesForPeer(
@@ -12160,12 +12177,9 @@ class SonarAppState internal constructor(
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
-        val merged = ArrayList<SonarMsg>()
-        for (group in groups) {
-            val msgs = refreshTranscriptGroupWindow(group.id, sessionChatId, generation)
-            merged += msgs.map { it.copy(viaInternet = true) }
-        }
-        return mergeAllTranscriptRows(merged)
+        if (groups.isEmpty()) return emptyList()
+        val rows = refreshTranscriptGroupWindow(groups.map { it.id }, sessionChatId, generation)
+        return mergeAllTranscriptRows(rows.map { it.copy(viaInternet = true) })
     }
 
     private fun refreshConversationRows(
@@ -12311,37 +12325,27 @@ class SonarAppState internal constructor(
         val generation = transcriptGeneration
         if (activeTranscriptChatId != chatId || (screen as? Screen.Chat)?.id != chatId) return false
 
+        // Core pages the White Noise groups as one source (one merged order),
+        // so the frontier below only weighs it against the mesh rows.
         val groupIds = transcriptGroupIds(chatId)
-        for (groupId in groupIds) {
-            var window = transcriptWindows[groupId]
-            if (window == null) {
-                refreshTranscriptGroupWindow(groupId, chatId, generation)
-                if (!isCurrentTranscriptSession(chatId, generation)) return false
-                window = transcriptWindows[groupId]
-            }
+        val key = transcriptWindowKey(groupIds)
+        if (groupIds.isNotEmpty() && transcriptWindows[key] == null) {
+            refreshTranscriptGroupWindow(groupIds, chatId, generation)
+            if (!isCurrentTranscriptSession(chatId, generation)) return false
         }
 
         val oldestVisible = conversationTranscriptRows.firstOrNull() ?: return false
         val peerId = chatId.takeIf(::isMeshChat)?.let(::meshPeerId)
+        fun sources() = buildList {
+            if (peerId != null) {
+                add(TranscriptSourceWindow(MESH_TRANSCRIPT_SOURCE_ID, meshTranscriptRows, hasOlderMeshRows(peerId)))
+            }
+            transcriptWindows[key]?.let { add(TranscriptSourceWindow(key, it.rows, it.hasMore)) }
+        }
         var sourcesReady = false
         for (attempt in 0..<3) {
-            val sources = buildList {
-                if (peerId != null) {
-                    if (meshTranscriptRows.isEmpty()) refreshMeshTranscriptWindow(peerId)
-                    add(
-                        TranscriptSourceWindow(
-                            id = MESH_TRANSCRIPT_SOURCE_ID,
-                            rows = meshTranscriptRows,
-                            hasMore = hasOlderMeshRows(peerId),
-                        ),
-                    )
-                }
-                for (groupId in groupIds) {
-                    val window = transcriptWindows[groupId] ?: continue
-                    add(TranscriptSourceWindow(groupId, window.rows, window.hasMore))
-                }
-            }
-            val sourceIds = transcriptSourceIdsNeedingExpansion(sources, oldestVisible)
+            if (peerId != null && meshTranscriptRows.isEmpty()) refreshMeshTranscriptWindow(peerId)
+            val sourceIds = transcriptSourceIdsNeedingExpansion(sources(), oldestVisible)
             if (sourceIds.isEmpty()) {
                 sourcesReady = true
                 break
@@ -12350,17 +12354,16 @@ class SonarAppState internal constructor(
             if (peerId != null && MESH_TRANSCRIPT_SOURCE_ID in sourceIds) {
                 prependOlderMeshRows(peerId)
             }
-            for (groupId in groupIds) {
-                if (groupId !in sourceIds) continue
-                val current = transcriptWindows[groupId] ?: continue
-                if (current.loadingOlder || !current.hasMore || current.rows.isEmpty()) continue
-
+            val current = transcriptWindows[key]
+            if (key in sourceIds && current != null &&
+                !current.loadingOlder && current.hasMore && current.rows.isNotEmpty()
+            ) {
                 if (!isCurrentTranscriptSession(chatId, generation)) return false
-                transcriptWindows[groupId] = current.copy(loadingOlder = true)
+                transcriptWindows[key] = current.copy(loadingOlder = true)
                 val cursor = current.rows.first()
                 val fetched = runCatching {
-                    SonarCore.messagesCursorPage(
-                        chatId = groupId,
+                    SonarCore.conversationCursorPage(
+                        groupIds = groupIds,
                         beforeSecs = cursor.tsSecs,
                         beforeIdHex = cursor.id,
                         limit = TRANSCRIPT_PAGE_FETCH_SIZE,
@@ -12370,42 +12373,32 @@ class SonarAppState internal constructor(
                 if (!isCurrentTranscriptSession(chatId, generation)) return false
 
                 if (fetched == null) {
-                    val latest = transcriptWindows[groupId] ?: current
-                    transcriptWindows[groupId] = latest.copy(loadingOlder = false)
-                    continue
+                    val latest = transcriptWindows[key] ?: current
+                    transcriptWindows[key] = latest.copy(loadingOlder = false)
+                } else {
+                    val older = visibleTranscriptPage(fetched)
+                    // A newest-page refresh can finish while this older query is
+                    // suspended. Merge into the latest window so it cannot overwrite
+                    // a new canonical row or clear the in-flight state prematurely.
+                    val latest = transcriptWindows[key] ?: current
+                    val trimsNewerEdge = latest.rows.size >= TRANSCRIPT_RETAINED_ROWS &&
+                        older.any { candidate -> latest.rows.none { it.id == candidate.id } }
+                    transcriptWindows[key] = TranscriptGroupWindow(
+                        rows = prependTranscriptRows(latest.rows, older),
+                        hasMore = fetched.size > TRANSCRIPT_PAGE_SIZE,
+                        pinnedToOlderEdge = latest.pinnedToOlderEdge || trimsNewerEdge,
+                    )
                 }
-                val older = visibleTranscriptPage(fetched)
-                // A newest-page refresh can finish while this older query is
-                // suspended. Merge into the latest window so it cannot overwrite
-                // a new canonical row or clear the in-flight state prematurely.
-                val latest = transcriptWindows[groupId] ?: current
-                val trimsNewerEdge = latest.rows.size >= TRANSCRIPT_RETAINED_ROWS &&
-                    older.any { candidate -> latest.rows.none { it.id == candidate.id } }
-                val merged = prependTranscriptRows(latest.rows, older)
-                transcriptWindows[groupId] = TranscriptGroupWindow(
-                    rows = merged,
-                    hasMore = fetched.size > TRANSCRIPT_PAGE_SIZE,
-                    pinnedToOlderEdge = latest.pinnedToOlderEdge || trimsNewerEdge,
-                )
             }
         }
 
-        if (!sourcesReady) {
-            val sources = buildList {
-                if (peerId != null) {
-                    add(TranscriptSourceWindow(MESH_TRANSCRIPT_SOURCE_ID, meshTranscriptRows, hasOlderMeshRows(peerId)))
-                }
-                for (groupId in groupIds) {
-                    val window = transcriptWindows[groupId] ?: continue
-                    add(TranscriptSourceWindow(groupId, window.rows, window.hasMore))
-                }
-            }
-            if (transcriptSourceIdsNeedingExpansion(sources, oldestVisible).isNotEmpty()) return false
+        if (!sourcesReady && transcriptSourceIdsNeedingExpansion(sources(), oldestVisible).isNotEmpty()) {
+            return false
         }
 
         if (!isCurrentTranscriptSession(chatId, generation)) return false
 
-        val canonical = groupIds.flatMap { transcriptWindows[it]?.rows.orEmpty() }
+        val canonical = transcriptWindows[key]?.rows.orEmpty()
         val source = if (isMeshChat(chatId)) {
             meshTranscriptRows + canonical
         } else {

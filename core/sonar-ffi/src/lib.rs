@@ -630,6 +630,9 @@ fn delivery_label_info(label: sonar_core::marmot::DeliveryLabel) -> DeliveryLabe
 #[derive(uniffi::Record)]
 pub struct MessageInfo {
     pub id_hex: String,
+    /// The MLS group that holds it: react, reply and retry go here. A
+    /// conversation page mixes the rows of several groups.
+    pub group_id_hex: String,
     pub sender_npub: String,
     pub content: String,
     pub created_at_secs: u64,
@@ -647,6 +650,15 @@ pub struct MessageInfo {
     pub reply: Option<ReplyRefInfo>,
     /// Aggregated kind-7 chips. Empty when nobody has reacted.
     pub reactions: Vec<ReactionTallyInfo>,
+}
+
+/// One transcript page across a conversation's groups.
+#[derive(uniffi::Record)]
+pub struct ConversationPageInfo {
+    /// Newest first.
+    pub messages: Vec<MessageInfo>,
+    /// More rows exist past the last one.
+    pub has_more: bool,
 }
 
 /// Target-keyed kind-7 tallies for overlaying retained historical rows.
@@ -2200,6 +2212,39 @@ impl SonarNode {
         Ok(msgs.into_iter().map(message_info).collect())
     }
 
+    /// One transcript page for a whole conversation: the rows of every group
+    /// in `group_id_hexes` in one `(created_at DESC, event_id DESC)` order,
+    /// de-duplicated, cut at `limit`. Pass the last row of the previous page
+    /// as the exclusive cursor. Errors when no group could be read, so an
+    /// unreadable store never paints as an empty chat (R-018).
+    pub fn conversation_cursor_page(
+        &self,
+        group_id_hexes: Vec<String>,
+        before_secs: Option<u64>,
+        before_id_hex: Option<String>,
+        limit: u32,
+    ) -> FfiResult<ConversationPageInfo> {
+        let groups = group_id_hexes
+            .iter()
+            .map(|hex| parse_group_id(hex))
+            .collect::<Result<Vec<_>, _>>()?;
+        let before_id = before_id_hex
+            .as_deref()
+            .map(EventId::from_hex)
+            .transpose()
+            .map_err(invalid("cursor event id"))?;
+        let page = self.client.conversation_cursor_page(
+            &groups,
+            before_secs,
+            before_id.as_ref(),
+            limit as usize,
+        )?;
+        Ok(ConversationPageInfo {
+            messages: page.rows.into_iter().map(message_info).collect(),
+            has_more: page.has_more,
+        })
+    }
+
     /// Target-keyed kind-7 tallies for already-loaded transcript ids.
     pub fn reaction_tallies(
         &self,
@@ -3577,6 +3622,7 @@ fn message_class_info(c: sonar_core::marmot::MessageClassification) -> MessageCl
 fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
     MessageInfo {
         id_hex: m.id.to_hex(),
+        group_id_hex: hex::encode(m.group_id.as_slice()),
         sender_npub: m.sender.to_bech32().expect("npub encoding cannot fail"),
         classification: message_class_info(m.classification),
         content: m.content,

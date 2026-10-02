@@ -7831,29 +7831,44 @@ impl SonarClient {
     /// Each read spends one unit of `budget`; when it runs out the chip keeps
     /// what the page gave it, and the host shows its fallback.
     fn fill_reply_parents(&self, group_id: &GroupId, msgs: &mut [ChatMessage], budget: &mut usize) {
+        let mut search = vec![group_id.clone()];
+        search.extend(self.folded_siblings(group_id));
+        self.fill_reply_parents_in(&search, msgs, budget);
+    }
+
+    /// [`Self::fill_reply_parents`] over an explicit set of groups, searched in
+    /// order.
+    fn fill_reply_parents_in(&self, search: &[GroupId], msgs: &mut [ChatMessage], budget: &mut usize) {
         use crate::conversation_list::ConversationPreview;
-        if *budget == 0 {
+        let open: HashSet<nostr::EventId> = msgs
+            .iter()
+            .filter_map(|m| m.reply.as_ref())
+            .filter(|r| r.chip == ConversationPreview::Empty)
+            .map(|r| r.parent_id)
+            .collect();
+        if open.is_empty() {
             return;
         }
-        let on_page: HashSet<nostr::EventId> = msgs.iter().map(|m| m.id).collect();
+        // Parents on this page first: a merged conversation page holds rows of
+        // several groups, so a parent can sit beside the reply here even when
+        // its own group's page did not hold it. Free, no read.
+        let mut found: HashMap<nostr::EventId, ConversationPreview> = msgs
+            .iter()
+            .filter(|m| open.contains(&m.id))
+            .map(|m| (m.id, crate::reply::reply_preview_of(m)))
+            .collect();
         let mut wanted: Vec<nostr::EventId> = Vec::new();
         for reply in msgs.iter().filter_map(|m| m.reply.as_ref()) {
             if reply.chip == ConversationPreview::Empty
                 && crate::reply::chip_needs_parent(reply)
-                && !on_page.contains(&reply.parent_id)
+                && !found.contains_key(&reply.parent_id)
                 && !wanted.contains(&reply.parent_id)
             {
                 wanted.push(reply.parent_id);
             }
         }
-        if wanted.is_empty() {
-            return;
-        }
-        let mut search = vec![group_id.clone()];
-        search.extend(self.folded_siblings(group_id));
-        let mut found: HashMap<nostr::EventId, ConversationPreview> = HashMap::new();
         'parents: for id in wanted {
-            for group in &search {
+            for group in search {
                 if *budget == 0 {
                     break 'parents;
                 }
@@ -7872,6 +7887,9 @@ impl SonarClient {
             }
         }
         for reply in msgs.iter_mut().filter_map(|m| m.reply.as_mut()) {
+            if reply.chip != ConversationPreview::Empty {
+                continue;
+            }
             if let Some(parent) = found.get(&reply.parent_id) {
                 reply.chip = crate::reply::reply_chip(reply.preview.as_deref(), Some(parent));
             }
@@ -8653,6 +8671,63 @@ impl SonarClient {
             .messages_cursor_page(group_id, before_secs, before_id, limit)?;
         let mut budget = REPLY_PARENT_LOOKUPS_PER_READ;
         Ok(self.finish_rows(group_id, msgs, &mut budget))
+    }
+
+    /// One transcript page for a whole conversation: every group in
+    /// `group_ids` merged into one newest-first `(created_at DESC, id DESC)`
+    /// order, de-duplicated by event id, cut at `limit`. The cursor is the
+    /// last row of the previous page and is exclusive.
+    ///
+    /// Each group answers `limit + 1` rows from the same cursor; every row of
+    /// the merged top `limit` is inside its own group's top `limit`, so the
+    /// merge is exact and the apps keep no per-group frontier. Quote chips
+    /// search the whole set under one read budget.
+    ///
+    /// A read that fails for every group is an error, never an empty page
+    /// (R-018). A group that fails while others answer is skipped, so one
+    /// removed group cannot blank the chat.
+    pub fn conversation_cursor_page(
+        &self,
+        group_ids: &[GroupId],
+        before_secs: Option<u64>,
+        before_id: Option<&nostr::EventId>,
+        limit: usize,
+    ) -> Result<crate::conversation_list::ConversationPage> {
+        let mut groups: Vec<GroupId> = Vec::with_capacity(group_ids.len());
+        for group in group_ids {
+            if !groups.contains(group) {
+                groups.push(group.clone());
+            }
+        }
+        if groups.is_empty() || limit == 0 {
+            return Ok(crate::conversation_list::ConversationPage::default());
+        }
+        let mut merged: Vec<ChatMessage> = Vec::new();
+        let mut first_error = None;
+        let mut answered = 0usize;
+        for group in &groups {
+            match self
+                .engine
+                .messages_cursor_page(group, before_secs, before_id, limit.saturating_add(1))
+            {
+                Ok(rows) => {
+                    answered += 1;
+                    merged.extend(rows);
+                }
+                Err(e) => {
+                    tracing::warn!(group = %hex::encode(group.as_slice()), %e, "conversation page: group read failed");
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if answered == 0 {
+            return Err(first_error.expect("no group answered, so one failed"));
+        }
+        let (mut rows, has_more) = crate::conversation_list::merge_conversation_page(merged, limit);
+        let mut budget = REPLY_PARENT_LOOKUPS_PER_READ;
+        rows = rows.into_iter().map(|m| self.with_delivery_state(m)).collect();
+        self.fill_reply_parents_in(&groups, &mut rows, &mut budget);
+        Ok(crate::conversation_list::ConversationPage { rows, has_more })
     }
 
     /// Durable outbox state for a locally created rumor id: `None` once a
@@ -13731,6 +13806,106 @@ mod tests {
             1,
             "asking for the anchor marked nothing read"
         );
+    }
+
+    /// The transcript page both apps render comes from core: every folded
+    /// group in one order, paged with one cursor, nothing skipped or repeated.
+    #[tokio::test]
+    async fn a_conversation_page_merges_every_folded_group_in_one_order() {
+        use crate::conversation_list::ConversationPreview;
+        let sara = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let old_leg = join_group_from(&sara, &bob, "").await;
+        let new_leg = join_group_from(&sara, &bob, "").await;
+        for i in 0..4 {
+            receive_text(&sara, &bob, &old_leg, &format!("old {i}")).await;
+            receive_text(&sara, &bob, &new_leg, &format!("new {i}")).await;
+        }
+        let legs = vec![old_leg.clone(), new_leg.clone()];
+        let mut expected: Vec<ChatMessage> = bob.messages(&old_leg).unwrap();
+        expected.extend(bob.messages(&new_leg).unwrap());
+        expected.sort_by(|a, b| {
+            b.created_at.as_secs().cmp(&a.created_at.as_secs()).then_with(|| b.id.cmp(&a.id))
+        });
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<(u64, nostr::EventId)> = None;
+        let mut pages = 0;
+        loop {
+            let page = bob
+                .conversation_cursor_page(&legs, cursor.map(|c| c.0), cursor.as_ref().map(|c| &c.1), 3)
+                .unwrap();
+            assert!(page.rows.len() <= 3);
+            pages += 1;
+            seen.extend(page.rows.iter().map(|m| m.id));
+            let Some(last) = page.rows.last() else { break };
+            cursor = Some((last.created_at.as_secs(), last.id));
+            if !page.has_more {
+                break;
+            }
+        }
+        assert_eq!(seen, expected.iter().map(|m| m.id).collect::<Vec<_>>(), "one order, no gap, no repeat");
+        assert_eq!(pages, 3, "8 rows in pages of 3");
+
+        // The set is the app's: quoting the other leg resolves from the page
+        // itself, with no chat-list shape cache to say the legs are one chat.
+        let parent = expected.iter().find(|m| m.group_id == old_leg).unwrap().clone();
+        let quote = crate::reply::ReplyTo {
+            parent_id: parent.id,
+            parent_pubkey: parent.sender,
+            preview: None,
+        };
+        bob.send_text_with_reply(&new_leg, "agreed", Some(&quote)).await.unwrap();
+        let per_group = bob.messages_cursor_page(&new_leg, None, None, 30).unwrap();
+        let chip = |rows: &[ChatMessage]| {
+            rows.iter().find(|m| m.content == "agreed").and_then(|m| m.reply.clone()).unwrap().chip
+        };
+        assert_eq!(chip(&per_group), ConversationPreview::Empty, "one group alone cannot see it");
+        let page = bob.conversation_cursor_page(&legs, None, None, 30).unwrap();
+        assert_eq!(chip(&page.rows), ConversationPreview::Text(parent.content.clone()));
+        assert!(page.rows.iter().all(|m| m.group_id == old_leg || m.group_id == new_leg));
+
+        // A group this store does not hold does not blank the others (R-018:
+        // an unreadable answer is never an empty page).
+        let gone = GroupId::from_slice(&[7u8; 32]);
+        let page = bob
+            .conversation_cursor_page(&[gone.clone(), new_leg.clone()], None, None, 100)
+            .unwrap();
+        assert_eq!(page.rows.len(), 5, "the new leg's four texts and the reply");
+        assert!(
+            bob.conversation_cursor_page(&[gone], None, None, 100).is_err(),
+            "every group failing is an error, never an empty conversation"
+        );
+    }
+
+    #[test]
+    fn merging_group_pages_keeps_one_order_and_one_copy() {
+        use crate::conversation_list::merge_conversation_page;
+        let group = GroupId::from_slice(&[1u8; 32]);
+        let me = Identity::generate().public_key();
+        let row = |secs: u64, id: u8| ChatMessage {
+            id: nostr::EventId::from_byte_array([id; 32]),
+            group_id: group.clone(),
+            sender: me,
+            content: String::new(),
+            created_at: Timestamp::from(secs),
+            mine: false,
+            delivery_state: DeliveryState::Received,
+            classification: crate::marmot::MessageClassification::Text,
+            media: Vec::new(),
+            sticker_ref: None,
+            reply: None,
+            reactions: Vec::new(),
+        };
+        let (rows, more) = merge_conversation_page(vec![row(5, 1), row(9, 2), row(5, 3), row(9, 2), row(1, 4)], 3);
+        let order: Vec<(u64, u8)> = rows.iter().map(|m| (m.created_at.as_secs(), m.id.as_bytes()[0])).collect();
+        assert_eq!(order, vec![(9, 2), (5, 3), (5, 1)], "newest first, higher id first inside a second");
+        assert!(more);
+        let (rows, more) = merge_conversation_page(vec![row(5, 1)], 3);
+        assert_eq!(rows.len(), 1);
+        assert!(!more);
     }
 
     #[tokio::test]

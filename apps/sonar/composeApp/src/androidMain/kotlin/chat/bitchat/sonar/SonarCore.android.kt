@@ -631,8 +631,24 @@ actual object SonarCore {
         ).map { it.toCommon() }
     }
 
+    actual suspend fun conversationCursorPage(
+        groupIds: List<String>,
+        beforeSecs: Long?,
+        beforeIdHex: String?,
+        limit: Int,
+    ): List<SonarMsg> = withContext(Dispatchers.IO) {
+        // Throws with no node, like messagesCursorPage (R-018).
+        requireNode().conversationCursorPage(
+            groupIds,
+            beforeSecs?.toULong(),
+            beforeIdHex,
+            limit.toUInt(),
+        ).messages.map { it.toCommon() }
+    }
+
     private fun uniffi.sonar_ffi.MessageInfo.toCommon(): SonarMsg = SonarMsg(
         id = idHex,
+        groupId = groupIdHex,
         senderNpub = senderNpub,
         content = content,
         mine = mine,

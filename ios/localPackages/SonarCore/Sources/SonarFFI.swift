@@ -2013,6 +2013,15 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func collectNotificationsAfterWake(maxWaitMs: UInt64) throws  -> [DrainNotificationInfo]
 
     /**
+     * One transcript page for a whole conversation: the rows of every group
+     * in `group_id_hexes` in one `(created_at DESC, event_id DESC)` order,
+     * de-duplicated, cut at `limit`. Pass the last row of the previous page
+     * as the exclusive cursor. Errors when no group could be read, so an
+     * unreadable store never paints as an empty chat (R-018).
+     */
+    func conversationCursorPage(groupIdHexes: [String], beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32) throws  -> ConversationPageInfo
+
+    /**
      * The Marmot half of the Messages list, folded and ordered by core:
      * Note to Self first, then newest first. `after` continues from the
      * previous page's last row; `limit` 0 returns every row. Local only.
@@ -2840,6 +2849,25 @@ open func collectNotificationsAfterWake(maxWaitMs: UInt64)throws  -> [DrainNotif
     uniffi_sonar_ffi_fn_method_sonarnode_collect_notifications_after_wake(
             self.uniffiCloneHandle(),
         FfiConverterUInt64.lower(maxWaitMs),$0
+    )
+})
+}
+
+    /**
+     * One transcript page for a whole conversation: the rows of every group
+     * in `group_id_hexes` in one `(created_at DESC, event_id DESC)` order,
+     * de-duplicated, cut at `limit`. Pass the last row of the previous page
+     * as the exclusive cursor. Errors when no group could be read, so an
+     * unreadable store never paints as an empty chat (R-018).
+     */
+open func conversationCursorPage(groupIdHexes: [String], beforeSecs: UInt64?, beforeIdHex: String?, limit: UInt32)throws  -> ConversationPageInfo  {
+    return try  FfiConverterTypeConversationPageInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_conversation_cursor_page(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(groupIdHexes),
+        FfiConverterOptionUInt64.lower(beforeSecs),
+        FfiConverterOptionString.lower(beforeIdHex),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -5037,6 +5065,75 @@ public func FfiConverterTypeConversationOpenInfo_lower(_ value: ConversationOpen
 
 
 /**
+ * One transcript page across a conversation's groups.
+ */
+public struct ConversationPageInfo: Equatable, Hashable {
+    /**
+     * Newest first.
+     */
+    public var messages: [MessageInfo]
+    /**
+     * More rows exist past the last one.
+     */
+    public var hasMore: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Newest first.
+         */messages: [MessageInfo],
+        /**
+         * More rows exist past the last one.
+         */hasMore: Bool) {
+        self.messages = messages
+        self.hasMore = hasMore
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ConversationPageInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConversationPageInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ConversationPageInfo {
+        return
+            try ConversationPageInfo(
+                messages: FfiConverterSequenceTypeMessageInfo.read(from: &buf),
+                hasMore: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ConversationPageInfo, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeMessageInfo.write(value.messages, into: &buf)
+        FfiConverterBool.write(value.hasMore, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationPageInfo_lift(_ buf: RustBuffer) throws -> ConversationPageInfo {
+    return try FfiConverterTypeConversationPageInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConversationPageInfo_lower(_ value: ConversationPageInfo) -> RustBuffer {
+    return FfiConverterTypeConversationPageInfo.lower(value)
+}
+
+
+/**
  * FFI-friendly conversation summary from the core-owned index.
  */
 public struct ConversationSummaryInfo: Equatable, Hashable {
@@ -6159,6 +6256,11 @@ public func FfiConverterTypeMeshPublicMessage_lower(_ value: MeshPublicMessage) 
  */
 public struct MessageInfo: Equatable, Hashable {
     public var idHex: String
+    /**
+     * The MLS group that holds it: react, reply and retry go here. A
+     * conversation page mixes the rows of several groups.
+     */
+    public var groupIdHex: String
     public var senderNpub: String
     public var content: String
     public var createdAtSecs: UInt64
@@ -6193,7 +6295,11 @@ public struct MessageInfo: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(idHex: String, senderNpub: String, content: String, createdAtSecs: UInt64,
+    public init(idHex: String,
+        /**
+         * The MLS group that holds it: react, reply and retry go here. A
+         * conversation page mixes the rows of several groups.
+         */groupIdHex: String, senderNpub: String, content: String, createdAtSecs: UInt64,
         /**
          * True when the local identity sent it.
          */mine: Bool,
@@ -6216,6 +6322,7 @@ public struct MessageInfo: Equatable, Hashable {
          * Aggregated kind-7 chips. Empty when nobody has reacted.
          */reactions: [ReactionTallyInfo]) {
         self.idHex = idHex
+        self.groupIdHex = groupIdHex
         self.senderNpub = senderNpub
         self.content = content
         self.createdAtSecs = createdAtSecs
@@ -6245,6 +6352,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         return
             try MessageInfo(
                 idHex: FfiConverterString.read(from: &buf),
+                groupIdHex: FfiConverterString.read(from: &buf),
                 senderNpub: FfiConverterString.read(from: &buf),
                 content: FfiConverterString.read(from: &buf),
                 createdAtSecs: FfiConverterUInt64.read(from: &buf),
@@ -6260,6 +6368,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
 
     public static func write(_ value: MessageInfo, into buf: inout [UInt8]) {
         FfiConverterString.write(value.idHex, into: &buf)
+        FfiConverterString.write(value.groupIdHex, into: &buf)
         FfiConverterString.write(value.senderNpub, into: &buf)
         FfiConverterString.write(value.content, into: &buf)
         FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
@@ -12245,6 +12354,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_collect_notifications_after_wake() != 17254) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_cursor_page() != 862) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_list() != 31021) {

@@ -102,6 +102,34 @@ pub fn preview_for(kind: &str, content: &str) -> ConversationPreview {
     ConversationPreview::Text(content.to_string())
 }
 
+/// One transcript page across a conversation's groups (see
+/// `SonarClient::conversation_cursor_page`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationPage {
+    /// Newest first, `(created_at DESC, id DESC)`.
+    pub rows: Vec<crate::marmot::ChatMessage>,
+    /// More rows exist past the last one.
+    pub has_more: bool,
+}
+
+/// Merge the per-group answers of one cursor read: one order, one copy of
+/// each event id, the first `limit` rows. `has_more` when anything was cut.
+pub fn merge_conversation_page(
+    mut rows: Vec<crate::marmot::ChatMessage>,
+    limit: usize,
+) -> (Vec<crate::marmot::ChatMessage>, bool) {
+    rows.sort_by(|a, b| {
+        b.created_at
+            .as_secs()
+            .cmp(&a.created_at.as_secs())
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    rows.dedup_by(|later, earlier| later.id == earlier.id);
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    (rows, has_more)
+}
+
 /// What kind of conversation a row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConversationListKind {
