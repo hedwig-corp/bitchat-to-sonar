@@ -73,18 +73,10 @@ ran its own quote-parent fill, so a group could not see its twin's rows.
    overlay are split by `SonarMsg.groupId`, so echo reconciliation (R-001,
    R-025) still sees per-group rows. `marmotGroupIdForReaction` reads the row's
    group.
-3. **iOS: tracked gap.** `MarmotChatModel.messagesByGroup` is per group, and
-   so is everything that reads it: send echoes, side-effect scans, unread, and
-   `SNConversationTranscriptWindow.refreshing`. That last one keeps each
-   source's uncovered prefix by that source's own page boundary.
-
-   Switching only the older-page load to the merged page would mix two
-   boundary models. A group whose newest page ends later would lose rows on
-   the next refresh, which is the case the per-source rule exists for. The
-   follow-up has to move both loads together:
-   - `loadLocalPage` and `loadOlderLocalPage` read `conversationCursorPage`
-     for the conversation's set (`conversationGroupIdsByGroup`) and split the
-     rows into `messagesByGroup` by `groupId`.
-   - `dmTranscriptSources` reports one White Noise source per set.
-   - That needs its own device QA pass, covering the transcript scenarios and
-     QA-156.
+3. **iOS** (shipped):
+   - **Shared paging state:** the folded set shares one cursor, has-older flag, loading guard and older-edge pin in `MarmotChatModel`, keyed by `localTranscriptPageKey`. That key is the sorted set from core's chat-list rows, or the group id alone.
+   - **Both loads read the merged page:** `loadLocalPage` and `loadOlderLocalPage` read `conversationCursorPage` for the set. They compute the window over the union of the set's rows and split it back into `messagesByGroup` by each row's `groupId`, so echoes, side-effect scans and unread still read per group.
+   - **One source per set:** `dmMsgs` stamps every White Noise row with the set's key as its source id, and `dmTranscriptSources` reports one source per set. `SNConversationTranscriptWindow` therefore sees a single boundary, which is what its per-source uncovered-prefix rule needs.
+   - **Rows keep their group:** `SNMessage.marmotGroupID` holds the row's own group, so reactions go to the group that holds the message.
+   - **Summary refresh:** for a set, the summary refresh may move the cursor only newer (a trim). A quiet group's newest rows can sit below the merged window, and dropping the cursor to them would skip the other groups' rows.
+   - **A single-group chat pages exactly as before:** its key is its group id and its page is that group's page.

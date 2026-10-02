@@ -398,6 +398,10 @@ struct SNMessage: Identifiable, Equatable {
     /// Optimistic/ephemeral rows intentionally have no source and are always
     /// rebuilt from the authoritative projection.
     var transcriptSourceID: String? = nil
+    /// The White Noise group holding this row. A folded chat pages its groups
+    /// as one source, so the source id names the set, not the group: react,
+    /// reply and retry into this.
+    var marmotGroupID: String? = nil
     var via: SNVia?
     var state: String?
     /// 0...1 while a Blossom upload is in flight for this optimistic media row.
@@ -1694,10 +1698,13 @@ final class SonarAppStore: ObservableObject {
     func sendReaction(chatId: String, to message: SNMessage, emoji: String) {
         guard snCanReact(to: message) else { return }
         if message.reactions.contains(where: { $0.emoji == emoji && $0.mine }) { return }
+        // A folded chat's source id names the whole set ("a,b"): only a
+        // single-group source id is itself a group id.
         let source = message.transcriptSourceID.flatMap {
-            $0 == SNConversationTranscriptSource.meshID ? nil : $0
+            $0 == SNConversationTranscriptSource.meshID || $0.contains(",") ? nil : $0
         }
-        let groupId = source
+        let groupId = message.marmotGroupID
+            ?? source
             ?? marmotGroupId(chatId)
             ?? resolvedSonarProfile(chatId).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId, let npub = message.senderNpub else { return }
@@ -6842,10 +6849,15 @@ final class SonarAppStore: ObservableObject {
         paymentNewestOffset: Int,
         callNewestOffset: Int
     ) -> [SNConversationTranscriptSource] {
-        var sources = localTranscriptGroups(for: id).map { group in
+        // One source per folded set, not per group: core merges the set's
+        // groups into one page, so they share one boundary and one cursor.
+        var seenKeys = Set<String>()
+        var sources = localTranscriptGroups(for: id).compactMap { group -> SNConversationTranscriptSource? in
+            let key = marmot.localTranscriptPageKey(group.id)
+            guard seenKeys.insert(key).inserted else { return nil }
             return SNConversationTranscriptSource(
-                id: group.id,
-                rows: candidates.filter { $0.transcriptSourceID == group.id },
+                id: key,
+                rows: candidates.filter { $0.transcriptSourceID == key },
                 hasMore: marmot.hasOlderLocalMessages(groupId: group.id)
             )
         }
@@ -6937,16 +6949,19 @@ final class SonarAppStore: ObservableObject {
         groupIDs: Set<String>
     ) async -> SNConversationTranscriptLoadResult {
         var result = SNConversationTranscriptLoadResult.none
-        for group in localTranscriptGroups(for: id) where groupIDs.contains(group.id) {
-            let before = marmot.localTranscriptCanonicalMessageIDs(groupId: group.id)
+        // `groupIDs` are source ids: one page key per folded set. Load each set
+        // once; its page carries every group's rows.
+        var loadedKeys = Set<String>()
+        for group in localTranscriptGroups(for: id) {
+            let key = marmot.localTranscriptPageKey(group.id)
+            guard groupIDs.contains(key), loadedKeys.insert(key).inserted else { continue }
+            let setGroups = marmot.localTranscriptPageGroups(group.id)
+            let ids = { Set(setGroups.flatMap { self.marmot.localTranscriptCanonicalMessageIDs(groupId: $0) }) }
+            let before = ids()
             let loaded = await marmot.loadOlderLocalPageWhenAvailable(groupId: group.id)
             if loaded > 0 {
-                marmotStagedPageRescanIds.insert(group.id)
-                result.record(
-                    before: before,
-                    after: marmot.localTranscriptCanonicalMessageIDs(groupId: group.id),
-                    loaded: loaded
-                )
+                marmotStagedPageRescanIds.formUnion(setGroups)
+                result.record(before: before, after: ids(), loaded: loaded)
             }
         }
         if result.added {
@@ -7128,6 +7143,9 @@ final class SonarAppStore: ObservableObject {
             // every group member on every message.
             let mentionCtx = mentionContext(forConversationId: id)
             for group in sourceGroups {
+                // One transcript source per folded set: core pages the set as
+                // one merged window (`conversationCursorPage`).
+                let marmotSourceID = marmot.localTranscriptPageKey(group.id)
                 let groupMessages = marmot.messagesByGroup[group.id] ?? []
                 let counterpartName = marmot.isDirectGroup(group)
                     ? directOtherNpub(in: group).flatMap { marmot.displayName(forNpub: $0) }
@@ -7165,7 +7183,8 @@ final class SonarAppStore: ObservableObject {
                             author: marmot.marmotAuthorName(m),
                             text: "",
                             time: Self.clock(m.createdAt),
-                            transcriptSourceID: group.id,
+                            transcriptSourceID: marmotSourceID,
+                            marmotGroupID: group.id,
                             via: .internet,
                             trill: true,
                             reply: reply,
@@ -7176,7 +7195,8 @@ final class SonarAppStore: ObservableObject {
                         return (m.createdAt, SNMessage(
                             id: m.id, mine: m.isMine, text: m.content,
                             time: Self.clock(m.createdAt),
-                            transcriptSourceID: group.id,
+                            transcriptSourceID: marmotSourceID,
+                            marmotGroupID: group.id,
                             via: payVia,
                             pay: pay,
                             reply: reply,
@@ -7190,7 +7210,8 @@ final class SonarAppStore: ObservableObject {
                             author: marmot.marmotAuthorName(m),
                             text: m.content,
                             time: Self.clock(m.createdAt),
-                            transcriptSourceID: group.id,
+                            transcriptSourceID: marmotSourceID,
+                            marmotGroupID: group.id,
                             via: .internet,
                             state: MarmotChatModel.stateText(for: m),
                             uploadProgress: marmot.mediaUploadProgress[m.id],
@@ -7365,6 +7386,7 @@ final class SonarAppStore: ObservableObject {
         // stores but RENDERS them as one, merged chronologically; the
         // White Noise leg always renders as internet (indigo).
         if let profile = resolvedSonarProfile(id), let group = marmotGroup(forNpub: profile.npub) {
+            let marmotSourceID = marmot.localTranscriptPageKey(group.id)
             dated += Self.transcriptSource(
                 marmot.messagesByGroup[group.id] ?? [],
                 limit: limit
@@ -7381,7 +7403,8 @@ final class SonarAppStore: ObservableObject {
                         author: m.isMine ? nil : peerDisplayName(id),
                         text: "",
                         time: Self.clock(m.createdAt),
-                        transcriptSourceID: group.id,
+                        transcriptSourceID: marmotSourceID,
+                            marmotGroupID: group.id,
                         via: .internet,
                         trill: true,
                         senderNpub: m.senderNpub,
@@ -7391,7 +7414,8 @@ final class SonarAppStore: ObservableObject {
                     return (m.createdAt, SNMessage(
                         id: m.id, mine: m.isMine, text: m.content,
                         time: Self.clock(m.createdAt),
-                        transcriptSourceID: group.id,
+                        transcriptSourceID: marmotSourceID,
+                            marmotGroupID: group.id,
                         via: payVia,
                         pay: pay,
                         senderNpub: m.senderNpub,
@@ -7404,7 +7428,8 @@ final class SonarAppStore: ObservableObject {
                         author: m.isMine ? nil : peerDisplayName(id),
                         text: m.content,
                         time: Self.clock(m.createdAt),
-                        transcriptSourceID: group.id,
+                        transcriptSourceID: marmotSourceID,
+                            marmotGroupID: group.id,
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
                         uploadProgress: marmot.mediaUploadProgress[m.id],

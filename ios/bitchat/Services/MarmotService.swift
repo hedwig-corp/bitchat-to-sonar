@@ -139,6 +139,10 @@ final class MarmotService: @unchecked Sendable {
         let reply: MarmotReplyRef?
         /// Aggregated kind-7 chips. Empty when nobody has reacted.
         let reactions: [MarmotReactionTally]
+        /// The MLS group holding a core row. A conversation page mixes the
+        /// rows of every folded group; nil for local echoes and rows decoded
+        /// from older snapshots (their group is the window they sit in).
+        let groupId: String?
 
         init(
             id: String,
@@ -151,7 +155,8 @@ final class MarmotService: @unchecked Sendable {
             stickerRef: MarmotStickerRef? = nil,
             classification: MarmotMessageClass = .text,
             reply: MarmotReplyRef? = nil,
-            reactions: [MarmotReactionTally] = []
+            reactions: [MarmotReactionTally] = [],
+            groupId: String? = nil
         ) {
             self.id = id
             self.senderNpub = senderNpub
@@ -164,6 +169,7 @@ final class MarmotService: @unchecked Sendable {
             self.classification = classification
             self.reply = reply
             self.reactions = reactions
+            self.groupId = groupId
         }
 
         func replacingReactions(_ reactions: [MarmotReactionTally]) -> MarmotMessage {
@@ -178,7 +184,8 @@ final class MarmotService: @unchecked Sendable {
                 stickerRef: stickerRef,
                 classification: classification,
                 reply: reply,
-                reactions: reactions
+                reactions: reactions,
+                groupId: groupId
             )
         }
 
@@ -194,6 +201,7 @@ final class MarmotService: @unchecked Sendable {
             case classification
             case reply
             case reactions
+            case groupId
         }
 
         init(from decoder: Decoder) throws {
@@ -210,6 +218,7 @@ final class MarmotService: @unchecked Sendable {
                 try container.decodeIfPresent(MarmotMessageClass.self, forKey: .classification) ?? .text
             self.reply = try container.decodeIfPresent(MarmotReplyRef.self, forKey: .reply)
             self.reactions = try container.decodeIfPresent([MarmotReactionTally].self, forKey: .reactions) ?? []
+            self.groupId = try container.decodeIfPresent(String.self, forKey: .groupId)
         }
     }
 
@@ -1567,7 +1576,8 @@ final class MarmotService: @unchecked Sendable {
             },
             reactions: message.reactions.map {
                 MarmotReactionTally(emoji: $0.emoji, count: $0.count, mine: $0.mine)
-            }
+            },
+            groupId: message.groupIdHex
         )
     }
 
@@ -2539,6 +2549,28 @@ final class MarmotService: @unchecked Sendable {
                     beforeIdHex: beforeIdHex,
                     limit: limit
                 )
+                .map(Self.marmotMessage)
+        }
+    }
+
+    /// One page for a conversation's folded groups, merged by core in one
+    /// `(createdAt DESC, id DESC)` order (`conversation_cursor_page`). Throws
+    /// when no group could be read, so an unreadable store never reads as an
+    /// empty chat (R-018). Rows carry their `groupId`.
+    func conversationCursorPage(
+        groupIds: [String],
+        beforeSecs: UInt64? = nil,
+        beforeIdHex: String? = nil,
+        limit: UInt32
+    ) async throws -> [MarmotMessage] {
+        try await readOnly {
+            try $0.conversationCursorPage(
+                    groupIdHexes: groupIds,
+                    beforeSecs: beforeSecs,
+                    beforeIdHex: beforeIdHex,
+                    limit: limit
+                )
+                .messages
                 .map(Self.marmotMessage)
         }
     }

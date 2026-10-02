@@ -541,9 +541,15 @@ nothing by design.
   author. The nudge quote reads "Message", never the raw `⚡TRILL|…` line.
   Both apps word each chip identically.
 - **How:** automated in core and at the app call sites. On devices it needs
-  two folded groups. `sonar-cli` has no command that opens a second 1:1, so
-  have the app and the peer each start a chat with the other before either
-  welcome lands. That leaves two direct groups, which fold.
+  two folded groups from one peer. Make a second `sonar-cli` home holding a
+  copy of the first peer's `config.json` (same key, empty store):
+  `mkdir $QA_HOME/peers/<p2> && cp $QA_HOME/peers/<p1>/config.json $QA_HOME/peers/<p2>/`.
+  Its first `send` opens a new 1:1, which folds into the existing chat.
+  Verified on iOS 2026-10-02 with 20 texts on one leg and 25 on the other:
+  - one chat row;
+  - all 45 rows in merged order when paging to the top;
+  - 👍 on a first-leg row reached that leg's group;
+  - a reply sent into the second leg showed the chip "Sonar agent DM / fold a 03".
 - **Guard:** `client.rs::a_reply_quoting_the_twin_group_gets_its_chip_from_core`,
   `reply.rs::the_chip_prefers_a_typed_parent_then_the_snapshot_then_the_parent_text`,
   `MarmotReplyChipTests.aChipFromCoreRendersWithoutTheParentInThisGroup`,
