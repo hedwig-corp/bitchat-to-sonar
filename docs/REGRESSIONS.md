@@ -120,9 +120,21 @@ roughly halves it. The ranking is stable across all three.)
 
 **Call sites:** iOS `SonarAppStore.swift` (`dmRows` + `snCollapseMeshDMRowsByIdentity` / `sonarPeerKey`); Compose `SonarAppState.duplicateDirectMarmotChats` / `preferredDirectMarmotChat` / `peerIdForMarmotGroup` / `meshConversationAliasGroups`
 
+**Shared call site (duplicate direct groups):** since the core-owned chat list, the
+Marmot 1:1 fold is decided once in `core/sonar-core/src/conversation_list.rs`
+(`build_rows`, exported as `SonarNode.conversationList`). Both apps read its
+folded sets: iOS `MarmotChatModel.conversationGroupIdsByGroup` →
+`buildHomeDMRows` / `directMarmotGroups(matching:)`; Compose
+`ChatListRepository.groupIdsByGroup` → `dedupeByConversationRows` /
+`duplicateDirectMarmotChats` / `computeMarmotRowModels`. Since Home rows became
+a core screen model, iOS `buildHomeDMRows` iterates core rows directly and its
+local fold (`snCanonicalDirectMarmotGroups`) is deleted; the startup snapshot
+carries core rows so first paint needs no local fold either. Compose keeps its
+peer-key fold only as the fallback for chats core has not listed yet.
+
 **Guarded by:** `ConversationRegressionSmokeTest.duplicateSaraGroupsKeepOneNewestTranscript`
 
-**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`
+**Also guarded by:** `client.rs::conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row`, `conversation_list.rs::duplicate_direct_groups_fold_into_one_row_that_sums_unread`, `ChatListAppStateTest.theCoreFoldDecidesWhichGroupRendersAndWhatOpeningMarksRead`, `ChatListAppStateTest.aFailedCoreListReadKeepsTheLastFold`, `DedupeByConversationRowsTest.coreSetPicksTheRowGroupEvenWhenLocalRecencyDisagrees`, `SonarCoreConversationFoldTests.coreSetResolvesInRowOrderAndSkipsGroupsThatAreGone`, `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`
 
 **Partly guarded:** the cited tests pin *chat-list* dedup and identity routing. The "one transcript" half is not pinned: if duplicate groups still collapse to one row but transcript loading stopped merging every duplicate group's messages, all of them stay green. See Unguarded.
 
@@ -2948,6 +2960,69 @@ once; later passes merge into the queue the heartbeat drains).
   restores summaries but resets every unread count and drops peer-zone revoke
   tombstones, and it hides the migration defect rather than fixing it.
 
+## R-052 — A mesh-folded row's unread badge sums the groups its open read-marks
+
+**Invariant:** the Home row of a person met over Bluetooth shows unread when
+any White Noise group folded into that conversation has unread, and the set it
+sums over is exactly the set opening the row read-marks,
+`transcriptGroupIds("mesh:<peerId>")`.
+
+**Breaks as:** someone you met over Bluetooth now writes over White Noise.
+iOS puts the unread dot on their row; Android and desktop show the new
+preview and no dot. Over-correcting (summing a wider set) leaves a dot that
+opening the chat cannot clear.
+
+**Why:** unread is keyed by Marmot group id and a `mesh:` row has none of its
+own. Compose built `MeshDmRow` from the Bluetooth leg only, and `HomeScreen`
+passed neither `unread` nor `verified` for it, so the row fell back to the
+defaults. Same bug class as the mesh-only unread divider (#303, see
+`docs/CHAT-TYPES.md`): group-keyed state not resolved for the mesh kind.
+
+**Compose call sites:** `SonarAppState.recomputeConversations` puts the
+groups it folds into each row on `MeshDmRow.groupIds`. Those are the linked
+npub's direct groups, the set `transcriptGroupIds` resolves when `openDm`
+read-marks the row. `refreshMeshDmRows` carries them through the
+Bluetooth-only pass, and `ChatListPresenter.rows` sums
+`ChatListRepository.unreadByChat` over them.
+
+**Apple call site:** `SonarAppStore.buildHomeDMRows`
+(`hasUnreadMarmotMessage(in: groupSet)`), already correct; this was a
+Compose-only gap.
+
+**Guarded by:** `ChatListAppStateTest.aMeshFoldedPersonsWhiteNoiseUnreadBadgesTheirBluetoothRow`
+(a real `SonarAppState`, core faked at the `ChatListCore` seam: the row is
+badged, and opening it marks exactly the folded group)
+
+**Also guarded by:** `ChatListPresenterTest.aMeshFoldedRowShowsTheUnreadOfItsWhiteNoiseLegs`
+
+**Shared since the core-owned list:** for pure Marmot rows the summed set is
+core's `ConversationListRow.group_ids`, and both apps mark exactly that set
+read on open, so the badge and the clear cannot disagree across platforms.
+Guarded in core by
+`client.rs::conversation_list_folds_duplicate_one_to_ones_and_marking_the_set_clears_the_row`.
+The mesh-folded half above still resolves its set in each app, because the
+Bluetooth link table is not in core yet.
+
+**Not guarded:** the fold set refreshes on every `recomputeConversations`
+(each housekeeping cycle and conversation change), so a link learned between
+cycles badges one cycle late, and nothing pins that latency. The `verified`
+half is covered only by the presenter test's fixture. No iOS test pins the
+Apple fold.
+
+**History:** Compose mesh rows never carried a badge. Found by the chat-list
+presenter pilot, whose "both chat kinds" test had nothing to assert for the
+mesh kind.
+
+**Rejected:**
+- *Resolve the fold set in the presenter per mesh row.* `transcriptGroupIds`
+  for a mesh id walks every group with Bech32 decodes: 21 ms for 10 mesh rows
+  over 278 groups on the JVM, about 2 ms a row. The presenter recomposes on
+  every Bluetooth peer update.
+- *Call `transcriptGroupIds` per row inside `recomputeConversations`.* It gives
+  the same set, but pays those 2 ms a row again, on the main dispatcher, every
+  housekeeping cycle. The fold loop has already computed the set, so the row
+  takes it from there in O(groups).
+
 ## R-054 — Per-group catch-up repairs the chats you are in first
 
 **Invariant:** the per-group relay catch-up queue a client builds is ranked by
@@ -3099,7 +3174,7 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **R-023's five call sites.** The predicate is pinned on both platforms, but nothing proves each of the five import paths actually consults it before wiping. Same root cause as the entries below: neither app object can be constructed in a test. Until then this is a helper-level guard on a data-loss path, which is precisely the shape R-001 regressed through.
 - **R-004, account wipe, both platforms.** Now implemented on iOS and Compose, but pinned by no test. The Compose path needs an injectable `SonarCore`; the iOS path needs a constructible `SonarAppStore`, and no iOS test builds one today (`MarmotOptimisticEchoTests` only exercises static functions).
 - **R-013, host push-tap / catching-up chip.** The iOS local-banner marker is pinned as a pure seam; the real `NotificationDelegate` → `refreshAfterForeground` call, full sync-lifetime indicator, and Compose notification-open → `forcedCatchupSync` route still need constructible app stores. Real-device APNs/FCM validation remains #262.
-- **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.
+- **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it. **Partly addressed (Compose):** `SonarAppState` now takes its chat-list core through the `ChatListCore` seam, and `ChatListAppStateTest` builds one on the JVM with that core faked to drive the real reload, projection and open paths (R-052). Paths that call `SonarCore` directly still reach the real core, so each needs its own seam; the pattern is in `docs/CHAT-LIST-PRESENTER.md`.
 - **Out-of-range mesh DM echo dedup + Marmot reconcile (R-011 outbox half).** The outbox-flush path (`flushOutboxNow` -> `sendMesh(messageId)` + durable `removeMeshEcho` after Marmot) extends R-011's echo lifecycle to a second entry point. The O(1) dedup in `sendMesh` (`messageId == null || messageId !in meshEchoIds`) and the bounded reconcile (`removeMeshEcho` polls `marmotMessagesForPeer` up to 10x100ms before clearing the echo; on outbox eviction `failMeshEcho` marks the echo "Couldn't send") are both untested -- `SonarAppState` cannot be constructed in a test. Same root cause as the entry above. (Compose media retry is now covered by #397's `SonarMediaOutbox`/`queueMeshMediaForRetry`, so the earlier display-only media-echo gap no longer applies on Android.)
 - **A running iOS process is not a rendered UI.** `BitchatApp.init()` read `_sonarStore.wrappedValue` before SwiftUI installed the `@StateObject`, so each access built a throwaway store: the throwaway connected and opened the account while the view's store never left its launch state, and the app sat on the splash forever. It shipped because the simulator check verified the process stayed alive and read `t1_local_paint groups=137` from the log — both true, both from the wrong instance. The **mechanism** is now pinned: `scripts/check-stateobject-init.sh` (CI: `.github/workflows/swiftui-lifecycle.yml`) fails on any `_x.wrappedValue` read inside an `init()` in a file declaring a `@StateObject` — verified by reintroducing the exact line and re-running, and by confirming the clean tree passes. Like the share-extension check below it is deliberately not cited as `Guarded by:`: it is a shell check, not a test in this ledger's citation grammar. **What it does not pin** is the entry's actual claim — that the app renders. Any other route to a split instance (a helper taking the projected value, the same mistake via `@ObservedObject`) still passes, and no iOS test builds an app scene. Until a UI test target exists (#520) treat "the process is alive" and "the log looks healthy" as insufficient evidence for any launch-path change, and screenshot the screen. Found on an iPhone 14 Pro Max in #368.
 - **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
@@ -3128,7 +3203,7 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **A degraded RNG path must never succeed quietly.** Five of seven production `SecRandomCopyBytes` call sites discarded the `OSStatus`. `SecRandomCopyBytes` leaves its buffer untouched on failure and every caller started from a zero-filled buffer, so an RNG failure yielded an all-zeros NIP-44 nonce, an all-zeros geohash device seed (identical derived private keys, then persisted to the keychain), and replayable verification nonces. Same shape in Rust (`let _ = getrandom(..)` in `media_staging.rs`) and in Compose (mesh/pay/trill ids from clock-seeded `kotlin.random` while iOS used CSPRNG-backed `UUID()`). Note the shape: nothing crashed, nothing logged, and every unit test passed — the failure is invisible until someone enumerates your keys. This is the COLDCARD firmware bug class (Block, 2026-07). `scripts/check-rng-hygiene.sh` (CI: `.github/workflows/rng-hygiene.yml`) fails without the fix — verified by reintroducing each defect, including the four bypasses a review panel found against the first draft of the script. Like the share-extension check above it is deliberately not cited as `Guarded by:`: it is a shell check, not a test in this ledger's citation grammar. **What it checks:** every `SecRandomCopyBytes` has `errSecSuccess` on its own line (a window search let an unchecked call inherit a neighbour's guard); every `getrandom` statement propagates or panics (`.ok()`, `let _res =`, and a bare `is_err()` all still zero the buffer); no `kotlin.random`/`java.util.Random`/`Math.random`/`.random()` token in shared Kotlin, matched on the token rather than the receiver shape (matching `"0123..".random()` was bypassed by hoisting the alphabet into a val — the deleted code, one refactor away). **What it does not:** whether a checked call feeds the right value, `core/vendor/`, or intent. `ios/bitchatTests/SecureRandomTests.swift` reads the 24-byte nonce straight out of the NIP-44 wire format across two encryptions and asserts they differ, which fails against a cached or constant nonce. It does **not** pin *this* bug: `SecRandomCopyBytes` cannot be made to fail without a seam, so the old code passes it too, and iOS tests still do not run in CI. The failure branch is guarded only by the shell check. **On the NIP-44 severity specifically:** an earlier draft of this entry claimed a zero nonce meant keystream reuse against a fixed per-peer conversation key. That is wrong for this implementation — `encrypt`'s only callers (`createSeal`, `createGiftWrap`) each pass a per-message *ephemeral* key, so the conversation key already varies per message. The fix is defence in depth against the spec-conformant shape (NIP-17 seals with the sender's long-term key), not a live hole that was being exploited.
 - **Duplicate-send.** Nothing pins "one tap produces exactly one canonical row". Worth adding if the duplicate bubble in #290 ever proves to be two real canonical rows rather than an echo — that was investigated and left unproven.
 - **iOS expand-button hit target (#357, PR #358; structural fix PR #426).** The invariant is "the Show more / Show less control is a full 44pt tap target on all three iOS bubble surfaces" — `SNMsgBubble` (`SonarComponents.swift`), `SonarMessageBubbleView`, `TextMessageView`. It is enforced *only* by view-tree shape: `.buttonStyle(.plain)` hit-tests the button's **label subtree**, so `.frame(minHeight: 44)` and `.contentShape(Rectangle())` must sit inside the `label:` closure. Chained onto the `Button` wrapper instead — which is what the `Button(<title>) { <action> }` convenience initializer invites — they widen the layout box and leave the blank part of the 44pt area dead. That is exactly how #358's first attempt failed review while looking correct. **Now structural rather than remembered:** all three surfaces render the shared `ShowMoreButton` (`ios/bitchat/Views/Components/ShowMoreButton.swift`), which owns the label-subtree shape and `ShowMoreButton.minimumHitTarget`, so a fourth surface cannot reintroduce the bug without editing that one file. Still no test, and none would run: iOS tests are not in CI (see below), and hit-region behaviour needs a UI test rather than a unit test — the shared component is the guard. Compose is structurally immune — in `MessageBubble` (`App.kt`) `heightIn(min = 44.dp)` sits outside `clickable`, so the constraint propagates into the clickable node. The expanded/collapsed accessibility state is now set on both platforms (iOS `.accessibilityValue`, Compose `stateDescription`) from the localized `content.message.expanded` / `.collapsed` keys; PR #426 also replaced Compose's hardcoded English `"Show more"` / `"Show less"` with the already-translated resources. **What is still unpinned:** nothing verifies the a11y value is actually announced, and nothing prevents a new surface from hand-rolling its own expand control instead of using `ShowMoreButton`.
-- **Mesh-folded chat id resolution.** Group-keyed state (`unreadByChat`, snapshots, read-marking) must be resolved through `transcriptGroupIds`, never indexed with a `mesh:` route id — and position/count logic must not trust a mesh chat's first painted feed before it catches up with `latestKnownMessageSecs` (the BLE window publishes before the White Noise leg merges). Both broke the unread divider for mesh chats only (PR #303, commits 070c00f3e + 80feb4ade); no test pins either invariant. `transcriptGroupIds` needs instance state, so pinning likely means extracting the resolver or an in-process store test. See `docs/CHAT-TYPES.md`.
+- **Mesh-folded chat id resolution.** Group-keyed state (`unreadByChat`, snapshots, read-marking) must be resolved through `transcriptGroupIds`, never indexed with a `mesh:` route id — and position/count logic must not trust a mesh chat's first painted feed before it catches up with `latestKnownMessageSecs` (the BLE window publishes before the White Noise leg merges). Both broke the unread divider for mesh chats only (PR #303, commits 070c00f3e + 80feb4ade); no test pins either invariant. `transcriptGroupIds` needs instance state, so pinning likely means extracting the resolver or an in-process store test. See `docs/CHAT-TYPES.md`. **Partly guarded since R-052:** the chat-list badge and the read-mark set for a mesh row now go through `transcriptGroupIds` at a real `SonarAppState` call site (`ChatListAppStateTest`). The divider/catch-up half is still unpinned.
 - **Sticker ref resolution on the hosts (#307).** The bug fixed there — a stale session pack LRU pinning a validated-local fallback, so a newly-added sticker showed the failed placeholder for the session while older ones rendered — lives in `SonarAppState.stickerImage(ref)` and `MarmotChatModel.stickerData(for:)`. Both need a real `SonarCore`, so none of the following is pinned; the helper tests in `StickerSendEchoTest` / `MarmotStickerOptimisticTests` only self-feed the key and retry-schedule functions and would stay green if the whole repair were deleted. Same root cause as the three gaps above. Unpinned invariants, all of which have already broken once:
   - **A received sticker renders even when its pack is not installed.** The installed set (`installedPackCoordinates`) gates only the *picker* via `shouldExposeCachedStickerPack` — what you may SEND. Anything a peer sends must resolve from the reference alone. If an install check ever leaks into the ref-render path, every sticker from a pack the recipient does not have goes black.
   - **A "not in pack" verdict is only trusted when a relay was actually reached.** `fetch_sticker_pack_singleflight` falls back to stale validated-local metadata when the relay fetch fails, so negative-caching an offline answer would keep a good sticker black for the session — the same class of bug #307 fixes. Guarded in code by the `isRelayConnected()` condition on `rememberUnresolvableStickerRef`, by nothing else.

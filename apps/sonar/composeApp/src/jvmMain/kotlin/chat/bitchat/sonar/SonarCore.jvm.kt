@@ -136,7 +136,10 @@ actual object SonarCore {
             installConversationListener()
             previousNode?.close()
             runCatching { connected.retryOutbox() }
+            // Without a published KeyPackage no one can start a chat with us,
+            // so a failure is logged, never swallowed.
             runCatching { connected.publishKeyPackageBackground() }
+                .onFailure { println("SonarCore: KeyPackage publish failed: ${it.message}") }
             npub
         }
     }
@@ -523,6 +526,52 @@ actual object SonarCore {
                 unreadCount = it.unreadCount.toLong(),
             )
         }
+    }
+
+    actual suspend fun conversationList(): List<SonarConversationListRow> = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext emptyList()
+        n.conversationList(0u, null).map {
+            SonarConversationListRow(
+                conversationId = it.conversationId,
+                kind = when (it.kind) {
+                    uniffi.sonar_ffi.ConversationListKindInfo.DIRECT -> SonarConversationListKind.Direct
+                    uniffi.sonar_ffi.ConversationListKindInfo.GROUP -> SonarConversationListKind.Group
+                    uniffi.sonar_ffi.ConversationListKindInfo.NOTE_TO_SELF -> SonarConversationListKind.NoteToSelf
+                },
+                groupIds = it.groupIds,
+                counterpartHex = it.counterpartHex,
+                name = it.name,
+                title = it.title,
+                preview = it.preview.toCommon(),
+                latestContent = it.latestContent,
+                latestSenderHex = it.latestSenderHex,
+                latestAtSecs = it.latestAtSecs.toLong(),
+                latestMine = it.latestMine,
+                latestGroupId = it.latestGroupId,
+                messageCount = it.messageCount.toLong(),
+                unreadCount = it.unreadCount.toLong(),
+                version = it.version.toLong(),
+            )
+        }
+    }
+
+    actual suspend fun rememberPeerNames(names: Map<String, String>): Unit = withContext(Dispatchers.IO) {
+        if (names.isEmpty()) return@withContext
+        node?.rememberPeerNames(names.map { (hex, name) -> uniffi.sonar_ffi.PeerNameInfo(hex, name) })
+    }
+
+    private fun uniffi.sonar_ffi.ConversationPreviewInfo.toCommon(): SonarConversationPreview = when (this) {
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Empty -> SonarConversationPreview.Empty
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Text -> SonarConversationPreview.Text(text)
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Photos -> SonarConversationPreview.Photos(count.toInt())
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Videos -> SonarConversationPreview.Videos(count.toInt())
+        is uniffi.sonar_ffi.ConversationPreviewInfo.VoiceNote -> SonarConversationPreview.VoiceNote
+        is uniffi.sonar_ffi.ConversationPreviewInfo.File -> SonarConversationPreview.File(name)
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Sticker -> SonarConversationPreview.Sticker
+        is uniffi.sonar_ffi.ConversationPreviewInfo.VoiceCall -> SonarConversationPreview.VoiceCall
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Nudge -> SonarConversationPreview.Nudge
+        is uniffi.sonar_ffi.ConversationPreviewInfo.Payment -> SonarConversationPreview.Payment
+        is uniffi.sonar_ffi.ConversationPreviewInfo.JsonPayload -> SonarConversationPreview.JsonPayload
     }
 
     actual suspend fun updateLocalTimezone(ianaIdentifier: String): Unit = withContext(Dispatchers.IO) {

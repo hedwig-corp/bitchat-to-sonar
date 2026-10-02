@@ -283,6 +283,52 @@ final class MarmotService: @unchecked Sendable {
         let plaintextSha256: String
     }
 
+    /// Kind of a core-computed Messages-list row (`conversationList`).
+    enum ConversationListKind: String, Sendable, Equatable, Codable {
+        case direct, group, noteToSelf
+    }
+
+    /// A row's newest message as core classified it; the app only words it.
+    enum ConversationPreview: Sendable, Equatable, Codable {
+        case empty
+        case text(String)
+        case photos(Int)
+        case videos(Int)
+        case voiceNote
+        case file(String)
+        case sticker
+        case voiceCall
+        case nudge
+        case payment
+        case jsonPayload
+    }
+
+    /// One Messages-list row computed by core: every Marmot group of one
+    /// conversation folded together (R-003), unread summed over `groupIds`
+    /// (R-052), Note to Self first. Compose renders the same rows, so the fold
+    /// is decided once for both apps.
+    struct ConversationListRow: Sendable, Equatable, Codable {
+        /// The group the row opens: newest in the set, lowest id on a tie.
+        let conversationId: String
+        let kind: ConversationListKind
+        /// Every folded group, `conversationId` first. Opening marks all read.
+        let groupIds: [String]
+        let counterpartHex: String?
+        let name: String
+        /// Core-resolved title; nil = the app's localized fallback.
+        let title: String?
+        let preview: ConversationPreview
+        let latestContent: String
+        let latestSenderHex: String
+        let latestAt: Date
+        let latestMine: Bool
+        let latestGroupId: String
+        let messageCount: UInt64
+        /// Sum over `groupIds`; 0 for Note to Self.
+        let unreadCount: UInt64
+        let version: UInt64
+    }
+
     struct ConversationSummary: Sendable, Equatable {
         let groupIdHex: String
         let name: String
@@ -2348,6 +2394,67 @@ final class MarmotService: @unchecked Sendable {
                 )
             }
         }, default: [])
+    }
+
+    /// Core's Messages-list rows, in list order. Local only. nil when the read
+    /// failed, so callers keep the fold they have instead of dropping it.
+    func conversationList() async -> [ConversationListRow]? {
+        await readOnlyNonThrowing({ node in
+            guard let rows = try? node.conversationList(limit: 0, after: nil) else { return nil }
+            return rows.map { row in
+                let kind: ConversationListKind
+                switch row.kind {
+                case .direct: kind = .direct
+                case .group: kind = .group
+                case .noteToSelf: kind = .noteToSelf
+                }
+                return ConversationListRow(
+                    conversationId: row.conversationId,
+                    kind: kind,
+                    groupIds: row.groupIds,
+                    counterpartHex: row.counterpartHex,
+                    name: row.name,
+                    title: row.title,
+                    preview: Self.conversationPreview(row.preview),
+                    latestContent: row.latestContent,
+                    latestSenderHex: row.latestSenderHex,
+                    latestAt: Date(timeIntervalSince1970: TimeInterval(row.latestAtSecs)),
+                    latestMine: row.latestMine,
+                    latestGroupId: row.latestGroupId,
+                    messageCount: row.messageCount,
+                    unreadCount: row.unreadCount,
+                    version: row.version
+                )
+            }
+        }, default: nil)
+    }
+
+    nonisolated static func conversationPreview(_ info: ConversationPreviewInfo) -> ConversationPreview {
+        switch info {
+        case .empty: return .empty
+        case .text(let text): return .text(text)
+        case .photos(let count): return .photos(Int(count))
+        case .videos(let count): return .videos(Int(count))
+        case .voiceNote: return .voiceNote
+        case .file(let name): return .file(name)
+        case .sticker: return .sticker
+        case .voiceCall: return .voiceCall
+        case .nudge: return .nudge
+        case .payment: return .payment
+        case .jsonPayload: return .jsonPayload
+        }
+    }
+
+    /// Seed core's name cache (titles the Messages list) from the app's
+    /// profile cache. Keys are canonical npubs or hex pubkeys.
+    func rememberPeerNames(_ names: [(pubkeyHex: String, name: String)]) async {
+        guard !names.isEmpty else { return }
+        await runNonThrowing { service in
+            _ = service.node?.rememberPeerNames(
+                names: names.map { PeerNameInfo(pubkeyHex: $0.pubkeyHex, name: $0.name) }
+            )
+            return ()
+        }
     }
 
     func markConversationRead(groupId: String) async {
